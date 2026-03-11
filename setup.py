@@ -15,7 +15,7 @@ from pathlib import Path
 from shutil import which
 
 import torch
-from packaging.version import Version, parse
+from packaging.version import VERSION_PATTERN, Version, parse
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
@@ -34,6 +34,14 @@ def load_module_from_path(module_name, path):
 
 ROOT_DIR = Path(__file__).parent
 logger = logging.getLogger(__name__)
+
+# This fork uses decorated release tags such as
+# `v0.15.2rc1-sm70-awq-cu128-py312`. Restrict setuptools_scm to the leading
+# PEP 440 portion so editable installs do not fail on the extra suffix.
+SETUPTOOLS_SCM_TAG_REGEX = re.compile(
+    rf"^(?:[\w-]+-)?(?P<version>[vV]?{VERSION_PATTERN})(?:[-+].*)?$",
+    re.VERBOSE | re.IGNORECASE,
+)
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
@@ -897,15 +905,19 @@ def _targets_cuda_arch_at_least(min_arch: str) -> bool:
     return any(arch >= Version(min_arch) for arch in target_arches)
 
 
+def _get_scm_version(*, write_to: str | None) -> str:
+    return get_version(write_to=write_to, tag_regex=SETUPTOOLS_SCM_TAG_REGEX)
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return _get_scm_version(write_to="vllm/_version.py")
 
-    version = get_version(write_to="vllm/_version.py")
+    version = _get_scm_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
