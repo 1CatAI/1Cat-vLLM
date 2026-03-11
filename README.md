@@ -20,6 +20,19 @@ MoE, and selected multimodal models.
 This repository is based on vLLM and keeps the original project structure and
 serving APIs wherever possible.
 
+## Benchmarks / Effort figures
+
+For a compact set of benchmark figures (Decode/Prefill comparisons and
+input-length scaling curves), see:
+
+- [`effort/README.md`](effort/README.md)
+
+Preview (gallery):
+
+| 总览对比 | Qwen3-coder-next-80b（1 卡） | Qwen3.5-122B-A10B-AWQ（4 卡） |
+| --- | --- | --- |
+| [![overview](effort/effort.jpg)](effort/effort.jpg) | [![qwen3 coder next 80b](effort/effort2.jpg)](effort/effort2.jpg) | [![qwen3.5 122b awq](effort/effort3.jpg)](effort/effort3.jpg) |
+
 ## Validated stack
 
 The commands in this README were validated on the following setup:
