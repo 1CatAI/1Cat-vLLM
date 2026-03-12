@@ -33,6 +33,12 @@ Preview (gallery):
 | --- | --- | --- |
 | [![overview](effort/effort.jpg)](effort/effort.jpg) | [![qwen3 coder next 80b](effort/effort2.jpg)](effort/effort2.jpg) | [![qwen3.5 122b awq](effort/effort3.jpg)](effort/effort3.jpg) |
 
+## WeChat Group / 微信交流群
+
+Scan the QR code below to join the WeChat group:
+
+![WeChat group QR code](effort/group.jpg)
+
 ## Validated stack
 
 The commands in this README were validated on the following setup:
