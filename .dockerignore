@@ -1,6 +1,13 @@
 /.venv
+/.git
+/.deps
 /build
 dist
+/dist-cu128-sm70
+/bench_results
+/logs
+/测试结果
+/.sm70_storage_env
 vllm/*.so
 
 # Byte-compiled / optimized / DLL files

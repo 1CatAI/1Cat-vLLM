@@ -62,6 +62,114 @@ print(vllm.__version__)
 PY
 ```
 
+## Docker 部署：推荐走 wheel 运行时镜像
+
+如果你要给别人分发一个可直接部署的容器，推荐用本仓库提供的
+SM70 wheel-runtime 镜像入口，而不是在 Docker 里重新从源码编译。
+
+### 1. 构建镜像
+
+```bash
+docker build \
+  -f docker/Dockerfile.sm70-wheel \
+  -t 1cat-vllm-sm70:0.0.2 \
+  .
+```
+
+第一次 `docker build` 会下载数 GB 的 PyTorch / CUDA 运行时层。仓库的
+Docker build context 已经尽量收紧，但 Docker 镜像层本身仍然会写到主机
+当前的 Docker Root 目录，除非你已经自己迁移过 Docker 数据目录。
+
+这个 Dockerfile 明确使用 `python:3.12-slim-trixie`。原因很直接：
+当前 SM70 wheel 需要 `glibc >= 2.38`，并且运行时镜像里还要保留
+`gcc/g++`，因为 Triton 首次启动时会现场编译一个很小的辅助模块。
+
+这个镜像默认会安装当前 `v0.0.2` release wheel，并且自带以下公开默认项：
+
+- `--skip-mm-profiling`
+- `--limit-mm-per-prompt '{"image":0,"video":0}'`
+- `--attention-backend TRITON_ATTN`
+- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}'`
+
+如果你想把运行期缓存放到 1T 盘之类的大盘上，可以在下面的 `docker run`
+命令后面额外补这些参数：
+
+- `-v /path/to/1t-cache/hf:/cache/hf -e HF_HOME=/cache/hf`
+- `-v /path/to/1t-cache/triton:/cache/triton -e TRITON_CACHE_DIR=/cache/triton`
+- `-v /path/to/1t-cache/torchinductor:/cache/torchinductor -e TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor`
+- `-v /path/to/1t-cache/tmp:/cache/tmp -e TMPDIR=/cache/tmp`
+
+这条 Docker runtime 路径已经在双 `16G` V100 + `Qwen3.5-35B-A3B-AWQ`
+上做过真实验证：`/health` 正常返回，首个 `2+2` 请求返回 `4`。
+
+### 2. 双 `16G` V100 运行 `Qwen3.5-27B-AWQ`
+
+```bash
+docker run --rm \
+  --gpus '"device=1,2"' \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-27B-AWQ \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-27B-AWQ \
+  -e VLLM_TENSOR_PARALLEL_SIZE=2 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
+  -e VLLM_MAX_NUM_SEQS=4 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  1cat-vllm-sm70:0.0.2
+```
+
+### 3. 双 `16G` V100 运行 `Qwen3.5-35B-A3B-AWQ`
+
+```bash
+docker run --rm \
+  --gpus '"device=1,2"' \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_TENSOR_PARALLEL_SIZE=2 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
+  -e VLLM_MAX_NUM_SEQS=2 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  1cat-vllm-sm70:0.0.2
+```
+
+### 4. 四卡 `16G` V100 运行 `Qwen3.5-35B-A3B-AWQ`
+
+```bash
+docker run --rm \
+  --gpus '"device=1,2,3,4"' \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=65536 \
+  -e VLLM_MAX_NUM_SEQS=1 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  1cat-vllm-sm70:0.0.2
+```
+
+### 5. 容器内快速验证
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.5-27B-AWQ",
+    "messages": [{"role": "user", "content": "只回答最终结果：2+2等于几？"}],
+    "temperature": 0,
+    "max_completion_tokens": 16,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
 ## 源码编译方式：保留，但不推荐
 
 只在下面几种情况才建议源码编译：

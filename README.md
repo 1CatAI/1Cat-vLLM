@@ -233,6 +233,136 @@ print("vllm", vllm.__version__)
 PY
 ```
 
+## Docker deployment
+
+Docker deployment is now supported for this fork. The recommended container
+path is a runtime image built from the released SM70 wheel, not a full
+source-build image.
+
+### 1. Build the recommended SM70 runtime image
+
+```bash
+docker build \
+  -f docker/Dockerfile.sm70-wheel \
+  -t 1cat-vllm-sm70:0.0.2 \
+  .
+```
+
+The first Docker build will download several gigabytes of PyTorch and CUDA
+runtime layers. The build context for this repository is already trimmed, but
+the Docker image store still lives under the host Docker root directory unless
+you have moved it yourself.
+
+This Dockerfile intentionally uses `python:3.12-slim-trixie`. The current
+SM70 wheel needs `glibc >= 2.38`, and the runtime image also keeps `gcc/g++`
+installed because Triton compiles a small helper module on first startup.
+
+This image is pinned to:
+
+- `Python 3.12`
+- `Debian trixie / glibc 2.41`
+- `torch 2.9.1`
+- `torchvision 0.24.1`
+- `torchaudio 2.9.1`
+- `gcc/g++` for Triton first-run compilation
+- the current `v0.0.2` release wheel
+
+The image entrypoint already includes these public defaults:
+
+- `--skip-mm-profiling`
+- `--limit-mm-per-prompt '{"image":0,"video":0}'`
+- `--attention-backend TRITON_ATTN`
+- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}'`
+
+If you want runtime caches to stay on a large disk, add these options to the
+`docker run` commands below:
+
+- `-v /path/to/1t-cache/hf:/cache/hf -e HF_HOME=/cache/hf`
+- `-v /path/to/1t-cache/triton:/cache/triton -e TRITON_CACHE_DIR=/cache/triton`
+- `-v /path/to/1t-cache/torchinductor:/cache/torchinductor -e TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor`
+- `-v /path/to/1t-cache/tmp:/cache/tmp -e TMPDIR=/cache/tmp`
+
+This runtime path was validated on dual `16 GB` V100 with
+`Qwen3.5-35B-A3B-AWQ`: `/health` returned successfully and the first
+`2+2` request returned `4`.
+
+### 2. Run on dual `16 GB` V100 with `Qwen3.5-27B-AWQ`
+
+```bash
+docker run --rm \
+  --gpus '"device=1,2"' \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-27B-AWQ \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-27B-AWQ \
+  -e VLLM_TENSOR_PARALLEL_SIZE=2 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
+  -e VLLM_MAX_NUM_SEQS=4 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  1cat-vllm-sm70:0.0.2
+```
+
+### 3. Run on dual `16 GB` V100 with `Qwen3.5-35B-A3B-AWQ`
+
+```bash
+docker run --rm \
+  --gpus '"device=1,2"' \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_TENSOR_PARALLEL_SIZE=2 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
+  -e VLLM_MAX_NUM_SEQS=2 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  1cat-vllm-sm70:0.0.2
+```
+
+### 4. Run on four `16 GB` V100 with `Qwen3.5-35B-A3B-AWQ`
+
+```bash
+docker run --rm \
+  --gpus '"device=1,2,3,4"' \
+  --ipc=host \
+  -p 8000:8000 \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-35B-A3B-AWQ \
+  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.90 \
+  -e VLLM_MAX_MODEL_LEN=65536 \
+  -e VLLM_MAX_NUM_SEQS=1 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  1cat-vllm-sm70:0.0.2
+```
+
+### 5. Quick API check
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.5-27B-AWQ",
+    "messages": [{"role": "user", "content": "只回答最终结果：2+2等于几？"}],
+    "temperature": 0,
+    "max_completion_tokens": 16,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+### 6. Container source build
+
+Container source build is still available through the upstream-style
+multi-stage [docker/Dockerfile](/media/test/软件/vllm-0.0.2/vllm/docker/Dockerfile), but
+it is not the recommended first path for public users.
+
+For this fork, the recommended public Docker path is still the released wheel
+image above.
+
 ## Source build
 
 Source build is still supported, but it is **not** the recommended first
