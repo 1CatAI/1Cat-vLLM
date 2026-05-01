@@ -15,7 +15,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 
 | Model | Params | Quant | Architecture | TP | Status |
 |-------|--------|-------|-------------|---:|--------|
-| [demon-zombie/MiniMax-M2.7-AWQ-4bit](https://huggingface.co/demon-zombie/MiniMax-M2.7-AWQ-4bit) | 240B (11B active) | compressed-tensors W4A16 | MoE (256 experts) | 8 | Working |
+| [cyankiwi/MiniMax-M2.7-AWQ-4bit](https://huggingface.co/cyankiwi/MiniMax-M2.7-AWQ-4bit) | 240B (11B active) | compressed-tensors W4A16 | MoE (256 experts) | 8 | Working |
 | [tclf90/Qwen3.5-27B-AWQ](https://huggingface.co/tclf90/Qwen3.5-27B-AWQ) | 27B | AWQ | Dense | 2-4 | Working (1Cat-validated) |
 | [tclf90/Qwen3.5-35B-A3B-AWQ](https://huggingface.co/tclf90/Qwen3.5-35B-A3B-AWQ) | 35B (3B active) | AWQ | MoE | 2-4 | Working (1Cat-validated) |
 | [tclf90/Qwen3.5-122B-A10B-AWQ](https://huggingface.co/tclf90/Qwen3.5-122B-A10B-AWQ) | 122B (10B active) | AWQ | MoE | 4+ | Working (1Cat-validated) |
@@ -44,7 +44,7 @@ docker build -f docker/Dockerfile.sm70-wheel -t vllm-v100:latest .
 ```bash
 docker run --rm --gpus all --ipc=host \
   -v /path/to/models:/models:ro \
-  -e VLLM_MODEL=/models/demon-zombie/MiniMax-M2.7-AWQ-4bit \
+  -e VLLM_MODEL=/models/cyankiwi/MiniMax-M2.7-AWQ-4bit \
   -e VLLM_SERVED_MODEL_NAME=MiniMax-M2.7 \
   -e VLLM_QUANTIZATION=compressed-tensors \
   -e VLLM_DTYPE=float16 \
