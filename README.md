@@ -56,6 +56,35 @@ docker run --rm --gpus all --ipc=host \
   vllm-v100:latest
 ```
 
+### Quick run (Qwen3.6-27B-AWQ-INT4 on 4x V100 32GB)
+
+Hybrid Gated DeltaNet, asymmetric compressed-tensors W4A16. Requires the
+new `TurboMindAsymLinearKernel` for dense Linear (already in this fork).
+`--enforce-eager` is required: V100 hits an upstream `causal_conv1d`
+CUDA-graph capture assertion (vllm-project/vllm#35945) on small batches.
+Tool-calling is enabled with the `qwen3_coder` parser.
+
+```bash
+docker run --rm --gpus '"device=0,1,2,3"' --ipc=host \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/cyankiwi/Qwen3.6-27B-AWQ-INT4 \
+  -e VLLM_SERVED_MODEL_NAME=Qwen3.6-27B-AWQ-INT4 \
+  -e VLLM_QUANTIZATION=compressed-tensors \
+  -e VLLM_DTYPE=float16 \
+  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.85 \
+  -e VLLM_MAX_MODEL_LEN=32768 \
+  -e VLLM_MAX_NUM_SEQS=1 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+  -e VLLM_COMPILATION_CONFIG='{"cudagraph_mode":"NONE"}' \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
+  -p 8000:8000 \
+  vllm-v100:latest \
+  --enforce-eager \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
+```
+
 ### Quick run (Qwen3.5-27B-AWQ on 2x V100)
 
 ```bash
