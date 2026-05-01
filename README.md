@@ -55,7 +55,7 @@ This assumes one of the following is true:
 
 ## What is new in 0.0.3
 
-- A release step forward over `0.0.2` for ##V100-flash-attention##, Qwen3.5/Qwen3.6
+- A release step forward over `0.0.2` for **V100-flash-attention**, Qwen3.5/Qwen3.6
   coverage, and public packaging
 - A **two-wheel** installation path for `Python 3.12 + CUDA 12.8`
   (`flash_attn_v100` plus `vllm`)
