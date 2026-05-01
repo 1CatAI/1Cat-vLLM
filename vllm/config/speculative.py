@@ -37,6 +37,7 @@ MTPModelTypes = Literal[
     "ernie_mtp",
     "exaone_moe_mtp",
     "qwen3_next_mtp",
+    "qwen3_5_mtp",
     "longcat_flash_mtp",
     "mtp",
     "pangu_ultra_moe_mtp",
@@ -107,6 +108,11 @@ class SpeculativeConfig:
     speculative input batches can contain sequences of different lengths,
     which may only be supported by certain attention backends. This currently
     only affects the EAGLE method of speculation."""
+    use_local_argmax_reduction: bool = False
+    """Use vocab-parallel local argmax instead of all-gathering full logits
+    for draft token generation. Reduces communication from O(vocab_size) to
+    O(2 * tp_size) per token. Only applies to greedy draft selection in
+    non-tree speculation."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -254,6 +260,17 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["ExaoneMoeMTP"]}
+            )
+
+        if hf_config.model_type in ("qwen3_5", "qwen3_5_moe"):
+            is_moe = hf_config.model_type == "qwen3_5_moe"
+            hf_config.model_type = "qwen3_5_mtp"
+            n_predict = getattr(hf_config, "mtp_num_hidden_layers", None)
+            hf_config.update(
+                {
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
+                }
             )
 
         if hf_config.model_type == "longcat_flash":

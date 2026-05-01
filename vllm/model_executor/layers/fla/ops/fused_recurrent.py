@@ -8,11 +8,88 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .op import exp
+
+
+def _parse_positive_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _parse_positive_int_list_env(name: str, default: list[int]) -> list[int]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    out: list[int] = []
+    for tok in value.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            parsed = int(tok)
+        except ValueError:
+            continue
+        if parsed > 0:
+            out.append(parsed)
+    return out or default
+
+
+def _round_num_warps(value: int) -> int:
+    if value <= 1:
+        return 1
+    if value <= 2:
+        return 2
+    if value <= 4:
+        return 4
+    return 8
+
+
+_SM70_FLA_BV_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_BV")
+_SM70_FLA_WARPS_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_WARPS")
+_SM70_FLA_STAGES_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_STAGES")
+_SM70_FLA_TARGET_WAVES = _parse_positive_int_env("VLLM_SM70_FLA_TARGET_WAVES") or 2
+_SM70_FLA_BV_CANDIDATES = _parse_positive_int_list_env(
+    "VLLM_SM70_FLA_BV_CANDIDATES", [32, 16, 8]
+)
+
+
+def _select_sm70_bv(V: int, N: int, HV: int, device: torch.device) -> int:
+    v_pow2 = triton.next_power_of_2(V)
+    if _SM70_FLA_BV_OVERRIDE is not None:
+        return min(v_pow2, triton.next_power_of_2(_SM70_FLA_BV_OVERRIDE))
+
+    candidates: list[int] = []
+    for cand in _SM70_FLA_BV_CANDIDATES:
+        cand_pow2 = min(v_pow2, triton.next_power_of_2(cand))
+        if cand_pow2 not in candidates:
+            candidates.append(cand_pow2)
+    candidates.sort(reverse=True)
+    if not candidates:
+        return min(v_pow2, 16)
+
+    if device.type != "cuda":
+        return candidates[-1]
+
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    target_ctas = sm_count * _SM70_FLA_TARGET_WAVES
+    fallback = candidates[-1]
+    for cand in candidates:
+        ctas = triton.cdiv(V, cand) * N * HV
+        if ctas >= target_ctas:
+            return cand
+    return fallback
 
 
 @triton.heuristics(
@@ -192,11 +269,33 @@ def fused_recurrent_gated_delta_rule_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK = triton.next_power_of_2(K)
+    from vllm.model_executor.layers.fla.ops.utils import is_sm70
+    BV = _select_sm70_bv(V, N, HV, q.device) if is_sm70 else min(
+        triton.next_power_of_2(V), 32
+    )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
+
+    if is_sm70:
+        if _SM70_FLA_STAGES_OVERRIDE is not None:
+            num_stages = _SM70_FLA_STAGES_OVERRIDE
+        else:
+            num_stages = 1 if T <= 1 else 2
+    else:
+        num_stages = 3
+
+    if is_sm70 and _SM70_FLA_WARPS_OVERRIDE is not None:
+        num_warps = _round_num_warps(_SM70_FLA_WARPS_OVERRIDE)
+    elif is_sm70:
+        if BV <= 8:
+            num_warps = 2 if N * HV >= 64 else 4
+        elif BV <= 16:
+            num_warps = 4
+        else:
+            num_warps = 8
+    else:
+        num_warps = 1
 
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:

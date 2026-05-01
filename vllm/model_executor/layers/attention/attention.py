@@ -599,7 +599,6 @@ def unified_attention(
 ) -> torch.Tensor:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
-
     return output
 
 
@@ -683,6 +682,7 @@ def unified_attention_with_output(
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
     del kv_cache_dummy_dep
+
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
 
     self.impl.forward(

@@ -14,6 +14,23 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+from .utils import is_sm70
+
+# SM70: reduce autotuner configs to save memory during tuning (27 -> 3)
+_kkt_configs = (
+    [
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=2)
+        for BK in [32, 64]
+        for num_warps in [4]
+    ]
+    if is_sm70
+    else [
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+)
 
 
 @triton.heuristics(
@@ -23,12 +40,7 @@ from .op import exp
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_kkt_configs,
     key=["H", "K", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])

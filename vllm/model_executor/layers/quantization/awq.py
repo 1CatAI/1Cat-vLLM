@@ -71,8 +71,19 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # The AWQ kernel only supports Turing or newer GPUs.
-        return 75
+        # SM70 uses TurboMind s884h kernels; SM75+ uses the native AWQ kernel.
+        return 70
+
+    @staticmethod
+    def _is_sm70_available() -> bool:
+        """Check if current CUDA device is SM70 (V100).
+
+        SM70 needs TurboMind kernels for MoE since Marlin requires SM75+.
+        """
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap[0] == 7 and cap[1] == 0
 
     @staticmethod
     def get_config_filenames() -> list[str]:
@@ -105,9 +116,56 @@ class AWQConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            # SM70 (V100): use TurboMind GEMM kernels for MoE,
+            # since Marlin requires SM75+.
+            if self._is_sm70_available():
+                # SM70 (V100): TurboMind s884h kernels require:
+                #   K % 8 == 0, N % 8 == 0, K % group_size == 0
+                # No requirement on (K/group_size) % 8.
+                moe_cfg = layer.moe_config
+                hidden = moe_cfg.hidden_dim
+                inter = moe_cfg.intermediate_size_per_partition
+                gs = self.group_size
+                sm70_compatible = (
+                    gs in (32, 64, 128)
+                    and hidden % gs == 0
+                    and inter % gs == 0
+                    and hidden % 8 == 0
+                    and inter % 8 == 0
+                )
+                if sm70_compatible:
+                    from .awq_sm70_moe import AWQSM70MoEMethod
+
+                    return AWQSM70MoEMethod(
+                        weight_bits=self.weight_bits,
+                        group_size=self.group_size,
+                        zero_point=self.zero_point,
+                        moe=moe_cfg,
+                    )
+                else:
+                    logger.warning_once(
+                        f"Layer '{prefix}' MoE dimensions incompatible "
+                        "with SM70 TurboMind kernels "
+                        f"(hidden={hidden}, inter={inter}, "
+                        f"group_size={gs}). "
+                        "Falling back to MoeWNA16 kernels."
+                    )
+                    from .moe_wna16 import MoeWNA16Config
+
+                    config = {
+                        "quant_method": "awq",
+                        "bits": self.weight_bits,
+                        "group_size": self.group_size,
+                        "zero_point": self.zero_point,
+                        "lm_head": False,
+                        "modules_to_not_convert": self.modules_to_not_convert,
+                    }
+                    return MoeWNA16Config.from_config(
+                        config
+                    ).get_quant_method(layer, prefix)
+
             # Lazy import to avoid circular import.
             from .awq_marlin import AWQMarlinConfig
-            from .moe_wna16 import MoeWNA16Config
             from .utils.marlin_utils import check_moe_marlin_supports_layer
 
             if not check_moe_marlin_supports_layer(layer, self.group_size):
@@ -252,6 +310,40 @@ class AWQLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
+        # SM70: eagerly prepare TurboMind weights at load time
+        # (not lazily in apply()) so torch.compile can trace the forward.
+        if (
+            layer.qweight.is_cuda
+            and hasattr(torch.ops._C, "awq_sm70_prepare")
+            and self.quant_config.group_size in (32, 64, 128)
+        ):
+            cap = torch.cuda.get_device_capability(layer.qweight.device)
+            if cap[0] == 7 and cap[1] == 0:
+                tm_weight, tm_scales, meta = ops.awq_sm70_prepare(
+                    layer.qweight, layer.scales, layer.qzeros,
+                    self.quant_config.group_size,
+                )
+                layer._awq_sm70_weight = tm_weight
+                layer._awq_sm70_scales = tm_scales
+                layer._awq_sm70_k_ld = int(meta[0])
+                layer._awq_sm70_q_ld = int(meta[1])
+                layer._awq_sm70_prepared = True
+                # Free original AWQ tensors once TM tensors are ready.
+                # This significantly lowers residency for large dense models
+                # (e.g. Qwen3.5-27B) and helps SM70 single-GPU startup.
+                layer.qweight = torch.nn.Parameter(
+                    torch.empty(0, dtype=torch.int32, device=tm_weight.device),
+                    requires_grad=False,
+                )
+                layer.qzeros = torch.nn.Parameter(
+                    torch.empty(0, dtype=torch.int32, device=tm_weight.device),
+                    requires_grad=False,
+                )
+                layer.scales = torch.nn.Parameter(
+                    torch.empty(0, dtype=torch.float16, device=tm_weight.device),
+                    requires_grad=False,
+                )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -262,16 +354,30 @@ class AWQLinearMethod(LinearMethodBase):
         scales = layer.scales
         qzeros = layer.qzeros
         pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+        group_size = self.quant_config.group_size
+        if group_size == -1:
+            group_size = x.shape[-1]
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         # num_tokens >= threshold
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
 
-        if FP16_MATMUL_HEURISTIC_CONDITION:
+        if getattr(layer, "_awq_sm70_prepared", False):
+            out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * 8,)
+            out = ops.awq_gemm_sm70(
+                reshaped_x,
+                layer._awq_sm70_weight,
+                layer._awq_sm70_scales,
+                group_size,
+                layer._awq_sm70_k_ld,
+                layer._awq_sm70_q_ld,
+            )
+        elif FP16_MATMUL_HEURISTIC_CONDITION:
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
             out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
             out = torch.matmul(reshaped_x, out)
         else:
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
             out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
         if bias is not None:
             out.add_(bias)

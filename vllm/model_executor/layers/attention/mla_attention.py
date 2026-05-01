@@ -237,6 +237,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionLayer,
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -1214,6 +1215,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
     # speculative decoding is enabled.
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.SINGLE_ONLY
 
+    # Enable FULL CUDA graph capture for MLA decode (matching FlashMLA,
+    # FlashInfer MLA, etc.). Without this, defaults to NEVER which forces
+    # PIECEWISE mode with ~47 separate graph captures per token.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_BATCH)
+
     # The threshold for reordering the batch into decode and prefill requests.
     # If > 1, the batch will be reordered such that requests with
     # query length <= threshold are classified as decode requests.
@@ -1904,6 +1911,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_cudnn
             self._pad_v = False
+        elif self._need_sdpa_prefill():
+            logger.info_once(
+                "Using SDPA prefill for MLA (SM70 fallback)", scope="local")
+            self._run_prefill_context_chunk = (
+                self._run_prefill_context_chunk_sdpa)
+            self._run_prefill_new_tokens = (
+                self._run_prefill_new_tokens_sdpa)
+            self._pad_v = True
         else:  # Use FlashAttention
             logger.info_once("Using FlashAttention prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
@@ -1935,6 +1950,76 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         self.cp_kv_cache_interleave_size: int = (
             get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+        )
+
+    @staticmethod
+    def _need_sdpa_prefill() -> bool:
+        """Check if SDPA prefill fallback is needed (FA2 unavailable)."""
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap[0] < 8  # FA2 requires SM80+
+
+    def _sdpa_varlen_attention(
+        self, q, k, v, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k, softmax_scale,
+        causal=False, return_softmax_lse=False,
+    ):
+        """SDPA-based varlen attention for SM70 MLA prefill."""
+        maybe_padded_v = v
+        if self._pad_v:
+            maybe_padded_v = torch.nn.functional.pad(
+                v, [0, q.shape[-1] - v.shape[-1]], value=0)
+
+        num_seqs = cu_seqlens_q.shape[0] - 1
+        outputs = []
+        for i in range(num_seqs):
+            q_start = cu_seqlens_q[i]
+            q_end = cu_seqlens_q[i + 1]
+            k_start = cu_seqlens_k[i]
+            k_end = cu_seqlens_k[i + 1]
+            qi = q[q_start:q_end].unsqueeze(0).transpose(1, 2)
+            ki = k[k_start:k_end].unsqueeze(0).transpose(1, 2)
+            vi = maybe_padded_v[k_start:k_end].unsqueeze(0).transpose(1, 2)
+            with torch.nn.attention.sdpa_kernel(
+                torch.nn.attention.SDPBackend.MATH
+            ):
+                oi = torch.nn.functional.scaled_dot_product_attention(
+                    qi, ki, vi, scale=softmax_scale, is_causal=causal)
+            outputs.append(oi.transpose(1, 2).squeeze(0))
+
+        attn_out = torch.cat(outputs, dim=0)
+        if return_softmax_lse:
+            return attn_out, None
+        return attn_out
+
+    def _run_prefill_new_tokens_sdpa(
+        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+    ):
+        return self._sdpa_varlen_attention(
+            q=q, k=k, v=v,
+            cu_seqlens_q=prefill.query_start_loc,
+            cu_seqlens_k=prefill.query_start_loc,
+            max_seqlen_q=prefill.max_query_len,
+            max_seqlen_k=prefill.max_query_len,
+            softmax_scale=self.scale,
+            causal=True,
+            return_softmax_lse=return_softmax_lse,
+        )
+
+    def _run_prefill_context_chunk_sdpa(
+        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
+    ):
+        assert prefill.chunked_context is not None
+        return self._sdpa_varlen_attention(
+            q=q, k=k, v=v,
+            cu_seqlens_q=prefill.query_start_loc,
+            cu_seqlens_k=prefill.chunked_context.cu_seq_lens[chunk_idx],
+            max_seqlen_q=prefill.max_query_len,
+            max_seqlen_k=prefill.chunked_context.max_seq_lens[chunk_idx],
+            softmax_scale=self.scale,
+            causal=False,
+            return_softmax_lse=True,
         )
 
     def _flash_attn_varlen_diff_headdims(

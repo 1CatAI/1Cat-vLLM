@@ -14,14 +14,34 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .utils import check_shared_mem, input_guard
+from .utils import check_shared_mem, input_guard, is_sm70
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+# SM70: reduce autotuner configs to save memory during tuning
+_cumsum_scalar_configs = (
+    [triton.Config({}, num_warps=num_warps) for num_warps in [2, 4]]
+    if is_sm70
+    else [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]]
+)
+_cumsum_vector_configs = (
+    [
+        triton.Config({"BS": BS}, num_warps=num_warps)
+        for BS in BS_LIST
+        for num_warps in [4]
+    ]
+    if is_sm70
+    else [
+        triton.Config({"BS": BS}, num_warps=num_warps)
+        for BS in BS_LIST
+        for num_warps in [2, 4, 8]
+    ]
+)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=_cumsum_scalar_configs,
     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -74,11 +94,7 @@ def chunk_local_cumsum_scalar_kernel(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-    ],
+    configs=_cumsum_vector_configs,
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
 )
 @triton.jit(do_not_specialize=["T"])

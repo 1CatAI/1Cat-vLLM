@@ -1173,6 +1173,7 @@ class FusedMoE(CustomOp):
         if self.quant_method.__class__.__name__ in (
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
+            "CompressedTensorsSM70WNA16MoEMethod",
         ):
             if is_transposed:
                 loaded_weight = loaded_weight.t().contiguous()

@@ -25,6 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -34,6 +35,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2MoeConfig
 
+from vllm import _custom_ops as ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -69,6 +71,61 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+SM70_SHARED_GATE_MAX_M = int(os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64"))
+SM70_GATE_UP_GATED_SILU = (
+    os.getenv("VLLM_SM70_GATE_UP_GATED_SILU", "0") == "1"
+)
+
+
+def _can_use_sm70_shared_gate_fusion(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    expert_gate: torch.nn.Module | None,
+) -> bool:
+    if expert_gate is None or not hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
+        return False
+    if not x.is_cuda or not out.is_cuda or x.dtype != torch.float16:
+        return False
+    weight = getattr(expert_gate, "weight", None)
+    if weight is None or not weight.is_cuda or weight.dtype != torch.float16:
+        return False
+    if weight.dim() != 2 or weight.shape[0] != 1 or weight.shape[1] != x.shape[-1]:
+        return False
+    if x.dim() != 2 or out.dim() != 2 or x.shape[0] > SM70_SHARED_GATE_MAX_M:
+        return False
+    if x.stride(-1) != 1 or out.stride(-1) != 1 or weight.stride(-1) != 1:
+        return False
+    return torch.cuda.get_device_capability(x.device) == (7, 0)
+
+
+def _maybe_sm70_gate_up_silu(
+    gate_up_proj: torch.nn.Module,
+    x: torch.Tensor,
+) -> torch.Tensor | None:
+    if not SM70_GATE_UP_GATED_SILU:
+        return None
+    if not getattr(gate_up_proj, "_sm70_f16_prepared", False):
+        return None
+    tm_weight = getattr(gate_up_proj, "_sm70_f16_gated_tm_weight", None)
+    k_ld = getattr(gate_up_proj, "_sm70_f16_gated_k_ld", None)
+    if tm_weight is None or k_ld is None:
+        return None
+    if not x.is_cuda or x.dtype != torch.float16 or x.dim() != 2:
+        return None
+    if x.shape[0] > SM70_SHARED_GATE_MAX_M:
+        return None
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if torch.cuda.get_device_capability(x.device) != (7, 0):
+        return None
+
+    out = torch.empty(
+        (x.shape[0], tm_weight.shape[0] // 2),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    ops.sm70_f16_gemm_out(out, x, tm_weight, k_ld, True)
+    return out
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -106,12 +163,17 @@ class Qwen2MoeMLP(nn.Module):
         self.expert_gate = expert_gate
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        out = _maybe_sm70_gate_up_silu(self.gate_up_proj, x)
+        if out is None:
+            gate_up, _ = self.gate_up_proj(x)
+            out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            if _can_use_sm70_shared_gate_fusion(x, out, self.expert_gate):
+                ops.sm70_f16_gate_mul_out(out, x, self.expert_gate.weight)
+            else:
+                out = F.sigmoid(self.expert_gate(x)[0]) * out
 
         return out
 

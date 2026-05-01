@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, dataclass, fields, is_dataclass
@@ -1849,6 +1850,31 @@ class EngineArgs:
                 UsageContext.LLM_CLASS: 256,
                 UsageContext.OPENAI_API_SERVER: 256,
             }
+
+        # V100-specific tuned server default: allow larger prompt chunks when
+        # the custom FLASH_ATTN_V100 backend is selected on 32GB SM70 GPUs.
+        # With the direct paged prefill path enabled, keeping long prompts in a
+        # single chunk removes a measurable amount of chunk scheduling overhead.
+        if current_platform.is_cuda_alike():
+            try:
+                cap = current_platform.get_device_capability()
+            except Exception:
+                cap = None
+            if (
+                cap is not None
+                and cap.major == 7
+                and cap.minor == 0
+                and device_memory >= 30 * GiB_bytes
+                and os.getenv("VLLM_ATTENTION_BACKEND") == "FLASH_ATTN_V100"
+            ):
+                default_max_num_batched_tokens[UsageContext.LLM_CLASS] = max(
+                    default_max_num_batched_tokens[UsageContext.LLM_CLASS],
+                    16384,
+                )
+                default_max_num_batched_tokens[UsageContext.OPENAI_API_SERVER] = max(
+                    default_max_num_batched_tokens[UsageContext.OPENAI_API_SERVER],
+                    16384,
+                )
 
         # tpu specific default values.
         if current_platform.is_tpu():

@@ -1,5 +1,6 @@
 
 #include "moe_permute_unpermute_kernel.h"
+#include <cstdlib>
 
 // moe_permute kernels require at least CUDA 12.0
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
@@ -61,6 +62,152 @@ static inline size_t pad_to_multiple_of_16(size_t const& input) {
   static constexpr int ALIGNMENT = 16;
   return ALIGNMENT * ((input + ALIGNMENT - 1) / ALIGNMENT);
 }
+
+namespace {
+
+constexpr int kSingleTokenFastPathMaxTopK = 32;
+
+bool envFlagEnabled(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
+bool singleTokenPermuteFastPathEnabled() {
+  static const bool enabled = []() {
+    if (envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH")) {
+      return true;
+    }
+    const char* raw = std::getenv("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH");
+    return raw != nullptr && std::atoi(raw) != 0;
+  }();
+  return enabled;
+}
+
+bool singleTokenUnpermuteFastPathEnabled() {
+  static const bool enabled = []() {
+    if (envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH")) {
+      return true;
+    }
+    const char* raw = std::getenv("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH");
+    return raw != nullptr && std::atoi(raw) != 0;
+  }();
+  return enabled;
+}
+
+template <typename T>
+__global__ void singleTokenMoePermuteKernel(
+    T const* input, int const* topk_ids, T* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int* m_indices, int num_experts, int topk,
+    int64_t cols) {
+  __shared__ int sorted_ids[kSingleTokenFastPathMaxTopK];
+  __shared__ int sorted_src[kSingleTokenFastPathMaxTopK];
+
+  if (threadIdx.x < topk) {
+    sorted_ids[threadIdx.x] = __ldg(topk_ids + threadIdx.x);
+    sorted_src[threadIdx.x] = threadIdx.x;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    for (int i = 1; i < topk; ++i) {
+      int expert_id = sorted_ids[i];
+      int src_idx = sorted_src[i];
+      int j = i - 1;
+      while (j >= 0 && sorted_ids[j] > expert_id) {
+        sorted_ids[j + 1] = sorted_ids[j];
+        sorted_src[j + 1] = sorted_src[j];
+        --j;
+      }
+      sorted_ids[j + 1] = expert_id;
+      sorted_src[j + 1] = src_idx;
+    }
+
+    int cursor = 0;
+    for (int expert = 0; expert < num_experts; ++expert) {
+      expert_first_token_offset[expert] = cursor;
+      while (cursor < topk && sorted_ids[cursor] == expert) {
+        ++cursor;
+      }
+    }
+    expert_first_token_offset[num_experts] = cursor;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < topk) {
+    int const sorted_pos = threadIdx.x;
+    int const src_idx = sorted_src[sorted_pos];
+    inv_permuted_idx[src_idx] = sorted_pos;
+    permuted_idx[sorted_pos] = src_idx;
+    m_indices[sorted_pos] = sorted_ids[sorted_pos];
+  }
+
+  constexpr int64_t ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<T>::value;
+  using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+
+  auto const* source_row_ptr = reinterpret_cast<DataElem const*>(input);
+  auto* dest_row_ptr = reinterpret_cast<DataElem*>(permuted_output);
+  int64_t const num_elems_in_col = cols / ELEM_PER_THREAD;
+  int64_t const total_elems = num_elems_in_col * topk;
+
+  for (int64_t elem_index = threadIdx.x; elem_index < total_elems;
+       elem_index += blockDim.x) {
+    int64_t const row = elem_index / num_elems_in_col;
+    int64_t const col = elem_index - row * num_elems_in_col;
+    dest_row_ptr[row * num_elems_in_col + col] = source_row_ptr[col];
+  }
+}
+
+template <typename T>
+__global__ void singleTokenMoeUnpermuteKernel(
+    T const* expanded_permuted_rows, T* reduced_unpermuted_output,
+    float const* scales, int const* expanded_source_row_to_expanded_dest_row,
+    int64_t cols, int64_t topk) {
+  __shared__ int inv_perm[kSingleTokenFastPathMaxTopK];
+  __shared__ float route_scale[kSingleTokenFastPathMaxTopK];
+
+  if (threadIdx.x < topk) {
+    inv_perm[threadIdx.x] =
+        __ldg(expanded_source_row_to_expanded_dest_row + threadIdx.x);
+    route_scale[threadIdx.x] = __ldg(scales + threadIdx.x);
+  }
+  __syncthreads();
+
+  constexpr int64_t FINALIZE_ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<T>::value;
+  using InputElem = cutlass::Array<T, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<T, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+
+  auto const* expanded_rows_v =
+      reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+  auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_unpermuted_output);
+  int64_t const num_elems_in_col = cols / FINALIZE_ELEM_PER_THREAD;
+
+  for (int64_t elem_index = threadIdx.x; elem_index < num_elems_in_col;
+       elem_index += blockDim.x) {
+    ComputeElem thread_output;
+    thread_output.fill(0);
+
+#pragma unroll
+    for (int k_idx = 0; k_idx < kSingleTokenFastPathMaxTopK; ++k_idx) {
+      if (k_idx >= topk) {
+        break;
+      }
+      int const expanded_row = inv_perm[k_idx];
+      auto const* expanded_row_ptr =
+          expanded_rows_v + expanded_row * num_elems_in_col;
+      ComputeElem expert_result =
+          arrayConvert<InputElem, ComputeElem>(expanded_row_ptr[elem_index]);
+      thread_output = thread_output + route_scale[k_idx] * expert_result;
+    }
+
+    reduced_row_ptr_v[elem_index] = arrayConvert<ComputeElem, OutputElem>(
+        thread_output);
+  }
+}
+
+}  // namespace
+
 template <class T>
 __device__ inline int64_t findTotalEltsLessThanTarget(T const* sorted_indices,
                                                       int64_t const arr_length,
@@ -227,5 +374,83 @@ void getMIndices(int64_t* expert_first_token_offset,
         num_local_expert, align_block_size);
   }
 }
+
+bool canUseSingleTokenMoePermuteFastPath(
+    int64_t n_token, int64_t topk, bool has_expert_map,
+    const std::optional<int64_t>& align_block_size, int64_t n_expert,
+    int64_t n_local_expert) {
+  if (!singleTokenPermuteFastPathEnabled()) {
+    return false;
+  }
+  if (n_token != 1 || topk <= 0 || topk > kSingleTokenFastPathMaxTopK) {
+    return false;
+  }
+  if (has_expert_map || align_block_size.has_value()) {
+    return false;
+  }
+  return n_expert > 0 && n_expert == n_local_expert;
+}
+
+template <typename T>
+void singleTokenMoePermuteLauncher(
+    T const* input, int const* topk_ids, T* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int* m_indices, int num_experts, int topk,
+    int64_t cols, cudaStream_t stream) {
+  constexpr int threads = 256;
+  singleTokenMoePermuteKernel<T><<<1, threads, 0, stream>>>(
+      input, topk_ids, permuted_output, expert_first_token_offset,
+      inv_permuted_idx, permuted_idx, m_indices, num_experts, topk, cols);
+}
+
+bool canUseSingleTokenMoeUnpermuteFastPath(int64_t n_token, int64_t topk) {
+  return singleTokenUnpermuteFastPathEnabled() && n_token == 1 && topk > 0 &&
+         topk <= kSingleTokenFastPathMaxTopK;
+}
+
+template <typename T>
+void singleTokenMoeUnpermuteLauncher(
+    T const* expanded_permuted_rows, T* reduced_unpermuted_output,
+    float const* scales, int const* expanded_source_row_to_expanded_dest_row,
+    int64_t cols, int64_t topk, cudaStream_t stream) {
+  constexpr int threads = 256;
+  singleTokenMoeUnpermuteKernel<T><<<1, threads, 0, stream>>>(
+      expanded_permuted_rows, reduced_unpermuted_output, scales,
+      expanded_source_row_to_expanded_dest_row, cols, topk);
+}
+
+template void singleTokenMoePermuteLauncher<half>(
+    half const* input, int const* topk_ids, half* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int* m_indices, int num_experts, int topk,
+    int64_t cols, cudaStream_t stream);
+
+template void singleTokenMoePermuteLauncher<float>(
+    float const* input, int const* topk_ids, float* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int* m_indices, int num_experts, int topk,
+    int64_t cols, cudaStream_t stream);
+
+template void singleTokenMoePermuteLauncher<__nv_bfloat16>(
+    __nv_bfloat16 const* input, int const* topk_ids,
+    __nv_bfloat16* permuted_output, int64_t* expert_first_token_offset,
+    int* inv_permuted_idx, int* permuted_idx, int* m_indices, int num_experts,
+    int topk, int64_t cols, cudaStream_t stream);
+
+template void singleTokenMoeUnpermuteLauncher<half>(
+    half const* expanded_permuted_rows, half* reduced_unpermuted_output,
+    float const* scales, int const* expanded_source_row_to_expanded_dest_row,
+    int64_t cols, int64_t topk, cudaStream_t stream);
+
+template void singleTokenMoeUnpermuteLauncher<float>(
+    float const* expanded_permuted_rows, float* reduced_unpermuted_output,
+    float const* scales, int const* expanded_source_row_to_expanded_dest_row,
+    int64_t cols, int64_t topk, cudaStream_t stream);
+
+template void singleTokenMoeUnpermuteLauncher<__nv_bfloat16>(
+    __nv_bfloat16 const* expanded_permuted_rows,
+    __nv_bfloat16* reduced_unpermuted_output, float const* scales,
+    int const* expanded_source_row_to_expanded_dest_row, int64_t cols,
+    int64_t topk, cudaStream_t stream);
 
 #endif

@@ -352,6 +352,50 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
 
+  # TurboMind SM70 AWQ GEMM integration (V100)
+  set(VLLM_TURBOMIND_INCLUDE_DIRS "")
+  set(LMDEPLOY_ROOT "${CMAKE_CURRENT_LIST_DIR}/lmdeploy")
+  if (NOT EXISTS "${LMDEPLOY_ROOT}/src/turbomind")
+    set(LMDEPLOY_ROOT "${CMAKE_CURRENT_LIST_DIR}/../lmdeploy")
+  endif()
+  if (EXISTS "${LMDEPLOY_ROOT}/src/turbomind")
+    cuda_archs_loose_intersection(AWQ_SM70_ARCHS "7.0" "${CUDA_ARCHS}")
+    if (AWQ_SM70_ARCHS)
+      set(VLLM_TURBOMIND_INCLUDE_DIRS "${LMDEPLOY_ROOT}")
+      set(AWQ_SM70_TURBOMIND_SRCS
+        "${LMDEPLOY_ROOT}/src/turbomind/core/check.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/core/layout.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/core/context.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/core/allocator.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/core/buffer.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/core/stream.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/utils/logger.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/utils/parser.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/gemm.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/dispatch_cache.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/context.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/convert_v3.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/cast.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/unpack.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/cache_utils.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/measurer.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/sampler.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/stopping_criterion.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/params.cc"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
+        "csrc/quantization/awq/tm_registry_sm70.cu"
+        "csrc/quantization/awq/awq_sm70_gemm.cu")
+
+      set_gencode_flags_for_srcs(
+        SRCS "${AWQ_SM70_TURBOMIND_SRCS}"
+        CUDA_ARCHS "${AWQ_SM70_ARCHS}")
+      list(APPEND VLLM_EXT_SRC "${AWQ_SM70_TURBOMIND_SRCS}")
+      message(STATUS "Building TurboMind SM70 AWQ kernels from ${LMDEPLOY_ROOT}")
+    endif()
+  endif()
+
   # Only build Marlin kernels if we are building for at least some compatible archs.
   # Keep building Marlin for 9.0 as there are some group sizes and shapes that
   # are not supported by Machete yet.
@@ -931,6 +975,7 @@ define_extension_target(
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+  INCLUDE_DIRECTORIES ${VLLM_TURBOMIND_INCLUDE_DIRS}
   USE_SABI 3
   WITH_SOABI)
 

@@ -73,6 +73,12 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
             ]
+        elif device_capability.major == 7:
+            # SM70 (V100): Use Flash Attention V100 with Tensor Core acceleration
+            return [
+                AttentionBackendEnum.FLASH_ATTN_V100,
+                AttentionBackendEnum.TRITON_ATTN,
+            ]
         else:
             return [
                 AttentionBackendEnum.FLASH_ATTN,

@@ -8,15 +8,56 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
-from .utils import use_cuda_graph
+from .utils import is_sm70, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
+
+def _parse_sm70_int_list(env_name: str, default_vals: list[int]) -> list[int]:
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default_vals
+    out: list[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            val = int(tok)
+        except ValueError:
+            continue
+        if val > 0:
+            out.append(val)
+    return out or default_vals
+
+
+# SM70: keep default config compact, but expose env-driven tuning.
+_sm70_delta_h_bv = _parse_sm70_int_list("VLLM_SM70_GDN_DELTA_H_BV", [16, 32, 64])
+_sm70_delta_h_warps = _parse_sm70_int_list("VLLM_SM70_GDN_DELTA_H_WARPS", [4, 8])
+_sm70_delta_h_stages = _parse_sm70_int_list("VLLM_SM70_GDN_DELTA_H_STAGES", [1, 2])
+
+_delta_h_configs = (
+    [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in _sm70_delta_h_bv
+        for num_warps in _sm70_delta_h_warps
+        for num_stages in _sm70_delta_h_stages
+    ]
+    if is_sm70
+    else [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [2, 3, 4]
+        for BV in [32, 64]
+    ]
+)
 
 
 @triton.heuristics(
@@ -30,12 +71,7 @@ NUM_WARPS = [2, 4, 8, 16]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ],
+    configs=_delta_h_configs,
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )

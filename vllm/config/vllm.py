@@ -24,6 +24,7 @@ from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.utils.math_utils import round_up
 
 from .attention import AttentionConfig
 from .cache import CacheConfig
@@ -1110,12 +1111,16 @@ class VllmConfig:
         self._post_init_kv_transfer_config()
 
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
-        # remove the sizes that not multiple of tp_size when
-        # enable sequence parallelism
+        # Sequence parallelism requires the effective batch size to be divisible
+        # by TP size. Round requested capture sizes up to the nearest valid
+        # multiple instead of silently dropping all small user-provided sizes
+        # such as [1, 2] for TP=4.
+        tp_size = self.parallel_config.tensor_parallel_size
+        max_num_tokens = self.scheduler_config.max_num_batched_tokens
         removed_sizes = [
             size
             for size in possible_sizes
-            if size % self.parallel_config.tensor_parallel_size != 0
+            if size % tp_size != 0
         ]
         if removed_sizes:
             logger.warning(
@@ -1123,14 +1128,30 @@ class VllmConfig:
                 "multiple of tp_size %d when "
                 "sequence parallelism is enabled",
                 removed_sizes,
-                self.parallel_config.tensor_parallel_size,
+                tp_size,
             )
-
-        return [
-            size
-            for size in possible_sizes
-            if size % self.parallel_config.tensor_parallel_size == 0
+        valid_sizes = [
+            size for size in possible_sizes if size % tp_size == 0
         ]
+        if valid_sizes:
+            return valid_sizes
+
+        rounded_sizes = sorted(
+            set(
+                round_up(size, tp_size)
+                for size in possible_sizes
+                if round_up(size, tp_size) <= max_num_tokens
+            )
+        )
+        if rounded_sizes:
+            logger.warning(
+                "Rounded cudagraph capture sizes %s up to TP-aligned sizes %s "
+                "for sequence parallelism (tp_size=%d).",
+                possible_sizes,
+                rounded_sizes,
+                tp_size,
+            )
+        return rounded_sizes
 
     def _set_cudagraph_sizes(self):
         """
@@ -1213,19 +1234,56 @@ class VllmConfig:
                 # sort to make sure the sizes are in ascending order
                 cudagraph_capture_sizes.sort()
             else:
-                cudagraph_capture_sizes = [
-                    i for i in [1, 2, 4] if i <= max_cudagraph_capture_size
-                ]
-                if max_cudagraph_capture_size >= 8:
-                    # Step size 8 for small batch sizes, up to 256(not included)
-                    cudagraph_capture_sizes += list(
-                        range(8, min(max_cudagraph_capture_size + 1, 256), 8)
+                # Optional SM70 tuning for decode-heavy serving:
+                # capture denser small-batch sizes to improve cudagraph hit rate
+                # under dynamic concurrency (e.g., 10-way decode).
+                use_dense_sm70_cudagraph = False
+                env_dense_sm70 = os.getenv("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE")
+                if env_dense_sm70 is not None:
+                    use_dense_sm70_cudagraph = env_dense_sm70.strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
                     )
-                if max_cudagraph_capture_size >= 256:
-                    # Step size 16 for larger batch sizes
-                    cudagraph_capture_sizes += list(
-                        range(256, max_cudagraph_capture_size + 1, 16)
+
+                if use_dense_sm70_cudagraph:
+                    from vllm.platforms import current_platform
+
+                    cap = current_platform.get_device_capability()
+                    use_dense_sm70_cudagraph = (
+                        cap is not None and cap.major == 7
                     )
+
+                if use_dense_sm70_cudagraph:
+                    dense_small_cap = min(max_cudagraph_capture_size, 64)
+                    cudagraph_capture_sizes = list(range(1, dense_small_cap + 1))
+                    if max_cudagraph_capture_size >= 72:
+                        cudagraph_capture_sizes += list(
+                            range(
+                                72,
+                                min(max_cudagraph_capture_size + 1, 256),
+                                8,
+                            )
+                        )
+                    if max_cudagraph_capture_size >= 256:
+                        cudagraph_capture_sizes += list(
+                            range(256, max_cudagraph_capture_size + 1, 16)
+                        )
+                else:
+                    cudagraph_capture_sizes = [
+                        i for i in [1, 2, 4] if i <= max_cudagraph_capture_size
+                    ]
+                    if max_cudagraph_capture_size >= 8:
+                        # Step size 8 for small batch sizes, up to 256(not included)
+                        cudagraph_capture_sizes += list(
+                            range(8, min(max_cudagraph_capture_size + 1, 256), 8)
+                        )
+                    if max_cudagraph_capture_size >= 256:
+                        # Step size 16 for larger batch sizes
+                        cudagraph_capture_sizes += list(
+                            range(256, max_cudagraph_capture_size + 1, 16)
+                        )
 
             if (
                 self.parallel_config.tensor_parallel_size > 1

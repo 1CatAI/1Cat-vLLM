@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <torch/library.h>
 #include <tuple>
 
@@ -196,6 +197,113 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
                              torch::Tensor _scaling_factors,
                              torch::Tensor _zeros, int64_t split_k_iters,
                              int64_t thx, int64_t thy);
+
+std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
+                                            torch::Tensor _scaling_factors,
+                                            torch::Tensor _zeros,
+                                            int64_t group_size,
+                                            bool interleave_gated_silu);
+
+std::vector<torch::Tensor> sm70_f16_prepare(torch::Tensor _kernel);
+
+torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats,
+                            torch::Tensor _kernel,
+                            torch::Tensor _scaling_factors,
+                            int64_t group_size,
+                            int64_t k_ld,
+                            int64_t q_ld);
+
+torch::Tensor sm70_f16_gemm(torch::Tensor _in_feats, torch::Tensor _kernel);
+
+void awq_gemm_sm70_out(torch::Tensor out,
+                       torch::Tensor _in_feats,
+                       torch::Tensor _kernel,
+                       torch::Tensor _scaling_factors,
+                       int64_t group_size,
+                       int64_t k_ld,
+                       int64_t q_ld,
+                       bool gated_silu);
+
+void sm70_f16_gemm_out(torch::Tensor out,
+                       torch::Tensor _in_feats,
+                       torch::Tensor _kernel,
+                       int64_t k_ld,
+                       bool gated_silu);
+
+void sm70_f16_gate_mul_out(torch::Tensor out,
+                           torch::Tensor _in_feats,
+                           torch::Tensor _gate_weight);
+
+int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
+                               const std::string& path);
+
+int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
+                               const std::string& path);
+
+std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
+    torch::Tensor tm_weights,
+    torch::Tensor tm_scales,
+    int64_t k_ld,
+    int64_t q_ld,
+    int64_t num_experts);
+
+void awq_moe_single_token_compact_prepare(
+    torch::Tensor topk_ids,
+    torch::Tensor src_w13_ptrs_w_rows,
+    torch::Tensor src_w13_ptrs_s_rows,
+    torch::Tensor src_w2_ptrs_w_rows,
+    torch::Tensor src_w2_ptrs_s_rows,
+    torch::Tensor dst_w13_ptrs_w_rows,
+    torch::Tensor dst_w13_ptrs_s_rows,
+    torch::Tensor dst_w2_ptrs_w_rows,
+    torch::Tensor dst_w2_ptrs_s_rows,
+    torch::Tensor inv_permuted_idx);
+
+void awq_moe_single_token_sm70_out(
+    torch::Tensor out,
+    torch::Tensor x,
+    torch::Tensor topk_weights,
+    torch::Tensor topk_ids,
+    torch::Tensor src_w13_ptrs_w_rows,
+    torch::Tensor src_w13_ptrs_s_rows,
+    torch::Tensor src_w2_ptrs_w_rows,
+    torch::Tensor src_w2_ptrs_s_rows,
+    torch::Tensor compact_input,
+    torch::Tensor intermediate,
+    torch::Tensor sorted_output,
+    torch::Tensor dst_w13_ptrs_w_rows,
+    torch::Tensor dst_w13_ptrs_s_rows,
+    torch::Tensor dst_w2_ptrs_w_rows,
+    torch::Tensor dst_w2_ptrs_s_rows,
+    torch::Tensor expert_offsets,
+    torch::Tensor inv_permuted_idx,
+    int64_t w13_k,
+    int64_t w13_n,
+    int64_t w2_k,
+    int64_t w2_n,
+    int64_t group_size,
+    int64_t hidden_logical_size);
+
+torch::Tensor awq_moe_gemm_sm70(
+    torch::Tensor sorted_input,
+    torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w,
+    torch::Tensor strided_ptrs_s,
+    int64_t num_experts,
+    int64_t k,
+    int64_t n,
+    int64_t group_size);
+
+void awq_moe_gemm_sm70_out(torch::Tensor out,
+                           torch::Tensor sorted_input,
+                           torch::Tensor expert_offsets,
+                           torch::Tensor strided_ptrs_w,
+                           torch::Tensor strided_ptrs_s,
+                           int64_t num_experts,
+                           int64_t k,
+                           int64_t n,
+                           int64_t group_size,
+                           bool gated_silu);
 
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 #endif

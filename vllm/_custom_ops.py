@@ -548,6 +548,417 @@ if hasattr(torch.ops._C, "awq_gemm"):
         ).sum(0)
 
 
+def awq_sm70_prepare(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    interleave_gated_silu: bool = False,
+) -> list[torch.Tensor]:
+    return torch.ops._C.awq_sm70_prepare(
+        qweight, scales, qzeros, group_size, interleave_gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "awq_sm70_prepare"):
+
+    @register_fake("_C::awq_sm70_prepare")
+    def _awq_sm70_prepare_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor,
+        group_size: int,
+        interleave_gated_silu: bool,
+    ) -> list[torch.Tensor]:
+        n = qweight.size(1) * 8
+        num_groups = scales.size(0)
+        tm_weight = torch.empty_like(qweight)  # int32
+        tm_scales = torch.empty(
+            (num_groups, n),
+            dtype=torch.int32,
+            device=qweight.device,
+        )
+        meta = torch.empty((2,), dtype=torch.int64)
+        return [tm_weight, tm_scales, meta]
+
+
+def sm70_f16_prepare(weight: torch.Tensor) -> list[torch.Tensor]:
+    return torch.ops._C.sm70_f16_prepare(weight)
+
+
+if hasattr(torch.ops._C, "sm70_f16_prepare"):
+
+    @register_fake("_C::sm70_f16_prepare")
+    def _sm70_f16_prepare_fake(weight: torch.Tensor) -> list[torch.Tensor]:
+        meta = torch.empty((1,), dtype=torch.int64)
+        return [torch.empty_like(weight), meta]
+
+
+def awq_gemm_sm70(
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+) -> torch.Tensor:
+    return torch.ops._C.awq_gemm_sm70(
+        input, qweight, scales, group_size, k_ld, q_ld
+    )
+
+
+def awq_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.awq_gemm_sm70_out(
+        out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu
+    )
+
+
+def sm70_f16_gemm(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.ops._C.sm70_f16_gemm(input, weight)
+
+
+def sm70_f16_gemm_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    k_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.sm70_f16_gemm_out(out, input, weight, k_ld, gated_silu)
+
+
+def sm70_f16_gate_mul_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> None:
+    torch.ops._C.sm70_f16_gate_mul_out(out, input, gate_weight)
+
+
+def sm70_gemm_import_cache(device_hint: torch.Tensor, path: str) -> int:
+    return torch.ops._C.sm70_gemm_import_cache(device_hint, path)
+
+
+def sm70_gemm_export_cache(device_hint: torch.Tensor, path: str) -> int:
+    return torch.ops._C.sm70_gemm_export_cache(device_hint, path)
+
+
+if hasattr(torch.ops._C, "awq_gemm_sm70"):
+
+    @register_fake("_C::awq_gemm_sm70")
+    def _awq_gemm_sm70_fake(
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ) -> torch.Tensor:
+        num_in_feats = input.size(0)
+        return torch.empty(
+            (num_in_feats, qweight.size(1) * 8),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+
+if hasattr(torch.ops._C, "sm70_f16_gemm"):
+
+    @register_fake("_C::sm70_f16_gemm")
+    def _sm70_f16_gemm_fake(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        num_in_feats = input.size(0)
+        out_dim = weight.size(0)
+        return torch.empty(
+            (num_in_feats, out_dim),
+            dtype=input.dtype,
+            device=input.device,
+        )
+
+
+if hasattr(torch.ops._C, "awq_gemm_sm70_out"):
+
+    @register_fake("_C::awq_gemm_sm70_out")
+    def _awq_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_f16_gemm_out"):
+
+    @register_fake("_C::sm70_f16_gemm_out")
+    def _sm70_f16_gemm_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        k_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
+
+    @register_fake("_C::sm70_f16_gate_mul_out")
+    def _sm70_f16_gate_mul_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        gate_weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def awq_moe_build_strided_ptrs(
+    tm_weights: torch.Tensor,
+    tm_scales: torch.Tensor,
+    k_ld: int,
+    q_ld: int,
+    num_experts: int,
+) -> list[torch.Tensor]:
+    return torch.ops._C.awq_moe_build_strided_ptrs(
+        tm_weights, tm_scales, k_ld, q_ld, num_experts
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_build_strided_ptrs"):
+
+    @register_fake("_C::awq_moe_build_strided_ptrs")
+    def _awq_moe_build_strided_ptrs_fake(
+        tm_weights: torch.Tensor,
+        tm_scales: torch.Tensor,
+        k_ld: int,
+        q_ld: int,
+        num_experts: int,
+    ) -> list[torch.Tensor]:
+        buf = num_experts * 16
+        opts = dict(dtype=torch.uint8, device=tm_weights.device)
+        return [torch.empty(buf, **opts), torch.empty(buf, **opts)]
+
+
+def awq_moe_single_token_compact_prepare(
+    topk_ids: torch.Tensor,
+    src_w13_ptrs_w_rows: torch.Tensor,
+    src_w13_ptrs_s_rows: torch.Tensor,
+    src_w2_ptrs_w_rows: torch.Tensor,
+    src_w2_ptrs_s_rows: torch.Tensor,
+    dst_w13_ptrs_w_rows: torch.Tensor,
+    dst_w13_ptrs_s_rows: torch.Tensor,
+    dst_w2_ptrs_w_rows: torch.Tensor,
+    dst_w2_ptrs_s_rows: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+) -> None:
+    torch.ops._C.awq_moe_single_token_compact_prepare(
+        topk_ids,
+        src_w13_ptrs_w_rows,
+        src_w13_ptrs_s_rows,
+        src_w2_ptrs_w_rows,
+        src_w2_ptrs_s_rows,
+        dst_w13_ptrs_w_rows,
+        dst_w13_ptrs_s_rows,
+        dst_w2_ptrs_w_rows,
+        dst_w2_ptrs_s_rows,
+        inv_permuted_idx,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_single_token_compact_prepare"):
+
+    @register_fake("_C::awq_moe_single_token_compact_prepare")
+    def _awq_moe_single_token_compact_prepare_fake(
+        topk_ids: torch.Tensor,
+        src_w13_ptrs_w_rows: torch.Tensor,
+        src_w13_ptrs_s_rows: torch.Tensor,
+        src_w2_ptrs_w_rows: torch.Tensor,
+        src_w2_ptrs_s_rows: torch.Tensor,
+        dst_w13_ptrs_w_rows: torch.Tensor,
+        dst_w13_ptrs_s_rows: torch.Tensor,
+        dst_w2_ptrs_w_rows: torch.Tensor,
+        dst_w2_ptrs_s_rows: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def awq_moe_single_token_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    src_w13_ptrs_w_rows: torch.Tensor,
+    src_w13_ptrs_s_rows: torch.Tensor,
+    src_w2_ptrs_w_rows: torch.Tensor,
+    src_w2_ptrs_s_rows: torch.Tensor,
+    compact_input: torch.Tensor,
+    intermediate: torch.Tensor,
+    sorted_output: torch.Tensor,
+    dst_w13_ptrs_w_rows: torch.Tensor,
+    dst_w13_ptrs_s_rows: torch.Tensor,
+    dst_w2_ptrs_w_rows: torch.Tensor,
+    dst_w2_ptrs_s_rows: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    w13_k: int,
+    w13_n: int,
+    w2_k: int,
+    w2_n: int,
+    group_size: int,
+    hidden_logical_size: int,
+) -> None:
+    torch.ops._C.awq_moe_single_token_sm70_out(
+        out,
+        x,
+        topk_weights,
+        topk_ids,
+        src_w13_ptrs_w_rows,
+        src_w13_ptrs_s_rows,
+        src_w2_ptrs_w_rows,
+        src_w2_ptrs_s_rows,
+        compact_input,
+        intermediate,
+        sorted_output,
+        dst_w13_ptrs_w_rows,
+        dst_w13_ptrs_s_rows,
+        dst_w2_ptrs_w_rows,
+        dst_w2_ptrs_s_rows,
+        expert_offsets,
+        inv_permuted_idx,
+        w13_k,
+        w13_n,
+        w2_k,
+        w2_n,
+        group_size,
+        hidden_logical_size,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_single_token_sm70_out"):
+
+    @register_fake("_C::awq_moe_single_token_sm70_out")
+    def _awq_moe_single_token_sm70_out_fake(
+        out: torch.Tensor,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        src_w13_ptrs_w_rows: torch.Tensor,
+        src_w13_ptrs_s_rows: torch.Tensor,
+        src_w2_ptrs_w_rows: torch.Tensor,
+        src_w2_ptrs_s_rows: torch.Tensor,
+        compact_input: torch.Tensor,
+        intermediate: torch.Tensor,
+        sorted_output: torch.Tensor,
+        dst_w13_ptrs_w_rows: torch.Tensor,
+        dst_w13_ptrs_s_rows: torch.Tensor,
+        dst_w2_ptrs_w_rows: torch.Tensor,
+        dst_w2_ptrs_s_rows: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        w13_k: int,
+        w13_n: int,
+        w2_k: int,
+        w2_n: int,
+        group_size: int,
+        hidden_logical_size: int,
+    ) -> None:
+        return None
+
+
+def awq_moe_gemm_sm70(
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    strided_ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.ops._C.awq_moe_gemm_sm70(
+        sorted_input, expert_offsets, strided_ptrs_w, strided_ptrs_s,
+        num_experts, k, n, group_size,
+    )
+
+
+def awq_moe_gemm_sm70_out(
+    out: torch.Tensor,
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    strided_ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.awq_moe_gemm_sm70_out(
+        out,
+        sorted_input,
+        expert_offsets,
+        strided_ptrs_w,
+        strided_ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_gemm_sm70"):
+
+    @register_fake("_C::awq_moe_gemm_sm70")
+    def _awq_moe_gemm_sm70_fake(
+        sorted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        strided_ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (sorted_input.size(0), n),
+            dtype=sorted_input.dtype,
+            device=sorted_input.device,
+        )
+
+
+if hasattr(torch.ops._C, "awq_moe_gemm_sm70_out"):
+
+    @register_fake("_C::awq_moe_gemm_sm70_out")
+    def _awq_moe_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        sorted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        strided_ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
 # gptq
 def gptq_gemm(
     a: torch.Tensor,

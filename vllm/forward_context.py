@@ -286,16 +286,20 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
 ):
+    additional_kwargs = additional_kwargs or {}
+
     if vllm_config.compilation_config.fast_moe_cold_start:
-        if vllm_config.speculative_config is None:
+        if "spec_decode_moe_layers" in additional_kwargs:
+            # Spec decode draft paths can provide their own per-model MoE layer
+            # order to safely enable fast MoE cold start.
+            all_moe_layers = additional_kwargs["spec_decode_moe_layers"]
+        elif vllm_config.speculative_config is None:
             all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
         else:
-            logger.warning_once(
-                "vllm_config.compilation_config.fast_moe_cold_start is not "
-                "compatible with speculative decoding so we are ignoring "
-                "fast_moe_cold_start."
-            )
-            all_moe_layers = None
+            # For target model paths under speculative decoding, we can still
+            # use the static layer order. Draft model paths should pass an
+            # explicit override via `spec_decode_moe_layers`.
+            all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
     else:
         all_moe_layers = None
 
@@ -310,7 +314,7 @@ def create_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
         skip_compiled=skip_compiled,
-        additional_kwargs=additional_kwargs or {},
+        additional_kwargs=additional_kwargs,
     )
 
 
@@ -341,6 +345,7 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    additional_kwargs: dict[str, Any] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -380,7 +385,7 @@ def set_forward_context(
     if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
         batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
-    additional_kwargs = current_platform.set_additional_forward_context(
+    platform_additional_kwargs = current_platform.set_additional_forward_context(
         attn_metadata=attn_metadata,
         vllm_config=vllm_config,
         virtual_engine=virtual_engine,
@@ -391,6 +396,8 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    merged_additional_kwargs = dict(additional_kwargs or {})
+    merged_additional_kwargs.update(platform_additional_kwargs)
 
     forward_context = create_forward_context(
         attn_metadata,
@@ -401,7 +408,7 @@ def set_forward_context(
         batch_descriptor,
         ubatch_slices,
         slot_mapping,
-        additional_kwargs,
+        merged_additional_kwargs,
         skip_compiled,
     )
 

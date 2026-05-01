@@ -7,6 +7,8 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -73,6 +75,8 @@ def kernel_unified_attention_2d(
     softcap,  # float32
     num_query_heads: tl.constexpr,  # int
     num_queries_per_kv: tl.constexpr,  # int
+    num_queries_per_kv_group: tl.constexpr,  # int
+    HEAD_GROUPS: tl.constexpr,  # int
     block_table_stride: tl.int64,  # int
     query_stride_0: tl.int64,  # int
     query_stride_1: tl.int64,  # int, should be equal to head_size
@@ -110,6 +114,11 @@ def kernel_unified_attention_2d(
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
+    head_group_idx = tl.program_id(2)
+
+    group_head_start = head_group_idx * num_queries_per_kv_group
+    if group_head_start >= num_queries_per_kv:
+        return
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -130,10 +139,14 @@ def kernel_unified_attention_2d(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv_group
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
-    query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
+    query_offset_1 = (
+        kv_head_idx * num_queries_per_kv
+        + group_head_start
+        + offs_m % num_queries_per_kv_group
+    )
     query_offset = (
         query_offset_0[:, None] * query_stride_0
         + query_offset_1[:, None] * query_stride_1
@@ -142,7 +155,10 @@ def kernel_unified_attention_2d(
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    kv_head_query_end = tl.minimum(
+        (kv_head_idx + 1) * num_queries_per_kv, num_query_heads
+    )
+    query_mask_1 = tl.where(query_offset_1 < kv_head_query_end, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
     Q = tl.load(
@@ -881,6 +897,31 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
+def _get_sm70_decode_head_groups(
+    max_seqlen_q: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+) -> int:
+    # Only split decode to increase parallelism when kv-head parallelism is low.
+    if max_seqlen_q != 1 or num_kv_heads > 2 or num_queries_per_kv < 16:
+        return 1
+    cap = current_platform.get_device_capability()
+    if cap is None or cap.major != 7:
+        return 1
+
+    env_value = os.getenv("VLLM_TRITON_ATTN_SM70_QHEAD_SPLIT")
+    if not env_value:
+        # Keep default behavior unchanged unless explicitly enabled.
+        return 1
+    try:
+        groups = int(env_value)
+    except ValueError:
+        return 1
+
+    groups = max(1, min(groups, num_queries_per_kv))
+    return groups
+
+
 def unified_attention(
     q,
     k,
@@ -939,10 +980,38 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    # Launch the 2D kernel if
+    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+    # 2. The batch includes at least one prefill request, or
+    # 3. The number of sequences exceeds the configured threshold, or
+    # 4. Batch invariance is enabled
+    use_2d_kernel = (
+        seq_threshold_3D is None
+        or num_par_softmax_segments is None
+        or softmax_segm_output is None
+        or softmax_segm_max is None
+        or softmax_segm_expsum is None
+        or max_seqlen_q > 1
+        or num_seqs > seq_threshold_3D
+        or is_batch_invariant
     )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+    decode_head_groups = 1
+    num_queries_per_kv_group = num_queries_per_kv
+    if use_2d_kernel:
+        decode_head_groups = _get_sm70_decode_head_groups(
+            max_seqlen_q=max_seqlen_q,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=num_queries_per_kv,
+        )
+        num_queries_per_kv_group = triton.cdiv(num_queries_per_kv, decode_head_groups)
+
+    BLOCK_M = (
+        16
+        if num_queries_per_kv_group <= 16
+        else triton.next_power_of_2(num_queries_per_kv_group)
+    )
+    BLOCK_Q = BLOCK_M // num_queries_per_kv_group
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -971,25 +1040,13 @@ def unified_attention(
         is_prefill=False,
     )
 
-    # Launch the 2D kernel if
-    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. The batch includes at least one prefill request, or
-    # 3. The number of sequences exceeds the configured threshold, or
-    # 4. Batch invariance is enabled
-    if (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
-        or is_batch_invariant
-    ):
+    if use_2d_kernel:
+        tile_size_2d = TILE_SIZE_DECODE if max_seqlen_q == 1 else TILE_SIZE_PREFILL
         kernel_unified_attention_2d[
             (
                 total_num_q_blocks,
                 num_kv_heads,
+                decode_head_groups,
             )
         ](
             output_ptr=out,
@@ -1008,6 +1065,8 @@ def unified_attention(
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
+            num_queries_per_kv_group=num_queries_per_kv_group,
+            HEAD_GROUPS=decode_head_groups,
             block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
@@ -1015,7 +1074,7 @@ def unified_attention(
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_PREFILL,
+            TILE_SIZE=tile_size_2d,
             HEAD_SIZE=head_size,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,

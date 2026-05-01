@@ -3,6 +3,7 @@
 """Utility methods for model layers."""
 
 from collections.abc import Callable
+import os
 
 import torch
 
@@ -24,11 +25,39 @@ MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "expert_gate",
 }
 
+SM70_F16_DENSE_SUFFIXES = {
+    "gate_up_proj",
+    "down_proj",
+    "in_proj_ba",
+    "in_proj_qkvz",
+    "qkv_proj",
+    "o_proj",
+    "out_proj",
+}
+
+
+def _parse_sm70_f16_dense_allowlist() -> set[str] | None:
+    raw = os.getenv("VLLM_SM70_F16_DENSE_ALLOWLIST")
+    if raw is None:
+        return None
+    suffixes = {item.strip() for item in raw.split(",") if item.strip()}
+    return suffixes or set()
+
 
 def is_layer_moe_router_gate(prefix: str) -> bool:
     if not prefix:
         return False
     return prefix.rsplit(".", 1)[-1] in MOE_LAYER_ROUTER_GATE_SUFFIXES
+
+
+def is_layer_sm70_f16_dense(prefix: str) -> bool:
+    if not prefix:
+        return False
+    suffix = prefix.rsplit(".", 1)[-1]
+    allowlist = _parse_sm70_f16_dense_allowlist()
+    if allowlist is not None:
+        return suffix in allowlist
+    return suffix in SM70_F16_DENSE_SUFFIXES
 
 
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
@@ -216,6 +245,51 @@ direct_register_custom_op(
     op_name="rocm_unquantized_gemm",
     op_func=rocm_unquantized_gemm_impl,
     fake_impl=rocm_unquantized_gemm_fake,
+)
+
+
+def sm70_unquantized_gemm_impl(
+    x: torch.Tensor,
+    tm_weight: torch.Tensor,
+    k_ld: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+    out = torch.empty(
+        (x_2d.size(0), tm_weight.shape[0]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    ops.sm70_f16_gemm_out(out, x_2d, tm_weight, k_ld, False)
+    if bias is not None:
+        out.add_(bias)
+    return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
+def sm70_unquantized_gemm_fake(
+    x: torch.Tensor,
+    tm_weight: torch.Tensor,
+    k_ld: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], tm_weight.shape[0]))
+
+
+def sm70_unquantized_gemm(
+    x: torch.Tensor,
+    tm_weight: torch.Tensor,
+    k_ld: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.sm70_unquantized_gemm(x, tm_weight, k_ld, bias)
+
+
+direct_register_custom_op(
+    op_name="sm70_unquantized_gemm",
+    op_func=sm70_unquantized_gemm_impl,
+    fake_impl=sm70_unquantized_gemm_fake,
 )
 
 

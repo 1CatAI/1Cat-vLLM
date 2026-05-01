@@ -135,7 +135,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
         # For batch invariance, use only 1 split to ensure deterministic reduction
-        num_kv_splits = 1 if vllm_is_batch_invariant() else 4
+        # Use 8 splits for better GPU occupancy on MLA (grid is small due to
+        # single KV head group), especially beneficial on SM70 where the grid
+        # is (batch, 1, splits) with TP=2.
+        num_kv_splits = 1 if vllm_is_batch_invariant() else 8
 
         # TODO(lucas) Allocate ahead of time
         attn_logits = torch.empty(

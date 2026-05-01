@@ -421,9 +421,15 @@ def _decode_grouped_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    # [TODO] work around shmem limit on MI3xx
+    # Work around shared memory limit on MI3xx and SM70 (V100, 96KB)
     if is_hip_ and Lk >= 576:
         BLOCK = 16
+    if not is_hip_ and Lk >= 576:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _cap = _torch.cuda.get_device_capability()
+            if _cap[0] < 8:  # SM70/SM75: 96KB shared memory
+                BLOCK = 16
 
     if Lk == 576:
         BLOCK_DMODEL = 512

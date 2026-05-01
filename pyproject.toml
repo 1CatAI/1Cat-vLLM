@@ -52,6 +52,7 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm*"]
+exclude = ["vllm-0.17*", "vllm-2026226*"]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]

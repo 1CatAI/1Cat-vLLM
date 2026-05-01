@@ -1515,9 +1515,34 @@ class OpenAIServingChat(OpenAIServing):
                     return self.create_error_response(str(e))
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
+                # Non-streaming reasoning parsers such as Qwen3 rely on
+                # explicit think boundary tokens. `output.text` may already
+                # have special tokens stripped, so prefer rebuilding the
+                # completion text from token ids when available.
+                parser_input_text = output.text
+                if output.token_ids is not None:
+                    try:
+                        parser_input_text = tokenizer.decode(
+                            output.token_ids,
+                            skip_special_tokens=False,
+                        )
+                    except Exception:
+                        parser_input_text = output.text
+
                 reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
+                    parser_input_text, request=request
                 )
+                if output.token_ids is not None and content is not None:
+                    try:
+                        content_ids = reasoning_parser.extract_content_ids(
+                            as_list(output.token_ids)
+                        )
+                        content = tokenizer.decode(
+                            content_ids,
+                            skip_special_tokens=True,
+                        )
+                    except Exception:
+                        pass
                 if not request.include_reasoning:
                     reasoning = None
             else:

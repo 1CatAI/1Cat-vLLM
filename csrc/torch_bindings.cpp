@@ -239,6 +239,81 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _zeros, SymInt split_k_iters) -> Tensor");
   ops.impl("awq_gemm", torch::kCUDA, &awq_gemm);
 
+  ops.def(
+      "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor _zeros, "
+      "int group_size, bool interleave_gated_silu) -> Tensor[]");
+  ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
+
+  ops.def("sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
+  ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
+
+  ops.def(
+      "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
+      "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
+  ops.impl("awq_gemm_sm70", torch::kCUDA, &awq_gemm_sm70);
+  ops.def("sm70_f16_gemm(Tensor _in_feats, Tensor _kernel) -> Tensor");
+  ops.impl("sm70_f16_gemm", torch::kCUDA, &sm70_f16_gemm);
+  ops.def(
+      "awq_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("awq_gemm_sm70_out", torch::kCUDA, &awq_gemm_sm70_out);
+  ops.def(
+      "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "int k_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
+  ops.def(
+      "sm70_f16_gate_mul_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _gate_weight) -> ()");
+  ops.impl("sm70_f16_gate_mul_out", torch::kCUDA, &sm70_f16_gate_mul_out);
+
+  ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
+  ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
+
+  ops.def("sm70_gemm_export_cache(Tensor device_hint, str path) -> int");
+  ops.impl("sm70_gemm_export_cache", torch::kCUDA, &sm70_gemm_export_cache);
+
+  ops.def(
+      "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "
+      "int k_ld, int q_ld, int num_experts) -> Tensor[]");
+  ops.impl("awq_moe_build_strided_ptrs", torch::kCUDA, &awq_moe_build_strided_ptrs);
+  ops.def(
+      "awq_moe_single_token_compact_prepare("
+      "Tensor topk_ids, "
+      "Tensor src_w13_ptrs_w_rows, Tensor src_w13_ptrs_s_rows, "
+      "Tensor src_w2_ptrs_w_rows, Tensor src_w2_ptrs_s_rows, "
+      "Tensor(a!) dst_w13_ptrs_w_rows, Tensor(b!) dst_w13_ptrs_s_rows, "
+      "Tensor(c!) dst_w2_ptrs_w_rows, Tensor(d!) dst_w2_ptrs_s_rows, "
+      "Tensor(e!) inv_permuted_idx) -> ()");
+  ops.impl("awq_moe_single_token_compact_prepare", torch::kCUDA,
+           &awq_moe_single_token_compact_prepare);
+  ops.def(
+      "awq_moe_single_token_sm70_out("
+      "Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor src_w13_ptrs_w_rows, Tensor src_w13_ptrs_s_rows, "
+      "Tensor src_w2_ptrs_w_rows, Tensor src_w2_ptrs_s_rows, "
+      "Tensor(b!) compact_input, Tensor(c!) intermediate, "
+      "Tensor(d!) sorted_output, "
+      "Tensor(e!) dst_w13_ptrs_w_rows, Tensor(f!) dst_w13_ptrs_s_rows, "
+      "Tensor(g!) dst_w2_ptrs_w_rows, Tensor(h!) dst_w2_ptrs_s_rows, "
+      "Tensor(i!) expert_offsets, Tensor(j!) inv_permuted_idx, "
+      "int w13_k, int w13_n, int w2_k, int w2_n, int group_size, "
+      "int hidden_logical_size) -> ()");
+  ops.impl("awq_moe_single_token_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_sm70_out);
+
+  ops.def(
+      "awq_moe_gemm_sm70(Tensor sorted_input, Tensor expert_offsets, "
+      "Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> Tensor");
+  ops.impl("awq_moe_gemm_sm70", torch::kCUDA, &awq_moe_gemm_sm70);
+  ops.def(
+      "awq_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
+      "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
+      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
+
   // Dequantization for AWQ.
   ops.def(
       "awq_dequantize(Tensor _kernel, Tensor _scaling_factors, "

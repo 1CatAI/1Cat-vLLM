@@ -80,9 +80,17 @@ class MambaStateDtypeCalculator:
         cls,
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType = "auto",
     ) -> tuple[torch.dtype, torch.dtype]:
-        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
-        return (state_dtype, state_dtype)
+        conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype,
+                                                    model_dtype)
+        if mamba_ssm_cache_dtype == "auto":
+            # GDN recurrent state needs float32 for numerical stability
+            # (accumulates over sequence, fp16 can overflow)
+            ssm_state_dtype = torch.float32
+        else:
+            ssm_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
+        return (conv_state_dtype, ssm_state_dtype)
 
     @classmethod
     def kda_state_dtype(

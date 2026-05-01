@@ -18,6 +18,7 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -76,6 +77,9 @@ class SpecDecodeBaseProposer:
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
+        self.use_local_argmax_reduction = (
+            self.speculative_config.use_local_argmax_reduction
+        )
         # The drafter can get longer sequences than the target model.
         max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = (
@@ -96,6 +100,7 @@ class SpecDecodeBaseProposer:
 
         self.attn_metadata_builder: AttentionMetadataBuilder | None = None
         self.draft_indexer_metadata_builder: AttentionMetadataBuilder | None = None
+        self.spec_decode_moe_layers: list[str] | None = None
         self.attn_layer_names: list[str] = []
         self.indexer_layer_names: list[str] = []
         self.eagle3_use_aux_hidden_state: bool = (
@@ -286,6 +291,27 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy-sample draft tokens from hidden states."""
+        if self.use_local_argmax_reduction and hasattr(self.model, "get_top_tokens"):
+            return self.model.get_top_tokens(hidden_states)
+        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+
+    def _collect_spec_decode_moe_layers(self) -> list[str] | None:
+        if not self.compilation_config.fast_moe_cold_start:
+            return None
+        moe_layers = [
+            module.layer_name
+            for module in self.model.modules()
+            if isinstance(module, FusedMoE)
+        ]
+        return moe_layers or None
+
+    def _get_forward_context_additional_kwargs(self) -> dict[str, object] | None:
+        if self.spec_decode_moe_layers:
+            return {"spec_decode_moe_layers": self.spec_decode_moe_layers}
+        return None
+
     def propose(
         self,
         # [num_tokens]
@@ -393,6 +419,8 @@ class SpecDecodeBaseProposer:
         }
         if self.pass_hidden_states_to_model:
             model_kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+        if self.method == "mtp":
+            model_kwargs["spec_step_idx"] = 0
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -403,6 +431,7 @@ class SpecDecodeBaseProposer:
             slot_mapping=self._get_slot_mapping(
                 num_input_tokens, common_attn_metadata.slot_mapping
             ),
+            additional_kwargs=self._get_forward_context_additional_kwargs(),
         ):
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -412,11 +441,10 @@ class SpecDecodeBaseProposer:
                 last_hidden_states, hidden_states = ret_hidden_states
 
         sample_hidden_states = last_hidden_states[last_token_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._greedy_sample(sample_hidden_states)
             return draft_token_ids.view(-1, 1)
 
         if self.uses_mrope:
@@ -435,6 +463,7 @@ class SpecDecodeBaseProposer:
 
         if isinstance(attn_metadata, TreeAttentionMetadata):
             # Draft using tree attention.
+            logits = self.model.compute_logits(sample_hidden_states)
             draft_token_ids_list = self.propose_tree(
                 batch_size=batch_size,
                 logits=logits,
@@ -446,7 +475,7 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = logits.argmax(dim=-1)
+        draft_token_ids = self._greedy_sample(sample_hidden_states)
 
         if self.allowed_attn_types is not None and not isinstance(
             attn_metadata, self.allowed_attn_types
@@ -592,6 +621,8 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+            if self.method == "mtp":
+                model_kwargs["spec_step_idx"] = token_index + 1
 
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -602,6 +633,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping(
                     input_batch_size, common_attn_metadata.slot_mapping
                 ),
+                additional_kwargs=self._get_forward_context_additional_kwargs(),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
@@ -611,8 +643,7 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            logits = self.model.compute_logits(last_hidden_states[:batch_size])
-            draft_token_ids = logits.argmax(dim=-1)
+            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
@@ -938,12 +969,14 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping(
                     num_input_tokens, attn_metadata.slot_mapping
                 ),
+                additional_kwargs=self._get_forward_context_additional_kwargs(),
             ):
                 last_hidden_states, hidden_states = self.model(
                     input_ids=self.input_ids[:num_input_tokens],
                     positions=self.positions[:num_input_tokens],
                     hidden_states=self.hidden_states[:num_input_tokens],
                     inputs_embeds=None,
+                    spec_step_idx=level + 1,
                 )
 
             # Get the output hidden states for the draft tokens.
@@ -1152,6 +1185,8 @@ class SpecDecodeBaseProposer:
                 "Qwen2_5_VLForConditionalGeneration",
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
                 "HunYuanVLForConditionalGeneration",
                 "GlmOcrForConditionalGeneration",
             ]:
@@ -1277,6 +1312,8 @@ class SpecDecodeBaseProposer:
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
 
+        self.spec_decode_moe_layers = self._collect_spec_decode_moe_layers()
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -1322,6 +1359,7 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping_dict,
+                additional_kwargs=self._get_forward_context_additional_kwargs(),
             ):
                 if self.supports_mm_inputs:
                     input_ids = None
@@ -1337,6 +1375,8 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                if self.method == "mtp":
+                    kwargs["spec_step_idx"] = fwd_idx
                 self.model(**kwargs)
 
     def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:

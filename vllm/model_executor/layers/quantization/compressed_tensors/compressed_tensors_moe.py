@@ -104,6 +104,17 @@ from vllm.platforms import CpuArchEnum, current_platform
 logger = init_logger(__name__)
 
 
+def _is_sm70_available() -> bool:
+    """Check if current CUDA device is SM70 (V100)."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        cap = torch.cuda.get_device_capability()
+        return cap == (7, 0)
+    except Exception:
+        return False
+
+
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
@@ -117,6 +128,7 @@ __all__ = [
     "CompressedTensorsWNA16MoEMethod",
     "CompressedTensorsW4A4Nvfp4MoEMethod",
     "CompressedTensorsW4A8Int8MoEMethod",
+    "CompressedTensorsSM70WNA16MoEMethod",
 ]
 
 
@@ -176,6 +188,37 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     f"but got format: {CompressionFormat.pack_quantized.value} "
                     f" and bits: {weight_quant.num_bits}",
                 )
+
+            # SM70 (V100): use TurboMind GEMM kernels,
+            # Marlin requires SM75+.
+            if _is_sm70_available() and weight_quant.num_bits == 4:
+                gs = weight_quant.group_size
+                moe_cfg = layer.moe_config
+                hidden = moe_cfg.hidden_dim
+                inter = moe_cfg.intermediate_size_per_partition
+                sm70_ok = (
+                    gs in (32, 64, 128)
+                    and hidden % gs == 0
+                    and inter % gs == 0
+                    and hidden % 8 == 0
+                    and inter % 8 == 0
+                    and weight_quant.symmetric
+                )
+                if sm70_ok:
+                    logger.info_once(
+                        "Using CompressedTensorsSM70WNA16MoEMethod "
+                        "(TurboMind SM70 kernels)")
+                    return CompressedTensorsSM70WNA16MoEMethod(
+                        weight_quant, input_quant, layer.moe_config
+                    )
+                else:
+                    logger.warning_once(
+                        "SM70 detected but compressed-tensors MoE "
+                        "dimensions incompatible with TurboMind "
+                        f"(hidden={hidden}, inter={inter}, "
+                        f"group_size={gs}, "
+                        f"symmetric={weight_quant.symmetric}). "
+                        "Falling back to WNA16MoE.")
 
             # Prefer to use the MarlinMoE kernel when it is supported.
             if (
@@ -1980,6 +2023,322 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     @property
     def supports_eplb(self) -> bool:
         return True
+
+
+class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
+    """SM70 (V100) MoE method for compressed-tensors pack-quantized format.
+
+    Converts compressed-tensors weights to AWQ format at load time,
+    then uses TurboMind SM70 GEMM kernels (same as AWQSM70MoEMethod).
+    """
+
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs | None,
+        moe: FusedMoEConfig,
+    ):
+        super().__init__(moe)
+        self.weight_quant = weight_quant
+        self.num_bits = weight_quant.num_bits
+        self.group_size = weight_quant.group_size
+        self.packed_factor = 32 // self.num_bits  # 8 for 4-bit
+        # Lazy import to avoid circular deps
+        self._awq_moe = None
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Create weights in compressed-tensors layout for checkpoint loading.
+
+        CT pack-quantized: packing along input dim, sequential order.
+        Shapes use is_transposed=True so FusedMoE weight_loader works.
+        """
+        extra_weight_attrs.update(
+            {"is_transposed": True, "quant_method": "group"}
+        )
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        pf = self.packed_factor
+
+        # qweight: [E, K/pack, 2N] and [E, N/pack, K]
+        w13_weight = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size // pf,
+                        w13_num_shards * intermediate_size_per_partition,
+                        dtype=torch.int32),
+            requires_grad=False)
+        layer.register_parameter("w13_weight_packed", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(num_experts,
+                        intermediate_size_per_partition // pf,
+                        hidden_size, dtype=torch.int32),
+            requires_grad=False)
+        layer.register_parameter("w2_weight_packed", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # scales: [E, K/gs, 2N] and [E, N/gs, K]
+        gs = self.group_size
+        num_groups_w13 = hidden_size // gs
+        num_groups_w2 = intermediate_size_per_partition // gs
+
+        w13_scale = torch.nn.Parameter(
+            torch.ones(num_experts, num_groups_w13,
+                       w13_num_shards * intermediate_size_per_partition,
+                       dtype=params_dtype),
+            requires_grad=False)
+        layer.register_parameter("w13_weight_scale", w13_scale)
+        set_weight_attrs(w13_scale, extra_weight_attrs)
+
+        w2_scale = torch.nn.Parameter(
+            torch.ones(num_experts, num_groups_w2, hidden_size,
+                       dtype=params_dtype),
+            requires_grad=False)
+        layer.register_parameter("w2_weight_scale", w2_scale)
+        set_weight_attrs(w2_scale, extra_weight_attrs)
+        set_weight_attrs(w2_scale, {"load_full_w2": False})
+
+        # weight_shape for CT format
+        w2_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False)
+        layer.register_parameter("w2_weight_shape", w2_weight_shape)
+        set_weight_attrs(w2_weight_shape, extra_weight_attrs)
+        w13_weight_shape = torch.nn.Parameter(
+            torch.empty(num_experts, 2), requires_grad=False)
+        layer.register_parameter("w13_weight_shape", w13_weight_shape)
+        set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        # g_idx / sort_indices (CT format requires these)
+        w13_g_idx = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, dtype=torch.int32),
+            requires_grad=False)
+        layer.register_parameter("w13_weight_g_idx", w13_g_idx)
+        set_weight_attrs(w13_g_idx, extra_weight_attrs)
+
+        w2_g_idx = torch.nn.Parameter(
+            torch.empty(num_experts, intermediate_size_per_partition,
+                        dtype=torch.int32),
+            requires_grad=False)
+        layer.register_parameter("w2_weight_g_idx", w2_g_idx)
+        set_weight_attrs(w2_g_idx, extra_weight_attrs)
+
+        w13_g_idx_sort = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, dtype=torch.int32),
+            requires_grad=False)
+        layer.register_parameter("w13_g_idx_sort_indices", w13_g_idx_sort)
+        set_weight_attrs(w13_g_idx_sort, extra_weight_attrs)
+
+        w2_g_idx_sort = torch.nn.Parameter(
+            torch.empty(num_experts, intermediate_size_per_partition,
+                        dtype=torch.int32),
+            requires_grad=False)
+        layer.register_parameter("w2_g_idx_sort_indices", w2_g_idx_sort)
+        set_weight_attrs(w2_g_idx_sort, extra_weight_attrs)
+
+    @staticmethod
+    def _ct_to_awq_qweight(ct_packed: torch.Tensor) -> torch.Tensor:
+        """Convert CT [E, X/8, Y] sequential → AWQ [E, X, Y/8] interleaved.
+
+        CT packs 8 x 4-bit values along dim1 in sequential order.
+        AWQ packs 8 x 4-bit values along dim2 in interleaved order
+        [0, 4, 1, 5, 2, 6, 3, 7].
+        """
+        E, X_div_8, Y = ct_packed.shape
+        X = X_div_8 * 8
+
+        # Unpack CT: each int32 → 8 sequential uint4 along dim1
+        unpacked = torch.zeros(E, X, Y, dtype=torch.uint8,
+                               device=ct_packed.device)
+        tmp = ct_packed.clone()
+        for i in range(8):
+            unpacked[:, i::8, :] = (tmp & 0xF).to(torch.uint8)
+            tmp = tmp >> 4
+
+        # Repack along dim2 with AWQ interleaved order.
+        # AWQ unpacking uses GATHER with awq_order [0,4,1,5,2,6,3,7],
+        # so packing must use the INVERSE permutation [0,2,4,6,1,3,5,7]
+        # to ensure round-trip correctness.
+        awq_pack_order = [0, 2, 4, 6, 1, 3, 5, 7]
+        grouped = unpacked.view(E, X, -1, 8)  # [E, X, Y/8, 8]
+        result = grouped[:, :, :, awq_pack_order[7]].to(torch.int32)
+        for i in range(6, -1, -1):
+            result = (result << 4) | grouped[:, :, :, awq_pack_order[i]].to(
+                torch.int32)
+        return result  # [E, X, Y/8]
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Convert CT weights to AWQ format, then run TurboMind prepare."""
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.quantization.awq_sm70_moe import (
+            _DEFAULT_MAX_TOKENS,
+        )
+
+        gs = self.group_size
+        pf = self.packed_factor
+        num_experts = layer.w13_weight_packed.shape[0]
+        device = layer.w13_weight_packed.device
+
+        logger.info("SM70 CT→AWQ: converting %d experts (group_size=%d)",
+                    num_experts, gs)
+
+        # --- Convert qweight: CT [E, X/8, Y] → AWQ [E, X, Y/8] ---
+        w13_qweight = self._ct_to_awq_qweight(layer.w13_weight_packed.data)
+        w2_qweight = self._ct_to_awq_qweight(layer.w2_weight_packed.data)
+
+        # --- Scales: same shape, just bf16→fp16 ---
+        w13_scales = layer.w13_weight_scale.data.to(torch.float16)
+        w2_scales = layer.w2_weight_scale.data.to(torch.float16)
+
+        # --- Generate qzeros (symmetric: zero_point=8 → 0x88888888) ---
+        # 0x88888888 overflows signed int32, use unsigned view
+        _zp = torch.tensor([0x88888888], dtype=torch.uint32).view(torch.int32).item()
+        E_w13, K_gs_w13, N2_w13 = w13_scales.shape
+        w13_qzeros = torch.full(
+            (E_w13, K_gs_w13, N2_w13 // pf),
+            _zp, dtype=torch.int32, device=device)
+        E_w2, N_gs_w2, K_w2 = w2_scales.shape
+        w2_qzeros = torch.full(
+            (E_w2, N_gs_w2, K_w2 // pf),
+            _zp, dtype=torch.int32, device=device)
+
+        # --- TurboMind prepare per expert ---
+        w13_tm_w, w13_tm_s, w13_meta = [], [], []
+        w2_tm_w, w2_tm_s, w2_meta = [], [], []
+
+        for e in range(num_experts):
+            r13 = ops.awq_sm70_prepare(
+                w13_qweight[e], w13_scales[e], w13_qzeros[e], gs)
+            w13_tm_w.append(r13[0])
+            w13_tm_s.append(r13[1])
+            w13_meta.append(r13[2])
+
+            r2 = ops.awq_sm70_prepare(
+                w2_qweight[e], w2_scales[e], w2_qzeros[e], gs)
+            w2_tm_w.append(r2[0])
+            w2_tm_s.append(r2[1])
+            w2_meta.append(r2[2])
+
+        # --- Store TurboMind weights as parameters ---
+        layer.w13_tm_weight = torch.nn.Parameter(
+            torch.stack(w13_tm_w), requires_grad=False)
+        layer.w13_tm_scales = torch.nn.Parameter(
+            torch.stack(w13_tm_s), requires_grad=False)
+        layer.w2_tm_weight = torch.nn.Parameter(
+            torch.stack(w2_tm_w), requires_grad=False)
+        layer.w2_tm_scales = torch.nn.Parameter(
+            torch.stack(w2_tm_s), requires_grad=False)
+
+        layer.w13_meta_list = [
+            (int(w13_meta[i][0].item()), int(w13_meta[i][1].item()))
+            for i in range(num_experts)]
+        layer.w2_meta_list = [
+            (int(w2_meta[i][0].item()), int(w2_meta[i][1].item()))
+            for i in range(num_experts)]
+        layer.sm70_num_experts = num_experts
+
+        # Dimensions for batched GEMM
+        layer.sm70_w13_k_dim = layer.w13_tm_weight.shape[1]
+        layer.sm70_w13_n_dim = layer.w13_tm_weight.shape[2] * 8
+        layer.sm70_w2_k_dim = layer.w2_tm_weight.shape[1]
+        layer.sm70_w2_n_dim = layer.w2_tm_weight.shape[2] * 8
+        intermediate_size = layer.sm70_w2_k_dim
+        layer.sm70_intermediate_size = intermediate_size
+
+        # --- Build StridedPtr arrays for batched GEMM ---
+        w13_k_ld, w13_q_ld = layer.w13_meta_list[0]
+        w2_k_ld, w2_q_ld = layer.w2_meta_list[0]
+        try:
+            w13_ptrs = ops.awq_moe_build_strided_ptrs(
+                layer.w13_tm_weight, layer.w13_tm_scales,
+                w13_k_ld, w13_q_ld, num_experts)
+            w2_ptrs = ops.awq_moe_build_strided_ptrs(
+                layer.w2_tm_weight, layer.w2_tm_scales,
+                w2_k_ld, w2_q_ld, num_experts)
+            layer.w13_strided_ptrs_w = torch.nn.Parameter(
+                w13_ptrs[0], requires_grad=False)
+            layer.w13_strided_ptrs_s = torch.nn.Parameter(
+                w13_ptrs[1], requires_grad=False)
+            layer.w2_strided_ptrs_w = torch.nn.Parameter(
+                w2_ptrs[0], requires_grad=False)
+            layer.w2_strided_ptrs_s = torch.nn.Parameter(
+                w2_ptrs[1], requires_grad=False)
+            layer.sm70_batched_ready = True
+            logger.info("SM70 CT MoE: batched GEMM enabled (%d experts)",
+                        num_experts)
+        except Exception as e:
+            layer.sm70_batched_ready = False
+            logger.warning("SM70 CT MoE: batched GEMM unavailable (%s)", e)
+
+        # --- Pre-allocate buffers (CUDA graph safe) ---
+        top_k = self.moe.experts_per_token
+        max_slots = _DEFAULT_MAX_TOKENS * top_k
+        layer._buf_max_slots = max_slots
+        layer._buf_top_k = top_k
+        layer._buf_expert_counts = torch.zeros(
+            num_experts, dtype=torch.int32, device=device)
+        layer._buf_expert_offsets = torch.zeros(
+            num_experts + 1, dtype=torch.int32, device=device)
+        layer._buf_intermediate = torch.empty(
+            max_slots, intermediate_size,
+            dtype=torch.float16, device=device)
+        layer._buf_ones = torch.ones(
+            max_slots, dtype=torch.int32, device=device)
+        hidden_size = layer.sm70_w13_k_dim
+        layer._buf_output = torch.empty(
+            _DEFAULT_MAX_TOKENS, hidden_size,
+            dtype=torch.float16, device=device)
+
+        # Free original CT weights
+        for attr in ("w13_weight_packed", "w13_weight_scale",
+                     "w2_weight_packed", "w2_weight_scale",
+                     "w13_weight_shape", "w2_weight_shape",
+                     "w13_weight_g_idx", "w2_weight_g_idx",
+                     "w13_g_idx_sort_indices", "w2_g_idx_sort_indices"):
+            if hasattr(layer, attr):
+                delattr(layer, attr)
+
+        logger.info("SM70 CT→AWQ conversion complete for %d experts",
+                    num_experts)
+
+    def _ensure_buffers(self, layer: torch.nn.Module, total_slots: int):
+        if total_slots <= layer._buf_max_slots:
+            return
+        device = layer._buf_expert_counts.device
+        layer._buf_max_slots = total_slots
+        layer._buf_intermediate = torch.empty(
+            total_slots, layer.sm70_intermediate_size,
+            dtype=torch.float16, device=device)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        # Lazy-import and delegate to AWQSM70MoEMethod
+        if self._awq_moe is None:
+            from vllm.model_executor.layers.quantization.awq_sm70_moe import (
+                AWQSM70MoEMethod,
+            )
+            self._awq_moe = AWQSM70MoEMethod(
+                weight_bits=self.num_bits,
+                group_size=self.group_size,
+                zero_point=False,
+                moe=self.moe,
+            )
+        return self._awq_moe.apply(layer, x, topk_weights, topk_ids)
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
 
 
 class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):

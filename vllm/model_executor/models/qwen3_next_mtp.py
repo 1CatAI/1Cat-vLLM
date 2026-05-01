@@ -268,8 +268,14 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        spec_step_idx = int(kwargs.get("spec_step_idx", 0))
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
         return hidden_states
 
@@ -279,6 +285,13 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         shared_weight_names = ["embed_tokens", "lm_head"]

@@ -9,6 +9,7 @@
 
 # ruff: noqa: E501
 
+import os
 
 import torch
 
@@ -16,10 +17,52 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
+from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper, is_sm70
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+def _parse_sm70_int_list(env_name: str, default_vals: list[int]) -> list[int]:
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default_vals
+    out: list[int] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            val = int(tok)
+        except ValueError:
+            continue
+        if val > 0:
+            out.append(val)
+    return out or default_vals
+
+
+# SM70: keep default config compact, but expose env-driven tuning.
+_sm70_chunk_o_bk = _parse_sm70_int_list("VLLM_SM70_GDN_CHUNK_O_BK", [32, 64])
+_sm70_chunk_o_bv = _parse_sm70_int_list("VLLM_SM70_GDN_CHUNK_O_BV", [32, 64])
+_sm70_chunk_o_warps = _parse_sm70_int_list("VLLM_SM70_GDN_CHUNK_O_WARPS", [4, 8])
+_sm70_chunk_o_stages = _parse_sm70_int_list("VLLM_SM70_GDN_CHUNK_O_STAGES", [2])
+
+_chunk_o_configs = (
+    [
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in _sm70_chunk_o_bk
+        for BV in _sm70_chunk_o_bv
+        for num_warps in _sm70_chunk_o_warps
+        for num_stages in _sm70_chunk_o_stages
+    ]
+    if is_sm70
+    else [
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in BKV_LIST
+        for BV in BKV_LIST
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ]
+)
 
 
 @triton.heuristics(
@@ -29,13 +72,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_chunk_o_configs,
     key=["H", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])

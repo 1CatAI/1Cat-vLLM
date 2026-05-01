@@ -151,6 +151,7 @@ is_nvidia_hopper = is_nvidia and (
     or torch.cuda.get_device_capability()[0] >= 9
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
+is_sm70 = is_nvidia and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7 and torch.cuda.get_device_capability()[1] == 0
 is_gather_supported = hasattr(triton.language, "gather")
 is_tma_supported = (is_nvidia and torch.cuda.get_device_capability(0)[0] >= 9) and (
     hasattr(triton.language, "_experimental_make_tensor_descriptor")

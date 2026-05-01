@@ -37,6 +37,40 @@ void moe_permute(
   auto align_block_size_value =
       align_block_size.has_value() ? align_block_size.value() : -1;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (canUseSingleTokenMoePermuteFastPath(
+          n_token, topk, expert_map.has_value(), align_block_size, n_expert,
+          n_local_expert)) {
+    if (input.scalar_type() == at::ScalarType::Half) {
+      singleTokenMoePermuteLauncher<half>(
+          get_ptr<half>(input), get_ptr<int>(topk_ids),
+          get_ptr<half>(permuted_input),
+          get_ptr<int64_t>(expert_first_token_offset),
+          get_ptr<int>(inv_permuted_idx), get_ptr<int>(permuted_idx),
+          get_ptr<int>(m_indices), static_cast<int>(n_expert),
+          static_cast<int>(topk), n_hidden, stream);
+      return;
+    }
+    if (input.scalar_type() == at::ScalarType::BFloat16) {
+      singleTokenMoePermuteLauncher<__nv_bfloat16>(
+          get_ptr<__nv_bfloat16>(input), get_ptr<int>(topk_ids),
+          get_ptr<__nv_bfloat16>(permuted_input),
+          get_ptr<int64_t>(expert_first_token_offset),
+          get_ptr<int>(inv_permuted_idx), get_ptr<int>(permuted_idx),
+          get_ptr<int>(m_indices), static_cast<int>(n_expert),
+          static_cast<int>(topk), n_hidden, stream);
+      return;
+    }
+    if (input.scalar_type() == at::ScalarType::Float) {
+      singleTokenMoePermuteLauncher<float>(
+          get_ptr<float>(input), get_ptr<int>(topk_ids),
+          get_ptr<float>(permuted_input),
+          get_ptr<int64_t>(expert_first_token_offset),
+          get_ptr<int>(inv_permuted_idx), get_ptr<int>(permuted_idx),
+          get_ptr<int>(m_indices), static_cast<int>(n_expert),
+          static_cast<int>(topk), n_hidden, stream);
+      return;
+    }
+  }
   const long sorter_size =
       CubKeyValueSorter::getWorkspaceSize(n_token * topk, n_expert);
   auto sort_workspace = torch::empty(
@@ -132,6 +166,30 @@ void moe_unpermute(
     int n_local_expert = expert_first_token_offset.value().size(0) - 1;
     valid_ptr =
         get_ptr<int64_t>(expert_first_token_offset.value()) + n_local_expert;
+  }
+
+  if (canUseSingleTokenMoeUnpermuteFastPath(n_token, topk)) {
+    if (hidden_states.scalar_type() == at::ScalarType::Half) {
+      singleTokenMoeUnpermuteLauncher<half>(
+          get_ptr<half>(permuted_hidden_states), get_ptr<half>(hidden_states),
+          get_ptr<float>(topk_weights), get_ptr<int>(inv_permuted_idx),
+          n_hidden, topk, stream);
+      return;
+    }
+    if (hidden_states.scalar_type() == at::ScalarType::BFloat16) {
+      singleTokenMoeUnpermuteLauncher<__nv_bfloat16>(
+          get_ptr<__nv_bfloat16>(permuted_hidden_states),
+          get_ptr<__nv_bfloat16>(hidden_states), get_ptr<float>(topk_weights),
+          get_ptr<int>(inv_permuted_idx), n_hidden, topk, stream);
+      return;
+    }
+    if (hidden_states.scalar_type() == at::ScalarType::Float) {
+      singleTokenMoeUnpermuteLauncher<float>(
+          get_ptr<float>(permuted_hidden_states), get_ptr<float>(hidden_states),
+          get_ptr<float>(topk_weights), get_ptr<int>(inv_permuted_idx),
+          n_hidden, topk, stream);
+      return;
+    }
   }
 
   MOE_DISPATCH(hidden_states.scalar_type(), [&] {
