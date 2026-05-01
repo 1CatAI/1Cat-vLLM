@@ -15,7 +15,7 @@
 > 一猫之下的朋友。你们的支持，是我们继续把这件事做深、做久、做好的动力。
 
 `1Cat-vLLM-0.0.3` is a formal `0.0.3` release of the **Tesla V100 / SM70** vLLM fork for
-**AWQ 4-bit inference on Volta GPUs**.
+**AWQ 4-bit inference on Volta GPUs,and FlashAttn-2!!**.
 
 Upstream vLLM AWQ kernels normally require **SM75+** in the default path.
 This branch integrates **lmdeploy TurboMind SM70 WMMA kernels**,
@@ -29,7 +29,7 @@ installation path. The validated default path now centers on
 
 ## Recommended model providers
 
-- `tclf90/Qwen3.5-27B-AWQ`
+- `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
 
