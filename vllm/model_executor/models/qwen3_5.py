@@ -489,6 +489,15 @@ class Qwen3_5Model(Qwen3NextModel):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 if isinstance(shard_id, tuple):
+                    # Plain metadata params (e.g. compressed-tensors
+                    # `weight_shape`) lack `output_dim` and must not be
+                    # sliced along it; just default-load them so the
+                    # last sub-id wins. Otherwise proceed with the
+                    # output-axis split.
+                    if not hasattr(param, "output_dim"):
+                        default_weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
+                        break
                     # Split by the target module's output shard metadata
                     # instead of hardcoding tensor shapes.
                     owner = getattr(weight_loader, "__self__", None)
