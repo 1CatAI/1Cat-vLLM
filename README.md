@@ -202,6 +202,10 @@ Notes:
 - Runtime installation from the wheels does not require the `lmdeploy` source
   tree.
 - Use `Python 3.12` and `CUDA 12.8`.
+- After installing from wheels, run `python -m vllm...` from a directory outside
+  this source checkout, such as `cd ~` or `cd /tmp`. Running inside the cloned
+  repository makes Python import the local `vllm/` source tree, which does not
+  contain the wheel-installed CUDA extension files such as `vllm/_C.abi3.so`.
 
 ### 4. Verify the environment
 
@@ -442,10 +446,9 @@ Important wording:
 
 ## Launch examples
 
-All commands below are written as full runnable commands.
-
-Run them from the repository root or from any environment where `vllm` has
-already been installed.
+All commands below are written as full runnable commands. When using the
+prebuilt wheels, run them outside the source checkout, for example after
+`cd ~`, so Python loads the installed wheel package and its CUDA extensions.
 
 ### Common V100 environment
 
