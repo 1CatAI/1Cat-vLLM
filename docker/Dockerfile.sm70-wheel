@@ -24,13 +24,17 @@ ARG TORCH_VERSION=2.9.1
 ARG TORCHVISION_VERSION=0.24.1
 ARG TORCHAUDIO_VERSION=2.9.1
 ARG VLLM_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.2/vllm-0.0.2.dev0+g55573923a.d20260321.cu128-cp312-cp312-linux_x86_64.whl"
+# Optional FlashAttention-V100 wheel. Unlocks `--attention-backend FLASH_ATTN_V100`.
+# Without it, the registered backend silently falls back to Triton.
+ARG FLASH_ATTN_V100_WHEEL_URL="https://github.com/1CatAI/1Cat-vLLM/releases/download/v0.0.3/flash_attn_v100-26.2-cp312-cp312-linux_x86_64.whl"
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install \
         torch==${TORCH_VERSION} \
         torchvision==${TORCHVISION_VERSION} \
         torchaudio==${TORCHAUDIO_VERSION} \
-    && python -m pip install "${VLLM_WHEEL_URL}"
+    && python -m pip install "${VLLM_WHEEL_URL}" \
+    && python -m pip install "${FLASH_ATTN_V100_WHEEL_URL}"
 
 COPY docker/entrypoint.sm70.sh /usr/local/bin/entrypoint.sm70.sh
 RUN chmod +x /usr/local/bin/entrypoint.sm70.sh

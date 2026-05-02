@@ -39,6 +39,28 @@ Build the image from the included Dockerfile:
 docker build -f docker/Dockerfile.sm70-wheel -t vllm-v100:latest .
 ```
 
+The Docker images install three artifacts: PyTorch (cu128), 1Cat's vLLM
+wheel (v0.0.2 with our overlaid Python patches), and 1Cat's
+`flash_attn_v100` wheel (v0.0.3, cp312/cu128). The FA-V100 wheel unlocks
+`--attention-backend FLASH_ATTN_V100` (the SM70 FlashAttention-2 path).
+Without it the registered backend silently falls back to Triton.
+
+### Building flash_attn_v100 from source
+
+If you need a different Python or CUDA combo than the published wheel
+(`cp312-cp312-linux_x86_64`, cu128), build the extension from the
+vendored source under `flash-attention-v100/`:
+
+```bash
+# Requires nvcc on PATH and the same torch already in the venv.
+PATH=/usr/local/cuda-12.8/bin:$PATH \
+  TORCH_CUDA_ARCH_LIST="7.0" \
+  pip install -e flash-attention-v100/ --no-build-isolation
+```
+
+`--no-build-isolation` is important: it ensures the build picks up the
+torch you already have installed instead of pulling a different version.
+
 ### Quick run (MiniMax M2.7 on 8x V100 32GB)
 
 ```bash
