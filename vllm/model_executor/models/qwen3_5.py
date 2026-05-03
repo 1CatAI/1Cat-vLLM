@@ -486,6 +486,13 @@ class Qwen3_5Model(Qwen3NextModel):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 if isinstance(shard_id, tuple):
+                    # Auxiliary CT-quantization params (weight_shape: BasevLLMParameter,
+                    # weight_g_idx: RowvLLMParameter, etc.) don't have output_dim and
+                    # aren't output-sharded. Load via the standard non-shard weight_loader
+                    # and bail out of the sub-id loop.
+                    if not hasattr(param, "output_dim"):
+                        weight_loader(param, loaded_weight)
+                        break
                     # Split by the target module's output shard metadata
                     # instead of hardcoding tensor shapes.
                     owner = getattr(weight_loader, "__self__", None)
