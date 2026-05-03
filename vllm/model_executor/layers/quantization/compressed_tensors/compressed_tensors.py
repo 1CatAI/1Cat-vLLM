@@ -342,7 +342,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                         f"{min_capability}. Current capability: {capability}.",
                     )
             else:
-                supported = True # capability >= min_capability
+                supported = capability >= min_capability
                 if error and not supported:
                     raise RuntimeError(
                         "Quantization scheme is not supported for ",
