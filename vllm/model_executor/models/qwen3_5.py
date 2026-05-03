@@ -110,12 +110,13 @@ logger = init_logger(__name__)
 def _should_split_linear_attn_ba(
     quant_config: QuantizationConfig | None,
 ) -> bool:
-    modules_to_not_convert = (
+    # Legacy AWQ uses modules_to_not_convert; compressed-tensors uses ignore.
+    skip_list = list(
         getattr(quant_config, "modules_to_not_convert", None) or []
-    )
+    ) + list(getattr(quant_config, "ignore", None) or [])
     return any("linear_attn.in_proj_b" in module
                or "linear_attn.in_proj_a" in module
-               for module in modules_to_not_convert)
+               for module in skip_list)
 
 
 def _get_qwen35_linear_attn_packed_modules_mapping(
@@ -502,12 +503,12 @@ class Qwen3_5Model(Qwen3NextModel):
                         )
                     logger.debug(
                         "Tuple shard load for %s: shard_ids=%s output_sizes=%s "
-                        "weight_shape=%s output_dim=%d",
+                        "weight_shape=%s output_dim=%s",
                         name,
                         shard_id,
                         output_sizes,
                         tuple(loaded_weight.shape),
-                        param.output_dim,
+                        getattr(param, "output_dim", "?"),
                     )
                     for sub_id in shard_id:
                         shard_offset = sum(output_sizes[:sub_id])

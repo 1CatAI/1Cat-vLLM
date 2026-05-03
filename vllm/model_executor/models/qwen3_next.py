@@ -186,7 +186,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None,  # router gate: stored as bf16 in checkpoint, must stay unquantized
             prefix=f"{prefix}.gate",
         )
 

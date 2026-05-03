@@ -20,6 +20,9 @@ from vllm.model_executor.layers.quantization.kernels.mixed_precision.dynamic_4bi
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.exllama import (  # noqa: E501
     ExllamaLinearKernel,
 )
+from vllm.model_executor.layers.quantization.kernels.mixed_precision.sm70_turbomind import (  # noqa: E501
+    SM70TurboMindLinearKernel,
+)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.machete import (  # noqa: E501
     MacheteLinearKernel,
 )
@@ -38,6 +41,7 @@ from vllm.platforms import PlatformEnum, current_platform
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        SM70TurboMindLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
         AllSparkLinearKernel,

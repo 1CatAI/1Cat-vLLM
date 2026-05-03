@@ -2176,7 +2176,7 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
         """Convert CT weights to AWQ format, then run TurboMind prepare."""
         from vllm import _custom_ops as ops
         from vllm.model_executor.layers.quantization.awq_sm70_moe import (
-            _DEFAULT_MAX_TOKENS,
+            _DEFAULT_PERSISTENT_MAX_TOKENS,
         )
 
         gs = self.group_size
@@ -2213,7 +2213,8 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
 
         for e in range(num_experts):
             r13 = ops.awq_sm70_prepare(
-                w13_qweight[e], w13_scales[e], w13_qzeros[e], gs)
+                w13_qweight[e], w13_scales[e], w13_qzeros[e], gs,
+                interleave_gated_silu=True)
             w13_tm_w.append(r13[0])
             w13_tm_s.append(r13[1])
             w13_meta.append(r13[2])
@@ -2250,6 +2251,14 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
         intermediate_size = layer.sm70_w2_k_dim
         layer.sm70_intermediate_size = intermediate_size
 
+        # CT weights are pre-aligned to TurboMind layout, so logical == aligned.
+        # AWQSM70MoEMethod.apply() reads these attrs during decode.
+        hidden_size = layer.sm70_w13_k_dim
+        layer.sm70_hidden_logical_size = hidden_size
+        layer.sm70_hidden_aligned_size = hidden_size
+        layer.sm70_intermediate_logical_size = intermediate_size
+        layer.sm70_intermediate_aligned_size = intermediate_size
+
         # --- Build StridedPtr arrays for batched GEMM ---
         w13_k_ld, w13_q_ld = layer.w13_meta_list[0]
         w2_k_ld, w2_q_ld = layer.w2_meta_list[0]
@@ -2268,31 +2277,83 @@ class CompressedTensorsSM70WNA16MoEMethod(CompressedTensorsMoEMethod):
                 w2_ptrs[0], requires_grad=False)
             layer.w2_strided_ptrs_s = torch.nn.Parameter(
                 w2_ptrs[1], requires_grad=False)
+            layer.w13_strided_ptrs_w_rows = layer.w13_strided_ptrs_w.view(
+                num_experts, -1)
+            layer.w13_strided_ptrs_s_rows = layer.w13_strided_ptrs_s.view(
+                num_experts, -1)
+            layer.w2_strided_ptrs_w_rows = layer.w2_strided_ptrs_w.view(
+                num_experts, -1)
+            layer.w2_strided_ptrs_s_rows = layer.w2_strided_ptrs_s.view(
+                num_experts, -1)
+            layer.sm70_ptr_row_bytes = layer.w13_strided_ptrs_w_rows.shape[1]
             layer.sm70_batched_ready = True
             logger.info("SM70 CT MoE: batched GEMM enabled (%d experts)",
                         num_experts)
         except Exception as e:
             layer.sm70_batched_ready = False
+            layer.sm70_ptr_row_bytes = 0
             logger.warning("SM70 CT MoE: batched GEMM unavailable (%s)", e)
 
         # --- Pre-allocate buffers (CUDA graph safe) ---
+        # Mirrors AWQSM70MoEMethod.process_weights_after_loading so the
+        # delegated AWQSM70MoEMethod.apply() path finds every buffer it needs.
+        hidden_size = layer.sm70_w13_k_dim
         top_k = self.moe.experts_per_token
-        max_slots = _DEFAULT_MAX_TOKENS * top_k
+        persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
+        max_slots = persistent_tokens * top_k
+        layer._buf_max_tokens = persistent_tokens
         layer._buf_max_slots = max_slots
         layer._buf_top_k = top_k
-        layer._buf_expert_counts = torch.zeros(
+        layer._buf_expert_counts = torch.empty(
             num_experts, dtype=torch.int32, device=device)
-        layer._buf_expert_offsets = torch.zeros(
+        layer._buf_expert_offsets = torch.empty(
             num_experts + 1, dtype=torch.int32, device=device)
+        layer._buf_expert_offsets64 = torch.empty(
+            num_experts + 1, dtype=torch.int64, device=device)
+        layer._buf_gate_up = torch.empty(
+            max_slots, layer.sm70_w13_n_dim,
+            dtype=torch.float16, device=device)
         layer._buf_intermediate = torch.empty(
             max_slots, intermediate_size,
             dtype=torch.float16, device=device)
+        layer._buf_permuted_input = torch.empty(
+            max_slots, hidden_size, dtype=torch.float16, device=device)
+        layer._buf_sorted_output = torch.empty(
+            max_slots, hidden_size, dtype=torch.float16, device=device)
+        layer._buf_inv_permuted_idx = torch.empty(
+            persistent_tokens, top_k, dtype=torch.int32, device=device)
+        layer._buf_topk_ids_i32 = torch.empty(
+            persistent_tokens, top_k, dtype=torch.int32, device=device)
+        layer._buf_token_expert_indices = torch.arange(
+            max_slots, dtype=torch.int32, device=device).view(
+                persistent_tokens, top_k)
+        layer._buf_permuted_idx = torch.empty(
+            max_slots, dtype=torch.int32, device=device)
+        layer._buf_m_indices = torch.empty(
+            max_slots, dtype=torch.int32, device=device)
+        layer._buf_output = torch.empty(
+            persistent_tokens, hidden_size,
+            dtype=torch.float16, device=device)
         layer._buf_ones = torch.ones(
             max_slots, dtype=torch.int32, device=device)
-        hidden_size = layer.sm70_w13_k_dim
-        layer._buf_output = torch.empty(
-            _DEFAULT_MAX_TOKENS, hidden_size,
-            dtype=torch.float16, device=device)
+        if layer.sm70_batched_ready:
+            ptr_row = layer.sm70_ptr_row_bytes
+            layer._buf_single_topk_ids_i64 = torch.empty(
+                top_k, dtype=torch.int64, device=device)
+            layer._buf_single_w13_ptrs_w = torch.empty(
+                top_k, ptr_row, dtype=torch.uint8, device=device)
+            layer._buf_single_w13_ptrs_s = torch.empty(
+                top_k, ptr_row, dtype=torch.uint8, device=device)
+            layer._buf_single_w2_ptrs_w = torch.empty(
+                top_k, ptr_row, dtype=torch.uint8, device=device)
+            layer._buf_single_w2_ptrs_s = torch.empty(
+                top_k, ptr_row, dtype=torch.uint8, device=device)
+            layer._buf_single_expert_offsets = torch.arange(
+                top_k + 1, dtype=torch.int32, device=device)
+            layer._buf_single_expert_offsets64 = torch.arange(
+                top_k + 1, dtype=torch.int64, device=device)
+            layer._buf_single_inv_permuted_idx = torch.arange(
+                top_k, dtype=torch.int32, device=device).view(1, top_k)
 
         # Free original CT weights
         for attr in ("w13_weight_packed", "w13_weight_scale",
