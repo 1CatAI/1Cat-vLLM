@@ -21,6 +21,7 @@ vLLM fork for Tesla V100 (SM70) extending [1CatAI/1Cat-vLLM](https://github.com/
 | [tclf90/Qwen3.5-35B-A3B-AWQ](https://huggingface.co/tclf90/Qwen3.5-35B-A3B-AWQ) | 35B (3B active) | AWQ | MoE | 2-4 | Working (1Cat-validated) |
 | [tclf90/Qwen3.5-122B-A10B-AWQ](https://huggingface.co/tclf90/Qwen3.5-122B-A10B-AWQ) | 122B (10B active) | AWQ | MoE | 4+ | Working (1Cat-validated) |
 | [cyankiwi/Qwen3.6-27B-AWQ-INT4](https://huggingface.co/cyankiwi/Qwen3.6-27B-AWQ-INT4) | 27B | compressed-tensors W4A16 (asymmetric) | Hybrid Gated DeltaNet | 4 | Working (greedy + tool-calling smoke) |
+| [cyankiwi/granite-4.1-8b-AWQ-INT4](https://huggingface.co/cyankiwi/granite-4.1-8b-AWQ-INT4) | 8B | compressed-tensors W4A16 group_size=32 (asymmetric) | Dense (GraniteForCausalLM) | 2 | Working (cudagraph; ~127 tok/s single-stream, ~587 tok/s aggregate batch=8) |
 | [Intel/DeepSeek-V4-Flash-W4A16-AutoRound](https://huggingface.co/Intel/DeepSeek-V4-Flash-W4A16-AutoRound) | 290B (37B active) | auto-round W4A16 | MoE (256 experts) + MLA + sparse-attn + Hyper-Connections | 8 | Working (single-request, ~5.66 tok/s decode-only) |
 
 ## Hardware tested
@@ -107,6 +108,38 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc=host \
   --enforce-eager \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder
+```
+
+### Quick run (granite-4.1-8b-AWQ-INT4 on 2x V100 32GB)
+
+Pure dense `GraniteForCausalLM`, asymmetric compressed-tensors W4A16 with
+`group_size=32`. Uses the existing `TurboMindAsymLinearKernel` (already in
+this fork; no new code path needed). The
+`compile_ranges_split_points:[]` setting disables the chunked-prefill
+split that otherwise triggers a silent `FLASH_ATTN_V100` fallback path
+producing all-token-id-0 ("!") garbage. Cudagraph capture engages
+cleanly -- do **not** add `--enforce-eager` (eager mode is ~3x slower
+on this model). Local bench (TP=2, dual V100 32GB SXM2, 32-prompt ->
+128-gen): 126.6 tok/s decode at batch=1; 586.8 tok/s aggregate / 73.3
+per-seq at batch=8.
+
+```bash
+docker run --rm --gpus '"device=0,1"' --ipc=host \
+  -v /path/to/models:/models:ro \
+  -e VLLM_MODEL=/models/cyankiwi/granite-4.1-8b-AWQ-INT4 \
+  -e VLLM_SERVED_MODEL_NAME=granite-4.1-8b-AWQ-INT4 \
+  -e VLLM_QUANTIZATION=compressed-tensors \
+  -e VLLM_DTYPE=float16 \
+  -e VLLM_TENSOR_PARALLEL_SIZE=2 \
+  -e VLLM_GPU_MEMORY_UTILIZATION=0.85 \
+  -e VLLM_MAX_MODEL_LEN=8192 \
+  -e VLLM_MAX_NUM_SEQS=16 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=4096 \
+  -e VLLM_COMPILATION_CONFIG='{"compile_ranges_split_points":[]}' \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000 \
+  -p 8000:8000 \
+  vllm-v100:latest \
+  --attention-backend FLASH_ATTN_V100
 ```
 
 ### Quick run (DeepSeek-V4-Flash on 8x V100 32GB)
