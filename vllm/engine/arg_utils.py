@@ -1875,6 +1875,7 @@ class EngineArgs:
                     default_max_num_batched_tokens[UsageContext.OPENAI_API_SERVER],
                     16384,
                 )
+                default_max_num_seqs[UsageContext.OPENAI_API_SERVER] = 1
 
         # tpu specific default values.
         if current_platform.is_tpu():

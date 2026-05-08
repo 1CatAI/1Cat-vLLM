@@ -1611,6 +1611,65 @@ def test_get_kv_cache_config_one_worker():
     )
 
 
+def test_kv_cache_auto_trim_for_low_concurrency():
+    model_config = ModelConfig(max_model_len=16)
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=1,
+        max_model_len=model_config.max_model_len,
+        is_encoder_decoder=model_config.is_encoder_decoder,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config, scheduler_config=scheduler_config
+    )
+    vllm_config.cache_config.kv_cache_auto_trim_ratio = 1.0
+
+    mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
+    kv_cache_specs = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(),
+    }
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+
+    assert kv_cache_config == KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[
+            KVCacheTensor(size=mem_per_block_per_layer, shared_by=["layer_1"]),
+            KVCacheTensor(size=mem_per_block_per_layer, shared_by=["layer_2"]),
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
+    )
+
+
+def test_kv_cache_auto_trim_can_be_disabled():
+    model_config = ModelConfig(max_model_len=16)
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=1,
+        max_model_len=model_config.max_model_len,
+        is_encoder_decoder=model_config.is_encoder_decoder,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config, scheduler_config=scheduler_config
+    )
+    vllm_config.cache_config.kv_cache_auto_trim_ratio = 0
+
+    mem_per_block_per_layer = 16 * 2 * 64 * 4 * 2
+    kv_cache_specs = {
+        "layer_1": new_kv_cache_spec(),
+        "layer_2": new_kv_cache_spec(),
+    }
+    kv_cache_config = get_kv_cache_configs(
+        vllm_config, [kv_cache_specs], [mem_per_block_per_layer * 2 * 32]
+    )[0]
+
+    assert kv_cache_config.num_blocks == 32
+    assert kv_cache_config.kv_cache_tensors == [
+        KVCacheTensor(size=mem_per_block_per_layer * 32, shared_by=["layer_1"]),
+        KVCacheTensor(size=mem_per_block_per_layer * 32, shared_by=["layer_2"]),
+    ]
+
+
 def test_get_kv_cache_configs_attention_free():
     kv_cache_specs: dict[str, KVCacheSpec] = {}
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))

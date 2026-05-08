@@ -99,6 +99,24 @@ def request_memory(init_snapshot: MemorySnapshot, cache_config: CacheConfig) -> 
     )
 
     if init_snapshot.free_memory < requested_memory:
+        if (
+            cache_config.kv_cache_auto_trim_ratio > 0
+            and cache_config.kv_cache_memory_bytes is None
+            and cache_config.num_gpu_blocks_override is None
+        ):
+            logger.warning(
+                "Free memory on device %s (%s/%s GiB) is less than requested "
+                "gpu_memory_utilization (%s, %s GiB). Continuing with current "
+                "free memory as the KV cache upper bound because "
+                "kv_cache_auto_trim_ratio is enabled.",
+                init_snapshot.device_,
+                format_gib(init_snapshot.free_memory),
+                format_gib(init_snapshot.total_memory),
+                cache_config.gpu_memory_utilization,
+                format_gib(requested_memory),
+            )
+            return init_snapshot.free_memory
+
         raise ValueError(
             f"Free memory on device {init_snapshot.device_} "
             f"({format_gib(init_snapshot.free_memory)}/"

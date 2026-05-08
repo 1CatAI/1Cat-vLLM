@@ -157,6 +157,13 @@ class CacheConfig:
     gpu_memory_utilization. Note that kv_cache_memory_bytes
     (when not-None) ignores gpu_memory_utilization"""
 
+    kv_cache_auto_trim_ratio: float = Field(default=1.05, ge=0)
+    """When kv_cache_memory_bytes and num_gpu_blocks_override are unset, cap the
+    inferred KV cache allocation to roughly this multiple of the memory needed
+    for max_num_seqs full-length requests. This keeps low-concurrency
+    long-context serving from preallocating all memory allowed by
+    gpu_memory_utilization. Set to 0 to keep the upstream behavior."""
+
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
@@ -193,6 +200,7 @@ class CacheConfig:
             # Post-init/derived counters
             "num_gpu_blocks",
             "num_cpu_blocks",
+            "kv_cache_auto_trim_ratio",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
         }

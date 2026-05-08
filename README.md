@@ -62,7 +62,8 @@ This assumes one of the following is true:
 - Public runtime defaults now center on:
   - `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`
   - `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1`
-  - `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2]}'`
+  - `--max-model-len 262144`
+  - `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}'`
 - V100 `32 GB` reference configs for 4-card systems:
   - `Qwen3.5-27B-AWQ`
   - `Qwen3.6-35B-A3B-AWQ`
@@ -101,6 +102,75 @@ The following local `0.0.3` regression charts were generated on a 4-card V100
 - the public runtime defaults in this README prioritize stable serving over
   peak single-case benchmark numbers
 
+### Reproducible 27B decode baseline
+
+The `0.0.3` 27B speed baseline is measured as **incremental decode TPS**:
+
+```text
+incremental_decode_tps =
+  (decode64_output_tokens - decode1_output_tokens) /
+  (decode64_median_latency - decode1_median_latency)
+```
+
+This removes prefill/TTFT from the measurement. It is stricter than API
+streaming throughput and should not be compared directly with browser-side
+OpenAI streaming numbers.
+
+Reference result on `4 x Tesla PG503 / V100 32 GB`:
+
+| Model | Backend | TP | Custom all-reduce | Short-context incremental decode | 8K-context incremental decode |
+| --- | --- | ---: | --- | ---: | ---: |
+| `Qwen3.5-27B-AWQ` | `FLASH_ATTN_V100` | 4 | enabled | `86.31 tok/s` | `79.04 tok/s` |
+
+Strict reproduction command. This speed-only harness intentionally keeps
+`max_model_len=12288` to match the historical model-side regression test. The
+public serving commands below default to 256K context with
+`max_model_len=262144`.
+
+```bash
+export ONECAT_VLLM_REPO=/path/to/1Cat-vLLM-0.0.3/vllm
+cd /tmp
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+VLLM_USE_V1=1 \
+VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
+VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1 \
+python "$ONECAT_VLLM_REPO/tools/vllm_v100_backend_regression.py" \
+  --child \
+  --backend FLASH_ATTN_V100 \
+  --model /home/ymzx/models/Qwen3.5-27B-AWQ \
+  --dtype float16 \
+  --kv-cache-dtype auto \
+  --max-model-len 12288 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.88 \
+  --kv-cache-auto-trim-ratio 1.05 \
+  --tensor-parallel-size 4 \
+  --prompt-style qwen35-chat \
+  --disable-thinking \
+  --disable-mm \
+  --quality-max-tokens 1 \
+  --long-prompt-tokens 8202 \
+  --speed-warmup 3 \
+  --speed-iters 5 \
+  --skip-quality \
+  --child-output /tmp/qwen35_27b_fa2_baseline.json
+```
+
+Expected key latencies:
+
+- `batch1_prefill512_decode1`: about `0.179 s`
+- `batch1_prefill512_decode64`: about `0.909 s`
+- incremental decode: about `86 tok/s`
+
+Do **not** add `--disable-custom-all-reduce` for the 27B TP4 baseline. On the
+same hardware this drops short-context incremental decode from about
+`86.31 tok/s` to about `75.91 tok/s`.
+
 ## 微信交流群
 
 请扫描下方二维码加入微信群组：
@@ -131,9 +201,18 @@ The public launch commands below are written for 4-card V100 32 GB systems.
 - For Qwen3.5/Qwen3.6 text-only serving on V100 32 GB, the recommended public
   defaults are:
   - `--skip-mm-profiling`
+  - `--max-model-len 262144`
+  - `--kv-cache-auto-trim-ratio 1.05`
   - `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`
   - `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1`
-  - `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2]}'`
+  - `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}'`
+- `--gpu-memory-utilization` is an upper bound for the model executor. By
+  default, 1Cat-vLLM trims the final KV cache allocation to about
+  `1.05 * max_model_len * max_num_seqs`, so single-request 256K serving does
+  not preallocate KV capacity for many extra full-length requests. Set
+  `--kv-cache-auto-trim-ratio 0` to keep upstream vLLM's "use all requested
+  memory for KV cache" behavior, or use `--kv-cache-memory-bytes` for an exact
+  per-GPU KV cache size.
 - `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is experimental. Keep it disabled for
   the public 35B/122B MoE commands.
 - Direct paged prefill can be forced with `VLLM_FLASH_V100_ENABLE_PAGED_PREFILL=1`,
@@ -257,9 +336,11 @@ This image is pinned to:
 The runtime entrypoint should include these public defaults:
 
 - `--skip-mm-profiling`
+- `--max-model-len 262144`
+- `--kv-cache-auto-trim-ratio 1.05`
 - `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`
 - `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=1`
-- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2]}'`
+- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}'`
 
 If you want runtime caches to stay on a large disk, add these options to the
 `docker run` commands below:
@@ -286,7 +367,8 @@ docker run --rm \
   -e VLLM_SERVED_MODEL_NAME=Qwen3.5-27B-AWQ \
   -e VLLM_TENSOR_PARALLEL_SIZE=4 \
   -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=36000 \
+  -e VLLM_KV_CACHE_AUTO_TRIM_RATIO=1.05 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
   -e VLLM_MAX_NUM_SEQS=1 \
   -e VLLM_MAX_NUM_BATCHED_TOKENS=16384 \
   1cat-vllm-sm70:0.0.3
@@ -306,9 +388,10 @@ docker run --rm \
   -e VLLM_SERVED_MODEL_NAME=Qwen3.6-35B-A3B-AWQ \
   -e VLLM_TENSOR_PARALLEL_SIZE=4 \
   -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=33000 \
+  -e VLLM_KV_CACHE_AUTO_TRIM_RATIO=1.05 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
   -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=16384 \
+  -e VLLM_MAX_NUM_BATCHED_TOKENS=8192 \
   1cat-vllm-sm70:0.0.3
 ```
 
@@ -326,7 +409,8 @@ docker run --rm \
   -e VLLM_SERVED_MODEL_NAME=Qwen3.5-122B-A10B-AWQ \
   -e VLLM_TENSOR_PARALLEL_SIZE=4 \
   -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=256000 \
+  -e VLLM_KV_CACHE_AUTO_TRIM_RATIO=1.05 \
+  -e VLLM_MAX_MODEL_LEN=262144 \
   -e VLLM_MAX_NUM_SEQS=1 \
   -e VLLM_MAX_NUM_BATCHED_TOKENS=8096 \
   1cat-vllm-sm70:0.0.3
@@ -430,15 +514,22 @@ deployment docs.
 
 | Host | Model | TP | `max_model_len` | `max_num_seqs` | `max_num_batched_tokens` | Use case |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 4-card `32 GB` V100 | `Qwen3.5-27B-AWQ` | 4 | `36000` | `1` | `16384` | stable public default |
-| 4-card `32 GB` V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `33000` | `1` | `16384` | stable public default for MoE |
-| 4-card `32 GB` V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `256000` | `1` | `8096` | long-context large-model default |
+| 4-card `32 GB` V100 | `Qwen3.5-27B-AWQ` | 4 | `262144` | `1` | `16384` | stable public default |
+| 4-card `32 GB` V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `262144` | `1` | `8192` | stable public default for MoE |
+| 4-card `32 GB` V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `262144` | `1` | `8096` | long-context large-model default |
 
 Important wording:
 
 - `FLASH_ATTN_V100` is the recommended attention backend for V100 in `0.0.3`.
+- Public baseline launch commands in this README default to 256K context
+  (`max_model_len=262144`). If you publish or compare a new baseline, add its
+  exact launch command to this README.
 - Keep `max_num_seqs=1` for the public commands until your workload has been
   profiled locally.
+- On 32 GB V100 with `VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100`, the API server
+  default is also capped at `max_num_seqs=1` to avoid upstream's high-concurrency
+  default preallocating unnecessary KV cache and sampler/CUDAGraph buffers.
+- Do not pass `--disable-custom-all-reduce` for the 27B TP4 decode baseline.
 - `122B` uses a small prefill chunk budget to leave room for SM70 MoE
   temporary workspace during long-context serving.
 - `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` is not recommended for the 35B/122B
@@ -473,13 +564,17 @@ python -m vllm.entrypoints.openai.api_server \
   --dtype float16 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.88 \
-  --max-model-len 36000 \
+  --kv-cache-auto-trim-ratio 1.05 \
+  --max-model-len 262144 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 16384 \
   --skip-mm-profiling \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --generation-config vllm \
   --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2]}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}' \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -498,13 +593,17 @@ python -m vllm.entrypoints.openai.api_server \
   --dtype float16 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.88 \
-  --max-model-len 33000 \
+  --kv-cache-auto-trim-ratio 1.05 \
+  --max-model-len 262144 \
   --max-num-seqs 1 \
-  --max-num-batched-tokens 16384 \
+  --max-num-batched-tokens 8192 \
   --skip-mm-profiling \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --generation-config vllm \
   --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2]}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}' \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -523,13 +622,17 @@ python -m vllm.entrypoints.openai.api_server \
   --dtype float16 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.88 \
-  --max-model-len 256000 \
+  --kv-cache-auto-trim-ratio 1.05 \
+  --max-model-len 262144 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 8096 \
   --skip-mm-profiling \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --generation-config vllm \
   --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking": true}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2]}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8]}' \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -568,12 +671,11 @@ Example:
 ## Known limits
 
 - This branch is optimized for **SM70 / Tesla V100**, not for all hardware.
-- The public `36000` profile is the recommended 27B starting point on
-  4-card `32 GB` V100 systems.
-- The public `33000` profile is the recommended 35B MoE starting point on
-  4-card `32 GB` V100 systems.
-- The public `122B` command uses `max_model_len=256000` with a reduced
-  `max_num_batched_tokens=8096` prefill chunk budget.
+- Public launch commands default to 256K context with
+  `max_model_len=262144`.
+- The public 27B command keeps `max_num_batched_tokens=16384`.
+- The public 35B and 122B commands use smaller prefill chunk budgets to leave
+  room for MoE and long-context workspace.
 - Multimodal and vision workloads are not the default public profile for this
   release.
 - If you want guaranteed headroom for very long prompts, keep

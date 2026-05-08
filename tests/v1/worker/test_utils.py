@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+import pytest
 
-from vllm.v1.worker.utils import bind_kv_cache
+from vllm.config import CacheConfig
+from vllm.utils.mem_utils import MemorySnapshot
+from vllm.v1.worker.utils import bind_kv_cache, request_memory
 
 
 def test_bind_kv_cache(default_vllm_config):
@@ -90,3 +93,23 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+def test_request_memory_uses_current_free_memory_with_auto_trim():
+    snapshot = MemorySnapshot(device="cpu", auto_measure=False)
+    snapshot.total_memory = 1000
+    snapshot.free_memory = 800
+    cache_config = CacheConfig(gpu_memory_utilization=0.9)
+
+    assert request_memory(snapshot, cache_config) == 800
+
+
+def test_request_memory_still_raises_without_auto_trim():
+    snapshot = MemorySnapshot(device="cpu", auto_measure=False)
+    snapshot.total_memory = 1000
+    snapshot.free_memory = 800
+    cache_config = CacheConfig(gpu_memory_utilization=0.9)
+    cache_config.kv_cache_auto_trim_ratio = 0
+
+    with pytest.raises(ValueError):
+        request_memory(snapshot, cache_config)

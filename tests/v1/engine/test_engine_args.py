@@ -90,3 +90,25 @@ def test_defaults_with_usage_context():
     vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     assert vllm_config.scheduler_config.max_num_seqs == default_max_num_seqs
     assert vllm_config.scheduler_config.max_num_batched_tokens == default_server_tokens  # noqa: E501
+
+
+def test_v100_flash_attn_server_defaults_for_long_context(monkeypatch):
+    from vllm.engine import arg_utils
+    from vllm.utils.mem_constants import GiB_bytes
+
+    cap = type("DeviceCapability", (), {"major": 7, "minor": 0})()
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "FLASH_ATTN_V100")
+    monkeypatch.setattr(arg_utils.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(arg_utils.current_platform, "get_device_capability", lambda: cap)
+    monkeypatch.setattr(
+        arg_utils.current_platform, "get_device_total_memory", lambda: 32 * GiB_bytes
+    )
+    monkeypatch.setattr(arg_utils.current_platform, "get_device_name", lambda: "V100")
+    monkeypatch.setattr(arg_utils.current_platform, "is_tpu", lambda: False)
+    monkeypatch.setattr(arg_utils.current_platform, "is_cpu", lambda: False)
+
+    default_tokens, default_seqs = EngineArgs.get_batch_defaults(world_size=4)
+
+    assert default_tokens[UsageContext.OPENAI_API_SERVER] == 16384
+    assert default_seqs[UsageContext.OPENAI_API_SERVER] == 1
+    assert default_seqs[UsageContext.LLM_CLASS] == 256

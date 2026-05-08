@@ -1353,6 +1353,54 @@ def _max_memory_usage_bytes_from_groups(
     return group_size * page_size * blocks_needed
 
 
+def _maybe_trim_available_memory_for_kv_cache(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> int:
+    """Trim KV cache memory for low-concurrency serving when safe.
+
+    The worker-side memory profiler reports all memory allowed by
+    gpu_memory_utilization as available for KV cache. That is useful for high
+    concurrency, but wasteful for long-context single-request serving where
+    max_num_seqs explicitly limits concurrency.
+    """
+    cache_config = vllm_config.cache_config
+    ratio = cache_config.kv_cache_auto_trim_ratio
+    if (
+        ratio <= 0
+        or not kv_cache_groups
+        or cache_config.kv_cache_memory_bytes is not None
+        or cache_config.num_gpu_blocks_override is not None
+    ):
+        return available_memory
+
+    per_request_memory = _max_memory_usage_bytes_from_groups(
+        vllm_config, kv_cache_groups
+    )
+    if per_request_memory <= 0:
+        return available_memory
+
+    max_num_seqs = max(1, vllm_config.scheduler_config.max_num_seqs)
+    trim_ratio = max(1.0, ratio)
+    target_memory = int(per_request_memory * max_num_seqs * trim_ratio)
+    target_memory = max(target_memory, per_request_memory)
+    if target_memory >= available_memory:
+        return available_memory
+
+    logger.info_once(
+        "Auto-trimming KV cache memory from %s GiB to %s GiB "
+        "(max_num_seqs=%d, trim_ratio=%.2f). Set "
+        "--kv-cache-auto-trim-ratio 0 or --kv-cache-memory-bytes to disable.",
+        format_gib(available_memory),
+        format_gib(target_memory),
+        max_num_seqs,
+        trim_ratio,
+        scope="local",
+    )
+    return target_memory
+
+
 def _estimate_max_model_len_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1541,6 +1589,9 @@ def get_kv_cache_configs(
         assert sum(
             len(group.layer_names) for group in kv_cache_groups_one_worker
         ) == len(kv_cache_spec_one_worker), "Some layers are not assigned to any group."
+        available_memory_one_worker = _maybe_trim_available_memory_for_kv_cache(
+            vllm_config, kv_cache_groups_one_worker, available_memory_one_worker
+        )
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, kv_cache_groups_one_worker, available_memory_one_worker
