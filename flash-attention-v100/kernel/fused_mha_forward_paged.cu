@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <string>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -11,6 +12,7 @@
 using namespace nvcuda::wmma;
 
 #include "flash_v100_traits.cuh"
+#include "fp8_kv_utils.cuh"
 
 #define WMMA_M 16
 #define WMMA_N 16
@@ -25,6 +27,23 @@ using namespace nvcuda::wmma;
 #define MAX_SMEM_PER_SM         98304
 
 #define WARP_ALLOC_GROUP        4
+
+namespace {
+
+int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
+    if (kv_cache_dtype == "auto" || kv_cache_dtype == "bfloat16") {
+        return flash_v100::KV_CACHE_DTYPE_FP16;
+    }
+    if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
+        return flash_v100::KV_CACHE_DTYPE_FP8_E4M3;
+    }
+    if (kv_cache_dtype == "fp8_e5m2") {
+        return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
+    }
+    return -1;
+}
+
+}  // namespace
 
 #define BLOCK_M_16  16
 #define BLOCK_N_16  512
@@ -93,12 +112,12 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
     __syncwarp();
 }
 
-template<int D, bool IS_CAUSAL>
+template<int D, bool IS_CAUSAL, int KV_DTYPE>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_kernel_paged(
     const __half* __restrict__ Q,
-    const __half* __restrict__ K_cache,
-    const __half* __restrict__ V_cache,
+    const void* __restrict__ K_cache,
+    const void* __restrict__ V_cache,
           __half* __restrict__ Out,
            float* __restrict__ softmax_lse,
     const int* __restrict__ block_table,
@@ -115,7 +134,9 @@ flash_attention_forward_kernel_paged(
     const int64_t v_block_stride,
     const int64_t v_token_stride,
     const int64_t v_head_stride,
-    const float softmax_scale
+    const float softmax_scale,
+    const float k_scale,
+    const float v_scale
 ) {
     using Config = KernelConfig<D>;
     using Traits = FlashV100Traits<D>;
@@ -258,54 +279,73 @@ flash_attention_forward_kernel_paged(
             two_page_tile && second_page_rows > 0
                 ? s_block_ids[start_page + 1]
                 : -1;
-        const uint4* k_page0_vec = reinterpret_cast<const uint4*>(
-            K_cache + (int64_t)physical_block_idx0 * k_block_stride
-            + (int64_t)page_offset * k_token_stride
-            + (int64_t)kv_head_id * k_head_stride);
-        const uint4* k_page1_vec =
-            two_page_tile && second_page_rows > 0
-                ? reinterpret_cast<const uint4*>(
-                      K_cache + (int64_t)physical_block_idx1 * k_block_stride
-                      + (int64_t)kv_head_id * k_head_stride)
-                : nullptr;
+        if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+            const __half* K_cache_h = reinterpret_cast<const __half*>(K_cache);
+            const uint4* k_page0_vec = reinterpret_cast<const uint4*>(
+                K_cache_h + (int64_t)physical_block_idx0 * k_block_stride
+                + (int64_t)page_offset * k_token_stride
+                + (int64_t)kv_head_id * k_head_stride);
+            const uint4* k_page1_vec =
+                two_page_tile && second_page_rows > 0
+                    ? reinterpret_cast<const uint4*>(
+                          K_cache_h + (int64_t)physical_block_idx1 * k_block_stride
+                          + (int64_t)kv_head_id * k_head_stride)
+                    : nullptr;
 
-        #pragma unroll 2
-        for (int idx = tid; idx < (valid_k_rows * d_stride_uint4);
-             idx += THREADS_PER_BLOCK) {
-            const int row = idx / d_stride_uint4;
-            const int vec_col = idx % d_stride_uint4;
+            #pragma unroll 2
+            for (int idx = tid; idx < (valid_k_rows * d_stride_uint4);
+                 idx += THREADS_PER_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
 
-            uint4 k_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < d_stride_uint4) {
-                if (single_page_tile) {
-                    k_val = __ldg(&k_page0_vec[row * row_stride_uint4 + vec_col]);
-                } else if (two_page_tile) {
-                    if (row < first_page_rows) {
-                        k_val = __ldg(
-                            &k_page0_vec[row * row_stride_uint4 + vec_col]);
+                uint4 k_val = make_uint4(0, 0, 0, 0);
+                if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                    if (single_page_tile) {
+                        k_val = __ldg(&k_page0_vec[row * row_stride_uint4 + vec_col]);
+                    } else if (two_page_tile) {
+                        if (row < first_page_rows) {
+                            k_val = __ldg(
+                                &k_page0_vec[row * row_stride_uint4 + vec_col]);
+                        } else {
+                            const int row_page1 = row - first_page_rows;
+                            k_val = __ldg(
+                                &k_page1_vec[row_page1 * row_stride_uint4 + vec_col]);
+                        }
                     } else {
-                        const int row_page1 = row - first_page_rows;
-                        k_val = __ldg(
-                            &k_page1_vec[row_page1 * row_stride_uint4 + vec_col]);
+                        const uint4* k_vec = reinterpret_cast<const uint4*>(K_cache_h);
+                        const int global_token_idx = start_col + row;
+                        const int virtual_block_idx =
+                            global_token_idx / page_block_size;
+                        const int block_offset = global_token_idx % page_block_size;
+                        const int physical_block_idx_slow =
+                            s_block_ids[virtual_block_idx];
+                        const int64_t physical_offset_halfs =
+                            (int64_t)physical_block_idx_slow * k_block_stride
+                            + (int64_t)block_offset * k_token_stride
+                            + (int64_t)kv_head_id * k_head_stride;
+                        const int64_t physical_offset_uint4 =
+                            (physical_offset_halfs / PER_UINT4) + vec_col;
+                        k_val = __ldg(&k_vec[physical_offset_uint4]);
                     }
-                } else {
-                    const uint4* k_vec = reinterpret_cast<const uint4*>(K_cache);
-                    const int global_token_idx = start_col + row;
-                    const int virtual_block_idx =
-                        global_token_idx / page_block_size;
-                    const int block_offset = global_token_idx % page_block_size;
-                    const int physical_block_idx_slow =
-                        s_block_ids[virtual_block_idx];
-                    const int64_t physical_offset_halfs =
-                        (int64_t)physical_block_idx_slow * k_block_stride
-                        + (int64_t)block_offset * k_token_stride
-                        + (int64_t)kv_head_id * k_head_stride;
-                    const int64_t physical_offset_uint4 =
-                        (physical_offset_halfs / PER_UINT4) + vec_col;
-                    k_val = __ldg(&k_vec[physical_offset_uint4]);
                 }
+                sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
             }
-            sK_vec[row * kv_stride_uint4 + vec_col] = k_val;
+        } else {
+            for (int idx = tid; idx < valid_k_rows * D; idx += THREADS_PER_BLOCK) {
+                const int row = idx / D;
+                const int col = idx % D;
+                const int global_token_idx = start_col + row;
+                const int virtual_block_idx = global_token_idx / page_block_size;
+                const int block_offset = global_token_idx % page_block_size;
+                const int physical_block_idx_slow = s_block_ids[virtual_block_idx];
+                const int64_t physical_offset =
+                    (int64_t)physical_block_idx_slow * k_block_stride
+                    + (int64_t)block_offset * k_token_stride
+                    + (int64_t)kv_head_id * k_head_stride + col;
+                sK[row * KV_STRIDE + col] =
+                    flash_v100::load_kv_cache_half<KV_DTYPE>(
+                        K_cache, physical_offset, k_scale);
+            }
         }
         __syncthreads();
 
@@ -497,54 +537,73 @@ flash_attention_forward_kernel_paged(
 
         uint4* sV_vec = reinterpret_cast<uint4*>(sV);
         const int64_t v_row_stride_uint4 = v_row_stride / PER_UINT4;
-        const uint4* v_page0_vec = reinterpret_cast<const uint4*>(
-            V_cache + (int64_t)physical_block_idx0 * v_block_stride
-            + (int64_t)page_offset * v_token_stride
-            + (int64_t)kv_head_id * v_head_stride);
-        const uint4* v_page1_vec =
-            two_page_tile && second_page_rows > 0
-                ? reinterpret_cast<const uint4*>(
-                      V_cache + (int64_t)physical_block_idx1 * v_block_stride
-                      + (int64_t)kv_head_id * v_head_stride)
-                : nullptr;
+        if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+            const __half* V_cache_h = reinterpret_cast<const __half*>(V_cache);
+            const uint4* v_page0_vec = reinterpret_cast<const uint4*>(
+                V_cache_h + (int64_t)physical_block_idx0 * v_block_stride
+                + (int64_t)page_offset * v_token_stride
+                + (int64_t)kv_head_id * v_head_stride);
+            const uint4* v_page1_vec =
+                two_page_tile && second_page_rows > 0
+                    ? reinterpret_cast<const uint4*>(
+                          V_cache_h + (int64_t)physical_block_idx1 * v_block_stride
+                          + (int64_t)kv_head_id * v_head_stride)
+                    : nullptr;
 
-        #pragma unroll 2
-        for (int idx = tid; idx < (valid_k_rows * d_stride_uint4);
-             idx += THREADS_PER_BLOCK) {
-            const int row = idx / d_stride_uint4;
-            const int vec_col = idx % d_stride_uint4;
+            #pragma unroll 2
+            for (int idx = tid; idx < (valid_k_rows * d_stride_uint4);
+                 idx += THREADS_PER_BLOCK) {
+                const int row = idx / d_stride_uint4;
+                const int vec_col = idx % d_stride_uint4;
 
-            uint4 v_val = make_uint4(0, 0, 0, 0);
-            if (row < valid_k_rows && vec_col < d_stride_uint4) {
-                if (single_page_tile) {
-                    v_val = __ldg(&v_page0_vec[row * v_row_stride_uint4 + vec_col]);
-                } else if (two_page_tile) {
-                    if (row < first_page_rows) {
-                        v_val = __ldg(
-                            &v_page0_vec[row * v_row_stride_uint4 + vec_col]);
+                uint4 v_val = make_uint4(0, 0, 0, 0);
+                if (row < valid_k_rows && vec_col < d_stride_uint4) {
+                    if (single_page_tile) {
+                        v_val = __ldg(&v_page0_vec[row * v_row_stride_uint4 + vec_col]);
+                    } else if (two_page_tile) {
+                        if (row < first_page_rows) {
+                            v_val = __ldg(
+                                &v_page0_vec[row * v_row_stride_uint4 + vec_col]);
+                        } else {
+                            const int row_page1 = row - first_page_rows;
+                            v_val = __ldg(
+                                &v_page1_vec[row_page1 * v_row_stride_uint4 + vec_col]);
+                        }
                     } else {
-                        const int row_page1 = row - first_page_rows;
-                        v_val = __ldg(
-                            &v_page1_vec[row_page1 * v_row_stride_uint4 + vec_col]);
+                        const uint4* v_vec = reinterpret_cast<const uint4*>(V_cache_h);
+                        const int global_token_idx = start_col + row;
+                        const int virtual_block_idx =
+                            global_token_idx / page_block_size;
+                        const int block_offset = global_token_idx % page_block_size;
+                        const int physical_block_idx_slow =
+                            s_block_ids[virtual_block_idx];
+                        const int64_t physical_offset_halfs =
+                            (int64_t)physical_block_idx_slow * v_block_stride
+                            + (int64_t)block_offset * v_token_stride
+                            + (int64_t)kv_head_id * v_head_stride;
+                        const int64_t physical_offset_uint4 =
+                            (physical_offset_halfs / PER_UINT4) + vec_col;
+                        v_val = __ldg(&v_vec[physical_offset_uint4]);
                     }
-                } else {
-                    const uint4* v_vec = reinterpret_cast<const uint4*>(V_cache);
-                    const int global_token_idx = start_col + row;
-                    const int virtual_block_idx =
-                        global_token_idx / page_block_size;
-                    const int block_offset = global_token_idx % page_block_size;
-                    const int physical_block_idx_slow =
-                        s_block_ids[virtual_block_idx];
-                    const int64_t physical_offset_halfs =
-                        (int64_t)physical_block_idx_slow * v_block_stride
-                        + (int64_t)block_offset * v_token_stride
-                        + (int64_t)kv_head_id * v_head_stride;
-                    const int64_t physical_offset_uint4 =
-                        (physical_offset_halfs / PER_UINT4) + vec_col;
-                    v_val = __ldg(&v_vec[physical_offset_uint4]);
                 }
+                sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
             }
-            sV_vec[row * kv_stride_uint4 + vec_col] = v_val;
+        } else {
+            for (int idx = tid; idx < valid_k_rows * D; idx += THREADS_PER_BLOCK) {
+                const int row = idx / D;
+                const int col = idx % D;
+                const int global_token_idx = start_col + row;
+                const int virtual_block_idx = global_token_idx / page_block_size;
+                const int block_offset = global_token_idx % page_block_size;
+                const int physical_block_idx_slow = s_block_ids[virtual_block_idx];
+                const int64_t physical_offset =
+                    (int64_t)physical_block_idx_slow * v_block_stride
+                    + (int64_t)block_offset * v_token_stride
+                    + (int64_t)kv_head_id * v_head_stride + col;
+                sV[row * KV_STRIDE + col] =
+                    flash_v100::load_kv_cache_half<KV_DTYPE>(
+                        V_cache, physical_offset, v_scale);
+            }
         }
         __syncthreads();
 
@@ -625,7 +684,7 @@ flash_attention_forward_kernel_paged(
     }
 }
 
-template<int D>
+template<int D, int KV_DTYPE>
 void launcher_flash_attention_forward_paged(
     const torch::Tensor& Q,
     const torch::Tensor& K_cache,
@@ -636,6 +695,8 @@ void launcher_flash_attention_forward_paged(
     const torch::Tensor& seq_lens,
     float softmax_scale,
     bool is_causal,
+    float k_scale,
+    float v_scale,
     cudaStream_t stream
 ) {
     using Config = KernelConfig<D>;
@@ -666,16 +727,17 @@ void launcher_flash_attention_forward_paged(
                 " bytes");
 
     auto kernel = is_causal
-                      ? (void*)flash_attention_forward_kernel_paged<D, true>
-                      : (void*)flash_attention_forward_kernel_paged<D, false>;
+                      ? (void*)flash_attention_forward_kernel_paged<D, true, KV_DTYPE>
+                      : (void*)flash_attention_forward_kernel_paged<D, false, KV_DTYPE>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem);
 
     if (is_causal) {
-        flash_attention_forward_kernel_paged<D, true><<<grid, block, smem, stream>>>(
+        flash_attention_forward_kernel_paged<D, true, KV_DTYPE>
+            <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
-            reinterpret_cast<const __half*>(K_cache.data_ptr()),
-            reinterpret_cast<const __half*>(V_cache.data_ptr()),
+            K_cache.data_ptr(),
+            V_cache.data_ptr(),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
             block_table.data_ptr<int>(),
@@ -692,13 +754,16 @@ void launcher_flash_attention_forward_paged(
             v_block_stride,
             v_token_stride,
             v_head_stride,
-            softmax_scale
+            softmax_scale,
+            k_scale,
+            v_scale
         );
     } else {
-        flash_attention_forward_kernel_paged<D, false><<<grid, block, smem, stream>>>(
+        flash_attention_forward_kernel_paged<D, false, KV_DTYPE>
+            <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
-            reinterpret_cast<const __half*>(K_cache.data_ptr()),
-            reinterpret_cast<const __half*>(V_cache.data_ptr()),
+            K_cache.data_ptr(),
+            V_cache.data_ptr(),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
             block_table.data_ptr<int>(),
@@ -715,7 +780,9 @@ void launcher_flash_attention_forward_paged(
             v_block_stride,
             v_token_stride,
             v_head_stride,
-            softmax_scale
+            softmax_scale,
+            k_scale,
+            v_scale
         );
     }
 }
@@ -727,11 +794,25 @@ at::Tensor flash_attention_prefill_paged(
     std::optional<at::Tensor>& out_,
     const at::Tensor& block_table,
     const at::Tensor& seq_lens,
-    const float softmax_scale
+    const float softmax_scale,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale
 ) {
     TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
-    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
-    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+    const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
+    TORCH_CHECK(kv_dtype_code >= 0, "Unsupported kv_cache_dtype: ", kv_cache_dtype);
+    if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
+        TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
+        TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+    } else {
+        TORCH_CHECK(k_cache.dtype() == torch::kUInt8,
+                    "fp8 k_cache must be stored as uint8");
+        TORCH_CHECK(v_cache.dtype() == torch::kUInt8,
+                    "fp8 v_cache must be stored as uint8");
+        TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
+                    "fp8 k/v scales must be positive");
+    }
     TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
                 "Tensors must be on CUDA");
     TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
@@ -763,35 +844,50 @@ at::Tensor flash_attention_prefill_paged(
     bool sm70 = props->major == 7 && props->minor == 0;
     TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
+    #define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                             \
+        launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(            \
+            q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,  \
+            softmax_scale, true, k_scale, v_scale, stream)
+
+    #define LAUNCH_PAGED_BY_KV(HDIM)                                            \
+        do {                                                                    \
+            switch (kv_dtype_code) {                                            \
+                case flash_v100::KV_CACHE_DTYPE_FP16:                           \
+                    LAUNCH_PAGED_TYPED(HDIM, flash_v100::KV_CACHE_DTYPE_FP16);  \
+                    break;                                                      \
+                case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                       \
+                    LAUNCH_PAGED_TYPED(HDIM, flash_v100::KV_CACHE_DTYPE_FP8_E4M3); \
+                    break;                                                      \
+                case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                       \
+                    LAUNCH_PAGED_TYPED(HDIM, flash_v100::KV_CACHE_DTYPE_FP8_E5M2); \
+                    break;                                                      \
+                default:                                                        \
+                    TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype); \
+            }                                                                   \
+        } while (0)
+
     switch (D) {
         case 16:
-            launcher_flash_attention_forward_paged<16>(
-                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
-                seq_lens, softmax_scale, true, stream);
+            LAUNCH_PAGED_BY_KV(16);
             break;
         case 32:
-            launcher_flash_attention_forward_paged<32>(
-                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
-                seq_lens, softmax_scale, true, stream);
+            LAUNCH_PAGED_BY_KV(32);
             break;
         case 64:
-            launcher_flash_attention_forward_paged<64>(
-                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
-                seq_lens, softmax_scale, true, stream);
+            LAUNCH_PAGED_BY_KV(64);
             break;
         case 128:
-            launcher_flash_attention_forward_paged<128>(
-                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
-                seq_lens, softmax_scale, true, stream);
+            LAUNCH_PAGED_BY_KV(128);
             break;
         case 256:
-            launcher_flash_attention_forward_paged<256>(
-                q, k_cache, v_cache, out_fp16, softmax_lse, block_table,
-                seq_lens, softmax_scale, true, stream);
+            LAUNCH_PAGED_BY_KV(256);
             break;
         default:
             TORCH_CHECK(false, "Unsupported D: ", D);
     }
+
+    #undef LAUNCH_PAGED_BY_KV
+    #undef LAUNCH_PAGED_TYPED
 
     return out_fp16;
 }

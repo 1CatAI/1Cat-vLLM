@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import json
 import os
 from collections.abc import Callable, Sequence
 from functools import cached_property
@@ -10,7 +11,11 @@ from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
 )
 
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+import vllm.envs as envs
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRequest,
+)
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
@@ -24,9 +29,11 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.utils import get_json_schema_from_tools
+from vllm.tool_parsers.utils import Tool, get_json_schema_from_tools
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import import_from_path
+
+__all__ = ["Tool"]
 
 logger = init_logger(__name__)
 
@@ -38,7 +45,13 @@ class ToolParser:
     derived classes.
     """
 
-    def __init__(self, tokenizer: TokenizerLike):
+    supports_required_and_named: bool = True
+
+    def __init__(
+        self,
+        tokenizer: TokenizerLike,
+        tools: list[Tool] | None = None,
+    ):
         self.prev_tool_call_arr: list[dict] = []
         # the index of the tool call that is currently being parsed
         self.current_tool_id: int = -1
@@ -46,6 +59,7 @@ class ToolParser:
         self.streamed_args_for_tool: list[str] = []
 
         self.model_tokenizer = tokenizer
+        self.tools = tools or []
 
     @cached_property
     def vocab(self) -> dict[str, int]:
@@ -53,12 +67,37 @@ class ToolParser:
         # whereas all tokenizers have .get_vocab()
         return self.model_tokenizer.get_vocab()
 
-    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
         """
         Static method that used to adjust the request parameters.
         """
         if not request.tools:
             return request
+
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and getattr(envs, "VLLM_ENFORCE_STRICT_TOOL_CALLING", False)
+        ):
+            need_tool_calling = (
+                request.tool_choice == "auto"
+                or request.tool_choice == "required"
+                or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            )
+            if need_tool_calling:
+                structural_tag = self.get_structural_tag(request)
+                if structural_tag is not None:
+                    if request.structured_outputs is None:
+                        request.structured_outputs = StructuredOutputsParams(
+                            structural_tag=json.dumps(structural_tag.model_dump())
+                        )
+                    else:
+                        request.structured_outputs.structural_tag = json.dumps(
+                            structural_tag.model_dump()
+                        )
+                    return request
+
         json_schema_from_tool = get_json_schema_from_tools(
             tool_choice=request.tool_choice, tools=request.tools
         )
@@ -82,6 +121,9 @@ class ToolParser:
                 )
 
         return request
+
+    def get_structural_tag(self, request: ChatCompletionRequest):
+        return None
 
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest

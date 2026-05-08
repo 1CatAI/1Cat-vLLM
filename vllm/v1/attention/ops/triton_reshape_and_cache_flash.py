@@ -7,6 +7,12 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
+def _fp8_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    if kv_cache_dtype == "fp8_e5m2":
+        return torch.float8_e5m2
+    return current_platform.fp8_dtype()
+
+
 @triton.jit
 def reshape_and_cache_kernel_flash(
     key_ptr,  # [num_tokens, num_heads, head_size]
@@ -149,7 +155,7 @@ def triton_reshape_and_cache_flash(
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
     kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
+        _fp8_cache_torch_dtype(kv_cache_dtype)
         if kv_cache_dtype.startswith("fp8")
         else key_cache.dtype
     )
@@ -327,7 +333,7 @@ def triton_reshape_and_cache_flash_diffkv(
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
     kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
+        _fp8_cache_torch_dtype(kv_cache_dtype)
         if kv_cache_dtype.startswith("fp8")
         else kv_cache.dtype
     )

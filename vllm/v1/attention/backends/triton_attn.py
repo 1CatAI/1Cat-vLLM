@@ -37,6 +37,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+def _fp8_cache_torch_dtype(kv_cache_dtype: str) -> torch.dtype:
+    if kv_cache_dtype == "fp8_e5m2":
+        return torch.float8_e5m2
+    return current_platform.fp8_dtype()
+
+
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -388,7 +394,7 @@ class TritonAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.attn_type = attn_type
-        self.fp8_dtype = current_platform.fp8_dtype()
+        self.fp8_dtype = _fp8_cache_torch_dtype(kv_cache_dtype)
 
         self.sinks = sinks
         if sinks is not None:
@@ -398,7 +404,9 @@ class TritonAttentionImpl(AttentionImpl):
                 f"num_heads: {num_heads}."
             )
         self.use_alibi_sqrt = use_alibi_sqrt
-        self.supports_quant_query_input = current_platform.is_cuda()
+        self.supports_quant_query_input = (
+            current_platform.is_cuda() and kv_cache_dtype != "fp8_e5m2"
+        )
 
     def forward(
         self,

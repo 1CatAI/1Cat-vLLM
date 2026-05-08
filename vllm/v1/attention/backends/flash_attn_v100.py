@@ -104,7 +104,7 @@ def _extract_contiguous_kv_from_paged_cache(
                 "expected dimension 2 at axis 0 or 1"
             )
 
-    if paged_kv_utils is not None:
+    if paged_kv_utils is not None and key_cache.dtype != torch.uint8:
         if hasattr(paged_kv_utils, "paged_kv_to_contiguous"):
             k_cont, v_cont = paged_kv_utils.paged_kv_to_contiguous(
                 key_cache, value_cache, block_table, seq_lens)
@@ -153,6 +153,29 @@ def _extract_contiguous_kv_from_paged_cache(
     return k_cont, v_cont
 
 
+def _fp8_dtype_from_cache_dtype(kv_cache_dtype: str) -> torch.dtype:
+    if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        return torch.float8_e4m3fn
+    if kv_cache_dtype == "fp8_e5m2":
+        return torch.float8_e5m2
+    raise ValueError(f"Unsupported FLASH_ATTN_V100 fp8 dtype: {kv_cache_dtype}")
+
+
+def _dequantize_fp8_contiguous_kv(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not kv_cache_dtype.startswith("fp8"):
+        return key, value
+    fp8_dtype = _fp8_dtype_from_cache_dtype(kv_cache_dtype)
+    key = key.view(fp8_dtype).to(torch.float16) * k_scale
+    value = value.view(fp8_dtype).to(torch.float16) * v_scale
+    return key, value
+
+
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     """Attach CPU metadata for the dense prefill path."""
 
@@ -172,6 +195,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         super().__init__(*args, **kwargs)
         (self.flash_attn_func, self.flash_attn_decode_paged,
          self.flash_attn_prefill_paged) = _get_flash_ops()
+        # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
+        # as storage compression only, with K/V dequantized inside FA2 kernels.
+        self.supports_quant_query_input = False
         self.use_flash_v100 = self.flash_attn_func is not None
         self.use_flash_v100_decode = self.flash_attn_decode_paged is not None
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
@@ -306,6 +332,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
+        supported_kv_dtype = (
+            not self.kv_cache_dtype.startswith("fp8")
+            or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
@@ -313,7 +343,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.logits_soft_cap == 0
             and self.sinks is None
             and self.sliding_window == (-1, -1)
-            and not self.kv_cache_dtype.startswith("fp8")
+            and supported_kv_dtype
         )
 
     def forward(
@@ -346,7 +376,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.use_flash_v100 and not _warned_feature_fallback:
                 logger.warning(
                     "FLASH_ATTN_V100 fallback to Triton due to unsupported "
-                    "attention features (alibi/softcap/sliding window/fp8/etc)."
+                    "attention features or KV cache dtype."
                 )
                 _warned_feature_fallback = True
             return super().forward(
@@ -398,6 +428,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     _logged_prefill_prefix_flash = True
                 self._reset_decode_cache()
                 return self._flash_v100_prefill_with_prefix(
+                    layer,
                     query,
                     kv_cache,
                     attn_metadata,
@@ -436,6 +467,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _logged_decode_flash = True
         return self._flash_v100_decode(
+            layer,
             query,
             key,
             value,
@@ -511,6 +543,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _flash_v100_decode(
         self,
+        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -539,11 +572,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             attn_metadata.seq_lens,
             softmax_scale=self.scale,
             out=out_view,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
         )
         return output
 
     def _flash_v100_prefill_with_prefix(
         self,
+        layer: torch.nn.Module,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
@@ -589,6 +626,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     attn_metadata.block_table[i:i + 1],
                     attn_metadata.seq_lens[i:i + 1],
                     softmax_scale=self.scale,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
                 )
                 if debug_compare and not _logged_prefill_compare:
                     seq_len = int(seq_lens[i].item())
@@ -600,6 +640,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         head_dim=head_dim,
                         block_size=block_size,
                         total_tokens=seq_len,
+                    )
+                    k_cont, v_cont = _dequantize_fp8_contiguous_kv(
+                        k_cont,
+                        v_cont,
+                        self.kv_cache_dtype,
+                        float(layer._k_scale_float),
+                        float(layer._v_scale_float),
                     )
                     ref_out = self.flash_attn_func(
                         query[start:end].unsqueeze(0),
@@ -667,6 +714,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     block_size=block_size,
                     total_tokens=seq_len,
                 )
+                k_cont, v_cont = _dequantize_fp8_contiguous_kv(
+                    k_cont,
+                    v_cont,
+                    self.kv_cache_dtype,
+                    float(layer._k_scale_float),
+                    float(layer._v_scale_float),
+                )
 
                 out_seq = self.flash_attn_func(
                     query[start:end].unsqueeze(0),
@@ -700,5 +754,5 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        # Flash Attention V100 requires head_dim % 8 == 0.
-        return [64, 80, 96, 112, 128, 256]
+        # Keep this aligned with the dense prefill kernel dispatch table.
+        return [64, 128, 256]

@@ -284,6 +284,9 @@ def flash_attn_decode_paged(
     seq_lens: torch.Tensor,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -308,6 +311,9 @@ def flash_attn_decode_paged(
         exp_sums,
         softmax_scale,
         partition_size,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
     )
 
 def flash_attn_prefill_paged(
@@ -318,6 +324,9 @@ def flash_attn_prefill_paged(
     seq_lens: torch.Tensor,
     softmax_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -338,6 +347,9 @@ def flash_attn_prefill_paged(
         block_table,
         seq_lens,
         softmax_scale,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
     )
     return out_.permute(0, 2, 1, 3).contiguous()
 

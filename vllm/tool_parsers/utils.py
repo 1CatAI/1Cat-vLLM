@@ -1,22 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import json
 from json import JSONDecodeError, JSONDecoder
-from typing import Any
+from typing import Any, TypeAlias
 
 import partial_json_parser
 from openai.types.responses import (
     FunctionTool,
     ToolChoiceFunction,
 )
-from openai.types.responses.tool import Tool
+from openai.types.responses.tool import Tool as ResponsesTool
 from partial_json_parser.core.options import Allow
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
 )
+
+Tool: TypeAlias = ChatCompletionToolsParam | ResponsesTool
+
+
+def partial_tag_overlap(text: str, tag: str) -> int:
+    """Length of the longest prefix of *tag* that matches a suffix of *text*."""
+    max_check = min(len(tag) - 1, len(text))
+    for k in range(max_check, 0, -1):
+        if text.endswith(tag[:k]):
+            return k
+    return 0
 
 
 def find_common_prefix(s1: str, s2: str) -> str:
@@ -145,9 +157,27 @@ def _extract_tool_info(
         raise TypeError(f"Unsupported tool type: {type(tool)}")
 
 
+def find_tool_properties(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> dict[str, Any]:
+    """Find a tool by name and return its properties dict, or {}."""
+    if not tools:
+        return {}
+    for tool in tools:
+        name, params = _extract_tool_info(tool)
+        if name == tool_name:
+            return (params or {}).get("properties", {})
+    return {}
+
+
 def _get_tool_schema_from_tool(tool: Tool | ChatCompletionToolsParam) -> dict:
     name, params = _extract_tool_info(tool)
-    params = params if params else {"type": "object", "properties": {}}
+    params = (
+        copy.deepcopy(params) if params else {"type": "object", "properties": {}}
+    )
+    if isinstance(params, dict):
+        params.pop("$defs", None)
     return {
         "properties": {
             "name": {"type": "string", "enum": [name]},
@@ -165,7 +195,7 @@ def _get_tool_schema_defs(
         _, params = _extract_tool_info(tool)
         if params is None:
             continue
-        defs = params.pop("$defs", {})
+        defs = params.get("$defs", {})
         for def_name, def_schema in defs.items():
             if def_name in all_defs and all_defs[def_name] != def_schema:
                 raise ValueError(

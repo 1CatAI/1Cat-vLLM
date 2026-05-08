@@ -14,6 +14,7 @@ from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import import_from_path
 
 if TYPE_CHECKING:
+    from vllm.config import ModelConfig
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
     )
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 else:
     ChatCompletionRequest = Any
     DeltaMessage = Any
+    ModelConfig = Any
     ResponsesRequest = Any
     TokenizerLike = Any
 
@@ -43,12 +45,21 @@ class ReasoningParser:
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         self.model_tokenizer = tokenizer
+        self._model_config: ModelConfig | None = kwargs.get("model_config")
 
     @cached_property
     def vocab(self) -> dict[str, int]:
         # NOTE: Only PreTrainedTokenizerFast is guaranteed to have .vocab
         # whereas all tokenizers have .get_vocab()
         return self.model_tokenizer.get_vocab()
+
+    @property
+    def reasoning_start_str(self) -> str | None:
+        return None
+
+    @property
+    def reasoning_end_str(self) -> str | None:
+        return None
 
     @abstractmethod
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
@@ -104,6 +115,9 @@ class ReasoningParser:
             The extracted content from the input_ids.
         """
 
+    def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
+        return 0
+
     @abstractmethod
     def extract_reasoning(
         self,
@@ -145,6 +159,12 @@ class ReasoningParser:
         the current tokens/diffs, but also the information about what has
         previously been parsed and extracted (see constructor)
         """
+
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        return request
 
     def prepare_structured_tag(
         self,

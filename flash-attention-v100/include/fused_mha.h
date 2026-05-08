@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <string>
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 
@@ -33,7 +34,10 @@ at::Tensor flash_attention_decode_paged(
     at::Tensor& max_logits,
     at::Tensor& exp_sums,
     const float softmax_scale,
-    const int partition_size
+    const int partition_size,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale
 );
 
 at::Tensor flash_attention_prefill_paged(
@@ -43,7 +47,10 @@ at::Tensor flash_attention_prefill_paged(
     std::optional<at::Tensor>& out_,
     const at::Tensor& block_table,
     const at::Tensor& seq_lens,
-    const float softmax_scale
+    const float softmax_scale,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale
 );
 
 std::vector<at::Tensor> flash_attention_backward(

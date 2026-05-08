@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT: bool = False
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
+    VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1430,6 +1431,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If disabled (default), raises an exception and fails the request
     "VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY": lambda: bool(
         int(os.getenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "0"))
+    ),
+    # When enabled, use model-specific structural tags to constrain tool-call
+    # output to the model's native tool format and schema.
+    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: bool(
+        int(os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0"))
     ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(

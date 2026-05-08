@@ -266,6 +266,14 @@ async def init_app_state(
 ) -> None:
     vllm_config = engine_client.vllm_config
 
+    from vllm.tool_parsers.structural_tag_registry import (
+        set_enable_structured_outputs_in_reasoning,
+    )
+
+    set_enable_structured_outputs_in_reasoning(
+        vllm_config.structured_outputs_config.enable_in_reasoning
+    )
+
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
     else:

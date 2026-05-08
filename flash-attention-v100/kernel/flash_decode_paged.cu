@@ -2,12 +2,28 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include <string>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include "fp8_kv_utils.cuh"
+
 namespace {
+
+int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
+  if (kv_cache_dtype == "auto" || kv_cache_dtype == "bfloat16") {
+    return flash_v100::KV_CACHE_DTYPE_FP16;
+  }
+  if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
+    return flash_v100::KV_CACHE_DTYPE_FP8_E4M3;
+  }
+  if (kv_cache_dtype == "fp8_e5m2") {
+    return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
+  }
+  return -1;
+}
 
 constexpr int kWarpSize = 32;
 constexpr int kThreadsPerBlock = 256;
@@ -97,11 +113,47 @@ __device__ __forceinline__ float dot_qk_half2(
   return warp_reduce_sum(acc);
 }
 
-template<int D, int PARTITION_SIZE>
+template<int D, int KV_DTYPE>
+__device__ __forceinline__ float dot_qk_cache(
+    const __half* __restrict__ q_ptr,
+    const void* __restrict__ k_cache,
+    const int64_t k_index_base,
+    const int lane) {
+  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+    const __half* k_ptr = reinterpret_cast<const __half*>(k_cache) + k_index_base;
+    return dot_qk_half2<D>(q_ptr, k_ptr, lane);
+  } else if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2) {
+    static_assert(D % 2 == 0, "Head dim must be even for e5m2 half2 dot");
+    const __half2* q_ptr2 = reinterpret_cast<const __half2*>(q_ptr);
+    float acc = 0.f;
+    #pragma unroll
+    for (int i = lane; i < D / 2; i += kWarpSize) {
+      const float2 qv = __half22float2(q_ptr2[i]);
+      const __half2 k_h2 = flash_v100::load_fp8_e5m2_half2_unscaled(
+          k_cache, k_index_base + static_cast<int64_t>(i) * 2);
+      const float2 kv = __half22float2(k_h2);
+      acc = fmaf(qv.x, kv.x, acc);
+      acc = fmaf(qv.y, kv.y, acc);
+    }
+    return warp_reduce_sum(acc);
+  } else {
+    float acc = 0.f;
+    #pragma unroll
+    for (int d = lane; d < D; d += kWarpSize) {
+      const float qv = __half2float(q_ptr[d]);
+      const float kv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
+          k_cache, k_index_base + d);
+      acc = fmaf(qv, kv, acc);
+    }
+    return warp_reduce_sum(acc);
+  }
+}
+
+template<int D, int PARTITION_SIZE, int KV_DTYPE>
 __global__ void flash_attention_decode_partition_kernel(
     const __half* __restrict__ q,
-    const __half* __restrict__ k_cache,
-    const __half* __restrict__ v_cache,
+    const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache,
     __half* __restrict__ tmp_out,
     float* __restrict__ max_logits,
     float* __restrict__ exp_sums,
@@ -126,7 +178,9 @@ __global__ void flash_attention_decode_partition_kernel(
     const int64_t v_block_stride,
     const int64_t v_token_stride,
     const int64_t v_head_stride,
-    const float softmax_scale) {
+    const float softmax_scale,
+    const float k_scale,
+    const float v_scale) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -147,6 +201,9 @@ __global__ void flash_attention_decode_partition_kernel(
   const int kv_head_idx = head_idx / q_per_kv;
   const int lane = threadIdx.x % kWarpSize;
   const int warp_idx = threadIdx.x / kWarpSize;
+  const float score_scale =
+      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16 ? softmax_scale
+                                                  : softmax_scale * k_scale;
 
   __shared__ __half q_shared[D];
   __shared__ float scores_shared[PARTITION_SIZE];
@@ -172,14 +229,15 @@ __global__ void flash_attention_decode_partition_kernel(
        token_local += kWarpsPerBlock) {
     const int physical_block = block_idx_shared[token_local];
     const int block_offset = block_offset_shared[token_local];
-    const __half* k_ptr =
-        k_cache + static_cast<int64_t>(physical_block) * k_block_stride +
+    const int64_t k_index =
+        static_cast<int64_t>(physical_block) * k_block_stride +
         static_cast<int64_t>(block_offset) * k_token_stride +
         static_cast<int64_t>(kv_head_idx) * k_head_stride;
 
-    float score = dot_qk_half2<D>(q_shared, k_ptr, lane);
+    float score =
+        dot_qk_cache<D, KV_DTYPE>(q_shared, k_cache, k_index, lane);
     if (lane == 0) {
-      score *= softmax_scale;
+      score *= score_scale;
       scores_shared[token_local] = score;
       local_max = fmaxf(local_max, score);
     }
@@ -211,9 +269,14 @@ __global__ void flash_attention_decode_partition_kernel(
           static_cast<int64_t>(physical_block) * v_block_stride +
           static_cast<int64_t>(block_offset) * v_token_stride +
           static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
-      acc = fmaf(scores_shared[i], __half2float(v_cache[v_index]), acc);
+      const float vv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
+          v_cache, v_index);
+      acc = fmaf(scores_shared[i], vv, acc);
     }
-    tmp_out[tmp_out_base + d] = __float2half(acc * inv_part_sum);
+    const float out_scale =
+        KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16 ? inv_part_sum
+                                                    : inv_part_sum * v_scale;
+    tmp_out[tmp_out_base + d] = __float2half(acc * out_scale);
   }
 
   if (threadIdx.x == 0) {
@@ -309,7 +372,7 @@ __global__ void flash_attention_decode_reduce_kernel(
   }
 }
 
-template<int D, int PARTITION_SIZE>
+template<int D, int PARTITION_SIZE, int KV_DTYPE>
 void launch_flash_attention_decode_paged(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -321,6 +384,8 @@ void launch_flash_attention_decode_paged(
     at::Tensor& max_logits,
     at::Tensor& exp_sums,
     const float softmax_scale,
+    const float k_scale,
+    const float v_scale,
     cudaStream_t stream) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
@@ -335,10 +400,11 @@ void launch_flash_attention_decode_paged(
   const size_t reduce_shared_mem =
       static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
 
-  flash_attention_decode_partition_kernel<D, PARTITION_SIZE><<<partition_grid, block, 0, stream>>>(
+  flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE>
+      <<<partition_grid, block, 0, stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
-      reinterpret_cast<const __half*>(k_cache.data_ptr<at::Half>()),
-      reinterpret_cast<const __half*>(v_cache.data_ptr<at::Half>()),
+      k_cache.data_ptr(),
+      v_cache.data_ptr(),
       reinterpret_cast<__half*>(tmp_out.data_ptr<at::Half>()),
       max_logits.data_ptr<float>(),
       exp_sums.data_ptr<float>(),
@@ -363,7 +429,9 @@ void launch_flash_attention_decode_paged(
       v_cache.stride(0),
       v_cache.stride(1),
       v_cache.stride(2),
-      softmax_scale);
+      softmax_scale,
+      k_scale,
+      v_scale);
 
   flash_attention_decode_reduce_kernel<D, PARTITION_SIZE><<<reduce_grid, block, reduce_shared_mem, stream>>>(
       reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),
@@ -396,15 +464,29 @@ at::Tensor flash_attention_decode_paged(
     at::Tensor& max_logits,
     at::Tensor& exp_sums,
     const float softmax_scale,
-    const int partition_size) {
+    const int partition_size,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(), "k/v cache must be on CUDA");
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(), "block_table and seq_lens must be on CUDA");
   TORCH_CHECK(tmp_out.is_cuda() && max_logits.is_cuda() && exp_sums.is_cuda(),
               "workspace tensors must be on CUDA");
   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
-  TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
-  TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+  const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
+  TORCH_CHECK(kv_dtype_code >= 0, "Unsupported kv_cache_dtype: ", kv_cache_dtype);
+  if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
+    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
+    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+  } else {
+    TORCH_CHECK(k_cache.dtype() == torch::kUInt8,
+                "fp8 k_cache must be stored as uint8");
+    TORCH_CHECK(v_cache.dtype() == torch::kUInt8,
+                "fp8 v_cache must be stored as uint8");
+    TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
+                "fp8 k/v scales must be positive");
+  }
   TORCH_CHECK(tmp_out.dtype() == torch::kFloat16, "tmp_out must be fp16");
   TORCH_CHECK(max_logits.dtype() == torch::kFloat32, "max_logits must be fp32");
   TORCH_CHECK(exp_sums.dtype() == torch::kFloat32, "exp_sums must be fp32");
@@ -451,23 +533,39 @@ at::Tensor flash_attention_decode_paged(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   c10::cuda::CUDAGuard device_guard(q.device());
 
-  #define LAUNCH_BY_PARTITION(HDIM)                                              \
+  #define LAUNCH_TYPED(HDIM, PARTITION, KV_DTYPE_CODE)                          \
+    launch_flash_attention_decode_paged<HDIM, PARTITION, KV_DTYPE_CODE>(        \
+        q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
+        exp_sums, softmax_scale, k_scale, v_scale, stream)
+
+  #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
+    do {                                                                        \
+      switch (kv_dtype_code) {                                                  \
+        case flash_v100::KV_CACHE_DTYPE_FP16:                                   \
+          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP16);       \
+          break;                                                                \
+        case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                               \
+          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3);   \
+          break;                                                                \
+        case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                               \
+          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E5M2);   \
+          break;                                                                \
+        default:                                                                \
+          TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype);  \
+      }                                                                         \
+    } while (0)
+
+  #define LAUNCH_BY_PARTITION(HDIM)                                             \
     do {                                                                         \
       switch (partition_size) {                                                  \
         case 256:                                                                \
-          launch_flash_attention_decode_paged<HDIM, 256>(                        \
-              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,          \
-              max_logits, exp_sums, softmax_scale, stream);                      \
+          LAUNCH_BY_KV_DTYPE(HDIM, 256);                                         \
           break;                                                                 \
         case 512:                                                                \
-          launch_flash_attention_decode_paged<HDIM, 512>(                        \
-              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,          \
-              max_logits, exp_sums, softmax_scale, stream);                      \
+          LAUNCH_BY_KV_DTYPE(HDIM, 512);                                         \
           break;                                                                 \
         case 1024:                                                               \
-          launch_flash_attention_decode_paged<HDIM, 1024>(                       \
-              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,          \
-              max_logits, exp_sums, softmax_scale, stream);                      \
+          LAUNCH_BY_KV_DTYPE(HDIM, 1024);                                        \
           break;                                                                 \
         default:                                                                 \
           TORCH_CHECK(false, "Unsupported decode partition_size: ", partition_size); \
@@ -498,6 +596,8 @@ at::Tensor flash_attention_decode_paged(
   }
 
   #undef LAUNCH_BY_PARTITION
+  #undef LAUNCH_BY_KV_DTYPE
+  #undef LAUNCH_TYPED
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
