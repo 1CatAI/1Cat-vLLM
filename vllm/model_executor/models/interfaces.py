@@ -1249,6 +1249,28 @@ def supports_any_eagle(
     return supports_eagle(model) or supports_eagle3(model)
 
 
+class EagleModelMixin:
+    aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.aux_hidden_state_layers = layers
+
+    def _maybe_add_hidden_state(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        if layer_idx in self.aux_hidden_state_layers:
+            value = hidden_states + residual if residual is not None else hidden_states
+            # Keep a stable snapshot for Eagle3/DFlash. Some optimized model
+            # paths reuse or mutate hidden-state storage across layers, which
+            # can otherwise make every collected aux tensor alias the final one.
+            aux_hidden_states.append(value.clone())
+        return aux_hidden_states
+
+
 @runtime_checkable
 class SupportsEagle(SupportsEagleBase, Protocol):
     """The interface required for models that support

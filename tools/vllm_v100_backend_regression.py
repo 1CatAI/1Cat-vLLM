@@ -25,6 +25,11 @@ from typing import Any
 
 
 BACKENDS = ("FLASH_ATTN_V100", "TRITON_ATTN")
+SPEC_DECODE_COUNTERS = (
+    "vllm:spec_decode_num_drafts",
+    "vllm:spec_decode_num_draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens",
+)
 
 
 def make_base_text() -> str:
@@ -150,6 +155,55 @@ def selected_logprob(logprob_map: Any, token_id: int) -> float | None:
     return float(getattr(logprob_map[token_id], "logprob"))
 
 
+def spec_decode_metrics_snapshot(llm: Any) -> dict[str, Any]:
+    counters = {name: 0 for name in SPEC_DECODE_COUNTERS}
+    accepted_per_pos: list[int] = []
+    for metric in llm.get_metrics():
+        if metric.name in counters:
+            counters[metric.name] += int(getattr(metric, "value"))
+        elif metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            values = [int(v) for v in getattr(metric, "values")]
+            if len(values) > len(accepted_per_pos):
+                accepted_per_pos.extend([0] * (len(values) - len(accepted_per_pos)))
+            for idx, value in enumerate(values):
+                accepted_per_pos[idx] += value
+    return {
+        "num_drafts": counters["vllm:spec_decode_num_drafts"],
+        "draft_tokens": counters["vllm:spec_decode_num_draft_tokens"],
+        "accepted_tokens": counters["vllm:spec_decode_num_accepted_tokens"],
+        "accepted_tokens_per_pos": accepted_per_pos,
+    }
+
+
+def diff_spec_decode_metrics(before: dict[str, Any],
+                             after: dict[str, Any]) -> dict[str, Any]:
+    num_drafts = int(after["num_drafts"] - before["num_drafts"])
+    draft_tokens = int(after["draft_tokens"] - before["draft_tokens"])
+    accepted_tokens = int(after["accepted_tokens"] - before["accepted_tokens"])
+    before_per_pos = before.get("accepted_tokens_per_pos", [])
+    after_per_pos = after.get("accepted_tokens_per_pos", [])
+    width = max(len(before_per_pos), len(after_per_pos))
+    delta_per_pos = []
+    per_pos_rates = []
+    for idx in range(width):
+        before_value = before_per_pos[idx] if idx < len(before_per_pos) else 0
+        after_value = after_per_pos[idx] if idx < len(after_per_pos) else 0
+        delta = int(after_value - before_value)
+        delta_per_pos.append(delta)
+        per_pos_rates.append(delta / num_drafts if num_drafts > 0 else None)
+    return {
+        "num_drafts": num_drafts,
+        "draft_tokens": draft_tokens,
+        "accepted_tokens": accepted_tokens,
+        "acceptance_rate": (
+            accepted_tokens / draft_tokens if draft_tokens > 0 else None),
+        "acceptance_length": (
+            1.0 + accepted_tokens / num_drafts if num_drafts > 0 else None),
+        "accepted_tokens_per_pos": delta_per_pos,
+        "per_position_acceptance_rates": per_pos_rates,
+    }
+
+
 def serialize_request_output(output: Any,
                              include_prompt_token_ids: bool = True) -> dict[str, Any]:
     completion = output.outputs[0]
@@ -218,9 +272,15 @@ def child_main(args: argparse.Namespace) -> int:
                 item for item in quality_prompts if item["name"] == "long_prefill"
             ]
 
+    cudagraph_capture_sizes = [1, 2, 4, 8]
+    if args.speculative_method is not None:
+        decode_width = args.num_speculative_tokens + 1
+        cudagraph_capture_sizes = [
+            decode_width * batch_size for batch_size in cudagraph_capture_sizes
+        ]
     compilation_config = {
         "cudagraph_mode": "full_and_piecewise",
-        "cudagraph_capture_sizes": [1, 2, 4, 8],
+        "cudagraph_capture_sizes": cudagraph_capture_sizes,
     }
     llm_kwargs = {}
     if args.disable_mm:
@@ -233,6 +293,22 @@ def child_main(args: argparse.Namespace) -> int:
             skip_mm_profiling=True,
         )
 
+    speculative_config = None
+    output_speculative_config = None
+    if args.speculative_method is not None:
+        if args.draft_model is None:
+            raise ValueError("--draft-model is required for speculative decoding")
+        speculative_config = {
+            "method": args.speculative_method,
+            "model": args.draft_model,
+            "num_speculative_tokens": args.num_speculative_tokens,
+        }
+        if args.draft_tensor_parallel_size is not None:
+            speculative_config["draft_tensor_parallel_size"] = (
+                args.draft_tensor_parallel_size
+            )
+        output_speculative_config = dict(speculative_config)
+
     llm = LLM(
         model=args.model,
         dtype=args.dtype,
@@ -241,6 +317,7 @@ def child_main(args: argparse.Namespace) -> int:
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        kv_cache_auto_trim_ratio=args.kv_cache_auto_trim_ratio,
         tensor_parallel_size=args.tensor_parallel_size,
         disable_custom_all_reduce=args.disable_custom_all_reduce,
         trust_remote_code=args.trust_remote_code,
@@ -248,8 +325,9 @@ def child_main(args: argparse.Namespace) -> int:
         enable_prefix_caching=False,
         enforce_eager=args.enforce_eager,
         attention_config={"backend": args.backend},
+        speculative_config=speculative_config,
         compilation_config=compilation_config,
-        disable_log_stats=True,
+        disable_log_stats=speculative_config is None,
         **llm_kwargs,
     )
 
@@ -361,12 +439,21 @@ def child_main(args: argparse.Namespace) -> int:
                 llm.generate(prompts, sampling, use_tqdm=False)
             latencies = []
             output_tokens = []
+            spec_before = (
+                spec_decode_metrics_snapshot(llm)
+                if speculative_config is not None else None)
             for _ in range(scenario["iters"]):
                 start = time.perf_counter()
                 outputs = llm.generate(prompts, sampling, use_tqdm=False)
                 latencies.append(time.perf_counter() - start)
                 output_tokens.append(
                     sum(len(out.outputs[0].token_ids) for out in outputs))
+            spec_metrics = None
+            if spec_before is not None:
+                spec_metrics = diff_spec_decode_metrics(
+                    spec_before,
+                    spec_decode_metrics_snapshot(llm),
+                )
             input_tokens = [
                 len(tokenizer.encode(prompt, add_special_tokens=False))
                 for prompt in prompts
@@ -386,6 +473,7 @@ def child_main(args: argparse.Namespace) -> int:
                 "total_tokens_per_sec": (
                     (sum(input_tokens) + statistics.median(output_tokens)) / median
                 ),
+                "spec_decode_metrics": spec_metrics,
             }
 
     result = {
@@ -394,9 +482,11 @@ def child_main(args: argparse.Namespace) -> int:
         "dtype": args.dtype,
         "kv_cache_dtype": args.kv_cache_dtype,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "speculative_config": output_speculative_config,
         "prompt_style": args.prompt_style,
         "enable_thinking": args.enable_thinking,
         "max_model_len": args.max_model_len,
+        "log_stats_enabled": speculative_config is not None,
         "quality": quality,
         "speed": speed,
     }
@@ -685,8 +775,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.45)
+    parser.add_argument("--kv-cache-auto-trim-ratio", type=float, default=1.05)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
+    parser.add_argument("--speculative-method", choices=("dflash",),
+                        default=None)
+    parser.add_argument("--draft-model", default=None)
+    parser.add_argument("--num-speculative-tokens", type=int, default=16)
+    parser.add_argument("--draft-tensor-parallel-size", type=int, default=None)
     parser.add_argument("--prompt-style", choices=("raw", "qwen35-chat"),
                         default="raw")
     parser.add_argument("--disable-thinking", action="store_false",

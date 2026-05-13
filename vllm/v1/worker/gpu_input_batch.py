@@ -210,6 +210,12 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
+        self.spec_num_accepted_tokens_cpu_tensor = torch.ones(
+            (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
+        )
+        self.spec_num_accepted_tokens_cpu = (
+            self.spec_num_accepted_tokens_cpu_tensor.numpy()
+        )
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
@@ -424,6 +430,7 @@ class InputBatch:
 
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
+        self.spec_num_accepted_tokens_cpu[req_index] = 1
 
         # Add request lora ID
         if request.lora_request:
@@ -610,6 +617,13 @@ class InputBatch:
             self.num_accepted_tokens_cpu[i2],
             self.num_accepted_tokens_cpu[i1],
         )
+        (
+            self.spec_num_accepted_tokens_cpu[i1],
+            self.spec_num_accepted_tokens_cpu[i2],
+        ) = (
+            self.spec_num_accepted_tokens_cpu[i2],
+            self.spec_num_accepted_tokens_cpu[i1],
+        )
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
@@ -731,6 +745,9 @@ class InputBatch:
             self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
                 last_req_index
             ]
+            self.spec_num_accepted_tokens_cpu[
+                empty_index
+            ] = self.spec_num_accepted_tokens_cpu[last_req_index]
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator

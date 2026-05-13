@@ -10,6 +10,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
@@ -128,7 +129,11 @@ def preprocess_mamba(
     block_size = mamba_spec.block_size
     finished_req_ids = scheduler_output.finished_req_ids
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
-    for req_id in itertools.chain(finished_req_ids, preempted_req_ids):
+    # Reset cached state positions for resumed requests as well. A request can
+    # be force-preempted during prefix-cache reset without appearing in
+    # preempted_req_ids, leaving a stale block index after it is reallocated.
+    resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+    for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         mamba_state_idx.pop(req_id, None)
 
     src_state_list: list[int] = []
@@ -142,7 +147,11 @@ def preprocess_mamba(
             # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
-        num_blocks = len(req_state.block_ids[mamba_group_ids[0]])
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+        num_blocks = (
+            cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
+            + num_speculative_blocks
+        )
 
         # We always save the current running state at the last
         # (1 + num_speculative_blocks) block.

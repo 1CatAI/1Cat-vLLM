@@ -32,6 +32,7 @@ _warned_feature_fallback = False
 _warned_decode_fallback = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
+_logged_prefill_smallq_decode = False
 _logged_decode_flash = False
 _logged_prefill_compare = False
 
@@ -71,6 +72,12 @@ def _get_paged_kv_utils():
 
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     """Return True if any sequence has KV context before current query tokens."""
+    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+    if query_start_loc_cpu is not None and seq_lens_cpu is not None:
+        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        return bool(torch.any(query_lens != seq_lens_cpu).item())
+
     query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
     return not torch.equal(query_lens, attn_metadata.seq_lens)
 
@@ -179,12 +186,13 @@ def _dequantize_fp8_contiguous_kv(
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     """Attach CPU metadata for the dense prefill path."""
 
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        attn_metadata.causal = common_attn_metadata.causal
         return attn_metadata
 
 
@@ -205,8 +213,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1")
         self.use_flash_v100_prefill_paged = (
             self.flash_attn_prefill_paged is not None
-            and paged_prefill_enable == "1"
+            and paged_prefill_enable != "0"
             and not paged_prefill_disable)
+        self.smallq_decode_max_query_len = int(
+            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
         self._decode_cache_k: torch.Tensor | None = None
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
@@ -346,6 +356,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and supported_kv_dtype
         )
 
+    def _small_query_decode_enabled(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> bool:
+        if (not getattr(attn_metadata, "causal", True)
+                or not self.use_flash_v100_decode
+                or self.smallq_decode_max_query_len <= 0):
+            return False
+
+        query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu",
+                                      None)
+        query_start_loc = (
+            query_start_loc_cpu
+            if query_start_loc_cpu is not None
+            else attn_metadata.query_start_loc
+        )
+        if len(query_start_loc) <= 1:
+            return False
+
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        max_query_len = int(query_lens.max().item())
+        return max_query_len <= self.smallq_decode_max_query_len
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -396,6 +429,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if is_prefill:
             if is_capturing:
+                # CUDA graph capture uses dummy metadata whose seq_lens can
+                # look like no-prefix prefill, while replayed MTP verification
+                # is a uniform small-query decode over an existing KV prefix.
+                # Capture the same small-query kernel branch that replay needs.
+                smallq_decode = self._small_query_decode_enabled(attn_metadata)
+                if smallq_decode:
+                    return self._flash_v100_prefill_with_prefix(
+                        layer,
+                        query,
+                        kv_cache,
+                        attn_metadata,
+                        output,
+                    )
                 if not _warned_prefill_fallback:
                     logger.warning(
                         "FLASH_ATTN_V100 prefill fallback during CUDA graph "
@@ -413,9 +459,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     output_scale,
                     output_block_scale,
                 )
-            if _has_prefix_context(attn_metadata):
+            has_prefix_context = _has_prefix_context(attn_metadata)
+            smallq_decode = (
+                has_prefix_context
+                and self._small_query_decode_enabled(attn_metadata)
+            )
+            if has_prefix_context:
                 if not _logged_prefill_prefix_flash:
-                    if self.use_flash_v100_prefill_paged:
+                    if smallq_decode:
+                        logger.info(
+                            "FLASH_ATTN_V100 prefill path active "
+                            "(prefix/chunked via small-query paged decode)."
+                        )
+                    elif self.use_flash_v100_prefill_paged:
                         logger.info(
                             "FLASH_ATTN_V100 prefill path active "
                             "(prefix/chunked via direct paged prefill kernel)."
@@ -485,6 +541,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Prefill path for no-prefix case (query_len == seq_len per sequence)."""
+        causal = getattr(attn_metadata, "causal", True)
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
         key = key[:num_actual_tokens]
@@ -530,7 +587,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     q_batch,
                     k_batch,
                     v_batch,
-                    causal=True,
+                    causal=causal,
                     softmax_scale=self.scale,
                 )
                 out_view[tok_start:tok_end].copy_(
@@ -578,6 +635,89 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return output
 
+    def _flash_v100_small_query_prefill_as_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        _seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run small causal prefix-prefill queries through paged decode.
+
+        MTP verification presents a tiny query span over a long KV prefix. The
+        paged prefill kernel is correct, but its work scheduling is much more
+        expensive for this shape and exceeds SM70 shared-memory limits at very
+        long contexts. Treating every query token as an independent decode row
+        with an increasing seq_len preserves the causal mask without exposing
+        future draft tokens.
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        out_view = output[:num_actual_tokens]
+
+        cached = getattr(attn_metadata, "_flash_v100_smallq_decode_metadata",
+                         None)
+        if cached is None:
+            device = attn_metadata.seq_lens.device
+            dtype = attn_metadata.seq_lens.dtype
+
+            query_start_loc_gpu = attn_metadata.query_start_loc
+            query_lens_gpu = query_start_loc_gpu[1:] - query_start_loc_gpu[:-1]
+            effective_seq_lens = torch.maximum(
+                attn_metadata.seq_lens,
+                query_lens_gpu.to(dtype=attn_metadata.seq_lens.dtype),
+            )
+            decode_block_table = torch.repeat_interleave(
+                attn_metadata.block_table,
+                query_lens_gpu,
+                dim=0,
+                output_size=num_actual_tokens,
+            ).contiguous()
+            seq_lens_rep = torch.repeat_interleave(
+                effective_seq_lens,
+                query_lens_gpu,
+                output_size=num_actual_tokens,
+            )
+            query_lens_rep = torch.repeat_interleave(
+                query_lens_gpu.to(dtype=dtype),
+                query_lens_gpu,
+                output_size=num_actual_tokens,
+            )
+            start_locs_rep = torch.repeat_interleave(
+                query_start_loc_gpu[:-1].to(dtype=dtype),
+                query_lens_gpu,
+                output_size=num_actual_tokens,
+            )
+            offsets = torch.arange(
+                num_actual_tokens,
+                device=device,
+                dtype=dtype,
+            ) - start_locs_rep + 1
+            decode_seq_lens = (seq_lens_rep - query_lens_rep +
+                               offsets).contiguous()
+            cached = (decode_block_table, decode_seq_lens)
+            setattr(attn_metadata, "_flash_v100_smallq_decode_metadata",
+                    cached)
+
+        decode_block_table, decode_seq_lens = cached
+        self.flash_attn_decode_paged(
+            query,
+            key_cache,
+            value_cache,
+            decode_block_table,
+            decode_seq_lens,
+            softmax_scale=self.scale,
+            out=out_view,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
+        )
+        return output
+
     def _flash_v100_prefill_with_prefix(
         self,
         layer: torch.nn.Module,
@@ -587,7 +727,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """Prefill path for prefix/chunked context via gathered contiguous KV."""
-        global _logged_prefill_compare
+        global _logged_prefill_compare, _logged_prefill_smallq_decode
+        causal = getattr(attn_metadata, "causal", True)
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
         out_view = output[:num_actual_tokens]
@@ -612,6 +753,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         debug_compare = (os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0")
                          == "1")
 
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
+        if (causal and self.use_flash_v100_decode
+                and self.smallq_decode_max_query_len > 0
+                and max_query_len <= self.smallq_decode_max_query_len):
+            if not _logged_prefill_smallq_decode:
+                logger.info(
+                    "FLASH_ATTN_V100 prefix prefill small-query path active "
+                    "(paged decode verifier, max_query_len<=%d).",
+                    self.smallq_decode_max_query_len,
+                )
+                _logged_prefill_smallq_decode = True
+            return self._flash_v100_small_query_prefill_as_decode(
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                output,
+                query_start_loc,
+                seq_lens,
+            )
+
         for i in range(num_seqs):
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
@@ -629,6 +793,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=float(layer._k_scale_float),
                     v_scale=float(layer._v_scale_float),
+                    causal=causal,
                 )
                 if debug_compare and not _logged_prefill_compare:
                     seq_len = int(seq_lens[i].item())
@@ -652,7 +817,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         query[start:end].unsqueeze(0),
                         k_cont.unsqueeze(0),
                         v_cont.unsqueeze(0),
-                        causal=True,
+                        causal=causal,
                         softmax_scale=self.scale,
                     )
                     diff = (out_seq - ref_out).abs()
@@ -726,7 +891,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     query[start:end].unsqueeze(0),
                     k_cont.unsqueeze(0),
                     v_cont.unsqueeze(0),
-                    causal=True,
+                    causal=causal,
                     softmax_scale=self.scale,
                 )
             out_view[start:end].copy_(out_seq.squeeze(0))

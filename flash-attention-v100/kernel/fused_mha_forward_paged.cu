@@ -439,6 +439,12 @@ flash_attention_forward_kernel_paged(
                 }
             }
 
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < valid_k_rows;
+                 c += THREADS_PER_ROW) {
+                thread_max = fmaxf(thread_max, sS_row_f[c]);
+            }
+
             #pragma unroll
             for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1) {
                 thread_max = fmaxf(thread_max,
@@ -456,6 +462,8 @@ flash_attention_forward_kernel_paged(
             __half2 half_buffer[20];
             int vc_base = thread_in_row;
             int h2_idx = 0;
+            int tail_col = -1;
+            __half tail_value = __float2half(0.f);
 
             #pragma unroll 4
             for (int j = 0; j < vecs_per_thread; ++j, vc_base += THREADS_PER_ROW) {
@@ -477,14 +485,13 @@ flash_attention_forward_kernel_paged(
             }
 
             #pragma unroll 4
-            for (int c = tail_start + thread_in_row; c < BLOCK_N;
+            for (int c = tail_start + thread_in_row; c < valid_k_rows;
                  c += THREADS_PER_ROW) {
-                float v = (c < valid_k_rows) ? sS_row_f[c] : NEG_INF;
+                float v = sS_row_f[c];
                 float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += (c < valid_k_rows) ? e : 0.0f;
-                sP_row_h[c] = (c < valid_k_rows)
-                                  ? __float2half_rn(e)
-                                  : __float2half(0.f);
+                thread_sum += e;
+                tail_col = c;
+                tail_value = __float2half_rn(e);
             }
 
             #pragma unroll
@@ -512,6 +519,18 @@ flash_attention_forward_kernel_paged(
                     int base_offset = vc_base * 2;
                     sP_half2[base_offset] = half_buffer[h2_idx++];
                     sP_half2[base_offset + 1] = half_buffer[h2_idx++];
+                }
+            }
+
+            if (tail_col >= 0) {
+                sP_row_h[tail_col] = tail_value;
+            }
+
+            #pragma unroll 4
+            for (int c = tail_start + thread_in_row; c < BLOCK_N;
+                 c += THREADS_PER_ROW) {
+                if (c >= valid_k_rows) {
+                    sP_row_h[c] = __float2half(0.f);
                 }
             }
 
@@ -797,7 +816,8 @@ at::Tensor flash_attention_prefill_paged(
     const float softmax_scale,
     const std::string& kv_cache_dtype,
     const float k_scale,
-    const float v_scale
+    const float v_scale,
+    const bool is_causal
 ) {
     TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
     const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
@@ -847,7 +867,7 @@ at::Tensor flash_attention_prefill_paged(
     #define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                             \
         launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(            \
             q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,  \
-            softmax_scale, true, k_scale, v_scale, stream)
+            softmax_scale, is_causal, k_scale, v_scale, stream)
 
     #define LAUNCH_PAGED_BY_KV(HDIM)                                            \
         do {                                                                    \

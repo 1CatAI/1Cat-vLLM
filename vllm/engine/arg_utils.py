@@ -435,6 +435,7 @@ class EngineArgs:
     cpu_offload_gb: float = CacheConfig.cpu_offload_gb
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    kv_cache_auto_trim_ratio: float = CacheConfig.kv_cache_auto_trim_ratio
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
@@ -911,6 +912,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-cache-memory-bytes", **cache_kwargs["kv_cache_memory_bytes"]
+        )
+        cache_group.add_argument(
+            "--kv-cache-auto-trim-ratio",
+            **cache_kwargs["kv_cache_auto_trim_ratio"],
         )
         cache_group.add_argument("--swap-space", **cache_kwargs["swap_space"])
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
@@ -1403,6 +1408,7 @@ class EngineArgs:
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
+            kv_cache_auto_trim_ratio=self.kv_cache_auto_trim_ratio,
             swap_space=self.swap_space,
             cache_dtype=resolved_cache_dtype,
             is_attention_free=model_config.is_attention_free,

@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -114,6 +115,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -152,6 +154,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
@@ -375,6 +378,11 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+        self.max_spec_state_slots = 1 + (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -447,6 +455,7 @@ class GPUModelRunner(
                 NgramProposer  # noqa: F823
                 | SuffixDecodingProposer
                 | EagleProposer
+                | DFlashProposer
                 | DraftModelProposer
                 | MedusaProposer
             )
@@ -454,6 +463,11 @@ class GPUModelRunner(
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.use_dflash():
+                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = (
+                    os.getenv("VLLM_DFLASH_DISABLE_AUX_OUTPUTS", "0") != "1"
+                )
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -587,6 +601,11 @@ class GPUModelRunner(
         )
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int64
+        )
+        self.current_mamba_state_block_ids = self._make_buffer(
+            self.max_num_reqs,
+            self.max_spec_state_slots,
+            dtype=torch.int32,
         )
 
         # Only relevant for multimodal models
@@ -859,6 +878,15 @@ class GPUModelRunner(
                 scheduler_output,
                 decode_threshold=self.reorder_batch_threshold,
             )
+
+    # Note: used for model runner override.
+    @staticmethod
+    def _split_aux_model_output(model_output):
+        if not isinstance(model_output, tuple):
+            return model_output, None
+        if len(model_output) == 2 and isinstance(model_output[1], list):
+            return model_output[0], model_output[1]
+        return model_output[0], list(model_output[1:])
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -1154,6 +1182,7 @@ class GPUModelRunner(
         )
         for i, num_tokens in enumerate(num_accepted_tokens):
             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+            self.input_batch.spec_num_accepted_tokens_cpu[i] = num_tokens
         if self.cache_config.mamba_cache_mode == "align":
             mamba_utils.postprocess_mamba(
                 scheduler_output,
@@ -1704,12 +1733,16 @@ class GPUModelRunner(
         else:
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
+        spec_sequence_masks_cpu = None
         if use_spec_decode:
             self.num_accepted_tokens.np[:num_reqs] = (
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs]
             )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
+            spec_sequence_masks_cpu = self.num_decode_draft_tokens.cpu[
+                :num_reqs_padded
+            ] >= 0
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -1775,6 +1808,36 @@ class GPUModelRunner(
                 logits_indices
             )
 
+        current_mamba_state_block_ids_by_gid: dict[int, torch.Tensor] = {}
+
+        def _get_current_mamba_state_block_ids(
+            kv_cache_gid: int,
+        ) -> torch.Tensor | None:
+            if not use_spec_decode:
+                return None
+            if kv_cache_gid in current_mamba_state_block_ids_by_gid:
+                return current_mamba_state_block_ids_by_gid[kv_cache_gid]
+
+            state_block_ids = self.current_mamba_state_block_ids
+            state_block_ids.cpu[:num_reqs_padded].fill_(PAD_SLOT_ID)
+            for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                state_block_idx = self.mamba_state_idx.get(req_id)
+                if state_block_idx is None:
+                    continue
+                req_state = self.requests[req_id]
+                block_ids = req_state.block_ids[kv_cache_gid]
+                for offset in range(self.max_spec_state_slots):
+                    block_idx = state_block_idx + offset
+                    if 0 <= block_idx < len(block_ids):
+                        state_block_ids.cpu[req_idx, offset] = block_ids[block_idx]
+                    else:
+                        break
+            state_block_ids.copy_to_gpu(num_reqs_padded)
+            current_mamba_state_block_ids_by_gid[kv_cache_gid] = (
+                state_block_ids.gpu[:num_reqs_padded]
+            )
+            return current_mamba_state_block_ids_by_gid[kv_cache_gid]
+
         # Cache attention metadata builds across hybrid KV-cache groups
         # The only thing that changes between different hybrid KV-cache groups when the
         # same metadata builder and KVCacheSpec is the same is the block table, so we
@@ -1811,6 +1874,10 @@ class GPUModelRunner(
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[
                         :num_reqs_padded
                     ],
+                    spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+                    current_state_block_ids=_get_current_mamba_state_block_ids(
+                        kv_cache_gid
+                    ),
                 )
 
             if for_cudagraph_capture:
@@ -1848,6 +1915,8 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        dflash_common_attn_metadata_by_gid: dict[int, CommonAttentionMetadata] | None
+        dflash_common_attn_metadata_by_gid = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -1864,11 +1933,16 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, EagleProposer):
+                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
+            if self.speculative_config and isinstance(self.drafter, DFlashProposer):
+                if set(self.drafter.attn_layer_names) & set(kv_cache_group.layer_names):
+                    if dflash_common_attn_metadata_by_gid is None:
+                        dflash_common_attn_metadata_by_gid = {}
+                    dflash_common_attn_metadata_by_gid[kv_cache_gid] = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
@@ -1906,6 +1980,16 @@ class GPUModelRunner(
             # padded attention metadata.
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
+            )
+        if dflash_common_attn_metadata_by_gid is not None:
+            if num_reqs != num_reqs_padded or num_tokens != num_tokens_padded:
+                dflash_common_attn_metadata_by_gid = {
+                    gid: metadata.unpadded(num_tokens, num_reqs)
+                    for gid, metadata in dflash_common_attn_metadata_by_gid.items()
+                }
+            assert isinstance(self.drafter, DFlashProposer)
+            self.drafter.set_common_attn_metadata_by_kv_cache_group(
+                dflash_common_attn_metadata_by_gid
             )
 
         return attn_metadata, spec_decode_common_attn_metadata
@@ -3447,6 +3531,9 @@ class GPUModelRunner(
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
             if self.cache_config.mamba_cache_mode == "align":
+                # preprocess_mamba may reset per-request accepted counts to 1
+                # after copying a running state to a new aligned block. Keep
+                # the GPU buffer in sync before GDN/spec metadata consumes it.
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
                     self.kv_cache_config,
@@ -3457,6 +3544,10 @@ class GPUModelRunner(
                     self.compilation_config.static_forward_context,
                     self.model.get_mamba_state_copy_func(),
                 )
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                )
+                self.num_accepted_tokens.copy_to_gpu()
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -3702,12 +3793,16 @@ class GPUModelRunner(
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
-                spec_config.use_eagle() or spec_config.uses_draft_model()
+                spec_config.use_eagle()
+                or spec_config.use_dflash()
+                or spec_config.uses_draft_model()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(
+                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -3715,7 +3810,6 @@ class GPUModelRunner(
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = (
                         self.drafter.prepare_next_token_ids_padded(
-                            spec_decode_common_attn_metadata,
                             sampled_token_ids,
                             self.requests,
                             self.input_batch,
@@ -3986,8 +4080,14 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
             )
-        elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+        elif (
+            spec_config.use_eagle()
+            or spec_config.use_dflash()
+            or spec_config.uses_draft_model()
+        ):
+            assert isinstance(
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+            )
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4014,16 +4114,16 @@ class GPUModelRunner(
                 )
                 next_token_ids, valid_sampled_tokens_count = (
                     self.drafter.prepare_next_token_ids_padded(
-                        common_attn_metadata,
                         sampled_token_ids,
                         self.requests,
                         self.input_batch,
                         self.discard_request_mask.gpu,
                     )
                 )
-                self._copy_valid_sampled_token_count(
-                    next_token_ids, valid_sampled_tokens_count
-                )
+                if self.use_async_scheduling or not spec_config.use_dflash():
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -4032,10 +4132,16 @@ class GPUModelRunner(
                 target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                 target_positions = self._get_positions(num_scheduled_tokens)
                 if self.use_aux_hidden_state_outputs:
-                    assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
-                    )
+                    if aux_hidden_states is None:
+                        aux_layers = self._get_eagle3_aux_layers_from_config() or (0,)
+                        target_hidden_states = hidden_states[
+                            :num_scheduled_tokens
+                        ].repeat(1, len(aux_layers))
+                    else:
+                        target_hidden_states = torch.cat(
+                            [h[:num_scheduled_tokens] for h in aux_hidden_states],
+                            dim=-1,
+                        )
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
@@ -4049,10 +4155,18 @@ class GPUModelRunner(
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
-                        assert aux_hidden_states is not None
-                        target_hidden_states = torch.cat(
-                            [h[token_indices] for h in aux_hidden_states], dim=-1
-                        )
+                        if aux_hidden_states is None:
+                            aux_layers = self._get_eagle3_aux_layers_from_config() or (
+                                0,
+                            )
+                            target_hidden_states = hidden_states[token_indices].repeat(
+                                1, len(aux_layers)
+                            )
+                        else:
+                            target_hidden_states = torch.cat(
+                                [h[token_indices] for h in aux_hidden_states],
+                                dim=-1,
+                            )
                     else:
                         target_hidden_states = hidden_states[token_indices]
                 else:
@@ -4070,10 +4184,18 @@ class GPUModelRunner(
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
                     target_positions = self._get_positions(total_num_tokens)
                     if self.use_aux_hidden_state_outputs:
-                        assert aux_hidden_states is not None
-                        target_hidden_states = torch.cat(
-                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
-                        )
+                        if aux_hidden_states is None:
+                            aux_layers = self._get_eagle3_aux_layers_from_config() or (
+                                0,
+                            )
+                            target_hidden_states = hidden_states[
+                                :total_num_tokens
+                            ].repeat(1, len(aux_layers))
+                        else:
+                            target_hidden_states = torch.cat(
+                                [h[:total_num_tokens] for h in aux_hidden_states],
+                                dim=-1,
+                            )
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
@@ -4090,7 +4212,7 @@ class GPUModelRunner(
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
-                last_token_indices=token_indices_to_sample,
+                token_indices_to_sample=token_indices_to_sample,
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
@@ -4298,10 +4420,11 @@ class GPUModelRunner(
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
-
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            if dflash_config and isinstance(dflash_config, dict):
+                layer_ids = dflash_config.get("target_layer_ids")
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
@@ -4864,18 +4987,21 @@ class GPUModelRunner(
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
-                )
+            )
 
             if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
+                hidden_states, _ = self._split_aux_model_output(outputs)
             else:
                 hidden_states = outputs
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
+                or self.speculative_config.use_dflash()
                 or self.speculative_config.uses_draft_model()
             ):
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(
+                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
@@ -5417,6 +5543,16 @@ class GPUModelRunner(
         # because some of them change the threshold at init time.
         self.calculate_reorder_batch_threshold()
 
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.use_dflash()
+            or self.speculative_config.uses_draft_model()
+        ):
+            assert isinstance(
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+            )
+            self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
@@ -5572,9 +5708,12 @@ class GPUModelRunner(
             cudagraph_mode, self.uniform_decode_query_len
         )
 
-        # Initialize eagle's cudagraph dispatcher if using eagle spec decode.
-        if self.speculative_config and self.speculative_config.use_eagle():
-            assert isinstance(self.drafter, EagleProposer)
+        # Initialize eagle/dflash cudagraph dispatcher if using spec decode.
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.use_dflash()
+        ):
+            assert isinstance(self.drafter, EagleProposer | DFlashProposer)
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
@@ -6057,9 +6196,12 @@ class GPUModelRunner(
 
         if self.speculative_config and (
             self.speculative_config.use_eagle()
+            or self.speculative_config.use_dflash()
             or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+            )
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)

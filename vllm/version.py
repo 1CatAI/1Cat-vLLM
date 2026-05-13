@@ -26,14 +26,24 @@ def _prev_minor_version_was(version_str):
     if __version_tuple__[0:2] == (0, 0):
         return True
 
-    # Note - this won't do the right thing when we release 1.0!
-    assert __version_tuple__[0] == 0
-    assert isinstance(__version_tuple__[1], int)
-    return version_str == f"{__version_tuple__[0]}.{__version_tuple__[1] - 1}"
+    major, minor = _prev_minor_version_pair()
+    return version_str == f"{major}.{minor}"
 
 
 def _prev_minor_version():
     """For the purpose of testing, return a previous minor version number."""
-    # In dev tree, this will return "0.-1", but that will work fine"
+    major, minor = _prev_minor_version_pair()
+    return f"{major}.{minor}"
+
+
+def _prev_minor_version_pair():
+    assert isinstance(__version_tuple__[0], int)
     assert isinstance(__version_tuple__[1], int)
-    return f"{__version_tuple__[0]}.{__version_tuple__[1] - 1}"
+    major = __version_tuple__[0]
+    minor = __version_tuple__[1]
+    if minor > 0:
+        return major, minor - 1
+    if major > 0:
+        return major - 1, 0
+    # In dev trees, this preserves the historical "0.-1" fallback.
+    return 0, -1

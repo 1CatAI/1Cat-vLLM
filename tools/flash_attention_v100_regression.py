@@ -632,6 +632,151 @@ def prefill_paged_quality_case(
     )
 
 
+@torch.inference_mode()
+def dense_short_tail_sweep_case(device: torch.device) -> CaseResult:
+    set_seed(20260511)
+    failures = 0
+    total = 0
+    worst_abs = 0.0
+    worst_mean = 0.0
+    worst_case = ""
+    lengths = [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256]
+    for head_dim in [16, 32, 64, 128, 256]:
+        q_heads = 24 if head_dim == 256 else 8
+        kv_heads = 4 if head_dim == 256 else 2
+        for seqlen in lengths:
+            for causal in [False, True]:
+                q = torch.randn(1, seqlen, q_heads, head_dim, device=device,
+                                dtype=torch.float16)
+                k = torch.randn(1, seqlen, kv_heads, head_dim, device=device,
+                                dtype=torch.float16)
+                v = torch.randn_like(k)
+                actual = flash_attn_func(q, k, v, causal=causal)
+                expected = ref_dense_attention(q, k, v, causal)
+                torch.cuda.synchronize()
+                diff = (actual.float() - expected.float()).abs()
+                max_abs = float(diff.max().item())
+                mean_abs = float(diff.mean().item())
+                total += 1
+                if max_abs > worst_abs:
+                    worst_abs = max_abs
+                    worst_mean = mean_abs
+                    worst_case = (
+                        f"seqlen={seqlen} head_dim={head_dim} "
+                        f"q_heads={q_heads} kv_heads={kv_heads} causal={causal}"
+                    )
+                if (
+                    not torch.isfinite(actual).all()
+                    or not torch.allclose(actual, expected, atol=3.5e-2, rtol=3.5e-2)
+                ):
+                    failures += 1
+    return CaseResult(
+        kind="dense",
+        name="dense_short_tail_sweep_len1_256_hd16_256",
+        shape={
+            "total_subcases": total,
+            "failures": failures,
+            "lengths": lengths,
+            "head_dims": [16, 32, 64, 128, 256],
+            "worst_case": worst_case,
+        },
+        passed=failures == 0,
+        max_abs=worst_abs,
+        mean_abs=worst_mean,
+    )
+
+
+@torch.inference_mode()
+def paged_prefill_tail_sweep_case(device: torch.device) -> CaseResult:
+    set_seed(20260512)
+    failures = 0
+    total = 0
+    worst_abs = 0.0
+    worst_mean = 0.0
+    worst_case = ""
+    q_lens = [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32]
+    prefixes = [0, 1, 15, 16, 17, 63]
+    for q_len in q_lens:
+        for prefix in prefixes:
+            seq_len = q_len + prefix
+            result = prefill_paged_quality_case(
+                name=f"prefill_tail_q{q_len}_prefix{prefix}_hd256",
+                q_len=q_len,
+                seq_lens=[seq_len],
+                block_size=16,
+                q_heads=24,
+                kv_heads=4,
+                head_dim=256,
+                device=device,
+            )
+            total += 1
+            max_abs = float(result.max_abs or 0.0)
+            mean_abs = float(result.mean_abs or 0.0)
+            if max_abs > worst_abs:
+                worst_abs = max_abs
+                worst_mean = mean_abs
+                worst_case = f"q_len={q_len} prefix={prefix} seq_len={seq_len}"
+            if not result.passed:
+                failures += 1
+    return CaseResult(
+        kind="prefill_paged",
+        name="prefill_paged_tail_sweep_qwen36_27b_hd256",
+        shape={
+            "total_subcases": total,
+            "failures": failures,
+            "q_lens": q_lens,
+            "prefixes": prefixes,
+            "worst_case": worst_case,
+        },
+        passed=failures == 0,
+        max_abs=worst_abs,
+        mean_abs=worst_mean,
+    )
+
+
+@torch.inference_mode()
+def long_decode_qwen36_27b_case(device: torch.device) -> CaseResult:
+    set_seed(20260513)
+    failures = 0
+    total = 0
+    worst_abs = 0.0
+    worst_mean = 0.0
+    worst_case = ""
+    seq_lens = [8192, 32768, 131072, 262144]
+    for seq_len in seq_lens:
+        result = decode_quality_case(
+            name=f"decode_paged_qwen36_27b_ctx{seq_len}_hd256",
+            seq_lens=[seq_len],
+            block_size=16,
+            q_heads=24,
+            kv_heads=4,
+            head_dim=256,
+            device=device,
+        )
+        total += 1
+        max_abs = float(result.max_abs or 0.0)
+        mean_abs = float(result.mean_abs or 0.0)
+        if max_abs > worst_abs:
+            worst_abs = max_abs
+            worst_mean = mean_abs
+            worst_case = f"seq_len={seq_len}"
+        if not result.passed:
+            failures += 1
+    return CaseResult(
+        kind="decode_paged",
+        name="decode_paged_qwen36_27b_long_context_sweep_hd256",
+        shape={
+            "total_subcases": total,
+            "failures": failures,
+            "seq_lens": seq_lens,
+            "worst_case": worst_case,
+        },
+        passed=failures == 0,
+        max_abs=worst_abs,
+        mean_abs=worst_mean,
+    )
+
+
 def support_surface_case(device: torch.device) -> list[CaseResult]:
     try:
         from vllm.v1.attention.backends.flash_attn_v100 import (
@@ -883,10 +1028,13 @@ def decode_speed_case(
     )
 
 
-def run_quality(device: torch.device) -> list[CaseResult]:
+def run_quality(device: torch.device,
+                include_long_context: bool = False) -> list[CaseResult]:
     cases: list[CaseResult] = []
     set_seed()
     runners = [
+        lambda: dense_short_tail_sweep_case(device),
+        lambda: paged_prefill_tail_sweep_case(device),
         lambda: dense_quality_case("dense_causal_b1_s64_h4_hd64", 1, 64, 64,
                                    4, 4, 64, True, device),
         lambda: dense_quality_case("dense_causal_b2_s128_h8_hd64", 2, 128, 128,
@@ -953,6 +1101,8 @@ def run_quality(device: torch.device) -> list[CaseResult]:
             "model_decode_logits_qwen35_27b_like_b4_ctx1024_h5120_hq24_hkv4_hd256",
             4, 1024, 16, 5120, 24, 4, 256, 4096, device),
     ]
+    if include_long_context:
+        runners.append(lambda: long_decode_qwen36_27b_case(device))
     for runner in runners:
         try:
             cases.append(runner())
@@ -1018,6 +1168,7 @@ def main() -> int:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--skip-quality", action="store_true")
     parser.add_argument("--skip-speed", action="store_true")
+    parser.add_argument("--include-long-quality", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--output-json", type=Path)
@@ -1035,7 +1186,7 @@ def main() -> int:
 
     quality: list[CaseResult] = []
     if not args.skip_quality:
-        quality = run_quality(device)
+        quality = run_quality(device, args.include_long_quality)
     speed: list[SpeedResult] = []
     if not args.skip_speed:
         speed = run_speed(device, args.warmup, args.iters)

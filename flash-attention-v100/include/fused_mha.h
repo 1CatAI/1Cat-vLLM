@@ -50,7 +50,8 @@ at::Tensor flash_attention_prefill_paged(
     const float softmax_scale,
     const std::string& kv_cache_dtype,
     const float k_scale,
-    const float v_scale
+    const float v_scale,
+    const bool is_causal
 );
 
 std::vector<at::Tensor> flash_attention_backward(

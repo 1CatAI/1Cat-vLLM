@@ -1341,16 +1341,19 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
+    # General case: all groups are padded to the largest group size for a
+    # uniform block layout, but each KV group still needs its own allocation.
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
-    )
-    any_spec = kv_cache_groups[0].kv_cache_spec
-    blocks_needed = cdiv(any_spec.max_memory_usage_bytes(vllm_config), page_size)
+    total_memory = 0
+    for group in kv_cache_groups:
+        page_size = get_uniform_page_size([group.kv_cache_spec])
+        blocks_needed = cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            page_size,
+        )
+        total_memory += group_size * page_size * blocks_needed
 
-    return group_size * page_size * blocks_needed
+    return total_memory
 
 
 def _maybe_trim_available_memory_for_kv_cache(

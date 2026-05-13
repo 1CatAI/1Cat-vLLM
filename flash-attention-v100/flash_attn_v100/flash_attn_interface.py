@@ -68,6 +68,7 @@ def _get_decode_partition_size(max_seq_capacity: int) -> int:
         )
     return value
 
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -327,6 +328,7 @@ def flash_attn_prefill_paged(
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    causal: bool = True,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -350,6 +352,7 @@ def flash_attn_prefill_paged(
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
+        causal,
     )
     return out_.permute(0, 2, 1, 3).contiguous()
 
