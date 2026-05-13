@@ -3,7 +3,7 @@
 import ast
 from importlib.util import find_spec
 import os
-from typing import Any, cast
+from typing import Any, Iterable, cast
 
 import numpy as np
 import torch
@@ -339,6 +339,10 @@ class SpecDecodeBaseProposer:
     def attn_layer_names(self) -> tuple[str, ...]:
         return tuple(self._draft_attn_layer_names)
 
+    @attn_layer_names.setter
+    def attn_layer_names(self, layer_names: Iterable[str]) -> None:
+        self._draft_attn_layer_names = set(layer_names)
+
     def _raise_if_padded_drafter_batch_disabled(self):
         if self.speculative_config.disable_padded_drafter_batch:
             raise NotImplementedError(
@@ -458,15 +462,20 @@ class SpecDecodeBaseProposer:
         target_hidden_states: torch.Tensor,
         # [batch_size]
         next_token_ids: torch.Tensor,
-        token_indices_to_sample: torch.Tensor | None,
-        common_attn_metadata: CommonAttentionMetadata,
-        sampling_metadata: SamplingMetadata,
+        token_indices_to_sample: torch.Tensor | None = None,
+        common_attn_metadata: CommonAttentionMetadata | None = None,
+        sampling_metadata: SamplingMetadata | None = None,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
+        last_token_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if token_indices_to_sample is None and last_token_indices is not None:
+            token_indices_to_sample = last_token_indices
+        assert common_attn_metadata is not None
+        assert sampling_metadata is not None
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
