@@ -582,8 +582,10 @@ public MTP profile used for Cherry Studio/OpenClaw-style API testing.
 ```bash
 python -m vllm.entrypoints.openai.api_server \
   --model /path/to/Qwen3.6-27B-AWQ \
-  --served-model-name Qwen3.6-27B-AWQ \
+  --served-model-name qwen3.6-27b-awq-mtp \
   --trust-remote-code \
+  --dtype float16 \
+  --quantization awq \
   --attention-backend FLASH_ATTN_V100 \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.88 \
@@ -600,6 +602,7 @@ python -m vllm.entrypoints.openai.api_server \
   --tool-call-parser qwen3_coder \
   --default-chat-template-kwargs '{"enable_thinking": false}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8,9,18]}' \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -614,6 +617,13 @@ runtime behavior:
 - `--mm-processor-cache-gb 0`, `--skip-mm-profiling`, and
   `--limit-mm-per-prompt '{"image":0,"video":0}'` keep this public profile
   text-only and avoid unnecessary multimodal processor cache/profiling.
+- `--compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8,9,18]}'`
+  captures the MTP decode shapes used by this TP4 profile. Omitting it can
+  reduce CUDA graph hit rate and noticeably lower decode throughput.
+
+Do not set `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` for this public MTP profile.
+That dense fast path is experimental and should be benchmarked separately from
+the stable serving command.
 
 For speed-only experiments without prefix cache or tool calling, use
 `--max-num-seqs 1`, remove `--enable-prefix-caching`,
