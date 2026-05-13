@@ -524,6 +524,7 @@ deployment docs.
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | 4-card `32 GB` V100 | `Qwen3.5-27B-AWQ` | 4 | `262144` | `1` | `16384` | stable public default |
 | 4-card `32 GB` V100 | `Qwen3.6-27B-AWQ` + MTP | 4 | `262144` | `4` | `8192` | MTP + prefix-cache API serving |
+| 2-card `32 GB` V100 | `Qwen3.6-27B-AWQ` + MTP | 2 | `262144` | `1` | `8192` | memory-constrained MTP serving |
 | 4-card `32 GB` V100 | `Qwen3.6-35B-A3B-AWQ` | 4 | `262144` | `1` | `8192` | stable public default for MoE |
 | 4-card `32 GB` V100 | `Qwen3.5-122B-A10B-AWQ` | 4 | `262144` | `1` | `8096` | long-context large-model default |
 
@@ -536,6 +537,8 @@ Important wording:
 - Keep `max_num_seqs=1` for the baseline public commands until your workload
   has been profiled locally. The MTP + prefix-cache profile intentionally uses
   `max_num_seqs=4`.
+- On 2 x 32 GB V100, keep the 27B MTP profile at `max_num_seqs=1`. The TP4
+  MTP setting `max_num_seqs=4` does not fit in 64 GB at 256K context.
 - On 32 GB V100 with `FLASH_ATTN_V100`, the baseline API
   server default is also capped at `max_num_seqs=1` to avoid upstream's
   high-concurrency default preallocating unnecessary KV cache and
@@ -634,6 +637,44 @@ For speed-only experiments without prefix cache or tool calling, use
 `--max-num-seqs 1`, remove `--enable-prefix-caching`,
 `--enable-auto-tool-choice`, and `--tool-call-parser`, and benchmark
 `num_speculative_tokens` in `{2,4,6,8}` locally.
+
+### Qwen3.6-27B-AWQ, TP2, MTP + prefix cache, 2-card 64 GB profile
+
+Use this profile for two 32 GB V100 cards. It keeps the 256K context limit, but
+uses `max_num_seqs=1` because the TP4 MTP concurrency setting does not fit on
+64 GB.
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model /path/to/Qwen3.6-27B-AWQ \
+  --served-model-name qwen3.6-27b-awq-mtp-tp2 \
+  --trust-remote-code \
+  --dtype float16 \
+  --quantization awq \
+  --attention-backend FLASH_ATTN_V100 \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.849 \
+  --kv-cache-auto-trim-ratio 0.0 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 8192 \
+  --enable-prefix-caching \
+  --mamba-cache-mode align \
+  --skip-mm-profiling \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1,2,4,8,9]}' \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Do not copy the TP4 `max_num_seqs=4` value into this TP2 profile. In local
+validation, it failed either at startup memory reservation or at KV-cache
+initialization.
 
 ### Qwen3.6-35B-A3B-AWQ, TP4, public 4-card default
 
