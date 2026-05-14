@@ -766,6 +766,7 @@ Example:
 
 - [vLLM](https://github.com/vllm-project/vllm)
 - [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
+- [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)
 
 ## License
 
