@@ -258,6 +258,7 @@ class SpecDecodeBaseProposer:
             device=device,
             with_numpy=True,
         )
+        self._last_draft_probs: torch.Tensor | None = None
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions,
@@ -452,6 +453,28 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if sampling_metadata.all_greedy:
+            return logits.argmax(dim=-1), None
+        return compute_probs_and_sample_next_token(logits, sampling_metadata)
+
+    def _sample_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        logits: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if logits is not None:
+            return logits.argmax(dim=-1), None
+        return self._greedy_sample(hidden_states), None
+
+    def take_last_draft_probs(self) -> torch.Tensor | None:
+        return self._last_draft_probs
+
     def propose(
         self,
         # [num_tokens]
@@ -476,6 +499,7 @@ class SpecDecodeBaseProposer:
             token_indices_to_sample = last_token_indices
         assert common_attn_metadata is not None
         assert sampling_metadata is not None
+        self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
@@ -586,10 +610,13 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            if debug_logits is None:
-                draft_token_ids = self._greedy_sample(sample_hidden_states)
-            else:
-                draft_token_ids = debug_logits.argmax(dim=-1)
+            draft_token_ids, draft_probs = self._sample_draft_tokens(
+                sample_hidden_states, sampling_metadata, debug_logits
+            )
+            if draft_probs is not None:
+                self._last_draft_probs = draft_probs.view(
+                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                ).contiguous()
             if (
                 _spec_dump_draft_logits_enabled(self.method)
                 and not getattr(self, "_spec_logits_dumped", False)
@@ -625,10 +652,10 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        if debug_logits is None:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
-        else:
-            draft_token_ids = debug_logits.argmax(dim=-1)
+        draft_token_ids, draft_probs = self._sample_draft_tokens(
+            sample_hidden_states, sampling_metadata, debug_logits
+        )
+        draft_probs_list = None if draft_probs is None else [draft_probs]
         if (
             _spec_dump_draft_logits_enabled(self.method)
             and not getattr(self, "_spec_logits_dumped", False)
@@ -771,11 +798,18 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+            draft_token_ids, draft_probs = self._sample_draft_tokens(
+                last_hidden_states[:batch_size], sampling_metadata
+            )
+            if draft_probs is not None:
+                assert draft_probs_list is not None
+                draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if draft_probs_list is not None:
+            self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
 
     def set_inputs_first_pass(

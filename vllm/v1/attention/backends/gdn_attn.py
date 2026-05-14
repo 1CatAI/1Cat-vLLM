@@ -316,7 +316,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_token_indx = torch.empty(
                     0, dtype=torch.int32, device=query_start_loc.device
                 )
-                if is_mamba_cache_all:
+                if current_state_block_ids is not None:
+                    spec_state_indices_tensor = current_state_block_ids[
+                        spec_sequence_masks_cpu, : self.num_spec + 1
+                    ]
+                elif is_mamba_cache_all:
                     spec_state_indices_tensor = _gather_state_block_ids(
                         block_table_tensor[spec_sequence_masks_cpu],
                         m.seq_lens[spec_sequence_masks_cpu],
@@ -341,7 +345,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
 
-                if is_mamba_cache_all:
+                if current_state_block_ids is not None:
+                    spec_state_indices_tensor = current_state_block_ids[
+                        spec_sequence_masks_cpu, : self.num_spec + 1
+                    ]
+                elif is_mamba_cache_all:
                     spec_state_indices_tensor = _gather_state_block_ids(
                         block_table_tensor[spec_sequence_masks_cpu],
                         m.seq_lens[spec_sequence_masks_cpu],
@@ -507,7 +515,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dump_path = _dump_dflash_state_table(
                 {
                     "block_table_tensor": block_table_tensor.detach().cpu(),
-                    "current_state_block_ids": None,
+                    "current_state_block_ids": (
+                        None
+                        if current_state_block_ids is None
+                        else current_state_block_ids.detach().cpu()
+                    ),
                     "query_start_loc": query_start_loc.detach().cpu(),
                     "query_start_loc_cpu": query_start_loc_cpu.clone(),
                     "seq_lens": m.seq_lens.detach().cpu(),

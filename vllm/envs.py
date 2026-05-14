@@ -140,6 +140,8 @@ if TYPE_CHECKING:
     VLLM_RAY_DP_PACK_STRATEGY: Literal["strict", "fill", "span"] = "strict"
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_SM70_FP8_DEQUANT_FALLBACK: bool = True
+    VLLM_SM70_FP8_TURBOMIND: bool = False
     VLLM_MXFP4_USE_MARLIN: bool | None = None
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
@@ -1101,6 +1103,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # V100/SM70 has no native FP8 tensor cores and Marlin starts at SM75.
+    # This fallback preserves correctness for FP8 checkpoints by dequantizing
+    # weights once at load time and running fp16 GEMM.
+    "VLLM_SM70_FP8_DEQUANT_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_DEQUANT_FALLBACK", "1"))
+    ),
+    "VLLM_SM70_FP8_TURBOMIND": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_TURBOMIND", "0"))
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with

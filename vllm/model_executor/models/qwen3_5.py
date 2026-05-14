@@ -43,6 +43,7 @@ from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import adjust_block_scale_shard
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -51,6 +52,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.parameter import BlockQuantScaleParameter
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -132,6 +134,8 @@ def _uses_split_gdn_input_projections(
     """
 
     modules_to_not_convert = getattr(quant_config, "modules_to_not_convert", None)
+    if modules_to_not_convert is None:
+        modules_to_not_convert = getattr(quant_config, "ignored_layers", None)
     if not modules_to_not_convert:
         return False
     return any(
@@ -580,6 +584,12 @@ class Qwen3_5Model(Qwen3NextModel):
                                     shard_size=shard_size,
                                     shard_offset=shard_offset,
                                 )
+                            )
+                        if isinstance(param, BlockQuantScaleParameter):
+                            weight_block_size = getattr(owner, "weight_block_size",
+                                                        None)
+                            shard_size, shard_offset = adjust_block_scale_shard(
+                                weight_block_size, shard_size, shard_offset
                             )
                         if shard_offset + shard_size > loaded_weight.size(
                             param.output_dim

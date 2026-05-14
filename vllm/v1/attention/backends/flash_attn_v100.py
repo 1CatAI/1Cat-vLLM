@@ -188,11 +188,28 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
+        attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
+
+        # The Triton builder shortens capture seq_lens to 1 so full graph
+        # capture stays cheap. That is valid for single-token decode, but the
+        # FA2 small-query MTP verifier replays a tiny causal prefill as paged
+        # decode. Capturing that branch with seq_len < query_len creates
+        # negative per-token decode lengths and can poison long-context graph
+        # replay. Keep capture cheap while preserving a valid verifier shape.
+        max_query_len = getattr(attn_metadata, "max_query_len", 1)
+        if max_query_len > 1:
+            attn_metadata.seq_lens.fill_(max_query_len)
+
+        return attn_metadata
+
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         attn_metadata.causal = common_attn_metadata.causal
+        attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         return attn_metadata
 
 
@@ -217,6 +234,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and not paged_prefill_disable)
         self.smallq_decode_max_query_len = int(
             os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
+        self.smallq_decode_max_model_len = int(
+            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN",
+                      "0"))
         self._decode_cache_k: torch.Tensor | None = None
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
@@ -377,7 +397,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         max_query_len = int(query_lens.max().item())
-        return max_query_len <= self.smallq_decode_max_query_len
+        max_model_len = getattr(attn_metadata, "max_model_len", 0)
+        model_len_supported = (
+            self.smallq_decode_max_model_len <= 0
+            or max_model_len <= self.smallq_decode_max_model_len
+        )
+        return (max_query_len <= self.smallq_decode_max_query_len
+                and model_len_supported)
 
     def forward(
         self,
@@ -659,51 +685,42 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         query = query[:num_actual_tokens]
         out_view = output[:num_actual_tokens]
 
-        cached = getattr(attn_metadata, "_flash_v100_smallq_decode_metadata",
-                         None)
-        if cached is None:
-            device = attn_metadata.seq_lens.device
-            dtype = attn_metadata.seq_lens.dtype
+        device = attn_metadata.seq_lens.device
+        dtype = attn_metadata.seq_lens.dtype
 
-            query_start_loc_gpu = attn_metadata.query_start_loc
-            query_lens_gpu = query_start_loc_gpu[1:] - query_start_loc_gpu[:-1]
-            effective_seq_lens = torch.maximum(
-                attn_metadata.seq_lens,
-                query_lens_gpu.to(dtype=attn_metadata.seq_lens.dtype),
-            )
-            decode_block_table = torch.repeat_interleave(
-                attn_metadata.block_table,
-                query_lens_gpu,
-                dim=0,
-                output_size=num_actual_tokens,
-            ).contiguous()
-            seq_lens_rep = torch.repeat_interleave(
-                effective_seq_lens,
-                query_lens_gpu,
-                output_size=num_actual_tokens,
-            )
-            query_lens_rep = torch.repeat_interleave(
-                query_lens_gpu.to(dtype=dtype),
-                query_lens_gpu,
-                output_size=num_actual_tokens,
-            )
-            start_locs_rep = torch.repeat_interleave(
-                query_start_loc_gpu[:-1].to(dtype=dtype),
-                query_lens_gpu,
-                output_size=num_actual_tokens,
-            )
-            offsets = torch.arange(
-                num_actual_tokens,
-                device=device,
-                dtype=dtype,
-            ) - start_locs_rep + 1
-            decode_seq_lens = (seq_lens_rep - query_lens_rep +
-                               offsets).contiguous()
-            cached = (decode_block_table, decode_seq_lens)
-            setattr(attn_metadata, "_flash_v100_smallq_decode_metadata",
-                    cached)
-
-        decode_block_table, decode_seq_lens = cached
+        query_start_loc_gpu = attn_metadata.query_start_loc
+        query_lens_gpu = query_start_loc_gpu[1:] - query_start_loc_gpu[:-1]
+        effective_seq_lens = torch.maximum(
+            attn_metadata.seq_lens,
+            query_lens_gpu.to(dtype=attn_metadata.seq_lens.dtype),
+        )
+        decode_block_table = torch.repeat_interleave(
+            attn_metadata.block_table,
+            query_lens_gpu,
+            dim=0,
+            output_size=num_actual_tokens,
+        ).contiguous()
+        seq_lens_rep = torch.repeat_interleave(
+            effective_seq_lens,
+            query_lens_gpu,
+            output_size=num_actual_tokens,
+        )
+        query_lens_rep = torch.repeat_interleave(
+            query_lens_gpu.to(dtype=dtype),
+            query_lens_gpu,
+            output_size=num_actual_tokens,
+        )
+        start_locs_rep = torch.repeat_interleave(
+            query_start_loc_gpu[:-1].to(dtype=dtype),
+            query_lens_gpu,
+            output_size=num_actual_tokens,
+        )
+        offsets = torch.arange(
+            num_actual_tokens,
+            device=device,
+            dtype=dtype,
+        ) - start_locs_rep + 1
+        decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
         self.flash_attn_decode_paged(
             query,
             key_cache,
@@ -757,7 +774,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
         if (causal and self.use_flash_v100_decode
                 and self.smallq_decode_max_query_len > 0
-                and max_query_len <= self.smallq_decode_max_query_len):
+                and max_query_len <= self.smallq_decode_max_query_len
+                and (self.smallq_decode_max_model_len <= 0
+                     or getattr(attn_metadata, "max_model_len", 0)
+                     <= self.smallq_decode_max_model_len)):
             if not _logged_prefill_smallq_decode:
                 logger.info(
                     "FLASH_ATTN_V100 prefix prefill small-query path active "

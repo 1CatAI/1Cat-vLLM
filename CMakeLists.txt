@@ -384,6 +384,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/stopping_criterion.cc"
         "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/params.cc"
         "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu"
+        "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu"
         "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
         "csrc/quantization/awq/tm_registry_sm70.cu"
         "csrc/quantization/awq/awq_sm70_gemm.cu")

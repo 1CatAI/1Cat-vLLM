@@ -5,6 +5,8 @@ import flash_attn_v100_cuda
 from typing import Optional, Sequence, Tuple, Union
 
 DEFAULT_DECODE_PARTITION_SIZE = 256
+LONG_CONTEXT_DECODE_PARTITION_SIZE = 512
+LONG_CONTEXT_DECODE_PARTITION_THRESHOLD = 20480
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _decode_workspace_cache = {}
 
@@ -53,6 +55,8 @@ def _get_decode_workspace(
 def _get_decode_partition_size(max_seq_capacity: int) -> int:
     raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     if raw is None:
+        if max_seq_capacity > LONG_CONTEXT_DECODE_PARTITION_THRESHOLD:
+            return LONG_CONTEXT_DECODE_PARTITION_SIZE
         return DEFAULT_DECODE_PARTITION_SIZE
     try:
         value = int(raw)

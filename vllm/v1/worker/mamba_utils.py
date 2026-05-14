@@ -235,6 +235,10 @@ def postprocess_mamba(
                 req_state,
                 forward_context,
             )
-            if src_block_idx == dest_block_idx:
-                num_accepted_tokens_cpu[i] = 1
+            # The accepted state has been materialized at the aligned block.
+            # Treat it as the new base state on the next step; carrying the
+            # previous accepted-token offset across a block copy can make the
+            # next speculative verifier read from a stale running-state slot.
+            mamba_state_idx[req_id] = dest_block_idx
+            num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(src_state_list, dest_state_list, num_elements_list)

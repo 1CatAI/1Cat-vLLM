@@ -343,6 +343,21 @@ void validate_awq_inputs(const torch::Tensor& qweight,
               "awq_sm70_prepare: scales must be float16.");
 }
 
+void validate_fp8_inputs(const torch::Tensor& qweight,
+                         const torch::Tensor& scales,
+                         int64_t group_size) {
+  TORCH_CHECK(qweight.is_cuda(), "fp8_sm70_prepare: qweight must be CUDA.");
+  TORCH_CHECK(scales.is_cuda(), "fp8_sm70_prepare: scales must be CUDA.");
+  TORCH_CHECK(qweight.scalar_type() == at::ScalarType::Float8_e4m3fn,
+              "fp8_sm70_prepare: qweight must be float8_e4m3fn.");
+  TORCH_CHECK(scales.scalar_type() == torch::kFloat32,
+              "fp8_sm70_prepare: scales must be float32.");
+  TORCH_CHECK(qweight.dim() == 2, "fp8_sm70_prepare: qweight must be 2D.");
+  TORCH_CHECK(scales.dim() == 2, "fp8_sm70_prepare: scales must be 2D.");
+  TORCH_CHECK(group_size == 128,
+              "fp8_sm70_prepare: only group_size=128 is supported.");
+}
+
 void validate_f16_weight(const torch::Tensor& weight,
                          const char* op_name) {
   TORCH_CHECK(weight.is_cuda(), op_name, ": weight must be CUDA.");
@@ -749,6 +764,133 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
   return {tm_weight, tm_scales, meta};
 }
 
+std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
+                                            torch::Tensor scales,
+                                            int64_t group_size) {
+  validate_fp8_inputs(qweight, scales, group_size);
+
+  qweight = qweight.contiguous();
+  scales = scales.contiguous();
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(qweight));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const int64_t n = qweight.size(0);
+  const int64_t k = qweight.size(1);
+  TORCH_CHECK(k % 8 == 0 && n % 8 == 0,
+              "fp8_sm70_prepare: K and N must be multiples of 8.");
+  TORCH_CHECK(scales.size(0) == (n + group_size - 1) / group_size,
+              "fp8_sm70_prepare: output scale block mismatch.");
+  TORCH_CHECK(scales.size(1) == (k + group_size - 1) / group_size,
+              "fp8_sm70_prepare: input scale block mismatch.");
+
+  const auto converters = turbomind::gemm::GetConverters(
+      turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
+  const auto* conv_w = converters[0];
+  const auto* conv_s = converters[1];
+  TORCH_CHECK(conv_w && conv_s,
+              "fp8_sm70_prepare: no compatible TurboMind converters.");
+
+  const auto order_w = conv_w->order;
+  const bool is_A_w =
+      turbomind::gemm::get_operand_tag(conv_w->pack) ==
+      turbomind::gemm::OPERAND_A;
+  const bool is_B_w = !is_A_w;
+
+  auto qweight_kn = qweight.transpose(0, 1).contiguous();
+  auto i16_opts = torch::TensorOptions()
+                      .device(qweight.device())
+                      .dtype(torch::kInt16);
+  auto tmp_u16 = torch::empty({k, n}, i16_opts);
+  turbomind::extend_to_u16(
+      reinterpret_cast<uint16_t*>(tmp_u16.data_ptr<int16_t>()),
+      reinterpret_cast<const uint8_t*>(qweight_kn.data_ptr()),
+      tmp_u16.numel(), stream);
+
+  torch::Tensor tmp_u16_conv = tmp_u16;
+  if (order_w == turbomind::gemm::kRowMajor) {
+    tmp_u16_conv = tmp_u16.transpose(0, 1).contiguous();
+  }
+
+  turbomind::gemm::MatrixLayout w_desc{
+      turbomind::kHalf,
+      order_w,
+      static_cast<int>(n),
+      static_cast<int>(k),
+      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
+                                            : static_cast<int>(n),
+  };
+  if (is_B_w) {
+    std::swap(w_desc.rows, w_desc.cols);
+    w_desc.order = ~w_desc.order;
+  }
+
+  turbomind::gemm::MatrixLayout k_desc = w_desc;
+  k_desc.type = turbomind::data_type_v<uint8_t>;
+  k_desc.pack = conv_w->pack;
+  if (is_A_w) {
+    k_desc = turbomind::gemm::transpose(k_desc);
+  }
+
+  auto tm_weight = torch::empty(
+      {k, n},
+      torch::TensorOptions().device(qweight.device()).dtype(torch::kUInt8));
+  TORCH_CHECK(
+      conv_w->Convert(tmp_u16_conv.data_ptr(),
+                      w_desc,
+                      tm_weight.data_ptr(),
+                      k_desc,
+                      stream) == 0,
+      "fp8_sm70_prepare: weight conversion failed.");
+
+  const auto order_s = conv_s->order;
+  const bool is_A_s =
+      turbomind::gemm::get_operand_tag(conv_s->pack) ==
+      turbomind::gemm::OPERAND_U;
+  const bool is_B_s = !is_A_s;
+  const int64_t num_groups = (k + group_size - 1) / group_size;
+
+  auto group_scales = scales.transpose(0, 1)
+                          .contiguous()
+                          .to(torch::kFloat16)
+                          .repeat_interleave(group_size, 1)
+                          .slice(1, 0, n)
+                          .contiguous();
+
+  turbomind::gemm::MatrixLayout s_desc{
+      turbomind::kUint16,
+      order_s,
+      static_cast<int>(n),
+      static_cast<int>(num_groups),
+      static_cast<int>(n),
+  };
+  if (is_B_s) {
+    std::swap(s_desc.rows, s_desc.cols);
+    s_desc.order = ~s_desc.order;
+  }
+
+  turbomind::gemm::MatrixLayout q_desc = s_desc;
+  q_desc.pack = conv_s->pack;
+  if (is_A_s) {
+    q_desc = turbomind::gemm::transpose(q_desc);
+  }
+
+  auto tm_scales = torch::empty_like(group_scales);
+  TORCH_CHECK(
+      conv_s->Convert(group_scales.data_ptr(),
+                      s_desc,
+                      tm_scales.data_ptr(),
+                      q_desc,
+                      stream) == 0,
+      "fp8_sm70_prepare: scale conversion failed.");
+
+  auto meta = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64));
+  meta.index_put_({0}, k_desc.ld);
+  meta.index_put_({1}, q_desc.ld);
+
+  return {tm_weight, tm_scales, meta};
+}
+
 std::vector<torch::Tensor> sm70_f16_prepare(torch::Tensor weight) {
   validate_f16_weight(weight, "sm70_f16_prepare");
 
@@ -921,6 +1063,234 @@ void awq_gemm_sm70_out(torch::Tensor out,
                           workspace_holder.workspace,
                           stream);
   TORCH_CHECK(ec == 0, "awq_gemm_sm70: TurboMind GEMM failed.");
+}
+
+void fp8_gemm_sm70_out(torch::Tensor out,
+                       torch::Tensor in_feats,
+                       torch::Tensor tm_weight,
+                       torch::Tensor tm_scales,
+                       int64_t group_size,
+                       int64_t k_ld,
+                       int64_t q_ld) {
+  TORCH_CHECK(in_feats.is_cuda(), "fp8_gemm_sm70: input must be CUDA.");
+  TORCH_CHECK(tm_weight.is_cuda(), "fp8_gemm_sm70: weight must be CUDA.");
+  TORCH_CHECK(tm_scales.is_cuda(), "fp8_gemm_sm70: scales must be CUDA.");
+  TORCH_CHECK(out.is_cuda(), "fp8_gemm_sm70: output must be CUDA.");
+  TORCH_CHECK(in_feats.scalar_type() == torch::kFloat16,
+              "fp8_gemm_sm70: input must be float16.");
+  TORCH_CHECK(tm_weight.scalar_type() == torch::kUInt8,
+              "fp8_gemm_sm70: weight must be uint8.");
+  TORCH_CHECK(tm_scales.scalar_type() == torch::kFloat16,
+              "fp8_gemm_sm70: scales must be float16.");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16,
+              "fp8_gemm_sm70: output must be float16.");
+  TORCH_CHECK(group_size == 128,
+              "fp8_gemm_sm70: only group_size=128 is supported.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_feats));
+  const int device = in_feats.get_device();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const int64_t m = in_feats.size(0);
+  const int64_t k = in_feats.size(1);
+  const int64_t n = tm_weight.size(1);
+  TORCH_CHECK(tm_weight.size(0) == k,
+              "fp8_gemm_sm70: weight shape mismatch.");
+  TORCH_CHECK(tm_scales.size(0) == (k + group_size - 1) / group_size,
+              "fp8_gemm_sm70: scale groups mismatch.");
+  TORCH_CHECK(tm_scales.size(1) == n,
+              "fp8_gemm_sm70: scale shape mismatch.");
+  TORCH_CHECK(out.size(0) == m,
+              "fp8_gemm_sm70: output rows must match input rows.");
+  TORCH_CHECK(out.size(1) == n,
+              "fp8_gemm_sm70: output cols must match weight output dim.");
+  TORCH_CHECK(out.stride(1) == 1,
+              "fp8_gemm_sm70: output must be row-major contiguous.");
+
+  const auto converters = turbomind::gemm::GetConverters(
+      turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
+  const auto* conv_w = converters[0];
+  const auto* conv_s = converters[1];
+  TORCH_CHECK(conv_w && conv_s,
+              "fp8_gemm_sm70: no compatible TurboMind converters.");
+
+  turbomind::gemm::MatrixLayout desc_A{
+      turbomind::kHalf,
+      turbomind::gemm::kRowMajor,
+      static_cast<int>(m),
+      static_cast<int>(k),
+      static_cast<int>(in_feats.stride(0)),
+  };
+  turbomind::gemm::MatrixLayout desc_U{};
+
+  const auto order_w = conv_w->order;
+  const bool is_A_w =
+      turbomind::gemm::get_operand_tag(conv_w->pack) ==
+      turbomind::gemm::OPERAND_A;
+  const bool is_B_w = !is_A_w;
+  turbomind::gemm::MatrixLayout w_desc{
+      turbomind::kHalf,
+      order_w,
+      static_cast<int>(n),
+      static_cast<int>(k),
+      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
+                                            : static_cast<int>(n),
+  };
+  if (is_B_w) {
+    std::swap(w_desc.rows, w_desc.cols);
+    w_desc.order = ~w_desc.order;
+  }
+  turbomind::gemm::MatrixLayout desc_B = w_desc;
+  desc_B.type = turbomind::kFloat8_e4m3;
+  desc_B.pack = conv_w->pack;
+  if (is_A_w) {
+    desc_B = turbomind::gemm::transpose(desc_B);
+  }
+  desc_B.ld = static_cast<int>(k_ld);
+
+  const auto order_s = conv_s->order;
+  const bool is_A_s =
+      turbomind::gemm::get_operand_tag(conv_s->pack) ==
+      turbomind::gemm::OPERAND_U;
+  const bool is_B_s = !is_A_s;
+  const int64_t num_groups = (k + group_size - 1) / group_size;
+  turbomind::gemm::MatrixLayout s_desc{
+      turbomind::kUint16,
+      order_s,
+      static_cast<int>(n),
+      static_cast<int>(num_groups),
+      static_cast<int>(n),
+  };
+  if (is_B_s) {
+    std::swap(s_desc.rows, s_desc.cols);
+    s_desc.order = ~s_desc.order;
+  }
+  turbomind::gemm::MatrixLayout desc_V = s_desc;
+  desc_V.pack = conv_s->pack;
+  if (is_A_s) {
+    desc_V = turbomind::gemm::transpose(desc_V);
+  }
+  desc_V.ld = static_cast<int>(q_ld);
+
+  turbomind::gemm::MatrixLayout desc_D{
+      turbomind::kHalf,
+      turbomind::gemm::kRowMajor,
+      static_cast<int>(m),
+      static_cast<int>(n),
+      static_cast<int>(out.stride(0)),
+  };
+
+  turbomind::gemm::Operation op{};
+  op.dispatch = select_dense_dispatch_policy(
+      device, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+      static_cast<int>(group_size), stream);
+  op.epilogue = turbomind::gemm::Epilogue::kNone;
+  op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
+  op.batch_dim = 0;
+
+  auto& workspace_holder = get_workspace(device, stream);
+  auto& gemm = get_gemm(device);
+
+  const int ec = gemm.Run(op,
+                          1.f,
+                          in_feats.data_ptr(),
+                          desc_A,
+                          nullptr,
+                          desc_U,
+                          tm_weight.data_ptr(),
+                          desc_B,
+                          tm_scales.data_ptr(),
+                          desc_V,
+                          0.f,
+                          out.data_ptr(),
+                          desc_D,
+                          out.data_ptr(),
+                          desc_D,
+                          workspace_holder.workspace,
+                          stream);
+  TORCH_CHECK(ec == 0, "fp8_gemm_sm70: TurboMind GEMM failed.");
+}
+
+void fp8_gemm_sm70_out_auto(torch::Tensor out,
+                            torch::Tensor in_feats,
+                            torch::Tensor tm_weight,
+                            torch::Tensor tm_scales) {
+  constexpr int64_t group_size = 128;
+  const int64_t k = in_feats.size(1);
+  const int64_t n = tm_weight.size(1);
+
+  const auto converters = turbomind::gemm::GetConverters(
+      turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
+  const auto* conv_w = converters[0];
+  const auto* conv_s = converters[1];
+  TORCH_CHECK(conv_w && conv_s,
+              "fp8_gemm_sm70: no compatible TurboMind converters.");
+
+  const auto order_w = conv_w->order;
+  const bool is_A_w =
+      turbomind::gemm::get_operand_tag(conv_w->pack) ==
+      turbomind::gemm::OPERAND_A;
+  const bool is_B_w = !is_A_w;
+  turbomind::gemm::MatrixLayout w_desc{
+      turbomind::kHalf,
+      order_w,
+      static_cast<int>(n),
+      static_cast<int>(k),
+      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
+                                            : static_cast<int>(n),
+  };
+  if (is_B_w) {
+    std::swap(w_desc.rows, w_desc.cols);
+    w_desc.order = ~w_desc.order;
+  }
+  turbomind::gemm::MatrixLayout desc_B = w_desc;
+  desc_B.type = turbomind::kFloat8_e4m3;
+  desc_B.pack = conv_w->pack;
+  if (is_A_w) {
+    desc_B = turbomind::gemm::transpose(desc_B);
+  }
+
+  const auto order_s = conv_s->order;
+  const bool is_A_s =
+      turbomind::gemm::get_operand_tag(conv_s->pack) ==
+      turbomind::gemm::OPERAND_U;
+  const bool is_B_s = !is_A_s;
+  const int64_t num_groups = (k + group_size - 1) / group_size;
+  turbomind::gemm::MatrixLayout s_desc{
+      turbomind::kUint16,
+      order_s,
+      static_cast<int>(n),
+      static_cast<int>(num_groups),
+      static_cast<int>(n),
+  };
+  if (is_B_s) {
+    std::swap(s_desc.rows, s_desc.cols);
+    s_desc.order = ~s_desc.order;
+  }
+  turbomind::gemm::MatrixLayout desc_V = s_desc;
+  desc_V.pack = conv_s->pack;
+  if (is_A_s) {
+    desc_V = turbomind::gemm::transpose(desc_V);
+  }
+
+  fp8_gemm_sm70_out(out, in_feats, tm_weight, tm_scales, group_size,
+                    desc_B.ld, desc_V.ld);
+}
+
+void fp8_gemm_sm70_out_meta(torch::Tensor out,
+                            torch::Tensor in_feats,
+                            torch::Tensor tm_weight,
+                            torch::Tensor tm_scales,
+                            torch::Tensor meta) {
+  TORCH_CHECK(meta.scalar_type() == torch::kInt64,
+              "fp8_gemm_sm70: meta must be int64.");
+  TORCH_CHECK(meta.numel() >= 2, "fp8_gemm_sm70: meta must have two values.");
+  auto meta_cpu = meta.device().is_cpu() ? meta.contiguous()
+                                        : meta.to(torch::kCPU).contiguous();
+  const int64_t* meta_ptr = meta_cpu.data_ptr<int64_t>();
+  fp8_gemm_sm70_out(out, in_feats, tm_weight, tm_scales, 128, meta_ptr[0],
+                    meta_ptr[1]);
 }
 
 void sm70_f16_gemm_out(torch::Tensor out,
@@ -1126,6 +1496,13 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
       interleave_gated_silu);
 }
 
+std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor _kernel,
+                                            torch::Tensor _scaling_factors,
+                                            int64_t group_size) {
+  return vllm::awq_sm70::fp8_sm70_prepare(
+      _kernel, _scaling_factors, group_size);
+}
+
 std::vector<torch::Tensor> sm70_f16_prepare(torch::Tensor _kernel) {
   return vllm::awq_sm70::sm70_f16_prepare(_kernel);
 }
@@ -1156,6 +1533,34 @@ void awq_gemm_sm70_out(torch::Tensor out,
   vllm::awq_sm70::awq_gemm_sm70_out(out, _in_feats, _kernel,
                                     _scaling_factors, group_size, k_ld, q_ld,
                                     gated_silu);
+}
+
+void fp8_gemm_sm70_out(torch::Tensor out,
+                       torch::Tensor _in_feats,
+                       torch::Tensor _kernel,
+                       torch::Tensor _scaling_factors,
+                       int64_t group_size,
+                       int64_t k_ld,
+                       int64_t q_ld) {
+  vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel,
+                                    _scaling_factors, group_size, k_ld, q_ld);
+}
+
+void fp8_gemm_sm70_out_auto(torch::Tensor out,
+                            torch::Tensor _in_feats,
+                            torch::Tensor _kernel,
+                            torch::Tensor _scaling_factors) {
+  vllm::awq_sm70::fp8_gemm_sm70_out_auto(out, _in_feats, _kernel,
+                                         _scaling_factors);
+}
+
+void fp8_gemm_sm70_out_meta(torch::Tensor out,
+                            torch::Tensor _in_feats,
+                            torch::Tensor _kernel,
+                            torch::Tensor _scaling_factors,
+                            torch::Tensor _meta) {
+  vllm::awq_sm70::fp8_gemm_sm70_out_meta(out, _in_feats, _kernel,
+                                         _scaling_factors, _meta);
 }
 
 void sm70_f16_gemm_out(torch::Tensor out,

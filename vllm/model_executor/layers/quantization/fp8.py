@@ -152,6 +152,13 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(70)
+            and not current_platform.has_device_capability(75)
+            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+        ):
+            return 70
         return 75
 
     @classmethod
@@ -204,7 +211,19 @@ class Fp8Config(QuantizationConfig):
                 online_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
                 return online_method
             else:
-                offline_method = Fp8LinearMethod(self)
+                force_sm70_dequant = (
+                    current_platform.is_cuda()
+                    and current_platform.has_device_capability(70)
+                    and not current_platform.has_device_capability(75)
+                    and (
+                        prefix == "mtp"
+                        or prefix.startswith("mtp.")
+                        or ".mtp." in prefix
+                    )
+                )
+                offline_method = Fp8LinearMethod(
+                    self, force_sm70_dequant=force_sm70_dequant
+                )
                 offline_method.marlin_input_dtype = get_marlin_input_dtype(prefix)
                 return offline_method
         elif isinstance(layer, FusedMoE):
@@ -287,7 +306,12 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(
+        self,
+        quant_config: Fp8Config,
+        *,
+        force_sm70_dequant: bool = False,
+    ):
         self.quant_config = quant_config
         self.cutlass_block_fp8_supported = cutlass_block_fp8_supported()
         self.out_dtype = torch.get_default_dtype()
@@ -311,16 +335,33 @@ class Fp8LinearMethod(LinearMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.block_quant = self.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
+        self.use_sm70_dequant_fallback = (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(70)
+            and not current_platform.has_device_capability(75)
+            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+        )
+        self.force_sm70_dequant = force_sm70_dequant
+        self.use_sm70_fp8_turbomind = (
+            self.use_sm70_dequant_fallback
+            and not self.force_sm70_dequant
+            and envs.VLLM_SM70_FP8_TURBOMIND
+            and self.block_quant
+            and self.weight_block_size == [128, 128]
+        )
+        if self.use_sm70_dequant_fallback:
+            self.use_marlin = False
 
         if self.block_quant:
             assert not self.act_q_static
             assert self.weight_block_size is not None
-            self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
-                weight_group_shape=GroupShape(*self.weight_block_size),
-                act_quant_group_shape=GroupShape(1, self.weight_block_size[0]),
-                cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
-                use_aiter_and_is_supported=self.use_aiter_and_is_supported,
-            )
+            if not self.use_sm70_dequant_fallback:
+                self.w8a8_block_fp8_linear = W8A8BlockFp8LinearOp(
+                    weight_group_shape=GroupShape(*self.weight_block_size),
+                    act_quant_group_shape=GroupShape(1, self.weight_block_size[0]),
+                    cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
+                    use_aiter_and_is_supported=self.use_aiter_and_is_supported,
+                )
         else:
             # Use per-token quantization for better perf if dynamic and cutlass
             if self.act_q_static:
@@ -417,6 +458,40 @@ class Fp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, "weight_scale_inv", weight_scale_inv.data)
 
+            if self.use_sm70_fp8_turbomind and layer.orig_dtype == torch.float16:
+                tm_weight, tm_scales, meta = ops.fp8_sm70_prepare(
+                    weight, weight_scale_inv, self.weight_block_size[0]
+                )
+                replace_parameter(layer, "weight", tm_weight)
+                replace_parameter(layer, "weight_scale_inv", tm_scales)
+                layer.input_scale = None
+                layer.sm70_fp8_turbomind = True
+                layer.sm70_fp8_group_size = self.weight_block_size[0]
+                layer.register_buffer(
+                    "sm70_fp8_meta", meta, persistent=False)
+                layer.sm70_fp8_k_ld = int(meta[0].item())
+                layer.sm70_fp8_q_ld = int(meta[1].item())
+                logger.warning_once(
+                    "SM70 FP8 TurboMind W8A16 path enabled for block FP8 "
+                    "weights. This keeps FP8 weights packed and runs the "
+                    "V100 TurboMind kernel instead of dequantizing to fp16."
+                )
+                return
+
+            if self.use_sm70_dequant_fallback:
+                weight = self._dequantize_block_weight(
+                    weight, weight_scale_inv, layer.orig_dtype
+                )
+                replace_parameter(layer, "weight", weight)
+                layer.input_scale = None
+                logger.warning_once(
+                    "SM70 FP8 fallback enabled: FP8 block weights are "
+                    "dequantized to %s at load time. This preserves correctness "
+                    "on V100 while the native W8A16 kernel is unavailable.",
+                    layer.orig_dtype,
+                )
+                return
+
         # If checkpoint not serialized fp8, quantize the weights.
         else:
             # If checkpoint is fp8 per-tensor, handle that there are N scales for N
@@ -442,6 +517,20 @@ class Fp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, "weight_scale", weight_scale.data)
 
+            if self.use_sm70_dequant_fallback:
+                dequant_weight = self._dequantize_tensor_weight(
+                    weight, weight_scale, layer.orig_dtype
+                )
+                replace_parameter(layer, "weight", dequant_weight.t().contiguous())
+                layer.input_scale = None
+                logger.warning_once(
+                    "SM70 FP8 fallback enabled: FP8 tensor weights are "
+                    "dequantized to %s at load time. This preserves correctness "
+                    "on V100 while the native W8A16 kernel is unavailable.",
+                    layer.orig_dtype,
+                )
+                return
+
         if input_scale is not None:
             replace_parameter(layer, "input_scale", input_scale)
         else:
@@ -458,12 +547,64 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             maybe_post_process_fp8_weight_block(layer)
 
+    def _dequantize_block_weight(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        assert self.weight_block_size is not None
+        block_n, block_k = self.weight_block_size
+        scales = weight_scale.to(dtype)
+        scales = scales.repeat_interleave(block_n, dim=0)
+        scales = scales.repeat_interleave(block_k, dim=1)
+        scales = scales[: weight.shape[0], : weight.shape[1]]
+        return (weight.to(dtype) * scales).contiguous()
+
+    def _dequantize_tensor_weight(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        scales = weight_scale.to(dtype)
+        if scales.numel() == 1:
+            return (weight.to(dtype) * scales).contiguous()
+        if scales.ndim == 1 and scales.numel() == weight.shape[1]:
+            return (weight.to(dtype) * scales.view(1, -1)).contiguous()
+        if scales.ndim == 1 and scales.numel() == weight.shape[0]:
+            return (weight.to(dtype) * scales.view(-1, 1)).contiguous()
+        return (weight.to(dtype) * scales).contiguous()
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "sm70_fp8_turbomind", False):
+            out_shape = (*x.shape[:-1], layer.output_size_per_partition)
+            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+            out_2d = torch.empty(
+                (x_2d.shape[0], layer.output_size_per_partition),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            ops.fp8_gemm_sm70_out_meta(
+                out_2d,
+                x_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                layer.sm70_fp8_meta,
+            )
+            out = out_2d.reshape(out_shape)
+            if bias is not None:
+                out = out + bias
+            return out
+
+        if self.use_sm70_dequant_fallback:
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
         # if batch invariant mode is enabled, prefer DeepGEMM FP8 path
         # we will use BF16 dequant when DeepGEMM is not supported.
         if vllm_is_batch_invariant():
