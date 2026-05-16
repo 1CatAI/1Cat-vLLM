@@ -28,6 +28,7 @@ import os
 from collections.abc import Iterable
 from itertools import islice
 
+import re
 import torch
 from torch import nn
 
@@ -646,6 +647,34 @@ class Qwen3_5Model(Qwen3NextModel):
                     )
                     break
                 else:
+                    # FP16 checkpoints (e.g. Qwen3.6-35B-A3B) store pre-fused
+                    # all-expert tensors rather than per-expert weights:
+                    #   mlp.experts.gate_up_proj [N, 2*ffn_dim, hidden]
+                    #   mlp.experts.down_proj    [N, hidden, ffn_dim]
+                    # These don't match the per-expert expert_params_mapping
+                    # entries, so we intercept them here and dispatch each
+                    # expert slice to the FusedMoE weight_loader.
+                    if re.search(r"mlp\.experts\.(gate_up_proj|down_proj)$", name):
+                        _is_gate_up = name.endswith(".gate_up_proj")
+                        _psuffix = "w13_weight" if _is_gate_up else "w2_weight"
+                        _pname = re.sub(
+                            r"mlp\.experts\.(gate_up_proj|down_proj)$",
+                            f"mlp.experts.{_psuffix}",
+                            name,
+                        )
+                        if not is_pp_missing_parameter(_pname, self) and _pname in params_dict:
+                            _param = params_dict[_pname]
+                            _n_exp = loaded_weight.shape[0]
+                            if _is_gate_up:
+                                _half = loaded_weight.shape[1] // 2
+                                for _eid in range(_n_exp):
+                                    _param.weight_loader(_param, loaded_weight[_eid, :_half, :].contiguous(), _pname, shard_id="w1", expert_id=_eid)
+                                    _param.weight_loader(_param, loaded_weight[_eid, _half:, :].contiguous(), _pname, shard_id="w3", expert_id=_eid)
+                            else:
+                                for _eid in range(_n_exp):
+                                    _param.weight_loader(_param, loaded_weight[_eid].contiguous(), _pname, shard_id="w2", expert_id=_eid)
+                            loaded_params.add(_pname)
+                        continue
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
