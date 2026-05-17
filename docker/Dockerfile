@@ -227,6 +227,7 @@ WORKDIR /workspace
 COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY cmake cmake/
 COPY csrc csrc/
+COPY lmdeploy lmdeploy/
 COPY vllm/envs.py vllm/envs.py
 COPY vllm/__init__.py vllm/__init__.py
 
