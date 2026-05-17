@@ -1871,15 +1871,18 @@ class GPUModelRunner(
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
                 assert ubid is None, "UBatching not supported with GDN yet"
+                current_state_block_ids = None
+                if self.cache_config.mamba_cache_mode == "align":
+                    current_state_block_ids = _get_current_mamba_state_block_ids(
+                        kv_cache_gid
+                    )
                 extra_attn_metadata_args = dict(
                     num_accepted_tokens=self.num_accepted_tokens.gpu[:num_reqs_padded],
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[
                         :num_reqs_padded
                     ],
                     spec_sequence_masks_cpu=spec_sequence_masks_cpu,
-                    current_state_block_ids=_get_current_mamba_state_block_ids(
-                        kv_cache_gid
-                    ),
+                    current_state_block_ids=current_state_block_ids,
                 )
 
             if for_cudagraph_capture:

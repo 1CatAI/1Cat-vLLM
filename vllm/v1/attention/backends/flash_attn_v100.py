@@ -681,46 +681,75 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         with an increasing seq_len preserves the causal mask without exposing
         future draft tokens.
         """
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        query = query[:num_actual_tokens]
-        out_view = output[:num_actual_tokens]
-
         device = attn_metadata.seq_lens.device
         dtype = attn_metadata.seq_lens.dtype
 
+        num_query_tokens = attn_metadata.num_actual_tokens
         query_start_loc_gpu = attn_metadata.query_start_loc
+        query = query[:num_query_tokens]
+        out_view = output[:num_query_tokens]
         query_lens_gpu = query_start_loc_gpu[1:] - query_start_loc_gpu[:-1]
+        real_query_lens_gpu = query_lens_gpu
+        real_num_query_tokens = query_start_loc_gpu[-1]
+        num_seqs = query_lens_gpu.numel()
+        if num_seqs > 0:
+            # FULL CUDA graph replay may pad a 3-request MTP verifier batch
+            # from 15 tokens to 20 tokens while query_start_loc still marks
+            # only the 15 live tokens. Give the padded tail a dummy query span
+            # so repeat_interleave keeps the captured graph shape. The padded
+            # rows are masked below and must not read real KV cache entries.
+            padding_tokens = torch.clamp(
+                num_query_tokens - real_num_query_tokens,
+                min=0,
+            )
+            query_lens_gpu = query_lens_gpu.clone()
+            query_lens_gpu[-1] += padding_tokens
+
+        seq_lens = attn_metadata.seq_lens[:num_seqs]
         effective_seq_lens = torch.maximum(
-            attn_metadata.seq_lens,
-            query_lens_gpu.to(dtype=attn_metadata.seq_lens.dtype),
+            seq_lens,
+            real_query_lens_gpu.to(dtype=attn_metadata.seq_lens.dtype),
         )
+        block_table = attn_metadata.block_table[:num_seqs].clamp_min(0)
         decode_block_table = torch.repeat_interleave(
-            attn_metadata.block_table,
+            block_table,
             query_lens_gpu,
             dim=0,
-            output_size=num_actual_tokens,
+            output_size=num_query_tokens,
         ).contiguous()
         seq_lens_rep = torch.repeat_interleave(
             effective_seq_lens,
             query_lens_gpu,
-            output_size=num_actual_tokens,
+            output_size=num_query_tokens,
         )
         query_lens_rep = torch.repeat_interleave(
-            query_lens_gpu.to(dtype=dtype),
+            real_query_lens_gpu.to(dtype=dtype),
             query_lens_gpu,
-            output_size=num_actual_tokens,
+            output_size=num_query_tokens,
         )
         start_locs_rep = torch.repeat_interleave(
             query_start_loc_gpu[:-1].to(dtype=dtype),
             query_lens_gpu,
-            output_size=num_actual_tokens,
+            output_size=num_query_tokens,
         )
-        offsets = torch.arange(
-            num_actual_tokens,
+        token_indices = torch.arange(
+            num_query_tokens,
             device=device,
             dtype=dtype,
-        ) - start_locs_rep + 1
+        )
+        offsets = token_indices - start_locs_rep + 1
         decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
+        padding_mask = token_indices >= real_num_query_tokens
+        decode_seq_lens = torch.where(
+            padding_mask,
+            torch.zeros_like(decode_seq_lens),
+            decode_seq_lens,
+        ).contiguous()
+        decode_block_table = torch.where(
+            padding_mask[:, None],
+            torch.zeros_like(decode_block_table),
+            decode_block_table,
+        ).contiguous()
         self.flash_attn_decode_paged(
             query,
             key_cache,

@@ -272,9 +272,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
         else:
-            query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            # query_start_loc may be padded for CUDA graph replay. The CPU
+            # metadata is authoritative for the live request count here.
+            query_lens = query_lens_cpu.to(query_start_loc.device, non_blocking=True)
 
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
             num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
@@ -349,6 +351,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     spec_state_indices_tensor = current_state_block_ids[
                         spec_sequence_masks_cpu, : self.num_spec + 1
                     ]
+                    non_spec_state_indices_tensor = current_state_block_ids[
+                        ~spec_sequence_masks_cpu, 0
+                    ]
                 elif is_mamba_cache_all:
                     spec_state_indices_tensor = _gather_state_block_ids(
                         block_table_tensor[spec_sequence_masks_cpu],
@@ -374,7 +379,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[spec_sequence_masks_cpu],
+                    query_lens[spec_sequence_masks],
                     dim=0,
                     out=spec_query_start_loc[1:],
                 )
@@ -384,7 +389,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[~spec_sequence_masks_cpu],
+                    query_lens[~spec_sequence_masks],
                     dim=0,
                     out=non_spec_query_start_loc[1:],
                 )

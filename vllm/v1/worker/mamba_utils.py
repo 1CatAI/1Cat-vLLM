@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from typing import Any
 
 import torch
 
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
 )
@@ -15,6 +17,15 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
+
+_DEBUG_MAMBA_ALIGN = os.environ.get("VLLM_MAMBA_ALIGN_DEBUG") == "1"
+
+
+def _debug_mamba_align(event: str, **kwargs: Any) -> None:
+    if _DEBUG_MAMBA_ALIGN:
+        logger.info("MAMBA_ALIGN_DEBUG %s %s", event, kwargs)
 
 
 @triton.jit
@@ -166,6 +177,23 @@ def preprocess_mamba(
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+            accept_token_bias = input_batch.num_accepted_tokens_cpu[i] - 1
+            _debug_mamba_align(
+                "pre_copy",
+                req_id=req_id,
+                i=i,
+                num_computed_tokens=req_state.num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_speculative_blocks=num_speculative_blocks,
+                block_size=block_size,
+                prev_state_idx=prev_state_idx,
+                curr_state_idx=curr_state_idx,
+                num_accepted_tokens_cpu=int(input_batch.num_accepted_tokens_cpu[i]),
+                spec_num_accepted_tokens_cpu=int(
+                    input_batch.spec_num_accepted_tokens_cpu[i]
+                ),
+                accept_token_bias=int(accept_token_bias),
+            )
             collect_mamba_copy_meta(
                 src_state_list,
                 dest_state_list,
@@ -175,11 +203,21 @@ def preprocess_mamba(
                 mamba_group_ids,
                 prev_state_idx,
                 curr_state_idx,
-                input_batch.num_accepted_tokens_cpu[i] - 1,
+                accept_token_bias,
                 req_state,
                 forward_context,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
+            input_batch.spec_num_accepted_tokens_cpu[i] = 1
+            _debug_mamba_align(
+                "pre_reset",
+                req_id=req_id,
+                i=i,
+                num_accepted_tokens_cpu=int(input_batch.num_accepted_tokens_cpu[i]),
+                spec_num_accepted_tokens_cpu=int(
+                    input_batch.spec_num_accepted_tokens_cpu[i]
+                ),
+            )
     do_mamba_copy_block(src_state_list, dest_state_list, num_elements_list)
 
 
@@ -222,6 +260,25 @@ def postprocess_mamba(
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
             src_block_idx = mamba_state_idx[req_id]
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
+            _debug_mamba_align(
+                "post_copy",
+                req_id=req_id,
+                i=i,
+                num_computed_tokens=num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_draft_tokens=num_draft_tokens,
+                num_accepted_tokens_cpu=int(num_accepted_tokens_cpu[i]),
+                spec_num_accepted_tokens_cpu=int(
+                    input_batch.spec_num_accepted_tokens_cpu[i]
+                ),
+                num_tokens_running_state=num_tokens_running_state,
+                new_num_computed_tokens=new_num_computed_tokens,
+                aligned_new_computed_tokens=aligned_new_computed_tokens,
+                accept_token_bias=accept_token_bias,
+                src_block_idx=src_block_idx,
+                dest_block_idx=dest_block_idx,
+                block_size=mamba_spec.block_size,
+            )
             collect_mamba_copy_meta(
                 src_state_list,
                 dest_state_list,
@@ -235,10 +292,18 @@ def postprocess_mamba(
                 req_state,
                 forward_context,
             )
-            # The accepted state has been materialized at the aligned block.
-            # Treat it as the new base state on the next step; carrying the
-            # previous accepted-token offset across a block copy can make the
-            # next speculative verifier read from a stale running-state slot.
-            mamba_state_idx[req_id] = dest_block_idx
-            num_accepted_tokens_cpu[i] = 1
+            if src_block_idx == dest_block_idx:
+                num_accepted_tokens_cpu[i] = 1
+                input_batch.spec_num_accepted_tokens_cpu[i] = 1
+                _debug_mamba_align(
+                    "post_reset",
+                    req_id=req_id,
+                    i=i,
+                    src_block_idx=src_block_idx,
+                    dest_block_idx=dest_block_idx,
+                    num_accepted_tokens_cpu=int(num_accepted_tokens_cpu[i]),
+                    spec_num_accepted_tokens_cpu=int(
+                        input_batch.spec_num_accepted_tokens_cpu[i]
+                    ),
+                )
     do_mamba_copy_block(src_state_list, dest_state_list, num_elements_list)
