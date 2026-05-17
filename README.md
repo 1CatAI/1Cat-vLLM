@@ -375,14 +375,14 @@ docker run --rm \
   -p 8000:8000 \
   -v /path/to/models:/models:ro \
   -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_MODEL=/models/Qwen3.5-27B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-27B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=16384 \
-  1cat-vllm-sm70:1.0.0
+  1cat-vllm-sm70:1.0.0 \
+  --model /models/Qwen3.5-27B-AWQ \
+  --served-model-name Qwen3.5-27B-AWQ \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.88 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 16384
 ```
 
 ### 3. Run on four `32 GB` V100 with `Qwen3.6-35B-A3B-AWQ`
@@ -394,14 +394,14 @@ docker run --rm \
   -p 8000:8000 \
   -v /path/to/models:/models:ro \
   -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_MODEL=/models/Qwen3.6-35B-A3B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.6-35B-A3B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=8192 \
-  1cat-vllm-sm70:1.0.0
+  1cat-vllm-sm70:1.0.0 \
+  --model /models/Qwen3.6-35B-A3B-AWQ \
+  --served-model-name Qwen3.6-35B-A3B-AWQ \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.88 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 8192
 ```
 
 ### 4. Run on four `32 GB` V100 with `Qwen3.5-122B-A10B-AWQ`
@@ -413,14 +413,14 @@ docker run --rm \
   -p 8000:8000 \
   -v /path/to/models:/models:ro \
   -e VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
-  -e VLLM_MODEL=/models/Qwen3.5-122B-A10B-AWQ \
-  -e VLLM_SERVED_MODEL_NAME=Qwen3.5-122B-A10B-AWQ \
-  -e VLLM_TENSOR_PARALLEL_SIZE=4 \
-  -e VLLM_GPU_MEMORY_UTILIZATION=0.88 \
-  -e VLLM_MAX_MODEL_LEN=262144 \
-  -e VLLM_MAX_NUM_SEQS=1 \
-  -e VLLM_MAX_NUM_BATCHED_TOKENS=8096 \
-  1cat-vllm-sm70:1.0.0
+  1cat-vllm-sm70:1.0.0 \
+  --model /models/Qwen3.5-122B-A10B-AWQ \
+  --served-model-name Qwen3.5-122B-A10B-AWQ \
+  --tensor-parallel-size 4 \
+  --gpu-memory-utilization 0.88 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 8096
 ```
 
 ### 5. Quick API check
