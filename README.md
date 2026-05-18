@@ -177,7 +177,7 @@ same hardware this drops short-context incremental decode from about
 
 ## 微信交流群
 
-**群聊：** 1Cat-vLLM 开源交流群2
+**群聊：** 1Cat-vLLM 开源交流群3
 
 请使用微信扫描下方二维码加入群组：
 
