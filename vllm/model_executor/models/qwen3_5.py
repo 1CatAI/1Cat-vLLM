@@ -548,6 +548,14 @@ class Qwen3_5Model(Qwen3NextModel):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 if isinstance(shard_id, tuple):
+                    # Auxiliary compressed-tensors params (weight_shape:
+                    # BasevLLMParameter, weight_g_idx: RowvLLMParameter, ...)
+                    # have no output_dim and are not output-sharded. Load them
+                    # via the standard non-shard weight_loader and bail out of
+                    # the sub-id loop.
+                    if not hasattr(param, "output_dim"):
+                        weight_loader(param, loaded_weight)
+                        break
                     # Split by the target module's output shard metadata
                     # instead of hardcoding tensor shapes.
                     owner = getattr(weight_loader, "__self__", None)
@@ -565,12 +573,12 @@ class Qwen3_5Model(Qwen3NextModel):
                         )
                     logger.debug(
                         "Tuple shard load for %s: shard_ids=%s output_sizes=%s "
-                        "weight_shape=%s output_dim=%d",
+                        "weight_shape=%s output_dim=%s",
                         name,
                         shard_id,
                         output_sizes,
                         tuple(loaded_weight.shape),
-                        param.output_dim,
+                        getattr(param, "output_dim", "?"),
                     )
                     for sub_id in shard_id:
                         shard_offset = sum(output_sizes[:sub_id])
