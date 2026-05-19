@@ -136,6 +136,10 @@ def _uses_split_gdn_input_projections(
     modules_to_not_convert = getattr(quant_config, "modules_to_not_convert", None)
     if modules_to_not_convert is None:
         modules_to_not_convert = getattr(quant_config, "ignored_layers", None)
+    # Compressed-tensors exposes its skip list as ``ignore`` rather than
+    # ``modules_to_not_convert`` / ``ignored_layers``.
+    if modules_to_not_convert is None:
+        modules_to_not_convert = getattr(quant_config, "ignore", None)
     if not modules_to_not_convert:
         return False
     return any(
