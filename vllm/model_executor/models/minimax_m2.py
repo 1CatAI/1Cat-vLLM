@@ -72,13 +72,36 @@ from .utils import (
 
 # vllm-v100 (SM_70 Volta) FP16 AllReduce overflow mitigation for MiniMaxM2.
 #
-# Same class of bug we already patch for Mistral4 / Trinity / DeepseekV2: the
-# fp16 TP AllReduce that follows each MoE block can saturate to +/-Inf under
-# real-workload activations, producing NaN logits downstream. The MiniMax
-# tokenizer's byte fallback (token id 0 -> byte 0x00) then surfaces those NaNs
-# as NUL characters embedded in tool-call arguments, which OpenCode / Pi reject
-# as "NUL characters not allowed in source." Cross-reference:
+# Same class of bug we already patch for Mistral4 (csrc/quantization/gguf/
+# {moe,moe_vec,mmvq,mmq}.cuh kernel-level fp16 clamps) and DeepseekV2 (upstream
+# protection): the fp16 TP AllReduce that follows each MoE block can saturate
+# to +/-Inf under real-workload activations, producing NaN logits downstream.
+# The MiniMax tokenizer's byte fallback (token id 0 -> byte 0x00) then surfaces
+# those NaNs as NUL characters embedded in tool-call arguments, which OpenCode
+# / Pi reject as "NUL characters not allowed in source." Cross-reference:
 # https://github.com/humanjesse/vllm-v100/issues/11.
+#
+# If you edit this file: two committed regression tests guard the assumptions
+# this code rests on. Run both before merging if you change the strategy
+# defaults, the layer-selection logic, or the fp32-promote/nan_to_num shape:
+#   * tests/distributed/test_fp16_allreduce_overflow.py -- exercises the AR
+#     primitive directly with bayley's overflow patterns. Catches NCCL/torch
+#     upgrades that change reduction precision under us (which would mean the
+#     fp32-promote here is no longer needed -- and would invalidate the
+#     "per-model fix is the only correct option" decision documented at
+#     ~/.claude/projects/-home-admin/memory/project_fp16_ar_overflow_decision.md).
+#   * tests/fleet/measurements.py::nul_scan + the minimax_m27 entry in
+#     tests/fleet/registry.py -- runs a 4-turn polyfact-style decode through
+#     the full stack and asserts 0 NUL bytes in the assistant transcript.
+#     Catches anyone who breaks the protection in this file at the
+#     integration level. See bayley's "every few write calls in OpenCode
+#     reliably triggers it" in #11.
+#
+# Cross-fleet polyfact soak (2026-05-18) confirmed Granite-4.1, Qwen3.6, and
+# MiMo-V2.5 do NOT exhibit this bug in 224K bytes of output across the three.
+# The fp16-MoE-AR-overflow class is specific to architectures like this one
+# (and Mistral4 at the kernel level) -- not systemic to all our fp16 MoE
+# models. Hence per-model fix here, not a shared helper.
 #
 # VLLM_ALLREDUCE_OVERFLOW_STRATEGY selects between four policies:
 #
