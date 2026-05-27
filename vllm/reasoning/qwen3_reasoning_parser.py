@@ -27,9 +27,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     def __init__(self, tokenizer, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
-        # Qwen3.5 chat templates open the <think> block in the prompt when
-        # thinking is enabled, so completion tokens may only contain </think>.
-        self.prompt_has_open_think = bool(chat_kwargs.get("enable_thinking", False))
+        # The standard Qwen3 chat template injects <think>\n into the prompt
+        # whenever enable_thinking is not explicitly False, so completion tokens
+        # may only contain </think>. Default to True and only honor an explicit
+        # enable_thinking=False to opt out.
+        self.prompt_has_open_think = bool(chat_kwargs.get("enable_thinking", True))
 
     @property
     def start_token(self) -> str:
