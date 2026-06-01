@@ -180,6 +180,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return quant_method
 
         if isinstance(layer, Attention):
+            # Only register a KV-cache quant method when the checkpoint
+            # actually ships KV scales. Without this guard, compressed-
+            # tensors W4A16 models (which set kv_cache_scheme=None) are
+            # routed through CompressedTensorsKVCacheMethod and then
+            # misclassified by should_load_quant_weights() in
+            # attention.py:166 as "FP8 checkpoints", which refuses
+            # --kv-cache-dtype fp8_e5m2 at attention.py:167. That ban
+            # is the only FP8 KV path Triton supports on V100/SM70
+            # (Triton on SM70 rejects fp8e4nv), so without this fix
+            # V100 deployments cannot use FP8 KV cache on a W4A16 model.
+            if self.kv_cache_scheme is None:
+                return None
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(
