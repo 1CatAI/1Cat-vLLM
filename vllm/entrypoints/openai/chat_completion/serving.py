@@ -1542,10 +1542,17 @@ class OpenAIServingChat(OpenAIServing):
                         content_ids = reasoning_parser.extract_content_ids(
                             as_list(output.token_ids)
                         )
-                        content = tokenizer.decode(
-                            content_ids,
-                            skip_special_tokens=True,
-                        )
+                        # extract_content_ids returns [] when the reasoning
+                        # block was never closed (e.g. generation truncated
+                        # by max_tokens mid-<think>). Decoding an empty id
+                        # list would blank out the content extract_reasoning
+                        # already produced, so only override when there are
+                        # content ids.
+                        if content_ids:
+                            content = tokenizer.decode(
+                                content_ids,
+                                skip_special_tokens=True,
+                            )
                     except Exception:
                         pass
                 if not request.include_reasoning:
