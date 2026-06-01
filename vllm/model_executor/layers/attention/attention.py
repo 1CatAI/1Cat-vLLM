@@ -164,13 +164,18 @@ def _init_kv_cache_quant(
         # TODO (mgoin): kv cache dtype should be specified in the FP8
         # checkpoint config and become the "auto" behavior
         if layer.kv_cache_dtype == "fp8_e5m2":
-            raise ValueError("fp8_e5m2 kv-cache is not supported with fp8 checkpoints.")
-        # If quantization is enabled, we make "k_scale" and "v_scale"
-        # parameters so that it can be loaded from the model checkpoint.
-        # The k/v_scale will then be converted back to native float32
-        # values after weight loading.
-        layer.quant_method = quant_method
-        layer.quant_method.create_weights(layer)
+            # e5m2 KV is scaleless (5 exponent bits = enough range) and does NOT need
+            # the k_scale/v_scale machinery the e4m3 path loads from the checkpoint.
+            # Allow on fp8 checkpoints: skip scale-quant setup, use plain e5m2 KV (the
+            # SM70-supported fp8 KV format). Default 1.0 scales are correct here.
+            pass
+        else:
+            # If quantization is enabled, we make "k_scale" and "v_scale"
+            # parameters so that it can be loaded from the model checkpoint.
+            # The k/v_scale will then be converted back to native float32
+            # values after weight loading.
+            layer.quant_method = quant_method
+            layer.quant_method.create_weights(layer)
 
 
 class Attention(nn.Module, AttentionLayerBase):
