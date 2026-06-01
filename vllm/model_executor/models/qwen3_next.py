@@ -203,6 +203,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
+            # Router gate is stored as bf16 in the checkpoint; it must stay
+            # unquantized even when the model uses compressed-tensors / AWQ.
             quant_config=None,
             prefix=f"{prefix}.gate",
         )

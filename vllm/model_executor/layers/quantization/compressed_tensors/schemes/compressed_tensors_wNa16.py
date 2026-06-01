@@ -79,7 +79,13 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing and up
+        # SM70 (V100) is supported via SM70TurboMindLinearKernel
+        # (CT pack -> AWQ pack -> awq_sm70_prepare/awq_gemm_sm70).
+        # All other pre-Turing GPUs (sm_60, sm_61, sm_62) are unsupported.
+        from vllm.platforms import current_platform
+        cap = current_platform.get_device_capability()
+        if cap is not None and cap[0] == 7 and cap[1] == 0:
+            return 70
         return 75
 
     def create_weights(
