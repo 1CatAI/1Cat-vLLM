@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
@@ -49,8 +50,17 @@ def get_config() -> dict[str, Any] | None:
     return _config
 
 
+def fused_moe_make_expert_params_mapping(*args, **kwargs):
+    # Standalone alias for FusedMoE.make_expert_params_mapping. Upstream vLLM
+    # refactored the classmethod into a module-level function; some models
+    # (e.g. gemma4) import it by that name.
+    return FusedMoE.make_expert_params_mapping(*args, **kwargs)
+
+
 __all__ = [
     "FusedMoE",
+    "GateLinear",
+    "fused_moe_make_expert_params_mapping",
     "FusedMoERouter",
     "FusedMoEConfig",
     "FusedMoEMethodBase",
