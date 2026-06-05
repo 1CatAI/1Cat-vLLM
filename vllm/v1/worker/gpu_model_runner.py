@@ -157,6 +157,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -476,6 +477,8 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.use_gemma4_mtp():
+                self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -1938,7 +1941,9 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
+                if isinstance(
+                    self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
+                ):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -1948,6 +1953,11 @@ class GPUModelRunner(
                     if dflash_common_attn_metadata_by_gid is None:
                         dflash_common_attn_metadata_by_gid = {}
                     dflash_common_attn_metadata_by_gid[kv_cache_gid] = cm
+            # Capture per-group block tables for multi-group proposers (Gemma4 MTP).
+            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+                self.drafter.set_per_group_block_table(
+                    kv_cache_gid, cm.block_table_tensor
+                )
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
@@ -3813,7 +3823,7 @@ class GPUModelRunner(
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
-                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4127,7 +4137,7 @@ class GPUModelRunner(
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5041,7 +5051,7 @@ class GPUModelRunner(
                 or self.speculative_config.uses_draft_model()
             ):
                 assert isinstance(
-                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -5590,7 +5600,7 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -5754,7 +5764,9 @@ class GPUModelRunner(
             self.speculative_config.use_eagle()
             or self.speculative_config.use_dflash()
         ):
-            assert isinstance(self.drafter, EagleProposer | DFlashProposer)
+            assert isinstance(
+                self.drafter, EagleProposer | DFlashProposer | Gemma4Proposer
+            )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
@@ -6241,7 +6253,7 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer
             )
             # validate all draft model layers belong to the same kv cache
             # group
