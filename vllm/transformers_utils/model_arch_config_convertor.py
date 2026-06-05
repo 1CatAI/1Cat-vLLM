@@ -429,6 +429,34 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 1)
 
 
+class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def is_mm_prefix_lm(self) -> bool:
+        return (
+            getattr(self.hf_text_config, "use_bidirectional_attention", None)
+            == "vision"
+        )
+
+    def get_head_size(self) -> int:
+        # Gemma4 uses dual head dimensions: head_dim (sliding attention)
+        # and global_head_dim (full attention).  Return the largest so
+        # that attention backends allocate buffers large enough for both.
+        head_dim = getattr(self.hf_text_config, "head_dim", 0)
+        global_head_dim = getattr(self.hf_text_config, "global_head_dim", 0)
+        return max(head_dim, global_head_dim) or super().get_head_size()
+
+
+class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def get_hidden_size(self) -> int:
+        # The speculator buffer must match the backbone (target) model's
+        # hidden dimension, not the draft model's smaller dimension.
+        return getattr(
+            self.hf_config, "backbone_hidden_size", super().get_hidden_size()
+        )
+
+    def get_num_hidden_layers(self) -> int:
+        return getattr(self.hf_text_config, "num_hidden_layers", 0)
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "mamba": MambaModelArchConfigConvertor,
@@ -439,6 +467,9 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "mpt": MPTModelArchConfigConvertor,
     "dbrx": DbrxModelArchConfigConvertor,
     "falcon": FalconModelArchConfigConvertor,
+    "gemma4": Gemma4ModelArchConfigConvertor,
+    "gemma4_text": Gemma4ModelArchConfigConvertor,
+    "gemma4_mtp": Gemma4MTPModelArchConfigConvertor,
     "RefinedWeb": FalconModelArchConfigConvertor,
     "RefinedWebModel": FalconModelArchConfigConvertor,
     "nemotron-nas": NemotronNasModelArchConfigConvertor,
