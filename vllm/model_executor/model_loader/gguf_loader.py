@@ -447,6 +447,44 @@ class GGUFModelLoader(BaseModelLoader):
                         r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
                     )
                 )
+        if model_type in ("qwen3_5_moe", "qwen3_5"):
+            # Qwen3.5/3.6 ship as a multimodal *ForConditionalGeneration*
+            # wrapper, but the bartowski text GGUF carries only the LM backbone
+            # (gguf arch "qwen35moe"/"qwen35"). Load text-only: drop the vision
+            # path and operate on the text config. gguf-py already maps the
+            # hybrid Gated-DeltaNet / SSM tensors (in_proj_*, A_log, conv1d,
+            # ssm_norm, out_proj); we only patch the gaps below.
+            is_multimodal = False
+            config = text_config
+            if model_type == "qwen3_5_moe":
+                for idx in range(config.num_hidden_layers):
+                    # 256-expert MoE with shared experts, merged per-expert in
+                    # the GGUF (like qwen3_moe). Map merged gate/up/down to
+                    # expert 0 (FusedMoE.weight_loader full-loads ndim==3).
+                    gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                        f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                    )
+                    gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                        f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                    )
+                    gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                        f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                    )
+                    sideload_params.append(
+                        re.compile(
+                            f"model\\.layers\\.{idx}"
+                            r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
+                        )
+                    )
+                    # Gated-DeltaNet dt_bias is a bare nn.Parameter (no
+                    # .weight/.bias suffix), so find_hf_name_in_tensor_map
+                    # can't route it through gguf-py. Map explicitly.
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                        f"model.layers.{idx}.linear_attn.dt_bias"
+                    )
+                model_type = "qwen35moe"
+            else:
+                model_type = "qwen35"
         if model_type == "mimo_v2":
             # gguf-py uses arch name "mimo2"; HF model_type is "mimo_v2".
             model_type = "mimo2"

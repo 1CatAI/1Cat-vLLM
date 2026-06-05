@@ -111,6 +111,12 @@ logger = init_logger(__name__)
 def _should_split_linear_attn_ba(
     quant_config: QuantizationConfig | None,
 ) -> bool:
+    # GGUF stores the Gated-DeltaNet in_proj_a / in_proj_b shards as F32 while
+    # in_proj_qkv / in_proj_z are quantized (Q8_0). A 4-way fused in_proj_qkvz
+    # would mix precisions, which MergedColumnParallelLinear rejects — so always
+    # split b/a into their own uniform-precision group for GGUF.
+    if quant_config is not None and quant_config.get_name() == "gguf":
+        return True
     # AWQ/GPTQ-style configs surface the ignore list as
     # `modules_to_not_convert`; compressed-tensors uses `ignore`.
     # Inspect both so the split also triggers for CT-quantized hybrids
@@ -397,6 +403,8 @@ class Qwen3_5Model(Qwen3NextModel):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -496,7 +504,21 @@ class Qwen3_5Model(Qwen3NextModel):
                     # last sub-id wins. Otherwise proceed with the
                     # output-axis split.
                     if not hasattr(param, "output_dim"):
-                        default_weight_loader(param, loaded_weight)
+                        # GGUF fused layers carry a per-shard `qweight_type`
+                        # vector (one int per output shard). The qkv sub-tensor
+                        # contributes a single scalar quant-type spanning several
+                        # shards (shard_id is a tuple). Route each slot through
+                        # the param's GGUF weight_loader so it sets BOTH
+                        # param.data[i] AND the shard_weight_type[i] dict that
+                        # apply() reads at runtime — a raw param.data write skips
+                        # that dict and KeyErrors on the first forward. Non-GGUF
+                        # metadata (e.g. compressed-tensors `weight_shape`) keeps
+                        # the default last-wins load.
+                        if getattr(param, "is_gguf_weight_type", False):
+                            for sub_id in shard_id:
+                                weight_loader(param, loaded_weight, sub_id)
+                        else:
+                            default_weight_loader(param, loaded_weight)
                         loaded_params.add(name)
                         break
                     # Split by the target module's output shard metadata
@@ -662,6 +684,29 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # Depthwise GDN conv1d: GGUF stores [C, K] but the param and
+                    # the mamba shard-loader expect [C, 1, K]. This param is a
+                    # lazy GGUFUninitializedParameter (shape unreadable), so key
+                    # the reshape off the name rather than param.shape.
+                    if "conv1d" in name and loaded_weight.dim() == 2:
+                        loaded_weight = loaded_weight.unsqueeze(1)
+                    # GGUF (ggml) drops singleton dims: shared_expert_gate is
+                    # stored [hidden] vs param [1, hidden]. Re-insert the
+                    # singleton at whichever dim the param carries one, so the
+                    # weight loader's shape check passes. Shape access on a lazy
+                    # GGUFUninitializedParameter raises ValueError — those are
+                    # GGUF-quant params that don't need this reshape, so skip.
+                    try:
+                        if param.dim() == loaded_weight.dim() + 1:
+                            for i, s in enumerate(param.shape):
+                                if s == 1 and (
+                                    tuple(param.shape[:i] + param.shape[i + 1:])
+                                    == tuple(loaded_weight.shape)
+                                ):
+                                    loaded_weight = loaded_weight.unsqueeze(i)
+                                    break
+                    except ValueError:
+                        pass
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -702,6 +747,7 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsLoRA,
     SupportsPP,
 ):
@@ -752,6 +798,7 @@ class Qwen3_5ForCausalLMBase(
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:
@@ -794,6 +841,49 @@ class Qwen3_5ForCausalLMBase(
             skip_prefixes=["mtp."],
         )
         return loader.load_weights(weights)
+
+    # IsHybrid hooks — the text-only backbone is just as hybrid (GDN + full
+    # attention) as the multimodal wrapper. Without these (and the IsHybrid
+    # base), model_config.is_hybrid is False and vLLM skips the mamba/attention
+    # KV-cache page-size unification, raising NotImplementedError at startup.
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

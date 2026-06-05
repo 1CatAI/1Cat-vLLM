@@ -113,6 +113,11 @@ _TEXT_GENERATION_MODELS = {
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),  # noqa: E501
     "Qwen3_5MoeForConditionalGeneration": ("qwen3_5", "Qwen3_5MoeForConditionalGeneration"),  # noqa: E501
+    # Text-only backbones — used when serving a text GGUF of the multimodal
+    # Qwen3.5/3.6 checkpoints (the GGUF carries no vision tensors). vLLM pulls
+    # hf_text_config automatically, so these bind straight to the LLM stack.
+    "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
+    "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
     "GlmForCausalLM": ("glm", "GlmForCausalLM"),
     "Glm4ForCausalLM": ("glm4", "Glm4ForCausalLM"),
     "Glm4MoeForCausalLM": ("glm4_moe", "Glm4MoeForCausalLM"),

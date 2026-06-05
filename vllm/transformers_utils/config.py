@@ -659,6 +659,30 @@ def get_config(
         # set architectures explicitly so the GGUF text-only path resolves.
         if config.model_type == "mistral4":
             config.update({"architectures": ["Mistral4ForCausalLM"]})
+        elif config.model_type in {"qwen3_5", "qwen3_5_moe"}:
+            # Qwen3.5/3.6 ship as multimodal *ForConditionalGeneration*, but the
+            # text GGUF carries no vision tensors. Bind to the text-only backbone
+            # (vLLM extracts hf_text_config from the wrapper config). Only force
+            # this when the config still points at the multimodal wrapper, so an
+            # explicit user `architectures` override is respected.
+            text_arch = (
+                "Qwen3_5MoeForCausalLM"
+                if config.model_type == "qwen3_5_moe"
+                else "Qwen3_5ForCausalLM"
+            )
+            multimodal_wrapper = text_arch.replace(
+                "ForCausalLM", "ForConditionalGeneration"
+            )
+            if not config.architectures or config.architectures == [
+                multimodal_wrapper
+            ]:
+                config.update({"architectures": [text_arch]})
+                # The text GGUF has no vision tensors. Drop vision_config so
+                # every downstream `is_multimodal` check (GGUF loader weight
+                # map + weight-type map, mm processor) uniformly treats this
+                # as a text-only model and doesn't demand an mmproj file.
+                if getattr(config, "vision_config", None) is not None:
+                    config.update({"vision_config": None})
         elif config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         else:
@@ -730,6 +754,21 @@ def get_config(
     if sub_configs:
         for sub_config in sub_configs:
             patch_rope_parameters(getattr(config, sub_config))
+
+    # Text-only serving of multimodal Qwen3.5/3.6: the text backbone has no
+    # M-RoPE implementation, but the VL config leaves `mrope_section` in the
+    # (text) rope_parameters -> uses_mrope -> True -> a hard assert at runtime.
+    # For text-only inputs M-RoPE is identical to standard RoPE (all positions
+    # are temporal), so drop the sectioning when bound to the text-only
+    # causal-LM architecture.
+    archs = getattr(config, "architectures", None) or []
+    if any(a in ("Qwen3_5MoeForCausalLM", "Qwen3_5ForCausalLM") for a in archs):
+        for cfg in (config, config.get_text_config()):
+            rope_params = getattr(cfg, "rope_parameters", None)
+            if isinstance(rope_params, dict) and "mrope_section" in rope_params:
+                rope_params.pop("mrope_section", None)
+                if rope_params.get("rope_type") == "mrope":
+                    rope_params["rope_type"] = "default"
 
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
