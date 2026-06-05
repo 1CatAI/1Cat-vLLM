@@ -109,6 +109,7 @@ _TEXT_GENERATION_MODELS = {
     "Gemma2ForCausalLM": ("gemma2", "Gemma2ForCausalLM"),
     "Gemma3ForCausalLM": ("gemma3", "Gemma3ForCausalLM"),
     "Gemma3nForCausalLM": ("gemma3n", "Gemma3nForCausalLM"),
+    "Gemma4ForCausalLM": ("gemma4", "Gemma4ForCausalLM"),
     "Qwen3NextForCausalLM": ("qwen3_next", "Qwen3NextForCausalLM"),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),  # noqa: E501
     "Qwen3_5MoeForConditionalGeneration": ("qwen3_5", "Qwen3_5MoeForConditionalGeneration"),  # noqa: E501
@@ -509,6 +510,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "Step3p5MTP": ("step3p5_mtp", "Step3p5MTP"),
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
+    "Gemma4MTPModel": ("gemma4_mtp", "Gemma4MTP"),
     # Temporarily disabled.
     # # TODO(woosuk): Re-enable this once the MLP Speculator is supported in V1.
     # "MLPSpeculatorPreTrainedModel": ("mlp_speculator", "MLPSpeculator"),
