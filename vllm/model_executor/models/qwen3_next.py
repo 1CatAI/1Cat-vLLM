@@ -26,6 +26,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -101,6 +102,16 @@ from .utils import (
 logger = init_logger(__name__)
 QWEN3_NEXT_SM70_TRACE = os.getenv("VLLM_QWEN3_NEXT_SM70_TRACE", "0") == "1"
 _QWEN3_NEXT_SM70_SEEN: set[tuple[str, int, int, int]] = set()
+
+# SM70 (V100) fp16 MoE AllReduce overflow mitigation. On fp16, summing the
+# per-rank MoE outputs across TP ranks can saturate to ±Inf, which becomes NaN
+# logits downstream and garbage tokens. Mirror the proven minimax_m2 fix: do
+# the reduce in fp32, then clamp-then-nan_to_num before casting back to fp16.
+# "safe" (default) applies it to every MoE layer; "none" restores the vanilla
+# fp16 reduce. Env: VLLM_ALLREDUCE_OVERFLOW_STRATEGY.
+_QWEN3_NEXT_AR_STRATEGY: str = os.environ.get(
+    "VLLM_ALLREDUCE_OVERFLOW_STRATEGY", "safe"
+)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -257,9 +268,26 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
         elif self.tp_size > 1:
-            final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
-                final_hidden_states
-            )
+            if _QWEN3_NEXT_AR_STRATEGY == "none":
+                final_hidden_states = (
+                    self.experts.maybe_all_reduce_tensor_model_parallel(
+                        final_hidden_states
+                    )
+                )
+            else:
+                # SM70 fp16 AllReduce overflow mitigation (see minimax_m2):
+                # reduce in fp32, then clamp-then-nan_to_num before the cast
+                # back to fp16. nan_to_num alone misses large-but-finite fp32
+                # sums that only overflow on the fp16 cast, so clamp first.
+                ar_dtype = final_hidden_states.dtype
+                fp32 = final_hidden_states.to(torch.float32)
+                fp32 = tensor_model_parallel_all_reduce(fp32)
+                finfo = torch.finfo(ar_dtype)
+                fp32 = torch.clamp(fp32, min=finfo.min, max=finfo.max)
+                fp32 = torch.nan_to_num(
+                    fp32, nan=0.0, posinf=finfo.max, neginf=finfo.min
+                )
+                final_hidden_states = fp32.to(ar_dtype)
 
         return final_hidden_states.view(orig_shape)
 
