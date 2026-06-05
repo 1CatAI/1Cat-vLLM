@@ -22,7 +22,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+# NOTE(rivet): upstream keeps SpecDecodeBaseProposer in v1/spec_decode/
+# llm_base_proposer; this base keeps it in eagle.py. Redirect accordingly.
+from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
