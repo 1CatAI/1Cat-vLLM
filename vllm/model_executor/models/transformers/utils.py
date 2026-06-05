@@ -141,6 +141,34 @@ TorchConv = nn.Conv2d | nn.Conv3d
 VllmConv = Conv2dLayer | Conv3dLayer
 
 
+def recursive_replace_linear(
+    model: nn.Module,
+    quant_config: "QuantizationConfig | None",
+    prefix: str = "",
+):
+    """Recursively replace linear modules in the model as needed."""
+    from vllm.model_executor.models.utils import maybe_prefix
+
+    def _recursive_replace(module: nn.Module, prefix: str):
+        for child_name, child_module in module.named_children():
+            new_module = child_module
+            qual_name = maybe_prefix(prefix, child_name)
+            # Replace modules as needed
+            if isinstance(child_module, nn.Linear):
+                new_module = replace_linear_class(
+                    child_module,
+                    "replicate",
+                    quant_config,
+                    prefix=qual_name,
+                )
+            else:
+                _recursive_replace(child_module, prefix=qual_name)
+            if new_module is not child_module:
+                setattr(module, child_name, new_module)
+
+    _recursive_replace(model, prefix=prefix)
+
+
 def replace_conv_class(conv: TorchConv) -> VllmConv | TorchConv:
     """Replace a Transformers Conv2d/Conv3d with vLLM's Conv2d/Conv3d.
 
