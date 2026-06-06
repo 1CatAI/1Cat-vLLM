@@ -1647,10 +1647,11 @@ class Gemma4ForConditionalGeneration(
                 except (ValueError, IndexError):
                     continue
                 if layer_idx in self._full_attn_layer_idxs:
+                    # mm_prefix_range_tensor is a read-only @property derived
+                    # from mm_prefix_range in this fork's TritonAttentionMetadata
+                    # (no setter); clearing the source dict suffices.
                     if hasattr(metadata, "mm_prefix_range"):
                         metadata.mm_prefix_range = None
-                    if hasattr(metadata, "mm_prefix_range_tensor"):
-                        metadata.mm_prefix_range_tensor = None
 
         if isinstance(attn_metadata, list):
             for ub_metadata in attn_metadata:
