@@ -680,6 +680,9 @@ _ACTIVATION_AND_MUL_REGISTRY = LazyDict(
         "gelu": lambda: GeluAndMul(),
         "silu": lambda: SiluAndMul(),
         "geglu": lambda: GeluAndMul(),
+        # Gemma uses tanh-approx GeGLU; gemma4 looks it up by name (gemma3
+        # special-cased it inline). Register it for the generic path.
+        "gelu_pytorch_tanh": lambda: GeluAndMul(approximate="tanh"),
         "swigluoai": lambda *args, **kwargs: SwigluOAIAndMul(*args, **kwargs),
     }
 )

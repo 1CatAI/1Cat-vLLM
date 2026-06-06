@@ -13,6 +13,7 @@ from .dynamic_ntk_alpha_rope import DynamicNTKAlphaRotaryEmbedding
 from .dynamic_ntk_scaling_rope import DynamicNTKScalingRotaryEmbedding
 from .fope import FourierRotaryEmbedding
 from .linear_scaling_rope import LinearScalingRotaryEmbedding
+from .gemma4_rope import Gemma4RotaryEmbedding
 from .llama3_rope import Llama3RotaryEmbedding
 from .llama4_vision_rope import Llama4VisionRotaryEmbedding
 from .mrope import MRotaryEmbedding
@@ -150,6 +151,17 @@ def get_rope(
             low_freq_factor,
             high_freq_factor,
             original_max_position,
+        )
+    elif scaling_type == "proportional":
+        # Proportional RoPE is used by Gemma4 for global (full) attention
+        # (sparse/fractional RoPE with cross-mixing between halves).
+        rotary_emb = Gemma4RotaryEmbedding(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            dtype,
         )
     elif scaling_type == "mllama4":
         rotary_emb = Llama4VisionRotaryEmbedding(

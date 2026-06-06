@@ -244,10 +244,16 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         # After padding is stripped the actual count is ≤ this value, but
         # vLLM needs the max for memory planning.
         tokens_per_image = config.vision_config.default_output_length
-        merged_kwargs = self.ctx.get_merged_mm_kwargs({})
-        val, _ = _get_max_soft_tokens(merged_kwargs)
-        if isinstance(val, int) and val in _SUPPORTED_SOFT_TOKENS:
-            tokens_per_image = val
+        # NOTE(rivet): get_merged_mm_kwargs is a newer InputProcessingContext
+        # method this base lacks; it only overrides the default soft-token count.
+        # Degrade gracefully to the config default when unavailable.
+        try:
+            merged_kwargs = self.ctx.get_merged_mm_kwargs({})
+            val, _ = _get_max_soft_tokens(merged_kwargs)
+            if isinstance(val, int) and val in _SUPPORTED_SOFT_TOKENS:
+                tokens_per_image = val
+        except AttributeError:
+            pass
         tokens: dict[str, int] = {"image": tokens_per_image}
         if config.audio_config is not None:
             # Audio max tokens from the processor's audio_seq_length.
