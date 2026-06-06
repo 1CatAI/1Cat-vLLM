@@ -755,21 +755,6 @@ def get_config(
         for sub_config in sub_configs:
             patch_rope_parameters(getattr(config, sub_config))
 
-    # Text-only serving of multimodal Qwen3.5/3.6: the text backbone has no
-    # M-RoPE implementation, but the VL config leaves `mrope_section` in the
-    # (text) rope_parameters -> uses_mrope -> True -> a hard assert at runtime.
-    # For text-only inputs M-RoPE is identical to standard RoPE (all positions
-    # are temporal), so drop the sectioning when bound to the text-only
-    # causal-LM architecture.
-    archs = getattr(config, "architectures", None) or []
-    if any(a in ("Qwen3_5MoeForCausalLM", "Qwen3_5ForCausalLM") for a in archs):
-        for cfg in (config, config.get_text_config()):
-            rope_params = getattr(cfg, "rope_parameters", None)
-            if isinstance(rope_params, dict) and "mrope_section" in rope_params:
-                rope_params.pop("mrope_section", None)
-                if rope_params.get("rope_type") == "mrope":
-                    rope_params["rope_type"] = "default"
-
     if trust_remote_code:
         maybe_register_config_serialize_by_value()
 

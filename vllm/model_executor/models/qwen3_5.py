@@ -75,6 +75,7 @@ from .interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -87,6 +88,8 @@ from .qwen3_next import (
     Qwen3NextSparseMoeBlock,
     QwenNextMixtureOfExperts,
     _maybe_sm70_projection,
+    _Q36_DBG,
+    _q36_dbg,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -263,6 +266,13 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             device=hidden_states.device,
         )
 
+        _dbg = _Q36_DBG and self.prefix.endswith("layers.0.linear_attn")
+        if _dbg:
+            _q36_dbg("GDN.mixed_qkv", mixed_qkv)
+            _q36_dbg("GDN.b", b)
+            _q36_dbg("GDN.a", a)
+            _q36_dbg("GDN.core_in(zeros)", core_attn_out)
+
         torch.ops.vllm.gdn_attention_core(
             mixed_qkv,
             b,
@@ -270,6 +280,9 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             core_attn_out,
             self.prefix,
         )
+
+        if _dbg:
+            _q36_dbg("GDN.core_out", core_attn_out)
 
         # ============================================================
         # Part 3: Output Projection
@@ -397,6 +410,7 @@ class Qwen3_5Model(Qwen3NextModel):
         self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
 
@@ -468,12 +482,30 @@ class Qwen3_5Model(Qwen3NextModel):
                 ("in_proj_qkvz", "in_proj_b", 4),
                 ("in_proj_qkvz", "in_proj_a", 5),
             ])
+        is_gguf = (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "gguf"
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
 
             if name.startswith("mtp."):
                 continue
+
+            # Qwen3.5/3.6 use Gemma-style RMSNorm: y = (1 + weight) * x. During
+            # GGUF conversion llama.cpp bakes the +1 into the stored weights and
+            # applies a plain weight*x norm, so the GGUF norm weights are ~1.0.
+            # vLLM re-applies (1 + weight), double-counting the +1 and doubling
+            # every norm -> garbage output. Revert the +1 here. The GDN gated
+            # norm (linear_attn.norm) uses a plain weight*x norm (init ones), so
+            # it must NOT be adjusted.
+            if (
+                is_gguf
+                and name.endswith("norm.weight")
+                and not name.endswith("linear_attn.norm.weight")
+            ):
+                loaded_weight = loaded_weight - 1
 
             # Remapping the name of FP8 kv-scale.
             if name.endswith("scale"):
@@ -749,6 +781,7 @@ class Qwen3_5ForCausalLMBase(
     HasInnerState,
     IsHybrid,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -830,7 +863,21 @@ class Qwen3_5ForCausalLMBase(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if _Q36_DBG:
+            _q36_dbg("final_hidden", hidden_states)
+            if logits is not None:
+                _q36_dbg("logits", logits)
+                import sys
+
+                top = logits[-1].float().topk(5)
+                print(
+                    f"[Q36DBG] top5_ids={top.indices.tolist()} "
+                    f"vals={[round(v, 3) for v in top.values.tolist()]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return logits
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
@@ -884,6 +931,22 @@ class Qwen3_5ForCausalLMBase(
         cls,
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list | None = None,
+    ) -> tuple[torch.Tensor, int]:
+        # Qwen3.5/3.6 use interleaved M-RoPE; we MUST go through the trained
+        # MRotaryEmbedding (stripping mrope_section to plain RoPE silently
+        # corrupts every full-attention layer). The text GGUF has no image/
+        # video tokens, so the three (T/H/W) position rows are all just the
+        # sequential text position, and the decode delta is 0.
+        n = len(input_tokens)
+        positions = (
+            torch.arange(n, dtype=torch.long).unsqueeze(0).expand(3, -1).clone()
+        )
+        return positions, 0
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

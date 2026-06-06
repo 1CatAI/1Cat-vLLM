@@ -113,6 +113,26 @@ _QWEN3_NEXT_AR_STRATEGY: str = os.environ.get(
     "VLLM_ALLREDUCE_OVERFLOW_STRATEGY", "safe"
 )
 
+# Activation-bisect probe (VLLM_QWEN36_DBG=1): print per-layer tensor stats to
+# stderr for the first few layers, to localize a weight-layout bug.
+_Q36_DBG: bool = os.environ.get("VLLM_QWEN36_DBG") == "1"
+
+
+def _q36_dbg(tag: str, t: torch.Tensor) -> None:
+    import sys
+
+    try:
+        f = t.detach().float()
+        print(
+            f"[Q36DBG] {tag} shape={tuple(t.shape)} "
+            f"absmax={f.abs().max().item():.4e} mean={f.mean().item():.4e} "
+            f"nan={int(f.isnan().sum())} inf={int(f.isinf().sum())}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[Q36DBG] {tag} ERR {e}", file=sys.stderr, flush=True)
+
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -625,6 +645,16 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
 
+        _fcdbg = _Q36_DBG and self.prefix.endswith("layers.0.linear_attn")
+        if _fcdbg:
+            import sys
+
+            print(
+                f"[Q36DBG] _fc meta={'None' if attn_metadata is None else 'dict'}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         if attn_metadata is None:
             # V1 profile run
             return
@@ -632,6 +662,17 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
+        if _fcdbg:
+            import sys
+
+            print(
+                f"[Q36DBG] _fc tokens={attn_metadata.num_actual_tokens} "
+                f"prefills={attn_metadata.num_prefills} "
+                f"decodes={attn_metadata.num_decodes} "
+                f"spec={attn_metadata.spec_sequence_masks is not None}",
+                file=sys.stderr,
+                flush=True,
+            )
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
@@ -1074,6 +1115,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        if _Q36_DBG and self.layer_idx < 3:
+            _q36_dbg(f"L{self.layer_idx}.{self.layer_type}.in", hidden_states)
+
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
             self.linear_attn(
@@ -1090,6 +1134,9 @@ class Qwen3NextDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
 
+        if _Q36_DBG and self.layer_idx < 3:
+            _q36_dbg(f"L{self.layer_idx}.attn_out", hidden_states)
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * self._attn_scale_p1
@@ -1100,6 +1147,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states)
+
+        if _Q36_DBG and self.layer_idx < 3:
+            _q36_dbg(f"L{self.layer_idx}.mlp_out", hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
