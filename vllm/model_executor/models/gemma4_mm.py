@@ -1679,11 +1679,51 @@ class Gemma4ForConditionalGeneration(
                     "embed_audio.",
                 ]
             )
+
+        # ---- Persistent-buffer fix for the SigLIP-style vision tower ----
+        # The HF Gemma4VisionModel registers `std_bias` / `std_scale` as
+        # *persistent buffers* at the tower root (config.vision_config.
+        # standardize=True). They are present in the checkpoint
+        # (model.vision_tower.std_{bias,scale}) and used at runtime in
+        # _process_image_input -> (states - std_bias) * std_scale.
+        # vLLM's AutoWeightsLoader only routes weights to child submodules
+        # or to nn.Parameters from named_parameters(recurse=False); generic
+        # persistent buffers are invisible to it (the only buffer rescue,
+        # _add_loadable_non_param_tensors, handles nn.BatchNorm* only). So
+        # these two tensors would hit the else-branch and raise
+        # "There is no module or parameter named vision_tower.std_bias".
+        # Load them here directly, then hand the rest to AutoWeightsLoader.
+        # Keyed on the *checkpoint* name because the WeightsMapper is applied
+        # inside loader.load_weights(), so `weights` still carries the
+        # original "model.vision_tower.*" names at this point.
+        buffer_targets = {}
+        if getattr(self, "vision_tower", None) is not None:
+            for buf_name in ("std_bias", "std_scale"):
+                if hasattr(self.vision_tower, buf_name):
+                    buffer_targets[f"model.vision_tower.{buf_name}"] = (
+                        f"vision_tower.{buf_name}",
+                        getattr(self.vision_tower, buf_name),
+                    )
+
+        loaded_buffers: set[str] = set()
+        remaining_weights = []
+        for name, weight in weights:
+            target = buffer_targets.get(name)
+            if target is not None:
+                mapped_name, buf = target
+                buf.data.copy_(weight.to(buf.dtype))
+                loaded_buffers.add(mapped_name)
+                continue
+            remaining_weights.append((name, weight))
+
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(
+            remaining_weights, mapper=self.hf_to_vllm_mapper
+        )
+        return loaded | loaded_buffers
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping
