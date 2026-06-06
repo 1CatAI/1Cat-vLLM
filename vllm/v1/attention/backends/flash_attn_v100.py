@@ -970,3 +970,17 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     def get_supported_head_sizes() -> list[int]:
         # Keep this aligned with the dense prefill kernel dispatch table.
         return [64, 128, 256]
+
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        # validate_configuration() calls supports_head_size(), NOT
+        # get_supported_head_sizes(). Without this override we inherit
+        # TritonAttentionBackend.supports_head_size (head_size >= 32) and
+        # would wrongly validate head sizes the Volta kernel cannot run
+        # (e.g. 512), then hard-crash in the CUDA dispatch (TORCH_CHECK
+        # D <= 256). Restricting to the sizes the kernel actually handles
+        # lets vLLM's per-layer backend selection keep the supported heads
+        # on FLASH_ATTN_V100 and fall through to TRITON_ATTN for the rest
+        # (e.g. models with mixed sliding/global head dims like Gemma-4,
+        # whose 256-dim layers stay fast while 512-dim layers use Triton).
+        return head_size in (64, 128, 256)
