@@ -207,6 +207,82 @@ def _mistral4_kv_b_iterator(
         )
 
 
+def _qwen35moe_gdn_vhead_permute(
+    it: Generator[tuple[str, torch.Tensor], None, None],
+    hf_config,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Reorder Gated-DeltaNet VALUE heads from the GGUF (llama.cpp) layout into
+    the order vLLM's FLA fused_recurrent kernel expects.
+
+    llama.cpp pairs value-head ``i`` with key-head ``i % num_k_heads`` (a TILE
+    of the key heads). vLLM's kernel pairs value-head ``p`` with key-head
+    ``p // (HV // H)`` (REPEAT_INTERLEAVE). Loading the GGUF value-heads verbatim
+    therefore mis-pairs every linear-attn layer -> fluent-looking garbage.
+
+    Permute the ``num_v_heads`` value heads (and every per-value-head tensor +
+    out_proj's value-head input columns) into HF order
+    ``perm[h*r + j] = h + j*num_k_heads`` (r = HV//H) so that contiguous tensor-
+    parallel sharding + the repeat_interleave kernel reproduce the tile mapping.
+    Done pre-shard on the full tensors; head boundaries align to Q8_0 blocks so
+    the packed-byte row/column permutes are byte-clean.
+    """
+    tc = getattr(hf_config, "text_config", hf_config)
+    nv = tc.linear_num_value_heads
+    nk = tc.linear_num_key_heads
+    hv = tc.linear_value_head_dim
+    hk = tc.linear_key_head_dim
+    r = nv // nk
+    perm = torch.tensor(
+        [h + j * nk for h in range(nk) for j in range(r)], dtype=torch.long
+    )
+    qkv_v_off = nk * hk * 2  # rows [0:2*nk*hk) are q,k; value rows follow
+
+    def perm_rows_vheads(t: torch.Tensor) -> torch.Tensor:
+        # t: [nv*hv, ...]; reshape to per-head blocks and gather by perm
+        rest = t.shape[1:]
+        return t.view(nv, hv, *rest)[perm].reshape(nv * hv, *rest).contiguous()
+
+    for name, t in it:
+        try:
+            if name.endswith("linear_attn.in_proj_qkv.qweight"):
+                # q,k rows untouched; permute the trailing value rows
+                head = t[:qkv_v_off]
+                vt = perm_rows_vheads(t[qkv_v_off:])
+                t = torch.cat([head, vt], dim=0).contiguous()
+            elif name.endswith("linear_attn.in_proj_z.qweight"):
+                t = perm_rows_vheads(t)
+            elif name.endswith("linear_attn.in_proj_a.weight") or name.endswith(
+                "linear_attn.in_proj_b.weight"
+            ):
+                t = t[perm].contiguous()  # [nv, hidden]
+            elif name.endswith("linear_attn.A_log") or name.endswith(
+                "linear_attn.dt_bias"
+            ):
+                t = t[perm].contiguous()  # [nv]
+            elif name.endswith("linear_attn.conv1d.weight"):
+                # [conv_dim, kernel]; conv_dim = 2*nk*hk (q,k) + nv*hv (v)
+                head = t[:qkv_v_off]
+                vt = perm_rows_vheads(t[qkv_v_off:])
+                t = torch.cat([head, vt], dim=0).contiguous()
+            elif name.endswith("linear_attn.out_proj.qweight"):
+                # [hidden, packed(in=nv*hv)]; value heads are the packed in-dim.
+                # head boundary (hv) is a multiple of the Q8_0 group (32), so the
+                # packed bytes split cleanly into per-head block-groups.
+                out_rows, packed = t.shape
+                assert packed % nv == 0, (packed, nv)
+                t = (
+                    t.view(out_rows, nv, packed // nv)[:, perm, :]
+                    .reshape(out_rows, packed)
+                    .contiguous()
+                )
+        except Exception as e:  # pragma: no cover - surface mapping bugs loudly
+            raise RuntimeError(
+                f"qwen35moe GDN v-head permute failed for {name} "
+                f"(shape={tuple(t.shape)}): {e}"
+            ) from e
+        yield name, t
+
+
 def _mimo2_attn_qkv_iterator(
     gguf_files: list[str],
     hf_config,
@@ -776,8 +852,17 @@ class GGUFModelLoader(BaseModelLoader):
         if hf_config.model_type == "mimo_v2":
             yield from _mimo2_attn_qkv_iterator(shards, hf_config)
 
+        _tc = getattr(hf_config, "text_config", hf_config)
+        _gdn_permute = (
+            getattr(hf_config, "model_type", None)
+            in ("qwen3_5_moe", "qwen3_5_moe_text")
+            or getattr(_tc, "model_type", None) == "qwen3_5_moe_text"
+        )
         for shard in shards:
-            yield from gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
+            base_it = gguf_quant_weights_iterator(shard, gguf_to_hf_name_map)
+            if _gdn_permute:
+                base_it = _qwen35moe_gdn_vhead_permute(base_it, hf_config)
+            yield from base_it
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config)

@@ -156,6 +156,29 @@ class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # GGUF GOTCHA: llama.cpp's qwen35moe converter stores `ssm_a` as the
+        # decay coefficient A = -exp(A_log) (always negative), NOT the raw
+        # `A_log`. But fused_gdn_gating computes g = -exp(A_log)*softplus(...),
+        # i.e. it re-applies -exp(). Loading ssm_a verbatim double-exponentiates
+        # (e.g. real A=-72 -> -exp(-72)~=0), inverting the GDN decay dynamics in
+        # every linear-attn layer -> fluent-looking garbage. Recover the raw
+        # A_log = log(-ssm_a) at load so -exp(A_log) == ssm_a == A.
+        quant_config = getattr(self, "quant_config", None)
+        if quant_config is not None and quant_config.get_name() == "gguf":
+            from vllm.model_executor.model_loader.weight_utils import (
+                sharded_weight_loader,
+            )
+            base_loader = sharded_weight_loader(0)
+
+            def _alog_log_neg_loader(param, loaded_weight):
+                lw = torch.log(torch.clamp(-loaded_weight.float(), min=1e-30))
+                base_loader(param, lw.to(loaded_weight.dtype))
+
+            # A_log already has a weight_loader from the base __init__; replace it.
+            self.A_log.weight_loader = _alog_log_neg_loader
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
