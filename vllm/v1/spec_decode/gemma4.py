@@ -334,6 +334,18 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
+            # The backend impl captured kv_sharing_target_layer_name at
+            # construction (None for these draft layers), and the KV-write gate
+            # checks the *impl's* copy (e.g. triton_attn.py: `if
+            # self.kv_sharing_target_layer_name is None: <store K/V>`). Setting
+            # only the module attr leaves the impl thinking it owns the cache, so
+            # the Q-only draft layer writes its draft K/V into the *target's*
+            # shared layer-N slots and corrupts the target's verify pass (output
+            # garbles after the first decoded token). Propagate to the impl so
+            # the write is correctly skipped — the draft layer reads the target's
+            # KV read-only, as intended.
+            if getattr(attn, "impl", None) is not None:
+                attn.impl.kv_sharing_target_layer_name = target_layer_name
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,
