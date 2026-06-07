@@ -106,6 +106,20 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     tarsier2="Tarsier2Config",
 )
 
+# The gemma4 MTP drafter checkpoint advertises model_type "gemma4_assistant",
+# which Transformers' AutoConfig does not recognize. The gemma4_assistant ->
+# gemma4_mtp remap in SpeculativeConfig runs only *after* the config is loaded,
+# so without this entry get_config falls through to AutoConfig and raises before
+# the remap can fire. Resolve it to the multimodal Gemma4Config (it carries the
+# .text_config the remap expects). LazyConfigDict.__getitem__ returns a type
+# value as-is, so registering the class directly is fine.
+try:
+    from transformers import Gemma4Config as _Gemma4Config
+
+    _CONFIG_REGISTRY["gemma4_assistant"] = _Gemma4Config
+except ImportError:
+    pass
+
 _CONFIG_ATTRS_MAPPING: dict[str, str] = {
     "llm_config": "text_config",
 }
