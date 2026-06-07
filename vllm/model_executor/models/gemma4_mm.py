@@ -1681,30 +1681,34 @@ class Gemma4ForConditionalGeneration(
                 ]
             )
 
-        # ---- Persistent-buffer fix for the SigLIP-style vision tower ----
-        # The HF Gemma4VisionModel registers `std_bias` / `std_scale` as
-        # *persistent buffers* at the tower root (config.vision_config.
-        # standardize=True). They are present in the checkpoint
-        # (model.vision_tower.std_{bias,scale}) and used at runtime in
-        # _process_image_input -> (states - std_bias) * std_scale.
-        # vLLM's AutoWeightsLoader only routes weights to child submodules
-        # or to nn.Parameters from named_parameters(recurse=False); generic
-        # persistent buffers are invisible to it (the only buffer rescue,
-        # _add_loadable_non_param_tensors, handles nn.BatchNorm* only). So
-        # these two tensors would hit the else-branch and raise
-        # "There is no module or parameter named vision_tower.std_bias".
-        # Load them here directly, then hand the rest to AutoWeightsLoader.
-        # Keyed on the *checkpoint* name because the WeightsMapper is applied
-        # inside loader.load_weights(), so `weights` still carries the
-        # original "model.vision_tower.*" names at this point.
+        # ---- Persistent-buffer fix for the vision/audio towers ----
+        # The HF Gemma4 towers register several *persistent buffers* that
+        # AutoWeightsLoader cannot see (it routes only to child submodules and
+        # nn.Parameters; generic buffers are invisible — its only buffer rescue,
+        # _add_loadable_non_param_tensors, handles nn.BatchNorm* only):
+        #   - SigLIP vision tower: std_bias / std_scale (standardize=True)
+        #   - Gemma4ClippableLinear (use_clipped_linears=True, in BOTH the
+        #     vision and audio encoders): input_min / input_max / output_min /
+        #     output_max activation clamps, one set per clipped linear.
+        # Without this they hit the else-branch and raise e.g. "There is no
+        # module or parameter named vision_tower...down_proj.input_max".
+        # Load every checkpoint-backed buffer in each tower here, then hand the
+        # rest to AutoWeightsLoader. Keyed on the *checkpoint* name
+        # (model.<tower>.*) because the WeightsMapper is applied inside
+        # loader.load_weights(), so `weights` still carries the original names.
+        # named_buffers() also surfaces non-persistent buffers (e.g.
+        # inv_timescales, softcap); those simply never match a checkpoint key
+        # and keep their post_init() values.
         buffer_targets = {}
-        if getattr(self, "vision_tower", None) is not None:
-            for buf_name in ("std_bias", "std_scale"):
-                if hasattr(self.vision_tower, buf_name):
-                    buffer_targets[f"model.vision_tower.{buf_name}"] = (
-                        f"vision_tower.{buf_name}",
-                        getattr(self.vision_tower, buf_name),
-                    )
+        for tower_attr in ("vision_tower", "audio_tower"):
+            tower = getattr(self, tower_attr, None)
+            if tower is None:
+                continue
+            for buf_name, buf in tower.named_buffers():
+                buffer_targets[f"model.{tower_attr}.{buf_name}"] = (
+                    f"{tower_attr}.{buf_name}",
+                    buf,
+                )
 
         loaded_buffers: set[str] = set()
         remaining_weights = []
@@ -1712,7 +1716,11 @@ class Gemma4ForConditionalGeneration(
             target = buffer_targets.get(name)
             if target is not None:
                 mapped_name, buf = target
-                buf.data.copy_(weight.to(buf.dtype))
+                w = weight.to(buf.dtype)
+                if buf.shape == w.shape:
+                    buf.data.copy_(w)
+                else:
+                    buf.data = w.to(buf.device)
                 loaded_buffers.add(mapped_name)
                 continue
             remaining_weights.append((name, weight))

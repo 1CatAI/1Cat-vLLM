@@ -623,5 +623,30 @@ class Gemma4MTP(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self._stable_full_lm_head_weight = None
+        # The masked embedder's `token_ordering` (token->centroid map) is a
+        # register_buffer, which AutoWeightsLoader cannot place (it routes only
+        # to child submodules / nn.Parameters). Without this, assistants with
+        # use_ordered_embeddings=True (e.g. the E2B/E4B drafters) raise "no
+        # module or parameter named masked_embedding.token_ordering". Load any
+        # masked_embedding.* buffer here, then hand the rest to AutoWeightsLoader.
+        # Scoped to masked_embedding.* so the predictor's own buffer-aware
+        # load_weights is left untouched. Checkpoint keys here are pre-mapper,
+        # but masked_embedding.* is identity under hf_to_vllm_mapper.
+        me_buffers = {
+            n: b for n, b in self.named_buffers() if n.startswith("masked_embedding.")
+        }
+        loaded_buffers: set[str] = set()
+        remaining = []
+        for name, w in weights:
+            buf = me_buffers.get(name)
+            if buf is not None:
+                w = w.to(buf.dtype)
+                if buf.shape == w.shape:
+                    buf.data.copy_(w)
+                else:
+                    buf.data = w.to(buf.device)
+                loaded_buffers.add(name)
+                continue
+            remaining.append((name, w))
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(remaining, mapper=self.hf_to_vllm_mapper) | loaded_buffers
