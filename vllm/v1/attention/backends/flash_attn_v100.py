@@ -470,10 +470,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         is_prefill = attn_metadata.max_query_len > 1
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
-        # Decode kernel handles head_dim 512; the prefill kernels (dense + paged)
-        # cap at 256. So for 512-dim layers we route true prefill to Triton but
-        # keep the small-query verifier (which uses the decode kernel) on FA.
-        flash_prefill_ok = self.head_size <= 256
+        # FA kernels now handle head_dim up to 512 for both decode and prefill
+        # (split via small blocks to fit smem). 512 prefill stays on FA.
+        flash_prefill_ok = self.head_size <= 512
 
         if is_prefill:
             if is_capturing:

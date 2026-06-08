@@ -138,4 +138,8 @@ if __name__ == "__main__":
     print("== D=512 decode (global layers: full + windowed) ==")
     for S, W in [(100, -1), (8192, -1), (100, 32), (200, 48), (8192, 1024)]:
         ok &= test_decode(512, S, W)
+    print("== D=512 prefill (global layers: full attention + windowed) ==")
+    for S, W in [(100, -1), (200, -1), (300, -1), (100, 48), (200, 64)]:
+        ok &= test_prefill(512, S, W)
+        ok &= test_dense(512, S, W)
     print("ALL PASS" if ok else "SOME FAILED")
