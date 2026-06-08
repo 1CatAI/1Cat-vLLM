@@ -35,6 +35,19 @@ _logged_prefill_prefix_flash = False
 _logged_prefill_smallq_decode = False
 _logged_decode_flash = False
 _logged_prefill_compare = False
+_warned_paged_prefill_smem = False
+
+# V100 dynamic shared-memory ceiling (bytes).
+_FLASH_V100_MAX_SMEM = 98304
+
+# Base (block-table-independent) shared memory of the PAGED prefill kernel,
+# per head_dim, mirroring KernelConfig<D>::TOTAL_SMEM in
+# flash-attention-v100/kernel/fused_mha_forward_paged.cu. The kernel ALSO
+# stores the per-sequence block table in smem (extra = align128(max_num_blocks
+# * 4)), so total smem grows with max_model_len / page_block_size. These bases
+# are already ~84-96KB, leaving little headroom: long-context servers overflow
+# the 96KB ceiling and must fall back to the gather+dense prefill path.
+_PAGED_PREFILL_BASE_SMEM = {64: 81408, 128: 97792, 256: 93952, 512: 85888}
 
 
 def _get_flash_ops():
@@ -801,6 +814,28 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return output
 
+    def _paged_prefill_smem_fits(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> bool:
+        """Whether the paged prefill kernel's smem fits V100's 96KB ceiling.
+
+        The kernel copies the per-sequence block table into shared memory, so
+        smem = TOTAL_SMEM[head_dim] + align128(max_num_blocks * 4). For long
+        max_model_len the block table alone blows the budget (e.g. head_dim 256
+        at 177k ctx needs ~135KB). When it does not fit, the caller uses the
+        gather + dense prefill path, which is smem-safe at any context length.
+        """
+        base = _PAGED_PREFILL_BASE_SMEM.get(self.head_size)
+        if base is None:
+            return False
+        block_table = getattr(attn_metadata, "block_table", None)
+        if block_table is None or block_table.ndim < 2:
+            return False
+        max_num_blocks = int(block_table.shape[1])
+        extra = (max_num_blocks * 4 + 127) & ~127
+        return base + extra <= _FLASH_V100_MAX_SMEM
+
     def _flash_v100_prefill_with_prefix(
         self,
         layer: torch.nn.Module,
@@ -835,6 +870,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         head_dim = key_cache.shape[3]
         debug_compare = (os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0")
                          == "1")
+        # The paged prefill kernel stores the block table in smem; at long
+        # max_model_len it overflows V100's 96KB. When it won't fit, use the
+        # gather + dense path below (smem-safe at any context length).
+        paged_smem_fits = self._paged_prefill_smem_fits(attn_metadata)
+        if not paged_smem_fits:
+            global _warned_paged_prefill_smem
+            if not _warned_paged_prefill_smem:
+                logger.info(
+                    "FLASH_ATTN_V100 paged prefill smem exceeds 96KB at this "
+                    "max_model_len; using gather+dense prefill (still FA)."
+                )
+                _warned_paged_prefill_smem = True
 
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
@@ -868,7 +915,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if end <= start:
                 continue
 
-            if self.use_flash_v100_prefill_paged:
+            if self.use_flash_v100_prefill_paged and paged_smem_fits:
                 out_seq = self.flash_attn_prefill_paged(
                     query[start:end].unsqueeze(0),
                     key_cache,
