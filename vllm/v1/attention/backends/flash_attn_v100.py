@@ -557,6 +557,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     attn_metadata,
                     output,
                 )
+            if getattr(self, "kv_sharing_target_layer_name", None) is not None:
+                # KV-shared layer (gemma E2B/E4B): it applies RoPE to Q only and
+                # passes raw, un-normed/un-RoPE'd K/V; the real K/V live in the
+                # TARGET layer's cache, aliased into kv_cache and already written
+                # by that earlier layer this forward pass. Read them via the
+                # prefix path (paged kernel when smem-safe, else gather+dense)
+                # instead of the dense passed-K/V path, which would attend to
+                # junk. (Decode already reads kv_cache directly.)
+                self._reset_decode_cache()
+                return self._flash_v100_prefill_with_prefix(
+                    layer, query, kv_cache, attn_metadata, output
+                )
             if not flash_prefill_ok:
                 # 512-dim no-prefix prefill: dense kernel caps at 256 -> Triton.
                 return super().forward(
