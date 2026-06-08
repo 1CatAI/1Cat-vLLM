@@ -136,7 +136,8 @@ flash_attention_forward_kernel_paged(
     const int64_t v_head_stride,
     const float softmax_scale,
     const float k_scale,
-    const float v_scale
+    const float v_scale,
+    const int window
 ) {
     using Config = KernelConfig<D>;
     using Traits = FlashV100Traits<D>;
@@ -396,7 +397,11 @@ flash_attention_forward_kernel_paged(
                     const int global_q_pos = global_m + causal_q_offset;
                     const bool is_valid = (global_m < start_row + valid_q_rows) &&
                                           (global_n < start_col + valid_k_rows);
-                    const bool is_causal_valid = (global_q_pos >= global_n);
+                    // Causal + optional sliding-window: key must satisfy
+                    // global_q_pos - window < global_n <= global_q_pos.
+                    const bool is_causal_valid =
+                        (global_q_pos >= global_n) &&
+                        (window < 0 || global_q_pos - global_n < window);
 
                     acc_frag.x[i] = is_valid
                         ? (is_causal_valid ? acc_frag.x[i] * softmax_scale : NEG_INF)
@@ -716,6 +721,7 @@ void launcher_flash_attention_forward_paged(
     bool is_causal,
     float k_scale,
     float v_scale,
+    int window,
     cudaStream_t stream
 ) {
     using Config = KernelConfig<D>;
@@ -775,7 +781,8 @@ void launcher_flash_attention_forward_paged(
             v_head_stride,
             softmax_scale,
             k_scale,
-            v_scale
+            v_scale,
+            window
         );
     } else {
         flash_attention_forward_kernel_paged<D, false, KV_DTYPE>
@@ -801,7 +808,8 @@ void launcher_flash_attention_forward_paged(
             v_head_stride,
             softmax_scale,
             k_scale,
-            v_scale
+            v_scale,
+            window
         );
     }
 }
@@ -817,7 +825,8 @@ at::Tensor flash_attention_prefill_paged(
     const std::string& kv_cache_dtype,
     const float k_scale,
     const float v_scale,
-    const bool is_causal
+    const bool is_causal,
+    const int window
 ) {
     TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
     const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
@@ -867,7 +876,7 @@ at::Tensor flash_attention_prefill_paged(
     #define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                             \
         launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(            \
             q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,  \
-            softmax_scale, is_causal, k_scale, v_scale, stream)
+            softmax_scale, is_causal, k_scale, v_scale, window, stream)
 
     #define LAUNCH_PAGED_BY_KV(HDIM)                                            \
         do {                                                                    \

@@ -37,7 +37,8 @@ at::Tensor flash_attention_decode_paged(
     const int partition_size,
     const std::string& kv_cache_dtype,
     const float k_scale,
-    const float v_scale
+    const float v_scale,
+    const int window
 );
 
 at::Tensor flash_attention_prefill_paged(
@@ -51,7 +52,8 @@ at::Tensor flash_attention_prefill_paged(
     const std::string& kv_cache_dtype,
     const float k_scale,
     const float v_scale,
-    const bool is_causal
+    const bool is_causal,
+    const int window
 );
 
 std::vector<at::Tensor> flash_attention_backward(

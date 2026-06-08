@@ -184,6 +184,10 @@ class FlashAttnFunc(torch.autograd.Function):
         if causal and (window_size_left != -1 or window_size_right != -1):
             if window_size_left > 0 and window_size_right > 0:
                 window_size_left, window_size_right = -1, -1
+            elif window_size_left >= 0 and window_size_right == 0:
+                # Causal sliding-window: query attends to window_size_left + 1
+                # tokens. Supported by the Volta dense kernel.
+                pass
             else:
                 raise NotImplementedError(f"Unsupported window_size={window_size} with causal=True")
 
@@ -292,6 +296,7 @@ def flash_attn_decode_paged(
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    window: int = -1,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -319,6 +324,7 @@ def flash_attn_decode_paged(
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
+        int(window),
     )
 
 def flash_attn_prefill_paged(
@@ -333,6 +339,7 @@ def flash_attn_prefill_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     causal: bool = True,
+    window: int = -1,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -357,6 +364,7 @@ def flash_attn_prefill_paged(
         float(k_scale),
         float(v_scale),
         causal,
+        int(window),
     )
     return out_.permute(0, 2, 1, 3).contiguous()
 

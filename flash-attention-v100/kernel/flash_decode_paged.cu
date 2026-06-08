@@ -180,7 +180,8 @@ __global__ void flash_attention_decode_partition_kernel(
     const int64_t v_head_stride,
     const float softmax_scale,
     const float k_scale,
-    const float v_scale) {
+    const float v_scale,
+    const int window) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -197,6 +198,19 @@ __global__ void flash_attention_decode_partition_kernel(
   }
 
   const int part_tokens = min(PARTITION_SIZE, seq_len - start_token_idx);
+  // Sliding-window: the decode query sits at seq_len-1 and attends only to keys
+  // in [seq_len-window, seq_len-1]. If the whole partition predates the window,
+  // it contributes nothing -- write neutral stats so the reduce step skips it.
+  if (window >= 0 && start_token_idx + part_tokens <= seq_len - window) {
+    if (threadIdx.x == 0) {
+      const int64_t stats_index =
+          static_cast<int64_t>(batch_idx) * stats_stride0 +
+          static_cast<int64_t>(head_idx) * stats_stride1 + partition_idx;
+      max_logits[stats_index] = -1.0e20f;
+      exp_sums[stats_index] = 0.f;
+    }
+    return;
+  }
   const int q_per_kv = num_heads_q / num_heads_kv;
   const int kv_head_idx = head_idx / q_per_kv;
   const int lane = threadIdx.x % kWarpSize;
@@ -227,6 +241,12 @@ __global__ void flash_attention_decode_partition_kernel(
   float local_max = -1.0e20f;
   for (int token_local = warp_idx; token_local < part_tokens;
        token_local += kWarpsPerBlock) {
+    // Per-token sliding-window mask (token_local is warp-uniform, so the branch
+    // is uniform across the warp and we can skip the dot product entirely).
+    if (window >= 0 && start_token_idx + token_local < seq_len - window) {
+      if (lane == 0) scores_shared[token_local] = -1.0e20f;
+      continue;
+    }
     const int physical_block = block_idx_shared[token_local];
     const int block_offset = block_offset_shared[token_local];
     const int64_t k_index =
@@ -386,6 +406,7 @@ void launch_flash_attention_decode_paged(
     const float softmax_scale,
     const float k_scale,
     const float v_scale,
+    const int window,
     cudaStream_t stream) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
@@ -431,7 +452,8 @@ void launch_flash_attention_decode_paged(
       v_cache.stride(2),
       softmax_scale,
       k_scale,
-      v_scale);
+      v_scale,
+      window);
 
   flash_attention_decode_reduce_kernel<D, PARTITION_SIZE><<<reduce_grid, block, reduce_shared_mem, stream>>>(
       reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),
@@ -467,7 +489,8 @@ at::Tensor flash_attention_decode_paged(
     const int partition_size,
     const std::string& kv_cache_dtype,
     const float k_scale,
-    const float v_scale) {
+    const float v_scale,
+    const int window) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(), "k/v cache must be on CUDA");
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(), "block_table and seq_lens must be on CUDA");
@@ -536,7 +559,7 @@ at::Tensor flash_attention_decode_paged(
   #define LAUNCH_TYPED(HDIM, PARTITION, KV_DTYPE_CODE)                          \
     launch_flash_attention_decode_paged<HDIM, PARTITION, KV_DTYPE_CODE>(        \
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
-        exp_sums, softmax_scale, k_scale, v_scale, stream)
+        exp_sums, softmax_scale, k_scale, v_scale, window, stream)
 
   #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
     do {                                                                        \

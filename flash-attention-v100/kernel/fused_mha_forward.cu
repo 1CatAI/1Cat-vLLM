@@ -109,7 +109,8 @@ flash_attention_forward_kernel(
     const int H_KV,
     const int M,
     const int N,
-    const float softmax_scale
+    const float softmax_scale,
+    const int window
 ) {
     using Config = KernelConfig<D>;
     constexpr int BLOCK_M           = Config::BLOCK_M;
@@ -269,9 +270,14 @@ flash_attention_forward_kernel(
 
                     const bool is_valid = (global_m < start_row + valid_q_rows) &&
                                           (global_n < start_col + valid_k_rows);
+                    // Causal + optional sliding-window: mask future keys and
+                    // keys older than `window` tokens from the query.
+                    const bool masked =
+                        (global_n > global_q_pos) ||
+                        (window >= 0 && global_q_pos - global_n >= window);
 
                     acc_frag.x[i] = is_valid
-                        ? ((global_n > global_q_pos) ? NEG_INF : acc_frag.x[i] * softmax_scale)
+                        ? (masked ? NEG_INF : acc_frag.x[i] * softmax_scale)
                         : NEG_INF;
                 }
             } else {
@@ -508,6 +514,7 @@ void launcher_flash_attention_forward(
     torch::Tensor& softmax_lse,
     float softmax_scale,
     bool is_causal,
+    int window,
     cudaStream_t stream
 ) {
     using Config = KernelConfig<D>;
@@ -538,7 +545,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(V.data_ptr()),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            B, H, H_KV, M, N, softmax_scale
+            B, H, H_KV, M, N, softmax_scale, window
         );
     } else {
         flash_attention_forward_kernel<D, false><<<grid, block, smem, stream>>>(
@@ -547,7 +554,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(V.data_ptr()),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            B, H, H_KV, M, N, softmax_scale
+            B, H, H_KV, M, N, softmax_scale, window
         );
     }
 }
@@ -570,8 +577,12 @@ std::vector<at::Tensor> flash_attention_forward(
 
     TORCH_CHECK(!alibi_slopes_.has_value(), "alibi_slopes not supported");
     TORCH_CHECK(p_dropout == 0.f, "dropout not supported");
-    TORCH_CHECK(window_size_left == -1, "window_size_left not supported");
+    TORCH_CHECK(window_size_left == -1 || (is_causal && window_size_left >= 0),
+                "window_size_left only supported with causal=True");
     TORCH_CHECK(window_size_right == -1 || (is_causal && window_size_right == 0), "window not supported");
+    // Attended-token count for the kernel: left==-1 means unlimited, otherwise
+    // a query attends to window_size_left + 1 tokens (itself + left preceding).
+    const int window = (window_size_left < 0) ? -1 : window_size_left + 1;
     TORCH_CHECK(softcap == 0.f, "softcap not supported");
     TORCH_CHECK(!return_softmax, "return_softmax not supported");
     TORCH_CHECK(!gen_.has_value(), "Generator not supported");
@@ -605,11 +616,11 @@ std::vector<at::Tensor> flash_attention_forward(
     TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
     switch (D) {
-        case 16:  launcher_flash_attention_forward<16>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
-        case 32:  launcher_flash_attention_forward<32>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
-        case 64:  launcher_flash_attention_forward<64>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
-        case 128: launcher_flash_attention_forward<128>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
-        case 256: launcher_flash_attention_forward<256>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 16:  launcher_flash_attention_forward<16>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, window, stream); break;
+        case 32:  launcher_flash_attention_forward<32>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, window, stream); break;
+        case 64:  launcher_flash_attention_forward<64>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, window, stream); break;
+        case 128: launcher_flash_attention_forward<128>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, window, stream); break;
+        case 256: launcher_flash_attention_forward<256>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, window, stream); break;
         default: TORCH_CHECK(false, "Unsupported D: ", D);
     }
 

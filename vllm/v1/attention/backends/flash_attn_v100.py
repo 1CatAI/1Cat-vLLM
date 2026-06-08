@@ -366,15 +366,33 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             not self.kv_cache_dtype.startswith("fp8")
             or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
         )
+        # Causal sliding-window (left>=0, right==0) is supported by the kernels
+        # via the `window` param. Full attention is (-1, -1). Bidirectional
+        # (right != 0) windows are not supported.
+        supported_window = (
+            self.sliding_window == (-1, -1)
+            or self.sliding_window[1] == 0
+        )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
             and self.alibi_slopes is None
             and self.logits_soft_cap == 0
             and self.sinks is None
-            and self.sliding_window == (-1, -1)
+            and supported_window
             and supported_kv_dtype
         )
+
+    @property
+    def _flash_window(self) -> int:
+        """Number of attended tokens for the kernels (-1 = unlimited).
+
+        self.sliding_window is (left, right) with left == sliding_window - 1,
+        so the attended-token count is left + 1 == the model's sliding_window.
+        """
+        if self.sliding_window == (-1, -1):
+            return -1
+        return self.sliding_window[0] + 1
 
     def _small_query_decode_enabled(
         self,
@@ -615,6 +633,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     v_batch,
                     causal=causal,
                     softmax_scale=self.scale,
+                    window_size=self.sliding_window,
                 )
                 out_view[tok_start:tok_end].copy_(
                     out_batch.view(tok_end - tok_start, out_batch.shape[2], out_batch.shape[3])
@@ -658,6 +677,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
+            window=self._flash_window,
         )
         return output
 
@@ -761,6 +781,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
+            window=self._flash_window,
         )
         return output
 
@@ -843,6 +864,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     k_scale=float(layer._k_scale_float),
                     v_scale=float(layer._v_scale_float),
                     causal=causal,
+                    window=self._flash_window,
                 )
                 if debug_compare and not _logged_prefill_compare:
                     seq_len = int(seq_lens[i].item())
@@ -868,6 +890,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         v_cont.unsqueeze(0),
                         causal=causal,
                         softmax_scale=self.scale,
+                        window_size=self.sliding_window,
                     )
                     diff = (out_seq - ref_out).abs()
                     nan_count = int(torch.isnan(out_seq).sum().item())
@@ -942,6 +965,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     v_cont.unsqueeze(0),
                     causal=causal,
                     softmax_scale=self.scale,
+                    window_size=self.sliding_window,
                 )
             out_view[start:end].copy_(out_seq.squeeze(0))
 
