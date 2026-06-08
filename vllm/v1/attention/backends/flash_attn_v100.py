@@ -470,6 +470,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         is_prefill = attn_metadata.max_query_len > 1
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
+        # Decode kernel handles head_dim 512; the prefill kernels (dense + paged)
+        # cap at 256. So for 512-dim layers we route true prefill to Triton but
+        # keep the small-query verifier (which uses the decode kernel) on FA.
+        flash_prefill_ok = self.head_size <= 256
 
         if is_prefill:
             if is_capturing:
@@ -508,6 +512,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 has_prefix_context
                 and self._small_query_decode_enabled(attn_metadata)
             )
+            if has_prefix_context and not (smallq_decode or flash_prefill_ok):
+                # 512-dim prefix/chunked prefill can't use the 256-cap prefill
+                # kernel and isn't small-query; fall back to Triton prefill.
+                return super().forward(
+                    layer, query, key, value, kv_cache, attn_metadata,
+                    output, output_scale, output_block_scale,
+                )
             if has_prefix_context:
                 if not _logged_prefill_prefix_flash:
                     if smallq_decode:
@@ -533,6 +544,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     kv_cache,
                     attn_metadata,
                     output,
+                )
+            if not flash_prefill_ok:
+                # 512-dim no-prefix prefill: dense kernel caps at 256 -> Triton.
+                return super().forward(
+                    layer, query, key, value, kv_cache, attn_metadata,
+                    output, output_scale, output_block_scale,
                 )
             if not _logged_prefill_flash:
                 logger.info(
@@ -992,16 +1009,15 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        # Keep this aligned with the dense prefill kernel dispatch table.
-        return [64, 128, 256]
+        # Decode kernel handles 512 (head-dim-generic GEMV); prefill kernels
+        # cap at 256 (smem), so 512 prefill falls back to Triton in forward().
+        return [64, 128, 256, 512]
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
         # NOTE(rivet): validate_configuration() calls supports_head_size(),
-        # NOT get_supported_head_sizes(). Without this override we'd inherit
-        # TritonAttentionBackend.supports_head_size (head_size >= 32) and
-        # wrongly accept head_size=512, then hard-crash the Volta CUDA kernel
-        # (TORCH_CHECK D<=256). The Volta FA kernel only handles 64/128/256.
-        # With this, auto-selection routes gemma-4's 256-dim sliding layers
-        # here and falls through to TRITON_ATTN for its 512-dim global layers.
-        return head_size in (64, 128, 256)
+        # NOT get_supported_head_sizes(). The Volta FA DECODE kernel is
+        # head-dim-generic and now handles 512 (gemma-4 global layers); the
+        # PREFILL kernels still cap at 256 (512 tile blows 96KB smem), so
+        # forward() routes 512-dim prefill to Triton while decode stays on FA.
+        return head_size in (64, 128, 256, 512)

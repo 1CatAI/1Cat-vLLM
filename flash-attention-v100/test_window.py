@@ -135,4 +135,7 @@ if __name__ == "__main__":
             ok &= test_decode(D, S, W)
             ok &= test_prefill(D, S, W)
             ok &= test_dense(D, S, W)
+    print("== D=512 decode (global layers: full + windowed) ==")
+    for S, W in [(100, -1), (8192, -1), (100, 32), (200, 48), (8192, 1024)]:
+        ok &= test_decode(512, S, W)
     print("ALL PASS" if ok else "SOME FAILED")

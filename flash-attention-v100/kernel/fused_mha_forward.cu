@@ -198,7 +198,18 @@ flash_attention_forward_kernel(
     }
     __syncthreads();
 
-    for (int block_n = 0; block_n < num_n_tiles; ++block_n) {
+    // Sliding-window lower-bound tile skip: keys older than `window` from the
+    // earliest query in this row-block are fully masked, so skip those tiles
+    // entirely (the per-element mask still guarantees correctness).
+    int first_n_tile = 0;
+    if constexpr (IS_CAUSAL) {
+        if (window >= 0) {
+            const int earliest_key = (start_row + causal_q_offset) - window + 1;
+            if (earliest_key > 0) first_n_tile = earliest_key / BLOCK_N;
+        }
+    }
+
+    for (int block_n = first_n_tile; block_n < num_n_tiles; ++block_n) {
         const int start_col = block_n * BLOCK_N;
         if (start_col >= N) break;
         const int valid_k_rows = min(BLOCK_N, N - start_col);
