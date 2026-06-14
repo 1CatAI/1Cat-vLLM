@@ -5,6 +5,11 @@
 Run `pytest tests/kernels/test_moe_permute_unpermute.py`.
 """
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 import torch
@@ -286,3 +291,215 @@ def test_moe_permute_reuses_scratch_buffers(dtype: torch.dtype):
         permuted_idx_1.untyped_storage().data_ptr()
         == scratch.permuted_idx.untyped_storage().data_ptr()
     )
+
+
+def _run_single_token_fastpath_subprocess(
+    code: str, *, fastpath_env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(fastpath_env)
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            "subprocess failed\n"
+            f"returncode={result.returncode}\n"
+            f"stdout={result.stdout}\n"
+            f"stderr={result.stderr}"
+        )
+    return result
+
+
+def test_sm70_single_token_moe_fastpath_matches_generic(tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for moe_permute_unpermute")
+    if not moe_permute_unpermute_supported():
+        pytest.skip("moe_permute_unpermute is not supported on this platform.")
+
+    baseline_path = tmp_path / "generic.pt"
+    generic_code = f"""
+        import torch
+        from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
+            moe_permute,
+            moe_unpermute,
+        )
+
+        device = "cuda"
+        n_expert = 64
+        topk_template = [
+            7, 2, 7, 0, 63, 1, 2, 4,
+            8, 8, 5, 9, 10, 11, 12, 13,
+            14, 3, 15, 16, 17, 18, 19, 20,
+            21, 22, 23, 24, 25, 26, 27, 28,
+        ]
+        cases = [
+            ("fp16_topk2_h256", torch.float16, 256, 2),
+            ("fp16_topk8_h2048", torch.float16, 2048, 8),
+            ("bf16_topk8_h2048", torch.bfloat16, 2048, 8),
+            ("fp32_topk8_h256", torch.float32, 256, 8),
+            ("fp16_topk32_h256", torch.float16, 256, 32),
+            ("fp16_topk8_h7168", torch.float16, 7168, 8),
+        ]
+        records = []
+        for seed, (name, dtype, n_hidden, topk) in enumerate(cases, start=123):
+            torch.manual_seed(seed)
+            hidden_states = torch.randn((1, n_hidden), device=device, dtype=dtype)
+            topk_ids = torch.tensor(
+                [topk_template[:topk]], device=device, dtype=torch.int64
+            )
+            topk_weights = torch.randn((1, topk), device=device)
+            permuted, _, offsets, inv, pidx = moe_permute(
+                hidden_states, None, topk_ids, n_expert
+            )
+            result0 = 0.5 * permuted + torch.randn_like(permuted)
+            out = torch.empty_like(hidden_states)
+            moe_unpermute(out, result0, topk_weights, inv, offsets)
+            records.append(
+                {{
+                    "name": name,
+                    "hidden_states": hidden_states.cpu(),
+                    "topk_ids": topk_ids.cpu(),
+                    "topk_weights": topk_weights.cpu(),
+                    "result0": result0.cpu(),
+                    "permuted": permuted.cpu(),
+                    "offsets": offsets.cpu(),
+                    "inv": inv.cpu(),
+                    "pidx": pidx.cpu(),
+                    "out": out.cpu(),
+                }}
+            )
+        torch.save(records, {str(baseline_path)!r})
+    """
+    _run_single_token_fastpath_subprocess(
+        generic_code,
+        fastpath_env={
+            "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": "0",
+            "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": "0",
+            "VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH": "0",
+        },
+    )
+
+    compare_code = f"""
+        import torch
+        from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
+            moe_permute,
+            moe_unpermute,
+        )
+
+        records = torch.load({str(baseline_path)!r})
+        for base in records:
+            hidden_states = base["hidden_states"].cuda()
+            topk_ids = base["topk_ids"].cuda()
+            topk_weights = base["topk_weights"].cuda()
+            result0 = base["result0"].cuda()
+            permuted, _, offsets, inv, pidx = moe_permute(
+                hidden_states, None, topk_ids, 64
+            )
+            out = torch.empty_like(hidden_states)
+            moe_unpermute(out, result0, topk_weights, inv, offsets)
+            checks = {{
+                "permuted": torch.equal(permuted.cpu(), base["permuted"]),
+                "offsets": torch.equal(offsets.cpu(), base["offsets"]),
+                "inv": torch.equal(inv.cpu(), base["inv"]),
+                "pidx": torch.equal(pidx.cpu(), base["pidx"]),
+                "out": torch.equal(out.cpu(), base["out"]),
+            }}
+            if not all(checks.values()):
+                out_diff = (out.cpu().float() - base["out"].float()).abs()
+                permuted_diff = (
+                    permuted.cpu().float() - base["permuted"].float()
+                ).abs()
+                raise SystemExit(
+                    "single-token fastpath mismatch "
+                    f"name={{base['name']}} "
+                    f"checks={{checks}} "
+                    f"out_max_diff={{float(out_diff.max().item())}} "
+                    f"permuted_max_diff={{float(permuted_diff.max().item())}}"
+                )
+    """
+    _run_single_token_fastpath_subprocess(
+        compare_code,
+        fastpath_env={
+            "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": "1",
+            "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH": "0",
+            "VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH": "0",
+        },
+    )
+
+
+def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for SM70 MoE weighted reduce")
+    current_platform.import_kernels()
+    if not hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out"):
+        pytest.skip("SM70 single-token weighted-reduce op is not available.")
+    if not moe_permute_unpermute_supported():
+        pytest.skip("moe_permute_unpermute is not supported on this platform.")
+
+    device = "cuda"
+    n_expert = 64
+    topk_template = [
+        7,
+        2,
+        7,
+        0,
+        63,
+        1,
+        2,
+        4,
+        8,
+        8,
+        5,
+        9,
+        10,
+        11,
+        12,
+        13,
+    ]
+    cases = [
+        ("topk2_h256_contiguous", 2, 256, 0),
+        ("topk8_h2048_contiguous", 8, 2048, 0),
+        ("topk8_h7168_padded_stride", 8, 7168, 64),
+    ]
+    for seed, (name, topk, hidden, pad) in enumerate(cases, start=231):
+        torch.manual_seed(seed)
+        topk_ids = torch.tensor(
+            [topk_template[:topk]], device=device, dtype=torch.int64
+        )
+        topk_weights = torch.randn((1, topk), device=device, dtype=torch.float32)
+        dummy_hidden = torch.randn((1, hidden), device=device, dtype=torch.float16)
+        _, _, offsets, inv, _ = moe_permute(
+            dummy_hidden, None, topk_ids, n_expert
+        )
+        sorted_output_storage = torch.randn(
+            (topk, hidden + pad), device=device, dtype=torch.float16
+        )
+        sorted_output = sorted_output_storage[:, :hidden]
+
+        expected = torch.empty((1, hidden), device=device, dtype=torch.float16)
+        actual = torch.empty_like(expected)
+        reference_sorted_output = (
+            sorted_output.contiguous() if pad else sorted_output
+        )
+        moe_unpermute(
+            expected, reference_sorted_output, topk_weights, inv, offsets
+        )
+        torch.ops._C.awq_moe_single_token_weighted_reduce_out(
+            sorted_output,
+            topk_weights,
+            inv,
+            actual,
+            topk,
+            hidden,
+        )
+        if not torch.equal(actual, expected):
+            diff = (actual.float() - expected.float()).abs()
+            raise AssertionError(
+                "single-token weighted-reduce mismatch "
+                f"name={name} max_diff={float(diff.max().item())}"
+            )

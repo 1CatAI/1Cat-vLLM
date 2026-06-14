@@ -585,6 +585,129 @@ def test_fp8_e4m3_conversion(
     torch.testing.assert_close(cache, converted_cache, atol=0.001, rtol=0.1)
 
 
+@torch.inference_mode()
+def test_fp8_e5m2_conversion_smoke() -> None:
+    device = "cuda:0"
+    if torch.accelerator.device_count() == 0:
+        pytest.skip("CUDA is required for FP8 KV cache conversion")
+
+    set_random_seed(0)
+    values = torch.tensor(
+        [-4096.0, -1024.0, -128.0, -1.0, 0.5, 1.0, 128.0, 4096.0],
+        dtype=torch.float16,
+        device=device,
+    )
+    cache = values.repeat(4, 2, 16, 1)
+    cache_fp8 = torch.empty_like(cache, dtype=torch.uint8)
+    ops.convert_fp8(cache_fp8, cache, kv_dtype="fp8_e5m2")
+
+    converted_cache = torch.empty_like(cache)
+    ops.convert_fp8(converted_cache, cache_fp8, kv_dtype="fp8_e5m2")
+
+    torch.testing.assert_close(converted_cache, cache, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("kv_cache_layout", CACHE_LAYOUTS)
+@torch.inference_mode()
+def test_reshape_and_cache_flash_fp8_e5m2_smoke(
+    kv_cache_factory_flashinfer, kv_cache_layout: str
+) -> None:
+    device = "cuda:0"
+    if torch.accelerator.device_count() == 0:
+        pytest.skip("CUDA is required for FP8 KV cache reshape")
+
+    dtype = torch.float16
+    num_tokens = 4
+    num_blocks = 2
+    block_size = 4
+    num_heads = 2
+    head_size = 16
+    kv_cache_dtype = "fp8_e5m2"
+
+    base = torch.tensor(
+        [
+            -64.0,
+            -32.0,
+            -16.0,
+            -8.0,
+            -4.0,
+            -2.0,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            2.0,
+            4.0,
+            8.0,
+            16.0,
+            32.0,
+        ],
+        dtype=dtype,
+        device=device,
+    )
+    key = base.repeat(num_tokens, num_heads, 1)
+    value = base.flip(0).repeat(num_tokens, num_heads, 1)
+    slot_mapping = torch.tensor([0, 3, 4, 7], dtype=torch.long, device=device)
+    k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    key_caches, value_caches = kv_cache_factory_flashinfer(
+        num_blocks,
+        block_size,
+        1,
+        num_heads,
+        head_size,
+        kv_cache_dtype,
+        dtype,
+        seed=0,
+        device=device,
+        cache_layout=kv_cache_layout,
+    )
+    key_cache, value_cache = key_caches[0], value_caches[0]
+
+    def compact(cache: torch.Tensor) -> torch.Tensor:
+        if kv_cache_layout == "NHD":
+            return cache.contiguous()
+        return cache.permute(0, 2, 1, 3).contiguous()
+
+    def dequant(cache: torch.Tensor) -> torch.Tensor:
+        cache_compact = compact(cache)
+        output = torch.empty_like(cache_compact, dtype=dtype)
+        ops.convert_fp8(output, cache_compact, 1.0, kv_dtype=kv_cache_dtype)
+        return output
+
+    expected_key = dequant(key_cache)
+    expected_value = dequant(value_cache)
+
+    ops.reshape_and_cache_flash(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+    block_indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
+    block_offsets = slot_mapping % block_size
+    for i, (block_idx, block_offset) in enumerate(
+        zip(block_indices.cpu().tolist(), block_offsets.cpu().tolist())
+    ):
+        if kv_cache_layout == "NHD":
+            expected_key[block_idx, block_offset, :, :] = key[i]
+            expected_value[block_idx, block_offset, :, :] = value[i]
+        else:
+            expected_key[block_idx, :, block_offset, :] = key[i]
+            expected_value[block_idx, :, block_offset, :] = value[i]
+
+    torch.cuda.synchronize()
+    assert torch.equal(dequant(key_cache), expected_key)
+    assert torch.equal(dequant(value_cache), expected_value)
+
+
 def _create_mla_cache(
     num_blocks: int,
     block_size: int,

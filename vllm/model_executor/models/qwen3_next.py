@@ -4,10 +4,13 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import os
+import time
 
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -60,6 +63,7 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .interfaces import (
     EagleModelMixin,
@@ -80,6 +84,223 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+_SM70_QWEN_LAYER_DUMP_COUNTS: dict[str, int] = {}
+_SM70_QWEN_LAYER_DUMP_SAVE_COUNTS: dict[str, int] = {}
+_SM70_QWEN_LAYER_GRAPH_BUFFERS: dict[str, torch.Tensor] = {}
+_SM70_QWEN_LAYER_GRAPH_META: dict[str, dict[str, object]] = {}
+
+
+def _sm70_profile_trace_enabled() -> bool:
+    return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
+
+
+def _sm70_profile_trace(message: str, *args: object) -> None:
+    if _sm70_profile_trace_enabled():
+        if args:
+            message = message % args
+        logger.info("SM70 model trace: %s", message)
+
+
+def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
+    if not raw_ranges:
+        return None
+    values: set[int] = set()
+    for raw_part in raw_ranges.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw.strip())
+            end = int(end_raw.strip())
+            if end < start:
+                start, end = end, start
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(part))
+    return values
+
+
+def _sm70_qwen_layer_dump_requested(layer_idx: int) -> bool:
+    if not os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR"):
+        return False
+    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1")
+    if raw_layer_ids.strip().lower() in {"*", "all"}:
+        return True
+    try:
+        layer_ids = _sm70_parse_int_ranges(raw_layer_ids) or {0, 1}
+    except ValueError:
+        layer_ids = {0, 1}
+    return layer_idx in layer_ids
+
+
+def _sm70_qwen_layer_dump_impl(
+    tensor: torch.Tensor,
+    label: str,
+    layer_idx: int,
+    layer_type: str,
+) -> torch.Tensor:
+    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
+    graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
+    target_labels = {
+        item.strip()
+        for item in os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS", "").split(",")
+        if item.strip()
+    }
+    if target_labels and label not in target_labels:
+        return tensor
+    if graph_buffers and dump_dir and tensor.is_cuda:
+        shape = tuple(tensor.shape)
+        key = f"{os.getpid()}:{layer_idx}:{label}:{shape}"
+        buffer = _SM70_QWEN_LAYER_GRAPH_BUFFERS.get(key)
+        if (
+            buffer is None
+            or tuple(buffer.shape) != shape
+            or buffer.dtype != tensor.dtype
+            or buffer.device != tensor.device
+        ):
+            buffer = torch.empty_like(tensor)
+            _SM70_QWEN_LAYER_GRAPH_BUFFERS[key] = buffer
+            _SM70_QWEN_LAYER_GRAPH_META[key] = {
+                "label": label,
+                "layer_idx": layer_idx,
+                "layer_type": layer_type,
+                "shape": shape,
+                "dtype": str(tensor.dtype),
+                "pid": os.getpid(),
+            }
+        buffer.copy_(tensor)
+        if torch.cuda.is_current_stream_capturing():
+            return tensor
+
+    enable_file = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE")
+    can_save = bool(dump_dir) and (
+        not enable_file or os.path.exists(enable_file)
+    )
+    direct_save = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE", "1") != "0"
+    if direct_save and can_save and not torch.cuda.is_current_stream_capturing():
+        target_counts = _sm70_parse_int_ranges(
+            os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
+        )
+        try:
+            max_dumps = int(os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS", "4"))
+        except ValueError:
+            max_dumps = 4
+        key = f"{os.getpid()}:{layer_idx}:{label}"
+        count = _SM70_QWEN_LAYER_DUMP_COUNTS.get(key, 0)
+        _SM70_QWEN_LAYER_DUMP_COUNTS[key] = count + 1
+        if target_counts is not None and count not in target_counts:
+            return tensor
+        save_count = _SM70_QWEN_LAYER_DUMP_SAVE_COUNTS.get(key, 0)
+        if max_dumps <= 0 or save_count < max_dumps:
+            _SM70_QWEN_LAYER_DUMP_SAVE_COUNTS[key] = save_count + 1
+            safe_label = label.replace("/", "_").replace(".", "_")
+            safe_type = layer_type.replace("/", "_").replace(".", "_")
+            path = os.path.join(
+                dump_dir,
+                (
+                    f"pid{os.getpid()}_layer{layer_idx:02d}_{safe_type}_"
+                    f"{safe_label}_{count:03d}.pt"
+                ),
+            )
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(
+                {
+                    "label": label,
+                    "layer_idx": layer_idx,
+                    "layer_type": layer_type,
+                    "count": count,
+                    "pid": os.getpid(),
+                    "shape": tuple(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "tensor": tensor.detach().cpu(),
+                },
+                path,
+            )
+    return tensor
+
+
+def dump_sm70_qwen_layer_graph_buffers(step: int, stage: str) -> None:
+    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
+    if not dump_dir:
+        return
+    enable_file = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE")
+    if enable_file and not os.path.exists(enable_file):
+        return
+    target_steps = _sm70_parse_int_ranges(
+        os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS")
+        or os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
+    )
+    if target_steps is not None and step not in target_steps:
+        return
+    if not _SM70_QWEN_LAYER_GRAPH_BUFFERS:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    for key, buffer in _SM70_QWEN_LAYER_GRAPH_BUFFERS.items():
+        meta = _SM70_QWEN_LAYER_GRAPH_META.get(key, {})
+        label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
+        layer_type = (
+            str(meta.get("layer_type", "unknown")).replace("/", "_").replace(".", "_")
+        )
+        layer_idx = int(meta.get("layer_idx", -1))
+        shape = "x".join(str(dim) for dim in tuple(buffer.shape))
+        path = os.path.join(
+            dump_dir,
+            (
+                f"pid{os.getpid()}_step{step:04d}_layer{layer_idx:02d}_"
+                f"{layer_type}_{label}_shape{shape}.pt"
+            ),
+        )
+        torch.save(
+            {
+                **meta,
+                "step": step,
+                "stage": stage,
+                "graph_buffer_key": key,
+                "tensor": buffer.detach().cpu(),
+            },
+            path,
+        )
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+        dump_sm70_moe_runner_graph_buffers,
+    )
+
+    dump_sm70_moe_runner_graph_buffers(step, stage)
+
+
+def _sm70_qwen_layer_dump_fake(
+    tensor: torch.Tensor,
+    label: str,
+    layer_idx: int,
+    layer_type: str,
+) -> torch.Tensor:
+    return tensor
+
+
+direct_register_custom_op(
+    op_name="sm70_qwen_layer_dump",
+    op_func=_sm70_qwen_layer_dump_impl,
+    mutates_args=[],
+    fake_impl=_sm70_qwen_layer_dump_fake,
+)
+
+
+def _sm70_dump_qwen_layer_tensor(
+    label: str,
+    layer_idx: int,
+    layer_type: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if not _sm70_qwen_layer_dump_requested(layer_idx):
+        return tensor
+    tensor = torch.ops.vllm.sm70_qwen_layer_dump(
+        tensor,
+        label,
+        layer_idx,
+        layer_type,
+    )
+    return tensor
+
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -91,6 +312,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         config = vllm_config.model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         quant_config = vllm_config.quant_config
+        self.layer_idx = extract_layer_index(prefix)
 
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -154,6 +376,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.shared_expert",
             )
+            if (
+                envs.VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP
+                or not envs.VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP
+            ):
+                self.shared_expert._vllm_disable_shared_experts_stream = True
+            if envs.VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP:
+                logger.info_once(
+                    "Enabling Qwen3Next FusedMoE shared_experts stream "
+                    "overlap by explicit request.",
+                    scope="local",
+                )
 
         self.experts = FusedMoE(
             shared_experts=self.shared_expert,
@@ -183,6 +416,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "moe_input",
+            self.layer_idx,
+            "moe",
+            hidden_states,
+        )
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(
@@ -191,9 +430,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            router_logits = _sm70_dump_qwen_layer_tensor(
+                "moe_router_logits",
+                self.layer_idx,
+                "moe",
+                router_logits,
+            )
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
+        final_hidden_states = _sm70_dump_qwen_layer_tensor(
+            "moe_output",
+            self.layer_idx,
+            "moe",
+            final_hidden_states,
+        )
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -238,6 +489,7 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.layer_idx = extract_layer_index(prefix)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -290,6 +542,12 @@ class Qwen3NextAttention(nn.Module):
         hidden_states: torch.Tensor,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+        qkv = _sm70_dump_qwen_layer_tensor(
+            "full_attn_qkv",
+            self.layer_idx,
+            "full_attention",
+            qkv,
+        )
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -301,7 +559,15 @@ class Qwen3NextAttention(nn.Module):
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+        v = _sm70_dump_qwen_layer_tensor(
+            "full_attn_v",
+            self.layer_idx,
+            "full_attention",
+            v,
+        )
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
@@ -311,14 +577,50 @@ class Qwen3NextAttention(nn.Module):
         )
 
         q, k = self.rotary_emb(positions, q, k)
+        q = _sm70_dump_qwen_layer_tensor(
+            "full_attn_q_rot",
+            self.layer_idx,
+            "full_attention",
+            q,
+        )
+        k = _sm70_dump_qwen_layer_tensor(
+            "full_attn_k_rot",
+            self.layer_idx,
+            "full_attention",
+            k,
+        )
 
         attn_output = self.attn(q, k, v)
+        attn_output = _sm70_dump_qwen_layer_tensor(
+            "full_attn_core_out",
+            self.layer_idx,
+            "full_attention",
+            attn_output,
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
+            gate = _sm70_dump_qwen_layer_tensor(
+                "full_attn_gate",
+                self.layer_idx,
+                "full_attention",
+                gate,
+            )
             attn_output = attn_output * gate
+            attn_output = _sm70_dump_qwen_layer_tensor(
+                "full_attn_gated_out",
+                self.layer_idx,
+                "full_attention",
+                attn_output,
+            )
 
         output[:], _ = self.o_proj(attn_output)
+        _sm70_dump_qwen_layer_tensor(
+            "full_attn_o_proj_out",
+            self.layer_idx,
+            "full_attention",
+            output,
+        )
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -407,11 +709,31 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "layer_input_hidden",
+            self.layer_idx,
+            self.layer_type,
+            hidden_states,
+        )
+        if residual is not None:
+            residual = _sm70_dump_qwen_layer_tensor(
+                "layer_input_residual",
+                self.layer_idx,
+                self.layer_type,
+                residual,
+            )
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "input_norm_out",
+            self.layer_idx,
+            self.layer_type,
+            hidden_states,
+        )
 
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
@@ -428,6 +750,12 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "attn_out",
+            self.layer_idx,
+            self.layer_type,
+            hidden_states,
+        )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -441,7 +769,25 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "post_attn_norm_out",
+            self.layer_idx,
+            self.layer_type,
+            hidden_states,
+        )
+        residual = _sm70_dump_qwen_layer_tensor(
+            "post_attn_residual",
+            self.layer_idx,
+            self.layer_type,
+            residual,
+        )
         hidden_states = self.mlp(hidden_states)
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "mlp_out",
+            self.layer_idx,
+            self.layer_type,
+            hidden_states,
+        )
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -521,15 +867,40 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        trace_enabled = _sm70_profile_trace_enabled()
+        if trace_enabled:
+            _sm70_profile_trace(
+                "Qwen3NextModel.forward start layers=%s:%s hidden_shape=%s",
+                self.start_layer,
+                self.end_layer,
+                tuple(hidden_states.shape),
+            )
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            layer_start = time.perf_counter() if trace_enabled else 0.0
+            if trace_enabled:
+                _sm70_profile_trace(
+                    "layer %s enter type=%s hidden_shape=%s residual=%s",
+                    layer_idx,
+                    getattr(layer, "layer_type", None),
+                    tuple(hidden_states.shape),
+                    residual is not None,
+                )
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if trace_enabled:
+                _sm70_profile_trace(
+                    "layer %s exit elapsed_s=%.3f hidden_shape=%s residual=%s",
+                    layer_idx,
+                    time.perf_counter() - layer_start,
+                    tuple(hidden_states.shape),
+                    residual is not None,
+                )
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
@@ -771,7 +1142,11 @@ class Qwen3NextForCausalLM(
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            **kwargs,
         )
 
         return hidden_states
@@ -818,6 +1193,9 @@ class Qwen3NextForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

@@ -24,11 +24,39 @@ MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "expert_gate",
 }
 
+SM70_F16_DENSE_SUFFIXES = {
+    "gate_up_proj",
+    "down_proj",
+    "in_proj_ba",
+    "in_proj_qkvz",
+    "qkv_proj",
+    "o_proj",
+    "out_proj",
+}
+
+
+def _parse_sm70_f16_dense_allowlist() -> set[str] | None:
+    raw = envs.VLLM_SM70_F16_DENSE_ALLOWLIST
+    if raw is None:
+        return None
+    suffixes = {item.strip() for item in raw.split(",") if item.strip()}
+    return suffixes or set()
+
 
 def is_layer_moe_router_gate(prefix: str) -> bool:
     if not prefix:
         return False
     return prefix.rsplit(".", 1)[-1] in MOE_LAYER_ROUTER_GATE_SUFFIXES
+
+
+def is_layer_sm70_f16_dense(prefix: str) -> bool:
+    if not prefix:
+        return False
+    suffix = prefix.rsplit(".", 1)[-1]
+    allowlist = _parse_sm70_f16_dense_allowlist()
+    if allowlist is not None:
+        return suffix in allowlist
+    return suffix in SM70_F16_DENSE_SUFFIXES
 
 
 def get_token_bin_counts_and_mask(

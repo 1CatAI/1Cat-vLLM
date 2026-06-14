@@ -2930,6 +2930,27 @@ def all_reduce(
     torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
+def all_reduce_sum2(
+    fa: int,
+    inp_a: torch.Tensor,
+    inp_b: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._C_custom_ar.all_reduce_sum2(fa, inp_a, inp_b, out)
+
+
+def top1_argmax(
+    fa: int,
+    input_pair: torch.Tensor,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.top1_argmax(
+        fa, input_pair, out, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
 def dispose(fa: int) -> None:
     torch.ops._C_custom_ar.dispose(fa)
 

@@ -45,6 +45,26 @@ class FixFunctionalizationPass(VllmInductorPass):
                 torch.ops.vllm.rocm_aiter_triton_rotary_embedding.default
             )
 
+        awq_sm70_single_token_stage_targets = []
+        if hasattr(torch.ops._C, "awq_moe_single_token_dense_stage_sm70_out"):
+            awq_sm70_single_token_stage_targets.append(
+                torch.ops._C.awq_moe_single_token_dense_stage_sm70_out.default
+            )
+        if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_stage_sm70_out"):
+            awq_sm70_single_token_stage_targets.append(
+                torch.ops._C.awq_moe_single_token_indexed_dense_stage_sm70_out.default
+            )
+
+        awq_sm70_single_token_w13_targets = []
+        if hasattr(torch.ops._C, "awq_moe_single_token_dense_w13_sm70_out"):
+            awq_sm70_single_token_w13_targets.append(
+                torch.ops._C.awq_moe_single_token_dense_w13_sm70_out.default
+            )
+        if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_w13_sm70_out"):
+            awq_sm70_single_token_w13_targets.append(
+                torch.ops._C.awq_moe_single_token_indexed_dense_w13_sm70_out.default
+            )
+
         for node in graph.nodes:
             if not is_func(node, auto_functionalized):
                 continue  # Avoid deep if-elif nesting
@@ -131,6 +151,112 @@ class FixFunctionalizationPass(VllmInductorPass):
                 mutated_args = {1: "result"}
                 self.defunctionalize(
                     graph, node, mutated_args, args=("result", "input")
+                )
+            elif at_target in awq_sm70_single_token_stage_targets:
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "out",
+                        "input",
+                        "expert_offsets",
+                        "sorted_expert_ids",
+                        "ptrs_w",
+                        "ptrs_s",
+                        "top_k",
+                        "k",
+                        "n",
+                        "group_size",
+                    ),
+                )
+            elif at_target in awq_sm70_single_token_w13_targets:
+                mutated_args = {
+                    1: "gate_up",
+                    2: "compact_input",
+                    3: "expert_offsets",
+                    4: "expert_offsets64",
+                    5: "inv_permuted_idx",
+                    6: "sorted_expert_ids",
+                }
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "gate_up",
+                        "compact_input",
+                        "x",
+                        "topk_ids",
+                        "w13_ptrs_w",
+                        "w13_ptrs_s",
+                        "expert_offsets",
+                        "expert_offsets64",
+                        "inv_permuted_idx",
+                        "sorted_expert_ids",
+                        "w13_k",
+                        "w13_n",
+                        "group_size",
+                        "hidden_logical_size",
+                    ),
+                )
+            elif (
+                hasattr(torch.ops._C, "awq_moe_single_token_compact_dense_w13_sm70_out")
+                and at_target
+                == torch.ops._C.awq_moe_single_token_compact_dense_w13_sm70_out.default
+            ):
+                mutated_args = {
+                    1: "gate_up",
+                    2: "compact_input",
+                    3: "compact_w13_ptrs_w",
+                    4: "compact_w13_ptrs_s",
+                    5: "expert_offsets",
+                    6: "expert_offsets64",
+                    7: "inv_permuted_idx",
+                    8: "sorted_expert_ids",
+                }
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "gate_up",
+                        "compact_input",
+                        "x",
+                        "topk_ids",
+                        "w13_ptrs_w",
+                        "w13_ptrs_s",
+                        "compact_w13_ptrs_w",
+                        "compact_w13_ptrs_s",
+                        "expert_offsets",
+                        "expert_offsets64",
+                        "inv_permuted_idx",
+                        "sorted_expert_ids",
+                        "w13_k",
+                        "w13_n",
+                        "group_size",
+                        "hidden_logical_size",
+                    ),
+                )
+            elif (
+                hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out")
+                and at_target
+                == torch.ops._C.awq_moe_single_token_weighted_reduce_out.default
+            ):
+                mutated_args = {1: "out"}
+                self.defunctionalize(
+                    graph,
+                    node,
+                    mutated_args,
+                    args=(
+                        "sorted_output",
+                        "topk_weights",
+                        "inv_permuted_idx",
+                        "out",
+                        "top_k",
+                        "hidden_logical_size",
+                    ),
                 )
             elif at_target == torch.ops._C.silu_and_mul_quant.default:
                 mutated_args = {1: "result"}

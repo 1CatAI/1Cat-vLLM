@@ -9,10 +9,10 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 
-@triton.jit()
+@triton.jit(do_not_specialize=["num_cache_lines"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -33,7 +33,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     o_ptr,  # (dim, seqlen) - actually pointing to x_ptr
     # Matrix dimensions
     dim: tl.constexpr,
-    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    num_cache_lines,  # added to support vLLM larger cache lines
     # Strides
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
     stride_x_token: tl.int64,  # stride to get to next token (same feature-index, same sequence-index)
@@ -48,13 +48,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_block_m: tl.constexpr,  # Stride block to align divided by BLOCK_M
     # others
     pad_slot_id: tl.constexpr,
-    null_block_id: tl.constexpr,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
     IS_APC_ENABLED: tl.constexpr,
-    HAS_NULL_BLOCK: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -133,9 +132,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
     ).to(tl.int64)
 
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
-            # not processing as this is a null block (padding)
+    if USE_PAD_SLOT:  # noqa
+        if conv_states_input_coord == pad_slot_id:
+            # not processing as this is a padded state slot
             return
     conv_states_base = (
         conv_states_ptr
@@ -475,7 +474,6 @@ def causal_conv1d_fn(
     has_initial_state: torch.Tensor | None = None,
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-    null_block_id: int = NULL_BLOCK_ID,
     block_idx_first_scheduled_token: torch.Tensor | None = None,
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
@@ -729,13 +727,12 @@ def causal_conv1d_fn(
         block_size_to_align // BLOCK_M,
         # others
         pad_slot_id,
-        null_block_id,
         # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ["silu", "swish"],
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
-        HAS_NULL_BLOCK=null_block_id is not None,
+        USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
@@ -778,7 +775,7 @@ def _causal_conv1d_update_kernel(
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.int64,
     # others
-    null_block_id: tl.constexpr,
+    pad_slot_id: tl.constexpr,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
@@ -787,7 +784,7 @@ def _causal_conv1d_update_kernel(
     IS_APC_ENABLED: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
-    HAS_NULL_BLOCK: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     # ruff: noqa: E501
@@ -811,8 +808,8 @@ def _causal_conv1d_update_kernel(
         conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
     ).to(tl.int64)
 
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
+    if USE_PAD_SLOT:  # noqa
+        if conv_states_input_coord == pad_slot_id:
             # not processing as this is not the actual sequence
             return
 
@@ -1076,7 +1073,7 @@ def causal_conv1d_update(
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
-    null_block_id: int = NULL_BLOCK_ID,
+    pad_slot_id: int = PAD_SLOT_ID,
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
@@ -1111,16 +1108,16 @@ def causal_conv1d_update(
     max_query_len: int
         If query_start_loc is not None, this indicates the maximum query
         length in the batch.
-    null_block_id: int
-            Block ID used to identify padded entries in
-            conv_state_indices. Block 0 is the null block.
-            for example: conv_state_indices = [null_block_id, 1, 20, null_block_id]
+    pad_slot_id: int
+            Slot ID used to identify padded entries in Mamba/GDN state indices.
+            The live state slot 0 is valid; padding is PAD_SLOT_ID=-1.
+            for example: conv_state_indices = [pad_slot_id, 1, 20, pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
     """
     if validate_data:
-        assert null_block_id is not None
+        assert pad_slot_id is not None
         assert x.stride(1) == 1
     if isinstance(activation, bool):
         activation = "silu" if activation is True else None
@@ -1222,7 +1219,7 @@ def causal_conv1d_update(
         stride_o_dim,
         stride_o_token,
         # others
-        null_block_id,
+        pad_slot_id,
         # META
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
@@ -1231,7 +1228,7 @@ def causal_conv1d_update(
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
-        HAS_NULL_BLOCK=null_block_id is not None,
+        USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
     )
     if unsqueeze:

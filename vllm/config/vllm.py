@@ -985,6 +985,14 @@ class VllmConfig:
             "Asynchronous scheduling is %s.",
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
         )
+        if envs.VLLM_ENABLE_MAMBA_PREFIX_ASYNC:
+            logger.warning_once(
+                "VLLM_ENABLE_MAMBA_PREFIX_ASYNC is upstream-replaced in "
+                "latest vLLM and is treated as a no-op compatibility knob. "
+                "The old Mamba prefix-cache async-scheduling hard block is no "
+                "longer present; current mamba_cache_mode runner constraints "
+                "still apply."
+            )
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
@@ -1036,6 +1044,30 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        if envs.VLLM_SM70_USE_BREAKABLE_CUDAGRAPH:
+            if current_platform.is_cuda() and current_platform.is_device_capability(
+                (7, 0)
+            ):
+                if "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ:
+                    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+                    logger.info_once(
+                        "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 because "
+                        "VLLM_SM70_USE_BREAKABLE_CUDAGRAPH=1 was requested on "
+                        "SM70/V100. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt "
+                        "out."
+                    )
+                elif os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") == "0":
+                    logger.warning_once(
+                        "VLLM_SM70_USE_BREAKABLE_CUDAGRAPH=1 was requested on "
+                        "SM70/V100, but explicit VLLM_USE_BREAKABLE_CUDAGRAPH=0 "
+                        "takes precedence."
+                    )
+            else:
+                logger.warning_once(
+                    "Ignoring VLLM_SM70_USE_BREAKABLE_CUDAGRAPH=1 because the "
+                    "current platform is not SM70/V100."
+                )
+
         if self.model_config is not None and self.model_config.enforce_eager:
             logger.warning(
                 "Enforce eager set, disabling torch.compile and CUDAGraphs. "
@@ -1075,6 +1107,320 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
+        sm70_compile_disabled_by_user = (
+            (self.model_config is not None and self.model_config.enforce_eager)
+            or os.environ.get("TORCH_COMPILE_DISABLE") == "1"
+            or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        )
+        sm70_no_compile_decode_graph_explicit = (
+            os.environ.get("VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE", "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        sm70_fp8_kv_requested = str(self.cache_config.cache_dtype).startswith("fp8")
+
+        if (
+            self.model_config is not None
+            and self.model_config.quantization == "fp8"
+            and self.model_config.is_moe
+            and self.parallel_config.tensor_parallel_size <= 2
+            and sm70_fp8_kv_requested
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+            and envs.VLLM_SM70_FP8_TURBOMIND
+            and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
+        ):
+            os.environ["VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK"] = "0"
+            logger.info_once(
+                "Auto-setting VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK=0 for "
+                "SM70 FP8 MoE with explicit FP8 KV cache on TP<=2. This keeps "
+                "dense FP8 TurboMind enabled and uses the native SM70 FP8 MoE "
+                "route to avoid the fp16 expert dequant fallback memory cliff. "
+                "Set VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK explicitly to override."
+            )
+
+        if (
+            self.model_config is not None
+            and self.model_config.quantization == "fp8"
+            and self.model_config.is_moe
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+            and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
+            and "VLLM_SM70_FP8_TURBOMIND" not in os.environ
+        ):
+            os.environ["VLLM_SM70_FP8_TURBOMIND"] = "0"
+            logger.info_once(
+                "Auto-setting VLLM_SM70_FP8_TURBOMIND=0 for SM70 FP8 MoE "
+                "0.0.3 dense dequant fallback lane. Set "
+                "VLLM_SM70_FP8_TURBOMIND explicitly to override."
+            )
+
+        sm70_flash_v100_baseline = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and envs.VLLM_SM70_FLASH_ATTN_V100
+        )
+        if sm70_flash_v100_baseline:
+            sm70_baseline_env_defaults = {
+                "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "0",
+                "VLLM_SM70_GDN_KKT_SCHEDULE": "1",
+                "VLLM_SM70_GDN_DELTA_H_SCHEDULE": "1",
+                "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": "1",
+                "VLLM_SM70_FLA_RECURRENT_SCHEDULE": "1",
+                "VLLM_SM70_FUSED_SIGMOID_GATING_SCHED": "1",
+                "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": "1",
+                "VLLM_SM70_GDN_DECODE_FLASHQLA": "1",
+            }
+            if (
+                not sm70_compile_disabled_by_user
+                and not sm70_no_compile_decode_graph_explicit
+            ):
+                sm70_baseline_env_defaults[
+                    "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH"
+                ] = "1"
+            elif "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH" not in os.environ:
+                logger.info_once(
+                    "Not auto-setting "
+                    "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 for the "
+                    "SM70 Flash-V100 baseline because compile/no-compile "
+                    "behavior was explicitly disabled or overridden."
+                )
+            for env_name, env_value in sm70_baseline_env_defaults.items():
+                if env_name not in os.environ:
+                    os.environ[env_name] = env_value
+                    logger.info_once(
+                        "Auto-setting %s=%s for the SM70 Flash-V100 "
+                        "baseline. Set it explicitly to override.",
+                        env_name,
+                        env_value,
+                    )
+
+        sm70_flash_0dot3_compile_graph = (
+            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        )
+        sm70_flash_no_compile_graph = (
+            envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
+            and not sm70_flash_0dot3_compile_graph
+        )
+        sm70_flash_no_compile_graph_explicit = (
+            "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE" in os.environ
+        )
+        if sm70_flash_0dot3_compile_graph:
+            if sm70_compile_disabled_by_user:
+                logger.warning_once(
+                    "Ignoring VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 "
+                    "because enforce_eager, TORCH_COMPILE_DISABLE, or "
+                    "VLLM_USE_BREAKABLE_CUDAGRAPH explicitly disables the "
+                    "compile path."
+                )
+            elif (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+                and envs.VLLM_SM70_FLASH_ATTN_V100
+            ):
+                self.compilation_config.mode = CompilationMode.VLLM_COMPILE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_AND_PIECEWISE
+                )
+                if self.compilation_config.cudagraph_capture_sizes is None:
+                    cudagraph_capture_sizes = [1, 2]
+                    if (
+                        self.speculative_config is not None
+                        and self.speculative_config.num_speculative_tokens
+                    ):
+                        cudagraph_capture_sizes = (
+                            [1, 2, 4, 8, 9, 18]
+                            if self.parallel_config.tensor_parallel_size >= 4
+                            else [1, 2, 4, 8, 9]
+                        )
+                        decode_query_len = (
+                            self.speculative_config.num_speculative_tokens + 1
+                        )
+                        smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
+                        if (
+                            smallq_env not in os.environ
+                            and decode_query_len
+                            > envs.VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q
+                        ):
+                            os.environ[smallq_env] = str(decode_query_len)
+                            logger.info_once(
+                                "Auto-setting %s=%s so SM70 Flash-V100 "
+                                "speculative verifier graph capture uses the "
+                                "graph-safe small-query decode branch.",
+                                smallq_env,
+                                decode_query_len,
+                            )
+                        max_graph_reqs = (
+                            4
+                            if self.parallel_config.tensor_parallel_size >= 4
+                            else 1
+                        )
+                        max_graph_reqs = min(
+                            max(int(self.scheduler_config.max_num_seqs), 1),
+                            max_graph_reqs,
+                        )
+                        cudagraph_capture_sizes = sorted(
+                            set(cudagraph_capture_sizes)
+                            | {
+                                decode_query_len * num_reqs
+                                for num_reqs in range(1, max_graph_reqs + 1)
+                            }
+                        )
+                        logger.info_once(
+                            "Using SM70 speculative verifier cudagraph shapes "
+                            "%sx1..%s for Flash-V100 compile graph.",
+                            decode_query_len,
+                            max_graph_reqs,
+                        )
+                    self.compilation_config.cudagraph_capture_sizes = (
+                        cudagraph_capture_sizes
+                    )
+                if self.compilation_config.max_cudagraph_capture_size is None:
+                    self.compilation_config.max_cudagraph_capture_size = max(
+                        self.compilation_config.cudagraph_capture_sizes
+                    )
+                if self.compilation_config.use_inductor_graph_partition is None:
+                    self.compilation_config.use_inductor_graph_partition = False
+                self.kernel_config.ir_op_priority.rms_norm = [
+                    "vllm_c",
+                    "native",
+                ]
+                self.kernel_config.ir_op_priority.fused_add_rms_norm = [
+                    "vllm_c",
+                    "native",
+                ]
+                logger.info_once(
+                    "Using vllm_c RMSNorm priority for SM70 Flash-V100 "
+                    "0.0.3 compile graph quality parity."
+                )
+                if envs.VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS:
+                    self.compilation_config.pass_config.eliminate_noops = True
+                    logger.info_once(
+                        "Using eliminate_noops=True for SM70 Flash-V100 "
+                        "0.0.3 compile graph parity."
+                    )
+                if "VLLM_MQ_BROADCASTER_MAX_CHUNKS" not in os.environ:
+                    os.environ["VLLM_MQ_BROADCASTER_MAX_CHUNKS"] = "64"
+                    logger.info_once(
+                        "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
+                        "SM70 Flash-V100 0.0.3 compile graph startup."
+                    )
+                if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ:
+                    os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
+                    logger.info_once(
+                        "Auto-setting VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 "
+                        "for SM70 Flash-V100 0.0.3 compile graph startup."
+                    )
+                if "VLLM_SM70_LM_HEAD_TOP1" not in os.environ:
+                    os.environ["VLLM_SM70_LM_HEAD_TOP1"] = "0"
+                    logger.info_once(
+                        "Auto-setting VLLM_SM70_LM_HEAD_TOP1=0 for SM70 "
+                        "Flash-V100 0.0.3 compile graph quality parity; "
+                        "greedy decode keeps the local-logits top1 shortcut."
+                    )
+                if "VLLM_USE_AOT_COMPILE" not in os.environ:
+                    os.environ["VLLM_USE_AOT_COMPILE"] = "1"
+                    logger.info_once(
+                        "Auto-setting VLLM_USE_AOT_COMPILE=1 for SM70 "
+                        "Flash-V100 0.0.3 compile graph quality parity."
+                    )
+                elif os.environ.get("VLLM_USE_AOT_COMPILE") == "0":
+                    logger.warning_once(
+                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
+                        "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
+                        "configuration: regular torch.compile reproduced "
+                        "deterministic greedy token drift."
+                    )
+                if "VLLM_DISABLE_COMPILE_CACHE" not in os.environ:
+                    os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+                    logger.info_once(
+                        "Auto-setting VLLM_DISABLE_COMPILE_CACHE=1 for SM70 "
+                        "Flash-V100 0.0.3 compile graph quality parity; "
+                        "decode throughput is preserved, but AOT artifact "
+                        "reload stays disabled until its token drift is fixed."
+                    )
+                elif os.environ.get("VLLM_DISABLE_COMPILE_CACHE") == "0":
+                    logger.warning_once(
+                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
+                        "explicit VLLM_DISABLE_COMPILE_CACHE=0 is a "
+                        "diagnostic-only configuration: cached AOT artifact "
+                        "reload reproduced deterministic greedy token drift."
+                    )
+                self.compilation_config.inductor_compile_config[
+                    "combo_kernels"
+                ] = True
+                self.compilation_config.inductor_compile_config[
+                    "benchmark_combo_kernel"
+                ] = True
+                logger.info_once(
+                    "Using combo_kernels=True and benchmark_combo_kernel=True "
+                    "for SM70 Flash-V100 0.0.3 compile graph quality parity."
+                )
+                if (
+                    self.model_config is not None
+                    and self.model_config.multimodal_config is not None
+                ):
+                    self.model_config.multimodal_config.language_model_only = True
+                    self.model_config.multimodal_config.skip_mm_profiling = True
+                    logger.info_once(
+                        "Using text-only multimodal policy for SM70 Flash-V100 "
+                        "0.0.3 compile graph startup."
+                    )
+                logger.info_once(
+                    "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
+                    "mode=VLLM_COMPILE, cudagraph_mode=FULL_AND_PIECEWISE, "
+                    "capture_sizes=%s.",
+                    tuple(self.compilation_config.cudagraph_capture_sizes),
+                )
+            else:
+                logger.warning_once(
+                    "Ignoring VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 "
+                    "because the current platform is not SM70 CUDA or "
+                    "VLLM_SM70_FLASH_ATTN_V100 is disabled."
+                )
+        if sm70_flash_no_compile_graph:
+            if self.model_config is not None and self.model_config.enforce_eager:
+                logger.warning_once(
+                    "Ignoring VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1 "
+                    "because enforce_eager disables CUDA graphs."
+                )
+            elif (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+                and envs.VLLM_SM70_FLASH_ATTN_V100
+            ):
+                capture_size = max(
+                    1,
+                    envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE,
+                )
+                self.compilation_config.mode = CompilationMode.NONE
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_DECODE_ONLY
+                )
+                if self.compilation_config.max_cudagraph_capture_size is None:
+                    self.compilation_config.max_cudagraph_capture_size = capture_size
+                if self.compilation_config.cudagraph_capture_sizes is None:
+                    self.compilation_config.cudagraph_capture_sizes = list(
+                        range(1, capture_size + 1)
+                    )
+                logger.info_once(
+                    "Using SM70 Flash-V100 no-compile decode CUDA graph "
+                    "policy: mode=NONE, cudagraph_mode=FULL_DECODE_ONLY, "
+                    "capture_size=%d.",
+                    capture_size,
+                )
+            else:
+                if sm70_flash_no_compile_graph_explicit:
+                    logger.warning_once(
+                        "Ignoring "
+                        "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1 "
+                        "because the current platform is not SM70 CUDA or "
+                        "VLLM_SM70_FLASH_ATTN_V100 is disabled."
+                    )
+
         if self.compilation_config.backend == "eager" or (
             self.compilation_config.mode is not None
             and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
@@ -1093,11 +1439,24 @@ class VllmConfig:
                     return self.quant_config.has_blocked_weights()
             return False
 
+        def enable_quant_fp8_custom_op_for_blocked_weights() -> bool:
+            if not has_blocked_weights():
+                return False
+            if (
+                self.model_config is not None
+                and self.model_config.quantization == "fp8"
+                and current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+                and envs.VLLM_SM70_FP8_TURBOMIND
+            ):
+                return False
+            return True
+
         # Enable quant_fp8 CUDA ops (TODO disable in follow up)
         # On H100 the CUDA kernel is faster than
         # native implementation
         # https://github.com/vllm-project/vllm/issues/25094
-        if has_blocked_weights():
+        if enable_quant_fp8_custom_op_for_blocked_weights():
             custom_ops = self.compilation_config.custom_ops
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
@@ -1514,15 +1873,6 @@ class VllmConfig:
                 )
             self.compilation_config.debug_dump_path = env_path
 
-        # Enable quant_fp8 CUDA ops (TODO disable in follow up)
-        # On H100 the CUDA kernel is faster than
-        # native implementation
-        # https://github.com/vllm-project/vllm/issues/25094
-        if has_blocked_weights():
-            custom_ops = self.compilation_config.custom_ops
-            if "-quant_fp8" not in custom_ops:
-                custom_ops.append("+quant_fp8")
-
         self._verify_kv_transfer_compat()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
@@ -1685,7 +2035,22 @@ class VllmConfig:
                 # sort to make sure the sizes are in ascending order
                 cudagraph_capture_sizes.sort()
             else:
-                if self.performance_mode == "interactivity":
+                use_dense_sm70_cudagraph = envs.VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE
+                if use_dense_sm70_cudagraph:
+                    from vllm.platforms import current_platform
+
+                    cap = current_platform.get_device_capability()
+                    use_dense_sm70_cudagraph = (
+                        cap is not None and cap.major == 7
+                    )
+
+                if use_dense_sm70_cudagraph:
+                    # Legacy 0.0.3 SM70 decode-heavy tuning: capture every
+                    # small batch size up to 64 to avoid padding overhead under
+                    # dynamic low-concurrency decode.
+                    dense_small_cap = min(max_cudagraph_capture_size, 64)
+                    cudagraph_capture_sizes = list(range(1, dense_small_cap + 1))
+                elif self.performance_mode == "interactivity":
                     # Fine-grained CUDA graphs at small batch sizes
                     # for minimal padding overhead
                     interactivity_max = min(max_cudagraph_capture_size, 32)
@@ -1781,6 +2146,22 @@ class VllmConfig:
 
         # The upper bound of the compile ranges is the max_num_batched_tokens.
         compile_range_end = self.scheduler_config.max_num_batched_tokens
+        if (
+            compile_range_end is not None
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
+            and compilation_config.mode == CompilationMode.VLLM_COMPILE
+            and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+        ):
+            # FULL decode capture can enter the compiled piecewise wrapper with
+            # max_num_batched_tokens + one decode token. Keep scheduler capacity
+            # unchanged, but allow the wrapper to select a compiled range.
+            compile_range_end += 1
+            logger.info_once(
+                "Extending SM70 Flash-V100 0.0.3 decode-only compile range "
+                "endpoint to %d for CUDA graph capture.",
+                compile_range_end,
+            )
         if compile_range_end is not None:
             computed_compile_ranges_endpoints.append(compile_range_end)
 

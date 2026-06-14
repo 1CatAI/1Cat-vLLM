@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -26,6 +28,8 @@ if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
 logger = init_logger(__name__)
+
+_SPEC_ALIGNMENT_DUMP_COUNT = 0
 
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
@@ -164,6 +168,15 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+        self._maybe_dump_alignment(
+            metadata=metadata,
+            draft_probs=draft_probs,
+            target_logits=target_logits,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            bonus_token_ids=bonus_token_ids,
+            sampling_metadata=sampling_metadata,
+        )
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
@@ -193,6 +206,100 @@ class RejectionSampler(nn.Module):
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    @staticmethod
+    def _maybe_dump_alignment(
+        *,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor | None,
+        target_logits: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> None:
+        global _SPEC_ALIGNMENT_DUMP_COUNT
+        dump_limit = envs.VLLM_SPEC_DUMP_ALIGNMENT_LIMIT
+        should_dump_alignment = (
+            envs.VLLM_SPEC_DUMP_ALIGNMENT
+            and _SPEC_ALIGNMENT_DUMP_COUNT < dump_limit
+            and sum(metadata.num_draft_tokens) >= min(4, metadata.max_spec_len)
+        )
+        if not should_dump_alignment:
+            return
+
+        with torch.no_grad():
+            k = min(10, target_logits.shape[-1])
+            target_topk = torch.topk(target_logits, k=k, dim=-1)
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+            draft_token_ids_i64 = metadata.draft_token_ids.to(torch.int64)
+            # CUDA graph profiling can call the sampler with zero-filled dummy
+            # draft ids. Skipping those rows keeps the diagnostic focused on
+            # real request traffic instead of warmup placeholders.
+            if bool(torch.all(draft_token_ids_i64 == 0).item()):
+                return
+            draft_target_logits = target_logits.gather(
+                1, draft_token_ids_i64.view(-1, 1)
+            ).squeeze(1)
+            draft_target_probs = target_probs.gather(
+                1, draft_token_ids_i64.view(-1, 1)
+            ).squeeze(1)
+            target_topk_matches = target_topk.indices == draft_token_ids_i64.view(
+                -1, 1
+            )
+            target_topk_rank = torch.where(
+                target_topk_matches.any(dim=-1),
+                target_topk_matches.to(torch.int32).argmax(dim=-1) + 1,
+                torch.full(
+                    (target_topk_matches.shape[0],),
+                    -1,
+                    dtype=torch.int32,
+                    device=target_topk_matches.device,
+                ),
+            )
+            payload = {
+                "rank": int(os.getenv("RANK", "-1")),
+                "draft_token_ids": metadata.draft_token_ids.detach().cpu(),
+                "num_draft_tokens": list(metadata.num_draft_tokens),
+                "cu_num_draft_tokens": metadata.cu_num_draft_tokens.detach().cpu(),
+                "target_argmax": target_logits.argmax(dim=-1).detach().cpu(),
+                "target_topk_ids": target_topk.indices.detach().cpu(),
+                "target_topk_values": target_topk.values.detach().cpu(),
+                "draft_token_target_topk_rank": target_topk_rank.detach().cpu(),
+                "draft_target_logits": draft_target_logits.detach().cpu(),
+                "draft_target_probs": draft_target_probs.detach().cpu(),
+                "target_logits_indices": target_logits_indices.detach().cpu(),
+                "bonus_logits_indices": bonus_logits_indices.detach().cpu(),
+                "bonus_token_ids": bonus_token_ids.detach().cpu(),
+                "all_greedy": sampling_metadata.all_greedy,
+                "all_random": sampling_metadata.all_random,
+            }
+            if draft_probs is not None:
+                draft_token_probs = draft_probs.gather(
+                    1, draft_token_ids_i64.view(-1, 1)
+                ).squeeze(1)
+                payload["draft_token_probs"] = draft_token_probs.detach().cpu()
+                payload["draft_acceptance_caps"] = (
+                    (
+                        draft_target_probs
+                        / draft_token_probs.clamp_min(torch.finfo(torch.float32).tiny)
+                    )
+                    .clamp_max(1.0)
+                    .detach()
+                    .cpu()
+                )
+                draft_topk = torch.topk(draft_probs, k=k, dim=-1)
+                payload["draft_topk_ids"] = draft_topk.indices.detach().cpu()
+                payload["draft_topk_values"] = draft_topk.values.detach().cpu()
+            _SPEC_ALIGNMENT_DUMP_COUNT += 1
+            dump_path = (
+                f"/tmp/spec_alignment_pid{os.getpid()}_"
+                f"{_SPEC_ALIGNMENT_DUMP_COUNT}.pt"
+            )
+            torch.save(payload, dump_path)
+            logger.warning(
+                "Dumped speculative alignment diagnostics to %s", dump_path
+            )
 
     def _get_logprobs_tensors(
         self,

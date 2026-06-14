@@ -271,6 +271,8 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    QK_INPUT_PRECISION: tl.constexpr = "",
+    PV_INPUT_PRECISION: tl.constexpr = "",
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -506,9 +508,17 @@ def kernel_unified_attention(
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
-            S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
+            if QK_INPUT_PRECISION == "":
+                qk = tl.dot(Q, K)
+            else:
+                qk = tl.dot(Q, K, input_precision=QK_INPUT_PRECISION)
+            S += qk * (score_scale * k_token_head_scales[None, :])
         else:
-            S += score_scale * tl.dot(Q, K)
+            if QK_INPUT_PRECISION == "":
+                qk = tl.dot(Q, K)
+            else:
+                qk = tl.dot(Q, K, input_precision=QK_INPUT_PRECISION)
+            S += score_scale * qk
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
@@ -540,9 +550,17 @@ def kernel_unified_attention(
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
-            acc += tl.dot(P_v, V)
+            if PV_INPUT_PRECISION == "":
+                acc += tl.dot(P_v, V)
+            else:
+                acc += tl.dot(P_v, V, input_precision=PV_INPUT_PRECISION)
         else:
-            acc += tl.dot(P.to(V.dtype), V)
+            if PV_INPUT_PRECISION == "":
+                acc += tl.dot(P.to(V.dtype), V)
+            else:
+                acc += tl.dot(
+                    P.to(V.dtype), V, input_precision=PV_INPUT_PRECISION
+                )
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
@@ -760,6 +778,30 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
+def _validate_sm70_triton_attn_tile_size(tile_size: int, name: str) -> None:
+    if tile_size == 0:
+        return
+    if tile_size <= 0 or tile_size & (tile_size - 1) != 0:
+        raise ValueError(f"{name} must be a positive power of 2 or 0")
+    if tile_size < 16 or tile_size > 128:
+        raise ValueError(f"{name} must be in [16, 128] or 0")
+
+
+def _validate_sm70_triton_attn_warps(num_warps: int) -> None:
+    if num_warps == 0:
+        return
+    if num_warps not in (1, 2, 4, 8):
+        raise ValueError("VLLM_SM70_TRITON_ATTN_NUM_WARPS must be 1, 2, 4, 8, or 0")
+
+
+def _validate_sm70_triton_attn_input_precision(value: str | None, name: str) -> str:
+    if value is None or value == "":
+        return ""
+    if value not in ("tf32", "tf32x3", "ieee"):
+        raise ValueError(f"{name} must be one of tf32, tf32x3, ieee, or empty")
+    return value
+
+
 def unified_attention(
     q,
     k,
@@ -868,6 +910,76 @@ def unified_attention(
     TILE_SIZE_DECODE = _get_tile_size(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
+    sm70_num_warps = 0
+    sm70_prefill_num_warps = 0
+    sm70_decode_num_warps = 0
+    sm70_safe_defaults = False
+    sm70_qk_input_precision = ""
+    sm70_pv_input_precision = ""
+    if current_platform.is_device_capability(70):
+        sm70_prefill_tile_size = envs.VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE
+        sm70_decode_tile_size = envs.VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE
+        sm70_num_warps = envs.VLLM_SM70_TRITON_ATTN_NUM_WARPS
+        sm70_prefill_num_warps = (
+            envs.VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS
+        )
+        sm70_decode_num_warps = (
+            envs.VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS
+        )
+        sm70_safe_defaults = envs.VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS
+        sm70_qk_input_precision = _validate_sm70_triton_attn_input_precision(
+            envs.VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION,
+            "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION",
+        )
+        sm70_pv_input_precision = _validate_sm70_triton_attn_input_precision(
+            envs.VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION,
+            "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION",
+        )
+        _validate_sm70_triton_attn_tile_size(
+            sm70_prefill_tile_size, "VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE"
+        )
+        _validate_sm70_triton_attn_tile_size(
+            sm70_decode_tile_size, "VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE"
+        )
+        _validate_sm70_triton_attn_warps(sm70_num_warps)
+        _validate_sm70_triton_attn_warps(sm70_prefill_num_warps)
+        _validate_sm70_triton_attn_warps(sm70_decode_num_warps)
+        if sm70_prefill_tile_size:
+            TILE_SIZE_PREFILL = sm70_prefill_tile_size
+        if sm70_decode_tile_size:
+            TILE_SIZE_DECODE = sm70_decode_tile_size
+        if sm70_num_warps:
+            if not sm70_prefill_num_warps:
+                sm70_prefill_num_warps = sm70_num_warps
+            if not sm70_decode_num_warps:
+                sm70_decode_num_warps = sm70_num_warps
+        if sm70_safe_defaults:
+            if not sm70_prefill_num_warps:
+                sm70_prefill_num_warps = 4
+            if not sm70_decode_num_warps:
+                sm70_decode_num_warps = 8
+        if (
+            sm70_prefill_tile_size
+            or sm70_decode_tile_size
+            or sm70_prefill_num_warps
+            or sm70_decode_num_warps
+            or sm70_qk_input_precision
+            or sm70_pv_input_precision
+        ):
+            logger.info_once(
+                "SM70 Triton attention schedule override active: "
+                "prefill_tile=%s decode_tile=%s "
+                "prefill_num_warps=%s decode_num_warps=%s "
+                "qk_input_precision=%s pv_input_precision=%s "
+                "safe_defaults=%s",
+                TILE_SIZE_PREFILL,
+                TILE_SIZE_DECODE,
+                sm70_prefill_num_warps or "auto",
+                sm70_decode_num_warps or "auto",
+                sm70_qk_input_precision or "default",
+                sm70_pv_input_precision or "default",
+                sm70_safe_defaults,
+            )
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -964,6 +1076,13 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    launch_kwargs: dict[str, Any] = {}
+    sm70_launch_num_warps = (
+        sm70_decode_num_warps if max_seqlen_q <= 1 else sm70_prefill_num_warps
+    )
+    if sm70_launch_num_warps:
+        launch_kwargs["num_warps"] = sm70_launch_num_warps
+
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1033,6 +1152,9 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        QK_INPUT_PRECISION=sm70_qk_input_precision,
+        PV_INPUT_PRECISION=sm70_pv_input_precision,
+        **launch_kwargs,
     )
 
     if use_3d:

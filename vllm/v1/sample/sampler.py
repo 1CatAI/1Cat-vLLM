@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -15,6 +18,70 @@ from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
+_SM70_LOGITS_DUMP_COUNTER = 0
+
+
+def _sm70_cuda_graph_capture_active() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if is_capturing is None:
+        return False
+    try:
+        return bool(is_capturing())
+    except RuntimeError:
+        return False
+
+
+def _maybe_dump_sm70_sampler_logits(
+    logits: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    stage: str,
+) -> None:
+    dump_dir = os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR")
+    if not dump_dir:
+        return
+    enable_file = os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE")
+    if enable_file and not Path(enable_file).exists():
+        return
+    if _sm70_cuda_graph_capture_active():
+        return
+
+    global _SM70_LOGITS_DUMP_COUNTER
+    _SM70_LOGITS_DUMP_COUNTER += 1
+    max_steps = int(os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0"))
+    if max_steps > 0 and max_steps < _SM70_LOGITS_DUMP_COUNTER:
+        return
+
+    def tensor_cpu(value: torch.Tensor | None) -> torch.Tensor | None:
+        return None if value is None else value.detach().cpu()
+
+    path = Path(dump_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "logits": logits.detach().cpu(),
+            "stage": stage,
+            "step": _SM70_LOGITS_DUMP_COUNTER,
+            "pid": os.getpid(),
+            "shape": tuple(logits.shape),
+            "dtype": str(logits.dtype),
+            "temperature": tensor_cpu(sampling_metadata.temperature),
+            "top_k": tensor_cpu(sampling_metadata.top_k),
+            "top_p": tensor_cpu(sampling_metadata.top_p),
+            "all_greedy": sampling_metadata.all_greedy,
+            "all_random": sampling_metadata.all_random,
+            "max_num_logprobs": sampling_metadata.max_num_logprobs,
+            "output_token_ids": [
+                list(ids) for ids in sampling_metadata.output_token_ids
+            ],
+        },
+        path
+        / (
+            f"sampler_logits_pid{os.getpid()}"
+            f"_step{_SM70_LOGITS_DUMP_COUNTER:04d}.pt"
+        ),
+    )
 
 
 class Sampler(nn.Module):
@@ -89,6 +156,7 @@ class Sampler(nn.Module):
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
+        _maybe_dump_sm70_sampler_logits(logits, sampling_metadata, "pre_process")
 
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token

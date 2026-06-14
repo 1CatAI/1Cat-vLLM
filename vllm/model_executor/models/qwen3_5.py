@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -39,9 +40,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
+    _qwen_gdn_non_spec_metadata_tensors,
+    _resolve_qwen_gdn_kv_cache_args,
+    _sm70_compile_graph_slice_dim,
+    _sm70_dump_gdn_projection_tensor,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -53,6 +59,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -66,6 +73,9 @@ from vllm.transformers_utils.configs.qwen3_5 import (
 from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
+)
+from vllm.utils.torch_utils import (
+    _encode_layer_name,
 )
 
 from .interfaces import (
@@ -107,6 +117,53 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
+    raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
+    if raw is None:
+        return None
+    suffixes = {item.strip() for item in raw.split(",") if item.strip()}
+    return suffixes or set()
+
+
+def _uses_split_gdn_input_projections(
+    quant_config: QuantizationConfig | None,
+) -> bool:
+    """Return True when qkv/z and b/a use different precisions."""
+    modules_to_not_convert = getattr(quant_config, "modules_to_not_convert", None)
+    if modules_to_not_convert is None:
+        modules_to_not_convert = getattr(quant_config, "ignored_layers", None)
+    if not modules_to_not_convert:
+        return False
+    return any(
+        module_name == "linear_attn"
+        or module_name.endswith(".linear_attn")
+        or ("linear_attn.in_proj_a" in module_name)
+        or ("linear_attn.in_proj_b" in module_name)
+        for module_name in modules_to_not_convert
+    )
+
+
+def _get_default_sm70_dense_force_suffixes(tp_size: int) -> set[str]:
+    # 0.0.3 enabled the SM70 f16 dense fast path for the narrow dense
+    # Qwen3.5 projection pair. Keep the set intentionally small; broader
+    # projection force-enables were not part of the accepted dense baseline.
+    _ = tp_size
+    return {"qkv_proj", "out_proj"}
+
+
+def _mark_default_sm70_dense_modules(model: nn.Module, tp_size: int) -> None:
+    suffixes = _get_default_sm70_dense_force_suffixes(tp_size)
+    if not suffixes:
+        return
+
+    for module in model.modules():
+        prefix = getattr(module, "prefix", "")
+        if not prefix:
+            continue
+        if prefix.rsplit(".", 1)[-1] in suffixes:
+            module._sm70_f16_force_enable = True
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -115,6 +172,148 @@ class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
 class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5MoeConfig)
+
+
+class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
+    """Qwen3.5 GDN layout compatible with the 0.0.3 SM70 baseline.
+
+    Some checkpoints keep q/k/v/z/b/a in one quantized projection, while
+    mixed-precision Qwen3.5 checkpoints keep b/a in a separate unquantized
+    projection. The 0.0.3 baseline supported both layouts, so this wrapper
+    preserves the split/fused loader compatibility without forcing a layout
+    that the checkpoint did not use.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_split_input_projections = _uses_split_gdn_input_projections(
+            self.quant_config
+        )
+
+    def create_qkvz_proj(
+        self,
+        hidden_size: int,
+        key_dim: int,
+        value_dim: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear:
+        output_sizes = [
+            key_dim,
+            key_dim,
+            value_dim,
+            value_dim,
+        ]
+        if not _uses_split_gdn_input_projections(quant_config):
+            output_sizes.extend([self.num_v_heads, self.num_v_heads])
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=output_sizes,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def create_ba_proj(
+        self,
+        hidden_size: int,
+        num_v_heads: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> MergedColumnParallelLinear | None:
+        if not _uses_split_gdn_input_projections(quant_config):
+            return None
+        return MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[num_v_heads] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        num_tokens = hidden_states.size(0)
+        layer_name = _encode_layer_name(self.prefix)
+        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        z_size = self.value_dim // self.tp_size
+        ba_size = self.num_v_heads // self.tp_size
+
+        hidden_states = _sm70_dump_gdn_projection_tensor(
+            "gdn_hidden_states", layer_name, hidden_states
+        )
+
+        if self.use_split_input_projections:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            assert self.in_proj_ba is not None
+            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _sm70_dump_gdn_projection_tensor(
+                "in_proj_qkvz", layer_name, mixed_qkvz
+            )
+            ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
+            mixed_qkv = mixed_qkvz[..., :qkv_size]
+            z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+            b = ba[..., :ba_size]
+            a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+        else:
+            mixed_qkvzba, _ = self.in_proj_qkvz(hidden_states)
+            mixed_qkvzba = _sm70_dump_gdn_projection_tensor(
+                "in_proj_qkvzba", layer_name, mixed_qkvzba
+            )
+            z_start = qkv_size
+            ba_start = z_start + z_size
+            a_start = ba_start + ba_size
+            mixed_qkv = mixed_qkvzba[..., :qkv_size]
+            z = _sm70_compile_graph_slice_dim(
+                mixed_qkvzba, -1, z_start, z_size
+            )
+            b = _sm70_compile_graph_slice_dim(
+                mixed_qkvzba, -1, ba_start, ba_size
+            )
+            a = _sm70_compile_graph_slice_dim(
+                mixed_qkvzba, -1, a_start, ba_size
+            )
+
+        mixed_qkv = _sm70_dump_gdn_projection_tensor(
+            "split_mixed_qkv", layer_name, mixed_qkv
+        )
+        z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
+        z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
+        b = b.contiguous()
+        a = a.contiguous()
+
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
+            layer_name,
+            core_attn_out,
+        )
+        (
+            non_spec_query_start_loc,
+            non_spec_state_indices_tensor,
+        ) = _qwen_gdn_non_spec_metadata_tensors(
+            layer_name,
+            core_attn_out.device,
+        )
+
+        torch.ops.vllm.qwen_gdn_attention_core_standard(
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            conv_state_cache,
+            ssm_state_cache,
+            non_spec_query_start_loc,
+            non_spec_state_indices_tensor,
+            layer_name,
+        )
+        self._output_projection(core_attn_out, z, output, num_tokens)
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -135,7 +334,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
+            self.linear_attn = Qwen3_5GatedDeltaNet(
                 config=config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
@@ -274,6 +473,10 @@ class Qwen3_5Model(Qwen3NextModel):
         return loaded_local_expert
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        has_split_ba_proj = any(
+            ".linear_attn.in_proj_ba." in name for name in params_dict
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             # GDN
@@ -286,11 +489,22 @@ class Qwen3_5Model(Qwen3NextModel):
             # mlp
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            ("in_proj_ba", "in_proj_b", 0),
-            ("in_proj_ba", "in_proj_a", 1),
         ]
+        if has_split_ba_proj:
+            stacked_params_mapping.extend(
+                [
+                    ("in_proj_ba", "in_proj_b", 0),
+                    ("in_proj_ba", "in_proj_a", 1),
+                ]
+            )
+        else:
+            stacked_params_mapping.extend(
+                [
+                    ("in_proj_qkvz", "in_proj_b", 4),
+                    ("in_proj_qkvz", "in_proj_a", 5),
+                ]
+            )
 
-        params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         is_fused_expert = False
@@ -427,6 +641,7 @@ class Qwen3_5Model(Qwen3NextModel):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
         return loaded_params
 
 
@@ -507,7 +722,11 @@ class Qwen3_5ForCausalLMBase(
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            **kwargs,
         )
 
         return hidden_states
@@ -518,6 +737,9 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -527,12 +749,34 @@ class Qwen3_5ForCausalLMBase(
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        _mark_default_sm70_dense_modules(
+            self, vllm_config.parallel_config.tensor_parallel_size
+        )
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # Qwen3.5 MoE variants have not accepted the generic dense FP16
+        # TurboMind path for all projections. Keep the 0.0.3 safety default:
+        # forbid it unless an explicit MoE-only suffix allowlist is provided.
+        allowlist = _parse_sm70_moe_dense_allowlist()
+        for module in self.modules():
+            module._sm70_f16_forbidden = True
+            if allowlist:
+                module_prefix = getattr(module, "prefix", "")
+                if module_prefix and module_prefix.rsplit(".", 1)[-1] in allowlist:
+                    module._sm70_f16_forbidden = False
+        if envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH or allowlist is not None:
+            logger.info_once(
+                "SM70 dense fp16 fast path is disabled for Qwen3.5 MoE "
+                "modules except VLLM_SM70_MOE_DENSE_ALLOWLIST=%s.",
+                ",".join(sorted(allowlist)) if allowlist else "",
+                scope="local",
+            )
 
         # set MoE hyperparameters
         self.set_moe_parameters()
@@ -663,9 +907,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+            **kwargs,
         )
 
         return hidden_states
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.language_model.get_top_tokens(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

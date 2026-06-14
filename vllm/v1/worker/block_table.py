@@ -163,6 +163,43 @@ class BlockTable:
             BLOCK_SIZE=1024,
         )
 
+    def warmup_slot_mapping_kernel(self) -> None:
+        """JIT the slot-mapping kernel without touching live block-table state."""
+        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        max_num_tokens = self.max_num_batched_tokens
+        block_table = torch.zeros(
+            (1, self.max_num_blocks_per_req), dtype=torch.int32, device=self.device
+        )
+        slot_mapping = torch.empty(
+            max_num_tokens, dtype=torch.int64, device=self.device
+        )
+        warmup_token_counts = (
+            count
+            for count in (1, 2, 4, 5, 8, max_num_tokens)
+            if count <= max_num_tokens
+        )
+        for num_tokens in dict.fromkeys(warmup_token_counts):
+            query_start_loc = torch.tensor(
+                [0, num_tokens], dtype=torch.int32, device=self.device
+            )
+            positions = torch.zeros(num_tokens, dtype=torch.int64, device=self.device)
+            _compute_slot_mapping_kernel[(2,)](
+                num_tokens,
+                max_num_tokens,
+                query_start_loc,
+                positions,
+                block_table,
+                block_table.stride(0),
+                self.block_size,
+                slot_mapping,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
+
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
 
@@ -308,6 +345,10 @@ class MultiGroupBlockTable:
     ) -> None:
         for block_table in self.block_tables:
             block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+
+    def warmup_slot_mapping_kernel(self) -> None:
+        for block_table in self.block_tables:
+            block_table.warmup_slot_mapping_kernel()
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:

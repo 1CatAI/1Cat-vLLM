@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -237,6 +238,19 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
+                        if (
+                            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                            and current_platform.is_cuda()
+                            and current_platform.is_device_capability((7, 0))
+                        ):
+                            logger.info_once(
+                                "Running SM70 Flash-V100 compile full-graph "
+                                "pre-capture warmup for stable replay."
+                            )
+                            get_offloader().sync_prev_onload()
+                            forward_fn(CUDAGraphMode.NONE)
+                            get_offloader().join_after_forward()
+                            torch.cuda.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.

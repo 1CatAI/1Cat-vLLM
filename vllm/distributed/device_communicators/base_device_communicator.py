@@ -181,6 +181,11 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def all_reduce_sum2(
+        self, input_a: torch.Tensor, input_b: torch.Tensor
+    ) -> torch.Tensor:
+        return self.all_reduce(input_a + input_b)
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             # Convert negative dim to positive.

@@ -200,6 +200,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
+            if envs.VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE:
+                logger.info_once(
+                    "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE is "
+                    "upstream-replaced by the latest modular unquantized "
+                    "MoE kernel; no legacy use_inplace flag exists to "
+                    "disable.",
+                    scope="local",
+                )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)

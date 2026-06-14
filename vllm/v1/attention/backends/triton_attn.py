@@ -49,10 +49,23 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+_logged_sm70_fp8_kv_cpp_cache_update = False
+
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+
+
+def _sm70_fp8_kv_needs_cpp_cache_update(
+    kv_cache_dtype: str,
+    key: torch.Tensor,
+) -> bool:
+    if not current_platform.is_cuda() or not key.is_cuda:
+        return False
+    if not is_quantized_kv_cache(kv_cache_dtype):
+        return False
+    return torch.cuda.get_device_capability(key.device)[0] < 8
 
 
 @dataclass
@@ -725,6 +738,8 @@ class TritonAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
+        global _logged_sm70_fp8_kv_cpp_cache_update
+
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
@@ -748,6 +763,25 @@ class TritonAttentionImpl(AttentionImpl):
             return
         # For decoder and cross-attention, use KV cache as before.
         key_cache, value_cache = kv_cache.unbind(1)
+        if _sm70_fp8_kv_needs_cpp_cache_update(self.kv_cache_dtype, key):
+            if not _logged_sm70_fp8_kv_cpp_cache_update:
+                logger.info(
+                    "SM70 FP8 KV cache C++ reshape_and_cache_flash path enabled "
+                    "(kv_cache_dtype=%s).",
+                    self.kv_cache_dtype,
+                )
+                _logged_sm70_fp8_kv_cpp_cache_update = True
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+            return
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)

@@ -37,7 +37,7 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     block_ids_ptr,
@@ -112,7 +112,10 @@ class KVBlockZeroer:
         PAGE_SIZE_EL accounts for this ratio so that
         ``block_id * PAGE_SIZE_EL`` lands at the correct offset.
 
-        Only AttentionSpec layers are processed; Mamba layers are skipped.
+        Full-attention layers may expose K/V as separate outer dimensions, so
+        they can contribute multiple segments. Mamba/GDN layers expose typed
+        state tensor views over one raw page per block; the first state tensor
+        starts at the page base, so one segment per layer zeros the whole page.
         """
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
@@ -120,52 +123,74 @@ class KVBlockZeroer:
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, FullAttentionSpec):
-                continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
-            kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
-            ratio = spec.block_size // kernel_bs
-            block_dim = group.backend.get_kv_cache_block_dim(
-                kernel_bs,
-                spec.num_kv_heads,
-                spec.head_size,
-                cache_dtype_str=cache_dtype,
-            )
 
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv = static_forward_context[layer_name].kv_cache
-                if not isinstance(kv, torch.Tensor):
-                    continue
-                dp = kv.data_ptr()
-                if dp in seen_ptrs:
-                    continue
-                seen_ptrs.add(dp)
-
-                el = kv.element_size()
-                cur_bytes = kv.stride(block_dim) * el
-                assert cur_bytes % 4 == 0
-                kernel_block_el = cur_bytes // 4
-                cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
-                else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                if isinstance(spec, FullAttentionSpec):
+                    if not isinstance(kv, torch.Tensor):
+                        continue
+                    kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+                    ratio = spec.block_size // kernel_bs
+                    block_dim = group.backend.get_kv_cache_block_dim(
+                        kernel_bs,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        cache_dtype_str=cache_dtype,
                     )
+                    dp = kv.data_ptr()
+                    if dp in seen_ptrs:
+                        continue
+                    seen_ptrs.add(dp)
 
-                block_stride_bytes = cur_bytes
-                outer_dims = [
-                    d
-                    for d in range(block_dim)
-                    if kv.stride(d) * el > block_stride_bytes
-                ]
-                outer_strides = [kv.stride(d) * el for d in outer_dims]
-                for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
-                    off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
+                    el = kv.element_size()
+                    cur_bytes = kv.stride(block_dim) * el
+                    assert cur_bytes % 4 == 0
+                    kernel_block_el = cur_bytes // 4
+                    cur_page_el = kernel_block_el * ratio
+                    if page_size_el is None:
+                        page_size_el = cur_page_el
+                    else:
+                        assert page_size_el == cur_page_el, (
+                            f"Non-uniform page sizes: {page_size_el} vs "
+                            f"{cur_page_el}"
+                        )
+
+                    block_stride_bytes = cur_bytes
+                    outer_dims = [
+                        d
+                        for d in range(block_dim)
+                        if kv.stride(d) * el > block_stride_bytes
+                    ]
+                    outer_strides = [kv.stride(d) * el for d in outer_dims]
+                    for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
+                        off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
+                        seg_addrs.append(dp + off_bytes)
+                elif isinstance(spec, MambaSpec):
+                    if not isinstance(kv, (list, tuple)) or not kv:
+                        continue
+                    first_state = kv[0]
+                    if not isinstance(first_state, torch.Tensor):
+                        continue
+                    dp = first_state.data_ptr()
+                    if dp in seen_ptrs:
+                        continue
+                    seen_ptrs.add(dp)
+
+                    page_bytes = spec.page_size_bytes
+                    assert page_bytes % 4 == 0
+                    cur_page_el = page_bytes // 4
+                    if page_size_el is None:
+                        page_size_el = cur_page_el
+                    else:
+                        assert page_size_el == cur_page_el, (
+                            f"Non-uniform page sizes: {page_size_el} vs "
+                            f"{cur_page_el}"
+                        )
+                    seg_addrs.append(dp)
 
         if not seg_addrs or page_size_el is None:
             self._meta = None
@@ -215,6 +240,13 @@ class KVBlockZeroer:
             PAGE_SIZE_EL=page_size_el,
             BLOCK_SIZE=blk_size,
         )
+
+    def warmup_kernel(self) -> bool:
+        """JIT the zero-block kernel before the first real scheduler step."""
+        if self._meta is None:
+            return False
+        self.zero_block_ids([0])
+        return True
 
 
 @dataclass

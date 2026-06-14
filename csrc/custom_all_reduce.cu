@@ -1,6 +1,10 @@
+#include <atomic>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
@@ -9,6 +13,37 @@
 // We use this type alias to indicate when pointers are passed in as int64_t.
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
+
+bool sm70_profile_trace_enabled() {
+  const char* value = std::getenv("VLLM_SM70_PROFILE_TRACE");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+const char* scalar_type_name(at::ScalarType scalar_type) {
+  switch (scalar_type) {
+    case at::ScalarType::Float:
+      return "float32";
+    case at::ScalarType::Half:
+      return "float16";
+    case at::ScalarType::BFloat16:
+      return "bfloat16";
+    default:
+      return "other";
+  }
+}
+
+const char* capture_status_name(cudaStreamCaptureStatus status) {
+  switch (status) {
+    case cudaStreamCaptureStatusNone:
+      return "none";
+    case cudaStreamCaptureStatusActive:
+      return "active";
+    case cudaStreamCaptureStatusInvalidated:
+      return "invalidated";
+    default:
+      return "unknown";
+  }
+}
 
 fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
                       torch::Tensor& rank_data, int64_t rank,
@@ -102,6 +137,91 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
       throw std::runtime_error(
           "custom allreduce only supports float32, float16 and bfloat16");
   }
+}
+
+void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
+                     torch::Tensor& out) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp_a));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+
+  TORCH_CHECK_EQ(inp_a.scalar_type(), inp_b.scalar_type());
+  TORCH_CHECK_EQ(inp_a.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp_a.numel(), inp_b.numel());
+  TORCH_CHECK_EQ(inp_a.numel(), out.numel());
+  TORCH_CHECK(_is_weak_contiguous(inp_a));
+  TORCH_CHECK(_is_weak_contiguous(inp_b));
+  TORCH_CHECK(_is_weak_contiguous(out));
+
+  static std::atomic<bool> logged_sum2_route{false};
+  bool expected = false;
+  if (sm70_profile_trace_enabled() &&
+      logged_sum2_route.compare_exchange_strong(expected, true)) {
+    std::cerr << "SM70 custom all_reduce_sum2 op reached"
+              << " rank=" << fa->rank_ << " world_size=" << fa->world_size_
+              << " numel=" << out.numel()
+              << " dtype=" << scalar_type_name(out.scalar_type())
+              << " capture=" << capture_status_name(capture_status)
+              << std::endl;
+  }
+
+  switch (out.scalar_type()) {
+    case at::ScalarType::Float: {
+      fa->allreduce_sum2<float>(stream, reinterpret_cast<float*>(inp_a.data_ptr()),
+                                reinterpret_cast<float*>(inp_b.data_ptr()),
+                                reinterpret_cast<float*>(out.data_ptr()),
+                                out.numel());
+      break;
+    }
+    case at::ScalarType::Half: {
+      fa->allreduce_sum2<half>(stream, reinterpret_cast<half*>(inp_a.data_ptr()),
+                               reinterpret_cast<half*>(inp_b.data_ptr()),
+                               reinterpret_cast<half*>(out.data_ptr()),
+                               out.numel());
+      break;
+    }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16: {
+      fa->allreduce_sum2<nv_bfloat16>(
+          stream, reinterpret_cast<nv_bfloat16*>(inp_a.data_ptr()),
+          reinterpret_cast<nv_bfloat16*>(inp_b.data_ptr()),
+          reinterpret_cast<nv_bfloat16*>(out.data_ptr()), out.numel());
+      break;
+    }
+#endif
+    default:
+      throw std::runtime_error(
+          "custom allreduce sum2 only supports float32, float16 and bfloat16");
+  }
+}
+
+void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
+                 fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input_pair));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK(input_pair.scalar_type() == at::ScalarType::Float);
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Long);
+  TORCH_CHECK(input_pair.numel() == 2);
+  TORCH_CHECK(output.numel() == 1);
+  TORCH_CHECK(_is_weak_contiguous(input_pair));
+  TORCH_CHECK(_is_weak_contiguous(output));
+
+  auto input_size = input_pair.numel() * input_pair.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, input_pair.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = input_pair.data_ptr();
+  }
+
+  fa->top1_argmax(stream, reinterpret_cast<float*>(reg_buffer),
+                  reinterpret_cast<int64_t*>(output.data_ptr()));
 }
 
 void dispose(fptr_t _fa) {

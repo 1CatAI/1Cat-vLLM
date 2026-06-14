@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -9,12 +10,14 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
+from vllm import _sm70_ops as sm70_ops
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
@@ -30,6 +33,192 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+logger = init_logger(__name__)
+
+
+def _sm70_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _sm70_lm_head_top1_default() -> bool:
+    return not _sm70_env_bool(
+        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False
+    )
+
+
+def _trace_sm70_lm_head_skip(reason: str) -> None:
+    if envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE or envs.VLLM_SM70_PROFILE_TRACE:
+        logger.warning_once("SM70 LM head fast path not prepared: %s", reason)
+
+
+def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
+    prefix = getattr(layer, "prefix", "")
+    is_lm_head = (
+        bool(prefix) and prefix.rsplit(".", 1)[-1] == "lm_head"
+    ) or layer.__class__.__name__ == "ParallelLMHead"
+    if not is_lm_head:
+        return False
+    if not (
+        _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
+        or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
+        or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+    ):
+        _trace_sm70_lm_head_skip("disabled")
+        return False
+    if not current_platform.is_cuda_alike():
+        _trace_sm70_lm_head_skip("non_cuda_platform")
+        return False
+    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        _trace_sm70_lm_head_skip("missing_sm70_f16_prepare_op")
+        return False
+    if layer.weight.dtype != torch.float16:
+        _trace_sm70_lm_head_skip(f"weight_dtype={layer.weight.dtype}")
+        return False
+    if not layer.weight.is_cuda:
+        _trace_sm70_lm_head_skip("weight_not_cuda")
+        return False
+    if torch.cuda.get_device_capability(layer.weight.device) != (7, 0):
+        _trace_sm70_lm_head_skip(
+            f"capability={torch.cuda.get_device_capability(layer.weight.device)}"
+        )
+        return False
+    if layer.weight.ndim != 2:
+        _trace_sm70_lm_head_skip(f"weight_ndim={layer.weight.ndim}")
+        return False
+    if layer.weight.shape[1] % 16 != 0 or layer.weight.shape[0] % 32 != 0:
+        _trace_sm70_lm_head_skip(f"weight_shape={tuple(layer.weight.shape)}")
+        return False
+    return True
+
+
+def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
+    if getattr(layer, "_sm70_f16_prepared", False):
+        return True
+    if not _is_sm70_lm_head_fastpath_eligible(layer):
+        return False
+    prepared = sm70_ops.sm70_f16_prepare(layer.weight)
+    layer._sm70_f16_tm_weight = prepared[0]
+    layer._sm70_f16_k_ld = int(prepared[1][0].item())
+    layer._sm70_f16_prepared = True
+    if envs.VLLM_SM70_ENABLE_LM_HEAD_FASTPATH:
+        logger.info_once("SM70 dense fp16 fast path enabled for LM head.")
+    else:
+        logger.info_once("SM70 LM head top1 layout prepared.")
+    return True
+
+
+def _maybe_sm70_lm_head_forward(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if not _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False):
+        return None
+    if not getattr(layer, "_sm70_f16_prepared", False):
+        return None
+    if not hasattr(torch.ops._C, "sm70_f16_gemm"):
+        return None
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
+    k_ld = getattr(layer, "_sm70_f16_k_ld", None)
+    if tm_weight is not None and k_ld is not None:
+        out = torch.empty(
+            (x_2d.size(0), tm_weight.shape[0]),
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+        sm70_ops.sm70_f16_gemm_out(out, x_2d, tm_weight, k_ld, False)
+    else:
+        out = sm70_ops.sm70_f16_gemm(x_2d, layer.weight)
+
+    if bias is not None:
+        out = out + bias
+    return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
+def _maybe_sm70_lm_head_top1(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    lm_head_top1 = _sm70_env_bool(
+        "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
+    )
+    lm_head_top1_tc = _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+    if not (lm_head_top1 or lm_head_top1_tc):
+        return None
+    if bias is not None:
+        return None
+    if not getattr(layer, "_sm70_f16_prepared", False):
+        _trace_sm70_lm_head_skip("top1_not_prepared")
+        return None
+    if not (
+        hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out")
+        or hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out")
+    ):
+        logger.warning_once(
+            "SM70 LM head top1 requested, but no top1 op is available; "
+            "falling back."
+        )
+        return None
+    if x.dtype != torch.float16 or not x.is_cuda:
+        return None
+    if torch.cuda.get_device_capability(x.device) != (7, 0):
+        return None
+    if x.reshape(-1, x.shape[-1]).size(0) != 1:
+        return None
+
+    weight = layer.weight
+    if weight.dtype != torch.float16 or not weight.is_cuda or weight.stride(1) != 1:
+        return None
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
+    indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
+    if lm_head_top1_tc and hasattr(
+        torch.ops._C, "sm70_f16_lm_head_top1_tc_out"
+    ):
+        tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
+        k_ld = getattr(layer, "_sm70_f16_k_ld", None)
+        if tm_weight is not None and k_ld is not None:
+            sm70_ops.sm70_f16_lm_head_top1_tc_out(
+                values,
+                indices,
+                x_2d,
+                tm_weight,
+                int(k_ld),
+                layer.shard_indices.org_vocab_start_index,
+                layer.shard_indices.num_org_vocab_padding,
+            )
+            logger.info_once("SM70 Tensor Core LM head top1 epilogue path enabled.")
+            return values.reshape(*x.shape[:-1]), indices.reshape(*x.shape[:-1])
+
+    if not lm_head_top1 or not hasattr(
+        torch.ops._C, "sm70_f16_lm_head_top1_out"
+    ):
+        return None
+
+    sm70_ops.sm70_f16_lm_head_top1_out(
+        values,
+        indices,
+        x_2d,
+        weight,
+        int(weight.stride(0)),
+        layer.shard_indices.org_vocab_start_index,
+        layer.shard_indices.num_org_vocab_padding,
+    )
+    logger.info_once("SM70 fused LM head top1 path enabled.")
+    return values.reshape(*x.shape[:-1]), indices.reshape(*x.shape[:-1])
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -63,6 +252,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+            return
+
+        maybe_prepare_sm70_lm_head_top1(layer)
 
     def apply(
         self,
@@ -70,6 +262,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        sm70_out = _maybe_sm70_lm_head_forward(layer, x, bias)
+        if sm70_out is not None:
+            return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
@@ -241,6 +436,7 @@ class VocabParallelEmbedding(PluggableLayer):
         prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
 
         # Keep the input dimensions.
         tp_rank = get_tensor_model_parallel_rank()
@@ -495,6 +691,13 @@ class VocabParallelEmbedding(PluggableLayer):
         # Reduce across all the model parallel GPUs.
         output = tensor_model_parallel_all_reduce(output_parallel)
         return output
+
+    def maybe_get_sm70_lm_head_top1(
+        self,
+        hidden_states: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return _maybe_sm70_lm_head_top1(self, hidden_states, bias)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

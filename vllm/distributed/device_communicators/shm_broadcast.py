@@ -83,6 +83,13 @@ def to_bytes_big(value: int, size: int) -> bytes:
 
 
 logger = init_logger(__name__)
+if envs.VLLM_SLEEP_WHEN_IDLE:
+    logger.warning_once(
+        "VLLM_SLEEP_WHEN_IDLE is upstream-replaced in latest vLLM and is "
+        "treated as a no-op compatibility knob. Shared-memory broadcast now "
+        "uses SpinCondition, which spins under load and waits on notification "
+        "while idle."
+    )
 
 
 LONG_WAIT_TIME_LOG_MSG = (
@@ -364,7 +371,7 @@ class MessageQueue:
         # Default of 24MiB chosen to be large enough to accommodate grammar
         # bitmask tensors for large batches (1024 requests).
         max_chunk_bytes: int = 1024 * 1024 * 24,
-        max_chunks: int = 10,
+        max_chunks: int = envs.VLLM_MQ_MAX_CHUNKS,
         connect_ip: str | None = None,
     ):
         if local_reader_ranks is None:

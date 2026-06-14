@@ -139,6 +139,22 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def all_reduce_sum2(
+    tensor_a: torch.Tensor, tensor_b: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_sum2_out_place(tensor_a, tensor_b)
+
+
+def all_reduce_sum2_fake(
+    tensor_a: torch.Tensor, tensor_b: torch.Tensor, group_name: str
+) -> torch.Tensor:
+    return torch.empty_like(tensor_a)
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -263,6 +279,12 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_sum2",
+    op_func=all_reduce_sum2,
+    fake_impl=all_reduce_sum2_fake,
 )
 
 direct_register_custom_op(
@@ -391,7 +413,7 @@ class GroupCoordinator:
         self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6
+                self.cpu_group, 1 << 22, envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS
             )
 
         # TODO(#35915): Remove is_tpu() check once tpu_inference
@@ -414,7 +436,7 @@ class GroupCoordinator:
         return MessageQueue.create_from_process_group(
             self.cpu_group,
             1 << 22,
-            6,
+            envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS,
             writer_rank=writer_rank,
             external_writer_handle=external_writer_handle,
             blocking=blocking,
@@ -428,7 +450,7 @@ class GroupCoordinator:
         return MessageQueue.create_from_process_group_single_reader(
             self.cpu_group,
             1 << 22,
-            6,
+            envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
         )
@@ -539,6 +561,25 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
+
+    def all_reduce_sum2(
+        self, input_a: torch.Tensor, input_b: torch.Tensor
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_a + input_b
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce_sum2(
+                input_a, input_b, group_name=self.unique_name
+            )
+        return self._all_reduce_sum2_out_place(input_a, input_b)
+
+    def _all_reduce_sum2_out_place(
+        self, input_a: torch.Tensor, input_b: torch.Tensor
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce_sum2(input_a, input_b)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size

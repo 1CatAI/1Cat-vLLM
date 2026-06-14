@@ -268,6 +268,7 @@ def _generate_random_fp8(
     tensor: torch.Tensor,
     low: float,
     high: float,
+    kv_dtype: str = "fp8",
 ) -> None:
     # NOTE(zhaoyang): Due to NaN and Inf representation for fp8 data type,
     # it may occur Inf or NaN if we directly use torch.randint
@@ -281,7 +282,7 @@ def _generate_random_fp8(
 
     tensor_tmp = torch.empty_like(tensor, dtype=torch.float16)
     tensor_tmp.uniform_(low, high)
-    ops.convert_fp8(tensor, tensor_tmp)
+    ops.convert_fp8(tensor, tensor_tmp, kv_dtype=kv_dtype)
     del tensor_tmp
 
 
@@ -515,6 +516,7 @@ def create_kv_caches_with_random_flash(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     set_random_seed(seed)
 
+    fp8_cache_dtypes = ("fp8", "fp8_e4m3", "fp8_e5m2")
     dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
     generic_kv_cache_shape = (num_blocks, 2, block_size, num_heads, head_size)
     assert cache_layout in ("NHD", "HND")
@@ -548,8 +550,10 @@ def create_kv_caches_with_random_flash(
             ).permute(*stride_order)
             if cache_dtype in ["auto", "half", "bfloat16", "float"]:
                 key_value_cache.uniform_(-scale, scale)
-            elif cache_dtype == "fp8":
-                _generate_random_fp8(key_value_cache, -scale, scale)
+            elif cache_dtype in fp8_cache_dtypes:
+                _generate_random_fp8(
+                    key_value_cache, -scale, scale, kv_dtype=str(cache_dtype)
+                )
             else:
                 raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_value_cache[:, 0])
@@ -568,9 +572,11 @@ def create_kv_caches_with_random(
     seed: int | None = None,
     device: str | None = "cuda",
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    if cache_dtype == "fp8" and head_size % 16:
+    fp8_cache_dtypes = ("fp8", "fp8_e4m3", "fp8_e5m2")
+    if cache_dtype in fp8_cache_dtypes and head_size % 16:
         raise ValueError(
-            f"Does not support key cache of type fp8 with head_size {head_size}"
+            f"Does not support key cache of type {cache_dtype} with "
+            f"head_size {head_size}"
         )
 
     set_random_seed(seed)
@@ -585,8 +591,10 @@ def create_kv_caches_with_random(
         key_cache = torch.empty(size=key_cache_shape, dtype=dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             key_cache.uniform_(-scale, scale)
-        elif cache_dtype == "fp8":
-            _generate_random_fp8(key_cache, -scale, scale)
+        elif cache_dtype in fp8_cache_dtypes:
+            _generate_random_fp8(
+                key_cache, -scale, scale, kv_dtype=str(cache_dtype)
+            )
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_cache)
@@ -597,8 +605,10 @@ def create_kv_caches_with_random(
         value_cache = torch.empty(size=value_cache_shape, dtype=dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             value_cache.uniform_(-scale, scale)
-        elif cache_dtype == "fp8":
-            _generate_random_fp8(value_cache, -scale, scale)
+        elif cache_dtype in fp8_cache_dtypes:
+            _generate_random_fp8(
+                value_cache, -scale, scale, kv_dtype=str(cache_dtype)
+            )
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
         value_caches.append(value_cache)

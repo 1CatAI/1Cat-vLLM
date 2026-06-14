@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -712,7 +713,9 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_prefill_backend: Literal[
+        "flashinfer", "triton", "cutedsl", "flashqla_sm70"
+    ] | None = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1532,7 +1535,7 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl"],
+            choices=["flashinfer", "triton", "cutedsl", "flashqla_sm70"],
             default=None,
             help="Select GDN prefill backend.",
         )
@@ -1688,6 +1691,14 @@ class EngineArgs:
         if self.speculative_config is None:
             return None
 
+        if "enforce_eager" not in self.speculative_config:
+            self.speculative_config["enforce_eager"] = False
+            logger.info_once(
+                "Defaulting speculative_config.enforce_eager=False. "
+                "Set speculative_config.enforce_eager=true to disable "
+                "drafter CUDA graphs."
+            )
+
         # Note(Shangming): These parameters are not obtained from the cli arg
         # '--speculative-config' and must be passed in when creating the engine
         # config.
@@ -1698,6 +1709,143 @@ class EngineArgs:
             }
         )
         return SpeculativeConfig(**self.speculative_config)
+
+    def _maybe_apply_sm70_mtp_defaults(
+        self,
+        usage_context: UsageContext | None,
+        model_config: ModelConfig,
+    ) -> None:
+        """Apply the 1Cat SM70 MTP baseline knobs that affect decode speed."""
+        if (
+            os.getenv("VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS")
+            or os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS")
+        ):
+            return
+        if not current_platform.is_cuda_alike():
+            return
+        try:
+            cap = current_platform.get_device_capability()
+        except Exception:
+            return
+        if cap is None or cap.major != 7:
+            return
+
+        text_config = model_config.hf_text_config
+        has_native_mtp = bool(getattr(text_config, "mtp_num_hidden_layers", 0))
+        is_server = getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
+        profile_updates: list[str] = []
+
+        if self.speculative_config is None:
+            if is_server and has_native_mtp and not model_config.is_moe:
+                self.speculative_config = {
+                    "method": "mtp",
+                    "num_speculative_tokens": 4,
+                    "use_local_argmax_reduction": True,
+                }
+                profile_updates.append("speculative_config=mtp4")
+                profile_updates.append(
+                    "speculative_config.use_local_argmax_reduction=True"
+                )
+            else:
+                return
+
+        if not isinstance(self.speculative_config, dict):
+            return
+        spec_method = self.speculative_config.get("method")
+        if spec_method not in ("mtp", "dflash"):
+            return
+
+        if "draft_sample_method" not in self.speculative_config:
+            self.speculative_config["draft_sample_method"] = "probabilistic"
+            profile_updates.append(
+                "speculative_config.draft_sample_method=probabilistic"
+            )
+
+        if spec_method != "mtp":
+            if profile_updates:
+                logger.info(
+                    "Applied SM70 speculative defaults: %s",
+                    ", ".join(profile_updates),
+                )
+            return
+
+        if "use_local_argmax_reduction" not in self.speculative_config:
+            self.speculative_config["use_local_argmax_reduction"] = True
+            profile_updates.append(
+                "speculative_config.use_local_argmax_reduction=True"
+            )
+
+        if "attention_backend" not in self.speculative_config:
+            self.speculative_config["attention_backend"] = "TRITON_ATTN"
+            profile_updates.append("speculative_config.attention_backend=TRITON_ATTN")
+
+        if self.max_num_seqs is None:
+            self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1
+            profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
+
+        if has_native_mtp and self.compilation_config.fast_moe_cold_start is None:
+            # Native MTP layers are encoded explicitly by MoERunner and do not
+            # consume the target-model forward-context MoE order.
+            self.compilation_config.fast_moe_cold_start = True
+            profile_updates.append("fast_moe_cold_start=True")
+
+        if (
+            self.cudagraph_capture_sizes is None
+            and self.max_cudagraph_capture_size is None
+            and self.compilation_config.cudagraph_capture_sizes is None
+            and self.compilation_config.max_cudagraph_capture_size is None
+        ):
+            cudagraph_capture_sizes = (
+                [1, 2, 4, 8, 9, 18]
+                if self.tensor_parallel_size >= 4
+                else [1, 2, 4, 8, 9]
+            )
+            num_speculative_tokens = int(
+                self.speculative_config.get("num_speculative_tokens") or 0
+            )
+            if num_speculative_tokens > 0:
+                decode_query_len = num_speculative_tokens + 1
+                max_num_seqs = max(int(self.max_num_seqs or 1), 1)
+                cudagraph_capture_sizes = sorted(
+                    set(cudagraph_capture_sizes)
+                    | {
+                        decode_query_len * num_reqs
+                        for num_reqs in range(1, max_num_seqs + 1)
+                    }
+                )
+                profile_updates.append(
+                    "mtp_verifier_cudagraph_shapes="
+                    f"{decode_query_len}x1..{max_num_seqs}"
+                )
+            self.compilation_config.cudagraph_capture_sizes = (
+                cudagraph_capture_sizes
+            )
+            self.compilation_config.max_cudagraph_capture_size = max(
+                cudagraph_capture_sizes
+            )
+            profile_updates.append(
+                "cudagraph_capture_sizes="
+                f"{self.compilation_config.cudagraph_capture_sizes}"
+            )
+
+        layer_types = getattr(text_config, "layer_types", None) or []
+        has_linear_attention = any(
+            layer_type == "linear_attention" for layer_type in layer_types
+        )
+        if (
+            self.enable_prefix_caching
+            and has_linear_attention
+            and self.mamba_cache_mode == CacheConfig.mamba_cache_mode
+        ):
+            self.mamba_cache_mode = "align"
+            profile_updates.append("mamba_cache_mode=align")
+
+        if profile_updates:
+            logger.info_once(
+                "Applied 1Cat SM70 MTP defaults: %s. "
+                "Set VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS=1 to disable.",
+                ", ".join(profile_updates),
+            )
 
     def create_engine_config(
         self,
@@ -1739,6 +1887,7 @@ class EngineArgs:
 
         self._check_feature_supported()
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
+        self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
         if not is_interleaved(model_config.hf_text_config):

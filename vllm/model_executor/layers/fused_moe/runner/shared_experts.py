@@ -68,8 +68,18 @@ class SharedExperts:
         # debug purposes.
         # TODO: Remove this after more extensive testings with TP/DP
         # and other execution modes
-        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM:
-            logger.debug_once("Disabling MoE shared_experts cuda stream")
+        layer_disables_stream = getattr(
+            layer, "_vllm_disable_shared_experts_stream", False
+        )
+        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM or layer_disables_stream:
+            if layer_disables_stream:
+                logger.info_once(
+                    "Disabling MoE shared_experts cuda stream for this layer "
+                    "via legacy Qwen3Next SM70 overlap gate.",
+                    scope="local",
+                )
+            else:
+                logger.debug_once("Disabling MoE shared_experts cuda stream")
             self._stream = None
         else:
             # TODO(rob): enable shared expert overlap with non-cuda-alike.

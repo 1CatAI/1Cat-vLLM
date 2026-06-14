@@ -109,6 +109,59 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
     # lazy import to avoid triggering `torch.compile` too early
+    if quantization == "humming":
+        try:
+            from .humming import HummingConfig
+        except ModuleNotFoundError as exc:
+            if exc.name != "humming":
+                raise
+
+            class HummingConfig(QuantizationConfig):
+                """Placeholder used when the optional humming package is absent."""
+
+                def get_name(self) -> QuantizationMethods:
+                    return "humming"
+
+                def get_supported_act_dtypes(self) -> list:
+                    return []
+
+                @classmethod
+                def get_min_capability(cls) -> int:
+                    return 0
+
+                @staticmethod
+                def get_config_filenames() -> list[str]:
+                    return []
+
+                @classmethod
+                def from_config(cls, config: dict) -> "HummingConfig":
+                    del config
+                    raise ModuleNotFoundError(
+                        "The optional 'humming' package is required for "
+                        "quantization='humming'."
+                    )
+
+                @classmethod
+                def override_quantization_method(
+                    cls, hf_quant_cfg: dict, user_quant: str | None, hf_config=None
+                ) -> QuantizationMethods | None:
+                    del hf_quant_cfg, hf_config
+                    if user_quant == "humming":
+                        raise ModuleNotFoundError(
+                            "The optional 'humming' package is required for "
+                            "quantization='humming'."
+                        )
+                    return None
+
+                def get_quant_method(self, layer, prefix):
+                    del layer, prefix
+                    raise ModuleNotFoundError(
+                        "The optional 'humming' package is required for "
+                        "quantization='humming'."
+                    )
+
+        return HummingConfig
+
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
     from vllm.models.deepseek_v4 import DeepseekV4FP8Config
@@ -125,7 +178,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .fp8 import Fp8Config
     from .fp_quant import FPQuantConfig
     from .gguf import GGUFConfig
-    from .humming import HummingConfig
     from .inc import INCConfig
     from .modelopt import (
         ModelOptFp8Config,
@@ -163,7 +215,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4": Mxfp4Config,
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
-        "humming": HummingConfig,
         "online": OnlineQuantizationConfig,
     }
 

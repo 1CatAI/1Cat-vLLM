@@ -27,11 +27,13 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
+    count_expert_num_tokens,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.ubatching import (
     dbo_enabled,
     dbo_maybe_run_recv_hook,
@@ -1013,6 +1015,18 @@ class FusedMoEExpertsMonolithic(FusedMoEExperts):
         raise NotImplementedError
 
 
+def _slice_scales(
+    scales: torch.Tensor | None,
+    start: int,
+    end: int,
+) -> torch.Tensor | None:
+    if scales is None:
+        return None
+    if scales.numel() == 1:
+        return scales
+    return scales[start:end]
+
+
 ################################################################################
 # Kernel
 ################################################################################
@@ -1034,6 +1048,18 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.dp_size > 1
             and moe_parallel_config.use_ep
         )
+
+    @staticmethod
+    def _chunk_info(M: int, can_chunk: bool) -> tuple[int, int]:
+        chunk_size = max(
+            1,
+            M
+            if not can_chunk
+            else min(M, envs.VLLM_FUSED_MOE_CHUNK_SIZE),
+        )
+        num_chunks = cdiv(M, chunk_size)
+        assert M > 0 or num_chunks == 0
+        return num_chunks, chunk_size
 
     def _allocate_buffers(
         self,
@@ -1059,6 +1085,7 @@ class FusedMoEKernelModularImpl:
         """
         assert M_full > 0 and M_chunk > 0
 
+        num_chunks = cdiv(M_full, M_chunk)
         workspace_dtype = self.fused_experts.workspace_dtype(out_dtype)
 
         # Get intermediate workspace shapes based off the chunked M size.
@@ -1085,18 +1112,70 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
-        )
-        workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        fused_out = _resize_cache(common_workspace, fused_out_shape)
+        if num_chunks == 1:
+            # We can reuse the memory between cache1 and cache3 because by the
+            # time we need cache3, we're done with cache1.
+            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+            common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
+            workspace13 = _resize_cache(common_workspace, workspace13_shape)
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
+        else:
+            workspace13, workspace2, fused_out = (
+                current_workspace_manager().get_simultaneous(
+                    (workspace13_shape, workspace_dtype),
+                    (workspace2_shape, workspace_dtype),
+                    (fused_out_shape, out_dtype),
+                )
+            )
 
         return workspace13, workspace2, fused_out
+
+    @staticmethod
+    def _slice_output_tensor(
+        fused_out: torch.Tensor,
+        chunk_idx: int,
+        num_chunks: int,
+        chunk_size: int,
+        M: int,
+    ) -> torch.Tensor:
+        if num_chunks == 1:
+            return fused_out
+
+        assert fused_out.size(0) % M == 0, f"fused_out shape {fused_out.shape} vs {M}"
+        factor = fused_out.size(0) // M
+        out_chunk_size = chunk_size * factor
+        start = chunk_idx * out_chunk_size
+        end = min(start + out_chunk_size, fused_out.size(0))
+        return fused_out[start:end]
+
+    @staticmethod
+    def _slice_expert_tokens_metadata(
+        num_chunks: int,
+        full_expert_tokens_meta: ExpertTokensMetadata | None,
+        chunk_topk_ids: torch.Tensor,
+        local_num_experts: int,
+        expert_map: torch.Tensor | None,
+    ) -> ExpertTokensMetadata | None:
+        if num_chunks == 1 or full_expert_tokens_meta is None:
+            return full_expert_tokens_meta
+
+        expert_num_tokens = count_expert_num_tokens(
+            chunk_topk_ids,
+            local_num_experts,
+            expert_map,
+        )
+
+        expert_num_tokens_cpu = None
+        if full_expert_tokens_meta.expert_num_tokens_cpu is not None:
+            expert_num_tokens_cpu = expert_num_tokens.to("cpu", non_blocking=False)
+
+        return ExpertTokensMetadata(
+            expert_num_tokens=expert_num_tokens,
+            expert_num_tokens_cpu=expert_num_tokens_cpu,
+        )
 
     def _maybe_apply_shared_experts(
         self,
@@ -1109,6 +1188,64 @@ class FusedMoEKernelModularImpl:
                 shared_experts_input,
                 SharedExpertsOrder.MK_INTERNAL_OVERLAPPED,
             )
+
+    def _can_use_sm70_0dot3_inplace_output(
+        self,
+        shared_experts: SharedExperts | None,
+    ) -> bool:
+        if shared_experts is not None:
+            return False
+        if envs.VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE:
+            return False
+        if not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG:
+            return False
+        if not current_platform.is_cuda():
+            return False
+        capability = current_platform.get_device_capability()
+        if (
+            capability is None
+            or capability.major != 7
+            or capability.minor != 0
+        ):
+            return False
+        quant_config = self.fused_experts.quant_config
+        if quant_config.quant_dtype is not None:
+            return False
+        if quant_config.weight_quant_dtype is not None:
+            return False
+        return True
+
+    def _can_use_sm70_0dot3_functional_experts(
+        self,
+        M_full: int,
+        a1q: torch.Tensor,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+    ) -> bool:
+        if not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL:
+            return False
+        if not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG:
+            return False
+        if expert_tokens_meta is not None:
+            return False
+        if getattr(self.fused_experts, "_lora_context", None) is not None:
+            return False
+        if a1q.dim() != 2 or M_full > envs.VLLM_FUSED_MOE_CHUNK_SIZE:
+            return False
+        if not current_platform.is_cuda():
+            return False
+        capability = current_platform.get_device_capability()
+        if (
+            capability is None
+            or capability.major != 7
+            or capability.minor != 0
+        ):
+            return False
+        quant_config = self.fused_experts.quant_config
+        if quant_config.quant_dtype is not None:
+            return False
+        if quant_config.weight_quant_dtype is not None:
+            return False
+        return True
 
     def _prepare(
         self,
@@ -1219,6 +1356,39 @@ class FusedMoEKernelModularImpl:
             a1q, w1, w2, topk_ids
         )
 
+        if self._can_use_sm70_0dot3_functional_experts(
+            M_full,
+            a1q,
+            expert_tokens_meta,
+        ):
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                fused_experts,
+            )
+
+            logger.info_once(
+                "Using SM70 0.0.3 unquantized MoE functional fused_experts path.",
+                scope="local",
+            )
+            return fused_experts(
+                hidden_states=a1q,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                quant_config=self.fused_experts.quant_config,
+            )
+
+        can_chunk = (
+            envs.VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING
+            and a1q.dim() == 2
+            and M_full > envs.VLLM_FUSED_MOE_CHUNK_SIZE
+        )
+        num_chunks, chunk_size = self._chunk_info(M_full, can_chunk)
+
         # This happens when none of the tokens from the all2all reach this
         # EP rank. Also, note that this is only relevant for CUDAGraph
         # incompatible all2all kernels like the DeepEP high-throughput
@@ -1231,7 +1401,7 @@ class FusedMoEKernelModularImpl:
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
             a1q.device,
-            M_full,
+            chunk_size,
             M_full,
             N,
             K,
@@ -1246,7 +1416,7 @@ class FusedMoEKernelModularImpl:
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
         # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
         # double-copy MoE write-back path).
-        if current_platform.is_rocm():
+        if num_chunks == 1 and current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
             if (
@@ -1259,23 +1429,46 @@ class FusedMoEKernelModularImpl:
             ):
                 fused_out = output_alias
 
-        self.fused_experts.apply(
-            output=fused_out,
-            hidden_states=a1q,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            a1q_scale=a1q_scale,
-            a2_scale=self.fused_experts.a2_scale,
-            workspace13=workspace13,
-            workspace2=workspace2,
-            expert_tokens_meta=expert_tokens_meta,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-        )
+        for chunk_idx in range(num_chunks):
+            if num_chunks == 1:
+                start, end = 0, a1q.size(0)
+            else:
+                start = chunk_idx * chunk_size
+                end = min(start + chunk_size, M_full)
+
+            chunk_topk_ids = topk_ids[start:end]
+            chunk_expert_tokens_meta = self._slice_expert_tokens_metadata(
+                num_chunks,
+                expert_tokens_meta,
+                chunk_topk_ids,
+                local_num_experts,
+                expert_map,
+            )
+            chunk_fused_out = self._slice_output_tensor(
+                fused_out,
+                chunk_idx,
+                num_chunks,
+                chunk_size,
+                M_full,
+            )
+
+            self.fused_experts.apply(
+                output=chunk_fused_out,
+                hidden_states=a1q[start:end],
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights[start:end],
+                topk_ids=chunk_topk_ids,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=_slice_scales(a1q_scale, start, end),
+                a2_scale=_slice_scales(self.fused_experts.a2_scale, start, end),
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=chunk_expert_tokens_meta,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
         return fused_out
 
@@ -1389,7 +1582,14 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = torch.empty_like(hidden_states)
+        if self._can_use_sm70_0dot3_inplace_output(shared_experts):
+            logger.info_once(
+                "Using SM70 0.0.3 unquantized MoE inplace output path.",
+                scope="local",
+            )
+            output = hidden_states
+        else:
+            output = torch.empty_like(hidden_states)
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:

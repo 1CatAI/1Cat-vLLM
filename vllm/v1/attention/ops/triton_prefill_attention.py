@@ -177,13 +177,21 @@ def _fwd_kernel(
     )
 
 
-def get_block_size(dtype: torch.dtype) -> int:
+def get_block_size(dtype: torch.dtype, head_dim: int | None = None) -> int:
     if dtype == torch.float32:
         return 32
     elif current_platform.is_cuda_alike() and current_platform.has_device_capability(
         80
     ):
         return 128
+    elif (
+        current_platform.is_cuda_alike()
+        and head_dim is not None
+        and head_dim >= 256
+    ):
+        # SM70/SM75 only expose 96KB shared memory per block. With head_dim=256,
+        # BLOCK=64 requires 128KB in this Triton kernel.
+        return 32
     else:
         return 64
 
@@ -207,9 +215,8 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
-
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
+    BLOCK = get_block_size(q.dtype, Lk)
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
     # rescale with 1/ln(2) for triton exp2

@@ -1250,6 +1250,37 @@ def get_default_config(
             config = {"BLOCK_SIZE_M": 32, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
         else:
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
+    elif (
+        envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
+        and dtype is None
+        and block_shape is None
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(70)
+        and not current_platform.has_device_capability(75)
+    ):
+        # Recover the 0.0.3 V100 unquantized Triton MoE defaults. Latest
+        # upstream's larger small-batch tiles are poor for single-token SM70
+        # decode, which is the FP8-MoE-dequant fallback route used by the
+        # old 35B-FP8 baseline.
+        if M <= E:
+            config = {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "SPLIT_K": 1,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 32,
+                "GROUP_SIZE_M": 8,
+                "SPLIT_K": 1,
+            }
+        logger.info_once(
+            f"Using SM70 0.0.3 unquantized MoE default config: {config}"
+        )
     else:
         # General defaults for bf16/fp16 and fp8 per-tensor.
         # Tile sizes scale with batch: small batches are memory-bound

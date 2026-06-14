@@ -74,6 +74,35 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _sm70_dump_qwen_mlp_tensor(
+    label: str,
+    layer_idx: int | None,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if layer_idx is None:
+        return tensor
+    # This diagnostic piggybacks on qwen3_next's graph-buffer dump path. It is
+    # intentionally env-gated so normal model execution is unchanged.
+    import os
+
+    if os.getenv("VLLM_SM70_DUMP_QWEN_MLP_INTERNALS") != "1":
+        return tensor
+    from vllm.model_executor.models.qwen3_next import _sm70_dump_qwen_layer_tensor
+
+    return _sm70_dump_qwen_layer_tensor(label, layer_idx, "mlp", tensor)
+
+
+def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
+    if ".shared_expert" not in prefix:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability() == (7, 0)
+    except RuntimeError:
+        return False
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -87,6 +116,7 @@ class Qwen2MoeMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -108,16 +138,38 @@ class Qwen2MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        self.act_fn = SiluAndMul(
+            enforce_enable=_sm70_force_shared_expert_silu_custom_op(prefix)
+        )
         self.expert_gate = expert_gate
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
+        fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
+        out = fused_act(x) if fused_act is not None else None
+        if out is None:
+            gate_up, _ = self.gate_up_proj(x)
+            gate_up = _sm70_dump_qwen_mlp_tensor(
+                "mlp_gate_up", self.layer_idx, gate_up
+            )
+            out = self.act_fn(gate_up)
+        out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
         out, _ = self.down_proj(out)
+        out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            expert_gate = self.expert_gate(x)[0]
+            expert_gate = _sm70_dump_qwen_mlp_tensor(
+                "mlp_expert_gate", self.layer_idx, expert_gate
+            )
+            expert_gate = F.sigmoid(expert_gate)
+            expert_gate = _sm70_dump_qwen_mlp_tensor(
+                "mlp_expert_gate_sigmoid", self.layer_idx, expert_gate
+            )
+            out = expert_gate * out
+            out = _sm70_dump_qwen_mlp_tensor(
+                "mlp_after_expert_gate", self.layer_idx, out
+            )
 
         return out
 

@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
+from vllm import _sm70_ops as sm70_ops
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -27,6 +28,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
+    is_layer_sm70_f16_dense,
 )
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
@@ -41,6 +43,55 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _interleave_output_rows_for_gated_silu(weight: torch.Tensor) -> torch.Tensor:
+    half = weight.shape[0] // 2
+    return torch.stack((weight[:half], weight[half:]), dim=1).reshape(weight.shape)
+
+
+def _maybe_sm70_dense_forward(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if getattr(layer, "_sm70_f16_forbidden", False):
+        return None
+    if not getattr(layer, "_sm70_f16_prepared", False):
+        return None
+    if not hasattr(torch.ops._C, "sm70_f16_gemm"):
+        return None
+
+    if envs.VLLM_SM70_F16_DENSE_DEBUG or envs.VLLM_QWEN3_NEXT_SM70_TRACE:
+        rows = x.numel() // x.shape[-1]
+        logger.info(
+            "SM70 dense apply active for %s m=%d n=%d k=%d",
+            getattr(layer, "prefix", "<unknown>"),
+            rows,
+            layer.weight.shape[0],
+            x.shape[-1],
+        )
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
+    k_ld = getattr(layer, "_sm70_f16_k_ld", None)
+    if not torch.compiler.is_compiling() and tm_weight is not None and k_ld is not None:
+        out = torch.empty(
+            (x_2d.size(0), tm_weight.shape[0]),
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+        sm70_ops.sm70_f16_gemm_out(out, x_2d, tm_weight, k_ld, False)
+    else:
+        out = sm70_ops.sm70_f16_gemm(x_2d, layer.weight)
+
+    if bias is not None:
+        out = out + bias
+    return out.reshape(*x.shape[:-1], out.shape[-1])
+
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -213,6 +264,60 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+            return
+
+        if not current_platform.is_cuda_alike():
+            return
+
+        force_enable = getattr(layer, "_sm70_f16_force_enable", False)
+        if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH and not force_enable:
+            return
+        if getattr(layer, "_sm70_f16_forbidden", False):
+            return
+        if not force_enable and not is_layer_sm70_f16_dense(
+            getattr(layer, "prefix", "")
+        ):
+            return
+        if hasattr(layer, "input_is_parallel") and not layer.input_is_parallel:
+            return
+        if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+            return
+        if layer.weight.dtype != torch.float16 or not layer.weight.is_cuda:
+            return
+        if torch.cuda.get_device_capability(layer.weight.device) != (7, 0):
+            return
+        if (
+            layer.weight.ndim != 2
+            or (layer.weight.shape[1] % 16) != 0
+            or (layer.weight.shape[0] % 32) != 0
+        ):
+            return
+
+        prepared = sm70_ops.sm70_f16_prepare(layer.weight)
+        layer._sm70_f16_tm_weight = prepared[0]
+        layer._sm70_f16_k_ld = int(prepared[1][0].item())
+        prefix = getattr(layer, "prefix", "")
+        if (
+            prefix.rsplit(".", 1)[-1] == "gate_up_proj"
+            and layer.weight.shape[0] % 2 == 0
+        ):
+            gated_weight = _interleave_output_rows_for_gated_silu(
+                layer.weight
+            ).contiguous()
+            gated_prepared = sm70_ops.sm70_f16_prepare(gated_weight)
+            layer._sm70_f16_gated_weight = gated_weight
+            layer._sm70_f16_gated_tm_weight = gated_prepared[0]
+            layer._sm70_f16_gated_k_ld = int(gated_prepared[1][0].item())
+        layer._sm70_f16_prepared = True
+        logger.info_once(
+            "SM70 dense fp16 fast path enabled for small decode projections."
+        )
+        if envs.VLLM_SM70_F16_DENSE_DEBUG or envs.VLLM_QWEN3_NEXT_SM70_TRACE:
+            logger.info(
+                "SM70 dense prepared for %s weight_shape=%s",
+                getattr(layer, "prefix", "<unknown>"),
+                tuple(layer.weight.shape),
+            )
 
     def apply(
         self,
@@ -220,8 +325,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        sm70_out = _maybe_sm70_dense_forward(layer, x, bias)
+        if sm70_out is not None:
+            return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
+            x_2d = x.reshape(-1, x.shape[-1])
+            log_fn = (
+                logger.info
+                if x_2d.size(0) <= envs.VLLM_SM70_F16_DENSE_MAX_M
+                else logger.info_once
+            )
+            log_fn(
+                "Unquantized linear fallback prefix=%s x_shape=%s w_shape=%s "
+                "bias=%s batch_invariant=%s",
+                getattr(layer, "prefix", "<unknown>"),
+                tuple(x.shape),
+                tuple(layer.weight.shape),
+                bias is not None,
+                envs.VLLM_BATCH_INVARIANT,
+            )
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
@@ -388,7 +512,9 @@ class ReplicatedLinear(LinearBase):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
-        output = self.quant_method.apply(self, x, bias)
+        output = _maybe_sm70_dense_forward(self, x, bias)
+        if output is None:
+            output = self.quant_method.apply(self, x, bias)
 
         if not self.return_bias:
             return output
@@ -579,7 +705,9 @@ class ColumnParallelLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = _maybe_sm70_dense_forward(self, input_, bias)
+        if output_parallel is None:
+            output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -658,6 +786,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
+
+    def forward_fused_silu_and_mul(self, input_: torch.Tensor) -> torch.Tensor | None:
+        if self.gather_output:
+            return None
+        if self.bias is not None and not self.skip_bias_add:
+            return None
+        fused_apply = getattr(self.quant_method, "apply_fused_silu_and_mul", None)
+        if fused_apply is None:
+            return None
+        return fused_apply(self, input_)
 
     def validate_shard_id(self, loaded_shard_id: int | tuple[int, ...] | None):
         if loaded_shard_id is None:
@@ -1550,7 +1688,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        output_parallel = _maybe_sm70_dense_forward(self, input_parallel, bias_)
+        if output_parallel is None:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)

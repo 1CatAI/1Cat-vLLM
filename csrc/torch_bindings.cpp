@@ -143,6 +143,286 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? qzeros_or_none, bool inplace) -> Tensor");
   // conditionally compiled so impl registrations are in source file
 
+#ifdef ENABLE_SM70_TURBOMIND
+  ops.def(
+      "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor _zeros, "
+      "int group_size, bool interleave_gated_silu) -> Tensor[]");
+  ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
+
+  ops.def(
+      "fp8_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, "
+      "int group_size, bool interleave_gated_silu) -> Tensor[]");
+  ops.impl("fp8_sm70_prepare", torch::kCUDA, &fp8_sm70_prepare);
+
+  ops.def("sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
+  ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
+
+  ops.def(
+      "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
+      "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
+  ops.impl("awq_gemm_sm70", torch::kCUDA, &awq_gemm_sm70);
+
+  ops.def("sm70_f16_gemm(Tensor _in_feats, Tensor _kernel) -> Tensor");
+  ops.impl("sm70_f16_gemm", torch::kCUDA, &sm70_f16_gemm);
+
+  ops.def(
+      "awq_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("awq_gemm_sm70_out", torch::kCUDA, &awq_gemm_sm70_out);
+
+  ops.def(
+      "fp8_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
+
+  ops.def(
+      "fp8_gemm_sm70_out_auto(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _scaling_factors) -> ()");
+  ops.impl("fp8_gemm_sm70_out_auto", torch::kCUDA,
+           &fp8_gemm_sm70_out_auto);
+
+  ops.def(
+      "fp8_gemm_sm70_out_meta(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _scaling_factors, Tensor _meta, "
+      "bool gated_silu) -> ()");
+  ops.impl("fp8_gemm_sm70_out_meta", torch::kCUDA,
+           &fp8_gemm_sm70_out_meta);
+
+  ops.def(
+      "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "int k_ld, bool gated_silu) -> ()");
+  ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
+
+  ops.def(
+      "sm70_f16_lm_head_top1_out(Tensor(a!) values_out, "
+      "Tensor(b!) indices_out, Tensor _in_feats, Tensor _kernel, int k_ld, "
+      "int vocab_start_index, int num_vocab_padding) -> ()");
+  ops.impl("sm70_f16_lm_head_top1_out", torch::kCUDA,
+           &sm70_f16_lm_head_top1_out);
+
+  ops.def(
+      "sm70_f16_lm_head_top1_tc_out(Tensor(a!) values_out, "
+      "Tensor(b!) indices_out, Tensor _in_feats, Tensor _kernel, int k_ld, "
+      "int vocab_start_index, int num_vocab_padding) -> ()");
+  ops.impl("sm70_f16_lm_head_top1_tc_out", torch::kCUDA,
+           &sm70_f16_lm_head_top1_tc_out);
+
+  ops.def(
+      "sm70_f16_gate_mul_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _gate_weight) -> ()");
+  ops.impl("sm70_f16_gate_mul_out", torch::kCUDA, &sm70_f16_gate_mul_out);
+
+  ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
+  ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
+
+  ops.def("sm70_gemm_export_cache(Tensor device_hint, str path) -> int");
+  ops.impl("sm70_gemm_export_cache", torch::kCUDA, &sm70_gemm_export_cache);
+
+  ops.def(
+      "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "
+      "int k_ld, int q_ld, int num_experts) -> Tensor[]");
+  ops.impl("awq_moe_build_strided_ptrs", torch::kCUDA,
+           &awq_moe_build_strided_ptrs);
+
+  ops.def(
+      "awq_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
+      "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
+      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
+
+  ops.def(
+      "awq_moe_gemm_sm70_per_expert_dispatch_out("
+      "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
+      "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
+      "int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("awq_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
+           &awq_moe_gemm_sm70_per_expert_dispatch_out);
+
+  ops.def(
+      "awq_moe_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_dense_stage_sm70_out", torch::kCUDA,
+           &awq_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_active_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
+      "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "
+      "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
+           &awq_moe_active_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_single_token_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
+      "int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_single_token_dense_stage_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_single_token_indexed_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
+      "int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_single_token_indexed_dense_stage_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_indexed_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_single_token_dense_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
+      "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+  ops.impl("awq_moe_single_token_dense_w13_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_dense_w13_sm70_out);
+
+  ops.def(
+      "awq_moe_single_token_indexed_dense_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
+      "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+  ops.impl("awq_moe_single_token_indexed_dense_w13_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_indexed_dense_w13_sm70_out);
+
+  ops.def(
+      "awq_moe_single_token_compact_dense_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) compact_w13_ptrs_w, Tensor(d!) compact_w13_ptrs_s, "
+      "Tensor(e!) expert_offsets, Tensor(f!) expert_offsets64, "
+      "Tensor(g!) inv_permuted_idx, Tensor(h!) sorted_expert_ids, "
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+  ops.impl("awq_moe_single_token_compact_dense_w13_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_compact_dense_w13_sm70_out);
+
+  ops.def(
+      "awq_moe_single_token_exact_layout_prepare("
+      "Tensor topk_ids, Tensor x, Tensor(a!) compact_input, "
+      "Tensor(b!) expert_offsets, Tensor(c!) expert_offsets64, "
+      "Tensor(d!) inv_permuted_idx, int num_experts) -> ()");
+  ops.impl("awq_moe_single_token_exact_layout_prepare", torch::kCUDA,
+           &awq_moe_single_token_exact_layout_prepare);
+
+  ops.def(
+      "awq_moe_single_token_weighted_reduce_out("
+      "Tensor sorted_output, Tensor topk_weights, Tensor inv_permuted_idx, "
+      "Tensor(a!) out, int top_k, int hidden_logical_size) -> ()");
+  ops.impl("awq_moe_single_token_weighted_reduce_out", torch::kCUDA,
+           &awq_moe_single_token_weighted_reduce_out);
+
+  ops.def(
+      "awq_moe_single_token_sm70_out("
+      "Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor src_w13_ptrs_w_rows, Tensor src_w13_ptrs_s_rows, "
+      "Tensor src_w2_ptrs_w_rows, Tensor src_w2_ptrs_s_rows, "
+      "Tensor(b!) compact_input, Tensor(c!) intermediate, "
+      "Tensor(d!) sorted_output, "
+      "Tensor(e!) dst_w13_ptrs_w_rows, Tensor(f!) dst_w13_ptrs_s_rows, "
+      "Tensor(g!) dst_w2_ptrs_w_rows, Tensor(h!) dst_w2_ptrs_s_rows, "
+      "Tensor(i!) expert_offsets, Tensor(j!) inv_permuted_idx, "
+      "int w13_k, int w13_n, int w2_k, int w2_n, int group_size, "
+      "int hidden_logical_size) -> ()");
+  ops.impl("awq_moe_single_token_sm70_out", torch::kCUDA,
+           &awq_moe_single_token_sm70_out);
+
+  ops.def(
+      "fp8_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
+      "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
+      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("fp8_moe_gemm_sm70_out", torch::kCUDA, &fp8_moe_gemm_sm70_out);
+
+  ops.def(
+      "fp8_moe_gemm_sm70_per_expert_dispatch_out("
+      "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
+      "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
+      "int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("fp8_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
+           &fp8_moe_gemm_sm70_per_expert_dispatch_out);
+
+  ops.def(
+      "fp8_moe_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("fp8_moe_dense_stage_sm70_out", torch::kCUDA,
+           &fp8_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "fp8_moe_single_token_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
+      "int k, int n, int group_size) -> ()");
+  ops.impl("fp8_moe_single_token_dense_stage_sm70_out", torch::kCUDA,
+           &fp8_moe_single_token_dense_stage_sm70_out);
+
+  ops.def(
+      "fp8_moe_single_token_indexed_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
+      "int k, int n, int group_size) -> ()");
+  ops.impl("fp8_moe_single_token_indexed_dense_stage_sm70_out", torch::kCUDA,
+           &fp8_moe_single_token_indexed_dense_stage_sm70_out);
+
+  ops.def(
+      "fp8_moe_single_token_dense_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
+      "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+  ops.impl("fp8_moe_single_token_dense_w13_sm70_out", torch::kCUDA,
+           &fp8_moe_single_token_dense_w13_sm70_out);
+
+  ops.def(
+      "fp8_moe_single_token_indexed_dense_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
+      "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+  ops.impl("fp8_moe_single_token_indexed_dense_w13_sm70_out", torch::kCUDA,
+           &fp8_moe_single_token_indexed_dense_w13_sm70_out);
+
+  ops.def(
+      "fp8_moe_single_token_compact_dense_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) compact_w13_ptrs_w, Tensor(d!) compact_w13_ptrs_s, "
+      "Tensor(e!) expert_offsets, Tensor(f!) expert_offsets64, "
+      "Tensor(g!) inv_permuted_idx, Tensor(h!) sorted_expert_ids, "
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+  ops.impl("fp8_moe_single_token_compact_dense_w13_sm70_out", torch::kCUDA,
+           &fp8_moe_single_token_compact_dense_w13_sm70_out);
+
+  ops.def(
+      "fp8_moe_single_token_sm70_out("
+      "Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor src_w13_ptrs_w_rows, Tensor src_w13_ptrs_s_rows, "
+      "Tensor src_w2_ptrs_w_rows, Tensor src_w2_ptrs_s_rows, "
+      "Tensor(b!) compact_input, Tensor(c!) gate_up, Tensor(d!) intermediate, "
+      "Tensor(e!) sorted_output, Tensor(f!) sorted_weights, "
+      "Tensor(g!) dst_w13_ptrs_w_rows, Tensor(h!) dst_w13_ptrs_s_rows, "
+      "Tensor(i!) dst_w2_ptrs_w_rows, Tensor(j!) dst_w2_ptrs_s_rows, "
+      "Tensor(k!) expert_offsets, Tensor(l!) inv_permuted_idx, "
+      "Tensor(m!) sorted_expert_ids, Tensor broadcast_input_indices, "
+      "Tensor w2_raw_weight, Tensor w2_raw_scale_inv, "
+      "int w13_k, int w13_n, int w2_k, int w2_n, int group_size, "
+      "int hidden_logical_size, bool fused_gated_silu, "
+      "bool fused_weighted_reduce, bool broadcast_input, "
+      "bool w2_direct_reduce, bool indexed_expert_ptrs, "
+      "bool exact_per_route) -> ()");
+  ops.impl("fp8_moe_single_token_sm70_out", torch::kCUDA,
+           &fp8_moe_single_token_sm70_out);
+#endif
+
 #endif
 
 #ifndef USE_ROCM
@@ -215,6 +495,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("all_reduce", torch::kCUDA, &all_reduce);
+  custom_ar.def(
+      "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
+  custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);
+  custom_ar.def(
+      "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.impl("top1_argmax", torch::kCUDA, &top1_argmax);
 
   custom_ar.def("dispose", &dispose);
   custom_ar.def("meta_size", &meta_size);

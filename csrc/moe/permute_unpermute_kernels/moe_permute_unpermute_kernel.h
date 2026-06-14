@@ -75,4 +75,23 @@ void preprocessTopkIdLauncher(int* topk_id_ptr, int size,
                               const int* expert_map_ptr, int num_experts,
                               cudaStream_t stream);
 
+bool canUseSingleTokenMoePermuteFastPath(int64_t n_token, int64_t topk,
+                                         bool has_expert_map, int64_t n_expert,
+                                         int64_t n_local_expert);
+
+template <typename T>
+void singleTokenMoePermuteLauncher(
+    T const* input, int const* topk_ids, T* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int num_experts, int topk, int64_t cols,
+    cudaStream_t stream);
+
+bool canUseSingleTokenMoeUnpermuteFastPath(int64_t n_token, int64_t topk);
+
+template <typename T>
+void singleTokenMoeUnpermuteLauncher(
+    T const* expanded_permuted_rows, T* reduced_unpermuted_output,
+    float const* scales, int const* expanded_source_row_to_expanded_dest_row,
+    int64_t cols, int64_t topk, cudaStream_t stream);
+
 #include "moe_permute_unpermute_kernel.inl"

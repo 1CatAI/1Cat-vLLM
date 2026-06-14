@@ -1293,11 +1293,14 @@ class EagleModelMixin:
         aux_hidden_states: list[torch.Tensor],
         layer_idx: int,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
+        residual: torch.Tensor | None,
     ) -> list[torch.Tensor]:
         if layer_idx in self.aux_hidden_state_layers:
             value = hidden_states + residual if residual is not None else hidden_states
-            aux_hidden_states.append(value)
+            # Keep a stable snapshot for Eagle3/DFlash. Some optimized model
+            # paths reuse or mutate hidden-state storage across layers, which
+            # can otherwise make every collected aux tensor alias the final one.
+            aux_hidden_states.append(value.clone())
         return aux_hidden_states
 
 

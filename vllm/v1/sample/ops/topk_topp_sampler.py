@@ -315,6 +315,15 @@ def apply_top_k_top_p(
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
+    if (
+        HAS_TRITON
+        and current_platform.is_cuda()
+        and logits.dtype == torch.float32
+        and logits.shape[0] >= 2
+        and logits.shape[1] >= 32768
+    ):
+        return apply_top_k_top_p_triton(logits, k, p)
+
     if HAS_TRITON and logits.shape[0] >= 8:
         return apply_top_k_top_p_triton(logits, k, p)
 

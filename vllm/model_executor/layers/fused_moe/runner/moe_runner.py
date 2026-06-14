@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -7,16 +8,19 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_sum2,
 )
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
@@ -42,6 +46,156 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+
+logger = init_logger(__name__)
+_SM70_MOE_RUNNER_DUMP_BUFFERS: dict[str, torch.Tensor] = {}
+_SM70_MOE_RUNNER_DUMP_META: dict[str, dict[str, object]] = {}
+
+
+def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
+    if not raw_ranges:
+        return None
+    values: set[int] = set()
+    for raw_part in raw_ranges.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw.strip())
+            end = int(end_raw.strip())
+            if end < start:
+                start, end = end, start
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(part))
+    return values
+
+
+def _sm70_extract_moe_layer_idx(layer_name: str) -> int:
+    parts = layer_name.split(".")
+    for idx, part in enumerate(parts[:-1]):
+        if part == "layers":
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return -1
+    return -1
+
+
+def _sm70_moe_runner_dump_requested(layer_idx: int, label: str) -> bool:
+    if not os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR") or layer_idx < 0:
+        return False
+    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1")
+    if raw_layer_ids.strip().lower() not in {"*", "all"}:
+        try:
+            layer_ids = _sm70_parse_int_ranges(raw_layer_ids) or {0, 1}
+        except ValueError:
+            layer_ids = {0, 1}
+        if layer_idx not in layer_ids:
+            return False
+    target_labels = {
+        item.strip()
+        for item in os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS", "").split(",")
+        if item.strip()
+    }
+    return not target_labels or label in target_labels
+
+
+def _sm70_moe_runner_dump_impl(
+    tensor: torch.Tensor,
+    label: str,
+    layer_idx: int,
+) -> torch.Tensor:
+    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
+    if not dump_dir:
+        return tensor
+    graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
+    if graph_buffers and tensor.is_cuda:
+        shape = tuple(tensor.shape)
+        key = f"{os.getpid()}:{layer_idx}:{label}:{shape}:{tensor.dtype}"
+        buffer = _SM70_MOE_RUNNER_DUMP_BUFFERS.get(key)
+        if (
+            buffer is None
+            or tuple(buffer.shape) != shape
+            or buffer.dtype != tensor.dtype
+            or buffer.device != tensor.device
+        ):
+            buffer = torch.empty_like(tensor)
+            _SM70_MOE_RUNNER_DUMP_BUFFERS[key] = buffer
+            _SM70_MOE_RUNNER_DUMP_META[key] = {
+                "label": label,
+                "layer_idx": layer_idx,
+                "layer_type": "moe_runner",
+                "shape": shape,
+                "dtype": str(tensor.dtype),
+                "pid": os.getpid(),
+            }
+        buffer.copy_(tensor)
+    return tensor
+
+
+def _sm70_moe_runner_dump_fake(
+    tensor: torch.Tensor,
+    label: str,
+    layer_idx: int,
+) -> torch.Tensor:
+    return tensor
+
+
+direct_register_custom_op(
+    op_name="sm70_moe_runner_dump",
+    op_func=_sm70_moe_runner_dump_impl,
+    mutates_args=[],
+    fake_impl=_sm70_moe_runner_dump_fake,
+)
+
+
+def _sm70_dump_moe_runner_tensor(
+    tensor: torch.Tensor,
+    label: str,
+    layer_name: str,
+) -> torch.Tensor:
+    layer_idx = _sm70_extract_moe_layer_idx(layer_name)
+    if _sm70_moe_runner_dump_requested(layer_idx, label):
+        tensor = torch.ops.vllm.sm70_moe_runner_dump(tensor, label, layer_idx)
+    return tensor
+
+
+def dump_sm70_moe_runner_graph_buffers(step: int, stage: str) -> None:
+    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
+    if not dump_dir or not _SM70_MOE_RUNNER_DUMP_BUFFERS:
+        return
+    target_steps = _sm70_parse_int_ranges(
+        os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS")
+        or os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
+    )
+    if target_steps is not None and step not in target_steps:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    for key, buffer in _SM70_MOE_RUNNER_DUMP_BUFFERS.items():
+        meta = _SM70_MOE_RUNNER_DUMP_META.get(key, {})
+        label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
+        layer_type = str(meta.get("layer_type", "moe_runner"))
+        layer_idx = int(meta.get("layer_idx", -1))
+        shape = "x".join(str(dim) for dim in tuple(buffer.shape))
+        path = os.path.join(
+            dump_dir,
+            (
+                f"pid{os.getpid()}_step{step:04d}_layer{layer_idx:02d}_"
+                f"{layer_type}_{label}_shape{shape}.pt"
+            ),
+        )
+        torch.save(
+            {
+                **meta,
+                "step": step,
+                "stage": stage,
+                "graph_buffer_key": key,
+                "tensor": buffer.detach().cpu(),
+            },
+            path,
+        )
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
@@ -247,6 +401,13 @@ class MoERunner(MoERunnerInterface):
         # in a single launch.
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
+        if self._fse_fuse_gate and envs.is_set("VLLM_SM70_SHARED_GATE_MAX_M"):
+            logger.info_once(
+                "VLLM_SM70_SHARED_GATE_MAX_M is upstream-replaced by "
+                "generic FusedMoE shared gate fusion; latest vLLM has no "
+                "SM70 shared-gate custom-kernel M limit.",
+                scope="local",
+            )
 
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
@@ -417,9 +578,55 @@ class MoERunner(MoERunnerInterface):
 
         return states[..., :trunc_size]
 
+    def _can_use_sm70_moe_sum2_allreduce(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+    ) -> bool:
+        if shared_output is None or not envs.VLLM_SM70_MOE_ADD_ALLREDUCE:
+            return False
+        if not current_platform.is_cuda():
+            return False
+        if self.moe_config.is_sequence_parallel:
+            return False
+        if self._fused_output_is_reduced:
+            return False
+        if self.moe_config.tp_size <= 1:
+            return False
+        if self.moe_config.ep_size != 1 or self.moe_config.pcp_size != 1:
+            return False
+        if (
+            shared_output.shape != fused_output.shape
+            or shared_output.dtype != fused_output.dtype
+        ):
+            return False
+
+        tp_size = self.moe_config.tp_size
+        return tp_size in (2, 4, 6, 8)
+
+    def _maybe_sm70_moe_sum2_allreduce(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        trunc_size: int,
+    ) -> torch.Tensor | None:
+        if not self._can_use_sm70_moe_sum2_allreduce(shared_output, fused_output):
+            return None
+        assert shared_output is not None
+        if envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling():
+            logger.info_once(
+                "SM70 MoE shared+routed all_reduce_sum2 candidate selected; "
+                "actual custom op route is reported by C++ trace during CUDA "
+                "graph capture."
+            )
+        states = tensor_model_parallel_all_reduce_sum2(shared_output, fused_output)
+        return states[..., :trunc_size]
+
     def _encode_layer_name(self) -> str | LayerName:
         if _USE_LAYERNAME:
             return LayerName(self.layer_name)
+        if self.layer_name.startswith("mtp."):
+            return self.layer_name
         # Can be unavailable or None in unittests
         if (
             is_forward_context_available()
@@ -526,6 +733,16 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 input_ids=input_ids,
             )
+            topk_weights = _sm70_dump_moe_runner_tensor(
+                topk_weights,
+                "moe_topk_weights",
+                self.layer_name,
+            )
+            topk_ids = _sm70_dump_moe_runner_tensor(
+                topk_ids,
+                "moe_topk_ids",
+                self.layer_name,
+            )
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
@@ -543,10 +760,22 @@ class MoERunner(MoERunnerInterface):
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
         )
 
-        return (
-            self._shared_experts.output if self._shared_experts is not None else None,
+        fused_out = _sm70_dump_moe_runner_tensor(
             fused_out,
+            "moe_fused_raw",
+            self.layer_name,
         )
+        shared_out = (
+            self._shared_experts.output if self._shared_experts is not None else None
+        )
+        if shared_out is not None:
+            shared_out = _sm70_dump_moe_runner_tensor(
+                shared_out,
+                "moe_shared_raw",
+                self.layer_name,
+            )
+
+        return shared_out, fused_out
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
@@ -662,20 +891,63 @@ class MoERunner(MoERunnerInterface):
         # If combine kernel already reduced fused, reduce shared to match.
         # See note above re: the two all-reduce points.
         shared_output = self._maybe_reduce_shared_expert_output(shared_output)
+        if shared_output is not None:
+            shared_output = _sm70_dump_moe_runner_tensor(
+                shared_output,
+                "moe_shared_reduced",
+                self.layer_name,
+            )
 
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
         )
+        fused_output = _sm70_dump_moe_runner_tensor(
+            fused_output,
+            "moe_fused_scaled",
+            self.layer_name,
+        )
+        if shared_output is not None:
+            shared_output = _sm70_dump_moe_runner_tensor(
+                shared_output,
+                "moe_shared_scaled",
+                self.layer_name,
+            )
 
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
+        fused_output = _sm70_dump_moe_runner_tensor(
+            fused_output,
+            "moe_fused_projected",
+            self.layer_name,
+        )
+
+        result = self._maybe_sm70_moe_sum2_allreduce(
+            shared_output, fused_output, og_hidden_dim
+        )
+        if result is not None:
+            result = _sm70_dump_moe_runner_tensor(
+                result,
+                "moe_sum2_output",
+                self.layer_name,
+            )
+            return self._maybe_add_zero_expert_output(result)
 
         if shared_output is not None:
             result = shared_output + fused_output
         else:
             result = fused_output
+        result = _sm70_dump_moe_runner_tensor(
+            result,
+            "moe_added_output",
+            self.layer_name,
+        )
 
         result = self._maybe_reduce_final_output(result, og_hidden_dim)
+        result = _sm70_dump_moe_runner_tensor(
+            result,
+            "moe_final_output",
+            self.layer_name,
+        )
 
         return self._maybe_add_zero_expert_output(result)
 
@@ -776,6 +1048,11 @@ class MoERunner(MoERunnerInterface):
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
+            router_logits = _sm70_dump_moe_runner_tensor(
+                router_logits,
+                "moe_router_logits",
+                self.layer_name,
+            )
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

@@ -11,6 +11,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 
 #include <iostream>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <unordered_map>
@@ -295,6 +296,20 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+template <typename P, int ngpus, typename A>
+DINLINE P packed_reduce_sum2(const P* ptrs_a[], const P* ptrs_b[], int idx) {
+  P local = ptrs_a[0][idx];
+  packed_assign_add(local, ptrs_b[0][idx]);
+  A tmp = upcast(local);
+#pragma unroll
+  for (int i = 1; i < ngpus; i++) {
+    local = ptrs_a[i][idx];
+    packed_assign_add(local, ptrs_b[i][idx]);
+    packed_assign_add(tmp, upcast(local));
+  }
+  return downcast<P>(tmp);
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -309,6 +324,24 @@ __global__ void __launch_bounds__(512, 1)
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
        idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_sum2_1stage(
+    RankData* _dp_a, RankData* _dp_b, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp_a = *_dp_a;
+  auto dp_b = *_dp_b;
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    ((P*)result)[idx] =
+        packed_reduce_sum2<P, ngpus, A>((const P**)&dp_a.ptrs[0],
+                                        (const P**)&dp_b.ptrs[0], idx);
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
@@ -363,6 +396,79 @@ __global__ void __launch_bounds__(512, 1)
       }
     }
   }
+}
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_sum2_2stage(
+    RankData* _dp_a, RankData* _dp_b, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  int part = size / ngpus;
+  int start = rank * part;
+  int end = rank == ngpus - 1 ? size : start + part;
+  int largest_part = part + size % ngpus;
+  const P* ptrs_a[ngpus];
+  const P* ptrs_b[ngpus];
+  P* tmps[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    int target = (rank + i) % ngpus;
+    ptrs_a[i] = (const P*)_dp_a->ptrs[target];
+    ptrs_b[i] = (const P*)_dp_b->ptrs[target];
+    tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+  }
+  auto tmp_out = tmps[0];
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  // Stage 1 mirrors cross_device_reduce_2stage, but each rank first forms
+  // its local input_a + input_b value before the cross-rank reduction.
+  for (int idx = start + tid; idx < end; idx += stride) {
+    tmp_out[idx - start] =
+        packed_reduce_sum2<P, ngpus, A>(ptrs_a, ptrs_b, idx);
+  }
+  barrier_at_end<ngpus>(sg, self_sg, rank);
+
+  // Stage 2 allgather is intentionally identical to cross_device_reduce_2stage
+  // so the final reduction order matches custom_all_reduce(input_a + input_b).
+  for (int idx = tid; idx < largest_part; idx += stride) {
+#pragma unroll
+    for (int i = 0; i < ngpus; i++) {
+      int gather_from_rank = ((rank + i) % ngpus);
+      if (gather_from_rank == ngpus - 1 || idx < part) {
+        int dst_idx = gather_from_rank * part + idx;
+        ((P*)result)[dst_idx] = tmps[i][idx];
+      }
+    }
+  }
+}
+
+template <int ngpus>
+__global__ void cross_device_top1_argmax(RankData* _dp, RankSignals sg,
+                                         Signal* self_sg, int64_t* output,
+                                         int rank) {
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  if (threadIdx.x == 0) {
+    float best_value = -std::numeric_limits<float>::infinity();
+    int64_t best_index = std::numeric_limits<int64_t>::max();
+
+#pragma unroll
+    for (int i = 0; i < ngpus; ++i) {
+      const float* pair = reinterpret_cast<const float*>(_dp->ptrs[i]);
+      const float value = pair[0];
+      const int64_t index = static_cast<int64_t>(llrintf(pair[1]));
+      if (value > best_value || (value == best_value && index < best_index)) {
+        best_value = value;
+        best_index = index;
+      }
+    }
+    output[0] = best_index;
+  }
+
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
@@ -614,6 +720,139 @@ class CustomAllreduce {
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  template <typename T>
+  void allreduce_sum2(cudaStream_t stream, T* input_a, T* input_b, T* output,
+                      int size, int threads = 512,
+                      int block_limit = defaultBlockLimit) {
+    auto d = packed_t<T>::P::size;
+    if (size % d != 0)
+      throw std::runtime_error(
+          "custom allreduce sum2 currently requires input length to be "
+          "multiple of " +
+          std::to_string(d));
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("max supported block limit is " +
+                               std::to_string(kMaxBlocks) + ". Got " +
+                               std::to_string(block_limit));
+
+    RankData* ptrs_a;
+    RankData* ptrs_b;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs_a = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input_a);
+      ptrs_b = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input_b);
+    } else {
+      auto it_a = buffers_.find(input_a);
+      auto it_b = buffers_.find(input_b);
+      if (it_a == buffers_.end() || it_b == buffers_.end())
+        throw std::runtime_error(
+            "custom allreduce sum2 input address is not registered!");
+      ptrs_a = it_a->second;
+      ptrs_b = it_b->second;
+    }
+
+    size /= d;
+    auto bytes = size * sizeof(typename packed_t<T>::P);
+    int blocks = std::min(block_limit, (size + threads - 1) / threads);
+
+    const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
+    bool force_1stage = false;
+    bool force_2stage = false;
+    if (env_algo != nullptr) {
+      if (std::strcmp(env_algo, "1stage") == 0 ||
+          std::strcmp(env_algo, "oneshot") == 0) {
+        force_1stage = true;
+      } else if (std::strcmp(env_algo, "2stage") == 0 ||
+                 std::strcmp(env_algo, "twoshot") == 0) {
+        force_2stage = true;
+      } else {
+        throw std::runtime_error(
+            "Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " + std::string(env_algo) +
+            ". Valid values: 1stage, oneshot, 2stage, twoshot");
+      }
+    }
+
+#define SUM2_KL(ngpus, name)                                                  \
+  name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs_a, ptrs_b, sg_,         \
+                                                 self_sg_, output, rank_,     \
+                                                 size);
+#define SUM2_CASE(ngpus)                              \
+  case ngpus: {                                      \
+    if (force_1stage) {                              \
+      SUM2_KL(ngpus, cross_device_reduce_sum2_1stage); \
+    } else if (force_2stage) {                       \
+      SUM2_KL(ngpus, cross_device_reduce_sum2_2stage); \
+    } else {                                         \
+      if (world_size_ == 2) {                        \
+        SUM2_KL(ngpus, cross_device_reduce_sum2_1stage); \
+      } else if (fully_connected_) {                 \
+        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
+            (world_size_ <= 8 && bytes < 256 * 1024)) { \
+          SUM2_KL(ngpus, cross_device_reduce_sum2_1stage); \
+        } else {                                     \
+          SUM2_KL(ngpus, cross_device_reduce_sum2_2stage); \
+        }                                            \
+      }                                              \
+    }                                                \
+    break;                                           \
+  }
+
+    switch (world_size_) {
+      SUM2_CASE(2)
+      SUM2_CASE(4)
+      SUM2_CASE(6)
+      SUM2_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allreduce sum2 only supports num gpus in (2,4,6,8). "
+            "Actual num gpus = " +
+            std::to_string(world_size_));
+    }
+#undef SUM2_CASE
+#undef SUM2_KL
+  }
+
+  void top1_argmax(cudaStream_t stream, float* input_pair, int64_t* output) {
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input_pair);
+    } else {
+      auto it = buffers_.find(input_pair);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " +
+            std::to_string(reinterpret_cast<uint64_t>(input_pair)) +
+            " is not registered!");
+      ptrs = it->second;
+    }
+
+#define TOP1_CASE(ngpus)                                   \
+  case ngpus: {                                            \
+    cross_device_top1_argmax<ngpus><<<1, 32, 0, stream>>>( \
+        ptrs, sg_, self_sg_, output, rank_);               \
+    break;                                                 \
+  }
+
+    switch (world_size_) {
+      TOP1_CASE(2)
+      TOP1_CASE(4)
+      TOP1_CASE(6)
+      TOP1_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom top1 argmax only supports num gpus in (2,4,6,8). Actual "
+            "num gpus = " +
+            std::to_string(world_size_));
+    }
+#undef TOP1_CASE
   }
 
   ~CustomAllreduce() {

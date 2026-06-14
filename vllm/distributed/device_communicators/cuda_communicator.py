@@ -21,6 +21,40 @@ from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+_SEEN_TP_ALLREDUCE_PATHS: set[
+    tuple[str, str, tuple[int, ...], torch.dtype, int]
+] = set()
+
+
+def _trace_all_reduce_path(
+    communicator: "CudaCommunicator",
+    backend: str,
+    input_: torch.Tensor,
+) -> None:
+    if not envs.VLLM_TP_ALLREDUCE_TRACE:
+        return
+    key = (
+        communicator.unique_name,
+        backend,
+        tuple(input_.shape),
+        input_.dtype,
+        input_.element_size() * input_.numel(),
+    )
+    if key in _SEEN_TP_ALLREDUCE_PATHS:
+        return
+    _SEEN_TP_ALLREDUCE_PATHS.add(key)
+    logger.warning(
+        "TP all-reduce trace backend=%s group=%s shape=%s dtype=%s bytes=%d "
+        "custom_enabled=%s torch_symm_mem=%s flashinfer=%s",
+        backend,
+        communicator.unique_name,
+        tuple(input_.shape),
+        input_.dtype,
+        input_.element_size() * input_.numel(),
+        communicator.use_custom_allreduce,
+        communicator.use_torch_symm_mem,
+        communicator.use_flashinfer_allreduce,
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -45,16 +79,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if "tp" not in unique_name:
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
+            use_top1_custom_ar = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+            use_top1_custom_ar = envs.VLLM_SM70_TOP1_CUSTOM_AR
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
 
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_top1_custom_ar = use_top1_custom_ar
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
 
@@ -97,8 +134,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.world_size > 1:
+        if (use_custom_allreduce or use_top1_custom_ar) and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            # `use_top1_custom_ar` deliberately only provisions the IPC/signaling
+            # resources used by the greedy top1 token reducer. It must not make
+            # the normal hidden-state all-reduce dispatch choose CUSTOM when
+            # `disable_custom_all_reduce=True`.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
@@ -114,6 +155,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # If it's a rocm, 'use_custom_allreduce==True' means it must
                 # currently be an MI300 series.
                 self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+            if (
+                use_top1_custom_ar
+                and not use_custom_allreduce
+                and self.ca_comm is not None
+                and not self.ca_comm.disabled
+            ):
+                logger.info_once(
+                    "SM70 custom top1 argmax resources enabled for group '%s' "
+                    "while hidden-state custom all-reduce dispatch remains "
+                    "disabled.",
+                    self.unique_name or "<unnamed>",
+                    scope="global",
+                )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -227,7 +282,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             enabled_ar_backends.append("QUICK_REDUCE")
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
-        if self.ca_comm is not None and not self.ca_comm.disabled:
+        if (
+            self.use_custom_allreduce
+            and self.ca_comm is not None
+            and not self.ca_comm.disabled
+        ):
             enabled_ar_backends.append("CUSTOM")
         if self.symm_mem_comm is not None and not self.symm_mem_comm.disabled:
             enabled_ar_backends.append("SYMM_MEM")
@@ -251,6 +310,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
+                _trace_all_reduce_path(self, "nccl_symmetric", input_)
                 return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -262,6 +322,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
+            _trace_all_reduce_path(self, "quick_reduce", input_)
             return out
         fi_ar_comm = self.fi_ar_comm
         if (
@@ -271,25 +332,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
+            _trace_all_reduce_path(self, "flashinfer", input_)
             return out
         ca_comm = self.ca_comm
         if (
-            ca_comm is not None
+            self.use_custom_allreduce
+            and ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
+            _trace_all_reduce_path(self, "custom", input_)
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
+            _trace_all_reduce_path(self, "torch_symm_mem", input_)
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
+            _trace_all_reduce_path(self, "torch_distributed", input_)
             return out
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
@@ -300,7 +366,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # group, where we always have either custom allreduce or pynccl.
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
+            _trace_all_reduce_path(self, "torch_distributed_fallback", input_)
+        else:
+            _trace_all_reduce_path(self, "pynccl", input_)
         return out
+
+    def all_reduce_sum2(self, input_a, input_b):
+        ca_comm = self.ca_comm
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.should_custom_ar(input_a)
+            and input_a.shape == input_b.shape
+            and input_a.dtype == input_b.dtype
+        ):
+            out = ca_comm.custom_all_reduce_sum2(input_a, input_b)
+            if out is not None:
+                _trace_all_reduce_path(self, "custom_sum2", input_a)
+                return out
+        return self.all_reduce(input_a + input_b)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

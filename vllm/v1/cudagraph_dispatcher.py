@@ -4,6 +4,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
@@ -190,7 +191,22 @@ class CudagraphDispatcher:
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
-        if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
+        skip_sm70_mixed_capture = (
+            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
+            and cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+        if skip_sm70_mixed_capture:
+            logger.info_once(
+                "Skipping mixed/piecewise CUDA graph capture for SM70 "
+                "Flash-V100 0.0.3 decode-only baseline recovery; FULL decode "
+                "graph capture remains enabled."
+            )
+
+        if (
+            cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE
+            and not skip_sm70_mixed_capture
+        ):
             assert self.compilation_config.cudagraph_capture_sizes is not None, (
                 "Cudagraph capture sizes must be set when mixed mode is enabled."
             )

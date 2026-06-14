@@ -13,6 +13,8 @@ from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -31,6 +33,72 @@ def poly_norm(
         variance_epsilon,
     )
     return out
+
+
+def _sm70_gemma_rms_norm_eager(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    orig_dtype = x.dtype
+    gemma_weight = weight.float() + 1.0
+    out = ir.ops.rms_norm(x, gemma_weight, variance_epsilon)
+    return out.to(orig_dtype)
+
+
+def _sm70_gemma_rms_norm_eager_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    return _sm70_gemma_rms_norm_eager(x, weight, variance_epsilon)
+
+
+def _sm70_gemma_fused_add_rms_norm_eager(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_dtype = x.dtype
+    gemma_weight = weight.float() + 1.0
+    x = (
+        x.float() + residual.float()
+        if orig_dtype == torch.float16
+        else x + residual
+    )
+    residual_out = x
+    out = ir.ops.rms_norm(x, gemma_weight, variance_epsilon)
+    return out.to(orig_dtype), residual_out
+
+
+def _sm70_gemma_fused_add_rms_norm_eager_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _sm70_gemma_fused_add_rms_norm_eager(
+        x,
+        residual,
+        weight,
+        variance_epsilon,
+    )
+
+
+direct_register_custom_op(
+    op_name="sm70_gemma_rms_norm_eager",
+    op_func=_sm70_gemma_rms_norm_eager,
+    mutates_args=[],
+    fake_impl=_sm70_gemma_rms_norm_eager_fake,
+)
+
+direct_register_custom_op(
+    op_name="sm70_gemma_fused_add_rms_norm_eager",
+    op_func=_sm70_gemma_fused_add_rms_norm_eager,
+    mutates_args=[],
+    fake_impl=_sm70_gemma_fused_add_rms_norm_eager_fake,
+)
 
 
 # --8<-- [start:rms_norm]
@@ -149,12 +217,68 @@ class GemmaRMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
+    @staticmethod
+    def _forward_static_no_residual(
+        weight: torch.Tensor,
+        variance_epsilon: float,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * (1.0 + weight.float())
+        return x.to(orig_dtype)
+
+    @staticmethod
+    def _forward_static_with_residual(
+        weight: torch.Tensor,
+        variance_epsilon: float,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = x.dtype
+        x = (
+            x.float() + residual.float()
+            if orig_dtype == torch.float16
+            else x + residual
+        )
+        residual = x
+        x = x.float()
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * (1.0 + weight.float())
+        return x.to(orig_dtype), residual
+
+    @staticmethod
+    def _use_sm70_compile_native(x: torch.Tensor) -> bool:
+        return (
+            envs.VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and torch.compiler.is_compiling()
+            and x.is_cuda
+        )
+
     def forward_native(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if self._use_sm70_compile_native(x):
+            if residual is None:
+                return self._forward_static_no_residual(
+                    self.weight.data,
+                    self.variance_epsilon,
+                    x,
+                )
+            return self._forward_static_with_residual(
+                self.weight.data,
+                self.variance_epsilon,
+                x,
+                residual,
+            )
+
         orig_dtype = x.dtype
         weight = self.weight.data.float() + 1.0
         if residual is not None:
@@ -175,6 +299,24 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if (
+            envs.VLLM_SM70_GEMMA_RMS_NORM_EAGER
+            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and x.is_cuda
+            and current_platform.is_device_capability(70)
+        ):
+            if residual is None:
+                return torch.ops.vllm.sm70_gemma_rms_norm_eager(
+                    x,
+                    self.weight,
+                    self.variance_epsilon,
+                )
+            return torch.ops.vllm.sm70_gemma_fused_add_rms_norm_eager(
+                x,
+                residual,
+                self.weight,
+                self.variance_epsilon,
+            )
         return self.forward_native(x, residual)
 
 

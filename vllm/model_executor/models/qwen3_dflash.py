@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -9,6 +10,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -47,6 +49,45 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _get_dflash_per_layer_sliding_window(
+    config: Qwen3Config,
+    layer_idx: int,
+) -> int | None:
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None:
+        return None
+    layer_type = layer_types[layer_idx]
+    if layer_type == "sliding_attention":
+        return getattr(config, "sliding_window", None)
+    if layer_type == "full_attention":
+        return None
+    raise ValueError(f"Invalid DFlash layer_type {layer_type}")
+
+
+def _debug_sync_context_kv_enabled() -> bool:
+    return envs.VLLM_DFLASH_SYNC_CONTEXT_KV
+
+
+def _skip_context_kv_precompute_enabled() -> bool:
+    return envs.VLLM_DFLASH_SKIP_CONTEXT_KV_PRECOMPUTE
+
+
+def _debug_context_kv_enabled() -> bool:
+    return envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
+
+
+def _dump_draft_layer_hiddens_enabled() -> bool:
+    return envs.VLLM_DFLASH_DUMP_LAYER_HIDDENS
+
+
+def _dump_draft_layer0_components_enabled() -> bool:
+    return envs.VLLM_DFLASH_DUMP_LAYER0_COMPONENTS
+
+
+def _dump_draft_attn_components_enabled() -> bool:
+    return envs.VLLM_DFLASH_DUMP_ATTN_COMPONENTS
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -68,10 +109,12 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        per_layer_sliding_window: int | None = None,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
         self.hidden_size = hidden_size
+        self.per_layer_sliding_window = per_layer_sliding_window
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -118,9 +161,12 @@ class DFlashQwen3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
+            per_layer_sliding_window=per_layer_sliding_window,
         )
+        self.attn.is_dflash_draft_attn = True
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self._attn_components_dumped = False
 
     def forward(
         self,
@@ -147,6 +193,27 @@ class DFlashQwen3Attention(nn.Module):
 
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+        if (
+            _dump_draft_attn_components_enabled()
+            and not self._attn_components_dumped
+            and positions.shape[-1] == 17
+            and int(positions.max().item()) > 0
+            and ".layers.32.self_attn" in self.layer_name
+        ):
+            dump_path = f"/tmp/dflash_draft_attn_components_pid{os.getpid()}.pt"
+            torch.save(
+                {
+                    "positions": positions.detach().cpu(),
+                    "q": q.detach().to(torch.float16).cpu(),
+                    "k": k.detach().to(torch.float16).cpu(),
+                    "v": v.detach().to(torch.float16).cpu(),
+                    "attn_output": attn_output.detach().to(torch.float16).cpu(),
+                    "o_proj_output": output.detach().to(torch.float16).cpu(),
+                },
+                dump_path,
+            )
+            self._attn_components_dumped = True
+            logger.warning("Saved DFlash draft attn components to %s", dump_path)
         return output
 
 
@@ -158,12 +225,16 @@ class DFlashQwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_idx: int,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
+        per_layer_sliding_window = _get_dflash_per_layer_sliding_window(
+            config, layer_idx
+        )
 
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
@@ -178,6 +249,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            per_layer_sliding_window=per_layer_sliding_window,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -190,6 +262,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._layer0_components_dumped = False
 
     def forward(
         self,
@@ -202,14 +275,44 @@ class DFlashQwen3DecoderLayer(nn.Module):
         else:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        ln_out = hidden_states
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        attn_out = hidden_states
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        post_attn_ln_out = hidden_states
         hidden_states = self.mlp(hidden_states)
+        if (
+            _dump_draft_layer0_components_enabled()
+            and not self._layer0_components_dumped
+            and positions.shape[-1] == 17
+            and int(positions.max().item()) > 0
+            and ".layers.32.self_attn" in self.self_attn.layer_name
+        ):
+            mlp_gate_up, _ = self.mlp.gate_up_proj(post_attn_ln_out)
+            mlp_act_out = self.mlp.act_fn(mlp_gate_up)
+            dump_path = f"/tmp/dflash_draft_layer0_components_pid{os.getpid()}.pt"
+            torch.save(
+                {
+                    "positions": positions.detach().cpu(),
+                    "input_layernorm_out": ln_out.detach().to(torch.float16).cpu(),
+                    "self_attn_out": attn_out.detach().to(torch.float16).cpu(),
+                    "post_attention_layernorm_out": post_attn_ln_out.detach()
+                    .to(torch.float16)
+                    .cpu(),
+                    "mlp_gate_up": mlp_gate_up.detach().to(torch.float16).cpu(),
+                    "mlp_act_out": mlp_act_out.detach().to(torch.float16).cpu(),
+                    "mlp_out": hidden_states.detach().to(torch.float16).cpu(),
+                    "residual": residual.detach().to(torch.float16).cpu(),
+                },
+                dump_path,
+            )
+            self._layer0_components_dumped = True
+            logger.warning("Saved DFlash draft layer0 components to %s", dump_path)
         return hidden_states, residual
 
 
@@ -250,6 +353,7 @@ class DFlashQwen3Model(nn.Module):
                     config=self.config,
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
+                    layer_idx=layer_idx,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
@@ -282,6 +386,8 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+        self._debug_context_kv_dumped = False
+        self._draft_layer_hiddens_dumped = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -345,7 +451,7 @@ class DFlashQwen3Model(nn.Module):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | None = None,
+        context_slot_mapping: torch.Tensor | dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -359,6 +465,10 @@ class DFlashQwen3Model(nn.Module):
         When context_slot_mapping is None (e.g. during dummy_run) only
         the computation runs, and no K/V is written to cache.
         """
+        if _skip_context_kv_precompute_enabled():
+            logger.warning("Skipping DFlash context KV precompute for debugging.")
+            return
+
         if not hasattr(self, "_num_attn_layers"):
             logger.warning_once(
                 "DFlash buffer initialization was skipped. If dummy weights are not "
@@ -424,16 +534,145 @@ class DFlashQwen3Model(nn.Module):
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        debug_direct_refs: dict[
+            int, list[tuple[str, int, torch.Tensor, torch.Tensor]]
+        ] = {}
+        if _debug_context_kv_enabled() and not self._debug_context_kv_dumped:
+            sample_tokens = min(8, num_ctx)
+            debug_ranges: list[tuple[str, int, int]] = [("head", 0, sample_tokens)]
+            if num_ctx > sample_tokens:
+                tail_start = max(0, num_ctx - sample_tokens)
+                if tail_start > 0:
+                    debug_ranges.append(("tail", tail_start, num_ctx))
+
+            debug_cos_sin_cache = self._rope_cos_sin_cache
+            for layer_idx in sorted({0, L // 2, L - 1}):
+                attn_layer = self.layers[layer_idx].self_attn
+                layer_refs: list[tuple[str, int, torch.Tensor, torch.Tensor]] = []
+                for sample_name, sample_start, sample_end in debug_ranges:
+                    sample_len = sample_end - sample_start
+                    direct_kv = F.linear(
+                        normed_context_states[sample_start:sample_end],
+                        attn_layer.qkv_proj.weight[attn_layer.q_size :],
+                        (
+                            None
+                            if attn_layer.qkv_proj.bias is None
+                            else attn_layer.qkv_proj.bias[attn_layer.q_size :]
+                        ),
+                    )
+                    direct_k, direct_v = direct_kv.split([kv, kv], dim=-1)
+                    direct_k = direct_k.view(sample_len, nkv, hd).contiguous()
+                    direct_v = direct_v.view(sample_len, nkv, hd).contiguous()
+                    direct_k_norm = torch.empty_like(direct_k)
+                    ops.rms_norm(
+                        direct_k_norm,
+                        direct_k,
+                        attn_layer.k_norm.weight.data,
+                        self._rms_norm_eps,
+                    )
+                    direct_k_flat = direct_k_norm.view(sample_len, kv)
+                    if debug_cos_sin_cache.dtype != direct_k_flat.dtype:
+                        debug_cos_sin_cache = debug_cos_sin_cache.to(
+                            dtype=direct_k_flat.dtype
+                        )
+                    ops.rotary_embedding(
+                        context_positions[sample_start:sample_end],
+                        direct_k_flat,
+                        None,
+                        self._rope_head_size,
+                        debug_cos_sin_cache,
+                        self._rope_is_neox,
+                    )
+                    direct_k = direct_k_flat.view(sample_len, nkv, hd)
+                    layer_refs.append((sample_name, sample_start, direct_k, direct_v))
+
+                    fused_k_diff = (
+                        all_k_final[layer_idx, sample_start:sample_end] - direct_k
+                    ).abs()
+                    fused_v_diff = (
+                        all_v[layer_idx, sample_start:sample_end] - direct_v
+                    ).abs()
+                    logger.warning(
+                        "DFlash context KV fused-vs-direct layer=%d sample=%s "
+                        "start=%d tokens=%d k_max=%.6f k_mean=%.6f "
+                        "v_max=%.6f v_mean=%.6f",
+                        layer_idx,
+                        sample_name,
+                        sample_start,
+                        sample_len,
+                        float(fused_k_diff.max().item()),
+                        float(fused_k_diff.mean().item()),
+                        float(fused_v_diff.max().item()),
+                        float(fused_v_diff.mean().item()),
+                    )
+                debug_direct_refs[layer_idx] = layer_refs
+
         for i in range(L):
             attn = self._attn_layers[i]
+            layer_context_slot_mapping = context_slot_mapping
+            if isinstance(context_slot_mapping, dict):
+                layer_context_slot_mapping = context_slot_mapping[attn.layer_name]
+            assert layer_context_slot_mapping is not None
             kv_cache = attn.kv_cache
+            if isinstance(kv_cache, list):
+                kv_cache = kv_cache[0]
+            if _debug_sync_context_kv_enabled():
+                logger.warning(
+                    "DFlash context KV update layer=%s kv_cache_shape=%s "
+                    "slot_min=%s slot_max=%s num_ctx=%d",
+                    attn.layer_name,
+                    tuple(kv_cache.shape),
+                    int(layer_context_slot_mapping.min().item()),
+                    int(layer_context_slot_mapping.max().item()),
+                    num_ctx,
+                )
             attn.impl.do_kv_cache_update(
                 attn,
                 all_k_final[i],
                 all_v[i],
                 kv_cache,
-                context_slot_mapping,
+                layer_context_slot_mapping,
             )
+            if (
+                i in debug_direct_refs
+                and _debug_context_kv_enabled()
+                and not self._debug_context_kv_dumped
+            ):
+                block_size = kv_cache.shape[2]
+                for (
+                    sample_name,
+                    sample_start,
+                    direct_k,
+                    direct_v,
+                ) in debug_direct_refs[i]:
+                    sample_len = direct_k.shape[0]
+                    sample_end = sample_start + sample_len
+                    slots = layer_context_slot_mapping[sample_start:sample_end].to(
+                        torch.long
+                    )
+                    block_idx = torch.div(slots, block_size, rounding_mode="floor")
+                    block_off = torch.remainder(slots, block_size)
+                    cache_k = kv_cache[block_idx, 0, block_off]
+                    cache_v = kv_cache[block_idx, 1, block_off]
+                    cache_k_diff = (cache_k - direct_k).abs()
+                    cache_v_diff = (cache_v - direct_v).abs()
+                    logger.warning(
+                        "DFlash context KV cache-readback layer=%d sample=%s "
+                        "start=%d tokens=%d k_max=%.6f k_mean=%.6f "
+                        "v_max=%.6f v_mean=%.6f",
+                        i,
+                        sample_name,
+                        sample_start,
+                        sample_len,
+                        float(cache_k_diff.max().item()),
+                        float(cache_k_diff.mean().item()),
+                        float(cache_v_diff.max().item()),
+                        float(cache_v_diff.mean().item()),
+                    )
+                if i == max(debug_direct_refs):
+                    self._debug_context_kv_dumped = True
+            if _debug_sync_context_kv_enabled():
+                torch.cuda.synchronize(all_k_final.device)
 
     def forward(
         self,
@@ -447,13 +686,41 @@ class DFlashQwen3Model(nn.Module):
         hidden_states = input_embeds
 
         residual = None
+        layer_hidden_states: list[torch.Tensor] | None = None
+        should_dump_layer_hiddens = (
+            _dump_draft_layer_hiddens_enabled()
+            and not self._draft_layer_hiddens_dumped
+            and positions.shape[-1] == 17
+            and int(positions.max().item()) > 0
+        )
+        if should_dump_layer_hiddens:
+            layer_hidden_states = []
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if layer_hidden_states is not None:
+                layer_hidden_states.append(
+                    hidden_states.detach().to(torch.float16).cpu()
+                )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if layer_hidden_states is not None:
+            dump_path = f"/tmp/dflash_draft_layers_pid{os.getpid()}.pt"
+            torch.save(
+                {
+                    "positions": positions.detach().cpu(),
+                    "input_embeds": input_embeds.detach().to(torch.float16).cpu(),
+                    "layer_hidden_states": layer_hidden_states,
+                    "final_hidden_states": hidden_states.detach()
+                    .to(torch.float16)
+                    .cpu(),
+                },
+                dump_path,
+            )
+            self._draft_layer_hiddens_dumped = True
+            logger.warning("Saved DFlash draft layer hiddens to %s", dump_path)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -570,7 +837,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
-        context_slot_mapping: torch.Tensor | None = None,
+        context_slot_mapping: torch.Tensor | dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
@@ -586,6 +853,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        # Keep the auxiliary hidden-state projection on the same dtype as the
+        # DFlash FC weights. AWQ target paths may surface fp32 hidden states
+        # even when the draft projection is initialized in fp16.
+        fc_weight = getattr(self.model.fc, "weight", None)
+        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
+            hidden_states = hidden_states.to(dtype=fc_weight.dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)

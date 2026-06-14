@@ -54,6 +54,22 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             assert not hasattr(layer, "prob_scale")
             return
 
+        if getattr(layer, "_force_unit_fp8_e5m2_kv_scales", False):
+            # Explicit e5m2 KV cache uses the native e5m2 range.  Do not reuse
+            # e4m3 checkpoint scales for the cache write/read path.
+            layer._k_scale.copy_(1.0)
+            layer._v_scale.copy_(1.0)
+            layer._q_scale.copy_(1.0)
+            layer._prob_scale.copy_(1.0)
+            layer._k_scale_float = 1.0
+            layer._v_scale_float = 1.0
+            layer._q_scale_float = 1.0
+            del layer.k_scale
+            del layer.v_scale
+            del layer.q_scale
+            del layer.prob_scale
+            return
+
         # Per-token-head quantized KV cache: scales are computed dynamically
         # per (token, head) in the kernel at cache-write time.  Checkpoint
         # scales are never used regardless of calculate_kv_scales.

@@ -6,6 +6,7 @@ from typing import Union
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, SchedulerConfig
 from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_dp_group, get_pcp_group, get_tensor_model_parallel_rank
@@ -1301,6 +1302,15 @@ class FusedMoEConfig:
             logger.debug_once(
                 "Using FusedMoEConfig::max_num_tokens=%d", self.max_num_tokens
             )
+            if envs.VLLM_ENABLE_MOE_DP_CHUNK:
+                logger.warning_once(
+                    "VLLM_ENABLE_MOE_DP_CHUNK is registered for 0.0.3 "
+                    "compatibility but is not yet wired into the latest MoE "
+                    "runner. Latest keeps max_num_tokens=%d; porting the old "
+                    "DP all-to-all chunk loop requires a separate runner-level "
+                    "migration and quality/performance validation.",
+                    self.max_num_tokens,
+                )
 
         assert self.max_num_tokens > 0
 

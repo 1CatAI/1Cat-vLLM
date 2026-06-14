@@ -133,6 +133,7 @@ class CUDAGraphEntry:
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    input_debug: list[str] | None = None
 
 
 @dataclasses.dataclass
@@ -189,6 +190,10 @@ class CUDAGraphWrapper:
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
+        self.check_input_addresses = (
+            self.is_debugging_mode
+            or envs.VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG
+        )
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
@@ -226,6 +231,35 @@ class CUDAGraphWrapper:
     @property
     def cudagraph_wrapper(self) -> "CUDAGraphWrapper":
         return self
+
+    @staticmethod
+    def _collect_tensor_addresses(
+        args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> list[int]:
+        addrs = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+        addrs.extend(
+            v.data_ptr() for v in kwargs.values() if isinstance(v, torch.Tensor)
+        )
+        return addrs
+
+    @staticmethod
+    def _collect_tensor_debug(
+        args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> list[str]:
+        result: list[str] = []
+        for idx, arg in enumerate(args):
+            if isinstance(arg, torch.Tensor):
+                result.append(
+                    f"arg{idx}:ptr={arg.data_ptr()} shape={tuple(arg.shape)} "
+                    f"stride={tuple(arg.stride())} dtype={arg.dtype}"
+                )
+        for key, value in kwargs.items():
+            if isinstance(value, torch.Tensor):
+                result.append(
+                    f"{key}:ptr={value.data_ptr()} shape={tuple(value.shape)} "
+                    f"stride={tuple(value.stride())} dtype={value.dtype}"
+                )
+        return result
 
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()
@@ -276,10 +310,10 @@ class CUDAGraphWrapper:
             # validate that cudagraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
+            input_addresses = self._collect_tensor_addresses(args, kwargs)
             entry.input_addresses = input_addresses
+            if self.check_input_addresses:
+                entry.input_debug = self._collect_tensor_debug(args, kwargs)
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -343,16 +377,20 @@ class CUDAGraphWrapper:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if self.check_input_addresses:
             # check if the input addresses are the same
-            new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            assert new_input_addresses == entry.input_addresses, (
-                f"Input addresses for cudagraphs are different "
-                f"during replay. Expected {entry.input_addresses}, "
-                f"got {new_input_addresses}"
-            )
+            new_input_addresses = self._collect_tensor_addresses(args, kwargs)
+            if new_input_addresses != entry.input_addresses:
+                new_input_debug = self._collect_tensor_debug(args, kwargs)
+                raise RuntimeError(
+                    "Input addresses for cudagraphs are different during "
+                    f"replay. runtime_mode={self.runtime_mode.name} "
+                    f"batch_descriptor={batch_descriptor}. "
+                    f"Expected {entry.input_addresses}, got "
+                    f"{new_input_addresses}. Capture tensors: "
+                    f"{entry.input_debug}. Replay tensors: "
+                    f"{new_input_debug}"
+                )
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.

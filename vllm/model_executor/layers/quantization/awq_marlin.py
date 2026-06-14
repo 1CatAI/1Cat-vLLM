@@ -222,7 +222,7 @@ class AWQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        return 70
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:

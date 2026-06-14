@@ -249,3 +249,12 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Generated artifacts for the optional SM70 FlashAttention-V100 extension.
+flash-attention-v100/build/
+flash-attention-v100/*.so
+flash-attention-v100/*.egg-info/
+
+# Local agent state and benchmark artifacts.
+.serena/
+bench_results/

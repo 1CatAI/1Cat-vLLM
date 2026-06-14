@@ -14,6 +14,7 @@ import torch
 from tests.quantization.utils import is_quant_method_supported
 from vllm import _custom_ops as ops
 from vllm.config.model import ModelConfig
+from vllm.model_executor.layers.attention import attention as attention_module
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.quantization.fp8 import (
     Fp8Config,
@@ -21,6 +22,7 @@ from vllm.model_executor.layers.quantization.fp8 import (
     Fp8LinearMethod,
     Fp8MoEMethod,
 )
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
 
@@ -471,6 +473,70 @@ def test_fp8_reloading(
         weight_loader(param, torch.zeros(shape))  # cannot use empty
 
     method.process_weights_after_loading(layer)
+
+
+def test_fp8_e5m2_checkpoint_override_forces_unit_scales():
+    layer = torch.nn.Module()
+    layer.kv_cache_dtype = "fp8_e5m2"
+    layer._force_unit_fp8_e5m2_kv_scales = True
+    layer.k_scale = torch.nn.Parameter(torch.tensor(7.0), requires_grad=False)
+    layer.v_scale = torch.nn.Parameter(torch.tensor(11.0), requires_grad=False)
+    layer.q_scale = torch.nn.Parameter(torch.tensor(13.0), requires_grad=False)
+    layer.prob_scale = torch.nn.Parameter(torch.tensor(17.0), requires_grad=False)
+    layer._k_scale = torch.tensor(0.0)
+    layer._v_scale = torch.tensor(0.0)
+    layer._q_scale = torch.tensor(0.0)
+    layer._prob_scale = torch.tensor(0.0)
+    layer._k_scale_float = 0.0
+    layer._v_scale_float = 0.0
+    layer._q_scale_float = 0.0
+
+    method = BaseKVCacheMethod.__new__(BaseKVCacheMethod)
+    method.process_weights_after_loading(layer)
+
+    assert layer._k_scale.item() == 1.0
+    assert layer._v_scale.item() == 1.0
+    assert layer._q_scale.item() == 1.0
+    assert layer._prob_scale.item() == 1.0
+    assert layer._k_scale_float == 1.0
+    assert layer._v_scale_float == 1.0
+    assert layer._q_scale_float == 1.0
+    assert not hasattr(layer, "k_scale")
+    assert not hasattr(layer, "v_scale")
+    assert not hasattr(layer, "q_scale")
+    assert not hasattr(layer, "prob_scale")
+
+
+def test_fp8_e5m2_checkpoint_override_init_gate(monkeypatch):
+    class DummyQuantConfig:
+
+        def get_quant_method(self, layer, prefix):
+            return BaseKVCacheMethod(self)
+
+    class DummySM70Platform:
+
+        @staticmethod
+        def is_cuda():
+            return True
+
+        @staticmethod
+        def has_device_capability(capability):
+            return capability <= 70
+
+    layer = torch.nn.Module()
+    layer.kv_cache_dtype = "fp8_e5m2"
+
+    monkeypatch.setattr(attention_module, "current_platform", DummySM70Platform())
+    monkeypatch.setattr(attention_module.envs, "VLLM_SM70_FLASH_ATTN_V100", True)
+
+    attention_module._init_kv_cache_quant(layer, DummyQuantConfig(), "attn")
+
+    assert layer._force_unit_fp8_e5m2_kv_scales is True
+    assert layer.quant_method.__class__ is BaseKVCacheMethod
+    assert layer.k_scale.item() == -1.0
+    assert layer.v_scale.item() == -1.0
+    assert layer.q_scale.item() == -1.0
+    assert layer.prob_scale.item() == -1.0
 
 
 @pytest.mark.skipif(

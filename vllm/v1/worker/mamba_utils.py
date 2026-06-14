@@ -7,7 +7,9 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
@@ -20,6 +22,14 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
+_DEBUG_MAMBA_ALIGN = envs.VLLM_MAMBA_ALIGN_DEBUG
+
+
+def _debug_mamba_align(event: str, **kwargs: Any) -> None:
+    if _DEBUG_MAMBA_ALIGN:
+        logger.info("MAMBA_ALIGN_DEBUG %s %s", event, kwargs)
 
 
 @triton.jit
@@ -472,6 +482,14 @@ class MambaSpecDecodeGPUContext:
             self.block_table_ptrs[i] = bt.data_ptr()
 
         self.is_initialized = True
+        _debug_mamba_align(
+            "postprocess_init",
+            num_groups=self.num_groups,
+            num_layers=self.num_layers,
+            num_state_types=self.num_state_types,
+            block_size=self.block_size,
+            block_table_stride_req=self.block_table_stride_req,
+        )
 
     def run_fused_postprocess(
         self,
@@ -688,6 +706,20 @@ def preprocess_mamba(
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+            accept_token_bias = input_batch.num_accepted_tokens_cpu[i] - 1
+            _debug_mamba_align(
+                "pre_copy",
+                req_id=req_id,
+                i=i,
+                num_computed_tokens=req_state.num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_speculative_blocks=num_speculative_blocks,
+                block_size=block_size,
+                prev_state_idx=prev_state_idx,
+                curr_state_idx=curr_state_idx,
+                num_accepted_tokens_cpu=int(input_batch.num_accepted_tokens_cpu[i]),
+                accept_token_bias=int(accept_token_bias),
+            )
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
@@ -695,11 +727,21 @@ def preprocess_mamba(
                 mamba_group_ids,
                 prev_state_idx,
                 curr_state_idx,
-                input_batch.num_accepted_tokens_cpu[i] - 1,
+                accept_token_bias,
                 req_state,
                 forward_context,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
+            input_batch.spec_num_accepted_tokens_cpu[i] = 1
+            _debug_mamba_align(
+                "pre_reset",
+                req_id=req_id,
+                i=i,
+                num_accepted_tokens_cpu=int(input_batch.num_accepted_tokens_cpu[i]),
+                spec_num_accepted_tokens_cpu=int(
+                    input_batch.spec_num_accepted_tokens_cpu[i]
+                ),
+            )
     do_mamba_copy_block(copy_bufs)
 
 
@@ -733,6 +775,92 @@ def postprocess_mamba_all(
             mamba_state_idx.pop(req_id, None)
 
 
+def postprocess_mamba(
+    scheduler_output: SchedulerOutput,
+    kv_cache_config: KVCacheConfig,
+    input_batch: GPUInputBatch,
+    requests: dict[str, CachedRequestState],
+    mamba_state_idx: dict[str, int],
+    forward_context: dict[str, Any],
+    mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+    copy_bufs: MambaCopyBuffers,
+):
+    """0.0.3-compatible CPU reference for align-mode spec postprocess.
+
+    This is kept behind a diagnostic switch so the fused GPU postprocess can
+    be compared against the known-good state movement semantics.
+    """
+    num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
+    scheduled_spec_decode_tokens_dict = scheduler_output.scheduled_spec_decode_tokens
+    num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu
+    mamba_group_ids = copy_bufs.mamba_group_ids
+    mamba_spec = copy_bufs.mamba_spec
+
+    copy_bufs.offset = 0
+    for i, req_id in enumerate(input_batch.req_ids):
+        req_state = requests[req_id]
+        num_computed_tokens = req_state.num_computed_tokens
+        num_draft_tokens = len(scheduled_spec_decode_tokens_dict.get(req_id, []))
+        num_scheduled_tokens = num_scheduled_tokens_dict[req_id]
+        num_accepted_tokens = num_accepted_tokens_cpu[i]
+        num_tokens_running_state = (
+            num_computed_tokens + num_scheduled_tokens - num_draft_tokens
+        )
+        new_num_computed_tokens = num_tokens_running_state + num_accepted_tokens - 1
+        aligned_new_computed_tokens = (
+            new_num_computed_tokens // mamba_spec.block_size * mamba_spec.block_size
+        )
+        if aligned_new_computed_tokens >= num_tokens_running_state:
+            accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
+            src_block_idx = mamba_state_idx[req_id]
+            dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
+            _debug_mamba_align(
+                "post_copy_cpu",
+                req_id=req_id,
+                i=i,
+                num_computed_tokens=num_computed_tokens,
+                num_scheduled_tokens=num_scheduled_tokens,
+                num_draft_tokens=num_draft_tokens,
+                num_accepted_tokens_cpu=int(num_accepted_tokens_cpu[i]),
+                spec_num_accepted_tokens_cpu=int(
+                    input_batch.spec_num_accepted_tokens_cpu[i]
+                ),
+                num_tokens_running_state=num_tokens_running_state,
+                new_num_computed_tokens=new_num_computed_tokens,
+                aligned_new_computed_tokens=aligned_new_computed_tokens,
+                accept_token_bias=accept_token_bias,
+                src_block_idx=src_block_idx,
+                dest_block_idx=dest_block_idx,
+                block_size=mamba_spec.block_size,
+            )
+            collect_mamba_copy_meta(
+                copy_bufs,
+                kv_cache_config,
+                mamba_state_copy_funcs,
+                mamba_group_ids,
+                src_block_idx,
+                dest_block_idx,
+                accept_token_bias,
+                req_state,
+                forward_context,
+            )
+            if src_block_idx == dest_block_idx:
+                num_accepted_tokens_cpu[i] = 1
+                input_batch.spec_num_accepted_tokens_cpu[i] = 1
+                _debug_mamba_align(
+                    "post_reset_cpu",
+                    req_id=req_id,
+                    i=i,
+                    src_block_idx=src_block_idx,
+                    dest_block_idx=dest_block_idx,
+                    num_accepted_tokens_cpu=int(num_accepted_tokens_cpu[i]),
+                    spec_num_accepted_tokens_cpu=int(
+                        input_batch.spec_num_accepted_tokens_cpu[i]
+                    ),
+                )
+    do_mamba_copy_block(copy_bufs)
+
+
 def preprocess_mamba_all_specdec(
     scheduler_output: SchedulerOutput,
     input_batch: GPUInputBatch,
@@ -754,6 +882,7 @@ def postprocess_mamba_align_gpu(
     num_reqs: int,
     num_accepted_tokens_gpu: torch.Tensor,
     num_accepted_tokens_cpu_tensor: torch.Tensor,
+    spec_num_accepted_tokens_cpu_tensor: torch.Tensor,
     input_batch: GPUInputBatch,
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
@@ -786,6 +915,13 @@ def postprocess_mamba_align_gpu(
             ],
         )
 
+    _debug_mamba_align(
+        "postprocess_align_gpu",
+        num_reqs=num_reqs,
+        num_layers=ctx.num_layers,
+        num_state_types=ctx.num_state_types,
+        block_size=ctx.block_size,
+    )
     ctx.run_fused_postprocess(
         num_reqs=num_reqs,
         num_accepted_tokens_gpu=num_accepted_tokens_gpu,
@@ -800,6 +936,9 @@ def postprocess_mamba_align_gpu(
     # when src_block_idx == dest_block_idx (copy within the same block), so
     # the original count is preserved for everyone else.
     num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+    )
+    spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
         ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
     )
 

@@ -17,7 +17,9 @@ Per-head per-position slot layout:
 """
 
 import functools
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -26,9 +28,11 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -45,7 +49,14 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
+from vllm.v1.attention.backends.flash_attn_v100 import (
+    flash_v100_dense_prefill,
+    flash_v100_dense_prefill_available,
+    flash_v100_turboquant_decode,
+    flash_v100_turboquant_decode_available,
+)
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
@@ -57,9 +68,18 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
+logger = init_logger(__name__)
+
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
+
+_logged_flash_v100_prefill = False
+_logged_flash_v100_tq_decode = False
+_flash_v100_prefill_compare_count = 0
+_flash_v100_decode_compare_count = 0
+_flash_v100_prefill_dump_count = 0
+_flash_v100_decode_dump_count = 0
 
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
@@ -67,6 +87,77 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+
+
+def _flash_attn_varlen_supported_on_device() -> bool:
+    if not _HAS_FLASH_ATTN:
+        return False
+    if current_platform.is_cuda():
+        device_capability = current_platform.get_device_capability()
+        return device_capability is not None and device_capability.major >= 8
+    return True
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid integer env %s=%r", name, raw)
+        return default
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid float env %s=%r", name, raw)
+        return default
+
+
+def _record_compare_result(record: dict[str, Any]) -> None:
+    logger.info(
+        "TURBOQUANT %s compare %s: max_diff=%s mean_diff=%s shape=%s meta=%s",
+        record["stage"],
+        record["route"],
+        record["max_diff"],
+        record["mean_diff"],
+        record["shape"],
+        record["meta"],
+    )
+    log_path = os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_LOG_PATH")
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _compare_tensors(
+    *,
+    stage: str,
+    route: str,
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    diff = (candidate - reference).abs()
+    record = {
+        "stage": stage,
+        "route": route,
+        "max_diff": float(diff.max().item()) if diff.numel() else 0.0,
+        "mean_diff": float(diff.float().mean().item()) if diff.numel() else 0.0,
+        "shape": list(candidate.shape),
+        "candidate_dtype": str(candidate.dtype),
+        "reference_dtype": str(reference.dtype),
+        "pid": os.getpid(),
+        "meta": meta,
+    }
+    _record_compare_result(record)
+    return record
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -268,6 +359,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.num_kv_groups = num_heads // self.num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.sliding_window = (
+            (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+        )
 
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,
@@ -285,8 +379,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
-        # Detect flash-attn version (FA2/3/4) for prefill paths.
-        self.fa_version = get_flash_attn_version(head_size=head_size)
+        self.use_flash_attn_prefill = _flash_attn_varlen_supported_on_device()
+        # Detect flash-attn version (FA2/3/4) only when the current device can
+        # actually run varlen FA. On SM70 the package may be importable, but FA2
+        # kernels are not supported and would fail at runtime.
+        self.fa_version = (
+            get_flash_attn_version(head_size=head_size)
+            if self.use_flash_attn_prefill
+            else None
+        )
+        if current_platform.is_cuda() and self.fa_version is None:
+            self.use_flash_attn_prefill = False
+        self.use_flash_v100_dense_prefill = (
+            os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_PREFILL", "1") != "0"
+            and flash_v100_dense_prefill_available()
+        )
+        self.use_flash_v100_tq_decode = (
+            not self.tq_config.key_fp8
+            and os.getenv("VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE", "1") != "0"
+            and flash_v100_turboquant_decode_available()
+        )
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
@@ -330,6 +442,298 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             softmax_scale=self.scale,
             causal=True,
             fa_version=self.fa_version,
+        )
+
+    def _triton_prefill_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        b_start_loc: torch.Tensor,
+        b_seq_len: torch.Tensor,
+        max_input_len: int,
+    ) -> torch.Tensor:
+        out = torch.empty_like(q)
+        context_attention_fwd(
+            q=q,
+            k=k,
+            v=v,
+            o=out,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            max_input_len=max_input_len,
+            is_causal=True,
+            softmax_scale=self.scale,
+            sliding_window_q=self.sliding_window[0],
+            sliding_window_k=self.sliding_window[1],
+        )
+        return out
+
+    def _flash_v100_prefill_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> torch.Tensor:
+        global _logged_flash_v100_prefill
+        if not _logged_flash_v100_prefill:
+            logger.info(
+                "TURBOQUANT prefill using Flash-V100 dense raw-QKV path "
+                "(kv_cache_dtype=%s).",
+                self.kv_cache_dtype,
+            )
+            _logged_flash_v100_prefill = True
+        out = torch.empty_like(q)
+        return flash_v100_dense_prefill(
+            query=q,
+            key=k,
+            value=v,
+            output=out,
+            query_start_loc=query_start_loc,
+            num_actual_tokens=num_actual_tokens,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+
+    def _maybe_compare_flash_v100_prefill(
+        self,
+        flash_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        b_start_loc: torch.Tensor,
+        b_seq_len: torch.Tensor,
+        max_input_len: int,
+        meta: dict[str, Any],
+    ) -> None:
+        global _flash_v100_prefill_compare_count
+        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_FLASH_V100_PREFILL", 0)
+        if limit <= 0 or _flash_v100_prefill_compare_count >= limit:
+            return
+        _flash_v100_prefill_compare_count += 1
+        triton_out = self._triton_prefill_attention(
+            q=q,
+            k=k,
+            v=v,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            max_input_len=max_input_len,
+        )
+        record = _compare_tensors(
+            stage="prefill",
+            route="flash_v100_dense_vs_triton_context",
+            candidate=flash_out,
+            reference=triton_out,
+            meta={
+                **meta,
+                "compare_index": _flash_v100_prefill_compare_count,
+                "max_input_len": max_input_len,
+            },
+        )
+        self._maybe_dump_flash_v100_prefill_compare(
+            record=record,
+            flash_out=flash_out,
+            triton_out=triton_out,
+            q=q,
+            k=k,
+            v=v,
+            b_start_loc=b_start_loc,
+            b_seq_len=b_seq_len,
+            max_input_len=max_input_len,
+        )
+
+    def _maybe_dump_flash_v100_prefill_compare(
+        self,
+        record: dict[str, Any],
+        flash_out: torch.Tensor,
+        triton_out: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        b_start_loc: torch.Tensor,
+        b_seq_len: torch.Tensor,
+        max_input_len: int,
+    ) -> None:
+        dump_dir = os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR")
+        if not dump_dir:
+            return
+        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_LIMIT", 1)
+        if limit <= 0:
+            return
+        threshold = _env_float("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_THRESHOLD", 0.0)
+        if record["max_diff"] < threshold:
+            return
+
+        global _flash_v100_prefill_dump_count
+        if _flash_v100_prefill_dump_count >= limit:
+            return
+        _flash_v100_prefill_dump_count += 1
+
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(
+            dump_dir,
+            (
+                f"prefill_compare_pid{os.getpid()}_"
+                f"idx{record['meta']['compare_index']}_"
+                f"max{record['max_diff']}.pt"
+            ),
+        )
+        torch.save(
+            {
+                "record": record,
+                "q": q.detach().cpu(),
+                "k": k.detach().cpu(),
+                "v": v.detach().cpu(),
+                "flash_out": flash_out.detach().cpu(),
+                "triton_out": triton_out.detach().cpu(),
+                "diff": (flash_out - triton_out).detach().cpu(),
+                "b_start_loc": b_start_loc.detach().cpu(),
+                "b_seq_len": b_seq_len.detach().cpu(),
+                "max_input_len": int(max_input_len),
+                "config": {
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "head_size": self.head_size,
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "scale": self.scale,
+                    "sliding_window": self.sliding_window,
+                },
+            },
+            path,
+        )
+        logger.info("TURBOQUANT prefill compare tensor dump saved: %s", path)
+
+    def _maybe_dump_flash_v100_decode_compare(
+        self,
+        record: dict[str, Any],
+        flash_out: torch.Tensor,
+        triton_out: torch.Tensor,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+    ) -> None:
+        dump_dir = os.getenv("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_DIR")
+        if not dump_dir:
+            return
+        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_LIMIT", 1)
+        if limit <= 0:
+            return
+        threshold = _env_float("VLLM_SM70_TURBOQUANT_COMPARE_DUMP_THRESHOLD", 0.0)
+        if record["max_diff"] < threshold:
+            return
+
+        global _flash_v100_decode_dump_count
+        if _flash_v100_decode_dump_count >= limit:
+            return
+        _flash_v100_decode_dump_count += 1
+
+        os.makedirs(dump_dir, exist_ok=True)
+        batch_size = int(query.shape[0])
+        block_size = int(kv_cache.shape[1])
+        max_seq_len = int(attn_metadata.seq_lens[:batch_size].max().item())
+        max_blocks = max(1, math.ceil(max_seq_len / block_size))
+        block_table = attn_metadata.block_table[:batch_size, :max_blocks].detach()
+        unique_blocks_cpu = torch.unique(block_table.cpu().to(torch.long))
+        kv_blocks = kv_cache.index_select(
+            0, unique_blocks_cpu.to(device=kv_cache.device)
+        ).detach()
+        path = os.path.join(
+            dump_dir,
+            (
+                f"decode_compare_pid{os.getpid()}_"
+                f"idx{record['meta']['compare_index']}_"
+                f"max{record['max_diff']}.pt"
+            ),
+        )
+        torch.save(
+            {
+                "record": record,
+                "query": query.detach().cpu(),
+                "flash_out": flash_out.detach().cpu(),
+                "triton_out": triton_out.detach().cpu(),
+                "diff": (flash_out - triton_out).detach().cpu(),
+                "kv_blocks": kv_blocks.cpu(),
+                "kv_block_ids": unique_blocks_cpu,
+                "block_table": block_table.cpu(),
+                "seq_lens": attn_metadata.seq_lens[:batch_size].detach().cpu(),
+                "centroids": centroids.detach().cpu(),
+                "PiT": PiT.detach().cpu() if PiT is not None else None,
+                "config": {
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                    "head_size": self.head_size,
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "scale": self.scale,
+                    "mse_bits": self.tq_config.key_mse_bits,
+                    "key_packed_size": self.tq_config.key_packed_size,
+                    "value_quant_bits": self.tq_config.effective_value_quant_bits,
+                    "norm_correction": self.tq_config.norm_correction,
+                    "max_num_kv_splits": self.max_num_kv_splits,
+                    "block_size": block_size,
+                },
+            },
+            path,
+        )
+        logger.info("TURBOQUANT decode compare tensor dump saved: %s", path)
+
+    def _maybe_compare_flash_v100_decode(
+        self,
+        flash_out: torch.Tensor,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+    ) -> None:
+        global _flash_v100_decode_compare_count
+        limit = _env_int("VLLM_SM70_TURBOQUANT_COMPARE_FLASH_V100_DECODE", 0)
+        if limit <= 0 or _flash_v100_decode_compare_count >= limit:
+            return
+        _flash_v100_decode_compare_count += 1
+        triton_out = triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=attn_metadata.block_table,
+            seq_lens=attn_metadata.seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            key_fp8=self.tq_config.key_fp8,
+            norm_correction=self.tq_config.norm_correction,
+            PiT=PiT,
+            max_num_kv_splits=self.max_num_kv_splits,
+        )
+        record = _compare_tensors(
+            stage="decode",
+            route="flash_v100_tq_packed_vs_triton_tq_packed",
+            candidate=flash_out,
+            reference=triton_out,
+            meta={
+                "compare_index": _flash_v100_decode_compare_count,
+                "batch": int(query.shape[0]),
+                "num_heads": int(query.shape[1]),
+                "head_dim": int(query.shape[2]),
+                "max_seq_len": int(attn_metadata.max_seq_len),
+                "num_decodes": int(attn_metadata.num_decodes),
+            },
+        )
+        self._maybe_dump_flash_v100_decode_compare(
+            record=record,
+            flash_out=flash_out,
+            triton_out=triton_out,
+            query=query,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            centroids=centroids,
+            PiT=PiT,
         )
 
     def _ensure_on_device(self, layer, device):
@@ -576,7 +980,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
+        if (
+            self.use_flash_attn_prefill
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+        ):
             return self._flash_attn_varlen(
                 q=query,
                 k=key,
@@ -585,6 +992,49 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 cu_seqlens_k=attn_metadata.query_start_loc,
                 max_seqlen_q=attn_metadata.max_query_len,
                 max_seqlen_k=attn_metadata.max_query_len,
+            )
+        if (
+            self.use_flash_v100_dense_prefill
+            and attn_metadata.max_query_len == attn_metadata.max_seq_len
+        ):
+            query_start_loc = (
+                attn_metadata.query_start_loc_cpu
+                if attn_metadata.query_start_loc_cpu is not None
+                else attn_metadata.query_start_loc
+            )
+            out = self._flash_v100_prefill_attention(
+                q=query,
+                k=key,
+                v=value,
+                query_start_loc=query_start_loc,
+                num_actual_tokens=N,
+            )
+            self._maybe_compare_flash_v100_prefill(
+                flash_out=out,
+                q=query,
+                k=key,
+                v=value,
+                b_start_loc=attn_metadata.query_start_loc[:-1],
+                b_seq_len=attn_metadata.seq_lens,
+                max_input_len=attn_metadata.max_query_len,
+                meta={
+                    "num_actual_tokens": int(N),
+                    "num_reqs": int(attn_metadata.query_start_loc.shape[0] - 1),
+                    "max_query_len": int(attn_metadata.max_query_len),
+                    "max_seq_len": int(attn_metadata.max_seq_len),
+                },
+            )
+            return out
+        if attn_metadata.max_query_len == attn_metadata.max_seq_len:
+            # On SM70 flash-attn may be importable but unusable. Avoid SDPA's
+            # dense attention matrix fallback for long first-chunk prefills.
+            return self._triton_prefill_attention(
+                q=query,
+                k=key,
+                v=value,
+                b_start_loc=attn_metadata.query_start_loc[:-1],
+                b_seq_len=attn_metadata.seq_lens,
+                max_input_len=attn_metadata.max_query_len,
             )
 
         # Continuation or no flash_attn: per-request attention.
@@ -637,7 +1087,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
-                if _HAS_FLASH_ATTN:
+                if self.use_flash_attn_prefill:
                     # Assign to slice to avoid gpu/cpu sync.
                     self._cu_2[1:2] = q_len
                     cu = self._cu_2
@@ -650,18 +1100,35 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_q=q_len,
                         max_seqlen_k=q_len,
                     )
+                elif self.use_flash_v100_dense_prefill:
+                    if not hasattr(self, "_flash_v100_qsl_2"):
+                        self._flash_v100_qsl_2 = torch.empty(2, dtype=torch.int32)
+                    self._flash_v100_qsl_2[0] = 0
+                    self._flash_v100_qsl_2[1] = q_len
+                    out = self._flash_v100_prefill_attention(
+                        q=q_seq,
+                        k=k_seq,
+                        v=v_seq,
+                        query_start_loc=self._flash_v100_qsl_2,
+                        num_actual_tokens=q_len,
+                    )
                 else:
-                    q_t = q_seq.transpose(0, 1).contiguous()
-                    k_t = k_seq.transpose(0, 1).contiguous()
-                    v_t = v_seq.transpose(0, 1).contiguous()
-                    out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
-                        is_causal=True,
-                        scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    if not hasattr(self, "_triton_start_1"):
+                        self._triton_start_1 = torch.zeros(
+                            1, device=query.device, dtype=torch.int32
+                        )
+                        self._triton_seq_1 = torch.empty(
+                            1, device=query.device, dtype=torch.int32
+                        )
+                    self._triton_seq_1[0:1] = q_len
+                    out = self._triton_prefill_attention(
+                        q=q_seq,
+                        k=k_seq,
+                        v=v_seq,
+                        b_start_loc=self._triton_start_1,
+                        b_seq_len=self._triton_seq_1,
+                        max_input_len=q_len,
+                    )
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
@@ -813,7 +1280,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_full[cached_len:] = val_chunk
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
+        if self.use_flash_attn_prefill:
             # Reuse pre-allocated cu_seqlens (avoid host→device transfer)
             if not hasattr(self, "_cu_2_q"):
                 self._cu_2_q = torch.zeros(2, device=device, dtype=torch.int32)
@@ -882,6 +1349,47 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     ((B, Hq), torch.float32),
                 )
             )
+
+        if self.use_flash_v100_tq_decode:
+            global _logged_flash_v100_tq_decode
+            if output_buf is None:
+                output_buf = torch.empty(B, Hq, D, dtype=query.dtype, device=query.device)
+            q_float = query.float()
+            if PiT is None:
+                PiT = Pi.T.contiguous()
+            q_rot = (q_float @ PiT).contiguous()
+            if not _logged_flash_v100_tq_decode:
+                logger.info(
+                    "TURBOQUANT decode using Flash-V100 packed-cache path "
+                    "(kv_cache_dtype=%s, mse_bits=%d, value_bits=%d).",
+                    self.kv_cache_dtype,
+                    self.tq_config.key_mse_bits,
+                    self.tq_config.effective_value_quant_bits,
+                )
+                _logged_flash_v100_tq_decode = True
+            result = flash_v100_turboquant_decode(
+                q_rot=q_rot,
+                kv_cache=kv_cache,
+                output=output_buf,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                centroids=centroids,
+                softmax_scale=self.scale,
+                mse_bits=self.tq_config.key_mse_bits,
+                value_quant_bits=self.tq_config.effective_value_quant_bits,
+                norm_correction=self.tq_config.norm_correction,
+                num_kv_splits=self.max_num_kv_splits,
+            )
+            self._maybe_compare_flash_v100_decode(
+                flash_out=result,
+                query=query,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+                Pi=Pi,
+                centroids=centroids,
+                PiT=PiT,
+            )
+            return result
 
         result = triton_turboquant_decode_attention(
             query=query,

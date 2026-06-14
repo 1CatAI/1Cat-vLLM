@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
+import os
 import typing
 from collections.abc import Callable, Iterable
 
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
@@ -44,6 +47,53 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+_SM70_MTP_DENSE_F16_SUFFIXES = {
+    "fc",
+    "qkv_proj",
+    "o_proj",
+    "out_proj",
+    "gate_up_proj",
+    "down_proj",
+}
+
+
+def _parse_sm70_mtp_dense_f16_allowlist() -> set[str]:
+    raw = envs.VLLM_SM70_MTP_DENSE_F16_ALLOWLIST
+    if raw is None:
+        return set(_SM70_MTP_DENSE_F16_SUFFIXES)
+    lowered = raw.strip().lower()
+    if lowered in {"", "0", "false", "off", "none"}:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _mark_sm70_mtp_dense_f16_modules(model: nn.Module) -> None:
+    if not envs.VLLM_SM70_MTP_DENSE_F16_FASTPATH:
+        return
+
+    suffixes = _parse_sm70_mtp_dense_f16_allowlist()
+    if not suffixes:
+        return
+
+    marked: set[str] = set()
+    for module in model.modules():
+        prefix = getattr(module, "prefix", "")
+        if not prefix:
+            continue
+        suffix = prefix.rsplit(".", 1)[-1]
+        if suffix not in suffixes:
+            continue
+        module._sm70_f16_force_enable = True
+        module._sm70_f16_forbidden = False
+        marked.add(suffix)
+
+    if marked:
+        logger.info_once(
+            "SM70 MTP draft dense fp16 TurboMind fast path requested for %s.",
+            ",".join(sorted(marked)),
+            scope="local",
+        )
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -57,7 +107,13 @@ logger = init_logger(__name__)
     }
 )
 class Qwen3_5MultiTokenPredictor(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        share_target_embed_tokens: bool = False,
+    ):
         super().__init__()
 
         model_config = vllm_config.model_config
@@ -69,12 +125,22 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
         self.vocab_size = config.vocab_size
 
+        if envs.VLLM_DEBUG_MTP_LOAD:
+            logger.warning(
+                "Qwen3_5MultiTokenPredictor init quant_config=%s",
+                type(quant_config).__name__ if quant_config is not None else "None",
+            )
+
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = getattr(config, "mtp_num_hidden_layers", 1)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
+        self.embed_tokens = (
+            PPMissingLayer()
+            if share_target_embed_tokens
+            else VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+            )
         )
 
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
@@ -116,6 +182,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        _mark_sm70_mtp_dense_f16_modules(self)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -332,6 +399,27 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if envs.VLLM_DEBUG_MTP_LOAD:
+            logger.warning(
+                "Qwen3_5MultiTokenPredictor loaded %d tensors into %d params",
+                len(loaded_params),
+                len(params_dict),
+            )
+            if envs.VLLM_DEBUG_MTP_LOAD_VERBOSE:
+                missing_params = sorted(set(params_dict.keys()) - loaded_params)
+                if missing_params:
+                    logger.warning(
+                        "Qwen3_5MultiTokenPredictor missing params (%d): %s",
+                        len(missing_params),
+                        ", ".join(missing_params),
+                    )
+                loaded_param_names = sorted(loaded_params)
+                if loaded_param_names:
+                    logger.warning(
+                        "Qwen3_5MultiTokenPredictor loaded params (%d): %s",
+                        len(loaded_param_names),
+                        ", ".join(loaded_param_names),
+                    )
         return loaded_params
 
 
@@ -356,6 +444,31 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    @staticmethod
+    def _mtp_quant_disabled_in_hf_config(*hf_configs: object) -> bool:
+        for cfg in hf_configs:
+            if cfg is None:
+                continue
+            quant_cfg = getattr(cfg, "quantization_config", None)
+            if quant_cfg is None:
+                continue
+
+            modules_to_not_convert = None
+            if isinstance(quant_cfg, dict):
+                modules_to_not_convert = quant_cfg.get("modules_to_not_convert")
+            else:
+                modules_to_not_convert = getattr(
+                    quant_cfg, "modules_to_not_convert", None
+                )
+
+            if modules_to_not_convert and any(
+                str(module) in ("mtp", "model.mtp")
+                for module in modules_to_not_convert
+            ):
+                return True
+
+        return False
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
@@ -367,15 +480,42 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             )
 
         self.quant_config = vllm_config.quant_config
+        self.share_target_io_weights = (
+            os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS", "1") != "0"
+        )
+        mtp_vllm_config = vllm_config
+        keep_quant = os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT", "0") == "1"
+        if (
+            self.quant_config is not None
+            and not keep_quant
+            and self._mtp_quant_disabled_in_hf_config(
+                config,
+                vllm_config.model_config.hf_config,
+            )
+        ):
+            # Qwen3.5/Qwen3.6 AWQ checkpoints commonly keep the MTP branch in
+            # full precision (`modules_to_not_convert` includes "mtp"). Build
+            # that branch unquantized so loader params match checkpoint tensors.
+            self.quant_config = None
+            mtp_vllm_config = copy.copy(vllm_config)
+            mtp_vllm_config.quant_config = None
+            logger.info(
+                "Qwen3_5MTP: disabling quantization for MTP branch based on "
+                "config.quantization_config.modules_to_not_convert."
+            )
 
         super().__init__()
         self.config = config
         self.model = Qwen3_5MultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
+            vllm_config=mtp_vllm_config,
+            prefix=maybe_prefix(prefix, "mtp"),
+            share_target_embed_tokens=self.share_target_io_weights,
         )
 
         if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
+            if self.share_target_io_weights:
+                self.lm_head = PPMissingLayer()
+            elif config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -424,8 +564,14 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        spec_step_idx = int(kwargs.get("spec_step_idx", 0))
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx=spec_step_idx,
         )
         return hidden_states
 
@@ -435,6 +581,13 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names(weights):

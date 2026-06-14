@@ -8,6 +8,8 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -17,6 +19,57 @@ from .op import exp, exp2
 from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
+
+
+def _is_sm70() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 7
+        and torch.cuda.get_device_capability()[1] == 0
+    )
+
+
+def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
+    raw = os.getenv(env_name)
+    if raw is None or not raw.strip():
+        return default_vals
+    out: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            continue
+        if value > 0:
+            out.append(value)
+    return out or default_vals
+
+
+_use_sm70_delta_h_schedule = (
+    os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1") == "1" and _is_sm70()
+)
+_delta_h_configs = (
+    [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        # The SM70 schedule gate is intentionally canonical by default:
+        # BV=16/warps=8/stages=1 was the fastest strict-equal candidate on the
+        # Qwen-like V100 fixture. Env overrides keep the old broader search
+        # space available for diagnostics without making the accepted route
+        # depend on Triton autotune winner variability.
+        for BV in _parse_int_list("VLLM_SM70_GDN_DELTA_H_BV", [16])
+        for num_warps in _parse_int_list("VLLM_SM70_GDN_DELTA_H_WARPS", [8])
+        for num_stages in _parse_int_list("VLLM_SM70_GDN_DELTA_H_STAGES", [1])
+    ]
+    if _use_sm70_delta_h_schedule
+    else [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [2, 3, 4]
+        for BV in [32, 64]
+    ]
+)
 
 
 @triton.heuristics(
@@ -30,12 +83,7 @@ NUM_WARPS = [2, 4, 8, 16]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ],
+    configs=_delta_h_configs,
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )

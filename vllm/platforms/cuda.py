@@ -138,6 +138,17 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TURBOQUANT,
             ]
         else:
+            if (
+                envs.VLLM_SM70_FLASH_ATTN_V100
+                and device_capability.major == 7
+                and device_capability.minor == 0
+            ):
+                return [
+                    AttentionBackendEnum.FLASH_ATTN_V100,
+                    AttentionBackendEnum.TRITON_ATTN,
+                    AttentionBackendEnum.FLEX_ATTENTION,
+                    AttentionBackendEnum.TURBOQUANT,
+                ]
             return [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASHINFER,

@@ -586,7 +586,7 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return p.is_cuda() and p.has_device_capability((7, 5))
+        return p.is_cuda() and p.has_device_capability((7, 0))
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:

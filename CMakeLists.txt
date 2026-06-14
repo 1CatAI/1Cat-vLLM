@@ -104,7 +104,10 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
   set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
 elseif(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
-  set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
+  # Keep SM70 available for the isolated V100 TurboMind backend. CUDA 12.8
+  # still supports offline SM70 compilation, while CUDA 13 warns that pre-7.5
+  # offline support is removed.
+  set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;12.0;12.1")
 else()
   set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
@@ -356,6 +359,53 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
 
+  set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
+  cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
+  if (SM70_TURBOMIND_ARCHS)
+    set(VLLM_SM70_TURBOMIND_ROOT
+        "${CMAKE_CURRENT_LIST_DIR}/csrc/sm70_turbomind")
+    set(VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT
+        "${VLLM_SM70_TURBOMIND_ROOT}/lmdeploy")
+    set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS
+        "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}")
+    set(VLLM_SM70_TURBOMIND_SRCS
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/core/check.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/core/layout.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/core/context.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/core/allocator.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/core/buffer.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/core/stream.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/utils/logger.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/utils/parser.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/gemm.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/dispatch_cache.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/context.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/convert_v3.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/cast.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/unpack.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/cache_utils.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/measurer.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/sampler.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/stopping_criterion.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/tuner/params.cc"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu"
+      "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
+
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
+      CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+    set_source_files_properties(
+      csrc/torch_bindings.cpp
+      PROPERTIES COMPILE_DEFINITIONS ENABLE_SM70_TURBOMIND=1)
+    list(APPEND VLLM_EXT_SRC "${VLLM_SM70_TURBOMIND_SRCS}")
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_SM70_TURBOMIND=1")
+    message(STATUS "Building SM70 TurboMind GEMM backend for archs: ${SM70_TURBOMIND_ARCHS}")
+  endif()
+
   # Only build Marlin kernels if we are building for at least some compatible archs.
   # Keep building Marlin for 9.0 as there are some group sizes and shapes that
   # are not supported by Machete yet.
@@ -387,6 +437,33 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
   # marlin arches for other files
   cuda_archs_loose_intersection(MARLIN_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(MARLIN_SM70_ARCHS "7.0" "${CUDA_ARCHS}")
+
+  if (MARLIN_SM70_ARCHS AND NOT MARLIN_OTHER_ARCHS)
+    set(MARLIN_SM70_SRCS
+       "csrc/quantization/marlin/sm70_marlin_dispatch.cu"
+       "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
+       "csrc/quantization/marlin/sm70_gptq_marlin_repack.cu"
+       "csrc/quantization/marlin/sm70_awq_marlin_repack.cu"
+       "csrc/quantization/marlin/sm70_marlin_u4b8_gemm.cu"
+       "csrc/quantization/marlin/sm70_marlin_u4_gemm.cu"
+       "csrc/quantization/marlin/sm70_marlin_u8_gemm.cu"
+       "csrc/quantization/marlin/sm70_marlin_u8b128_gemm.cu"
+       "csrc/quantization/marlin/sm70_marlin_fp8_gemm.cu"
+       "csrc/quantization/marlin/sm70_marlin_nvfp4_gemm.cu"
+       "csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${MARLIN_SM70_SRCS}"
+      CUDA_ARCHS "${MARLIN_SM70_ARCHS}")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+      set_source_files_properties(${MARLIN_SM70_SRCS}
+        PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
+    endif()
+    list(APPEND VLLM_EXT_SRC "${MARLIN_SM70_SRCS}")
+    message(STATUS "Building SM70 Marlin kernels for archs: ${MARLIN_SM70_ARCHS}")
+  elseif(MARLIN_SM70_ARCHS)
+    message(STATUS "Skipping SM70 Marlin kernels in mixed Marlin arch build")
+  endif()
 
   if (MARLIN_OTHER_ARCHS)
 
@@ -613,7 +690,7 @@ define_extension_target(
   SOURCES ${VLLM_EXT_SRC}
   COMPILE_FLAGS ${VLLM_GPU_FLAGS}
   ARCHITECTURES ${VLLM_GPU_ARCHES}
-  INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
+  INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} ${VLLM_SM70_TURBOMIND_INCLUDE_DIRS}
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
   USE_SABI 3
   WITH_SOABI)
@@ -1147,6 +1224,29 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0;12.1" "${CUDA_ARCHS}")
   # moe marlin arches for other files
   cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(MARLIN_MOE_SM70_ARCHS "7.0" "${CUDA_ARCHS}")
+  if (MARLIN_MOE_SM70_ARCHS AND NOT MARLIN_MOE_OTHER_ARCHS)
+    set(MARLIN_MOE_SM70_SRC
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_moe_dispatch.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_u4_gemm.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_u4b8_gemm.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_u8_gemm.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_u8b128_gemm.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_fp8_gemm.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_nvfp4_gemm.cu"
+      "csrc/moe/marlin_moe_wna16/sm70_marlin_mxfp4_gemm.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${MARLIN_MOE_SM70_SRC}"
+      CUDA_ARCHS "${MARLIN_MOE_SM70_ARCHS}")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+      set_source_files_properties(${MARLIN_MOE_SM70_SRC}
+        PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
+    endif()
+    list(APPEND VLLM_MOE_EXT_SRC "${MARLIN_MOE_SM70_SRC}")
+    message(STATUS "Building SM70 Marlin MOE kernels for archs: ${MARLIN_MOE_SM70_ARCHS}")
+  elseif(MARLIN_MOE_SM70_ARCHS)
+    message(STATUS "Skipping SM70 Marlin MOE kernels in mixed Marlin arch build")
+  endif()
   if (MARLIN_MOE_OTHER_ARCHS)
 
     #
@@ -1320,10 +1420,65 @@ endif()
 
 # For CUDA we also build and ship some external projects.
 if (VLLM_GPU_LANG STREQUAL "CUDA")
-    include(cmake/external_projects/deepgemm.cmake)
-    include(cmake/external_projects/flashmla.cmake)
-    include(cmake/external_projects/qutlass.cmake)
+    set(DEEPGEMM_SUPPORT_ARCHS)
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
+      list(APPEND DEEPGEMM_SUPPORT_ARCHS "9.0a")
+    endif()
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+      list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0f")
+    elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+      list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0a")
+    endif()
+    cuda_archs_loose_intersection(VLLM_DEEPGEMM_ARCHS
+      "${DEEPGEMM_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+    if(VLLM_DEEPGEMM_ARCHS)
+      include(cmake/external_projects/deepgemm.cmake)
+    else()
+      message(STATUS
+        "Skipping DeepGEMM external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
+    endif()
 
-    # vllm-flash-attn should be last as it overwrites some CMake functions
-    include(cmake/external_projects/vllm_flash_attn.cmake)
+    set(FLASHMLA_SUPPORT_ARCHS)
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
+      list(APPEND FLASHMLA_SUPPORT_ARCHS "9.0a")
+    endif()
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
+      list(APPEND FLASHMLA_SUPPORT_ARCHS "10.0f")
+    elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+      list(APPEND FLASHMLA_SUPPORT_ARCHS "10.0a")
+    endif()
+    cuda_archs_loose_intersection(VLLM_FLASHMLA_ARCHS
+      "${FLASHMLA_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
+    if(VLLM_FLASHMLA_ARCHS)
+      include(cmake/external_projects/flashmla.cmake)
+    else()
+      message(STATUS
+        "Skipping FlashMLA external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
+    endif()
+
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(VLLM_QUTLASS_ARCHS
+        "10.0f;12.0f" "${CUDA_ARCHS}")
+    elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+      cuda_archs_loose_intersection(VLLM_QUTLASS_ARCHS
+        "10.0a;10.3a;12.0a;12.1a" "${CUDA_ARCHS}")
+    else()
+      set(VLLM_QUTLASS_ARCHS)
+    endif()
+    if(VLLM_QUTLASS_ARCHS)
+      include(cmake/external_projects/qutlass.cmake)
+    else()
+      message(STATUS
+        "Skipping QuTLASS external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
+    endif()
+
+    cuda_archs_loose_intersection(VLLM_FLASH_ATTN_ARCHS
+      "8.0+PTX" "${CUDA_ARCHS}")
+    if(VLLM_FLASH_ATTN_ARCHS)
+      # vllm-flash-attn should be last as it overwrites some CMake functions
+      include(cmake/external_projects/vllm_flash_attn.cmake)
+    else()
+      message(STATUS
+        "Skipping vllm-flash-attn external project fetch: unsupported CUDA architecture ${CUDA_ARCHS}")
+    endif()
 endif ()

@@ -165,7 +165,27 @@ def _init_kv_cache_quant(
         # TODO (mgoin): kv cache dtype should be specified in the FP8
         # checkpoint config and become the "auto" behavior
         if layer.kv_cache_dtype == "fp8_e5m2":
-            raise ValueError("fp8_e5m2 kv-cache is not supported with fp8 checkpoints.")
+            sm70_flash_v100 = (
+                current_platform.is_cuda()
+                and current_platform.has_device_capability(70)
+                and not current_platform.has_device_capability(75)
+                and envs.VLLM_SM70_FLASH_ATTN_V100
+            )
+            uses_base_scale_processing = (
+                type(quant_method).process_weights_after_loading
+                is BaseKVCacheMethod.process_weights_after_loading
+            )
+            if not sm70_flash_v100 or not uses_base_scale_processing:
+                raise ValueError(
+                    "fp8_e5m2 kv-cache is not supported with fp8 checkpoints "
+                    "outside the SM70 Flash-V100 unit-scale override path."
+                )
+            layer._force_unit_fp8_e5m2_kv_scales = True
+            logger.info_once(
+                "Using explicit fp8_e5m2 KV cache with an FP8 checkpoint on "
+                "SM70 Flash-V100; checkpoint KV/q/prob scales will be ignored "
+                "and unit scales will be used."
+            )
         # If quantization is enabled, we make "k_scale" and "v_scale"
         # parameters so that it can be loaded from the model checkpoint.
         # The k/v_scale will then be converted back to native float32

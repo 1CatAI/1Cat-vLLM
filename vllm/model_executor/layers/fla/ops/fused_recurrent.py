@@ -8,11 +8,129 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .op import exp
+
+
+def _parse_positive_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _parse_positive_int_list_env(name: str, default: list[int]) -> list[int]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    out: list[int] = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            parsed = int(token)
+        except ValueError:
+            continue
+        if parsed > 0:
+            out.append(parsed)
+    return out or default
+
+
+def _round_num_warps(value: int) -> int:
+    if value <= 1:
+        return 1
+    if value <= 2:
+        return 2
+    if value <= 4:
+        return 4
+    return 8
+
+
+_SM70_FLA_RECURRENT_SCHEDULE = (
+    os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1") == "1"
+)
+_SM70_FLA_BV_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_BV")
+_SM70_FLA_WARPS_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_WARPS")
+_SM70_FLA_STAGES_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_STAGES")
+_SM70_FLA_TARGET_WAVES = _parse_positive_int_env("VLLM_SM70_FLA_TARGET_WAVES") or 2
+_SM70_FLA_BV_CANDIDATES = _parse_positive_int_list_env(
+    "VLLM_SM70_FLA_BV_CANDIDATES", [32, 16, 8]
+)
+_SM70_FLA_HAS_LEGACY_OVERRIDE = any(
+    os.getenv(name) not in (None, "")
+    for name in (
+        "VLLM_SM70_FLA_BV",
+        "VLLM_SM70_FLA_WARPS",
+        "VLLM_SM70_FLA_STAGES",
+        "VLLM_SM70_FLA_TARGET_WAVES",
+        "VLLM_SM70_FLA_BV_CANDIDATES",
+    )
+)
+
+
+def _is_sm70_device(device: torch.device) -> bool:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return major == 7 and minor == 0
+
+
+def _use_sm70_fla_recurrent_schedule(device: torch.device) -> bool:
+    return _is_sm70_device(device) and (
+        _SM70_FLA_RECURRENT_SCHEDULE or _SM70_FLA_HAS_LEGACY_OVERRIDE
+    )
+
+
+def _select_sm70_bv(V: int, N: int, HV: int, device: torch.device) -> int:
+    v_pow2 = triton.next_power_of_2(V)
+    if _SM70_FLA_BV_OVERRIDE is not None:
+        return min(v_pow2, triton.next_power_of_2(_SM70_FLA_BV_OVERRIDE))
+
+    candidates: list[int] = []
+    for candidate in _SM70_FLA_BV_CANDIDATES:
+        candidate_pow2 = min(v_pow2, triton.next_power_of_2(candidate))
+        if candidate_pow2 not in candidates:
+            candidates.append(candidate_pow2)
+    candidates.sort(reverse=True)
+    if not candidates:
+        return min(v_pow2, 16)
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    target_ctas = sm_count * _SM70_FLA_TARGET_WAVES
+    fallback = candidates[-1]
+    for candidate in candidates:
+        ctas = triton.cdiv(V, candidate) * N * HV
+        if ctas >= target_ctas:
+            return candidate
+    return fallback
+
+
+def _select_sm70_num_warps(BV: int, N: int, HV: int) -> int:
+    if _SM70_FLA_WARPS_OVERRIDE is not None:
+        return _round_num_warps(_SM70_FLA_WARPS_OVERRIDE)
+    return 1
+
+
+def _select_sm70_num_stages(T: int) -> int:
+    if _SM70_FLA_STAGES_OVERRIDE is not None:
+        return _SM70_FLA_STAGES_OVERRIDE
+    return 3
 
 
 @triton.heuristics(
@@ -106,12 +224,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            # Load state index and check for invalid entries
+            # Load state index and check for invalid entries.
+            # Mamba/GDN state tables use PAD_SLOT_ID=-1; state slot 0 is a
+            # valid live slot in the 0.0.3 MTP path.
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
-            if state_idx <= 0:
+            if state_idx < 0:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
@@ -150,12 +269,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
-            # Load state index and check for invalid entries
+            # Load state index and check for invalid entries.
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
             ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
-            if final_state_idx > 0:
+            if final_state_idx >= 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
@@ -192,11 +310,17 @@ def fused_recurrent_gated_delta_rule_fwd(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    sm70_schedule = _use_sm70_fla_recurrent_schedule(q.device)
+    BK = triton.next_power_of_2(K)
+    BV = (
+        _select_sm70_bv(V, N, HV, q.device)
+        if sm70_schedule
+        else min(triton.next_power_of_2(V), 32)
+    )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
+    num_stages = _select_sm70_num_stages(T) if sm70_schedule else 3
+    num_warps = _select_sm70_num_warps(BV, N, HV) if sm70_schedule else 1
 
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
@@ -292,15 +416,17 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    # Skip if state index is invalid (NULL_BLOCK_ID=0)
-    if state_idx <= 0:
+    # GDN/Mamba state tables use PAD_SLOT_ID=-1 for padded graph rows. Slot 0
+    # is a valid live cache slot and must be processed.
+    if state_idx < 0:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
 
     p_h0 = h0 + state_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k
@@ -311,8 +437,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     b_v = tl.load(p_mixed + v_off, mask=mask_v, other=0).to(tl.float32)
 
     if USE_QK_L2NORM_IN_KERNEL:
-        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
 
     a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
@@ -320,11 +446,15 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
     x = a_val + dt_bias_val
-    softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
+    softplus_x = tl.where(
+        1.0 * x <= SOFTPLUS_THRESHOLD,
+        (1.0 / 1.0) * tl.log(1.0 + tl.exp(1.0 * x)),
+        x,
+    )
     g_val = -tl.exp(A_log_val) * softplus_x
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    beta_val = tl.sigmoid(b_val)
 
-    b_h *= exp(g_val)
+    b_h *= tl.exp(g_val)
     b_v -= tl.sum(b_h * b_k[None, :], 1)
     b_v *= beta_val
     b_h += b_v[:, None] * b_k[None, :]
@@ -434,9 +564,14 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
-    num_stages = 3
-    num_warps = 1
+    sm70_schedule = _use_sm70_fla_recurrent_schedule(mixed_qkv.device)
+    BV = (
+        _select_sm70_bv(V, B, HV, mixed_qkv.device)
+        if sm70_schedule
+        else min(triton.next_power_of_2(V), 32)
+    )
+    num_stages = _select_sm70_num_stages(1) if sm70_schedule else 3
+    num_warps = _select_sm70_num_warps(BV, B, HV) if sm70_schedule else 1
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)

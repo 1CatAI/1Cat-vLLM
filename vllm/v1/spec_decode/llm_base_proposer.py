@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -7,14 +9,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
     replace,
 )
-from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.distributed.parallel_state import get_pp_group, is_global_first_rank
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -32,6 +35,13 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.rejection_sampler import (
+    MAX_SPEC_LEN,
+)
+from vllm.v1.sample.rejection_sampler import (
+    expand_kernel as rejection_expand_kernel,
+)
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -50,6 +60,33 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _sm70_mtp_profile_env_enabled() -> bool:
+    return envs.VLLM_SM70_MTP_PROFILE
+
+
+def _sm70_mtp_profile_interval() -> int:
+    return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
+
+
+def _spec_debug_corruption_enabled(method: str) -> bool:
+    if method == "dflash" and envs.VLLM_DFLASH_DEBUG_CORRUPTION:
+        return True
+    return envs.VLLM_SPEC_DEBUG_CORRUPTION
+
+
+def _spec_dump_draft_logits_enabled(method: str) -> bool:
+    if method == "dflash" and envs.VLLM_DFLASH_DUMP_DRAFT_LOGITS:
+        return True
+    return envs.VLLM_SPEC_DUMP_DRAFT_LOGITS
+
+
+def _dump_spec_debug(payload: dict[str, Any], method: str, suffix: str) -> str:
+    prefix = "dflash" if method == "dflash" else f"spec_{method}"
+    dump_path = f"/tmp/{prefix}_{suffix}_pid{os.getpid()}.pt"
+    torch.save(payload, dump_path)
+    return dump_path
 
 
 class SpecDecodeBaseProposer:
@@ -380,14 +417,17 @@ class SpecDecodeBaseProposer:
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for the drafter.
 
-        Only supports PIECEWISE cudagraphs (via mixed_mode).
+        MTP keeps the existing PIECEWISE drafter graph even when the target
+        model uses FULL graphs. Capturing the drafter as a model-level FULL
+        graph changes its replay metadata assumptions and collapses acceptance.
         This should be called after adjust_cudagraph_sizes_for_spec_decode.
         """
-        if (
-            not self.speculative_config.enforce_eager
-            and cudagraph_mode.mixed_mode()
-            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
-        ):
+        if self.speculative_config.enforce_eager:
+            eagle_cudagraph_mode = CUDAGraphMode.NONE
+        elif cudagraph_mode.mixed_mode() in [
+            CUDAGraphMode.PIECEWISE,
+            CUDAGraphMode.FULL,
+        ]:
             eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE
         else:
             eagle_cudagraph_mode = CUDAGraphMode.NONE
@@ -415,11 +455,248 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
+            if logits is not None:
+                return logits.argmax(dim=-1), None
             return self._greedy_sample(hidden_states), None
-        logits = self.model.compute_logits(hidden_states)
+        if logits is None:
+            logits = self.model.compute_logits(hidden_states)
         return self._sample_from_logits(logits, sampling_metadata)
+
+    def _sm70_mtp_profile_enabled(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.device.type == "cuda"
+            and _sm70_mtp_profile_env_enabled()
+        )
+
+    def _sm70_mtp_profile_start(
+        self,
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+    ) -> torch.cuda.Event | None:
+        if events is None:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def _sm70_mtp_profile_finish(
+        self,
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+        name: str,
+        start: torch.cuda.Event | None,
+    ) -> None:
+        if events is None or start is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        events.append((name, start, end))
+
+    def _sm70_mtp_profile_add_cpu_ms(
+        self,
+        cpu_ms: dict[str, float],
+        name: str,
+        start: float,
+    ) -> None:
+        cpu_ms[name] = cpu_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000.0
+
+    def _sm70_mtp_profile_report(
+        self,
+        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+        cpu_ms: dict[str, float],
+        batch_size: int,
+        num_tokens: int,
+    ) -> None:
+        if events is None:
+            return
+        if events:
+            events[-1][2].synchronize()
+
+        timings: dict[str, float] = {}
+        for name, start, end in events:
+            timings[name] = timings.get(name, 0.0) + start.elapsed_time(end)
+        timings.update(cpu_ms)
+
+        totals = getattr(self, "_sm70_mtp_profile_totals", None)
+        if totals is None:
+            totals = {}
+            self._sm70_mtp_profile_totals = totals
+        calls = getattr(self, "_sm70_mtp_profile_calls", 0) + 1
+        self._sm70_mtp_profile_calls = calls
+        for name, value in timings.items():
+            totals[name] = totals.get(name, 0.0) + value
+
+        if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
+            return
+        try:
+            should_log = is_global_first_rank()
+        except RuntimeError:
+            should_log = True
+        if not should_log:
+            return
+
+        preferred = [
+            "total_gpu",
+            "total_wall_cpu",
+            "first_setup_cpu",
+            "first_forward",
+            "first_sample",
+            "loop_metadata_cpu",
+            "loop0_forward",
+            "loop0_sample",
+            "loop1_forward",
+            "loop1_sample",
+            "loop2_forward",
+            "loop2_sample",
+        ]
+        keys = [key for key in preferred if key in totals]
+        keys.extend(sorted(key for key in totals if key not in keys))
+        summary = " ".join(f"{key}={totals[key] / calls:.3f}" for key in keys)
+        logger.info(
+            "SM70 MTP proposer profile avg_ms calls=%d batch=%d tokens=%d %s",
+            calls,
+            batch_size,
+            num_tokens,
+            summary,
+        )
+
+    def warmup_sm70_mtp_hotpath_kernels(self) -> tuple[str, ...]:
+        """Warm MTP helper kernels that otherwise JIT on the first request."""
+        if (
+            self.method != "mtp"
+            or self.device.type != "cuda"
+            or not current_platform.is_device_capability(70)
+        ):
+            return ()
+        if getattr(self, "_sm70_mtp_hotpath_warmed", False):
+            return ()
+        self._sm70_mtp_hotpath_warmed = True
+        if self.block_size <= 0:
+            return ()
+
+        try:
+            batch_size = max(1, min(self.max_batch_size, 4))
+            vocab_size = max(2, self.draft_model_config.get_vocab_size())
+
+            valid_sampled_tokens_count = None
+            for num_sampled_tokens in sorted({1, self.num_speculative_tokens + 1}):
+                sampled_token_ids = torch.zeros(
+                    (batch_size, num_sampled_tokens),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                discard_request_mask = torch.zeros(
+                    batch_size, dtype=torch.bool, device=self.device
+                )
+                backup_next_token_ids = torch.zeros(
+                    batch_size, dtype=torch.int32, device=self.device
+                )
+                next_token_ids = torch.empty(
+                    batch_size, dtype=torch.int32, device=self.device
+                )
+                next_valid_count = torch.empty_like(next_token_ids)
+                eagle_prepare_next_token_padded_kernel[(batch_size,)](
+                    sampled_token_ids,
+                    discard_request_mask,
+                    backup_next_token_ids,
+                    next_token_ids,
+                    next_valid_count,
+                    vocab_size,
+                    num_sampled_tokens,
+                    batch_size,
+                    sampled_token_ids.stride(0),
+                    BLOCK_SIZE_TOKENS=next_power_of_2(num_sampled_tokens),
+                )
+                if num_sampled_tokens == self.num_speculative_tokens + 1:
+                    valid_sampled_tokens_count = next_valid_count
+            assert valid_sampled_tokens_count is not None
+
+            next_token_ids = torch.empty(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+
+            cu_num_draft_tokens = (
+                torch.arange(
+                    1,
+                    batch_size + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                * self.num_speculative_tokens
+            )
+            query_start_loc = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
+            token_indices_to_sample = torch.empty_like(next_token_ids)
+            num_rejected_tokens_gpu = torch.empty_like(next_token_ids)
+            eagle_prepare_inputs_padded_kernel[(batch_size,)](
+                cu_num_draft_tokens,
+                valid_sampled_tokens_count,
+                query_start_loc,
+                token_indices_to_sample,
+                num_rejected_tokens_gpu,
+                batch_size,
+            )
+
+            for dtype, replace_from, replace_to in (
+                (torch.float32, 0, 1),  # temperature
+                (torch.float32, 0, 0),  # top_p
+                (torch.int32, 0, 0),  # top_k
+            ):
+                rejection_expand_input = torch.ones(
+                    batch_size, dtype=dtype, device=self.device
+                )
+                rejection_expand_output = torch.empty(
+                    batch_size * self.num_speculative_tokens,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                rejection_expand_kernel[(batch_size,)](
+                    rejection_expand_output,
+                    rejection_expand_input,
+                    cu_num_draft_tokens,
+                    replace_from,
+                    replace_to,
+                    MAX_NUM_TOKENS=MAX_SPEC_LEN,
+                )
+
+            n_blocks_per_req = max(
+                1, (self.max_model_len + self.block_size - 1) // self.block_size
+            )
+            positions = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
+            block_table = torch.zeros(
+                (batch_size, n_blocks_per_req),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            seq_lens = torch.ones(batch_size, dtype=torch.int32, device=self.device)
+            out_positions = torch.empty_like(positions)
+            out_slot_mapping = torch.empty(
+                batch_size, dtype=torch.int64, device=self.device
+            )
+            eagle_step_update_slot_mapping_and_metadata(
+                positions_1d=positions,
+                block_table_tensor=block_table,
+                seq_lens=seq_lens,
+                block_size=self.block_size,
+                max_model_len=self.max_model_len,
+                out_clamped_positions=out_positions,
+                out_slot_mapping=out_slot_mapping,
+                input_batch_size=batch_size,
+            )
+            torch.accelerator.synchronize()
+        except Exception as err:  # pragma: no cover - best-effort warmup
+            logger.warning_once("SM70 MTP hotpath warmup skipped: %s", err)
+            return ()
+
+        return (
+            "mtp_prepare_next_token",
+            "mtp_prepare_inputs",
+            "mtp_rejection_expand",
+            "mtp_step_slot_mapping",
+        )
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
@@ -445,6 +722,14 @@ class SpecDecodeBaseProposer:
     ) -> torch.Tensor:
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        profile_events = (
+            [] if self._sm70_mtp_profile_enabled() else None
+        )
+        profile_cpu_ms: dict[str, float] = {}
+        profile_wall_start = (
+            time.perf_counter() if profile_events is not None else 0.0
+        )
+        profile_total_start = self._sm70_mtp_profile_start(profile_events)
 
         if self.method in ("eagle3", "dflash"):
             assert isinstance(
@@ -476,7 +761,12 @@ class SpecDecodeBaseProposer:
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+        (
+            cudagraph_runtime_mode,
+            num_input_tokens,
+            num_tokens_across_dp,
+            batch_descriptor,
+        ) = (
             self._determine_batch_execution_and_padding(num_tokens)
         )
 
@@ -484,12 +774,18 @@ class SpecDecodeBaseProposer:
             num_tokens, num_input_tokens, mm_embed_inputs
         )
 
+        if profile_events is not None:
+            self._sm70_mtp_profile_add_cpu_ms(
+                profile_cpu_ms, "first_setup_cpu", profile_wall_start
+            )
+        first_forward_start = self._sm70_mtp_profile_start(profile_events)
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
@@ -500,18 +796,115 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+        self._sm70_mtp_profile_finish(
+            profile_events, "first_forward", first_forward_start
+        )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        debug_logits = None
+        debug_summary: dict[str, Any] | None = None
+        should_collect_draft_logits = (
+            _spec_debug_corruption_enabled(self.method)
+            or _spec_dump_draft_logits_enabled(self.method)
+        )
+        if should_collect_draft_logits:
+            debug_logits = self.model.compute_logits(sample_hidden_states)
+            topk = min(5, debug_logits.shape[-1])
+            topk_vals, topk_ids = torch.topk(debug_logits.float(), k=topk, dim=-1)
+            nan_counts = debug_logits.isnan().sum(dim=-1)
+            nonfinite_counts = (~torch.isfinite(debug_logits)).sum(dim=-1)
+            debug_summary = {
+                "sample_indices": token_indices_to_sample.detach().cpu(),
+                "last_hidden_states_shape": tuple(last_hidden_states.shape),
+                "sample_hidden_states_shape": tuple(sample_hidden_states.shape),
+                "sampling_temperature": None
+                if sampling_metadata.temperature is None
+                else sampling_metadata.temperature.detach().cpu(),
+                "sampling_top_p": None
+                if sampling_metadata.top_p is None
+                else sampling_metadata.top_p.detach().cpu(),
+                "sampling_top_k": None
+                if sampling_metadata.top_k is None
+                else sampling_metadata.top_k.detach().cpu(),
+                "sampling_all_greedy": sampling_metadata.all_greedy,
+                "sampling_all_random": sampling_metadata.all_random,
+                "sample_hidden_state_nan_counts": sample_hidden_states.isnan()
+                .sum(dim=-1)
+                .detach()
+                .cpu(),
+                "sample_hidden_state_norms": sample_hidden_states.float()
+                .norm(dim=-1)
+                .detach()
+                .cpu(),
+                "logits_nan_counts": nan_counts.detach().cpu(),
+                "logits_nonfinite_counts": nonfinite_counts.detach().cpu(),
+                "logits_argmax": debug_logits.argmax(dim=-1).detach().cpu(),
+                "logits_topk_ids": topk_ids.detach().cpu(),
+                "logits_topk_vals": topk_vals.detach().cpu(),
+                "first_pass": getattr(self, "_debug_last_first_pass", None),
+            }
+            if _spec_dump_draft_logits_enabled(self.method):
+                debug_summary["sample_hidden_states"] = (
+                    sample_hidden_states.detach().to(torch.float16).cpu()
+                )
+                debug_summary["logits"] = debug_logits.detach().to(torch.float16).cpu()
+            self._debug_last_propose_summary = debug_summary
+            if (
+                not getattr(self, "_spec_corruption_dumped", False)
+                and (
+                    int(nan_counts.sum().item()) > 0
+                    or int(nonfinite_counts.sum().item()) > 0
+                )
+            ):
+                dump_path = _dump_spec_debug(
+                    debug_summary, self.method, "draft_corruption"
+                )
+                self._spec_corruption_dumped = True
+                logger.warning(
+                    "Saved %s draft corruption debug to %s",
+                    self.method,
+                    dump_path,
+                )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
+            first_sample_start = self._sm70_mtp_profile_start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
+                sample_hidden_states, sampling_metadata, debug_logits
+            )
+            self._sm70_mtp_profile_finish(
+                profile_events, "first_sample", first_sample_start
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
+            if (
+                _spec_dump_draft_logits_enabled(self.method)
+                and not getattr(self, "_spec_logits_dumped", False)
+                and debug_summary is not None
+            ):
+                debug_summary["draft_token_ids"] = draft_token_ids.detach().cpu()
+                if draft_probs is not None:
+                    debug_summary["draft_probs"] = (
+                        draft_probs.detach().to(torch.float16).cpu()
+                    )
+                dump_path = _dump_spec_debug(
+                    debug_summary, self.method, "draft_logits"
+                )
+                self._spec_logits_dumped = True
+                logger.warning(
+                    "Saved %s draft logits debug to %s", self.method, dump_path
+                )
+            self._sm70_mtp_profile_finish(
+                profile_events, "total_gpu", profile_total_start
+            )
+            self._sm70_mtp_profile_add_cpu_ms(
+                profile_cpu_ms, "total_wall_cpu", profile_wall_start
+            )
+            self._sm70_mtp_profile_report(
+                profile_events, profile_cpu_ms, batch_size, num_tokens
+            )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -526,10 +919,25 @@ class SpecDecodeBaseProposer:
             # (which read via _get_positions) use the correct values.
             self.positions[:batch_size] = positions
 
+        first_sample_start = self._sm70_mtp_profile_start(profile_events)
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata
+            sample_hidden_states, sampling_metadata, debug_logits
+        )
+        self._sm70_mtp_profile_finish(
+            profile_events, "first_sample", first_sample_start
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
+        if (
+            _spec_dump_draft_logits_enabled(self.method)
+            and not getattr(self, "_spec_logits_dumped", False)
+            and debug_summary is not None
+        ):
+            debug_summary["draft_token_ids"] = draft_token_ids.detach().cpu()
+            dump_path = _dump_spec_debug(debug_summary, self.method, "draft_logits")
+            self._spec_logits_dumped = True
+            logger.warning(
+                "Saved %s draft logits debug to %s", self.method, dump_path
+            )
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -544,7 +952,12 @@ class SpecDecodeBaseProposer:
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
 
-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
+        (
+            cudagraph_runtime_mode,
+            input_batch_size,
+            batch_size_across_dp,
+            batch_descriptor,
+        ) = (
             self._determine_batch_execution_and_padding(batch_size)
         )
 
@@ -568,6 +981,9 @@ class SpecDecodeBaseProposer:
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
         for token_index in range(self.num_speculative_tokens - 1):
+            loop_cpu_start = (
+                time.perf_counter() if profile_events is not None else 0.0
+            )
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -613,12 +1029,23 @@ class SpecDecodeBaseProposer:
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
+            if profile_events is not None:
+                metadata_name = f"loop{token_index}_metadata_cpu"
+                self._sm70_mtp_profile_add_cpu_ms(
+                    profile_cpu_ms, metadata_name, loop_cpu_start
+                )
+                profile_cpu_ms["loop_metadata_cpu"] = profile_cpu_ms.get(
+                    "loop_metadata_cpu", 0.0
+                ) + profile_cpu_ms[metadata_name]
+
+            loop_forward_start = self._sm70_mtp_profile_start(profile_events)
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -627,10 +1054,17 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
+            self._sm70_mtp_profile_finish(
+                profile_events, f"loop{token_index}_forward", loop_forward_start
+            )
 
             hidden_states = hidden_states[:batch_size]
+            loop_sample_start = self._sm70_mtp_profile_start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
                 last_hidden_states[:batch_size], sampling_metadata
+            )
+            self._sm70_mtp_profile_finish(
+                profile_events, f"loop{token_index}_sample", loop_sample_start
             )
             if draft_probs is not None:
                 assert draft_probs_list is not None
@@ -641,6 +1075,15 @@ class SpecDecodeBaseProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
+        self._sm70_mtp_profile_finish(
+            profile_events, "total_gpu", profile_total_start
+        )
+        self._sm70_mtp_profile_add_cpu_ms(
+            profile_cpu_ms, "total_wall_cpu", profile_wall_start
+        )
+        self._sm70_mtp_profile_report(
+            profile_events, profile_cpu_ms, batch_size, num_tokens
+        )
         return draft_token_ids
 
     def _update_positions_dependent_metadata(
@@ -1460,7 +1903,12 @@ class SpecDecodeBaseProposer:
             1 if only_one_forward_pass else self.num_speculative_tokens
         ):
             if fwd_idx <= 1:
-                cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+                (
+                    cudagraph_runtime_mode,
+                    num_input_tokens,
+                    num_tokens_across_dp,
+                    batch_descriptor,
+                ) = (
                     self._determine_batch_execution_and_padding(
                         num_tokens, use_cudagraphs=use_cudagraphs
                     )
@@ -1482,6 +1930,7 @@ class SpecDecodeBaseProposer:
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mapping_dict,
             ):
                 if self.supports_mm_inputs:
@@ -1605,7 +2054,7 @@ class SpecDecodeBaseProposer:
         self,
         num_tokens: int,
         use_cudagraphs: bool = True,
-    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None]:
+    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None, BatchDescriptor]:
         cudagraph_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
             num_tokens,
             valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
@@ -1643,15 +2092,9 @@ class SpecDecodeBaseProposer:
                 assert batch_desc.num_tokens == num_tokens_padded
                 num_tokens_across_dp[dp_rank] = num_tokens_padded
 
-        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
+        return cudagraph_mode, num_tokens_padded, num_tokens_across_dp, batch_desc
 
 
-# NOTE(woosuk): Currently, the below code is not used and we always use argmax
-# to sample the draft tokens. We will use this after we find a way to manage
-# the draft prob tensor.
-# Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
-# FIXME(woosuk): The logic here is duplicated with the main sampling code.
-# We should refactor this to reuse the same sampling implementation.
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1664,21 +2107,31 @@ def compute_probs_and_sample_next_token(
         return next_token_ids, probs
 
     assert sampling_metadata.temperature is not None
+    logits = logits.float()
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold
-    temperature = sampling_metadata.temperature
+    temperature = _expand_sampling_param_for_logits(
+        sampling_metadata.temperature,
+        logits.shape[0],
+    )
+    assert temperature is not None
     # Avoid division by zero if there are greedy requests.
+    is_greedy = None
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
+    top_k = _expand_sampling_param_for_logits(
+        sampling_metadata.top_k,
+        logits.shape[0],
+    )
+    top_p = _expand_sampling_param_for_logits(
+        sampling_metadata.top_p,
+        logits.shape[0],
+    )
+    logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
-
-    # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
-    # generating the draft tokens. We only use the temperature. While this
-    # could degrade the acceptance rate, it does not affect the distribution
-    # of the generated tokens after rejection sampling.
 
     # TODO(woosuk): Consider seeds.
     q = torch.empty_like(probs)
@@ -1688,5 +2141,21 @@ def compute_probs_and_sample_next_token(
     next_token_ids = probs.div(q).argmax(dim=-1).view(-1)
     if not sampling_metadata.all_random:
         greedy_token_ids = probs.argmax(dim=-1)
+        assert is_greedy is not None
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
     return next_token_ids, probs
+
+
+def _expand_sampling_param_for_logits(
+    param: torch.Tensor | None,
+    num_logits: int,
+) -> torch.Tensor | None:
+    if param is None or param.numel() == num_logits:
+        return param
+    if param.numel() == 1:
+        return param.expand(num_logits)
+    assert num_logits % param.numel() == 0, (
+        "Draft sampling metadata does not align with draft logits: "
+        f"num_logits={num_logits}, param_shape={tuple(param.shape)}"
+    )
+    return param.repeat_interleave(num_logits // param.numel())

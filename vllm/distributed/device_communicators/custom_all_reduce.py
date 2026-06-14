@@ -263,6 +263,58 @@ class CustomAllreduce:
             )
         return out
 
+    def all_reduce_sum2(
+        self,
+        inp_a: torch.Tensor,
+        inp_b: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if out is None:
+            out = torch.empty_like(inp_a)
+        ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
+        return out
+
+    def top1_argmax(
+        self,
+        input_pair: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        registered: bool = False,
+    ) -> torch.Tensor:
+        if out is None:
+            out = torch.empty((1,), dtype=torch.int64, device=input_pair.device)
+        if registered:
+            ops.top1_argmax(self._ptr, input_pair, out, 0, 0)
+        else:
+            ops.top1_argmax(
+                self._ptr,
+                input_pair,
+                out,
+                self.buffer_ptrs[self.rank],
+                self.max_size,
+            )
+        return out
+
+    def custom_top1_argmax(self, input_pair: torch.Tensor) -> torch.Tensor | None:
+        if self.disabled:
+            return None
+        if input_pair.dtype != torch.float32 or input_pair.numel() != 2:
+            return None
+        if not is_weak_contiguous(input_pair):
+            return None
+        if self.world_size != 2 and not self.fully_connected:
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.top1_argmax(input_pair, registered=True)
+            # Graph warmup still consumes the sampled token. Returning an
+            # uninitialized placeholder here can change the dummy decode
+            # sequence or even produce an invalid token id, so use the exact
+            # all-gather fallback until the real CUDA graph capture starts.
+            return None
+        return self.top1_argmax(input_pair, registered=False)
+
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -271,15 +323,32 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce(input, registered=True)
-            else:
-                # If warm up, mimic the allocation pattern since custom
-                # allreduce is out-of-place.
-                return torch.empty_like(input)
+            # Graph warmup can still feed persistent model state (KV, SSM, or
+            # CUDA graph metadata buffers). Returning an uninitialized tensor
+            # here can poison the state captured immediately afterwards. Keep
+            # the same out-of-place allocation pattern, but compute the real
+            # reduction through the eager registered-buffer path.
+            return self.all_reduce(input, registered=False)
         else:
             # Note: outside of cuda graph context, custom allreduce incurs a
             # cost of cudaMemcpy, which should be small (<=1% of overall
             # latency) compared to the performance gain of using custom kernels
             return self.all_reduce(input, registered=False)
+
+    def custom_all_reduce_sum2(
+        self, input_a: torch.Tensor, input_b: torch.Tensor
+    ) -> torch.Tensor | None:
+        if self.disabled or not self.should_custom_ar(input_a):
+            return None
+        if input_a.shape != input_b.shape or input_a.dtype != input_b.dtype:
+            return None
+        if not is_weak_contiguous(input_b):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce_sum2(input_a, input_b)
+            return self.all_reduce(input_a + input_b, registered=False)
+        return None
 
     def close(self):
         if not self.disabled and self._ptr:

@@ -402,12 +402,13 @@ class Worker(WorkerBase):
                 "allocated_bytes.all.peak", 0
             )
 
-            # Profile CUDA graph memory if graphs will be captured.
-            # Skip on ROCm/HIP/XPU as graph pool handles and mem_get_info behave
-            # differently and can produce incorrect/negative estimates.
+            # Profile CUDA graph memory if graphs will be captured and the
+            # estimator is enabled. 0.0.3-style SM70 runs disable this startup
+            # profiling but still perform the real capture in warmup.
             cudagraph_memory_estimate = 0
             if (
-                current_platform.is_cuda()
+                envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                and current_platform.is_cuda()
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
@@ -709,6 +710,9 @@ class Worker(WorkerBase):
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+
+        if hasattr(self.model_runner, "_warmup_sm70_aux_kernels"):
+            self.model_runner._warmup_sm70_aux_kernels()
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
