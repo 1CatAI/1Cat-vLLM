@@ -327,7 +327,7 @@ imageio==2.37.0
     # via scikit-image
 importlib-metadata==8.7.0
     # via opentelemetry-api
-inflect==5.6.2
+inflect==7.5.0
     # via datamodel-code-generator
 iniconfig==2.0.0
     # via pytest
