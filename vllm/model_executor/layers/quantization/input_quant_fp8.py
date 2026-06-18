@@ -25,6 +25,13 @@ _FP8_MIN, _FP8_MAX = get_fp8_min_max()
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
 
 
+def _get_fp8_min_max_for_dtype(dtype: torch.dtype) -> tuple[float, float]:
+    if dtype == _FP8_DTYPE:
+        return _FP8_MIN, _FP8_MAX
+    finfo = torch.finfo(dtype)
+    return finfo.min, finfo.max
+
+
 # --8<-- [start:quant_fp8]
 @CustomOp.register("quant_fp8")
 class QuantFP8(CustomOp):
@@ -44,6 +51,7 @@ class QuantFP8(CustomOp):
         tma_aligned_scales: bool = False,
         use_ue8m0: bool | None = None,  # for Torch compile
         compile_native: bool = True,
+        quant_dtype: torch.dtype | None = None,
     ):
         """
         :param static: static or dynamic quantization
@@ -56,8 +64,14 @@ class QuantFP8(CustomOp):
         :param column_major_scales: For group quantization, output scales in
             column major format
         :param compile_native: Manually compile forward_native if compile mode > None
+        :param quant_dtype: Optional FP8 output dtype. Defaults to the platform
+            FP8 dtype; attention KV paths may override this to match the
+            explicit cache dtype.
         """
         super().__init__(compile_native=compile_native)
+        self.quant_dtype = _FP8_DTYPE if quant_dtype is None else quant_dtype
+        self.fp8_min, self.fp8_max = _get_fp8_min_max_for_dtype(self.quant_dtype)
+        self.fp8_min_scaling_factor = 1.0 / (self.fp8_max * 512.0)
         self.static = static
         self.group_shape = group_shape
         self.use_per_token_if_dynamic = group_shape == GroupShape.PER_TOKEN
@@ -109,7 +123,7 @@ class QuantFP8(CustomOp):
                 group_size=self.group_size,
                 column_major_scales=self.column_major_scales,
                 tma_aligned_scales=self.tma_aligned_scales,
-                dtype=_FP8_DTYPE,
+                dtype=self.quant_dtype,
                 use_ue8m0=self.use_ue8m0,
             )
 
@@ -129,6 +143,7 @@ class QuantFP8(CustomOp):
             group_shape=(self.group_shape.row, self.group_shape.col)
             if self.static
             else None,
+            output_dtype=self.quant_dtype,
         )
 
     def forward_hip(
@@ -180,7 +195,7 @@ class QuantFP8(CustomOp):
                 x,
                 group_size=self.group_size,
                 column_major_scales=self.column_major_scales,
-                dtype=_FP8_DTYPE,
+                dtype=self.quant_dtype,
                 use_ue8m0=self.use_ue8m0,
             )
         return self.forward_cuda(x, scale, scale_ub, use_triton)
@@ -212,7 +227,9 @@ class QuantFP8(CustomOp):
             else:
                 x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
 
-            scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
+            scale = (x_max / self.fp8_max).clamp(
+                min=self.fp8_min_scaling_factor
+            )
         else:
             scale = prep_scale_for_group_broadcast(scale, x, self.group_shape)
 
@@ -222,7 +239,7 @@ class QuantFP8(CustomOp):
             x.to(torch.float32)
             * group_broadcast(scale.to(torch.float32), x.shape[-2:]).reciprocal()
         )
-        out = out.clamp(_FP8_MIN, _FP8_MAX).to(_FP8_DTYPE)
+        out = out.clamp(self.fp8_min, self.fp8_max).to(self.quant_dtype)
 
         # This currently generates an extra Triton kernel in compilation.
         # Fortunately, we don't use padding if compiling.
@@ -248,13 +265,13 @@ class QuantFP8(CustomOp):
 
         x_grouped = x.view(-1, num_groups, self.group_size)
         absmax = x_grouped.abs().max(dim=-1, keepdim=True)[0].float()
-        scales_raw = absmax / _FP8_MAX
+        scales_raw = absmax / self.fp8_max
         if self.use_ue8m0:
             scales_raw = torch.exp2(torch.ceil(torch.log2(scales_raw)))
-        scales = (scales_raw).clamp(min=_FP8_MIN_SCALING_FACTOR)
+        scales = (scales_raw).clamp(min=self.fp8_min_scaling_factor)
 
         x_scaled = x_grouped / scales
-        x_quant = x_scaled.clamp(_FP8_MIN, _FP8_MAX).to(_FP8_DTYPE)
+        x_quant = x_scaled.clamp(self.fp8_min, self.fp8_max).to(self.quant_dtype)
 
         x_quant = x_quant.view(-1, padded_dim)
         if padded_dim != hidden_dim:

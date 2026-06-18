@@ -9,6 +9,7 @@ from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import PretrainedConfig
 
 import vllm.model_executor.layers.fused_moe  # noqa
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
 )
 from vllm.model_executor.layers.linear import LinearMethodBase, set_weight_attrs
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -449,6 +451,60 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if sm70_tm.is_exact_sm70_cuda(
+            layer.qweight, envs.VLLM_SM70_GPTQ_TURBOMIND
+        ):
+            unsupported = []
+            if self.quant_config.weight_bits != 4:
+                unsupported.append(f"bits={self.quant_config.weight_bits}")
+            if not self.quant_config.is_sym:
+                unsupported.append("asymmetric")
+            if self.quant_config.desc_act:
+                unsupported.append("desc_act")
+            if self.quant_config.group_size not in sm70_tm.GPTQ_GROUP_SIZES:
+                unsupported.append(f"group_size={self.quant_config.group_size}")
+            if self.input_dtype is not None:
+                unsupported.append(f"input_dtype={self.input_dtype}")
+
+            if unsupported:
+                logger.warning_once(
+                    "SM70 TurboMind GPTQ dense path skipped for unsupported "
+                    "configuration: %s. Falling back to %s.",
+                    ", ".join(unsupported),
+                    type(self.kernel).__name__,
+                )
+            else:
+                sm70_tm.prepare_gptq_linear(
+                    layer,
+                    group_size=self.quant_config.group_size,
+                )
+                layer.qweight = torch.nn.Parameter(
+                    torch.empty(
+                        0, dtype=torch.int32, device=layer.qweight.device
+                    ),
+                    requires_grad=False,
+                )
+                layer.qzeros = torch.nn.Parameter(
+                    torch.empty(
+                        0, dtype=torch.int32, device=layer.scales.device
+                    ),
+                    requires_grad=False,
+                )
+                layer.scales = torch.nn.Parameter(
+                    torch.empty(
+                        0, dtype=layer.scales.dtype, device=layer.scales.device
+                    ),
+                    requires_grad=False,
+                )
+                layer.g_idx = torch.nn.Parameter(
+                    torch.empty(
+                        0, dtype=torch.int32, device=layer.scales.device
+                    ),
+                    requires_grad=False,
+                )
+                logger.info_once("SM70 GPTQ TurboMind dense path enabled.")
+                return
+
         self.kernel.process_weights_after_loading(layer)
 
     def apply(
@@ -457,6 +513,8 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if sm70_tm.has_prepared_linear(layer):
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self.kernel.apply_weights(layer, x, bias)
 
 

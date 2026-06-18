@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -22,6 +23,22 @@ logger = init_logger(__name__)
 __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
+def _explicit_nvfp4_emulation_requested() -> bool:
+    if (
+        envs.VLLM_USE_NVFP4_CT_EMULATIONS
+        or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation"
+    ):
+        return True
+
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    return (
+        vllm_config is not None
+        and vllm_config.kernel_config.linear_backend == "emulation"
+    )
+
+
 class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
     def __init__(self):
         self.kernel = init_nvfp4_linear_kernel()
@@ -29,6 +46,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if _explicit_nvfp4_emulation_requested():
+            return 70
         return 75
 
     def create_weights(

@@ -1334,7 +1334,14 @@ class VllmConfig:
                         "configuration: regular torch.compile reproduced "
                         "deterministic greedy token drift."
                     )
-                if "VLLM_DISABLE_COMPILE_CACHE" not in os.environ:
+                if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
+                    logger.warning_once(
+                        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "
+                        "leaving VLLM_DISABLE_COMPILE_CACHE unset for "
+                        "diagnostic profiling. This reuses compile artifacts "
+                        "and is not a quality-parity baseline."
+                    )
+                elif "VLLM_DISABLE_COMPILE_CACHE" not in os.environ:
                     os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
                     logger.info_once(
                         "Auto-setting VLLM_DISABLE_COMPILE_CACHE=1 for SM70 "

@@ -613,6 +613,8 @@ class Worker(WorkerBase):
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
+        if hasattr(self.model_runner, "_warmup_sm70_aux_kernels"):
+            self.model_runner._warmup_sm70_aux_kernels()
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -715,9 +717,6 @@ class Worker(WorkerBase):
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
-
-        if hasattr(self.model_runner, "_warmup_sm70_aux_kernels"):
-            self.model_runner._warmup_sm70_aux_kernels()
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

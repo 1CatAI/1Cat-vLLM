@@ -76,8 +76,12 @@ def get_cmdclass():
     class CustomBuildExtension(BuildExtension):
         def build_extensions(self):
             import torch
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is required but not available.")
+            from torch.utils.cpp_extension import CUDA_HOME
+
+            if CUDA_HOME is None:
+                raise RuntimeError("CUDA toolkit is required but CUDA_HOME is not set.")
+            if torch.version.cuda is None:
+                raise RuntimeError("A CUDA-enabled PyTorch build is required.")
             if parse(torch.version.cuda) < parse("11.6"):
                 raise RuntimeError(
                     f"CUDA version {torch.version.cuda} < 11.6 is not supported. "

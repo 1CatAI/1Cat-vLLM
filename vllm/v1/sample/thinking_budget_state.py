@@ -146,10 +146,26 @@ class ThinkingBudgetStateHolder:
             state["force_index"] = []
             if len(state["output_tok_ids"]) > 0:
                 spec_len = len(state["spec_token_ids"])
+                # In normal bonus-token sampling the row layout is
+                # ``output + all spec``. In rejection-sampler target-logit
+                # processing, ``repeat_indices`` points us at the last per-draft
+                # row, whose layout is only ``output + spec[:-1]``. Strip exactly
+                # the suffix that is present; stripping the full spec length in
+                # the repeated layout drops one real output token.
+                spec_suffix_len = (
+                    max(0, spec_len - 1)
+                    if last_row_for_req is not None
+                    else spec_len
+                )
                 # Only strip draft suffix when there are spec tokens; ``[:-0]`` would
                 # clear the whole list (Python treats stop index 0 as "up to empty").
-                if spec_len > 0 and len(state["output_tok_ids"]) >= spec_len:
-                    state["output_tok_ids"] = state["output_tok_ids"][:-spec_len]
+                if (
+                    spec_suffix_len > 0
+                    and len(state["output_tok_ids"]) >= spec_suffix_len
+                ):
+                    state["output_tok_ids"] = state["output_tok_ids"][
+                        :-spec_suffix_len
+                    ]
             self._update_think_state(state)
 
     def apply_to_logits(

@@ -5,7 +5,10 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_mxfp4_linear_kernel
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
@@ -15,6 +18,8 @@ from vllm.model_executor.parameter import (
 )
 
 __all__ = ["CompressedTensorsW4A4Mxfp4"]
+
+logger = init_logger(__name__)
 
 
 class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
@@ -35,10 +40,14 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
 
     def __init__(self):
         self.group_size = 32
-        self.kernel = init_mxfp4_linear_kernel()
+        self.kernel = (
+            None if envs.VLLM_SM70_MXFP4_TURBOMIND else init_mxfp4_linear_kernel()
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if envs.VLLM_SM70_MXFP4_TURBOMIND:
+            return 70
         return 80
 
     def create_weights(
@@ -82,10 +91,36 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_scale", weight_scale)
 
+    def _fallback_kernel(self):
+        if self.kernel is None:
+            self.kernel = init_mxfp4_linear_kernel()
+        return self.kernel
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if sm70_tm.is_exact_sm70_cuda(
+            layer.weight_packed, envs.VLLM_SM70_MXFP4_TURBOMIND
+        ):
+            logger.info_once(
+                "SM70 compressed-tensors MXFP4 TurboMind dense path enabled."
+            )
+            sm70_tm.prepare_mxfp4_linear(layer)
+            layer.weight_packed = Parameter(
+                torch.empty(
+                    0, dtype=torch.uint8, device=layer.weight_packed.device
+                ),
+                requires_grad=False,
+            )
+            layer.weight_scale = Parameter(
+                torch.empty(
+                    0, dtype=torch.uint8, device=layer.weight_scale.device
+                ),
+                requires_grad=False,
+            )
+            return
+
         layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
         del layer.weight_packed
-        self.kernel.process_weights_after_loading(layer)
+        self._fallback_kernel().process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -93,4 +128,6 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.kernel.apply_weights(layer, x, bias)
+        if sm70_tm.has_prepared_linear(layer):
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
+        return self._fallback_kernel().apply_weights(layer, x, bias)

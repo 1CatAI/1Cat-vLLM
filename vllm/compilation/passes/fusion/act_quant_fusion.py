@@ -289,9 +289,14 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config, "activation_quant_fusion_pass")
 
-        self.register(SiluMulFp8StaticQuantPattern())
+        if kFp8StaticTensorSym in QUANT_OPS and kFp8StaticTensorSym in FUSED_OPS:
+            self.register(SiluMulFp8StaticQuantPattern())
 
-        if silu_and_mul_nvfp4_quant_supported:
+        if (
+            silu_and_mul_nvfp4_quant_supported
+            and kNvfp4Dynamic in QUANT_OPS
+            and kNvfp4Dynamic in FUSED_OPS
+        ):
             self.register(SiluMulNvfp4QuantPattern())
 
         if current_platform.is_cuda():
@@ -306,13 +311,14 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
                 [True, False],
                 [False, True],
             ):
-                self.register(
-                    SiluMulBlockQuantPattern(
-                        quant_key,
-                        is_scale_transposed=is_scale_transposed,
-                        is_e8m0=is_e8m0,
-                        is_tma_aligned=is_tma_aligned,
+                if quant_key in QUANT_OPS and quant_key in FUSED_OPS:
+                    self.register(
+                        SiluMulBlockQuantPattern(
+                            quant_key,
+                            is_scale_transposed=is_scale_transposed,
+                            is_e8m0=is_e8m0,
+                            is_tma_aligned=is_tma_aligned,
+                        )
                     )
-                )
 
         self.dump_patterns(config, self.pm_pass)

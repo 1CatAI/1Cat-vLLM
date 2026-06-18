@@ -60,11 +60,19 @@ bool GemmTraceFilterAllows(const std::string& desc)
 
 const char* ToString(DispatchPolicy policy)
 {
-    if (policy & DispatchPolicy::kPreserveDefaultSplits) {
+    if ((policy & DispatchPolicy::kPreserveDefaultSplits)
+        || (policy & DispatchPolicy::kPreserveDefaultSplitCount)) {
         static thread_local std::string text;
-        auto base = static_cast<DispatchPolicy>(
-            (int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits);
-        text = std::string(ToString(base)) + "|preserve_default_splits";
+        auto base =
+            static_cast<DispatchPolicy>((int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits
+                                        & ~(int)DispatchPolicy::kPreserveDefaultSplitCount);
+        text = std::string(ToString(base));
+        if (policy & DispatchPolicy::kPreserveDefaultSplits) {
+            text += "|preserve_default_splits";
+        }
+        if (policy & DispatchPolicy::kPreserveDefaultSplitCount) {
+            text += "|preserve_default_split_count";
+        }
         return text.c_str();
     }
     switch (policy) {
@@ -429,11 +437,15 @@ int Gemm::Run(const Operation&    operation,
         }
 
         spec = impl_->Dispatch(*dispatch_context, operation.dispatch, workspace.barriers_size, workspace.partials_size);
-        if (spec.kernel && (operation.dispatch & DispatchPolicy::kPreserveDefaultSplits)) {
+        const bool preserve_default_kernel = operation.dispatch & DispatchPolicy::kPreserveDefaultSplits;
+        const bool preserve_default_split_count = operation.dispatch & DispatchPolicy::kPreserveDefaultSplitCount;
+        if (spec.kernel && (preserve_default_kernel || preserve_default_split_count)) {
             auto default_specs = impl_->Find(*dispatch_context, workspace.barriers_size, workspace.partials_size, 1);
             if (!default_specs.empty()) {
                 const auto default_spec = default_specs.front();
-                spec.kernel = default_spec.kernel;
+                if (preserve_default_kernel) {
+                    spec.kernel = default_spec.kernel;
+                }
                 spec.splits = default_spec.splits;
                 const auto& default_desc = dispatch_context->get_desc(*spec.kernel);
                 spec.swizzle = std::min(

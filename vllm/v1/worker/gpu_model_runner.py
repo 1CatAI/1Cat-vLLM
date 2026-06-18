@@ -112,6 +112,10 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
+from vllm.sm70_decode_trace import (
+    sm70_decode_event_trace_enabled,
+    sm70_trace_event_sync,
+)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
@@ -180,6 +184,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.draft_prob_alignment import (
+    clone_draft_prob_token_ids,
+    get_aligned_draft_probs,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -235,6 +243,23 @@ logger = init_logger(__name__)
 _SM70_SAMPLE_TENSOR_DUMP_COUNTER = 0
 _SM70_SAMPLE_SYNC_COUNTER = 0
 _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER = 0
+_SM70_MTP_STEP_DUMP_COUNTER = 0
+_SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = False
+
+
+def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tensor:
+    valid_token_mask = output_token_ids != -1
+    token_offsets = torch.arange(
+        output_token_ids.shape[1],
+        device=output_token_ids.device,
+        dtype=torch.int32,
+    )
+    first_invalid = torch.where(
+        valid_token_mask,
+        output_token_ids.shape[1],
+        token_offsets,
+    ).min(dim=1).values
+    return first_invalid.to(torch.int32)
 
 
 def _sm70_cuda_graph_capture_active() -> bool:
@@ -255,6 +280,72 @@ def _sm70_mtp_profile_env_enabled() -> bool:
 
 def _sm70_mtp_profile_interval() -> int:
     return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
+
+
+def _maybe_dump_sm70_mtp_step(phase: str, payload: dict[str, object]) -> None:
+    dump_dir = os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR")
+    if not dump_dir:
+        return
+
+    global _SM70_MTP_STEP_DUMP_COUNTER
+    _SM70_MTP_STEP_DUMP_COUNTER += 1
+    step = _SM70_MTP_STEP_DUMP_COUNTER
+    target_steps = _sm70_parse_step_filter(
+        os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS")
+    )
+    if target_steps is not None:
+        if step not in target_steps:
+            return
+    else:
+        max_steps = int(os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512"))
+        if max_steps > 0 and step > max_steps:
+            return
+
+    def _to_cpu(value: object) -> object:
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach()
+            max_elems = int(os.getenv("VLLM_SM70_MTP_DUMP_TENSOR_MAX", "512"))
+            if max_elems > 0 and tensor.numel() > max_elems:
+                flat = tensor.reshape(-1)
+                return {
+                    "shape": tuple(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "head": flat[:max_elems].cpu(),
+                    "tail": flat[-max_elems:].cpu(),
+                }
+            return tensor.cpu()
+        if isinstance(value, np.ndarray):
+            max_elems = int(os.getenv("VLLM_SM70_MTP_DUMP_TENSOR_MAX", "512"))
+            if max_elems > 0 and value.size > max_elems:
+                flat = value.reshape(-1)
+                return {
+                    "shape": tuple(value.shape),
+                    "dtype": str(value.dtype),
+                    "head": flat[:max_elems].copy(),
+                    "tail": flat[-max_elems:].copy(),
+                }
+            return value.copy()
+        if isinstance(value, dict):
+            return {str(key): _to_cpu(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(_to_cpu(item) for item in value)
+        return value
+
+    os.makedirs(dump_dir, exist_ok=True)
+    rank = get_tp_group().rank_in_group if torch.distributed.is_initialized() else 0
+    path = os.path.join(
+        dump_dir,
+        f"mtp_step_pid{os.getpid()}_rank{rank}_{step:06d}_{phase}.pt",
+    )
+    torch.save(
+        {
+            "phase": phase,
+            "step": step,
+            **{key: _to_cpu(value) for key, value in payload.items()},
+        },
+        path,
+    )
 
 
 def _sm70_parse_step_filter(raw_steps: str | None) -> set[int] | None:
@@ -467,6 +558,29 @@ def _sm70_profile_trace(message: str, *args: object) -> None:
         logger.info("SM70 profile trace: %s", message)
 
 
+def _maybe_log_sm70_decode_event_trace_config(
+    *,
+    use_async_scheduling: bool,
+    greedy_token_fastpath: bool,
+    num_spec_tokens: int,
+) -> None:
+    if not sm70_decode_event_trace_enabled():
+        return
+    global _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED
+    if _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED:
+        return
+    _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = True
+    logger.warning(
+        "SM70 decode event trace enabled: async_scheduling=%s "
+        "greedy_token_fastpath=%s num_spec_tokens=%s threshold_ms=%s every=%s",
+        use_async_scheduling,
+        greedy_token_fastpath,
+        num_spec_tokens,
+        envs.VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS,
+        envs.VLLM_SM70_DECODE_EVENT_TRACE_EVERY,
+    )
+
+
 _SM70_COMPILE_GRAPH_INPUT_DUMP_STEP = 0
 
 
@@ -540,12 +654,37 @@ def _sm70_dump_compile_graph_inputs(
                 gdn_metadata[str(layer_name)] = {
                     "num_prefills": getattr(metadata, "num_prefills", None),
                     "num_decodes": getattr(metadata, "num_decodes", None),
+                    "num_decode_tokens": getattr(metadata, "num_decode_tokens", None),
+                    "num_spec_decodes": getattr(
+                        metadata, "num_spec_decodes", None
+                    ),
+                    "num_spec_decode_tokens": getattr(
+                        metadata, "num_spec_decode_tokens", None
+                    ),
                     "num_actual_tokens": getattr(metadata, "num_actual_tokens", None),
                     "non_spec_query_start_loc": _sm70_to_cpu_for_dump(
                         getattr(metadata, "non_spec_query_start_loc", None)
                     ),
                     "non_spec_state_indices_tensor": _sm70_to_cpu_for_dump(
                         getattr(metadata, "non_spec_state_indices_tensor", None)
+                    ),
+                    "spec_query_start_loc": _sm70_to_cpu_for_dump(
+                        getattr(metadata, "spec_query_start_loc", None)
+                    ),
+                    "spec_state_indices_tensor": _sm70_to_cpu_for_dump(
+                        getattr(metadata, "spec_state_indices_tensor", None)
+                    ),
+                    "spec_sequence_masks": _sm70_to_cpu_for_dump(
+                        getattr(metadata, "spec_sequence_masks", None)
+                    ),
+                    "spec_token_indx": _sm70_to_cpu_for_dump(
+                        getattr(metadata, "spec_token_indx", None)
+                    ),
+                    "non_spec_token_indx": _sm70_to_cpu_for_dump(
+                        getattr(metadata, "non_spec_token_indx", None)
+                    ),
+                    "num_accepted_tokens": _sm70_to_cpu_for_dump(
+                        getattr(metadata, "num_accepted_tokens", None)
                     ),
                 }
                 break
@@ -644,7 +783,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        sm70_trace_event_sync(
+            self.async_copy_ready_event,
+            "AsyncGPUModelRunnerOutput.async_copy_ready_event.synchronize",
+        )
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -751,7 +893,10 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        self.async_copy_ready_event.synchronize()
+        sm70_trace_event_sync(
+            self.async_copy_ready_event,
+            "AsyncGPUPoolingModelRunnerOutput.async_copy_ready_event.synchronize",
+        )
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
@@ -929,6 +1074,11 @@ class GPUModelRunner(
             if self.speculative_config is not None
             else 0
         )
+        self.num_spec_tokens = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config is not None
+            else 0
+        )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -973,6 +1123,11 @@ class GPUModelRunner(
             envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE
         )
         self._sm70_greedy_token_fastpath_trace_seen: set[str] = set()
+        _maybe_log_sm70_decode_event_trace_config(
+            use_async_scheduling=self.use_async_scheduling,
+            greedy_token_fastpath=self.sm70_greedy_token_fastpath,
+            num_spec_tokens=self.num_spec_tokens,
+        )
 
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
@@ -1087,17 +1242,22 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
-        self.num_spec_tokens = 0
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
-            self.num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_config = self.speculative_config.draft_model_config
             if draft_config is not None and draft_config.max_model_len is not None:
                 self.effective_drafter_max_model_len = draft_config.max_model_len
             else:
                 self.effective_drafter_max_model_len = self.max_model_len
+        self.sync_spec_decode_accept_counts = (
+            self.use_async_scheduling
+            and self.num_spec_tokens > 0
+            and envs.VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS
+        )
         self.use_async_spec_decode = (
-            self.use_async_scheduling and self.num_spec_tokens > 0
+            self.use_async_scheduling
+            and self.num_spec_tokens > 0
+            and not self.sync_spec_decode_accept_counts
         )
 
         # Request states.
@@ -1306,6 +1466,7 @@ class GPUModelRunner(
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
+        self._draft_prob_token_ids: list[list[int]] | torch.Tensor | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -1781,6 +1942,9 @@ class GPUModelRunner(
             )
         if self.use_async_spec_decode:
             self.prev_num_draft_tokens.np.fill(0)
+        sync_valid_sampled_token_count: list[int] | None = None
+        if self.sync_spec_decode_accept_counts:
+            sync_valid_sampled_token_count = self._get_valid_sampled_token_count()
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -1806,6 +1970,14 @@ class GPUModelRunner(
                 # when prev_num_draft_len > 0.
                 if req_index is None:
                     req_state.prev_num_draft_len = 0
+                elif self.sync_spec_decode_accept_counts:
+                    assert self.input_batch.prev_req_id_to_index is not None
+                    assert sync_valid_sampled_token_count is not None
+                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
+                    num_accepted = sync_valid_sampled_token_count[prev_req_index] - 1
+                    num_rejected = req_state.prev_num_draft_len - num_accepted
+                    num_computed_tokens -= num_rejected
+                    req_state.output_token_ids.extend([-1] * num_accepted)
                 else:
                     # Optimistically assume all accepted; queue up a correction
                     # to be called after the model forward to preserve async
@@ -2009,11 +2181,12 @@ class GPUModelRunner(
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
 
-        # Count the number of accepted tokens for each sequence.
-        # Valid tokens are contiguous from position 0, so counting non-(-1)
-        # tokens gives us the first -1 position (i.e., number of accepted).
+        # Count only the contiguous accepted prefix. Values after the first -1
+        # are rejected/padding slots and may contain stale token ids.
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        self.num_accepted_tokens.gpu[:num_reqs] = _count_contiguous_spec_tokens(
+            output_token_ids
+        )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: stage this step's metadata immediately
@@ -2342,13 +2515,36 @@ class GPUModelRunner(
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
+        if not spec_flattened_indices:
             return
 
-        assert isinstance(self._draft_token_ids, torch.Tensor)
+        if self._draft_token_ids is None:
+            raise RuntimeError(
+                "Speculative decode scheduled draft input slots, but the "
+                "worker has no draft token tensor to scatter. Continuing would "
+                "reuse stale GPU input_ids and can corrupt generation."
+            )
+
+        if not isinstance(self._draft_token_ids, torch.Tensor):
+            raise RuntimeError(
+                "Speculative decode scheduled draft input slots, but the "
+                f"worker draft tokens are {type(self._draft_token_ids).__name__} "
+                "instead of a tensor. The scheduler must trim invalid draft "
+                "slots before target verification."
+            )
+
         draft_tokens_index_tensor = torch.tensor(
             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
+        if prev_draft_token_indices:
+            max_prev_draft_index = max(prev_draft_token_indices)
+            if max_prev_draft_index >= self._draft_token_ids.numel():
+                raise RuntimeError(
+                    "Speculative decode scheduled more draft input slots than "
+                    "the worker produced: "
+                    f"required_flat_index={max_prev_draft_index}, "
+                    f"available={self._draft_token_ids.numel()}."
+                )
         prev_draft_token_indices_tensor = torch.tensor(
             prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
@@ -2559,7 +2755,10 @@ class GPUModelRunner(
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
+            sm70_trace_event_sync(
+                self.num_accepted_tokens_event,
+                "GPUModelRunner.num_accepted_tokens_event.synchronize",
+            )
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
@@ -4204,16 +4403,68 @@ class GPUModelRunner(
         # Update spec_token_ids with real draft tokens from pre step only when
         # output_token_ids is needed (penalties or bad_words are in use).
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
-            draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
-            self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+            draft_token_ids_cpu, draft_token_req_ids = self._get_draft_token_ids_cpu()
+            self.input_batch.update_async_spec_token_ids(
+                draft_token_ids_cpu,
+                draft_token_req_ids,
+            )
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.speculative_config.draft_sample_method == "probabilistic"
+            and not sampling_metadata.all_greedy
+            and draft_probs is None
+        ):
+            raise RuntimeError(
+                "MTP probabilistic draft sampling requires draft probability "
+                "rows for exact rejection sampling. Missing draft_probs would "
+                "silently fall back to an invalid no-draft-probability "
+                "acceptance path and can corrupt output quality."
+            )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
             logits,
             sampling_metadata,
         )
+        if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"):
+            sampled_token_ids = sampler_output.sampled_token_ids
+            valid_sampled_count = _count_contiguous_spec_tokens(sampled_token_ids)
+            payload: dict[str, object] = {
+                "req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
+                "sampled_token_ids": sampled_token_ids,
+                "valid_sampled_count": valid_sampled_count,
+                "draft_token_ids": spec_decode_metadata.draft_token_ids,
+                "num_draft_tokens": spec_decode_metadata.num_draft_tokens,
+                "cu_num_draft_tokens": spec_decode_metadata.cu_num_draft_tokens,
+                "cu_num_sampled_tokens": spec_decode_metadata.cu_num_sampled_tokens,
+                "target_logits_indices": spec_decode_metadata.target_logits_indices,
+                "bonus_logits_indices": spec_decode_metadata.bonus_logits_indices,
+                "logits_indices": spec_decode_metadata.logits_indices,
+                "num_computed_tokens_cpu": (
+                    self.input_batch.num_computed_tokens_cpu_tensor[
+                        : self.input_batch.num_reqs
+                    ].clone()
+                ),
+                "num_tokens_no_spec": (
+                    self.input_batch.num_tokens_no_spec[: self.input_batch.num_reqs]
+                ),
+                "num_prompt_tokens": (
+                    self.input_batch.num_prompt_tokens_cpu_tensor[
+                        : self.input_batch.num_reqs
+                    ].clone()
+                ),
+            }
+            logits_indices = spec_decode_metadata.logits_indices
+            payload["sample_input_ids"] = self.input_ids.gpu[logits_indices]
+            payload["sample_positions"] = self.positions[logits_indices]
+            if self.valid_sampled_token_count_gpu is not None:
+                payload["prev_valid_sampled_token_count_gpu"] = (
+                    self.valid_sampled_token_count_gpu
+                )
+            _maybe_dump_sm70_mtp_step("sample_output", payload)
         return sampler_output
 
     def _can_use_greedy_token_fastpath(
@@ -4462,7 +4713,10 @@ class GPUModelRunner(
 
         # Async output processing may still be consuming tensors that input
         # prep reuses on the next step.
-        self.prepare_inputs_event.synchronize()
+        sm70_trace_event_sync(
+            self.prepare_inputs_event,
+            "GPUModelRunner.prepare_inputs_event.synchronize",
+        )
         try:
             yield
         finally:
@@ -5241,6 +5495,7 @@ class GPUModelRunner(
         self._draft_token_ids = None
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        self._draft_prob_token_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -5341,17 +5596,25 @@ class GPUModelRunner(
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
             if not input_fits_in_drafter:
-                # Zero out draft tokens so the scheduler doesn't schedule
-                # stale drafts from the previous step.
-                # For Nemotron-H: it is necessary to zero out the draft tokens,
-                # otherwise the stale tokens will corrupt Mamba recurrent
-                # state and logprobs for sequences near max_model_len.
-                self._draft_token_ids = torch.zeros(
-                    1, device=self.device, dtype=torch.int32
-                ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                # Do not schedule any new drafts once the drafter cannot cover
+                # the current context. Returning zero-filled draft rows would
+                # make token id 0 look like a real speculative token to the
+                # scheduler and verifier.
+                logger.warning_once(
+                    "Skipping speculative drafts because the drafter context "
+                    "limit is reached: max_seq_len=%s, num_spec_tokens=%s, "
+                    "effective_drafter_max_model_len=%s.",
+                    spec_decode_common_attn_metadata.max_seq_len
+                    if spec_decode_common_attn_metadata is not None
+                    else None,
+                    self.num_spec_tokens,
+                    self.effective_drafter_max_model_len,
+                )
+                self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
-                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+                self._draft_prob_token_ids = None
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             mtp_bookkeeping_wall_start = (
@@ -5569,13 +5832,19 @@ class GPUModelRunner(
 
     def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
         if isinstance(self._draft_token_ids, list):
-            return self._draft_token_ids, self.input_batch.req_ids
+            req_ids = self._draft_token_req_ids
+            if req_ids is None:
+                req_ids = self.input_batch.req_ids.copy()
+            return self._draft_token_ids, req_ids
         req_ids = self._draft_token_req_ids
         if req_ids is None:
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
-        self.draft_token_ids_event.synchronize()
+        sm70_trace_event_sync(
+            self.draft_token_ids_event,
+            "GPUModelRunner.draft_token_ids_event.synchronize",
+        )
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
     def _copy_valid_sampled_token_count(
@@ -5609,37 +5878,22 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        sampled_count_event.synchronize()
+        sm70_trace_event_sync(
+            sampled_count_event,
+            "GPUModelRunner.valid_sampled_token_count_event.synchronize",
+        )
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def _get_spec_decode_draft_probs(
         self, spec_decode_metadata: SpecDecodeMetadata
     ) -> torch.Tensor | None:
-        if self._draft_probs is None or self._draft_prob_req_ids is None:
-            return None
-
-        row_by_req_id = {
-            req_id: idx for idx, req_id in enumerate(self._draft_prob_req_ids)
-        }
-        draft_probs_rows: list[torch.Tensor] = []
-        for req_id, num_draft in zip(
-            self.input_batch.req_ids, spec_decode_metadata.num_draft_tokens
-        ):
-            if num_draft == 0:
-                continue
-            row_idx = row_by_req_id.get(req_id)
-            if row_idx is None:
-                logger.warning(
-                    "Missing cached draft probabilities for request %s; "
-                    "falling back to legacy speculative rejection behavior.",
-                    req_id,
-                )
-                return None
-            draft_probs_rows.append(self._draft_probs[row_idx, :num_draft])
-
-        if not draft_probs_rows:
-            return None
-        return torch.cat(draft_probs_rows, dim=0).contiguous()
+        return get_aligned_draft_probs(
+            req_ids=self.input_batch.req_ids,
+            draft_probs=self._draft_probs,
+            draft_prob_req_ids=self._draft_prob_req_ids,
+            draft_prob_token_ids=self._draft_prob_token_ids,
+            spec_decode_metadata=spec_decode_metadata,
+        )
 
     def propose_draft_token_ids(
         self,
@@ -5658,6 +5912,7 @@ class GPUModelRunner(
         assert spec_config is not None
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        self._draft_prob_token_ids = None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -5883,6 +6138,50 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
+            if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR") and spec_config.method == "mtp":
+                payload = {
+                    "req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
+                    "sampled_token_ids": sampled_token_ids,
+                    "next_token_ids": next_token_ids,
+                    "token_indices_to_sample": token_indices_to_sample,
+                    "num_rejected_tokens_gpu": num_rejected_tokens_gpu,
+                    "target_token_ids": target_token_ids,
+                    "target_positions": target_positions,
+                    "target_hidden_shape": tuple(target_hidden_states.shape),
+                    "common_query_start_loc": common_attn_metadata.query_start_loc,
+                    "common_query_start_loc_cpu": (
+                        common_attn_metadata.query_start_loc_cpu
+                    ),
+                    "common_seq_lens": common_attn_metadata.seq_lens,
+                    "common_seq_lens_cpu": common_attn_metadata._seq_lens_cpu,
+                    "common_seq_lens_cpu_upper_bound": (
+                        common_attn_metadata.seq_lens_cpu_upper_bound
+                    ),
+                    "common_num_computed_tokens_cpu": (
+                        common_attn_metadata._num_computed_tokens_cpu
+                    ),
+                    "common_max_query_len": common_attn_metadata.max_query_len,
+                    "common_max_seq_len": common_attn_metadata.max_seq_len,
+                    "common_slot_mapping": common_attn_metadata.slot_mapping,
+                }
+                if spec_decode_metadata is not None:
+                    payload.update(
+                        {
+                            "spec_num_draft_tokens": (
+                                spec_decode_metadata.num_draft_tokens
+                            ),
+                            "spec_cu_num_draft_tokens": (
+                                spec_decode_metadata.cu_num_draft_tokens
+                            ),
+                            "spec_draft_token_ids": (
+                                spec_decode_metadata.draft_token_ids
+                            ),
+                        }
+                    )
+                if "valid_sampled_tokens_count" in locals():
+                    payload["valid_sampled_tokens_count"] = valid_sampled_tokens_count
+                _maybe_dump_sm70_mtp_step("draft_input", payload)
+
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
                 mm_embed_inputs = self._gather_mm_embeddings(
                     scheduler_output,
@@ -5903,11 +6202,27 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR") and spec_config.method == "mtp":
+                _maybe_dump_sm70_mtp_step(
+                    "draft_output",
+                    {
+                        "req_ids": list(
+                            self.input_batch.req_ids[: self.input_batch.num_reqs]
+                        ),
+                        "draft_token_ids": draft_token_ids,
+                        "num_rejected_tokens_gpu": num_rejected_tokens_gpu,
+                        "token_indices_to_sample": token_indices_to_sample,
+                        "next_token_ids": next_token_ids,
+                    },
+                )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+                    self._draft_prob_token_ids = clone_draft_prob_token_ids(
+                        draft_token_ids
+                    )
 
         return draft_token_ids
 
@@ -7617,11 +7932,13 @@ class GPUModelRunner(
                         batch_desc.num_tokens,
                         use_cudagraphs=False,
                         is_graph_capturing=False,
+                        spec_step_idx=batch_desc.graph_variant,
                     )
                 drafter.dummy_run(
                     batch_desc.num_tokens,
                     use_cudagraphs=True,
                     is_graph_capturing=True,
+                    spec_step_idx=batch_desc.graph_variant,
                 )
                 torch.accelerator.synchronize()
 
@@ -8432,7 +8749,10 @@ class GPUModelRunner(
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
-        self.transfer_event.synchronize()
+        sm70_trace_event_sync(
+            self.transfer_event,
+            "GPUModelRunner.transfer_event.synchronize",
+        )
         return pinned.tolist()
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:

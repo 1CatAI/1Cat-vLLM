@@ -12,8 +12,10 @@ logger = init_logger(__name__)
 class AsyncScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # reusable read-only placeholder list for speculative decoding.
-        self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+        # Template for speculative decoding placeholders. Each request must get
+        # its own list instance because scheduler outputs and worker feedback
+        # mutate spec-token rows in later phases.
+        self._spec_token_placeholders: tuple[int, ...] = (-1,) * self.num_spec_tokens
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -32,7 +34,7 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            request.spec_token_ids = list(self._spec_token_placeholders)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

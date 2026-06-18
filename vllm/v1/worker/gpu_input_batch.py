@@ -8,6 +8,7 @@ from typing import cast
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config.reasoning import ReasoningConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -1059,14 +1060,27 @@ class InputBatch:
                 self.async_copy_ready_event.synchronize()
                 sampled_token_ids = self.sampled_token_ids_cpu.tolist()
             # Replace placeholder token id(s) with actual sampled id(s).
-            new_ids: list[int] = sampled_token_ids[prev_index]
-            if not new_ids:
+            sampled_ids: list[int] = sampled_token_ids[prev_index]
+            if not sampled_ids:
                 continue
-            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            num_sampled_ids = (
+                len(sampled_ids) if sampled_ids[-1] != -1 else sampled_ids.index(-1)
+            )
+            if envs.VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR:
+                first_placeholder = req_output_token_ids.index(-1)
+                num_placeholders = len(req_output_token_ids) - first_placeholder
+                num_to_replace = min(num_sampled_ids, num_placeholders)
+                new_ids = sampled_ids[:num_to_replace]
+                end_index = first_placeholder + num_to_replace
+                req_output_token_ids[first_placeholder:end_index] = new_ids
+                continue
+
             # Also account for case where there may be a smaller number of
             # output placeholders (tokens can be discarded after kv-load
             # failure) or a larger number (async spec decode adds optimistic
             # placeholders that may exceed the actual acceptance count).
+            old_no_spec_end = int(self.num_tokens_no_spec[index])
+            old_active_end = old_no_spec_end + len(self.spec_token_ids[index])
             first_placeholder = len(req_output_token_ids)
             while (
                 first_placeholder > 0
@@ -1075,29 +1089,107 @@ class InputBatch:
                 first_placeholder -= 1
             num_placeholders = len(req_output_token_ids) - first_placeholder
             num_to_replace = min(num_sampled_ids, num_placeholders)
-            del new_ids[num_to_replace:]
+            new_ids = sampled_ids[:num_to_replace]
             req_output_token_ids[first_placeholder:] = new_ids
             # ^ Implicitly resizes to (first_placeholder + num_to_replace)
 
-    def update_async_spec_token_ids(self, draft_token_ids: list[list[int]]) -> None:
+            prompt_len = int(self.num_prompt_tokens[index])
+            write_start = prompt_len + first_placeholder
+            new_no_spec_end = prompt_len + len(req_output_token_ids)
+            if new_ids:
+                self.token_ids_cpu[index, write_start:new_no_spec_end] = new_ids
+                self.is_token_ids[index, write_start:new_no_spec_end] = True
+
+            spec_ids = self.spec_token_ids[index]
+            if spec_ids:
+                spec_end = new_no_spec_end + len(spec_ids)
+                self.token_ids_cpu[index, new_no_spec_end:spec_end] = spec_ids
+                self.is_token_ids[index, new_no_spec_end:spec_end] = True
+                new_active_end = spec_end
+            else:
+                new_active_end = new_no_spec_end
+
+            if new_active_end < old_active_end:
+                self.token_ids_cpu[index, new_active_end:old_active_end] = 0
+                self.is_token_ids[index, new_active_end:old_active_end] = False
+            self.num_tokens_no_spec[index] = new_no_spec_end
+
+    def _valid_async_draft_prefix(
+        self,
+        draft_ids: list[int],
+        zero_row_is_sentinel: bool = False,
+    ) -> list[int]:
+        if not draft_ids:
+            return []
+        # A zero-filled row is a legacy "no draft copied" sentinel only when
+        # the scheduler row itself was also zero-filled. In the normal async
+        # path token id 0 is valid and must not be discarded.
+        if zero_row_is_sentinel and all(token_id == 0 for token_id in draft_ids):
+            return []
+
+        valid_ids: list[int] = []
+        for token_id in draft_ids:
+            if token_id < 0 or token_id >= self.vocab_size:
+                break
+            valid_ids.append(token_id)
+        return valid_ids
+
+    def update_async_spec_token_ids(
+        self,
+        draft_token_ids: list[list[int]],
+        draft_token_req_ids: list[str] | None = None,
+    ) -> None:
         """
         In async scheduling case, update spec_token_ids in sampling metadata with
         real draft token ids from prior step. This is called right before they are
         needed by the rejection sampler for penalty/bad_words computation.
         """
-        if not draft_token_ids or not self.prev_req_id_to_index:
+        if not draft_token_ids:
             return
 
         if (spec_token_ids := self.sampling_metadata.spec_token_ids) is not None:
-            for req_id, spec_ids in zip(self.req_ids, spec_token_ids):
+            draft_ids_by_req_id = (
+                dict(zip(draft_token_req_ids, draft_token_ids))
+                if draft_token_req_ids is not None
+                else None
+            )
+            for req_index, (req_id, spec_ids) in enumerate(
+                zip(self.req_ids, spec_token_ids)
+            ):
                 if spec_ids:
-                    prev_index = self.prev_req_id_to_index.get(req_id)
-                    if prev_index is not None:
-                        draft_ids = draft_token_ids[prev_index]
-                        if draft_ids:
-                            del draft_ids[len(spec_ids) :]
-                            spec_ids.clear()
-                            spec_ids.extend(draft_ids)
+                    if draft_ids_by_req_id is not None:
+                        draft_ids = draft_ids_by_req_id.get(req_id)
+                    else:
+                        if not self.prev_req_id_to_index:
+                            continue
+                        prev_index = self.prev_req_id_to_index.get(req_id)
+                        draft_ids = (
+                            None if prev_index is None else draft_token_ids[prev_index]
+                        )
+                    if draft_ids is None:
+                        continue
+
+                    current_spec_ids_are_zero = all(
+                        token_id == 0 for token_id in spec_ids
+                    )
+                    valid_draft_ids = self._valid_async_draft_prefix(
+                        draft_ids,
+                        zero_row_is_sentinel=current_spec_ids_are_zero,
+                    )
+                    if valid_draft_ids:
+                        replacement = valid_draft_ids[: len(spec_ids)]
+                        if len(replacement) < len(spec_ids):
+                            replacement.extend(
+                                [-1] * (len(spec_ids) - len(replacement))
+                            )
+                        spec_ids[:] = replacement
+                    elif current_spec_ids_are_zero:
+                        spec_ids[:] = [-1] * len(spec_ids)
+
+                    start_index = int(self.num_tokens_no_spec[req_index])
+                    end_index = start_index + len(spec_ids)
+                    self.token_ids_cpu[req_index, start_index:end_index] = spec_ids
+                    self.is_token_ids[req_index, start_index:end_index] = True
 
     @property
     def num_reqs(self) -> int:

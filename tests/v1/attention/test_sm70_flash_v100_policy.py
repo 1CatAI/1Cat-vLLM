@@ -273,6 +273,50 @@ def test_flash_v100_decode_shape_hints_stay_backend_local(
     assert capture_metadata.flash_v100_static_decode_seq_hint == 1025
 
 
+def test_flash_v100_capture_decode_workspace_covers_graph_max_seq_len(
+    local_flash_v100_model,
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=2048,
+        max_num_seqs=1,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1025], query_lens=[1]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.max_seq_len = 2048
+    common.block_table_tensor = torch.zeros(
+        (1, 2048 // 16),
+        dtype=torch.int32,
+        device=torch.device("cpu"),
+    )
+
+    capture_metadata = builder.build_for_cudagraph_capture(common)
+
+    assert capture_metadata.flash_v100_decode_max_seq_len_hint == 1025
+    assert capture_metadata.flash_v100_decode_workspace_seq_capacity_hint == 2048
+    assert capture_metadata.flash_v100_static_decode_seq_hint == 2048
+
+
 def test_flash_v100_smallq_cudagraph_metadata_uses_persistent_buffers(
     monkeypatch,
     local_flash_v100_model,

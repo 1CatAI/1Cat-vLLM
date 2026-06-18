@@ -10,12 +10,14 @@ import torch.nn.functional as F
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
     sample_recovered_tokens,
 )
+import vllm.v1.sample.rejection_sampler as rejection_sampler_module
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
@@ -149,6 +151,63 @@ def test_perfect_match(rejection_sampler):
     )
     expected = torch.tensor([[1, 2, 3, 4]], dtype=torch.int, device=logits.device)
     assert torch.equal(output.sampled_token_ids, expected)
+
+
+def test_rejection_sampler_updates_thinking_budget_state(rejection_sampler):
+    """Spec target-logit processing must refresh thinking-budget state.
+
+    Regular sampling calls holder.update_state before applying thinking masks.
+    Rejection sampling expands each request into per-draft target-logit rows,
+    so it must pass repeat_indices to make the holder pick the final row for
+    each request instead of using stale request-level state.
+    """
+
+    class FakeThinkingBudgetHolder:
+        def __init__(self):
+            self.update_calls = []
+            self.apply_calls = []
+
+        def has_tracked_requests(self):
+            return True
+
+        def update_state(self, output_token_ids, spec_token_ids, repeat_indices):
+            self.update_calls.append(
+                (
+                    [list(row) for row in output_token_ids],
+                    [list(row) for row in spec_token_ids],
+                    repeat_indices.detach().cpu().tolist(),
+                )
+            )
+
+        def apply_to_logits(self, logits, predict_bonus_token, spec_token_ids):
+            self.apply_calls.append(
+                (predict_bonus_token, [list(row) for row in spec_token_ids])
+            )
+            return logits
+
+    logits = torch.zeros((3, 100), device=DEVICE_TYPE)
+    spec_decode_metadata = create_spec_decode_metadata([[11, 12], [21]], logits)
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=True,
+        output_token_ids=[[100], [200]],
+        spec_token_ids=[[11, 12], [21]],
+    )
+    holder = FakeThinkingBudgetHolder()
+    sampling_metadata.thinking_budget_state_holder = holder
+
+    result = rejection_sampler.apply_logits_processors(
+        logits.clone(), sampling_metadata, spec_decode_metadata
+    )
+
+    assert result.shape == logits.shape
+    assert holder.update_calls == [
+        (
+            [[100], [100, 11], [200]],
+            [[11, 12], [21]],
+            [0, 0, 1],
+        )
+    ]
+    assert holder.apply_calls == [(False, [[11, 12], [21]])]
 
 
 def test_early_mismatch(rejection_sampler):
@@ -306,6 +365,73 @@ def test_parametrized_cases(rejection_sampler, spec_tokens, output_tokens, expec
 
 
 ########################### Tests for Random Sampling ###################
+def test_token_matching_path_is_used_for_safe_mtp_stochastic_sampling(
+    rejection_sampler, monkeypatch
+):
+    """0.0.3 MTP stochastic token matching must remain reachable.
+
+    This avoids falling back to the no-draft-probs standard rejection path,
+    which accepts a draft token with probability target_prob and is not the
+    quality-validated 0.0.3 behavior for this SM70 MTP route.
+    """
+
+    monkeypatch.setenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "1")
+    expected = torch.tensor([[11, 12, 99]], dtype=torch.int32, device=DEVICE_TYPE)
+    calls = {"expand": 0, "token_match": 0}
+
+    def fake_expand(x, cu_num_tokens, num_tokens, replace_from=0, replace_to=0):
+        calls["expand"] += 1
+        return x.repeat_interleave(torch.tensor([num_tokens], device=x.device))
+
+    def fake_token_match(metadata, sampled_token_ids):
+        calls["token_match"] += 1
+        assert sampled_token_ids.tolist() == [11, 12, 99]
+        return expected
+
+    monkeypatch.setattr(rejection_sampler_module, "expand_batch_to_tokens", fake_expand)
+    monkeypatch.setattr(rejection_sampler_module, "token_match_sample", fake_token_match)
+
+    logits = torch.zeros((3, 32), device=DEVICE_TYPE)
+    spec_decode_metadata = SpecDecodeMetadata(
+        draft_token_ids=torch.tensor([11, 12], dtype=torch.int32, device=DEVICE_TYPE),
+        num_draft_tokens=[2],
+        cu_num_draft_tokens=torch.tensor([2], dtype=torch.int32, device=DEVICE_TYPE),
+        cu_num_sampled_tokens=torch.tensor([3], dtype=torch.int32, device=DEVICE_TYPE),
+        target_logits_indices=torch.tensor(
+            [0, 1], dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        bonus_logits_indices=torch.tensor([2], dtype=torch.int32, device=DEVICE_TYPE),
+        logits_indices=torch.arange(3, dtype=torch.int32, device=DEVICE_TYPE),
+    )
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.tensor([0.7], dtype=torch.float32, device=DEVICE_TYPE),
+        top_k=torch.tensor([20], dtype=torch.int32, device=DEVICE_TYPE),
+        top_p=torch.tensor([0.95], dtype=torch.float32, device=DEVICE_TYPE),
+    )
+    # Latest vLLM installs MinTokensLogitsProcessor under spec decode. When
+    # min_tokens is inactive it is a no-op and must not block the 0.0.3
+    # token-matching route.
+    min_tokens_proc = MinTokensLogitsProcessor.__new__(MinTokensLogitsProcessor)
+    min_tokens_proc.min_toks = {}
+    sampling_metadata.logitsprocs = LogitsProcessors([min_tokens_proc])
+    rejection_sampler.sampler.return_value = SamplerOutput(
+        sampled_token_ids=torch.tensor([11, 12, 99], device=DEVICE_TYPE),
+        logprobs_tensors=None,
+    )
+
+    output = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=sampling_metadata,
+    )
+
+    assert torch.equal(output.sampled_token_ids, expected)
+    assert calls == {"expand": 3, "token_match": 1}
+    rejection_sampler.sampler.assert_called_once()
+
+
 @pytest.mark.parametrize("k", [1, 3, 5])
 @pytest.mark.parametrize("vocab_size", [1000])
 @pytest.mark.parametrize("batch_size", [1, 4, 8])

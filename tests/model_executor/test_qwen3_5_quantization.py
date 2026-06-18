@@ -4,6 +4,41 @@
 from unittest.mock import Mock, patch
 
 
+class _QuantConfig:
+    pass
+
+
+def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    quant_config = _QuantConfig()
+    quant_config.ignore = [
+        "model.language_model.layers.0.linear_attn.in_proj_b",
+        "model.language_model.layers.0.linear_attn.in_proj_a",
+    ]
+    quant_config.config = {}
+
+    assert _uses_split_gdn_input_projections(quant_config)
+
+
+def test_qwen3_5_split_gdn_detects_compressed_tensors_config_ignore():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    quant_config = _QuantConfig()
+    quant_config.config = {
+        "ignore": [
+            "model.language_model.layers.0.linear_attn.in_proj_b",
+            "model.language_model.layers.0.linear_attn.in_proj_a",
+        ],
+    }
+
+    assert _uses_split_gdn_input_projections(quant_config)
+
+
 def test_qwen3_5_lm_head_receives_quant_config():
     from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
 
@@ -52,9 +87,11 @@ def test_qwen3_5_mtp_lm_head_receives_quant_config():
     mock_hf_config.tie_word_embeddings = False
     mock_hf_config.vocab_size = 128
     mock_hf_config.hidden_size = 64
+    mock_hf_config.quantization_config = None
 
     mock_vllm_config = Mock()
     mock_vllm_config.model_config.hf_text_config = mock_hf_config
+    mock_vllm_config.model_config.hf_config = None
     mock_vllm_config.cache_config.mamba_cache_mode = "align"
     mock_vllm_config.compilation_config.mode = CompilationMode.NONE
     mock_vllm_config.quant_config = mock_quant_config
@@ -66,6 +103,7 @@ def test_qwen3_5_mtp_lm_head_receives_quant_config():
         patch("vllm.model_executor.models.qwen3_5_mtp.Qwen3_5MultiTokenPredictor"),
         patch("vllm.model_executor.models.qwen3_5_mtp.ParallelLMHead") as MockLMHead,
         patch("vllm.model_executor.models.qwen3_5_mtp.LogitsProcessor"),
+        patch.dict("os.environ", {"VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS": "0"}),
         patch(
             "vllm.model_executor.models.qwen3_5_mtp.get_pp_group",
             return_value=mock_pp_group,

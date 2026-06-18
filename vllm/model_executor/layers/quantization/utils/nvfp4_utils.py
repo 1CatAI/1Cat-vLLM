@@ -58,7 +58,10 @@ def cutlass_fp4_supported() -> bool:
         return False
     capability_tuple = current_platform.get_device_capability()
     capability = -1 if capability_tuple is None else capability_tuple.to_int()
-    return cutlass_scaled_mm_supports_fp4(capability)
+    try:
+        return cutlass_scaled_mm_supports_fp4(capability)
+    except AttributeError:
+        return False
 
 
 def pad_nvfp4_weight_for_cutlass(

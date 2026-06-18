@@ -155,6 +155,9 @@ def _sm70_tune_policy() -> dict[str, Any]:
     awq_preserve_splits_raw = os.environ.get(
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS"
     )
+    awq_preserve_splits_only_raw = os.environ.get(
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY"
+    )
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
@@ -162,11 +165,17 @@ def _sm70_tune_policy() -> dict[str, Any]:
     return {
         "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": awq_tune_raw,
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": awq_preserve_splits_raw,
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": (
+            awq_preserve_splits_only_raw
+        ),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "awq_tune0_pinned_effective": awq_tune0_pinned,
         "awq_preserve_default_splits_effective": (
             awq_preserve_splits_raw is None
             or _atoi_nonzero(awq_preserve_splits_raw)
+        ),
+        "awq_preserve_default_splits_only_effective": _atoi_nonzero(
+            awq_preserve_splits_only_raw
         ),
         "awq_moe_safe_default_selector_effective": (
             awq_moe_safe_default_selector
@@ -291,9 +300,23 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": os.environ.get(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS"
         ),
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": os.environ.get(
+            "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY"
+        ),
+        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": os.environ.get(
+            "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING"
+        ),
         "awq_preserve_default_splits_effective": _env_bool(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS",
             True,
+        ),
+        "awq_preserve_default_splits_only_effective": _env_bool(
+            "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY",
+            False,
+        ),
+        "allow_compile_cache_for_profiling_effective": _env_bool(
+            "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING",
+            False,
         ),
         "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": os.environ.get(
             "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M"

@@ -1083,6 +1083,52 @@ def test_thinking_budget_holder_update_state_repeat_indices_last_row_wins():
     assert h._state[0]["output_tok_ids"] == out_lists[1]
 
 
+def test_thinking_budget_holder_spec_repeat_rows_strip_only_present_drafts():
+    h = ThinkingBudgetStateHolder(
+        MockReasoningConfig(),
+        8,
+        4,
+        torch.device("cpu"),
+        False,
+    )
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(thinking_token_budget=32),
+                    None,
+                    [THINK_START_TOKEN_ID],
+                )
+            ],
+            moved=(),
+        )
+    )
+
+    base_output = [THINK_START_TOKEN_ID, 10, 11, 12]
+    spec_tokens = [101, 102, 103, 104]
+    # RejectionSampler._combine_outputs_with_spec_tokens builds one row for
+    # each draft target-logit position: output, output+spec[0], ...
+    # output+spec[:-1]. update_state selects the last row via repeat_indices.
+    repeated_rows = [
+        base_output,
+        [*base_output, 101],
+        [*base_output, 101, 102],
+        [*base_output, 101, 102, 103],
+    ]
+
+    h.update_state(
+        repeated_rows,
+        [spec_tokens],
+        torch.tensor([0, 0, 0, 0], dtype=torch.long),
+    )
+
+    assert h._state[0]["output_tok_ids"] == base_output
+    assert h._state[0]["spec_token_ids"] == spec_tokens
+
+
 def test_thinking_budget_holder_spec_mode_tensor_layout():
     h = ThinkingBudgetStateHolder(
         MockReasoningConfig(),

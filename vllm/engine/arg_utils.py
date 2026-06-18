@@ -1832,6 +1832,14 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
+        if self.enable_prefix_caching is None and has_linear_attention:
+            # 0.0.3 ran native SM70 MTP on hybrid Qwen/GDN with prefix caching
+            # enabled, then pinned Mamba state to align mode. Leaving prefix
+            # disabled routes GDN through the fixed speculative state slots
+            # instead of the block-aligned state movement path and is not the
+            # validated production baseline.
+            self.enable_prefix_caching = True
+            profile_updates.append("enable_prefix_caching=True")
         if (
             self.enable_prefix_caching
             and has_linear_attention
@@ -1886,8 +1894,8 @@ class EngineArgs:
         self.tokenizer = model_config.tokenizer
 
         self._check_feature_supported()
-        self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
+        self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
         if not is_interleaved(model_config.hf_text_config):

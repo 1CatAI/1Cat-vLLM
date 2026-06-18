@@ -1955,6 +1955,7 @@ def scaled_fp8_quant(
     use_per_token_if_dynamic: bool = False,
     output: torch.Tensor | None = None,
     group_shape: tuple[int, int] | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to FP8 and return quantized tensor and scale.
@@ -1992,7 +1993,7 @@ def scaled_fp8_quant(
     assert input.ndim == 2
     shape: tuple[int, int] | torch.Size = input.shape
     # For ROCm on MI300, the output fp8 dtype is torch.float_e3m3fnuz
-    out_dtype: torch.dtype = current_platform.fp8_dtype()
+    out_dtype: torch.dtype = output_dtype or current_platform.fp8_dtype()
     if num_token_padding:
         shape = (max(num_token_padding, input.shape[0]), shape[1])
     if output is None:

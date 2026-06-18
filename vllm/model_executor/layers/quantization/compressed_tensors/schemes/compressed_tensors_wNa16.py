@@ -6,12 +6,14 @@ from collections.abc import Callable
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinLinearKernel,
     MPLinearLayerConfig,
     choose_mp_linear_kernel,
 )
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
@@ -77,6 +79,8 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND:
+            return 70
         # Turing and up
         return 75
 
@@ -220,9 +224,73 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if sm70_tm.is_exact_sm70_cuda(
+            layer.weight_packed,
+            envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND,
+        ):
+            unsupported = []
+            if self.quant_type.size_bits != 4:
+                unsupported.append(f"bits={self.quant_type.size_bits}")
+            if self.has_g_idx:
+                unsupported.append("actorder")
+            if self.group_size not in sm70_tm.COMPRESSED_UINT4_GROUP_SIZES:
+                unsupported.append(f"group_size={self.group_size}")
+
+            if unsupported:
+                logger.warning_once(
+                    "SM70 TurboMind compressed-tensors dense path skipped for "
+                    "unsupported configuration: %s. Falling back to %s.",
+                    ", ".join(unsupported),
+                    type(self.kernel).__name__,
+                )
+            else:
+                sm70_tm.prepare_compressed_uint4_linear(
+                    layer,
+                    group_size=self.group_size,
+                    symmetric=bool(self.symmetric),
+                )
+                layer.weight_packed = torch.nn.Parameter(
+                    torch.empty(
+                        0, dtype=torch.int32, device=layer.weight_packed.device
+                    ),
+                    requires_grad=False,
+                )
+                layer.weight_scale = torch.nn.Parameter(
+                    torch.empty(
+                        0,
+                        dtype=layer.weight_scale.dtype,
+                        device=layer.weight_scale.device,
+                    ),
+                    requires_grad=False,
+                )
+                if hasattr(layer, "weight_zero_point"):
+                    layer.weight_zero_point = torch.nn.Parameter(
+                        torch.empty(
+                            0,
+                            dtype=torch.int32,
+                            device=layer.weight_scale.device,
+                        ),
+                        requires_grad=False,
+                    )
+                if hasattr(layer, "weight_g_idx"):
+                    layer.weight_g_idx = torch.nn.Parameter(
+                        torch.empty(
+                            0,
+                            dtype=torch.int32,
+                            device=layer.weight_scale.device,
+                        ),
+                        requires_grad=False,
+                    )
+                logger.info_once(
+                    "SM70 compressed-tensors int4 TurboMind dense path enabled."
+                )
+                return
+
         self.kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
+        if sm70_tm.has_prepared_linear(layer):
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self.kernel.apply_weights(layer, x, bias)

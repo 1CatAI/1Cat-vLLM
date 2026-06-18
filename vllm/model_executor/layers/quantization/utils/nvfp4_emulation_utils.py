@@ -20,6 +20,36 @@ FLOAT4_E2M1_MAX_RECIPROCAL = 1 / FLOAT4_E2M1_MAX
 kE2M1ToFloat_handle = SimpleNamespace(
     val=torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 )
+_TRITON_NVFP4_EMULATION_SUPPORTED: bool | None = None
+
+
+def _supports_triton_nvfp4_emulation(device: torch.device | None = None) -> bool:
+    if device is not None and device.type != "cuda":
+        return False
+
+    global _TRITON_NVFP4_EMULATION_SUPPORTED
+    if _TRITON_NVFP4_EMULATION_SUPPORTED is None:
+        _TRITON_NVFP4_EMULATION_SUPPORTED = (
+            current_platform.is_cuda_alike()
+            and current_platform.has_device_capability(89)
+        )
+    return _TRITON_NVFP4_EMULATION_SUPPORTED
+
+
+def _quantize_e4m3fn_scale(scale: torch.Tensor) -> torch.Tensor:
+    if not scale.is_cuda or _supports_triton_nvfp4_emulation(scale.device):
+        return scale.to(torch.float8_e4m3fn).to(torch.float32)
+
+    # Triton cannot compile fp8e4nv on SM70. Keep the emulation path graphable
+    # by rounding to the E4M3 grid with float32 operations.
+    scale = torch.clamp(scale, min=0.0, max=448.0)
+    safe_scale = torch.clamp(scale, min=2.0**-9)
+    exponent = torch.clamp(torch.floor(torch.log2(safe_scale)), min=-6.0, max=8.0)
+    step = torch.pow(2.0, exponent - 3.0)
+    step = torch.where(scale < 2.0**-6, torch.full_like(step, 2.0**-9), step)
+    rounded = torch.round(scale / step) * step
+    rounded = torch.clamp(rounded, min=0.0, max=448.0)
+    return torch.where(scale == 0.0, torch.zeros_like(rounded), rounded)
 
 
 @triton.jit
@@ -339,6 +369,10 @@ def break_fp4_bytes(a, dtype):
     abs_vals = (combined & 0x07).to(torch.long)
 
     kE2M1 = kE2M1ToFloat_handle.val
+    if kE2M1.device != abs_vals.device:
+        kE2M1 = kE2M1.to(abs_vals.device)
+        if not torch.compiler.is_compiling():
+            kE2M1ToFloat_handle.val = kE2M1
     # Device-aware lookup and sign application
     values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
     # Reshape to final form
@@ -372,7 +406,7 @@ def dequantize_to_dtype(
     # Two fp4 values are packed into one uint8.
     assert tensor_fp4.dtype == torch.uint8
 
-    if not swizzle and current_platform.is_cuda_alike():
+    if not swizzle and _supports_triton_nvfp4_emulation(tensor_fp4.device):
         return _triton_dequantize_nvfp4(
             tensor_fp4, tensor_sf, global_scale, dtype, block_size
         )
@@ -443,8 +477,8 @@ def ref_nvfp4_quant(x, global_scale, block_size):
     x = torch.reshape(x, (m, n // block_size, block_size))
     vec_max = torch.max(torch.abs(x), dim=-1, keepdim=True)[0].to(torch.float32)
     scale = global_scale * (vec_max * FLOAT4_E2M1_MAX_RECIPROCAL)
-    scale = torch.clamp(scale, max=448, min=-448)
-    scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
+    scale = torch.clamp(scale, max=448, min=0)
+    scale = _quantize_e4m3fn_scale(scale)
     output_scale = get_reciprocal(scale * get_reciprocal(global_scale))
 
     scaled_x = x.to(torch.float32) * output_scale
@@ -461,7 +495,7 @@ def ref_nvfp4_quant_dequant(
 
     `global_scale` is expected to have a single element.
     """
-    if current_platform.is_cuda_alike():
+    if _supports_triton_nvfp4_emulation(x.device):
         return _triton_nvfp4_quant_dequant(x, global_scale, block_size)
 
     x_m, x_k = x.shape
@@ -484,6 +518,7 @@ def run_nvfp4_emulations(
     weight: torch.Tensor,
     weight_scale_swizzled: torch.Tensor,
     weight_global_scale: torch.Tensor,
+    weight_dequant: torch.Tensor | None = None,
     swizzle: bool | None = True,
 ):
     output_dtype = x.dtype
@@ -491,16 +526,20 @@ def run_nvfp4_emulations(
 
     x_dq = ref_nvfp4_quant_dequant(x, input_global_scale, block_size=group_size)
 
-    # dequantize weight
-    w_fp4 = weight.data.view(torch.uint8)
-    w_dq = dequantize_to_dtype(
-        w_fp4,
-        weight_scale_swizzled.data,
-        weight_global_scale,
-        output_dtype,
-        group_size,
-        swizzle=swizzle,
-    )
+    if weight_dequant is None:
+        w_fp4 = weight.data.view(torch.uint8)
+        w_dq = dequantize_to_dtype(
+            w_fp4,
+            weight_scale_swizzled.data,
+            weight_global_scale,
+            output_dtype,
+            group_size,
+            swizzle=swizzle,
+        )
+    else:
+        w_dq = weight_dequant
+        if w_dq.dtype != output_dtype:
+            w_dq = w_dq.to(output_dtype)
 
     # matmul
     out = torch.matmul(x_dq, w_dq.t())

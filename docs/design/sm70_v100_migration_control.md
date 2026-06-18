@@ -30043,3 +30043,2229 @@ evidence before they can count as accepted/default.
        `105.572`, load memory `11.04 GiB`, available KV `16.06 GiB`, KV cache
        `1,187,095`. This recovers about `5.18 GiB` per GPU for KV/cache use
        while preserving the 110 tok/s decode lane and token output.
+
+401. 2026-06-15 Qwen3.6-35B-A3B-AWQ TP4 Flash-V100 FULL graph numeric
+     gibberish root cause fixed without disabling Flash or CUDA graph.
+
+     Root cause:
+     - `FlashAttnV100MetadataBuilder.build_for_cudagraph_capture()` stabilizes
+       q=1 FULL decode graph capture by binding attention replay to persistent
+       `block_table`, `seq_lens`, and `query_start_loc` buffers.
+     - The normal runtime `build()` path refreshed a new metadata object, but
+       did not refresh those captured persistent buffers before
+       `run_fullgraph()`. FULL graph replay could therefore read capture/dummy
+       decode metadata instead of the current request metadata.
+     - This matches the observed shape: TP4 Flash eager was clean, TP4 Flash
+       FULL graph was bad, Triton was clean, and disabling unrelated paths such
+       as dynamic partition, packed recurrent decode, or GDN FlashQLA did not
+       fix the numeric output.
+
+     Fix:
+     - Runtime q=1 Flash-V100 `build()` now refreshes the persistent graph
+       metadata buffers when they exist from capture. The patch keeps
+       `FLASH_ATTN_V100`, `VLLM_COMPILE`, and `FULL_AND_PIECEWISE` enabled; it
+       is not a Triton fallback or graph disable.
+
+     Accepted evidence:
+     - Syntax check:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile vllm/vllm/v1/attention/backends/flash_attn_v100.py`.
+     - Fixed 8K reproducer:
+       `/tmp/vllm_flash_defaultkv_35b_awq_tp4_8k_graph_metadata_fix_long_result.json`.
+       Same TP4 Flash-V100 compile/FULL graph lane as the failing 8K artifact;
+       result `1024` output tokens, `digit_ratio=0.005961`, `weird_runs=0`,
+       `steady_decode_tps=121.269`, hash
+       `bfdaac78c6b9de453d838bc3f44b0740e28136b27ffa97d123ffe2fe94ccdadd`.
+     - Fixed user-scale 262K口径:
+       `/tmp/vllm_flash_defaultkv_35b_awq_tp4_262k_graph_metadata_fix_long_result.json`.
+       Model `/home/ymzx/models/Qwen3.6-35B-A3B-AWQ`, TP4,
+       `max_model_len=262144`, `max_num_batched_tokens=16324`,
+       `max_num_seqs=1`, `FLASH_ATTN_V100`, default KV, official sampling
+       shape used in the quality reproducer. Result `1024` output tokens,
+       `digit_ratio=0.011162`, `weird_runs=0`, `steady_decode_tps=119.431`,
+       available KV cache `2,008,547` tokens, hash
+       `f20764a41806a6bbdf29efd521a237774ec90d8e3272569cb6a5ef60e6e5cf62`.
+     - Fixed 8-prompt dataset quality regression without `ignore_eos`:
+       `bench_results/flash_v100_quality_fix_20260615/qwen36_35b_awq_tp4_flash_fullgraph_262k_quality_prompts8_o1024_no_ignore_eos.json`.
+       Same TP4, 262K, default KV, Flash-V100 compile/FULL graph lane. Sampling
+       params record `ignore_eos=False`, `temperature=1.0`, `top_p=0.95`,
+       `top_k=20`, `max_tokens=1024`, `seed=20260615`. Result `4095` total
+       output tokens across 8 prompts with per-prompt output token counts
+       `[75, 1024, 1024, 209, 295, 1024, 323, 121]`, aggregate output
+       throughput `109.571 tok/s`, max digit ratio `0.0195`,
+       `weird_runs=0`, `repeated_num_runs=0`, and max digit run length `4`.
+       The earlier forced-continue `--ignore-eos` attempt is excluded from the
+       quality gate because output-quality checks must respect natural EOS.
+
+402. 2026-06-15 Qwen3.6-35B-A3B-AWQ TP4 Flash-V100 long-context speed sweep
+     after the FULL graph metadata fix, without `ignore_eos`.
+
+     Artifact:
+     - `bench_results/flash_v100_quality_fix_20260615/qwen36_35b_awq_tp4_flash_fullgraph_longctx_speed_i4k_16k_64k_256k_o1024_natural_eos_w1_r1.json`.
+
+     Route and setup:
+     - Model `/home/ymzx/models/Qwen3.6-35B-A3B-AWQ`, TP4, `dtype=half`,
+       `quantization=awq`, `max_model_len=262144`,
+       `max_num_batched_tokens=16324`, `max_num_seqs=1`,
+       `gpu_memory_utilization=0.88`, `attention_backend=FLASH_ATTN_V100`,
+       default KV cache, `VLLM_COMPILE` + `FULL_AND_PIECEWISE`.
+     - Sampling params record `ignore_eos=false`, `temperature=0.0`,
+       `top_p=1.0`, `top_k=-1`, requested max output `1024`.
+     - Loaded KV cache capacity from startup logs: `2,008,547` tokens,
+       available KV memory `19.29 GiB`.
+
+     Counted-repeat results:
+     - 4K input / 1024 requested output: natural output `1024` tokens
+       (`finish_reason=length`), prefill `0.303814 s` = `13,481.94 tok/s`,
+       decode `8.121213 s`, steady decode `125.966 tok/s`.
+     - 16K input / 1024 requested output: natural output `1024` tokens
+       (`finish_reason=length`), prefill `1.912846 s` = `8,565.25 tok/s`,
+       decode `8.109965 s`, steady decode `126.141 tok/s`.
+     - 64K input / 1024 requested output: natural output `834` tokens
+       (`finish_reason=stop`), prefill `14.012099 s` = `4,677.10 tok/s`,
+       decode `6.604901 s`, steady decode `126.118 tok/s`.
+     - 256K-window test used `input_len=261120`, `output_len=1024` so the
+       request stays within `max_model_len=262144`. Natural output stopped at
+       `21` tokens, prefill `179.864901 s` = `1,451.76 tok/s`, decode
+       `0.159076 s`, steady decode `125.726 tok/s`. Treat this 256K decode
+       TPS as weak evidence because only `20` steady decode tokens were
+       measured under natural EOS.
+
+     Output-quality screen:
+     - All four counted outputs had digit ratio `0.0`, no numeric/date
+       gibberish regex hits, no repeated-number runs, and max digit run length
+       `0`. The prompt construction is synthetic benchmark text, so this is a
+       numeric-gibberish regression screen, while the natural 8-prompt dataset
+       in item 401 remains the stronger semantic quality check.
+
+403. 2026-06-15 Qwen3.6-35B-A3B-AWQ TP2 vs TP4 Flash-V100 long-context
+     comparison, same natural-EOS benchmark harness.
+
+     TP2 artifact:
+     - `bench_results/flash_v100_quality_fix_20260615/qwen36_35b_awq_tp2_flash_fullgraph_longctx_speed_i4k_16k_64k_256k_o1024_natural_eos_w1_r1.json`.
+
+     TP2 route and setup:
+     - GPUs `CUDA_VISIBLE_DEVICES=2,3`, model
+       `/home/ymzx/models/Qwen3.6-35B-A3B-AWQ`, TP2, `dtype=half`,
+       `quantization=awq`, `max_model_len=262144`,
+       `max_num_batched_tokens=16324`, `max_num_seqs=1`,
+       `gpu_memory_utilization=0.88`, `attention_backend=FLASH_ATTN_V100`,
+       default KV cache, `VLLM_COMPILE` + `FULL_AND_PIECEWISE`.
+     - Startup logs: model loading `11.04 GiB/GPU`, available KV memory
+       `13.99 GiB`, KV cache `1,444,912` tokens, maximum 262K-request
+       concurrency `5.51x`, attention block size `1056`.
+     - Sampling params record `ignore_eos=false`, `temperature=0.0`,
+       `top_p=1.0`, `top_k=-1`, requested max output `1024`.
+
+     Counted-repeat TP2 results:
+     - 4K input: natural output `1024` tokens (`finish_reason=length`),
+       prefill `0.484016 s` = `8,462.53 tok/s`, decode `9.542640 s`,
+       steady decode `107.203 tok/s`.
+     - 16K input: natural output `1024` tokens (`finish_reason=length`),
+       prefill `3.244378 s` = `5,049.97 tok/s`, decode `9.549320 s`,
+       steady decode `107.128 tok/s`.
+     - 64K input: natural output `834` tokens (`finish_reason=stop`),
+       prefill `24.309908 s` = `2,695.86 tok/s`, decode `7.769797 s`,
+       steady decode `107.210 tok/s`.
+     - 256K-window test used `input_len=261120`, `output_len=1024`. Natural
+       output stopped at `21` tokens, prefill `313.885764 s` =
+       `831.90 tok/s`, decode `0.185982 s`, steady decode `107.537 tok/s`.
+       As with TP4, this 256K decode figure is weak because only `20` steady
+       decode tokens were measured under natural EOS.
+
+     Same-run TP4 comparison from item 402:
+     - 4K prefill `13,481.94 tok/s`, steady decode `125.966 tok/s`.
+     - 16K prefill `8,565.25 tok/s`, steady decode `126.141 tok/s`.
+     - 64K prefill `4,677.10 tok/s`, steady decode `126.118 tok/s`.
+     - 256K-window prefill `1,451.76 tok/s`, steady decode `125.726 tok/s`
+       on only `20` steady decode tokens.
+
+     Quality screen:
+     - TP2 and TP4 counted outputs both had digit ratio `0.0`,
+       `weird_runs=0`, `repeated_num_runs=0`, and max digit run length `0`.
+     - TP4 4K prefill in this 262K natural-EOS run is `13.48k tok/s`, below
+       the remembered `~15k tok/s` target. Treat the 15k value as not recovered
+       by this exact route until a repeat-focused 4K run or historical artifact
+       confirms the same max-length, graph, prompt, and scheduler settings.
+
+404. 2026-06-15 Qwen3.6-35B-A3B-AWQ focused 4K/1024 repeat check shows the
+     current no-MTP TP2/TP4 speed gap is not caused by the 262K max-length
+     setting.
+
+     Current focused artifacts:
+     - TP2:
+       `bench_results/flash_v100_quality_fix_20260615/qwen36_35b_awq_tp2_flash_fullgraph_i4k_o1024_maxlen8192_natural_eos_w1_r3.json`.
+     - TP4:
+       `bench_results/flash_v100_quality_fix_20260615/qwen36_35b_awq_tp4_flash_fullgraph_i4k_o1024_maxlen8192_natural_eos_w1_r3.json`.
+
+     Route and setup:
+     - Same model, AWQ, default KV cache, `FLASH_ATTN_V100`, compile/FULL graph,
+       `max_num_seqs=1`, `max_num_batched_tokens=8192`, natural EOS, greedy
+       sampling, requested 4K input and 1024 output.
+     - The only deliberate isolation from item 402/403 is
+       `max_model_len=8192`, so this run checks whether the 262K graph/capture
+       shape or larger KV reservation caused the lower 4K decode rate.
+
+     Focused repeat results:
+     - TP2 on GPUs 2/3: all 3 counted repeats produced 1024 output tokens.
+       Prefill mean `0.482099 s` = `8,496.18 tok/s`; steady decode values
+       `[107.410, 107.327, 107.239]`, mean `107.325 tok/s`; output throughput
+       mean `102.229 tok/s`.
+     - TP4 on GPUs 0/1/2/3: all 3 counted repeats produced 1024 output tokens.
+       Prefill mean `0.301798 s` = `13,572.00 tok/s`; steady decode values
+       `[126.681, 126.730, 126.706]`, mean `126.706 tok/s`; output throughput
+       mean `122.220 tok/s`.
+
+     Historical comparison:
+     - Old 0.0.3 no-MTP 35B-AWQ baseline search under
+       `1Cat-vLLM-0.0.3/vllm/bench_results/qwen36_35b_awq_nomtp_baseline_search_20260517/combined.json`
+       records TP4 `code_1024` medians around `122.52 tok/s`
+       (`readme_public_seq1_no_prefix_256k`) and `125.68 tok/s`
+       (`seq1_no_prefix_256k_full_piecewise_123481632`). Those prompts have
+       about `40` prompt tokens, so they are not the same as the current 4K
+       prefill/decode benchmark.
+     - The clearly recorded `~135 tok/s` artifact in the latest-tree docs is
+       MTP4 1K/256, not no-MTP 4K/1024:
+       `bench_results/sm70_migration_20260612/decode_latest_qwen36_35b_a3b_awq_mtp4_compilegraph_drafter_triton_graph_i1024_o256_w1_r1_tp2_20260612.json`
+       had output throughput `135.699 tok/s` and steady decode
+       `150.383 tok/s`.
+
+     Decision:
+     - Do not attribute the current TP2 `~107 tok/s` or TP4 `~126.7 tok/s`
+       no-MTP 4K/1024 results to the 262K max-length configuration; maxlen
+       8192 reproduces the same lane.
+     - The remembered `120/135 tok/s` targets need exact-route separation:
+       old no-MTP short-code TP4 evidence is `~123-126 tok/s`, while the
+       `~135 tok/s` figure found so far is MTP/short-output evidence. If a
+       no-MTP 4K/1024 TP2=`120` or TP4=`135` artifact exists, use that exact
+       route/env as the next speed-recovery target rather than repeating the
+       long-context sweep.
+
+405. 2026-06-16 Flash-V100 decode dynamic-partition quality root cause and
+     planner fix.
+
+     User-facing symptom:
+     - Qwen3.6-35B-A3B-AWQ TP2, `FLASH_ATTN_V100`, no prefix cache, normal API
+       serving could answer the first coding prompt but then drift into severe
+       repetition and stale story content on later turns.
+     - Setting `VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS=0` made the same
+       service behavior return to normal, localizing the issue to Flash-V100
+       decode dynamic partitioning rather than Cherry Studio, prefix cache, or
+       a generic sampler problem.
+
+     Root cause:
+     - The dynamic-partition path stores a device scalar
+       `active_num_partitions` in the Flash-V100 decode workspace. The paged
+       decode kernels use this scalar to skip partitions beyond the current
+       sequence length while keeping graph-safe workspace buffers.
+     - During CUDA graph capture, `_get_decode_workspace_for_plan()` executes
+       `active_num_partitions.fill_(plan.actual_num_partitions)`. That fill is
+       captured as a graph operation. Replay does not rerun Python planning for
+       the new runtime sequence length, so the scalar can stay at the short
+       capture value.
+     - If capture used a short sequence but replay needed a longer context,
+       the partition and reduce kernels only consumed the first captured number
+       of KV partitions. This is a correctness bug, not fp16 numerical noise.
+
+     Fix:
+     - `flash-attention-v100/flash_attn_v100/flash_attn_interface.py` now
+       detects CUDA graph capture in `_get_decode_plan()`. When
+       `workspace_seq_capacity_hint` is present, it promotes the captured
+       `effective_max_seq_len` to the full workspace envelope before computing
+       `actual_num_partitions`.
+     - Follow-up kernel/operator audit found the upstream metadata envelope
+       must also be graph-sized. `vllm/v1/attention/backends/flash_attn_v100.py`
+       now builds static decode workspace capacity from
+       `common_attn_metadata.max_seq_len` when `static_decode=True`, bounded by
+       the block-table raw capacity, instead of using only the short
+       `_seq_lens_cpu` capture value.
+     - Normal non-captured dynamic decode remains unchanged: eager/runtime
+       planning still uses the current sequence length, so this does not turn
+       off the speed path.
+
+     Numeric evidence:
+     - Planner regression test added:
+       `tests/kernels/attention/test_sm70_flash_v100_decode_planner.py`.
+       It verifies non-graph static decode keeps runtime active partitions
+       (`4097 -> 17`) while CUDA graph capture uses workspace active partitions
+       (`8192 -> 32`).
+     - Metadata policy regression test added:
+       `tests/v1/attention/test_sm70_flash_v100_policy.py` now checks that
+       graph capture with current `seq_len=1025` but graph `max_seq_len=2048`
+       emits workspace capacity `2048`.
+     - Test command:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/kernels/attention/test_sm70_flash_v100_decode_planner.py`
+       passed: `4 passed`.
+     - Additional policy test command:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/attention/test_sm70_flash_v100_policy.py -k 'decode_shape_hints or capture_decode_workspace'`
+       passed: `2 passed`.
+     - Op-level CUDA graph A/B on GPU 0, fp16 KV, `H=8`, `Hkv=1`, `D=256`,
+       `partition_size=256`, capture seq `257`, replay seq `4097`,
+       workspace capacity `8192`:
+       - patched dynamic graph replay vs static full-envelope oracle:
+         `max_diff=0.0`;
+       - emulated old capture behavior (`active=2`, runtime needs `17`):
+         `max_diff=0.233154296875`.
+     - Strict operator/kernel audit matrix, same GPU/op setup, compared patched
+       dynamic CUDA graph replay against static full-envelope oracle:
+       B=1 capture/runtime `[1]->[1]`, `[1]->[257]`, `[257]->[4097]`,
+       `[1025]->[8191]`; B=1 sliding-window `(512,-1)` and `(1024,-1)`; B=2
+       uneven batch `[257,1025]->[4097,257]` with and without
+       sliding-window `(512,-1)`. All cases had `max_diff=0.0`.
+
+     Decision:
+     - Keep `VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS=1` as the intended
+       speed path after this planner fix. Do not classify the previous
+       repetition as an unavoidable Flash attention fp16 drift; it was a graph
+       replay metadata bug that truncated the effective KV partition range.
+
+406. 2026-06-16 MTP quality audit: zero-filled fallback and non-prefix
+     accepted counts are not safe no-ops.
+
+     User-facing symptom:
+     - After the Flash-V100 dynamic-partition fix, the earlier stale-story
+       quality failure disappeared, but MTP-enabled Qwen3.6-27B-AWQ API
+       serving could still produce another failure mode while writing code or
+       reasoning: generation sometimes jumped into visible runs of `0`, or
+       separately into repeated text.
+
+     Source audit:
+     - The MTP padded drafter path checks whether the current context plus
+       `num_spec_tokens` fits the drafter:
+       `spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens <=
+       self.effective_drafter_max_model_len`.
+     - Before this entry, the false branch created a fixed
+       `torch.zeros(...).expand(num_reqs, num_spec_tokens)` draft tensor and
+       copied those zeros to the scheduler. From the scheduler/verifier point
+       of view, those zeros are real speculative token ids, not a disabled
+       speculation marker.
+     - That fallback was intended to avoid stale draft reuse near the drafter
+       context limit, but it can leak token id `0` into the next speculative
+       verification step. It is therefore a correctness bug, not a harmless
+       quality variation.
+     - Hybrid MTP state postprocess also counted accepted tokens with
+       `(output_token_ids != -1).sum(dim=1)`. That assumes every row is a clean
+       valid-prefix followed only by `-1`; if any stale valid-looking value
+       remains after the first rejected slot, recurrent/linear state can be
+       advanced too far. This matches the MTP-on-only repeated-text failure
+       mode better than a generic sampler issue.
+
+     Fix:
+     - `vllm/v1/worker/gpu_model_runner.py` now returns an empty draft list for
+       every active request when the drafter cannot safely cover the current
+       context. This tells the scheduler to skip speculation for that step
+       instead of verifying zero-filled drafts.
+     - Added a `warning_once` at this branch with
+       `max_seq_len`, `num_spec_tokens`, and
+       `effective_drafter_max_model_len`, so future incidents are visible in
+       logs instead of surfacing only as corrupted text.
+     - `vllm/v1/spec_decode/utils.py` now computes
+       `valid_sampled_tokens_count` from the contiguous valid prefix of each
+       sampler output row. The old kernel counted every valid-looking token in
+       the row, so any stale/padded value after the first `-1` could advance
+       MTP state. Rejection sampler output is defined as valid tokens followed
+       by `-1` placeholders, so prefix counting is the stricter invariant.
+     - `vllm/v1/spec_decode/llm_base_proposer.py` now clones drafter-mutated
+       length metadata (`seq_lens`, DCP local seq lens, and CPU length shadows)
+       before MTP/EAGLE/DraftModel proposer code updates rejected-token and
+       per-draft-step positions. This prevents drafter bookkeeping from
+       mutating the target runner's persistent CUDA-graph metadata buffers.
+     - `vllm/v1/worker/gpu_model_runner.py` now computes hybrid
+       `num_accepted_tokens` from the contiguous valid prefix instead of an
+       entire-row non-`-1` sum. Values after the first rejected slot are padding
+       or stale data and must not shift MTP/recurrent state.
+     - Normal in-range MTP remains unchanged, so this does not disable the
+       speed path during ordinary decode.
+
+     Validation:
+     - Syntax check:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile vllm/v1/spec_decode/llm_base_proposer.py vllm/v1/spec_decode/utils.py vllm/v1/worker/gpu_model_runner.py tests/v1/spec_decode/test_sm70_mtp_safety.py`
+       passed.
+     - Added CUDA-only local regression file:
+       `tests/v1/spec_decode/test_sm70_mtp_safety.py`. It avoids HF model
+       config loading and directly checks the MTP helper kernels/metadata
+       invariants.
+     - Test command:
+       `CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/spec_decode/test_sm70_mtp_safety.py`
+       passed: `4 passed`.
+     - Kernel sanity check on GPU 2 with synthetic sampler rows:
+       `[11,12,-1,0,0] -> count=2,next=12`,
+       `[-1,0,0,0,0] -> count=0,next=backup`,
+       `[5,-2,7,-1,0] -> count=1,next=5`, and discarded rows use
+       `count=0,next=backup`. This confirms the prefix-counting guard
+       rejects stale valid-looking values after the first invalid slot.
+     - Attempted to run `python -m ruff check` for the touched files, but the
+       `vllm-0.0.5-t210` environment does not have `ruff` installed.
+
+     Remaining check:
+     - Restart the MTP-enabled API service so these code changes are loaded,
+       then repeat the same Cherry Studio/code-generation prompt. If MTP-on
+       still repeats after this patch, dump `VLLM_SPEC_DUMP_ALIGNMENT=1` and
+       inspect the last accepted-count/draft-prob alignment before the first
+       repeated span.
+
+407. 2026-06-16 full MTP chain re-audit: probabilistic draft verification and
+     thinking-budget repeat-row handling.
+
+     Chain audit:
+     - SM70 native MTP defaults are applied in `arg_utils.py`: MTP uses
+       `num_speculative_tokens=4`, local argmax reduction, async scheduling,
+       and `draft_sample_method=probabilistic` unless the user overrides it.
+       That means the verifier must receive both draft token ids and the
+       aligned per-draft probability rows for non-greedy official sampling.
+     - Async scheduling reserves speculative length with `-1` placeholders.
+       The worker scatters real `_draft_token_ids` back into
+       `self.input_ids.gpu` before `SpecDecodeMetadata` reads the verifier
+       inputs, so the normal MTP path is not verifying scheduler placeholders.
+     - `_get_spec_decode_draft_probs()` maps proposer `_draft_probs` by
+       `req_id` and slices by the actual draft-token count. This is the correct
+       request-order boundary for multi-request batches.
+     - `RejectionSampler` has a no-draft-probs fallback that effectively treats
+       draft probability as `1`. That is not mathematically valid for
+       probabilistic MTP under non-greedy sampling; if MTP ever reaches that
+       branch because draft probabilities were lost, output quality can be
+       corrupted rather than merely slower.
+     - `ThinkingBudgetStateHolder.update_state()` receives repeated
+       target-logit rows under rejection sampling. The last repeated row is
+       `output + spec[:-1]`, not `output + spec[:]`. Stripping the full
+       `spec_len` from that row drops one real output token whenever more than
+       one draft token was proposed. This only affects configured thinking
+       token budgets, but it is still an MTP/spec decode correctness bug.
+
+     Fix:
+     - `vllm/v1/worker/gpu_model_runner.py` now raises a hard error if native
+       MTP with probabilistic draft sampling and non-greedy sampling reaches
+       rejection sampling without `draft_probs`. This keeps the speed path
+       intact, but prevents a silent invalid-verifier path from producing bad
+       text.
+     - `vllm/v1/sample/thinking_budget_state.py` now strips
+       `spec_len - 1` tokens for rejection-sampler repeated target rows and
+       strips `spec_len` only for normal bonus-token rows. This preserves the
+       real output token while still removing speculative suffix tokens from
+       the thinking-budget parser input.
+
+     Validation:
+     - Targeted test command:
+       `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/logits_processors/test_correctness.py::test_thinking_budget_holder_update_state_repeat_indices_last_row_wins tests/v1/logits_processors/test_correctness.py::test_thinking_budget_holder_spec_repeat_rows_strip_only_present_drafts tests/v1/spec_decode/test_sm70_mtp_safety.py`
+       passed: `6 passed`.
+     - Syntax check:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile vllm/v1/sample/thinking_budget_state.py vllm/v1/worker/gpu_model_runner.py`
+       passed.
+
+     Remaining service validation:
+     - Restart the MTP-enabled API service and re-test the Cherry
+       Studio/code-generation prompt that previously produced `0` runs or
+       repeated text. If it still reproduces, the next useful evidence is not
+       another sampling-parameter sweep; dump draft token/prob alignment at the
+       first bad step and check whether verifier input, draft_probs, or
+       accepted-count state diverged first.
+
+408. 2026-06-16 follow-up MTP quality audit after user still reproduced
+     repeated/zero-like output with MTP enabled.
+
+     Scope:
+     - User reproduced a severe MTP-on-only quality issue after the previous
+       safety fixes: no-MTP output is normal, MTP output can enter repeated
+       planning text or runs that look like zeros/repeated fragments.
+     - Do not treat another manual chat transcript as sufficient evidence.
+       The next run must quantify the first bad token through sampler/GDN
+       diagnostics.
+
+     Current audit results:
+     - Flash-V100 MTP verifier small-query attention was checked at the
+       operator level. The synthetic CUDA regression compares q=5 and q=16
+       "small-query prefill as decode" against paged causal prefill reference
+       at seq_len 4097, H=8, Hkv=1, D=256. This passed and does not currently
+       explain the MTP-only degeneration.
+     - GDN/recurrent `num_accepted_tokens` semantics were re-read from the
+       kernels. The value is expected to be the number of output tokens
+       committed by the previous verification step, in the range
+       `1..1+num_speculative_tokens`, not merely the count of draft tokens
+       accepted before recovery. The existing contiguous-valid-output count
+       therefore matches the kernel contract.
+     - For the user's no-prefix-cache serving route, `mamba_cache_mode` is
+       forced to `none`, so the align-mode GPU postprocess copy path is not
+       the main suspect for this reproduction. The DS-layout fused copy remains
+       a conditional risk only when `VLLM_SSM_CONV_STATE_LAYOUT=DS` and
+       align-mode MTP are both enabled.
+     - Mamba/GDN cache specs do carry `num_speculative_blocks =
+       num_speculative_tokens`; in `mamba_cache_mode=none` the block table is
+       designed to expose `1 + num_speculative_blocks` state slots for the
+       verifier path.
+     - Native MTP probabilistic drafting still has a high-risk sampler
+       contract: the verifier is only exact when the draft token ids and their
+       cached `draft_probs` are aligned with the rows consumed by
+       `RejectionSampler`.
+
+     Diagnostic change:
+     - `VLLM_SPEC_DUMP_ALIGNMENT=1` now dumps the rejection sampler's final
+       `output_token_ids` and per-request `output_valid_counts` in addition to
+       draft ids, draft probabilities, target probabilities, target top-k,
+       target argmax, bonus ids, and alignment ranks.
+     - This is default-off and does not affect normal serving speed. When
+       enabled, artifacts are saved under `/tmp/spec_alignment_pid*_*.pt`.
+
+     Validation:
+     - Syntax check:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile vllm/v1/sample/rejection_sampler.py`
+       passed.
+     - Added CUDA operator regression:
+       `tests/kernels/attention/test_sm70_flash_v100_mtp_smallq_exactness.py`.
+       Command:
+       `CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm:/home/ymzx/桌面/1cat-vllm/vllm/flash-attention-v100 /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/kernels/attention/test_sm70_flash_v100_mtp_smallq_exactness.py`
+       passed: `2 passed`.
+
+     Next targeted reproduction:
+     - Restart the MTP service with:
+       `VLLM_SPEC_DUMP_ALIGNMENT=1 VLLM_SPEC_DUMP_ALIGNMENT_LIMIT=64`.
+     - If the first bad span appears, inspect the nearest
+       `/tmp/spec_alignment_pid*_*.pt` file and classify the bad committed
+       token as accepted draft, recovered target, or bonus. That determines
+       whether the root cause is draft generation/prob alignment, target
+       verifier logits, or post-sampling state/bookkeeping.
+
+409. 2026-06-16 MTP repeated/zero-like output root-cause fixes.
+
+     Root causes found:
+     - Rejection-sampler target-logit processing did not refresh
+       `ThinkingBudgetStateHolder` before applying thinking masks. The normal
+       sampler calls `holder.update_state(...)` before
+       `holder.apply_to_logits(...)`, but the MTP rejection path only called
+       `apply_to_logits`. With `enable_thinking` active, the holder could use
+       stale output/spec state while logits were laid out as repeated
+       per-draft rows. This is an MTP-on-only path difference and can force or
+       mask the wrong thinking token positions.
+     - GDN/Mamba `mamba_cache_mode=none` selected state slot 0 for a
+       non-spec step even when the previous MTP verifier accepted more than
+       one token. The verifier writes `1 + K` candidate recurrent states and
+       later spec steps use `num_accepted_tokens - 1` to choose the correct
+       slot. A following non-spec step must choose the same accepted slot;
+       otherwise it reads stale slot0 state and can poison subsequent decode.
+
+     Fix:
+     - `vllm/v1/sample/rejection_sampler.py` now calls
+       `holder.update_state(output_token_ids, spec_token_ids, repeat_indices)`
+       on the MTP rejection target-logit path before applying thinking masks.
+       A regression test verifies that repeated rows such as `[0, 0, 1]` are
+       passed through `repeat_indices`.
+     - `vllm/v1/attention/backends/gdn_attn.py` now selects the none-cache
+       non-spec state block by `num_accepted_tokens - 1` when spec decode is
+       active. Accepted count 1 still maps to slot0, so normal/no-MTP decode is
+       unchanged; accepted count greater than 1 now continues from the state
+       slot produced by the previous verifier.
+     - The speculative alignment dump now includes
+       `sampling_output_token_ids_tail`, `sampling_spec_token_ids`, and
+       `recovered_residual_mass`. If zero-like tokens still appear, this can
+       distinguish stale CPU metadata from a degenerate recovered-token
+       distribution.
+
+     Validation:
+     - Rejection sampler and thinking/MTP targeted regression:
+       `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/sample/test_rejection_sampler.py tests/v1/logits_processors/test_correctness.py::test_thinking_budget_holder_update_state_repeat_indices_last_row_wins tests/v1/logits_processors/test_correctness.py::test_thinking_budget_holder_spec_repeat_rows_strip_only_present_drafts tests/v1/logits_processors/test_correctness.py::test_thinking_budget_holder_spec_mode_tensor_layout tests/v1/logits_processors/test_correctness.py::test_thinking_budget_enforced_without_penalties tests/v1/spec_decode/test_sm70_mtp_safety.py tests/v1/attention/test_gdn_metadata_builder.py`
+       passed: `85 passed`.
+     - `tests/v1/attention/test_gdn_metadata_builder.py` now includes direct
+       none-cache regressions: accepted count 3 over block ids
+       `[10,11,12,13,14]` must select state slot `12`, and mixed
+       spec/non-spec batches must apply the same rule for the non-spec lane.
+     - Syntax checks:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile vllm/v1/sample/rejection_sampler.py vllm/v1/attention/backends/gdn_attn.py`
+       passed.
+     - `git diff --check` passed.
+
+     Required service validation:
+     - Restart the MTP-enabled API service and re-test the user's failing
+       Cherry Studio prompts. The expected result is no sudden runs of `0`,
+       no repeated thinking fragments, and no state fallback into previous
+       story/code content when MTP is enabled.
+
+410. 2026-06-16 MTP repeated-output four-path closure pass.
+
+     User correction:
+     - Do not inspect one possible root cause, drift into another, and leave the
+       first one unresolved. Each path must have a concrete fix/validation
+       status before moving on.
+
+     Paths fixed:
+     - Draft token/probability alignment:
+       `_draft_probs` is now cached with the corresponding draft token ids.
+       `_get_spec_decode_draft_probs()` no longer silently maps only by
+       request id; it validates probability shape, req rows, draft width,
+       verifier draft token count, and cached token identity before returning
+       flattened `[num_draft_tokens, vocab]` probabilities. CUDA token-identity
+       validation uses `torch._assert_async` to avoid a decode-hot-path CPU
+       synchronization while still failing closed on invariant violation.
+     - TP probabilistic draft sampling:
+       MTP draft sampling now broadcasts sampled draft token ids from TP rank 0
+       after local probabilistic sampling. Full draft probabilities stay local
+       because logits/probs are already full-vocab on each TP rank; only the
+       sampled ids need synchronization. This closes the rank-local RNG split
+       where rank A could verify token ids sampled by rank B against a different
+       local draft sample.
+     - GDN/Mamba recurrent state slot:
+       none/align cache non-spec lanes now choose the state block by
+       `num_accepted_tokens - 1`, including mixed spec/non-spec batches and
+       align-mode `current_state_block_ids`. Spec verifier tables remain full
+       `1 + K` state-slot rows; tests assert the effective accepted slot.
+     - Async scheduling CPU history/spec ids:
+       `update_async_output_token_ids()` repairs not only
+       `sampling_metadata.output_token_ids`, but also live request output
+       history, `token_ids_cpu`, `is_token_ids`, and `num_tokens_no_spec`.
+       `update_async_spec_token_ids()` now maps draft rows by req id, writes
+       real spec ids back into CPU token rows, and treats zero-filled rows as a
+       legacy sentinel only when the current scheduler row was zero-filled; a
+       normal `[-1, -1]` placeholder preserves token id `0` as valid.
+
+     Validation:
+     - `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py` and async
+       history selector:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/spec_decode/test_mtp_draft_prob_alignment.py tests/v1/worker/test_gpu_input_batch.py -k 'draft_prob or async_output_token_ids or async_spec_token_ids'`
+       passed: `10 passed`.
+     - TP sync, MTP safety, and GDN metadata:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/spec_decode/test_tp_draft_sampling_sync.py tests/v1/spec_decode/test_sm70_mtp_safety.py tests/v1/attention/test_gdn_metadata_builder.py`
+       passed: `22 passed`.
+     - `ruff check` over the touched MTP/GDN files passed.
+     - `py_compile` over the touched runtime files passed.
+     - `git diff --check` passed.
+
+     Remaining required service validation:
+     - Restart a TP2/TP4 MTP4 service from this source and rerun the failing
+       long code/reasoning prompts. Acceptance should no longer enter an
+       unexplained all-1.000 plateau; if it does, the new fail-closed
+       draft-prob alignment guard should either catch a token/prob mismatch or
+       the remaining root is outside the four paths above.
+
+411. 2026-06-16 MTP repeated-output second closure pass.
+
+     New root cause candidates closed after user reproduced the issue with MTP
+     still enabled:
+     - Generic Qwen3.5/Qwen3.6 MTP was using `EagleProposer`, not the
+       Step3.5-specific proposer. The generic proposer did not pass
+       `spec_step_idx` to the MTP model forward/logit helpers, while
+       `Qwen3_5MTP.forward()` selects `self.layers[spec_step_idx %
+       num_mtp_layers]`. With MTP4 this can make later draft positions reuse
+       the step-0 branch, lowering draft correctness and making the verifier
+       easier to push into degenerate repeated draft streams.
+     - `_prepare_input_ids()` could continue when scheduler metadata contained
+       spec input slots but the worker no longer had a real draft-token tensor.
+       That path can leave stale GPU `input_ids` in the spec slots, which
+       matches the delayed failure pattern: normal output first, then sudden
+       all-1.000 acceptance and repeated/padding-like text after a state or
+       bookkeeping mismatch.
+     - List-form draft rows now return the req-id snapshot taken when the draft
+       was produced instead of the current live `input_batch.req_ids`; this
+       avoids batch reorder/condense mapping a draft row to the wrong request.
+
+     Fix:
+     - `vllm/v1/spec_decode/llm_base_proposer.py` now passes `spec_step_idx`
+       for `method == "mtp"` only. EAGLE/DFlash/draft-model calls keep their
+       original signatures.
+     - Draft sampling/logit debug paths use the same per-step helper, so
+       diagnostics observe the exact logits used for that MTP position.
+     - `vllm/v1/worker/gpu_model_runner.py` now fails closed if scheduled spec
+       slots exist without a tensor draft source, or if the scheduler asks for
+       more draft slots than the worker produced. This prevents stale GPU spec
+       inputs from being silently verified as real draft tokens.
+
+     Validation:
+     - Targeted MTP/probability/TP-sync/safety regression:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/spec_decode/test_mtp_proposer_step_index.py tests/v1/spec_decode/test_mtp.py tests/v1/spec_decode/test_mtp_draft_prob_alignment.py tests/v1/spec_decode/test_tp_draft_sampling_sync.py tests/v1/spec_decode/test_sm70_mtp_safety.py`
+       passed: `20 passed`.
+     - `git diff --check` and `py_compile` over
+       `llm_base_proposer.py`, `gpu_model_runner.py`, and the new regression
+       test passed.
+     - A broad `test_eagle.py` run was not used as acceptance evidence because
+       most failures came from the test suite trying to access the gated
+       `meta-llama/Llama-3.1-8B-Instruct` repo without auth; it did not produce
+       a clean signal for this MTP fix.
+
+     Required service validation:
+     - Restart the MTP4 service from this source and rerun the failing Cherry
+       Studio/code-generation prompt. If repetition still occurs, inspect
+       whether the new fail-closed guard raises; a raise would confirm the
+       remaining bug is scheduler/worker draft-count trimming rather than model
+       sampling quality.
+
+412. 2026-06-17 Qwen3.6 27B/35B AWQ/FP8 TP2 quality and speed matrix.
+
+     Scope:
+     - Artifacts:
+       `bench_results/sm70_quality_speed_matrix_20260617_full/summary.md`,
+       `bench_results/sm70_quality_speed_matrix_20260617_full/summary.json`.
+     - Script:
+       `benchmarks/run_sm70_quality_speed_matrix.py`.
+     - Runtime: latest source tree, Python env
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210`, V100 cards `2,3`,
+       `tensor_parallel_size=2`, `dtype=half`, `max_model_len=262144`,
+       `max_num_batched_tokens=8096`, `max_num_seqs=1`,
+       `gpu_memory_utilization=0.88`, `FLASH_ATTN_V100`, no MTP/spec decode,
+       natural EOS (`ignore_eos` not used).
+     - Quality gate: four official-sampling chat prompts using model
+       `generation_config.json` (`temperature=1.0`, `top_k=20`,
+       `top_p=0.95`) plus greedy repeat determinism. Fatal screens cover long
+       same-token/same-character/digit runs, repeated windows/lines, and known
+       bad text markers such as malformed `rgba(...)`, long `555...`, or
+       repeated property tokens.
+     - Speed gate: one warmup, then 4K input / 1024 max output greedy request;
+       report actual output tokens because EOS is not ignored.
+
+     Results:
+     - `27b-awq-kv-auto`: PASS quality, PASS determinism,
+       prefill `1924.5 tok/s`, decode `48.6 tok/s`, output `1024`, KV
+       capacity `513429` tokens / concurrency `1.96`.
+     - `27b-awq-kv-fp8_e5m2`: PASS quality, PASS determinism,
+       prefill `1919.8 tok/s`, decode `48.8 tok/s`, output `445` natural EOS,
+       KV capacity `1014849` tokens / concurrency `3.87`.
+     - `35b-awq-kv-auto`: PASS quality, PASS determinism,
+       prefill `8195.0 tok/s`, decode `90.7 tok/s`, output `516` natural EOS,
+       KV capacity `1587427` tokens / concurrency `6.06`.
+     - `35b-awq-kv-fp8_e5m2`: PASS quality, PASS determinism,
+       prefill `8159.1 tok/s`, decode `89.7 tok/s`, output `1024`, KV
+       capacity `3125406` tokens / concurrency `11.92`.
+     - `27b-fp8-kv-auto`: startup FAIL at 256K max length, not a model-output
+       quality failure. Ordinary KV needed `8.09 GiB`; available KV memory was
+       `6.74 GiB`; vLLM estimated max model length `217952`.
+     - `27b-fp8-kv-fp8_e5m2`: PASS quality, PASS determinism,
+       prefill `1780.3 tok/s`, decode `41.0 tok/s`, output `1024`, KV
+       capacity `462967` tokens / concurrency `1.77`.
+     - `35b-fp8-kv-auto`: PASS quality, PASS determinism,
+       prefill `8164.5 tok/s`, decode `97.0 tok/s`, output `642` natural EOS,
+       KV capacity `1004885` tokens / concurrency `3.83`.
+     - `35b-fp8-kv-fp8_e5m2`: PASS quality, PASS determinism,
+       prefill `8150.7 tok/s`, decode `97.5 tok/s`, output `757` natural EOS,
+       KV capacity `1979288` tokens / concurrency `7.55`.
+
+     Interpretation:
+     - All cases that initialized passed dataset quality and greedy
+       determinism. No repeated-output, long-digit, or malformed-text gate
+       fired in this no-MTP matrix.
+     - FP8 KV roughly doubles KV capacity for AWQ 27B/35B and FP8 35B under
+       this configuration, with negligible decode loss for 35B and no quality
+       regression in this dataset gate.
+     - For Qwen3.6-27B-FP8 at `max_model_len=262144`, FP8 KV is required under
+       the tested memory budget; ordinary KV cannot initialize without lowering
+       max length or increasing usable KV memory.
+
+413. 2026-06-17 Qwen3.6 27B/35B AWQ/FP8 TP2 MTP4 quality and speed matrix.
+
+     Scope:
+     - Artifacts:
+       `bench_results/sm70_quality_speed_matrix_20260617_mtp4_v4/summary.md`,
+       `bench_results/sm70_quality_speed_matrix_20260617_mtp4_v4/summary.json`.
+     - Same runtime and quality gates as item 412, but with
+       `speculative_config={"method":"mtp","num_speculative_tokens":4}`.
+       The tested path uses the 1Cat SM70 MTP defaults: target
+       `FLASH_ATTN_V100`, drafter `TRITON_ATTN`, probabilistic draft sampling,
+       local argmax reduction, prefix caching enabled, Mamba cache `align`,
+       and compile/full CUDA graph capture sizes `[1, 2, 4, 5, 8, 9]`.
+
+     MTP4 results:
+     - `27b-awq-kv-auto-mtp4`: PASS quality, PASS determinism,
+       prefill `1827.7 tok/s`, decode `55.4 tok/s`, output `1024`, KV
+       capacity `427911` tokens / concurrency `1.63`. This is `1.14x`
+       versus the no-MTP decode baseline (`48.6 tok/s`).
+     - `27b-awq-kv-fp8_e5m2-mtp4`: PASS quality, PASS determinism,
+       prefill `1533.7 tok/s`, decode `63.4 tok/s`, output `1024`, KV
+       capacity `774845` tokens / concurrency `2.96`. This is `1.30x`
+       versus the no-MTP decode baseline (`48.8 tok/s`).
+     - `35b-awq-kv-auto-mtp4`: PASS quality, PASS determinism,
+       prefill `6437.8 tok/s`, decode `64.9 tok/s`, output `600`, KV
+       capacity `1289465` tokens / concurrency `4.92`. This is only `0.72x`
+       versus the no-MTP decode baseline (`90.7 tok/s`), so it is not a
+       default speed win.
+     - `35b-awq-kv-fp8_e5m2-mtp4`: PASS quality, PASS determinism,
+       prefill `6909.1 tok/s`, decode `72.4 tok/s`, output `885`, KV
+       capacity `2402362` tokens / concurrency `9.16`. This is only `0.81x`
+       versus the no-MTP decode baseline (`89.7 tok/s`), so it is not a
+       default speed win.
+     - `27b-fp8-kv-auto-mtp4`: startup FAIL at 256K max length, not a
+       model-output quality failure. Ordinary KV needed `9.0 GiB`; available
+       KV memory was `5.99 GiB`; vLLM estimated max model length `169728`.
+     - `27b-fp8-kv-fp8_e5m2-mtp4`: PASS quality, PASS determinism,
+       prefill `1436.9 tok/s`, decode `56.8 tok/s`, output `1024`, KV
+       capacity `330214` tokens / concurrency `1.26`. This is `1.39x`
+       versus the no-MTP decode baseline (`41.0 tok/s`).
+     - `35b-fp8-kv-auto-mtp4`: PASS quality, PASS determinism,
+       prefill `4204.0 tok/s`, decode `97.7 tok/s`, output `1024`, KV
+       capacity `819832` tokens / concurrency `3.13`. This is `1.01x`
+       versus the no-MTP decode baseline (`97.0 tok/s`), effectively neutral.
+     - `35b-fp8-kv-fp8_e5m2-mtp4`: PASS quality, PASS determinism,
+       prefill `7471.9 tok/s`, decode `88.3 tok/s`, output `535`, KV
+       capacity `1527925` tokens / concurrency `5.83`. This is `0.91x`
+       versus the no-MTP decode baseline (`97.5 tok/s`), so it is not a
+       default speed win.
+
+     Fix applied before the clean `mtp4_v4` run:
+     - MTP drafter uses `TRITON_ATTN`. With explicit `kv_cache_dtype=fp8_e5m2`,
+       several drafter/query paths still chose `current_platform.fp8_dtype()`
+       and therefore emitted or viewed tensors as e4m3/e4nv. On SM70 Triton
+       only supports `fp8e4b15` and `fp8e5`, so this produced the earlier
+       `fp8e4nv` failure in MTP + e5m2 KV.
+     - `vllm/model_executor/layers/attention/attention.py`,
+       `vllm/_custom_ops.py`,
+       `vllm/model_executor/layers/quantization/input_quant_fp8.py`, and
+       `vllm/v1/attention/backends/triton_attn.py` now propagate explicit
+       `fp8_e5m2` through query quantization and Triton KV cache views.
+     - The clean `mtp4_v4` run confirms the e5m2 MTP route initializes and
+       completes on AWQ/FP8, dense/MoE cases; remaining failures in this matrix
+       are resource/memory, not the old fp8 dtype bug.
+
+     Interpretation:
+     - MTP4 quality is acceptable for all initialized cases in this dataset
+       gate: no repeated-output, long-digit, malformed-text, or greedy
+       determinism failure fired.
+     - MTP4 should not be globally defaulted as a speed win from these numbers.
+       It helps `27B-AWQ` and `27B-FP8` with FP8 KV most clearly, is neutral
+       for `35B-FP8` ordinary KV, and regresses both tested `35B-AWQ` routes
+       plus `35B-FP8` with explicit FP8 KV.
+     - For MTP on 27B-FP8 at 256K, explicit FP8 KV is required under the tested
+       memory budget, same as the no-MTP matrix.
+
+414. 2026-06-17 Qwen3.6-35B-A3B-AWQ TP2 no-MTP 107 tok/s speed baseline
+     recovery: GDN full-forward/spec metadata pollution removed from the
+     no-MTP hot path.
+
+     Historical accepted baseline:
+     - `bench_results/flash_v100_quality_fix_20260615/qwen36_35b_awq_tp2_flash_fullgraph_i4k_o1024_maxlen8192_natural_eos_w1_r3.json`.
+       Same 35B-AWQ, TP2, 4K input, 1024 output, `max_model_len=8192`,
+       `max_num_batched_tokens=8192`, `FLASH_ATTN_V100`,
+       `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`, no MTP, natural EOS.
+       It recorded steady decode values `[107.410, 107.327, 107.239]`,
+       mean `107.325 tok/s`, prefill mean `0.482099 s`, and 1024 output
+       tokens in every counted repeat.
+
+     Regression evidence before this fix:
+     - `bench_results/sm70_speed_retest_20260617/35b_awq_i4096_o1024_tp2_max8192_4096_20260617.json`
+       recorded only `89.435 tok/s` steady decode.
+     - Setting `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1` recovered the same
+       route to `104.743 tok/s` in
+       `bench_results/sm70_speed_retest_20260617/35b_awq_i4096_o1024_tp2_max8192_4096_disable_gdn_full_forward_20260617.json`.
+       This localized the large regression to the Qwen GDN full-forward
+       boundary, not to Flash-V100 attention, AWQ TurboMind MoE, custom
+       all-reduce, or CUDA graph itself.
+
+     Root cause:
+     - The Qwen GDN full-forward quality guard had become tied to
+       `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH`, so no-MTP decode was also
+       eligible for the opaque full-forward path that was intended for active
+       MTP/spec decode quality protection.
+     - Later MTP diagnostics also expanded the default
+       `qwen_gdn_attention_core_standard` metadata contract to include spec
+       tensors. That made no-MTP decode pay the spec metadata boundary cost and
+       changed the compile/custom-op shape even when `speculative_config=None`.
+
+     Source fix:
+     - `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` now makes
+       automatic full-forward conditional on active spec decode metadata:
+       no-MTP keeps the split GDN path, while MTP/spec decode can still use the
+       full-forward guard.
+     - The no-MTP core op name/signature is restored to the historical
+       lightweight `vllm::qwen_gdn_attention_core_standard` contract with only
+       non-spec metadata tensors.
+     - The expanded spec metadata contract is moved to a separate
+       `vllm::qwen_gdn_attention_core_standard_spec` op and is used only when
+       `speculative_config` is present and active spec decode metadata exists.
+     - `vllm/model_executor/models/qwen3_5.py` uses the same split so inline
+       Qwen3.5 GDN paths cannot accidentally route no-MTP through spec metadata.
+     - `vllm/config/compilation.py` includes the new spec op in
+       `_attention_ops`; the historical no-spec op remains unchanged for
+       piecewise/full CUDA graph splitting.
+
+     Verification:
+     - Syntax check passed:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile`
+       on `qwen_gdn_linear_attn.py`, `qwen3_5.py`, `compilation.py`, and
+       `test_gdn_metadata_builder.py`.
+     - Targeted test passed:
+       `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q tests/v1/attention/test_gdn_metadata_builder.py -k 'full_forward_auto_only or gdn_build_classification or full_cuda_graph_decode_padding'`
+       -> `9 passed, 8 deselected`.
+     - Fixed-length 1024-token speed evidence:
+       `bench_results/sm70_speed_retest_20260617/35b_awq_i4096_o1024_tp2_max8192_8192_packed_default_gdn_standard_op_ignore_eos_20260617.json`.
+       Same route, plus `--ignore-eos` only to force the decode length to
+       1024 for speed measurement. It recorded 1024 output tokens,
+       prefill `0.480900 s`, steady decode `106.705 tok/s`, route policies
+       showing Flash-V100, FULL graph, AWQ TurboMind batched MoE,
+       FlashQLA GDN decode, and custom all-reduce all enabled.
+     - Clean-GPU fixed-length confirmation:
+       `bench_results/sm70_speed_retest_20260617/35b_awq_i4096_o1024_tp2_max8192_8192_packed_default_gdn_standard_op_ignore_eos_clean_20260617.json`.
+       Same command after `nvidia-smi` showed no compute processes. It recorded
+       1024 output tokens, prefill `0.486432 s`, and steady decode
+       `106.672 tok/s`. This rules out the earlier idle-worker overlap as the
+       reason the final value stayed below the historical `107.325 tok/s`.
+     - Natural-EOS A/B after the first no-spec split:
+       `bench_results/sm70_speed_retest_20260617/35b_awq_i4096_o1024_tp2_max8192_8192_packed_default_gdn_nospec_core_20260617.json`
+       produced 922 output tokens, prefill `0.482603 s`, and steady decode
+       `106.457 tok/s`. A later static-skip natural-EOS run stopped after only
+       109 tokens and is not a valid 1024-token speed comparison.
+
+     Interpretation:
+     - The large 89 tok/s regression is fixed in source; the 35B-AWQ no-MTP
+       route is back to the 106.5-106.7 tok/s band under current machine
+       conditions.
+     - The remaining gap to the historical `107.325 tok/s` mean is about
+       `0.65 tok/s` (`0.61%`) even after a clean-GPU fixed-length rerun. The
+       generated token sequence differs from the historical artifact starting
+       at output token index 25, and current graph/KV sizing also differs from
+       the historical startup logs. Treat this residual as a fine-grained
+       token-sequence / graph-memory / compile-shape profiling item, not
+       evidence that a major fast path is still disabled.
+
+415. 2026-06-17 0.0.3 Qwen3-Next MTP/GDN fastpath audit: old MTP did not
+     solve correctness by dropping GDN decode acceleration; it passed
+     speculative acceptance metadata into the recurrent kernels.
+
+     Source evidence:
+     - `1Cat-vLLM-0.0.3/vllm/vllm/v1/attention/backends/gdn_attn.py` builds
+       `spec_query_start_loc`, `spec_state_indices_tensor`, `spec_token_indx`,
+       `non_spec_token_indx`, and `num_accepted_tokens` for MTP/spec decode.
+       In mixed spec/non-spec batches, ordinary `query_len == 1` rows stay in
+       the decode bucket instead of being collapsed into the prefill bucket.
+       The inline comment explicitly says that moving these rows to the generic
+       prefill/mixed path preserves correctness but can erase most of the
+       expected DFlash/V100 speedup.
+     - `1Cat-vLLM-0.0.3/vllm/vllm/model_executor/models/qwen3_next.py`
+       consumes those tensors directly in `_forward_core`: it splits
+       spec/non-spec tokens, runs `causal_conv1d_update(...,
+       num_accepted_tokens=...)` for spec tokens, runs
+       `fused_recurrent_gated_delta_rule(..., num_accepted_tokens=...)` for
+       spec recurrent update, then merges outputs back with `index_copy_`.
+     - The old no-spec decode-only fastpath remains separate:
+       `causal_conv1d_update` plus either
+       `fused_sigmoid_gating_delta_rule_update_mixed_qkv` or
+       `fused_sigmoid_gating_delta_rule_update`. This is the speed path that
+       recovers the 35B-AWQ no-MTP decode baseline.
+
+     Difference in the latest tree:
+     - Latest Qwen GDN has a separate
+       `vllm::qwen_gdn_attention_core_standard_spec` custom op so compiled
+       regions can pass spec metadata across the GDN core boundary. That op
+       currently patches the live `GDNAttentionMetadata` and calls
+       `_forward_core`; it is a correctness/compile boundary, not yet the final
+       optimized MTP fastpath.
+     - Latest `vllm/v1/attention/backends/gdn_attn.py` contains two explicit
+       legacy A/B guards:
+       `VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0` and
+       `VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING`. The latter guard's
+       comment states that 0.0.3 kept ordinary `query_len == 1` rows on the
+       decode path even when another row was doing speculative verification.
+       With the guard disabled, latest routes those non-spec rows through the
+       prefill path during active spec decode, which is slower and also changes
+       recurrent-state metadata semantics.
+
+     Interpretation:
+     - Keeping MTP on `standard_spec` forever would limit MTP acceleration if
+       it remains only a heavier metadata-patching wrapper. That should be
+       treated as a temporary correctness boundary.
+     - The target fix is not to run active MTP through the no-spec
+       `qwen_gdn_attention_core_standard` blindly. The target is a
+       spec-aware standard fastpath: preserve 0.0.3's kernel-level accepted
+       token/state update semantics while making the spec metadata graph-safe
+       for latest vLLM compile/full-graph.
+     - Next migration step should compare latest with
+       `VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING=1` and then move the
+       verified 0.0.3 routing semantics from A/B guard to default if it fixes
+       MTP quality/speed without reintroducing no-MTP regression.
+
+416. 2026-06-17 MTP quality recovery guardrail: do not solve the current
+     long-output repetition regression by disabling MTP or dropping the MTP
+     acceleration path.
+
+     Working premise:
+     - This is a regression from a previously usable MTP quality state. The
+       target is to recover that state while keeping MTP enabled.
+     - A valid fix must preserve speculative decoding acceleration and the
+       SM70 GDN/MTP fast path unless a specific subpath is proven numerically
+       unsound and replaced by an equivalent fast implementation.
+
+     Invalid "fixes":
+     - Disabling MTP, forcing greedy/temperature changes, lowering output
+       length, or using short 512/512 smokes as quality acceptance.
+     - Treating a no-MTP clean output as the fix. No-MTP is only a control.
+     - Permanently routing active MTP away from the GDN acceleration path
+       without proving that the replacement keeps the same speed target.
+
+     Required quality repro:
+     - Use the macOS HTML long-output prompt family, MTP4, official sampling
+       parameters, and long output around 6k tokens or longer when needed.
+       Earlier failures start after the response is already underway, so short
+       prompts can miss the regression.
+
+     Current known state:
+     - Restoring the 0.0.3-style GDN metadata defaults and passing
+       `tests/v1/attention/test_gdn_metadata_builder.py` is not sufficient:
+       the macOS 6k run still degraded into repeated CSS text while MTP
+       acceptance climbed to all `1.000`.
+     - Next diagnostics must distinguish whether target logits are already
+       corrupted at the repeat point, or whether verifier/rejection sampling
+       accepts bad draft tokens because draft probability rows are stale or
+       misaligned.
+
+417. 2026-06-17 MTP/GDN standard-op root cause note: the historical
+     `vllm::qwen_gdn_attention_core_standard` op is not numerically "bad";
+     it is a no-MTP/no-spec interface and is semantically insufficient for
+     active MTP recurrent-state commit.
+
+     Root cause:
+     - `qwen_gdn_attention_core_standard` only carries the non-spec metadata
+       pair:
+       `non_spec_query_start_loc` and `non_spec_state_indices_tensor`.
+     - Active MTP/spec decode requires additional recurrent-state accounting:
+       `spec_query_start_loc`, `spec_state_indices_tensor`,
+       `spec_token_indx`, `non_spec_token_indx`, `spec_sequence_masks`, and
+       `num_accepted_tokens`.
+     - Those tensors decide which proposed draft tokens are merely verifier
+       candidates and which accepted prefix is allowed to advance the
+       conv/SSM recurrent cache. Without them, rejected draft tokens can affect
+       state, or the accepted prefix can be committed to the wrong state slot.
+       The failure mode is not a small fp16 max-diff; it can poison later
+       target logits, after which MTP acceptance may climb to all `1.000` and
+       the model can repeat code/text.
+
+     Correct split:
+     - no-MTP/non-spec decode should keep using the lightweight historical
+       `vllm::qwen_gdn_attention_core_standard` op to preserve the 35B-AWQ
+       speed baseline.
+     - active MTP/spec decode must use a spec-aware path such as
+       `vllm::qwen_gdn_attention_core_standard_spec` or an equivalent optimized
+       spec-aware fastpath. The long-term performance task is to optimize this
+       spec-aware path, not to force MTP through the no-spec standard op.
+
+     Guardrail:
+     - If MTP quality fails, do not "fix" it by disabling MTP or by
+       permanently falling back to a slower non-GDN path. First prove whether
+       `standard_spec` corrupts target logits/state or whether rejection
+       sampling/draft probability alignment is wrong; then fix that specific
+       spec-aware path while preserving acceleration.
+
+418. 2026-06-17 MTP quality regression memory: the current task is not to
+     rediscover an MTP quality fix from scratch. The earlier quality fix was
+     the full Qwen GDN forward opaque boundary under SM70 compile/FULL graph;
+     the follow-up task is to keep that quality property without polluting the
+     no-MTP speed baseline.
+
+     Previous quality-positive evidence:
+     - `SM70_MTP_OUTPUT_QUALITY_AUDIT_20260616.md` rows AA/AF/AG record that
+       `VLLM_SM70_QWEN_GDN_FULL_FORWARD=1`, and later the default full-Qwen-GDN
+       boundary, passed the macOS 6000-token MTP4 reproducer with MTP enabled,
+       target `FLASH_ATTN_V100`, drafter `TRITON_ATTN`, and compile/FULL graph
+       still enabled.
+     - The same audit showed that output projection only, input projection
+       only, context core, token matching, greedy draft, target Triton, dynamic
+       partition off, and exact CPU seq-len variants were not sufficient.
+       Do not repeat those as primary candidates unless their code changed.
+
+     Regression introduced by the quality fix:
+     - Letting the full-forward/spec boundary leak into no-MTP decode caused
+       the 35B-AWQ no-MTP speed path to fall from the historical
+       `107.325 tok/s` band to about `89.435 tok/s`.
+     - Item 414 fixed that by splitting the paths:
+       no-MTP returns to the lightweight historical
+       `vllm::qwen_gdn_attention_core_standard` op, while active MTP/spec
+       decode remains eligible for the spec-aware/full-forward boundary.
+
+     Correct next step:
+     - Preserve no-MTP on `qwen_gdn_attention_core_standard`.
+     - Preserve MTP quality by using the full-Qwen-GDN opaque boundary only
+       when active spec decode metadata exists.
+     - Then optimize the active-MTP spec-aware boundary, rather than disabling
+       MTP or pushing active MTP through the no-spec `standard` op.
+
+419. 2026-06-17 0.0.3 comparison for the MTP quality+speed optimum: the
+     full-Qwen-GDN boundary is a safe quality upper bound, not the final speed
+     target.
+
+     0.0.3 positive control:
+     - 0.0.3 passes the same long macOS MTP4 quality reproducer without the
+       late repeated-output collapse, and it does not require routing all
+       no-MTP decode through the MTP/full-forward quality guard.
+     - In 0.0.3 `Qwen3NextGatedDeltaNet.forward()`, input projection and output
+       projection stay outside the custom op. The opaque op is the recurrent
+       core only:
+       `torch.ops.vllm.gdn_attention_core(mixed_qkv, b, a, core_attn_out,
+       self.prefix)`.
+     - The core op resolves the layer from `forward_context.no_compile_layers`
+       and consumes live `GDNAttentionMetadata`; `_forward_core` handles the
+       spec/non-spec split, `num_accepted_tokens`, and recurrent state updates.
+
+     0.0.3 state-handling fix to preserve:
+     - Commit `acd2a3150 [Bugfix] Stabilize MTP state handling` changed GDN
+       metadata to use CPU live query lengths for CUDA graph replay instead of
+       padded `query_start_loc` values.
+     - The same commit changed align-mode Mamba/GDN state movement to copy from
+       the accepted-token slot (`accept_token_bias = num_accepted_tokens - 1`)
+       and reset accepted-token counts to `1` after materializing the accepted
+       state. This is the stable recurrent-state rollover semantics.
+
+     Latest-tree lesson:
+     - The latest full-Qwen-GDN opaque boundary passed quality because it hides
+       the bad split/dependency boundary from the compiler, but it is broader
+       than 0.0.3 and can cost speed if used as the permanent MTP path.
+     - The latest `context_core`/explicit-cache attempts failed by themselves,
+       so the missing piece is not simply "call a core custom op"; the custom
+       op boundary, state/cache dependency contract, and 0.0.3 rollover
+       metadata semantics must all be equivalent.
+
+     Desired optimum:
+     - no-MTP: lightweight historical `qwen_gdn_attention_core_standard`.
+     - active MTP first safe default: full-Qwen-GDN opaque boundary, because it
+       is the known quality pass and keeps MTP enabled.
+     - active MTP final target: a 0.0.3-equivalent spec-aware recurrent-core
+       opaque op that keeps projection/output projection outside the opaque
+       region, with graph-safe metadata/state dependencies. This should recover
+       most of the full-forward speed cost without reintroducing long-output
+       MTP repetition.
+
+420. 2026-06-17 Qwen GDN MTP path-structure guardrail and implementation
+     checkpoint: no-MTP, active MTP, and future fast-MTP must not become three
+     independent model paths.
+
+     Engineering rule:
+     - The model forward should stay structurally common: input projection,
+       recurrent core, output projection.
+     - The only valid dispatch boundary is the recurrent core strategy, because
+       only recurrent-state commit semantics differ between non-spec decode and
+       active speculative decode.
+     - `fast-MTP` is not a third semantic path. It must be an optimized
+       implementation behind the same active-MTP spec-aware recurrent-core
+       interface, with identical state rollover and accepted-slot semantics.
+     - Full-Qwen-GDN forward remains an explicit diagnostic/fallback quality
+       guard, not the permanent default structure.
+
+     Source change:
+     - Added `_qwen_gdn_run_recurrent_core()` as the single Qwen GDN recurrent
+       core strategy entry.
+     - `QwenGatedDeltaNetAttention.forward_cuda()`,
+       `qwen_gdn_input_projection_core()`, and
+       `Qwen3_5GatedDeltaNet.forward_cuda()` now call this helper instead of
+       each carrying separate `no-MTP / MTP / full-forward` branch logic.
+     - At this checkpoint the helper kept the then-current semantics:
+       no active spec decode uses `qwen_gdn_attention_core_standard`;
+       active MTP defaults to the 0.0.3-style
+       `qwen_gdn_attention_core_003_spec`; explicit full-forward fallback is
+       still available through `VLLM_SM70_QWEN_GDN_FULL_FORWARD=1` or by
+       disabling the spec-core gate.
+
+     Verification so far:
+     - `py_compile` passed for the touched GDN/Qwen/env/compilation/test files.
+     - Targeted metadata/spec tests passed:
+       `31 passed` for
+       `tests/v1/attention/test_gdn_metadata_builder.py`,
+       `tests/v1/spec_decode/test_sm70_mtp_safety.py`,
+       `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py`, and
+       `tests/v1/spec_decode/test_tp_draft_sampling_sync.py`.
+
+     Pending:
+     - Long macOS MTP4 model-quality regression with official sampling.
+     - no-MTP 35B-AWQ decode-speed regression check to confirm the helper did
+       not disturb the recovered `~106-107 tok/s` baseline.
+
+421. 2026-06-17 Qwen GDN active-MTP explicit `spec_commit` attempt is useful
+     evidence, but it is not the current quality-safe default.
+
+     Decision:
+     - Treat 0.0.3 as a semantic reference only. It proves that active MTP can
+       preserve GDN fastpath quality, but its hidden `forward_context`/old
+       metadata lifetime is not the latest-tree implementation target.
+     - The latest-tree target is vLLM-main-style explicit spec metadata plus
+       TokenSpeed-style accepted-state commit semantics: the compiler must see
+       `spec_query_start_loc`, `spec_state_indices_tensor`, token partition
+       indices, `spec_sequence_masks`, and `num_accepted_tokens` as operator
+       inputs.
+
+     Source change:
+     - Added `vllm::qwen_gdn_attention_core_spec_commit`, an active-MTP Qwen
+       GDN recurrent-core custom op that keeps input/output projection in the
+       compiled graph but passes all spec metadata tensors explicitly across
+       the opaque recurrent-state boundary.
+     - `_qwen_gdn_run_recurrent_core()` can route active MTP/spec decode to
+       `qwen_gdn_attention_core_spec_commit` when
+       `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`.
+     - `qwen_gdn_attention_core_003_spec` remains only as a diagnostic
+       0.0.3-style context path; no-MTP continues to use
+       `qwen_gdn_attention_core_standard`.
+     - The new op is registered in the compilation attention-op list so
+       piecewise/FULL graph handling treats it as an opaque attention boundary.
+     - After end-to-end failure, `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP` defaults to
+       `0` again. Active MTP therefore uses the full-Qwen-GDN quality guard
+       automatically when speculative metadata is active, while no-MTP remains
+       on the lightweight `standard` op.
+
+     Guardrail:
+     - Do not "fix" future MTP repetition by routing active MTP through the
+       no-spec `standard` op or by making full-Qwen-GDN the no-MTP default.
+       If `spec_commit` still fails long-output quality, compare it against
+       full-Qwen-GDN reference and inspect state snapshot/accepted-slot commit
+       semantics, not sampler temperature or short-output smokes.
+
+     Verification:
+     - `py_compile` passed for
+       `qwen_gdn_linear_attn.py` and `compilation.py`.
+     - Targeted metadata/spec tests passed:
+       `31 passed` for
+       `tests/v1/attention/test_gdn_metadata_builder.py`,
+       `tests/v1/spec_decode/test_sm70_mtp_safety.py`,
+       `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py`, and
+       `tests/v1/spec_decode/test_tp_draft_sampling_sync.py`.
+     - End-to-end `spec_commit` MTP4 long-output artifact:
+       `bench_results/sm70_mtp_speccommit_20260617/27b_awq_mtp4_speccommit_i4096_o1024_q6000.json`.
+       It measured `prefill_tps=1848.629`, `steady_decode_tps=117.853`, but
+       `quality_passed=false`. Failures:
+       `code_macos` repeated `border: transparent;` after 6000 tokens,
+       `code_snake` repeated ``self.snake[1``, and `long_story_review`
+       repeated `I'll do it. I'll output it.`. The deterministic 2x256
+       control still had exact token match, so short determinism is not enough
+       to accept this path.
+
+     Interpretation:
+     - Explicit graph-visible spec metadata is necessary for a narrow fast
+       boundary, but this first `spec_commit` op is not sufficient. It still
+       lacks the proven accepted-state snapshot/commit semantics needed to
+       match the full-Qwen-GDN reference over long outputs.
+     - Do not repeat the same `spec_commit` long-output run as if it were
+       unknown. The next fast-path attempt must add/verify state snapshot,
+       accepted-slot commit, and rollover semantics against the full-GDN
+       reference before another 6k model run.
+
+     Follow-up:
+     - The default active-MTP full-Qwen-GDN quality guard and the 35B-AWQ
+       no-MTP speed check are revalidated in item 422 after the guard scope is
+       corrected from active-spec-batch scope to MTP-engine scope.
+
+422. 2026-06-17 Qwen GDN MTP quality guard scope correction: the known-good
+     full-Qwen-GDN boundary must be armed at MTP-engine scope, not only when a
+     particular replay batch exposes active spec metadata.
+
+     Evidence:
+     - Default active-only guard run:
+       `bench_results/macos6000_default_mtp4_20260617_guardlog/27b-awq-kv-auto-mtp4.json`.
+       It armed the guard with `force=False, auto=True, spec_core=False`, but
+       failed two `code_macos` 6000-token requests. Run 1 repeated
+       `--win-bg`/`rgba(rgba`; run 2 collapsed into a long `9` run with
+       `max_same_token_run=1810`.
+     - Explicit full-forward positive control:
+       `bench_results/macos6000_force_fullgdn_mtp4_20260617_guardlog/27b-awq-kv-auto-mtp4.json`.
+       It hit `SM70 Qwen GDN full-forward route enabled` and passed both
+       `code_macos` 6000-token requests under official sampling, MTP4,
+       compile/FULL graph, target `FLASH_ATTN_V100`, and drafter `TRITON_ATTN`.
+       Repeats stayed low (`repeat100=2` for both runs) and acceptance did not
+       enter a sustained all-`1.000` plateau.
+
+     Source change:
+     - `_sm70_qwen_gdn_full_forward_enabled()` now returns the automatic guard
+       whenever the MTP engine has armed it, instead of rechecking active spec
+       metadata for the current batch.
+     - no-MTP services remain protected because the automatic guard is armed
+       only when `vllm_config.speculative_config is not None`; ordinary no-MTP
+       decode keeps `qwen_gdn_attention_core_standard`.
+     - The matrix harness gained `--quality-prompt-id` and `--quality-repeat`
+       so future long-output probes can run the documented macOS reproducer
+       without repeating the entire prompt matrix.
+
+     Verification:
+     - Default active-MTP engine-scoped guard artifact:
+       `bench_results/macos6000_default_mtp4_20260617_engine_guard/27b-awq-kv-auto-mtp4.json`.
+       No explicit `VLLM_SM70_QWEN_GDN_FULL_FORWARD` env was set; the MTP
+       engine armed the guard automatically with `force=False, auto=True,
+       spec_core=False` and hit `SM70 Qwen GDN full-forward route enabled`.
+       The `code_macos` 2x6000 official-sampling probe passed both repeats.
+       Repeat 1: `tokens=6000`, `max_same_token_run=4`, `max_digit_run=6`,
+       `repeat100=2`; repeat 2: `tokens=6000`, `max_same_token_run=5`,
+       `max_digit_run=6`, `repeat100=2`. No bad markers were detected and
+       acceptance did not enter a sustained all-`1.000` plateau.
+     - 35B-AWQ no-MTP speed/route artifact:
+       `bench_results/sm70_speed_retest_20260618/35b_awq_i4096_o1024_tp2_no_mtp_engine_guard_check.json`.
+       Same criterion as the clean 2026-06-17 baseline: TP2,
+       `FLASH_ATTN_V100`, `input_len=4096`, `output_len=1024`,
+       `max_model_len=8192`, `max_num_batched_tokens=8192`,
+       `max_num_seqs=1`, `temperature=0.0`, `top_p=1.0`, `top_k=-1`,
+       and `ignore_eos=True`. The final run used the matching
+       `vllm-0.0.5-t210` Python 3.12/Torch 2.10 environment so `_moe_C`
+       registered `moe_permute_sort_workspace_size`; a Python 3.13 attempt
+       failed during AWQ MoE initialization because its `_moe_C` extension was
+       ABI-mismatched.
+     - no-MTP result: `speculative_config=None`, `spec_decode_metrics=None`,
+       no full-forward env vars set, GDN decode `FlashQLA` effective, AWQ MoE
+       default batched/legacy route effective, and steady decode
+       `105.73826248978811 tok/s` (`output_tps=100.79483067958125`,
+       `prefill_time=0.481605913999374`). This remains in the recovered
+       `~106-107 tok/s` band and confirms the MTP-engine-scoped quality guard
+       does not leak into no-MTP decode.
+
+423. 2026-06-18 Qwen GDN `spec_commit` fast-path follow-up: direct
+     pure-spec recurrent core arguments are necessary, but still not a passing
+     active-MTP default.
+
+     Source change:
+     - `qwen_gdn_attention_core_spec_commit` now bypasses the metadata-patching
+       `_forward_core` fallback for pure active-spec decode batches
+       (`num_prefills == 0`, `num_decodes == 0`). In that hot path it consumes
+       the graph-visible `spec_query_start_loc`, padded
+       `spec_state_indices_tensor`, and padded `num_accepted_tokens` arguments
+       directly for the conv and recurrent kernels.
+     - The metadata fallback remains only for mixed spec/non-spec batches. This
+       keeps the forward structure as input projection, spec-aware recurrent
+       core, output projection; it does not widen back to full-Qwen-GDN.
+     - Added a unit test proving the pure-spec op path consumes padded graph
+       rows without mutating live `GDNAttentionMetadata`. This complements the
+       existing rollover contract tests near the `2 * 816 = 1632` state-block
+       boundary.
+
+     Static/unit verification:
+     - `python -m py_compile` passed for
+       `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` and
+       `tests/v1/attention/test_gdn_metadata_builder.py`.
+     - `ruff check` passed for the same files.
+     - Targeted metadata/Mamba/spec tests passed:
+       `50 passed` for `tests/v1/attention/test_gdn_metadata_builder.py`,
+       `tests/v1/worker/test_mamba_utils.py::TestPostprocessMambaFusedKernel`,
+       `tests/v1/spec_decode/test_sm70_mtp_safety.py`,
+       `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py`, and
+       `tests/v1/spec_decode/test_tp_draft_sampling_sync.py`.
+
+     End-to-end evidence:
+     - Short smoke with `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1` passed:
+       `bench_results/speccommit_direct_purespec_smoke_20260618/27b-awq-kv-auto-mtp4.json`.
+       It reported `quality_passed=true`, `prefill_tps=1688.3358`, and
+       `steady_decode_tps=75.7463` for the short 512-token gate.
+     - Long `code_macos` 2x6000 official-sampling gate still failed:
+       `bench_results/speccommit_direct_purespec_long_20260618/27b-awq-kv-auto-mtp4.json`.
+       Speed stayed in the fast-path band (`prefill_tps=1783.2126`,
+       `steady_decode_tps=115.9008`), but quality failed. Repeat 1 hit the
+       `UTF-UTF` bad-marker gate; repeat 2 repeated
+       `zypper: (args) => { /* zypper script */ },` with
+       `repeat100=33` and `max_same_line_run=34`.
+     - A schema ablation that removed `mixed_qkv` from
+       `qwen_gdn_attention_core_spec_commit` `mutates_args` also failed:
+       `bench_results/speccommit_direct_schema_long_20260618/27b-awq-kv-auto-mtp4.json`.
+       It preserved speed (`steady_decode_tps=115.3695`) but repeat 2 entered
+       a worse repeated `(top-right corner` loop with `repeat100=1426` and a
+       sustained all-position acceptance plateau. That ablation was reverted;
+       `mixed_qkv` remains declared mutable because the conv update may mutate
+       the projection buffer in place.
+
+     Decision:
+     - The plan target is not yet achieved. `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP`
+       must remain default-off, and active MTP must continue to default to the
+       engine-scoped full-Qwen-GDN quality guard.
+     - Direct graph-visible spec tensors fixed one hidden dependency class, but
+       they are not sufficient to match the full-GDN reference over long
+     outputs. The remaining gap is still inside the split Qwen GDN boundary:
+     recurrent state snapshot/commit ordering and/or the `core_attn_out`/`z`
+     handoff into the compiled output projection. Do not spend another 6k
+     run on sampler, CPU postprocess, or `mixed_qkv` schema ablations without
+     a new exactness comparison against the full-GDN reference.
+
+424. 2026-06-18 Qwen GDN active-MTP kernel-layer exactness probe: standalone
+     conv/gating/recurrent CUDA graph replay does not reproduce the long-output
+     `spec_commit` quality collapse on the full-query MTP4 contract.
+
+     Source change:
+     - Added `run-spec-decode-cudagraph` to
+       `benchmarks/benchmark_sm70_gdn_exactness.py`. The new harness builds a
+       synthetic active-MTP4 pure spec decode stream with graph-visible
+       `spec_query_start_loc`, padded `spec_state_indices_tensor` rows using
+       `PAD_SLOT_ID=-1`, padded `num_accepted_tokens`, accepted counts cycling
+       through `1..5`, random initial conv/SSM cache, and rolling state-slot
+       windows. It then runs the same `causal_conv1d_update ->
+       fused_gdn_gating -> fused_recurrent_gated_delta_rule` core in eager and
+       CUDA graph replay, comparing live recurrent output, the in-place mutated
+       `mixed_qkv`, conv state cache, and SSM state cache with exact
+       `torch.equal`/`max_diff=0`.
+
+     Verification:
+     - `python -m py_compile benchmarks/benchmark_sm70_gdn_exactness.py` passed.
+     - `ruff check benchmarks/benchmark_sm70_gdn_exactness.py` passed.
+     - Sanity artifact:
+       `bench_results/spec_decode_kernel_exactness_20260618/sanity_16.pt`.
+       MTP4, 16 steps, 16 rolling slots, random initial state:
+       `strict_ok=true`; live output, full output, mutated `mixed_qkv`,
+       conv state, and SSM state all matched exactly.
+     - Main full-query artifact:
+       `bench_results/spec_decode_kernel_exactness_20260618/mtp4_fullqlen_512.pt`.
+       MTP4, 512 graph replays, 64 rolling slots, accepted histogram
+       `[0, 103, 102, 102, 103, 102]`, query length always 5:
+       `strict_ok=true`; live output, full output, mutated `mixed_qkv`,
+       conv state, and SSM state all matched exactly with `max_diff=0.0`.
+     - Varlen stress artifact:
+       `bench_results/spec_decode_kernel_exactness_20260618/mtp4_varqlen_128.pt`.
+       Query lengths cycled through `1..5`; `strict_ok=true` for live output,
+       mutated `mixed_qkv`, conv state, and SSM state. The full output tensor
+       did not match because recurrent output rows outside the live
+       `cu_seqlens` range are uninitialized scratch values. This is expected
+       for unused token capacity but confirms downstream code must not treat
+       padded token tail rows as real logits/hidden states.
+
+     Interpretation:
+     - The long-output `spec_commit` failure is not reproduced by the
+       standalone SM70 conv/gating/recurrent kernels under the full-query MTP4
+       graph replay contract. Accepted-slot selection, state-slot writes,
+       in-place conv cache update, and graph-visible dynamic metadata are exact
+       at this layer for the tested contract.
+     - The remaining quality bug should be chased at the Qwen GDN split
+       boundary: custom op side-effect/schema visibility, full-GDN vs
+       `spec_commit` core equivalence, `core_attn_out`/`z` handoff, and padded
+       output masking. Do not use another standalone kernel replay as evidence
+       that the active-MTP fast path is fixed; the next useful check is a
+     `spec_commit` vs full-Qwen-GDN exactness comparison under identical
+     synthetic metadata/cache tensors.
+
+425. 2026-06-18 Qwen GDN `spec_commit` vs full-GDN core-op exactness at 6k
+     replay length: the synthetic op boundary still does not reproduce the
+     long-output quality collapse.
+
+     Source change:
+     - Added `run-spec-commit-vs-standard` to
+       `benchmarks/benchmark_sm70_gdn_exactness.py`. This harness reuses the
+       active-MTP synthetic metadata/cache generator from item 424, creates a
+       fake Qwen GDN layer plus fake forward context, then compares
+       `torch.ops.vllm.qwen_gdn_attention_core_standard_spec` as the full-GDN
+       core reference against `torch.ops.vllm.qwen_gdn_attention_core_spec_commit`
+       in both eager and CUDA graph replay.
+     - The comparison records live recurrent output, full core output, mutated
+       `mixed_qkv`, conv cache, and SSM cache. It keeps the runtime conv cache
+       layout (`SD` in this run, so cache shape is `[slots, state_len, dim]`)
+       separate from the kernel layout to avoid false layout mismatches.
+
+     Verification:
+     - `python -m py_compile benchmarks/benchmark_sm70_gdn_exactness.py` passed.
+     - `ruff check benchmarks/benchmark_sm70_gdn_exactness.py` passed.
+     - Short op-boundary sanity:
+       `bench_results/spec_commit_op_exactness_20260618/sanity_16.pt`.
+       MTP4, 16 replays, accepted counts cycling through `1..5`,
+       random initial state: `strict_ok=true`; every compared output/state
+       tensor matched exactly.
+     - 512-replay op-boundary check:
+       `bench_results/spec_commit_op_exactness_20260618/mtp4_fullqlen_512.pt`.
+       Accepted histogram `[0, 103, 102, 102, 103, 102]`;
+       `strict_ok=true`; eager `spec_commit`, graph `spec_commit`, and
+       `standard_spec` reference matched exactly with `max_diff=0.0`.
+     - 6000-replay op-boundary check:
+       `bench_results/spec_commit_op_exactness_20260618/mtp4_fullqlen_6000.pt`.
+       Accepted histogram `[0, 1200, 1200, 1200, 1200, 1200]`;
+       `strict_ok=true`; live output shape `[30000, 8, 128]` and full output
+       shape `[6000, 5, 8, 128]` matched exactly, as did mutated
+       `mixed_qkv`, conv cache, and SSM cache.
+     - 6000-replay all-accepted stress:
+       `bench_results/spec_commit_op_exactness_20260618/mtp4_fullqlen_6000_accept5.pt`.
+       Accepted histogram `[0, 0, 0, 0, 0, 6000]`, matching the sustained
+       all-position acceptance plateau seen in bad end-to-end runs;
+       `strict_ok=true`; every compared output/state tensor still matched
+       exactly with `max_diff=0.0`.
+
+     Interpretation:
+     - The earlier 512-step exactness evidence was too short to stand in for
+       the 6k quality gate by itself. The new 6000-replay and 6000 all-accepted
+       stress cases close that gap at the synthetic core-op boundary.
+     - The current evidence rules out a standalone `spec_commit` recurrent
+       core divergence under the tested active-MTP metadata/cache contract,
+       even over 6k graph replays. The remaining failure is likely outside this
+     boundary: compiled handoff from the custom op to output projection,
+     `core_attn_out`/`z` lifetime or masking, logits-side consumption of
+     padded rows, or a real-model metadata/cache pattern not represented by
+     the synthetic one. The next useful reproducer should capture real model
+     `spec_commit` core inputs around the onset of repetition and replay
+     them through this harness, or compare full forward vs split forward
+     including output projection/logits.
+
+426. 2026-06-18 Extended the synthetic active-MTP kernel check through
+     Qwen GDN output projection and a logits GEMM; this still does not
+     reproduce the long-output collapse, even at 6000 all-accepted replays.
+
+     Source change:
+     - Added `run-spec-commit-projection` to
+       `benchmarks/benchmark_sm70_gdn_exactness.py`. It reuses the synthetic
+       MTP4 metadata/cache stream from items 424/425, adds `z`, RMSNormGated
+       weight, out-projection weight, and a small logits weight, then compares:
+       `standard_spec + qwen_gdn_output_projection` as the opaque reference,
+       `spec_commit + direct _output_projection` in eager, `spec_commit +
+       direct _output_projection` under CUDA graph replay, `spec_commit +
+       qwen_gdn_output_projection` under CUDA graph replay, and optional
+       `torch.compile(fullgraph=True)` direct split replay.
+     - The compiled variant snapshots `core_attn_out` immediately after the
+       recurrent custom op and before projection so Inductor's legal reuse of
+       dead projection buffers is not misread as recurrent-core drift.
+
+     Verification:
+     - `python -m py_compile benchmarks/benchmark_sm70_gdn_exactness.py` passed.
+     - `ruff check benchmarks/benchmark_sm70_gdn_exactness.py` passed.
+     - CUDA graph sanity:
+       `bench_results/spec_commit_projection_exactness_20260618/sanity_16.pt`.
+       MTP4, 16 replays, accepted counts cycling through `1..5`:
+       `strict_ok=true`; direct projection, opaque projection, logits, core
+       snapshot, conv cache, and SSM cache all matched exactly.
+     - `torch.compile(fullgraph=True)` sanity:
+       `bench_results/spec_commit_projection_exactness_20260618/sanity_16_compile.pt`.
+       The recurrent core snapshot plus conv/SSM state matched exactly.
+       Compiled direct projection/logits differed from the opaque/eager
+       reference only at FP16 last-bit scale (`live_output max_diff=1.19e-7`,
+       `live_logits max_diff=1.19e-7`).
+     - 6000-replay all-accepted compile stress:
+       `bench_results/spec_commit_projection_exactness_20260618/mtp4_fullqlen_6000_accept5_compile.pt`.
+       Accepted histogram `[0, 0, 0, 0, 0, 6000]`. Recurrent core snapshot,
+       conv cache, and SSM cache matched exactly under eager, CUDA graph, and
+       compiled direct split replay. Direct/opaque CUDA graph projection and
+       logits matched exactly. Compiled direct projection stayed at FP16
+       last-bit scale (`live_output max_diff=4.77e-7`,
+       `live_logits max_diff=2.38e-7`) and did not grow into the sustained
+       all-position acceptance plateau seen in bad end-to-end runs.
+
+     Interpretation:
+     - The synthetic active-MTP contract now rules out standalone
+       conv/gating/recurrent kernels, the `spec_commit` custom-op boundary,
+       output projection, logits GEMM, and fullgraph Inductor projection math
+       as sufficient reproductions of the 6k quality collapse.
+     - This does not prove `spec_commit` is safe. It proves the missing
+       reproducer is a real-model condition not represented by the synthetic
+       stream: real projection tensors, real layer ordering, real cache/block
+       rollover, or CUDA-graph dependency/aliasing across the whole Qwen GDN
+       split. The next kernel-level proof should use real failing-request
+     captures: enable GDN state-table/core/projection dumps around the known
+     collapse window, pair them with `VLLM_SPEC_DUMP_ALIGNMENT`, and compare
+     the first bad `proj_core_in`, `proj_z`, `proj_out`, and target logits
+     against the full-Qwen-GDN quality-guard run. Do not run another
+     synthetic-only exactness case as evidence that the MTP fast path is
+     fixed.
+
+427. 2026-06-18 Real 27B-AWQ TP2 MTP4 6k A/B confirms the active-MTP
+     quality switch and narrows the kernel-level failure away from the
+     accepted-state metadata contract.
+
+     Setup:
+     - Prompt: `code_macos`.
+     - Sampling: official generation config, `temperature=1.0`, `top_p=0.95`,
+       `top_k=20`, `seed=20260617`, `max_tokens=6000`, `ignore_eos=false`.
+     - Bad split run: GPUs `0,1`, `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`,
+       `VLLM_SM70_QWEN_GDN_FULL_FORWARD=0`.
+       Artifact: `bench_results/quality_state_ab_20260618/bad_speccommit/`.
+     - Good guard run: GPUs `2,3`, `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`,
+       `VLLM_SM70_QWEN_GDN_FULL_FORWARD=1`.
+       Artifact: `bench_results/quality_state_ab_20260618/good_fullgdn/`.
+     - The rerun intentionally kept only the narrow state-table dump over
+       `seq=5600..6100`; a first attempt with broad GDN graph tensor dumps
+       proved too large and was deleted after preserving logs/state tables.
+
+     Result:
+     - Bad split path failed quality:
+       `bench_results/quality_state_ab_20260618/bad_speccommit/27b-awq-kv-auto-mtp4.json`.
+       Output hit `repeat20=390`, `repeat50=386`, `repeat100=380`; the tail
+       degenerated into repeated `ripple` tokens.
+     - Good full-forward guard passed quality:
+       `bench_results/quality_state_ab_20260618/good_fullgdn/27b-awq-kv-auto-mtp4.json`.
+       Output still reached 6000 tokens but had no quality failures
+       (`repeat20=21`, `repeat50=5`, `repeat100=3`).
+     - State-table accepted-count distribution over the long-output window:
+       bad split path had 94/95 logical decode steps with
+       `num_accepted_tokens[0] == 5`, including a continuous run from
+       `seq=5719` through `seq=6074`; good full-forward had 55/137 such
+       steps, with longest continuous run 12.
+     - State-table contract checks had zero violations for both runs:
+       active `spec_state_indices_tensor[0]` matched
+       `current_state_block_ids[0]`, padded rows were `-1`, padded accepted
+       counts were `1`, `spec_sequence_masks` was true only for the active
+       row, and `spec_query_start_loc` remained `[0, 5, 5, 5, 5, 5]`.
+     - Around the `7 * 816 = 5712` state-block rollover, both paths used the
+       same rollover pattern from `[54, 58, 62, 66, 70]` to
+       `[58, 62, 66, 70, 74]`, and `spec_state_indices_tensor[0]` followed
+       the same blocks.
+
+     Interpretation:
+     - The real failing request reproduces the sustained all-position
+       acceptance plateau only with the split `spec_commit` path, while the
+       full-Qwen-GDN quality guard remains good under the same prompt and
+       sampling.
+     - In the captured failure window, the visible accepted-state metadata is
+       internally consistent. Therefore the current root is not simply an
+       align-mode state-index/accepted-count tensor construction error at the
+       long-output block boundary.
+     - The next kernel-level proof should use a much narrower real tensor dump
+       or an in-run shadow comparator, not broad graph dumps: capture only a
+       few steps around the transition into `num_accepted_tokens==5` plateau
+       and compare split vs full-forward `proj_core_in`, `proj_z`, `proj_out`,
+       and logits under identical real inputs/state. The likely remaining
+       class is a real compiled split-boundary dependency/alias/order issue
+       between recurrent output, projection, and logits, not the standalone
+       recurrent op contract.
+
+428. 2026-06-18 Qwen GDN MTP 0.0.3 comparison checkpoint and narrow real-dump
+     instrumentation.
+
+     Current conclusion:
+     - 0.0.3 proves Qwen GDN active-MTP can be quality-clean, but the latest
+       failure is not explained by MTP itself or by missing sampler settings.
+     - The original "spec metadata not fully visible" diagnosis was a real
+       implementation gap, but the later `spec_commit` long-output failures
+       prove it is not the whole root cause.
+     - Real 6k A/B already showed the visible align-mode accepted-state
+       contract is internally consistent in the bad path: active state rows,
+       padded rows, accepted counts, and the 5712 block rollover all matched
+       the expected contract.
+     - The remaining root class is therefore the latest split Qwen GDN
+       compile/FULL graph boundary under real-model conditions: dependency,
+       aliasing, or ordering across input projection, recurrent core mutation,
+       output projection, and logits. The full-Qwen-GDN opaque guard remains
+       the quality-safe default until this split path is repaired.
+
+     Source change:
+     - Added default-off `VLLM_SM70_DUMP_GDN_GRAPH_METADATA=1` support in
+       `qwen_gdn_linear_attn.py`.
+     - When graph-buffer dumping is enabled, both the bad `spec_commit` route
+       and the full-forward guard's internal `standard_spec` route can now dump
+       the spec metadata tensors next to `core` and `proj` tensors:
+       `meta_non_spec_query_start_loc`, `meta_non_spec_state_indices`,
+       `meta_spec_query_start_loc`, `meta_spec_state_indices`,
+       `meta_spec_token_indx`, `meta_non_spec_token_indx`,
+       `meta_spec_sequence_masks`, and `meta_num_accepted_tokens`.
+     - Added default-off `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1` as a real
+       active-MTP routing switch for the existing 0.0.3-style recurrent-core
+       op. This disables the automatic full-forward guard for that experiment
+       and calls `qwen_gdn_attention_core_003_spec` with explicit cache mutation
+       args while letting the op consume live forward-context GDN metadata.
+       It is not a default path until the 6k quality gate passes.
+
+     Verification:
+     - `python -m py_compile
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` passed.
+     - `ruff check
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` passed.
+
+     Next proof:
+     - Run one bad split and one good full-forward request with the same
+       `code_macos` 6000-token official-sampling setup, but dump only selected
+       layers and a few steps around the transition into the all-accepted
+       plateau. Compare `meta_*`, `core_out`, `proj_core_in`, `proj_z`,
+       `proj_out`, and sampler logits. Do not repeat synthetic-only exactness
+       as proof of a fix.
+
+429. 2026-06-18 The 0.0.3-style recurrent-core switch alone does not fix the
+     Qwen GDN active-MTP 6k quality collapse.
+
+     Setup:
+     - GPUs `2,3`, model `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, AWQ,
+       MTP4, `FLASH_ATTN_V100`, compile/FULL graph, `mamba_cache_mode=align`.
+     - Prompt: `code_macos`.
+     - Sampling: official generation config, `temperature=1.0`, `top_p=0.95`,
+       `top_k=20`, `seed=20260617`, `max_tokens=6000`, `ignore_eos=false`.
+     - Route:
+       `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
+       `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`,
+       `VLLM_SM70_QWEN_GDN_FULL_FORWARD=0`,
+       `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=0`.
+       Startup log confirmed `SM70 Qwen GDN 0.0.3-style spec recurrent-core
+       route armed.`
+     - Artifact:
+       `bench_results/qwen_gdn_003_spec_core_macos6000_20260618/single_macos_003.json`.
+
+     Result:
+     - The run completed `6000` output tokens with `finish_reason=length`.
+     - Steady decode was `89.496 tok/s` in this first-request run, with
+       inference-time Triton JIT warnings for MTP postprocess/attention kernels;
+       treat speed as weak evidence until a warmed repeat is run.
+     - Quality failed. The output tail degenerated into repeated CSS fragments:
+       `--flex-shrink:0;--flex-shrink:0;...`.
+     - Acceptance reproduced the bad signature during the run. It rose from
+       normal partial acceptance to `1.000, 0.995, 0.991, 0.986`, then to
+       sustained `1.000, 1.000, 1.000, 1.000`.
+
+     Interpretation:
+     - "Use the 0.0.3 path" cannot mean only calling the existing
+       `qwen_gdn_attention_core_003_spec` recurrent-core op while leaving the
+       latest split input projection, output projection, and logits handoff in
+       place. That candidate still collapses under the real 6k quality gate.
+     - The state/metadata contract remains necessary, but the missing piece is
+       still the real latest Qwen GDN split boundary. Next useful A/B is to
+       expand the opaque boundary in controlled steps:
+       `qwen_gdn_input_projection_core` first, then
+       `qwen_gdn_output_projection`, before falling back to full-Qwen-GDN.
+       A candidate only counts if it removes the all-position acceptance
+       plateau on `code_macos` and then passes the 6000-token quality gate.
+
+430. 2026-06-18 Output-projection custom-op side-effect boundary is a real
+     Qwen GDN MTP split-path failure trigger.
+
+     Setup:
+     - GPUs `2,3`, model `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, AWQ,
+       MTP4, `FLASH_ATTN_V100`, compile/FULL graph, `mamba_cache_mode=align`.
+     - Prompt: `code_macos`.
+     - Sampling: official generation config, `temperature=1.0`, `top_p=0.95`,
+       `top_k=20`, `seed=20260617`, `max_tokens=3000`, `ignore_eos=false`.
+
+     A/B:
+     - Bad candidate:
+       `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
+       `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=1`,
+       `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
+       `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`,
+       `VLLM_SM70_QWEN_GDN_FULL_FORWARD=0`.
+       Artifact:
+       `bench_results/qwen_gdn_inputcore_outputop_003_macos3000_20260618/single_macos_inputcore_outputop_003_3000.json`.
+       Result: `3000` tokens, `finish_reason=length`, steady decode
+       `88.030 tok/s`, but the tail collapsed into a long run of `0` tokens.
+     - Control candidate:
+       same route except `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`.
+       Artifact:
+       `bench_results/qwen_gdn_inputcore_003_macos3000_20260618/single_macos_inputcore_003_outputdirect_3000.json`.
+       Result: `3000` tokens, `finish_reason=length`, steady decode
+       `75.295 tok/s`, no pure-zero tail, and acceptance stayed below the
+       sustained all-position `1.000` plateau during the run.
+
+     Interpretation:
+     - The pure-zero collapse is not caused by `qwen_gdn_input_projection_core`
+       alone. It appears when the Qwen GDN output projection is moved behind a
+       side-effect-only custom-op boundary.
+     - `Qwen3NextDecoderLayer.forward()` allocates
+       `self_attention_output = torch.empty_like(hidden_states)`, calls the
+       attention module to mutate it, then reads that same tensor as
+       `hidden_states`. A custom op that only mutates `output` and returns
+       `None` leaves a weaker value dependency under compile/FULL graph replay
+       than the 0.0.3 inline output-projection path.
+
+     Follow-up:
+     - A value-return output-projection custom-op experiment was attempted
+       after this A/B, but it caused initialization/capture hangs and was
+       removed. See item 431. The item 430 source-level decision is therefore
+       diagnostic only: keep `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=1` out
+       of the MTP recovery path.
+
+     Verification so far:
+     - `python -m py_compile
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` passed.
+     - `ruff check
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` passed.
+     - `pytest -q tests/v1/attention/test_gdn_metadata_builder.py -k
+       '003_spec_core_route or full_forward_auto or pure_spec_commit or
+       graph_rows or rollover'` passed (`4 passed`).
+
+     Pending:
+     - Re-run the bad candidate after this source change:
+       `input-core + output-op + 003-spec-core`, first at `3000` tokens to
+       confirm the pure-zero tail is gone, then at `6000` tokens before
+       treating it as a quality candidate.
+     - GPU validation is intentionally paused while other TP4/ncu jobs hold
+       the V100s; do not clear those processes.
+
+431. 2026-06-18 Output-projection value-return experiment is not viable in the
+     current compile/FULL graph setup; keep output-op out of the MTP recovery
+     path.
+
+     Attempt:
+     - To strengthen the dependency from Qwen GDN output projection to the next
+       decoder layer, `_output_projection()` was temporarily split so a new
+       `qwen_gdn_output_projection_value` custom op could return `proj_out`
+       and the compiled graph could copy that value into the attention output
+       buffer.
+     - The old `qwen_gdn_output_projection` side-effect op was left compatible
+       during the experiment.
+
+     Result:
+     - `input-core + output-op + 003-spec-core` with the value-return op did
+       not reach profiling/capture. It repeatedly stopped during
+       `determine_available_memory()` with EngineCore waiting on worker
+       shared-memory broadcast; GPU utilization was `0`.
+     - A follow-up `input-core + output-direct + 003-spec-core` run also failed
+       to produce a 6000-token quality result while the environment had a
+       separate D-state benchmark process. This is not counted as model quality
+       evidence; no output was generated.
+     - A second `input-core + output-direct + 003-spec-core` 6000-token retry
+       on GPUs `2,3` also did not reach generation. Startup reached model and
+       drafter loading, then stopped in `EngineCore._initialize_kv_caches()`
+       during `determine_available_memory()`: EngineCore waited on worker
+       shared-memory broadcast, workers slept, GPU utilization stayed `0`, and
+       no JSON result was written at
+       `bench_results/qwen_gdn_inputcore_003_macos6000_20260618/single_macos_inputcore_003_outputdirect_6000_retry2.json`.
+       This is also not counted as model quality evidence.
+
+     Decision:
+     - The value-return op, its registration, and its compilation splitting-op
+       entry were removed. The codebase is back to the old default-off
+       side-effect `qwen_gdn_output_projection` experiment.
+     - Do not use `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=1` as a speed
+       recovery route. It has a reproduced 3000-token pure-zero collapse in
+       item 430.
+     - Continue MTP recovery with output projection inline/direct, or with the
+       full-Qwen-GDN quality guard as the default. The next valid model-quality
+       run is `input-core + output-direct + 003-spec-core` at 6000 tokens after
+       the GPU/process environment is clean.
+
+     Verification after rollback:
+     - `python -m py_compile
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       vllm/config/compilation.py` passed.
+     - `ruff check
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       vllm/config/compilation.py` passed.
+     - `pytest -q tests/v1/attention/test_gdn_metadata_builder.py -k
+       '003_spec_core_route or full_forward_auto or pure_spec_commit or
+       graph_rows or rollover'` passed (`4 passed`).
+
+432. 2026-06-18 Flash-V100 D=256 long-context paged-prefill fast path,
+     benchmark result, and shared-memory audit.
+
+     Scope:
+     - Main tree: `/home/ymzx/桌面/1cat-vllm/vllm`.
+     - Kernel target:
+       `flash-attention-v100/kernel/fused_mha_forward_paged.cu`.
+     - Reproducer added:
+       `benchmarks/kernels/benchmark_flash_v100_prefill_decay.py`.
+       It can reproduce dense, paged-step, and chunked prefill up to 256K
+       without loading a full model. Use TP1 by default:
+       `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 conda run -n
+       vllm-0.0.5-t210 python
+       benchmarks/kernels/benchmark_flash_v100_prefill_decay.py --mode chunked
+       --profile qwen35-tp1 --prompt-lens 4096 16384 65536 261120
+       --chunk-size 16324`.
+
+     Source change:
+     - Added a narrow FP16 D=256 paged-prefill load fast path for four
+       physically contiguous 16-token pages. The path is used only when
+       `page_block_size == 16`, `page_offset == 0`,
+       `valid_k_rows == BLOCK_N`, K/V block strides match token strides, and
+       the four physical block IDs are consecutive.
+     - The fallback single-page, two-page, and generic multi-page paths remain
+       unchanged for non-contiguous or non-matching layouts.
+
+     Correctness gate:
+     - Strict fast-vs-slow checker compared a contiguous block table that
+       triggers the new path against a reversed physical-page cache that forces
+       the old path while preserving the same logical K/V.
+     - TP1 and TP4, seeds `0` and `123`, shapes up to
+       `q_len=16260`, `kv_len=261120`, all passed:
+       `torch.equal=True`, `fast_slow_max=0.0`, `fast_slow_mean=0.0`.
+     - Paged-vs-dense still has the same pre-existing fp16-level nonzero diff
+       on both fast and slow paths. This fast path is therefore Type A accepted
+       against the original paged path, while the paged-vs-dense arithmetic
+       classification remains separate evidence and must not be counted as a
+       new fast-path regression.
+
+     Kernel-only speed:
+     - TP1 paged-step, before -> after:
+       `M=16324,N=65296`: `1889.837 ms -> 1613.978 ms` (`+14.6%`);
+       `M=16324,N=130592`: `4730.539 ms -> 3471.554 ms` (`+26.6%`);
+       `M=16260,N=261120`: `9176.996 ms -> 7192.200 ms` (`+21.6%`).
+     - TP4 paged-step, before -> after:
+       `M=16324,N=65296`: about `440.354 ms -> 405.287 ms` (`+8.0%`);
+       `M=16324,N=130592`: about `957.695 ms -> 878.802 ms` (`+8.2%`);
+       `M=16260,N=261120`: about `1989.838 ms -> 1835.043 ms` (`+7.8%`).
+     - TP1 chunked 256K post-patch, one attention layer:
+       `59497.784 ms`, attention-only `4388.7 tok/s`,
+       effective `9.39 TF/s`. This is a kernel reproducer result, not a
+       whole-model throughput claim.
+
+     Shared-memory audit for current D=256 config:
+     - Compile-time tile: `BLOCK_M=32`, `BLOCK_N=64`, `WARPS=16`,
+       `THREADS=512`, `PAD=8`.
+     - Dynamic shared memory per CTA:
+       Q tile `16,896 B`, K/V union `33,792 B`, score/probability union
+       `9,216 B`, `p_strict` `2,560 B`, fp32 output accumulator `33,792 B`,
+       row stats `256 B`; total `96,512 B`.
+     - V100 limit is `98,304 B`, so only `1,792 B` slack remains. This
+       forces at most one CTA per SM by shared memory. With 16 warps per CTA,
+       resident warps are capped at 16/64 theoretical warp occupancy.
+     - Long chunks are not grid-starved: TP1 `q=16324,H=16` launches
+       `8176` CTAs; TP4 `q=16324,H=4` launches `2044` CTAs. Tiny tail chunks
+       are grid-starved: `q=60` launches only `32` CTAs at TP1 and `8` CTAs at
+       TP4.
+
+     Next optimization work:
+     - Primary target is shared-memory reduction or a tile-shape variant, not
+       just more block-level parallelism. Audit whether the large fp32 `o`
+       tile, Q residency, `p_strict`, and padding can be reduced without
+       changing the Type A fast-vs-slow result.
+     - Candidate experiments: D=256 `BM16/BN96` or `BM16/BN112` variants,
+       D-split/output-accumulator reduction, and tail-chunk merge/alignment.
+       Each candidate must first pass fast-vs-original `maxdiff == 0` before
+       any whole-model benchmark is counted.
+
+433. 2026-06-18 Qwen GDN MTP speed diagnosis and targeted real-request dump
+     setup.
+
+     Speed diagnosis:
+     - The quality-safe default was broader than the 0.0.3 optimum. In an
+       MTP-enabled engine, `_sm70_qwen_gdn_full_forward_enabled()` used to
+       return the engine-scoped guard without rechecking per-batch active spec
+       metadata, and `QwenGatedDeltaNetAttention.forward()` called
+       `qwen_gdn_full_forward` for the whole Qwen GDN layer. This preserved the
+       6000-token macOS quality gate, but it also made prefill and non-spec
+       decode pay the full-forward opaque-op cost.
+     - Narrowed the default guard to active spec decode only:
+       `VLLM_SM70_QWEN_GDN_FULL_FORWARD=1` still force-enables the old
+       all-batch/full-layer guard, but the automatic MTP quality guard now
+       requires `_sm70_qwen_gdn_has_active_spec_decode(layer_name)`. This keeps
+       no-MTP and MTP non-spec rows on the normal fast recurrent-core path
+       while still protecting the failing active-MTP split boundary.
+     - Follow-up correction: do not auto-enable full-forward during
+       `is_dummy_run` / memory-profile batches. Profile dummy runs do not carry
+       real active-spec metadata and should not be treated as the quality guard
+       boundary. `VLLM_SM70_QWEN_GDN_FULL_FORWARD=1` remains the explicit
+       force-on diagnostic escape hatch.
+     - This is a pragmatic speed recovery guard, not the final plan target.
+       The final target remains to make the spec-aware recurrent-core split
+       match the full-forward quality boundary so the active spec rows can also
+       avoid the full-forward wrapper.
+
+     Diagnostic change:
+     - Added default-off step filters for late-window real-request dumps:
+       `VLLM_SM70_MTP_DUMP_STEP_STEPS` filters
+       `VLLM_SM70_MTP_DUMP_STEP_DIR` records by the internal MTP dump counter,
+       and `VLLM_SPEC_DUMP_ALIGNMENT_STEPS` filters
+       `VLLM_SPEC_DUMP_ALIGNMENT=1` records by the rejection-sampler spec step.
+     - These filters are needed because the failing signal appears late in the
+       6000-token run. Dumping only "first N" records misses the all-accepted
+       plateau, while dumping every step perturbs the run with excessive IO.
+       When the `*_STEPS` variables are unset, existing dump behavior is
+       unchanged.
+
+     Next real-request proof:
+     - Run one bad split request and one good full-forward request with the
+       same `code_macos`, official sampling, TP2 MTP4 setup. Use a narrow
+       range around the observed collapse window and selected GDN layers only.
+     - Minimum useful dump labels:
+       `meta_spec_query_start_loc`, `meta_spec_state_indices`,
+       `meta_num_accepted_tokens`, `split_mixed_qkv`, `split_z`, `core_out`,
+       `proj_core_in`, `proj_z`, `proj_norm_out`, and `proj_out`, plus
+       rejection-sampler alignment payloads for target logits and draft-token
+       probabilities.
+     - Compare the first step where the split path enters sustained
+       all-position acceptance against the full-forward guard. The accepted
+       fast path must match the good run at this real-model boundary before it
+       can replace the full-forward default.
+
+     Real-request evidence reused from existing A/B run:
+     - Direct late-window dump attempts with `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`
+       did not reach generation in this checkout; both the 6000-token dump run
+       and the 1024-token no-dump startup check stalled before
+       `determine_available_memory()` returned. The worker logs stopped around
+       the FlashQLA prefill warmup / memory-profile phase and the engine waited
+       on shared-memory broadcast. These are startup/profiling artifacts, not
+       quality results.
+     - The existing A/B artifacts under
+       `bench_results/quality_state_ab_20260618/` already contain late-window
+       state-table evidence. In `bad_speccommit`, state tables from sequence
+       `5604..6074` have accepted-count distribution `{1: 6, 5: 564}` and a
+       sustained all-5 run from `5719..6074` (72 recorded sequence positions).
+       In `good_fullgdn`, the same window has `{1: 42, 2: 288, 3: 90, 4: 72,
+       5: 330}` and its longest all-5 run is only 12 positions.
+     - The bad and good state-table metadata shapes are otherwise structurally
+       aligned: pure spec rows, `num_spec_decodes=1`, `num_actual_tokens=5`,
+       padded graph rows filled with `PAD_SLOT_ID`, and matching state block
+       indices. This supports the current diagnosis that the late failure is
+       not a simple metadata/index construction bug; the split target path's
+       numerical/logit boundary drifts until the verifier over-accepts draft
+       tokens.
+     - 512-token `code_macos` speed retry after narrowing the guard did not
+       produce a valid speed datapoint. With `VLLM_SM70_PROFILE_TRACE=1`, the
+       run reached `profile_run -> _dummy_run` with `attn_metadata=None`,
+       `skip_compiled=True`, and then stayed in layer-0 original FlashQLA-SM70
+       TileLang GDN prefill warmup before any real request. During the retry,
+       another Codex/benchmark task began using GPU3, so the run was stopped
+       to avoid sharing/clearing occupied GPUs. Treat this as startup/warmup
+       diagnosis only, not an MTP throughput result.
+     - A second 512-token `code_macos` retry on physical GPUs `1,2` avoided
+       the GPU3 conflict and reproduced the same startup signature: profile
+       dummy run entered `attn_metadata=None`, `skip_compiled=True`, layer-0
+       GDN, then original FlashQLA-SM70 TileLang prefill warmup. No output JSON
+       was produced under
+       `bench_results/qwen_gdn_active_spec_guard_macos512_20260618_gpu12/`.
+       This confirms the remaining blocker for a quick speed smoke is the
+       profile/warmup path, not a measured decode throughput regression.
+     - Warmup route audit found the profile dummy prefill warmup was compiling
+       original FlashQLA-SM70 TileLang with `direct_output=False`, while the
+       production default real prefill path uses direct `core_attn_out` output
+       when possible. `_warmup_prefill_kernels()` now passes a dummy
+       `core_attn_out` for default original FlashQLA direct-output warmup, so
+       the profile warmup targets the same TileLang variant as the real
+       default path. A follow-up smoke confirmed the log changed to
+       `direct_output=True`, but it still did not complete profile quickly
+       enough to produce a 512-token speed JSON. The remaining startup issue is
+       therefore original TileLang warmup latency/hang itself, not the earlier
+       non-default warmup variant.
+     - Final startup diagnosis on physical GPUs `1,2`:
+       `bench_results/qwen_gdn_active_spec_guard_macos512_20260618_warmup_safe3/`
+       showed both ranks exiting layer-0 prefill warmup and mixed-QKV decode
+       warmup, then entering `SM70 profile trace: GDN FlashQLA decode warmup`
+       without an exit line. Worker CPU/GPU utilization dropped and the engine
+       emitted repeated shared-memory broadcast waits. This was not an
+       Inductor compile; it was the profile dummy FlashQLA recurrent-decode
+       warmup call.
+     - `_warmup_prefill_kernels()` now treats FlashQLA decode warmup as
+       explicit opt-in via `VLLM_SM70_FLASHQLA_DECODE_WARMUP=1`, defaults it off,
+       uses bounded deterministic tensors for prefill/decode warmup inputs, and
+       deduplicates the warmup by device/dtype/backend/shape so the same global
+       TileLang/autotune work is not repeated for every Qwen GDN layer.
+     - Validation artifact:
+       `bench_results/qwen_gdn_active_spec_guard_macos512_20260618_warmup_safe4/`
+       completed the same `code_macos` 512-token TP2 MTP4 guard run with
+       `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`. The trace skipped FlashQLA decode
+       warmup, completed profile, captured CUDA graphs, and produced
+       `default_mtp4_macos512.json`: prefill `257.77 tok/s`, steady decode
+       `66.83 tok/s`, output excluding prefill `66.96 tok/s`, finish reason
+       `length`. The benchmark process exited cleanly; only Python
+       resource-tracker cleanup warnings for semaphore/shared-memory objects
+       remained.
+
+     Verification:
+     - `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
+       vllm/envs.py vllm/v1/worker/gpu_model_runner.py
+       vllm/v1/sample/rejection_sampler.py` passed.
+     - `/home/ymzx/miniconda3/bin/ruff check --select F
+       vllm/envs.py vllm/v1/worker/gpu_model_runner.py
+       vllm/v1/sample/rejection_sampler.py` passed.
+     - `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       tests/v1/attention/test_gdn_metadata_builder.py` passed.
+     - `/home/ymzx/miniconda3/bin/ruff check --select F
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       tests/v1/attention/test_gdn_metadata_builder.py` passed.
+     - `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       tests/v1/attention/test_gdn_metadata_builder.py vllm/envs.py
+       vllm/v1/worker/gpu_model_runner.py
+       vllm/v1/sample/rejection_sampler.py` passed after the dummy/profile
+       guard correction.
+     - `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm:/tmp/vllm_c_preload_site
+       VLLM_C_PRELOAD_PATH=build/temp.linux-x86_64-cpython-312/_C.abi3.so
+       /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q
+       tests/v1/attention/test_gdn_metadata_builder.py -k
+       'full_forward_auto_is_active_spec_scoped'` passed.
+     - The full metadata/route file also passed under the same preload:
+       `tests/v1/attention/test_gdn_metadata_builder.py` -> `20 passed`.
+     - `/home/ymzx/miniconda3/bin/ruff check --select F
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       tests/v1/attention/test_gdn_metadata_builder.py vllm/envs.py
+       vllm/v1/worker/gpu_model_runner.py
+       vllm/v1/sample/rejection_sampler.py` passed after the dummy/profile
+       guard correction.
+     - The same `py_compile` and `ruff check --select F` command set passed
+       again after the direct-output warmup correction.
+     - `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       vllm/v1/worker/gpu_model_runner.py` passed after the FlashQLA decode
+       warmup default-off correction and `num_spec_tokens` init-order fix.
+     - `/home/ymzx/miniconda3/bin/ruff check --select F
+       vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+       vllm/v1/worker/gpu_model_runner.py` passed after the same correction.
+     - `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm:/tmp/vllm_c_preload_site
+       VLLM_C_PRELOAD_PATH=build/temp.linux-x86_64-cpython-312/_C.abi3.so
+       /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q
+       tests/v1/spec_decode/test_sm70_mtp_safety.py
+       tests/v1/spec_decode/test_mtp_draft_prob_alignment.py
+       tests/v1/spec_decode/test_tp_draft_sampling_sync.py` passed:
+       `14 passed`.
+     - `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm:/tmp/vllm_c_preload_site
+       VLLM_C_PRELOAD_PATH=build/temp.linux-x86_64-cpython-312/_C.abi3.so
+       /home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q
+       tests/v1/worker/test_mamba_utils.py -k
+       'postprocess or accepted or mamba_state_idx or state'` passed:
+       `18 passed`.
+     - After the direct-output warmup correction:
+       `tests/v1/attention/test_gdn_metadata_builder.py` passed with
+       `20 passed`, and the combined spec/state filter
+       `tests/v1/spec_decode/test_sm70_mtp_safety.py
+       tests/v1/spec_decode/test_mtp_draft_prob_alignment.py
+       tests/v1/spec_decode/test_tp_draft_sampling_sync.py
+       tests/v1/worker/test_mamba_utils.py -k
+       'postprocess or accepted or mamba_state_idx or state or sm70 or
+       draft_prob or sync'` passed with `32 passed`.
+     - Full `ruff` over `gpu_model_runner.py` still reports pre-existing
+       style-only findings (`E501`, `E731`); they were not changed in this
+       diagnostic patch.
+
+434. 2026-06-18 Flash-V100 D=256 low-shared-memory paged-prefill experiment.
+
+     Source change:
+     - Added an opt-in D=256 FP16 paged-prefill variant behind
+       `VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM=1`.
+     - The default path remains the legacy `BM32/BN64` kernel until model-level
+       validation is run. The new path supports paged block sizes that are
+       multiples of 16, covering the current hybrid-attention real sizes:
+       9B/35B TP4 `528`, 27B TP4 `784`, and 35B TP2 `1056`.
+     - Final candidate uses `BM16/BN128/WARPS16` and direct WMMA loads from
+       paged K/V physical pages instead of staging full K/V tiles in shared
+       memory. Its shared memory is about `36,096 B/CTA`, allowing `2 CTA/SM`
+       and up to `32/64` resident warps on V100.
+     - A follow-up page-id cache stores the 8 physical block ids for each
+       `BN128` tile in shared memory. This removes repeated page-table loads
+       and page-offset arithmetic from QK/PV hot loops without changing math
+       order.
+     - The generic-page follow-up stores both the physical page id and the
+       16-row offset within that page for each `BN128` subtile. This keeps the
+       same WMMA tile boundaries while allowing Qwen hybrid page sizes larger
+       than 16.
+     - The low-smem path now has a separate compile-time
+       `LOW_SMEM_CONTIG16` specialization. It is launched only when
+       `page_block_size == 16`, so the contiguous-page logic can be part of the
+       unified accelerated path without adding register/branch pressure to the
+       real `528/784/1056` hybrid-page kernels.
+
+     Model architecture coverage:
+     - Qwen3.5-9B-AWQ: `heads=16`, `kv_heads=4`, `head_dim=256`,
+       8 full-attention layers; TP1 uses local `heads_q=16`, `heads_kv=4`,
+       block size `528`.
+     - Qwen3.6-27B-AWQ: `heads=24`, `kv_heads=4`, `head_dim=256`,
+       16 full-attention layers; TP4 uses local `heads_q=6`, `heads_kv=1`,
+       block size `784`.
+     - Qwen3.6-35B-A3B-AWQ: `heads=16`, `kv_heads=2`, `head_dim=256`,
+       10 full-attention layers; TP4 uses local `heads_q=4`, `heads_kv=1`,
+       block size `528`, and TP2 uses local `heads_q=8`, `heads_kv=1`,
+       block size `1056`.
+     - Real-model long-context coverage is the chunked/prefix full-attention
+       path: `FlashAttnV100Impl.forward()` enters `prefill_prefix`, calls
+       `_flash_v100_prefill_with_prefix()`, then calls
+       `flash_attn_prefill_paged()` over the paged KV cache. That reaches the
+       CUDA `prefill_paged_fwd` kernel changed here.
+     - Coverage requires FP16 KV cache storage. AWQ weight quantization does not
+       block the path when `kv_cache_dtype=auto/float16`, but services started
+       with `--kv-cache-dtype fp8_e5m2` or other FP8 KV cache types do not use
+       the low-smem D=256 specialization yet. They stay on the legacy FP8 paged
+       kernel and need a separate FP8-KV low-smem implementation.
+     - The first dense chunk of a chunked prompt is not covered by this paged
+       kernel because the backend uses dense raw-QKV Flash-V100 when there is no
+       prefix. Small-query prefix/MTP verification can also route through paged
+       decode instead of paged prefill. The long-context decay improvement
+       applies to the later large prefix chunks where `M > 1`.
+
+     Rejected variants:
+     - `BM16/BN32` staged K/V used about `46,208 B/CTA` and reached
+       `2 CTA/SM`, but halving `BN` doubled the N-loop count and slowed TP1
+       long-context paged-step from about `9.4 TF/s` to `8.3 TF/s`.
+     - `BM16/BN64` with 32-row K/V staging used about `48,256 B/CTA` and kept
+       `BN64`, but extra staging and address work still slowed TP1:
+       `M=16260,N=261120` measured `7772.365 ms` after contiguous-load tuning
+       versus `7201.571 ms` legacy.
+     - `BM16/BN64` direct-KV reduced shared memory to about `32,000 B/CTA` and
+       reached `3 CTA/SM`, but the gain stayed modest: TP1 improved only
+       `+1.7%`, `+2.5%`, and `+2.6%` across the three paged-step points.
+     - `BM16/BN192` and `BM16/BN256` direct-KV both passed strict equality but
+       lost the long-context point versus `BN128`; `BN256` regressed
+       `M=16260,N=261120` to `8431.629 ms`.
+
+     Correctness:
+     - Legacy-vs-low-smem direct-KV comparisons passed strict equality:
+       `torch.equal=True`, `maxdiff=0.0`, `meandiff=0.0`.
+     - Covered seeds `0` and `123`, with shapes including
+       `q_len=17,kv_len=33`, `4096x32768`, `16324x65296`, and
+       `16260x261120`. A final post-rebuild smoke at `4096x32768` also passed
+       `maxdiff=0.0`.
+     - The page-id cache follow-up also passed strict equality at
+       `4096x32768` and `16260x261120`: `torch.equal=True`, `maxdiff=0.0`,
+       `meandiff=0.0`.
+     - The generic-page model-architecture check also passed strict equality:
+       9B TP1 block `528` heads `16/4`, 27B TP4 block `784` heads `6/1`,
+       35B TP4 block `528` heads `4/1`, and 35B TP2 block `1056` heads `8/1`
+       all returned `torch.equal=True`, `maxdiff=0.0`, `meandiff=0.0` at
+       `M=4096,N=32768`.
+     - The same four architecture cases also passed with randomized,
+       non-contiguous block tables at `M=2048,N=16384`, again with
+       `torch.equal=True`, `maxdiff=0.0`, `meandiff=0.0`.
+     - After adding the `LOW_SMEM_CONTIG16` specialization, synthetic
+       `block_size=16` checks with real head shapes also passed
+       `torch.equal=True`, `maxdiff=0.0` for contiguous and randomized block
+       tables.
+
+     Kernel-only speed with `BM16/BN128` direct-KV low-smem:
+     - TP1 paged-step, legacy -> low-smem:
+       `M=16324,N=65296`: `1614.835 ms -> 1477.345 ms` (`+9.3%`);
+       `M=16324,N=130592`: `3477.992 ms -> 3152.597 ms` (`+10.3%`);
+       `M=16260,N=261120`: `7201.571 ms -> 6511.624 ms` (`+10.6%`).
+     - TP4 paged-step, legacy -> low-smem:
+       `M=16324,N=65296`: `403.952 ms -> 373.583 ms` (`+8.1%`);
+       `M=16324,N=130592`: `878.767 ms -> 799.433 ms` (`+9.9%`);
+       `M=16260,N=261120`: `1834.530 ms -> 1648.992 ms` (`+11.3%`).
+     - TP1 256K chunked prefill, single-run kernel reproducer:
+       legacy `59627.266 ms` / `4379.2 tok/s`; `BM16/BN128` low-smem
+       direct-KV `54218.574 ms` / `4816.1 tok/s` (`+10.0%`).
+     - With the page-id cache, TP1 paged-step improves further:
+       `M=16324,N=65296`: `1477.345 ms -> 1441.557 ms`;
+       `M=16324,N=130592`: `3152.597 ms -> 3081.294 ms`;
+       `M=16260,N=261120`: `6511.624 ms -> 6354.114 ms`.
+       End-to-end kernel-only 256K chunked improves to `52882.090 ms` /
+       `4937.8 tok/s`, about `+12.8%` versus legacy.
+       After refactoring the page-id cache to reuse the low-smem `sK`
+       placeholder instead of growing default shared memory, the representative
+       long point remained in the same range: `16260x261120 = 6343.524 ms`.
+     - Architecture-specific paged-step, legacy -> low-smem:
+       9B TP1 block `528`, `M=8192,N=262144`:
+       `3707.067 ms -> 3310.575 ms` (`+12.0%`, `9.34 -> 10.46 TF/s`);
+       27B TP4 block `784`, `M=8192,N=262144`:
+       `1431.137 ms -> 1261.607 ms` (`+13.4%`, `9.08 -> 10.29 TF/s`);
+       35B TP4 block `528`, `M=8192,N=262144`:
+       `974.771 ms -> 859.575 ms` (`+13.4%`, `8.88 -> 10.07 TF/s`);
+       35B TP2 block `1056`, `M=8192,N=262144`:
+       `1880.520 ms -> 1663.255 ms` (`+13.1%`, `9.21 -> 10.41 TF/s`).
+     - Architecture-specific 256K chunked kernel-only prefill, chunk `8192`:
+       35B TP4 block `528` improved
+       `15776.073 ms -> 13830.778 ms` (`+14.1%`,
+       `8.85 -> 10.10 TF/s`); 27B TP4 block `784` improved
+       `23101.512 ms -> 20441.122 ms` (`+13.0%`,
+       `9.07 -> 10.25 TF/s`). These are single-layer kernel sums; scale only
+       by the model's full-attention layer count, not total hybrid layer count.
+     - Synthetic `block_size=16`, real head shapes, `M=8192,N=65536`, same
+       logical K/V with contiguous versus randomized physical block tables:
+       legacy 4-page hit improves 9B TP1 by `+12.0%`, 27B TP4 by `+12.5%`,
+       35B TP4 by `+12.1%`, and 35B TP2 by `+12.4%`; all comparisons passed
+       `torch.equal=True`, `maxdiff=0.0`.
+     - The same synthetic `block_size=16` cases with low-smem enabled also
+       dispatch through the `LOW_SMEM_CONTIG16` specialization. Contiguous-page
+       hit versus randomized fallback adds a smaller `+1.5%` to `+2.2%`, while
+       the unified accelerated path versus legacy+4-page improves by
+       `+6.2%` to `+8.2%` at this shorter point.
+     - Post-specialization real hybrid-page spot check at `M=8192,N=65536`
+       confirmed the `528/784/1056` kernels were not polluted by the bs16
+       branch: 9B TP1 block `528` `881.731 ms -> 788.378 ms` (`+11.8%`),
+       27B TP4 block `784` `337.702 ms -> 300.872 ms` (`+12.2%`), 35B TP4
+       block `528` `229.160 ms -> 201.790 ms` (`+13.6%`), and 35B TP2 block
+       `1056` `443.294 ms -> 397.343 ms` (`+11.6%`), all with `maxdiff=0.0`.
+
+     9B AWQ end-to-end check, 2026-06-18:
+     - Artifact:
+       `bench_results/flash_v100_9b_awq_e2e_low_smem_20260618_gpu1.json`.
+       Ran Qwen3.5-9B-AWQ TP1 on one V100 with `FLASH_ATTN_V100`,
+       `enforce_eager=True`, `kv_cache_dtype=auto`, `max_model_len=262144`,
+       `max_num_batched_tokens=8192`, `max_tokens=1`, and one model load.
+       Baseline and `VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM=1` were alternated
+       inside the same engine. Shutdown route summary confirmed the target
+       paths: `prefill_no_prefix_dense_flash=160` and
+       `prefill_prefix_flash=1296`.
+     - Median TTFT / prefill throughput:
+
+       | input tokens | baseline | low-smem | speed delta | prefill tok/s |
+       | --- | ---: | ---: | ---: | ---: |
+       | 8192 | `2.833570 s` | `2.874240 s` | `-1.42%` | `2891.8 -> 2851.5` |
+       | 32768 | `16.385335 s` | `16.539327 s` | `-0.93%` | `2000.1 -> 1981.4` |
+       | 65536 | `49.075133 s` | `49.628700 s` | `-1.12%` | `1335.8 -> 1320.7` |
+       | 131072 | `160.736387 s` | `159.734137 s` | `+0.63%` | `815.5 -> 820.6` |
+       | 261120 | `550.088976 s` | `549.194828 s` | `+0.16%` | `474.7 -> 475.5` |
+
+     - Interpretation: the 9B AWQ whole-model route hits the paged-prefix
+       kernel, but the kernel-only `+12%` does not survive as a material
+       end-to-end 9B TTFT gain. For this model, only 8 layers are full
+       attention; dense first chunk, GDN/linear-attention layers, AWQ GEMMs,
+       scheduler/runtime overhead, and sampling dilute the paged-prefix kernel
+       win. This result is not default-enable evidence for low-smem. It does
+       show the real route is wired correctly and that future acceptance should
+       focus on 27B/35B long-context shapes or a narrower per-layer/full-attn
+       attribution run.
+
+     Interpretation:
+     - The original `96.5 KB/CTA` shared-memory footprint is a real occupancy
+       limiter, but simply maximizing CTA count was not optimal: `BN64` reached
+       `3 CTA/SM` yet underperformed `BN128` at `2 CTA/SM`.
+     - The best measured point balances enough resident work with fewer
+       softmax/PV loop iterations. Larger `BN192/BN256` tiles start losing
+       long-context efficiency, so `BN128` is the current kernel-only optimum.
+     - Remaining bottlenecks are now likely in dense first-chunk cost,
+       page-table/address overhead, WMMA issue efficiency, and softmax/PV
+       ordering, rather than shared-memory occupancy alone.
+     - The page-id cache result shows page-table/address overhead is measurable
+       but secondary: it adds about `2.4%` on top of the `BN128` tile change.
+       The generic-page result shows the same optimization survives the real
+       hybrid page sizes and GQA layouts used by 9B/27B/35B.
+     - 4-page contiguous loading and low-smem are both retained as acceleration
+       paths, but they are not counted by simple addition. For `block_size=16`,
+       legacy hits the original 4-page fast path and low-smem hits the
+       `LOW_SMEM_CONTIG16` specialization. For real hybrid page sizes, the
+       relevant path is low-smem page-id/page-offset caching over
+       single-page/two-page tiles.
+     - The next high-value kernel checks are dense first-chunk optimization and
+       a strict-equality experiment around softmax/PV sub-tiling; any nonzero
+       `maxdiff` must reject that path.
+     - Keep this path opt-in until a whole-model 35B long-context prefill run
+       confirms the kernel-only gain survives scheduler, graph, and model
+       overheads.

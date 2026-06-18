@@ -103,6 +103,65 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
 }
 
 template<int D, bool IS_CAUSAL>
+__device__ __forceinline__ void compute_qk_scores_scalar_fp32(
+    const __half* __restrict__ sQ,
+    const __half* __restrict__ sK,
+    float* __restrict__ sS,
+    const int valid_q_rows,
+    const int valid_k_rows,
+    const int start_row,
+    const int start_col,
+    const int causal_q_offset,
+    const float score_scale,
+    const int window_size_left,
+    const int window_size_right
+) {
+    using Config = KernelConfig<D>;
+    constexpr int THREADS_PER_BLOCK = Config::THREADS_PER_BLOCK;
+    constexpr int Q_STRIDE = Config::Q_STRIDE;
+    constexpr int KV_STRIDE = Config::KV_STRIDE;
+    constexpr int S_STRIDE = Config::S_STRIDE;
+    const float NEG_INF = -1e30f;
+    const int tid = threadIdx.x;
+    const int total_scores = valid_q_rows * valid_k_rows;
+
+    for (int idx = tid; idx < total_scores; idx += THREADS_PER_BLOCK) {
+        const int row = idx / valid_k_rows;
+        const int col = idx - row * valid_k_rows;
+        const int global_m = start_row + row;
+        const int global_n = start_col + col;
+        const int global_q_pos = global_m + causal_q_offset;
+
+        bool is_valid = true;
+        if constexpr (IS_CAUSAL) {
+            is_valid = global_n <= global_q_pos;
+        }
+        if (window_size_left >= 0) {
+            is_valid = is_valid && global_n >= global_q_pos - window_size_left;
+        }
+        if (window_size_right >= 0) {
+            is_valid = is_valid && global_n <= global_q_pos + window_size_right;
+        }
+
+        float acc = 0.0f;
+        if (is_valid) {
+            #pragma unroll 8
+            for (int d = 0; d < D; d += 2) {
+                const __half2 q_h2 = *reinterpret_cast<const __half2*>(
+                    sQ + row * Q_STRIDE + d);
+                const __half2 k_h2 = *reinterpret_cast<const __half2*>(
+                    sK + col * KV_STRIDE + d);
+                const float2 q_f2 = __half22float2(q_h2);
+                const float2 k_f2 = __half22float2(k_h2);
+                acc = fmaf(q_f2.x, k_f2.x, acc);
+                acc = fmaf(q_f2.y, k_f2.y, acc);
+            }
+        }
+        sS[row * S_STRIDE + col] = is_valid ? acc * score_scale : NEG_INF;
+    }
+}
+
+template<int D, bool IS_CAUSAL>
 __global__ void __launch_bounds__(KernelConfig<D>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_kernel(
     const __half* __restrict__ Q,
@@ -249,71 +308,78 @@ flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-        const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;
-        const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;
-        const int total_tiles_qk    = num_tiles_m_qk * num_tiles_n_qk;
-        const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-        const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
-        const unsigned col_causal   = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
+        if constexpr (D == 256) {
+            compute_qk_scores_scalar_fp32<D, IS_CAUSAL>(
+                sQ, sK, sS, valid_q_rows, valid_k_rows, start_row, start_col,
+                causal_q_offset, softmax_scale, window_size_left,
+                window_size_right);
+        } else {
+            const int num_tiles_m_qk    = (BLOCK_M + WMMA_M - 1) / WMMA_M;
+            const int num_tiles_n_qk    = (BLOCK_N + WMMA_N - 1) / WMMA_N;
+            const int num_tiles_k_qk    = (D + WMMA_K - 1) / WMMA_K;
+            const int total_tiles_qk    = num_tiles_m_qk * num_tiles_n_qk;
+            const int tiles_per_warp_qk = (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+            const unsigned row_causal   = (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8 + ((lane_id >> 4) & 0b1) * 4;
+            const unsigned col_causal   = ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
 
-        for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
-            const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
-            if (global_tile_idx >= total_tiles_qk) break;
+            for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
+                const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
+                if (global_tile_idx >= total_tiles_qk) break;
 
-            const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
-            const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
+                const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
+                const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
 
-            const int tile_m = tile_m_idx * WMMA_M;
-            const int tile_n = tile_n_idx * WMMA_N;
+                const int tile_m = tile_m_idx * WMMA_M;
+                const int tile_n = tile_n_idx * WMMA_N;
 
-            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
+                if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
 
-            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
-            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
-            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-            fill_fragment(acc_frag, 0.0f);
+                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+                fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
+                fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+                fill_fragment(acc_frag, 0.0f);
 
-            #pragma unroll
-            for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
-                const int k_offset = k_tile * WMMA_K;
-                if (k_offset >= D) break;
+                #pragma unroll
+                for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
+                    const int k_offset = k_tile * WMMA_K;
+                    if (k_offset >= D) break;
 
-                load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
-                load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
-                mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                    load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset, Q_STRIDE);
+                    load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset, KV_STRIDE);
+                    mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+                }
+
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                    const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+
+                    const int global_m = start_row + tile_m + row;
+                    const int global_n = start_col + tile_n + col;
+                    const int global_q_pos = global_m + causal_q_offset;
+
+                    const bool is_valid = (global_m < start_row + valid_q_rows) &&
+                                          (global_n < start_col + valid_k_rows);
+                    bool is_causal_valid = true;
+                    if constexpr (IS_CAUSAL) {
+                        is_causal_valid = global_n <= global_q_pos;
+                    }
+                    bool is_window_valid = true;
+                    if (window_size_left >= 0) {
+                        is_window_valid = is_window_valid &&
+                                          global_n >= global_q_pos - window_size_left;
+                    }
+                    if (window_size_right >= 0) {
+                        is_window_valid = is_window_valid &&
+                                          global_n <= global_q_pos + window_size_right;
+                    }
+
+                    acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid)
+                        ? acc_frag.x[i] * softmax_scale_log2
+                        : NEG_INF;
+                }
+                store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
             }
-
-            #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                const unsigned col = col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
-                const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
-
-                const int global_m = start_row + tile_m + row;
-                const int global_n = start_col + tile_n + col;
-                const int global_q_pos = global_m + causal_q_offset;
-
-                const bool is_valid = (global_m < start_row + valid_q_rows) &&
-                                      (global_n < start_col + valid_k_rows);
-                bool is_causal_valid = true;
-                if constexpr (IS_CAUSAL) {
-                    is_causal_valid = global_n <= global_q_pos;
-                }
-                bool is_window_valid = true;
-                if (window_size_left >= 0) {
-                    is_window_valid = is_window_valid &&
-                                      global_n >= global_q_pos - window_size_left;
-                }
-                if (window_size_right >= 0) {
-                    is_window_valid = is_window_valid &&
-                                      global_n <= global_q_pos + window_size_right;
-                }
-
-                acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid)
-                    ? acc_frag.x[i] * softmax_scale_log2
-                    : NEG_INF;
-            }
-            store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE, mem_row_major);
         }
         __syncthreads();
 
@@ -391,7 +457,9 @@ flash_attention_forward_kernel(
                     __shfl_sync(mask, thread_max, row_leader, THREADS_PER_ROW);
                 const float old_max = sRowMax[row];
                 const float new_max = fmaxf(old_max, row_max);
-                const float exp_diff = exp2f(old_max - new_max);
+                const float exp_diff = (D == 256)
+                    ? expf(fmaxf(old_max - new_max, -80.0f))
+                    : exp2f(old_max - new_max);
 
                 float thread_sum = 0.0f;
                 __half2 half_buffer[20];
@@ -406,10 +474,18 @@ flash_attention_forward_kernel(
                     if (vc_base < vec_cols) {
                         float4 v4 = sS_vec4[vc_base];
 
-                        float e0 = exp2f(fmaxf(v4.x - new_max, EXP2_CLAMP));
-                        float e1 = exp2f(fmaxf(v4.y - new_max, EXP2_CLAMP));
-                        float e2 = exp2f(fmaxf(v4.z - new_max, EXP2_CLAMP));
-                        float e3 = exp2f(fmaxf(v4.w - new_max, EXP2_CLAMP));
+                        float e0 = (D == 256)
+                            ? expf(fmaxf(v4.x - new_max, -80.0f))
+                            : exp2f(fmaxf(v4.x - new_max, EXP2_CLAMP));
+                        float e1 = (D == 256)
+                            ? expf(fmaxf(v4.y - new_max, -80.0f))
+                            : exp2f(fmaxf(v4.y - new_max, EXP2_CLAMP));
+                        float e2 = (D == 256)
+                            ? expf(fmaxf(v4.z - new_max, -80.0f))
+                            : exp2f(fmaxf(v4.z - new_max, EXP2_CLAMP));
+                        float e3 = (D == 256)
+                            ? expf(fmaxf(v4.w - new_max, -80.0f))
+                            : exp2f(fmaxf(v4.w - new_max, EXP2_CLAMP));
 
                         thread_sum += (e0 + e1) + (e2 + e3);
 
@@ -424,7 +500,9 @@ flash_attention_forward_kernel(
                 for (int c = tail_start + thread_in_row; c < sub_valid_k_rows;
                      c += THREADS_PER_ROW) {
                     float v = sS_row_f[c];
-                    float e = exp2f(fmaxf(v - new_max, EXP2_CLAMP));
+                    float e = (D == 256)
+                        ? expf(fmaxf(v - new_max, -80.0f))
+                        : exp2f(fmaxf(v - new_max, EXP2_CLAMP));
                     thread_sum += e;
                     tail_col = c;
                     tail_value = __float2half_rn(e);
@@ -591,7 +669,9 @@ flash_attention_forward_kernel(
 
     if (tid < valid_q_rows) {
         const float sum = fmaxf(sRowSum[tid], 1e-24f);
-        softmax_lse_ptr[tid] = (sRowMax[tid] + log2f(sum)) * LN2;
+        softmax_lse_ptr[tid] = (D == 256)
+            ? sRowMax[tid] + logf(sum)
+            : (sRowMax[tid] + log2f(sum)) * LN2;
     }
 }
 
@@ -695,76 +775,82 @@ flash_attention_qk_scores_kernel(
     }
     __syncthreads();
 
-    const int num_tiles_m_qk = (BLOCK_M + WMMA_M - 1) / WMMA_M;
-    const int num_tiles_n_qk = (BLOCK_N + WMMA_N - 1) / WMMA_N;
-    const int num_tiles_k_qk = (D + WMMA_K - 1) / WMMA_K;
-    const int total_tiles_qk = num_tiles_m_qk * num_tiles_n_qk;
-    const int tiles_per_warp_qk =
-        (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-    const unsigned row_causal =
-        (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8
-        + ((lane_id >> 4) & 0b1) * 4;
-    const unsigned col_causal =
-        ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
+    if constexpr (D == 256) {
+        compute_qk_scores_scalar_fp32<D, IS_CAUSAL>(
+            sQ, sK, sS, valid_q_rows, valid_k_rows, start_row, start_col,
+            causal_q_offset, softmax_scale, -1, -1);
+    } else {
+        const int num_tiles_m_qk = (BLOCK_M + WMMA_M - 1) / WMMA_M;
+        const int num_tiles_n_qk = (BLOCK_N + WMMA_N - 1) / WMMA_N;
+        const int num_tiles_k_qk = (D + WMMA_K - 1) / WMMA_K;
+        const int total_tiles_qk = num_tiles_m_qk * num_tiles_n_qk;
+        const int tiles_per_warp_qk =
+            (total_tiles_qk + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+        const unsigned row_causal =
+            (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8
+            + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal =
+            ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
 
-    for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
-        const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
-        if (global_tile_idx >= total_tiles_qk) break;
+        for (int tile_idx = 0; tile_idx < tiles_per_warp_qk; ++tile_idx) {
+            const int global_tile_idx = warp_id * tiles_per_warp_qk + tile_idx;
+            if (global_tile_idx >= total_tiles_qk) break;
 
-        const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
-        const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
+            const int tile_m_idx = global_tile_idx / num_tiles_n_qk;
+            const int tile_n_idx = global_tile_idx % num_tiles_n_qk;
 
-        const int tile_m = tile_m_idx * WMMA_M;
-        const int tile_n = tile_n_idx * WMMA_N;
+            const int tile_m = tile_m_idx * WMMA_M;
+            const int tile_n = tile_n_idx * WMMA_N;
 
-        if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
+            if (tile_m >= valid_q_rows || tile_n >= valid_k_rows) continue;
 
-        fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
-        fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
-        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
-        fill_fragment(acc_frag, 0.0f);
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+            fill_fragment(acc_frag, 0.0f);
 
-        #pragma unroll
-        for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
-            const int k_offset = k_tile * WMMA_K;
-            if (k_offset >= D) break;
-
-            load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset,
-                             Q_STRIDE);
-            load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset,
-                             KV_STRIDE);
-            mma_sync(acc_frag, a_frag, b_frag, acc_frag);
-        }
-
-        if constexpr (IS_CAUSAL) {
             #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                const unsigned col =
-                    col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
-                const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+            for (int k_tile = 0; k_tile < num_tiles_k_qk; ++k_tile) {
+                const int k_offset = k_tile * WMMA_K;
+                if (k_offset >= D) break;
 
-                const int global_m = start_row + tile_m + row;
-                const int global_n = start_col + tile_n + col;
-                const int global_q_pos = global_m + causal_q_offset;
-
-                const bool is_valid =
-                    (global_m < start_row + valid_q_rows) &&
-                    (global_n < start_col + valid_k_rows);
-
-                acc_frag.x[i] = is_valid
-                    ? ((global_n > global_q_pos)
-                           ? NEG_INF
-                           : acc_frag.x[i] * softmax_scale)
-                    : NEG_INF;
+                load_matrix_sync(a_frag, sQ + tile_m * Q_STRIDE + k_offset,
+                                 Q_STRIDE);
+                load_matrix_sync(b_frag, sK + tile_n * KV_STRIDE + k_offset,
+                                 KV_STRIDE);
+                mma_sync(acc_frag, a_frag, b_frag, acc_frag);
             }
-        } else {
-            #pragma unroll
-            for (int i = 0; i < acc_frag.num_elements; ++i) {
-                acc_frag.x[i] *= softmax_scale;
+
+            if constexpr (IS_CAUSAL) {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    const unsigned col =
+                        col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+                    const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+
+                    const int global_m = start_row + tile_m + row;
+                    const int global_n = start_col + tile_n + col;
+                    const int global_q_pos = global_m + causal_q_offset;
+
+                    const bool is_valid =
+                        (global_m < start_row + valid_q_rows) &&
+                        (global_n < start_col + valid_k_rows);
+
+                    acc_frag.x[i] = is_valid
+                        ? ((global_n > global_q_pos)
+                               ? NEG_INF
+                               : acc_frag.x[i] * softmax_scale)
+                        : NEG_INF;
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < acc_frag.num_elements; ++i) {
+                    acc_frag.x[i] *= softmax_scale;
+                }
             }
+            store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag,
+                              S_STRIDE, mem_row_major);
         }
-        store_matrix_sync(sS + tile_m * S_STRIDE + tile_n, acc_frag, S_STRIDE,
-                          mem_row_major);
     }
     __syncthreads();
 

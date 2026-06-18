@@ -512,9 +512,9 @@ class Scheduler(SchedulerInterface):
                     - request.num_output_placeholders
                 )
                 if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                    spec_token_ids = list(
+                        request.spec_token_ids[:num_scheduled_spec_tokens]
+                    )
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
@@ -1714,7 +1714,7 @@ class Scheduler(SchedulerInterface):
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
-            request.spec_token_ids = spec_token_ids
+            request.spec_token_ids = list(spec_token_ids)
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -1737,8 +1737,10 @@ class Scheduler(SchedulerInterface):
 
             orig_num_spec_tokens = len(placeholder_spec_tokens)
             # Trim drafts to scheduled number of spec tokens
-            # (needed for chunked prefill case for example).
-            del spec_token_ids[orig_num_spec_tokens:]
+            # (needed for chunked prefill case for example). Make a snapshot
+            # instead of mutating the worker-returned row in-place; the same
+            # row can still be used for diagnostics or async state repair.
+            spec_token_ids = list(spec_token_ids[:orig_num_spec_tokens])
             # Filter out spec tokens which do not adhere to the grammar.
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request

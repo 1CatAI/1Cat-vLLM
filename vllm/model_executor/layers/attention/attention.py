@@ -447,11 +447,17 @@ class Attention(nn.Module, AttentionLayerBase):
                 hasattr(self, "q_scale") and self.q_scale.numel() == self.num_kv_heads
             )
             block_size = self.head_size * self.num_heads // self.num_kv_heads
+            query_quant_dtype = (
+                torch.float8_e5m2
+                if self.kv_cache_dtype == "fp8_e5m2"
+                else current_platform.fp8_dtype()
+            )
             self.query_quant = QuantFP8(
                 static=True,
                 group_shape=GroupShape(-1, block_size)
                 if is_per_head
                 else GroupShape.PER_TENSOR,
+                quant_dtype=query_quant_dtype,
             )
 
     def forward(
@@ -484,7 +490,7 @@ class Attention(nn.Module, AttentionLayerBase):
             # which reduces overheads during decoding.
             # Otherwise queries are quantized using custom ops
             # which causes decoding overheads
-            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3", "nvfp4"}
+            assert self.kv_cache_dtype in {"fp8", "fp8_e4m3", "fp8_e5m2", "nvfp4"}
 
             # check if query quantization is supported
             if self.impl.supports_quant_query_input:

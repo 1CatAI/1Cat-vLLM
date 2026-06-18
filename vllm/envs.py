@@ -109,6 +109,8 @@ if TYPE_CHECKING:
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_SM70_AWQ_TURBOMIND: bool = True
+    VLLM_SM70_GPTQ_TURBOMIND: bool = False
+    VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
     VLLM_SM70_AWQ_MOE_DISABLE: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
@@ -125,6 +127,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT: bool = True
     VLLM_SM70_AWQ_TUNE_SMALL_SHAPES: bool = False
     VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS: bool = True
+    VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
@@ -153,6 +156,7 @@ if TYPE_CHECKING:
     VLLM_SM70_SHARED_GATE_MAX_M: int = 64
     VLLM_SM70_FP8_DEQUANT_FALLBACK: bool = True
     VLLM_SM70_FP8_TURBOMIND: bool = True
+    VLLM_SM70_MXFP4_TURBOMIND: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -175,10 +179,24 @@ if TYPE_CHECKING:
     VLLM_ENABLE_MOE_DP_CHUNK: bool = False
     VLLM_SM70_FLASH_ATTN_V100: bool = True
     VLLM_SM70_PROFILE_TRACE: bool = False
+    VLLM_SM70_DECODE_EVENT_TRACE: bool = False
+    VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS: float = 1.0
+    VLLM_SM70_DECODE_EVENT_TRACE_EVERY: int = 16
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
+    VLLM_MTP_STOCHASTIC_TOKEN_MATCHING: bool = False
+    VLLM_SM70_MTP_DUMP_STEP_DIR: str | None = None
+    VLLM_SM70_MTP_DUMP_STEP_MAX: int = 512
+    VLLM_SM70_MTP_DUMP_STEP_STEPS: str | None = None
+    VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU: bool = False
     VLLM_SM70_MTP_DENSE_F16_FASTPATH: bool = True
     VLLM_SM70_MTP_DENSE_F16_ALLOWLIST: str | None = None
+    VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS: bool = False
+    VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR: bool = False
+    VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0: bool = True
+    VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING: bool = True
+    VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX: bool = False
+    VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
     VLLM_FLASH_V100_ENABLE_PAGED_PREFILL: str | None = None
@@ -223,6 +241,7 @@ if TYPE_CHECKING:
     VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS: int = 256
     VLLM_SPEC_DUMP_ALIGNMENT: bool = False
     VLLM_SPEC_DUMP_ALIGNMENT_LIMIT: int = 3
+    VLLM_SPEC_DUMP_ALIGNMENT_STEPS: str | None = None
     VLLM_DEBUG_MTP_LOAD: bool = False
     VLLM_DEBUG_MTP_LOAD_VERBOSE: bool = False
     VLLM_DFLASH_PROFILE: bool = False
@@ -272,6 +291,15 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_CHUNK_O_STAGES: str | None = None
     VLLM_SM70_GDN_LEGACY_PREFILL_PREP: bool = False
     VLLM_SM70_GDN_Z_CONTIGUOUS: bool = False
+    VLLM_SM70_QWEN_GDN_CONTEXT_CORE: bool = False
+    VLLM_SM70_QWEN_GDN_FULL_FORWARD: bool = False
+    VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD: bool = False
+    VLLM_SM70_QWEN_GDN_SPEC_CORE_OP: bool = False
+    VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP: bool = False
+    VLLM_SM70_QWEN_GDN_INPUT_CORE_OP: bool = False
+    VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP: bool = False
+    VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP: bool = False
+    VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_FUSED_SIGMOID_GATING_SCHED: bool = True
@@ -290,6 +318,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
+    VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL: bool = False
@@ -1281,6 +1310,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_TURBOMIND", "1"))
     ),
+    # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
+    # weight-only formats. Default-off until route-hit, quality, and decode
+    # speed are validated per format.
+    "VLLM_SM70_GPTQ_TURBOMIND": lambda: bool(
+        int(os.getenv("VLLM_SM70_GPTQ_TURBOMIND", "0"))
+    ),
+    "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": lambda: bool(
+        int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))
+    ),
     "VLLM_SM70_AWQ_MOE_DISABLE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MOE_DISABLE", "0"))
     ),
@@ -1336,6 +1374,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS", "1"))
+    ),
+    # Experimental graph-safety lane for AWQ LUT reuse: keep the measured/LUT
+    # kernel choice, but force only split-K to match the heuristic/default
+    # launch. This tests whether no-preserve LUT regressions come from graph
+    # dependencies introduced by measured split/workspace topology.
+    "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY", "0"))
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))
@@ -1458,6 +1503,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TURBOMIND", "1"))
     ),
+    "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "0"))
+    ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and
     # then executed by the unquantized Triton MoE path. Keep this default-off:
@@ -1567,17 +1615,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_PROFILE_TRACE", "0"))
         or int(os.getenv("VLLM_SM70_DECODE_TILE_PROFILE", "0"))
     ),
+    "VLLM_SM70_DECODE_EVENT_TRACE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE", "0"))
+    ),
+    "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS": lambda: float(
+        os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS", "1.0")
+    ),
+    "VLLM_SM70_DECODE_EVENT_TRACE_EVERY": lambda: max(
+        1, int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_EVERY", "16"))
+    ),
     "VLLM_SM70_MTP_PROFILE": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))
     ),
     "VLLM_SM70_MTP_PROFILE_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
     ),
+    "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": lambda: bool(
+        int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))
+    ),
+    "VLLM_SM70_MTP_DUMP_STEP_DIR": lambda: os.getenv(
+        "VLLM_SM70_MTP_DUMP_STEP_DIR"
+    ),
+    "VLLM_SM70_MTP_DUMP_STEP_MAX": lambda: int(
+        os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512")
+    ),
+    "VLLM_SM70_MTP_DUMP_STEP_STEPS": lambda: os.getenv(
+        "VLLM_SM70_MTP_DUMP_STEP_STEPS"
+    ),
+    "VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU", "0"))
+    ),
     "VLLM_SM70_MTP_DENSE_F16_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_DENSE_F16_FASTPATH", "1"))
     ),
     "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST": lambda: os.getenv(
         "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST"
+    ),
+    "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS", "0"))
+    ),
+    "VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR", "0"))
+    ),
+    "VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", "1"))
+    ),
+    "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING", "1"))
+    ),
+    "VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX", "0"))
     ),
     # Legacy no-MTP TileRT/Mirage planning name. It aliases the broader latest
     # SM70 profile trace gate instead of creating a separate trace surface.
@@ -1725,6 +1812,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SPEC_DUMP_ALIGNMENT_LIMIT": lambda: int(
         os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_LIMIT", "3")
+    ),
+    "VLLM_SPEC_DUMP_ALIGNMENT_STEPS": lambda: os.getenv(
+        "VLLM_SPEC_DUMP_ALIGNMENT_STEPS"
     ),
     "VLLM_DEBUG_MTP_LOAD": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))
@@ -1881,6 +1971,67 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GDN_Z_CONTIGUOUS": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_Z_CONTIGUOUS", "0"))
     ),
+    # Diagnostic-only: restore 0.0.3-style materialization of the packed
+    # Qwen3.5 GDN q/k/v slice before the custom-op boundary. This tests
+    # whether a strided projection view that is mutated by causal_conv1d_update
+    # can corrupt long MTP/spec-decode runs under compile/FULL graph.
+    "VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS", "0"))
+    ),
+    # Diagnostic-only: route Qwen3.5 GDN core through the 0.0.3-style
+    # context-resolved custom-op boundary. This keeps cache tensors hidden
+    # from the op signature and tests whether the latest explicit cache
+    # boundary changes MTP recurrent-state semantics under FULL graph.
+    "VLLM_SM70_QWEN_GDN_CONTEXT_CORE": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_CONTEXT_CORE", "0"))
+    ),
+    # Diagnostic force-on for the SM70 Qwen GDN opaque full-forward boundary.
+    # The automatic default is armed only for active MTP spec-decode batches so
+    # no-MTP services, prefill, and ordinary decode keep the faster split path.
+    "VLLM_SM70_QWEN_GDN_FULL_FORWARD": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_FULL_FORWARD", "0"))
+    ),
+    # Diagnostic escape hatch for comparing the latest split Qwen GDN compile
+    # boundary against the default full-forward quality guard.
+    "VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD", "0"))
+    ),
+    # Experimental SM70 MTP target: keep Qwen GDN input/output projections in
+    # the compiled graph and isolate only the spec-aware recurrent core. The
+    # default remains the full-Qwen-GDN active-MTP quality guard until this
+    # narrower boundary passes long-output quality.
+    "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0"))
+    ),
+    # Diagnostic-only: active-MTP 0.0.3-style recurrent-core boundary. This
+    # consumes live forward-context GDN metadata like the 0.0.3 quality-positive
+    # path while keeping latest explicit cache mutation args for graph safety.
+    "VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", "0"))
+    ),
+    # Diagnostic-only: keep Qwen GDN input projection plus recurrent core
+    # behind an opaque custom-op boundary while leaving output projection in
+    # the latest compiled path. This was not sufficient for long MTP quality.
+    "VLLM_SM70_QWEN_GDN_INPUT_CORE_OP": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_INPUT_CORE_OP", "0"))
+    ),
+    # Diagnostic escape hatch for comparing the split latest Qwen GDN compile
+    # boundary against the default full-forward quality guard.
+    "VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP", "0"))
+    ),
+    # Diagnostic-only: keep only Qwen GDN input projection/splitting behind an
+    # opaque custom-op boundary while leaving the recurrent core and output
+    # projection in the latest split path.
+    "VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP", "0"))
+    ),
+    # Diagnostic-only: keep only the Qwen GDN RMSNorm/output projection segment
+    # behind an opaque custom-op boundary while leaving input projection and the
+    # recurrent core in the latest split path.
+    "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP", "0"))
+    ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
     "VLLM_SM70_GEMMA_RMS_NORM_EAGER": lambda: bool(
@@ -1968,6 +2119,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
             "0",
         ).strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
+    # disables AOT cache reload by default due known token drift, but long
+    # profiler runs need an explicit way to reuse compile artifacts.
+    "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": lambda: bool(
+        os.getenv("VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING", "0")
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD": lambda: bool(

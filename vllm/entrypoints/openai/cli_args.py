@@ -93,7 +93,9 @@ class BaseFrontendArgs:
     """Whether to trust the chat template provided in the request. If False,
     the server will always use the chat template specified by `--chat-template`
     or the ones from tokenizer."""
-    default_chat_template_kwargs: dict[str, Any] | None = None
+    default_chat_template_kwargs: dict[str, Any] | None = field(
+        default_factory=lambda: {"enable_thinking": False}
+    )
     """Default keyword arguments to pass to the chat template renderer.
     These will be merged with request-level chat_template_kwargs,
     with request values taking precedence. Useful for setting default

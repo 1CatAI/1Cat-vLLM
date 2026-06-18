@@ -18,6 +18,53 @@ from vllm.triton_utils import triton
 
 @pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
+    reason="NVFP4 emulation compile fallback requires CUDA.",
+)
+def test_nvfp4_quant_dequant_sm70_fallback_compiles(monkeypatch) -> None:
+    monkeypatch.setattr(
+        nvfp4_emulation_utils, "_TRITON_NVFP4_EMULATION_SUPPORTED", False
+    )
+    block_size = 16
+    x = torch.randn(2, 32, dtype=torch.float16, device="cuda")
+    global_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+    compiled = torch.compile(
+        lambda t: ref_nvfp4_quant_dequant(t, global_scale, block_size),
+        fullgraph=True,
+    )
+
+    output = compiled(x)
+    torch.cuda.synchronize()
+
+    assert output.shape == x.shape
+    assert output.dtype == x.dtype
+    assert torch.isfinite(output).all()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="NVFP4 emulation scale fallback requires CUDA.",
+)
+def test_nvfp4_sm70_e4m3_scale_fallback_matches_torch_float8(monkeypatch) -> None:
+    monkeypatch.setattr(
+        nvfp4_emulation_utils, "_TRITON_NVFP4_EMULATION_SUPPORTED", False
+    )
+    values = torch.cat(
+        [
+            torch.linspace(0, 1, 257),
+            torch.linspace(1, 448, 1024),
+            torch.tensor([2.0**-9, 2.0**-6, 240.0, 256.0, 448.0]),
+        ]
+    ).to(torch.float32)
+
+    expected = values.to(torch.float8_e4m3fn).to(torch.float32)
+    actual = nvfp4_emulation_utils._quantize_e4m3fn_scale(values.cuda()).cpu()
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
     reason="Triton NVFP4 kernel requires CUDA.",
 )
 def test_triton_dequantize_nvfp4(monkeypatch) -> None:

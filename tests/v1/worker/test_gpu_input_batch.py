@@ -217,6 +217,137 @@ def _construct_cached_request_state(req_id_suffix: int):
     )
 
 
+def _make_async_history_input_batch(max_num_reqs: int = 2) -> InputBatch:
+    return InputBatch(
+        max_num_reqs=max_num_reqs,
+        max_model_len=32,
+        max_num_batched_tokens=32,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+        logitsprocs_need_output_token_ids=True,
+        num_spec_tokens=2,
+    )
+
+
+def _make_async_history_request(
+    req_id: str,
+    prompt_token_ids: list[int],
+    output_token_ids: list[int],
+) -> CachedRequestState:
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        mm_features=[],
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=len(prompt_token_ids) + len(output_token_ids),
+        output_token_ids=output_token_ids,
+    )
+
+
+class _FakeAsyncCopyReadyEvent:
+    def __init__(self) -> None:
+        self.synchronized = False
+
+    def synchronize(self) -> None:
+        self.synchronized = True
+
+
+def test_update_async_output_token_ids_repairs_cpu_history_and_moves_spec():
+    input_batch = _make_async_history_input_batch(max_num_reqs=1)
+    req = _make_async_history_request("r0", [10, 11], [20, -1, -1, -1])
+    input_batch.add_request(req)
+    input_batch.update_req_spec_token_ids(req, {"r0": [91, 92]})
+    input_batch.refresh_metadata()
+
+    copy_ready_event = _FakeAsyncCopyReadyEvent()
+    input_batch.prev_req_id_to_index = {"r0": 0}
+    input_batch.sampled_token_ids_cpu = torch.tensor(
+        [[30, 31, -1]],
+        dtype=torch.int32,
+    )
+    input_batch.async_copy_ready_event = copy_ready_event  # type: ignore[assignment]
+
+    input_batch.update_async_output_token_ids()
+
+    assert copy_ready_event.synchronized
+    assert req.output_token_ids == [20, 30, 31]
+    assert input_batch.sampling_metadata.output_token_ids[0] == [20, 30, 31]
+    assert int(input_batch.num_tokens_no_spec[0]) == 5
+    assert input_batch.token_ids_cpu[0, :7].tolist() == [
+        10,
+        11,
+        20,
+        30,
+        31,
+        91,
+        92,
+    ]
+    assert input_batch.is_token_ids[0, :7].all()
+    assert input_batch.token_ids_cpu[0, 7] == 0
+    assert not input_batch.is_token_ids[0, 7]
+
+
+def test_update_async_spec_token_ids_uses_req_id_mapping_after_reorder():
+    input_batch = _make_async_history_input_batch(max_num_reqs=2)
+    req0 = _make_async_history_request("r0", [10], [100])
+    req1 = _make_async_history_request("r1", [20], [200])
+    input_batch.add_request(req0)
+    input_batch.add_request(req1)
+    input_batch.update_req_spec_token_ids(req0, {"r0": [-1, -1]})
+    input_batch.update_req_spec_token_ids(req1, {"r1": [-1, -1]})
+    input_batch.refresh_metadata()
+
+    input_batch.swap_states(0, 1)
+    input_batch.refresh_metadata()
+    assert input_batch.req_ids == ["r1", "r0"]
+
+    input_batch.update_async_spec_token_ids(
+        [[101, 102], [201, 202]],
+        ["r0", "r1"],
+    )
+
+    assert input_batch.spec_token_ids[0] == [201, 202]
+    assert input_batch.spec_token_ids[1] == [101, 102]
+    start0 = int(input_batch.num_tokens_no_spec[0])
+    start1 = int(input_batch.num_tokens_no_spec[1])
+    assert input_batch.token_ids_cpu[0, start0 : start0 + 2].tolist() == [201, 202]
+    assert input_batch.token_ids_cpu[1, start1 : start1 + 2].tolist() == [101, 102]
+
+
+def test_update_async_spec_token_ids_does_not_treat_zero_rows_as_drafts():
+    input_batch = _make_async_history_input_batch(max_num_reqs=1)
+    req = _make_async_history_request("r0", [10], [100])
+    input_batch.add_request(req)
+    input_batch.update_req_spec_token_ids(req, {"r0": [0, 0]})
+    input_batch.refresh_metadata()
+
+    input_batch.update_async_spec_token_ids([[0, 0]], ["r0"])
+
+    assert input_batch.spec_token_ids[0] == [-1, -1]
+    start = int(input_batch.num_tokens_no_spec[0])
+    assert input_batch.token_ids_cpu[0, start : start + 2].tolist() == [-1, -1]
+
+
+def test_update_async_spec_token_ids_preserves_real_zero_token_ids():
+    input_batch = _make_async_history_input_batch(max_num_reqs=1)
+    req = _make_async_history_request("r0", [10], [100])
+    input_batch.add_request(req)
+    input_batch.update_req_spec_token_ids(req, {"r0": [-1, -1]})
+    input_batch.refresh_metadata()
+
+    input_batch.update_async_spec_token_ids([[0, 0]], ["r0"])
+
+    assert input_batch.spec_token_ids[0] == [0, 0]
+    start = int(input_batch.num_tokens_no_spec[0])
+    assert input_batch.token_ids_cpu[0, start : start + 2].tolist() == [0, 0]
+
+
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("batch_size", [1, 2, 32, 64])
 def test_sampling_metadata_in_input_batch(device: str, batch_size: int):

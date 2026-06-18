@@ -111,9 +111,16 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType = "auto",
     ) -> tuple[torch.dtype, torch.dtype]:
-        return cls._mamba_state_dtype(
-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
-        )
+        conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        if mamba_ssm_cache_dtype == "auto":
+            # GDN recurrent state accumulates over long decode sequences.  The
+            # 1Cat-vLLM 0.0.3 SM70 baseline kept this state in fp32 under
+            # "auto"; following the model dtype here can make MTP verification
+            # drift into self-consistent repetition after long outputs.
+            ssm_state_dtype = torch.float32
+        else:
+            ssm_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
+        return (conv_state_dtype, ssm_state_dtype)
 
     @classmethod
     def kda_state_dtype(

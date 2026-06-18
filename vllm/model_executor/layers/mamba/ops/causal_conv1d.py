@@ -919,6 +919,9 @@ def _causal_conv1d_update_kernel(
     conv_states_offset = tl.load(
         conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
     ).to(tl.int64)
+    if USE_PAD_SLOT:  # noqa
+        if conv_states_offset == pad_slot_id:
+            return
     conv_state_ptrs_target = (
         conv_state_ptr
         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq

@@ -67,6 +67,16 @@ def _decode_dynamic_partitions_enabled() -> bool:
     return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
 
 
+def _cuda_graph_capture_active() -> bool:
+    is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+    if is_capturing is None:
+        return False
+    try:
+        return bool(is_capturing())
+    except RuntimeError:
+        return False
+
+
 def _allocate_decode_workspace(
     q: torch.Tensor,
     *,
@@ -108,6 +118,7 @@ def _get_decode_plan(
     max_seq_len_hint: Optional[int] = None,
     batch_size_hint: Optional[int] = None,
     workspace_seq_capacity_hint: Optional[int] = None,
+    active_num_partitions: Optional[torch.Tensor] = None,
 ) -> _DecodePlan:
     batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
@@ -123,6 +134,19 @@ def _get_decode_plan(
         effective_workspace_seq_capacity,
         effective_max_seq_len,
     )
+    if (
+        workspace_seq_capacity_hint is not None
+        and active_num_partitions is None
+        and _cuda_graph_capture_active()
+    ):
+        # CUDA graph replay replays the captured fill_ into active_num_partitions
+        # instead of rerunning Python planning for the runtime sequence length.
+        # Capture the full workspace envelope so runtime seq_lens, not a stale
+        # short capture hint, bounds the effective decode range inside kernels.
+        effective_max_seq_len = max(
+            effective_max_seq_len,
+            effective_workspace_seq_capacity,
+        )
     partition_size = _get_decode_partition_size(
         max_seq_capacity=max_seq_capacity,
         head_dim=head_dim,
@@ -176,6 +200,7 @@ def _get_decode_workspace_for_plan(
     num_heads: int,
     head_dim: int,
     plan: _DecodePlan,
+    active_num_partitions: Optional[torch.Tensor] = None,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
@@ -205,12 +230,14 @@ def _get_decode_workspace_for_plan(
         if _can_cache_workspace(q):
             _decode_workspace_cache[key] = workspace
 
-    workspace.active_num_partitions.fill_(plan.actual_num_partitions)
+    if active_num_partitions is None:
+        workspace.active_num_partitions.fill_(plan.actual_num_partitions)
+        active_num_partitions = workspace.active_num_partitions
     return (
         workspace.tmp_out[:, :, :workspace.max_num_partitions, :],
         workspace.max_logits[:, :, :workspace.max_num_partitions],
         workspace.exp_sums[:, :, :workspace.max_num_partitions],
-        workspace.active_num_partitions,
+        active_num_partitions,
     )
 
 
@@ -570,6 +597,7 @@ def flash_attn_decode_paged(
     window_size: tuple = (-1, -1),
     max_seq_len_hint: Optional[int] = None,
     workspace_seq_capacity_hint: Optional[int] = None,
+    active_num_partitions: Optional[torch.Tensor] = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -587,6 +615,7 @@ def flash_attn_decode_paged(
     if not _decode_dynamic_partitions_enabled():
         max_seq_len_hint = None
         workspace_seq_capacity_hint = None
+        active_num_partitions = None
     plan = _get_decode_plan(
         q,
         k_cache,
@@ -594,6 +623,7 @@ def flash_attn_decode_paged(
         max_seq_len_hint=max_seq_len_hint,
         batch_size_hint=batch_capacity,
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+        active_num_partitions=active_num_partitions,
     )
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
@@ -602,6 +632,7 @@ def flash_attn_decode_paged(
             num_heads=num_heads,
             head_dim=head_dim,
             plan=plan,
+            active_num_partitions=active_num_partitions,
         )
     )
 

@@ -44,7 +44,7 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
-    _qwen_gdn_non_spec_metadata_tensors,
+    _qwen_gdn_run_recurrent_core,
     _resolve_qwen_gdn_kv_cache_args,
     _sm70_compile_graph_slice_dim,
     _sm70_dump_gdn_projection_tensor,
@@ -55,11 +55,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -129,17 +129,32 @@ def _uses_split_gdn_input_projections(
     quant_config: QuantizationConfig | None,
 ) -> bool:
     """Return True when qkv/z and b/a use different precisions."""
-    modules_to_not_convert = getattr(quant_config, "modules_to_not_convert", None)
-    if modules_to_not_convert is None:
-        modules_to_not_convert = getattr(quant_config, "ignored_layers", None)
-    if not modules_to_not_convert:
+    ignored_modules: list[str] = []
+
+    def add_ignored_modules(value: object) -> None:
+        if not value:
+            return
+        if isinstance(value, str):
+            ignored_modules.append(value)
+            return
+        try:
+            ignored_modules.extend(str(module) for module in value)
+        except TypeError:
+            return
+
+    for attr_name in ("modules_to_not_convert", "ignored_layers", "ignore"):
+        add_ignored_modules(getattr(quant_config, attr_name, None))
+    raw_config = getattr(quant_config, "config", None)
+    if isinstance(raw_config, dict):
+        add_ignored_modules(raw_config.get("ignore"))
+    if not ignored_modules:
         return False
     return any(
         module_name == "linear_attn"
         or module_name.endswith(".linear_attn")
         or ("linear_attn.in_proj_a" in module_name)
         or ("linear_attn.in_proj_b" in module_name)
-        for module_name in modules_to_not_convert
+        for module_name in ignored_modules
     )
 
 
@@ -280,6 +295,8 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
         )
+        if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+            mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
         z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
         b = b.contiguous()
@@ -294,24 +311,15 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             layer_name,
             core_attn_out,
         )
-        (
-            non_spec_query_start_loc,
-            non_spec_state_indices_tensor,
-        ) = _qwen_gdn_non_spec_metadata_tensors(
-            layer_name,
-            core_attn_out.device,
-        )
-
-        torch.ops.vllm.qwen_gdn_attention_core_standard(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-            conv_state_cache,
-            ssm_state_cache,
-            non_spec_query_start_loc,
-            non_spec_state_indices_tensor,
-            layer_name,
+        core_attn_out = _qwen_gdn_run_recurrent_core(
+            self,
+            mixed_qkv=mixed_qkv,
+            b=b,
+            a=a,
+            core_attn_out=core_attn_out,
+            layer_name=layer_name,
+            conv_state_cache=conv_state_cache,
+            ssm_state_cache=ssm_state_cache,
         )
         self._output_projection(core_attn_out, z, output, num_tokens)
 

@@ -215,6 +215,139 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             dtype=torch.float32,
             device=device,
         )
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        self._is_speculative_draft_model = (
+            spec_config is not None
+            and getattr(spec_config, "draft_model_config", None)
+            is self.vllm_config.model_config
+        )
+        self._draft_block_table: torch.Tensor | None = None
+        self._draft_seq_lens: torch.Tensor | None = None
+        self._draft_query_start_loc: torch.Tensor | None = None
+        self._draft_slot_mapping: torch.Tensor | None = None
+        self._draft_buffer_shape: tuple[int, int, int] | None = None
+        self._draft_slot_mapping_dtype: torch.dtype | None = None
+
+    def _ensure_draft_graph_buffers(
+        self,
+        required_reqs: int,
+        block_table: torch.Tensor,
+        required_tokens: int,
+        slot_mapping: torch.Tensor,
+    ) -> bool:
+        req_capacity = max(
+            int(self.vllm_config.scheduler_config.max_num_seqs),
+            int(required_reqs),
+            1,
+        )
+        token_capacity = max(
+            int(self.vllm_config.scheduler_config.max_num_seqs),
+            int(required_tokens),
+            1,
+        )
+        block_cols = int(block_table.shape[1])
+        slot_dtype = slot_mapping.dtype
+        shape = (req_capacity, block_cols, token_capacity)
+        if (
+            self._draft_buffer_shape == shape
+            and self._draft_slot_mapping_dtype == slot_dtype
+        ):
+            return True
+
+        if self._draft_buffer_shape is not None:
+            old_reqs, old_block_cols, old_tokens = self._draft_buffer_shape
+            if (
+                required_reqs <= old_reqs
+                and block_cols == old_block_cols
+                and required_tokens <= old_tokens
+                and self._draft_slot_mapping_dtype == slot_dtype
+            ):
+                return True
+            return False
+
+        self._draft_block_table = torch.empty(
+            (req_capacity, block_cols),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._draft_seq_lens = torch.empty(
+            (req_capacity,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._draft_query_start_loc = torch.empty(
+            (req_capacity + 1,),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._draft_slot_mapping = torch.empty(
+            (token_capacity,),
+            dtype=slot_dtype,
+            device=self.device,
+        )
+        self._draft_buffer_shape = shape
+        self._draft_slot_mapping_dtype = slot_dtype
+        return True
+
+    def _stabilize_draft_graph_metadata(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        if not self._is_speculative_draft_model:
+            return
+
+        num_reqs = int(common_attn_metadata.num_reqs)
+        if num_reqs <= 0:
+            return
+
+        block_table = attn_metadata.block_table[:num_reqs]
+        num_tokens = int(attn_metadata.slot_mapping.numel())
+        if not self._ensure_draft_graph_buffers(
+            num_reqs,
+            block_table,
+            num_tokens,
+            attn_metadata.slot_mapping,
+        ):
+            assert self._draft_buffer_shape is not None
+            req_capacity, block_cols, token_capacity = self._draft_buffer_shape
+            raise RuntimeError(
+                "TRITON_ATTN draft CUDA graph metadata shape exceeds the "
+                "captured persistent buffer capacity: "
+                f"required_reqs={num_reqs}, "
+                f"required_block_cols={int(block_table.shape[1])}, "
+                f"required_tokens={num_tokens}, "
+                f"capacity_reqs={req_capacity}, "
+                f"capacity_block_cols={block_cols}. "
+                f"capacity_tokens={token_capacity}. "
+                "Replay would otherwise read stale draft metadata."
+            )
+
+        assert self._draft_block_table is not None
+        assert self._draft_seq_lens is not None
+        assert self._draft_query_start_loc is not None
+        assert self._draft_slot_mapping is not None
+
+        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
+        self._draft_seq_lens[:num_reqs].copy_(
+            attn_metadata.seq_lens[:num_reqs],
+            non_blocking=True,
+        )
+        self._draft_query_start_loc[: num_reqs + 1].copy_(
+            attn_metadata.query_start_loc[: num_reqs + 1],
+            non_blocking=True,
+        )
+        self._draft_slot_mapping[:num_tokens].copy_(
+            attn_metadata.slot_mapping[:num_tokens],
+            non_blocking=True,
+        )
+
+        attn_metadata.block_table = self._draft_block_table[:num_reqs]
+        attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
+        attn_metadata.query_start_loc = self._draft_query_start_loc[
+            : num_reqs + 1
+        ]
+        attn_metadata.slot_mapping = self._draft_slot_mapping[:num_tokens]
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -278,6 +411,19 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
         )
+        return attn_metadata
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> TritonAttentionMetadata:
+        attn_metadata = self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=True,
+        )
+        self._stabilize_draft_graph_metadata(attn_metadata, common_attn_metadata)
         return attn_metadata
 
 
@@ -505,7 +651,11 @@ class TritonAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.attn_type = attn_type
-        self.fp8_dtype = current_platform.fp8_dtype()
+        self.fp8_dtype = (
+            torch.float8_e5m2
+            if kv_cache_dtype == "fp8_e5m2"
+            else current_platform.fp8_dtype()
+        )
 
         self.sinks = sinks
         if sinks is not None:

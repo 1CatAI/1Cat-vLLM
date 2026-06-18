@@ -156,6 +156,7 @@ enum class DispatchPolicy : int
     kReuse                 = 2,
     kAppend                = 3,
     kPreserveDefaultSplits = 4,
+    kPreserveDefaultSplitCount = 8,
 };
 
 constexpr bool operator&(const DispatchPolicy& a, const DispatchPolicy& b)

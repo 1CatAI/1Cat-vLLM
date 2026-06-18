@@ -526,6 +526,13 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 use_existing_torch.py --prefix; \
     fi
 
+# Build the bundled SM70 FlashAttention wheel alongside vLLM. FLASH_ATTN_V100
+# is an external Python/CUDA package, so the runtime image must install it
+# explicitly instead of relying on the vLLM wheel to carry the extension.
+RUN --mount=type=cache,target=/opt/uv/cache \
+    cd flash-attention-v100 && \
+    python3 setup.py bdist_wheel --dist-dir=/workspace/flash-attn-v100-dist
+
 # Build the vLLM wheel
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=.git,target=.git \
@@ -815,17 +822,18 @@ ARG PYTORCH_NIGHTLY
 # Check whether to install torch nightly instead of release for this build.
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
+    --mount=type=bind,from=build,src=/workspace/flash-attn-v100-dist,target=/vllm-workspace/flash-attn-v100-dist \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         && echo "Installing vLLM..." \
-        && uv pip install --system dist/*.whl --verbose \
+        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
         echo "Installing vLLM..." \
-        && uv pip install --system dist/*.whl --verbose \
+        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
@@ -854,6 +862,21 @@ RUN flashinfer show-config && flashinfer download-cubin
 # consistently from the host (see https://github.com/vllm-project/vllm/issues/18859).
 # Until then, add /usr/local/nvidia/lib64 before the image cuda path to allow override.
 ENV LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+
+# 1Cat SM70/V100 runtime defaults. Keep model-specific choices such as
+# CUDA_VISIBLE_DEVICES, tensor parallel size, quantization, and model path in the
+# run command, but make the validated baseline environment the image default.
+ENV CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    VLLM_SM70_FLASH_ATTN_V100=1 \
+    VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 \
+    VLLM_SM70_QWEN_GDN_FULL_FORWARD=0 \
+    VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=0 \
+    VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0 \
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_vllm \
+    TORCHINDUCTOR_COMPILE_THREADS=1 \
+    TRITON_CACHE_AUTOTUNING=1 \
+    TILELANG_CLEANUP_TEMP_FILES=1 \
+    TOKENIZERS_PARALLELISM=false
 
 # Copy examples and benchmarks at the end to minimize cache invalidation
 COPY examples examples

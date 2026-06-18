@@ -16,7 +16,11 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
-from vllm.distributed.parallel_state import get_pp_group, is_global_first_rank
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tp_group,
+    is_global_first_rank,
+)
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -87,6 +91,63 @@ def _dump_spec_debug(payload: dict[str, Any], method: str, suffix: str) -> str:
     dump_path = f"/tmp/{prefix}_{suffix}_pid{os.getpid()}.pt"
     torch.save(payload, dump_path)
     return dump_path
+
+
+def _clone_tensor_or_none(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    return None if tensor is None else tensor.clone()
+
+
+def _clone_drafter_mutable_metadata(
+    common_attn_metadata: CommonAttentionMetadata,
+) -> CommonAttentionMetadata:
+    """Clone metadata fields that drafter code mutates in-place.
+
+    The target runner keeps some of these tensors as persistent CUDA graph
+    metadata. Speculative drafting updates sequence lengths while accounting
+    for rejected tokens, so those updates must stay local to the drafter.
+    """
+    return common_attn_metadata.replace(
+        seq_lens=common_attn_metadata.seq_lens.clone(),
+        dcp_local_seq_lens=_clone_tensor_or_none(
+            common_attn_metadata.dcp_local_seq_lens
+        ),
+        _seq_lens_cpu=_clone_tensor_or_none(common_attn_metadata._seq_lens_cpu),
+        _num_computed_tokens_cpu=_clone_tensor_or_none(
+            common_attn_metadata._num_computed_tokens_cpu
+        ),
+        seq_lens_cpu_upper_bound=_clone_tensor_or_none(
+            common_attn_metadata.seq_lens_cpu_upper_bound
+        ),
+    )
+
+
+def _get_initialized_tp_group() -> Any | None:
+    if (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return None
+    return get_tp_group()
+
+
+def _sync_draft_token_ids_across_tp(
+    next_token_ids: torch.Tensor,
+    tp_group: Any | None = None,
+) -> torch.Tensor:
+    """Make probabilistic draft sampling choose the same token on all TP ranks.
+
+    Draft logits are all-gathered before sampling, so every TP rank keeps a
+    local copy of the same draft probability rows for rejection sampling. Only
+    the sampled token ids need synchronization; broadcasting full vocab
+    probabilities would add unnecessary communication to the MTP loop.
+    """
+    tp_group = _get_initialized_tp_group() if tp_group is None else tp_group
+    if tp_group is None or tp_group.world_size == 1:
+        return next_token_ids
+
+    if not next_token_ids.is_contiguous():
+        next_token_ids = next_token_ids.contiguous()
+    return tp_group.broadcast(next_token_ids, src=0)
 
 
 class SpecDecodeBaseProposer:
@@ -433,12 +494,82 @@ class SpecDecodeBaseProposer:
             eagle_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
+        self._specialize_mtp_cudagraph_keys()
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _uses_spec_step_idx(self) -> bool:
+        if (
+            envs.VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX
+            and self.method == "mtp"
+            and self.model.__class__.__name__ in ("Qwen3_5MTP", "Qwen3_5MoeMTP")
+        ):
+            return False
+        return self.method == "mtp"
+
+    def _add_spec_step_idx(
+        self,
+        model_kwargs: dict[str, Any],
+        spec_step_idx: int,
+    ) -> dict[str, Any]:
+        if self._uses_spec_step_idx():
+            model_kwargs["spec_step_idx"] = spec_step_idx
+        return model_kwargs
+
+    def _batch_descriptor_for_spec_step(
+        self,
+        batch_descriptor: BatchDescriptor,
+        spec_step_idx: int,
+    ) -> BatchDescriptor:
+        if self._uses_spec_step_idx():
+            return replace(batch_descriptor, graph_variant=spec_step_idx)
+        return batch_descriptor
+
+    def _specialize_mtp_cudagraph_keys(self) -> None:
+        if not self._uses_spec_step_idx() or self.num_speculative_tokens <= 1:
+            return
+        for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
+            if not key_set:
+                continue
+            specialized = {
+                replace(key, graph_variant=spec_step_idx)
+                for key in key_set
+                for spec_step_idx in range(self.num_speculative_tokens)
+            }
+            key_set.clear()
+            key_set.update(specialized)
+
+    def _compute_logits_for_step(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if self._uses_spec_step_idx():
+            return self.model.compute_logits(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.compute_logits(hidden_states)
+
+    def _get_top_tokens_for_step(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int,
+    ) -> torch.Tensor:
+        if self._uses_spec_step_idx():
+            return self.model.get_top_tokens(
+                hidden_states, spec_step_idx=spec_step_idx
+            )
+        return self.model.get_top_tokens(hidden_states)
+
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+            return self._get_top_tokens_for_step(hidden_states, spec_step_idx)
+        return self._compute_logits_for_step(hidden_states, spec_step_idx).argmax(
+            dim=-1
+        )
 
     def _sample_from_logits(
         self,
@@ -456,13 +587,14 @@ class SpecDecodeBaseProposer:
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         logits: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
             if logits is not None:
                 return logits.argmax(dim=-1), None
-            return self._greedy_sample(hidden_states), None
+            return self._greedy_sample(hidden_states, spec_step_idx), None
         if logits is None:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self._compute_logits_for_step(hidden_states, spec_step_idx)
         return self._sample_from_logits(logits, sampling_metadata)
 
     def _prepare_model_kwargs_for_aot(
@@ -474,9 +606,10 @@ class SpecDecodeBaseProposer:
         return model_kwargs
 
     def _sm70_mtp_profile_enabled(self) -> bool:
+        device_type = self.device.type if hasattr(self.device, "type") else self.device
         return (
             self.method == "mtp"
-            and self.device.type == "cuda"
+            and device_type == "cuda"
             and _sm70_mtp_profile_env_enabled()
         )
 
@@ -730,6 +863,7 @@ class SpecDecodeBaseProposer:
     ) -> torch.Tensor:
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        common_attn_metadata = _clone_drafter_mutable_metadata(common_attn_metadata)
         profile_events = (
             [] if self._sm70_mtp_profile_enabled() else None
         )
@@ -781,6 +915,8 @@ class SpecDecodeBaseProposer:
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
+        model_kwargs = self._add_spec_step_idx(model_kwargs, 0)
+        batch_descriptor = self._batch_descriptor_for_spec_step(batch_descriptor, 0)
 
         if profile_events is not None:
             self._sm70_mtp_profile_add_cpu_ms(
@@ -816,7 +952,7 @@ class SpecDecodeBaseProposer:
             or _spec_dump_draft_logits_enabled(self.method)
         )
         if should_collect_draft_logits:
-            debug_logits = self.model.compute_logits(sample_hidden_states)
+            debug_logits = self._compute_logits_for_step(sample_hidden_states, 0)
             topk = min(5, debug_logits.shape[-1])
             topk_vals, topk_ids = torch.topk(debug_logits.float(), k=topk, dim=-1)
             nan_counts = debug_logits.isnan().sum(dim=-1)
@@ -878,7 +1014,10 @@ class SpecDecodeBaseProposer:
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             first_sample_start = self._sm70_mtp_profile_start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata, debug_logits
+                sample_hidden_states,
+                sampling_metadata,
+                debug_logits,
+                spec_step_idx=0,
             )
             self._sm70_mtp_profile_finish(
                 profile_events, "first_sample", first_sample_start
@@ -929,7 +1068,10 @@ class SpecDecodeBaseProposer:
 
         first_sample_start = self._sm70_mtp_profile_start(profile_events)
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata, debug_logits
+            sample_hidden_states,
+            sampling_metadata,
+            debug_logits,
+            spec_step_idx=0,
         )
         self._sm70_mtp_profile_finish(
             profile_events, "first_sample", first_sample_start
@@ -982,6 +1124,13 @@ class SpecDecodeBaseProposer:
         # (i.e., not the first proposal).
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
+            if (
+                envs.VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU
+                and common_attn_metadata.seq_lens_cpu_upper_bound is not None
+            ):
+                common_attn_metadata.seq_lens_cpu_upper_bound -= (
+                    num_rejected_tokens_gpu.detach().cpu()
+                )
             # Invalidate the CPU-side shadows to avoid H<>D sync.
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
@@ -989,6 +1138,7 @@ class SpecDecodeBaseProposer:
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
         for token_index in range(self.num_speculative_tokens - 1):
+            spec_step_idx = token_index + 1
             loop_cpu_start = (
                 time.perf_counter() if profile_events is not None else 0.0
             )
@@ -1012,7 +1162,7 @@ class SpecDecodeBaseProposer:
             if not self.constant_draft_positions or token_index == 0:
                 _, per_layer_attn_metadata = (
                     self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=token_index + 1
+                        common_attn_metadata, draft_index=spec_step_idx
                     )
                 )
 
@@ -1036,6 +1186,7 @@ class SpecDecodeBaseProposer:
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
+            model_kwargs = self._add_spec_step_idx(model_kwargs, spec_step_idx)
             model_kwargs = self._prepare_model_kwargs_for_aot(model_kwargs)
 
             if profile_events is not None:
@@ -1054,7 +1205,9 @@ class SpecDecodeBaseProposer:
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_descriptor,
+                batch_descriptor=self._batch_descriptor_for_spec_step(
+                    batch_descriptor, spec_step_idx
+                ),
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -1070,7 +1223,9 @@ class SpecDecodeBaseProposer:
             hidden_states = hidden_states[:batch_size]
             loop_sample_start = self._sm70_mtp_profile_start(profile_events)
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size], sampling_metadata
+                last_hidden_states[:batch_size],
+                sampling_metadata,
+                spec_step_idx=spec_step_idx,
             )
             self._sm70_mtp_profile_finish(
                 profile_events, f"loop{token_index}_sample", loop_sample_start
@@ -1454,13 +1609,31 @@ class SpecDecodeBaseProposer:
 
         total_num_tokens = query_start_loc_cpu[-1].item()
 
+        # The drafter mutates seq_lens in-place while accounting for rejected
+        # speculative tokens. Keep that mutation local to the drafter metadata;
+        # the target runner's persistent seq_lens buffer is reused by CUDA
+        # graph metadata and must not be changed as a side effect.
+        seq_lens = common_attn_metadata.seq_lens.clone()
+        dcp_local_seq_lens = _clone_tensor_or_none(
+            common_attn_metadata.dcp_local_seq_lens
+        )
+        seq_lens_cpu = _clone_tensor_or_none(common_attn_metadata._seq_lens_cpu)
+        num_computed_tokens_cpu = _clone_tensor_or_none(
+            common_attn_metadata._num_computed_tokens_cpu
+        )
+        seq_lens_cpu_upper_bound = _clone_tensor_or_none(
+            common_attn_metadata.seq_lens_cpu_upper_bound
+        )
+        if envs.VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU:
+            seq_lens_cpu_upper_bound = seq_lens.detach().cpu()
+
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
-            seq_lens=common_attn_metadata.seq_lens,
+            seq_lens=seq_lens,
             query_start_loc_cpu=query_start_loc_cpu,
-            _seq_lens_cpu=common_attn_metadata._seq_lens_cpu,
-            _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
-            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
+            _seq_lens_cpu=seq_lens_cpu,
+            _num_computed_tokens_cpu=num_computed_tokens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
@@ -1468,7 +1641,7 @@ class SpecDecodeBaseProposer:
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             causal=True,
-            dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+            dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
         return (
@@ -1905,24 +2078,34 @@ class SpecDecodeBaseProposer:
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
+        spec_step_idx: int | None = None,
     ) -> None:
         # FIXME: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
-        only_one_forward_pass = is_graph_capturing or self.parallel_drafting
-        for fwd_idx in range(
-            1 if only_one_forward_pass else self.num_speculative_tokens
-        ):
-            if fwd_idx <= 1:
-                (
-                    cudagraph_runtime_mode,
-                    num_input_tokens,
-                    num_tokens_across_dp,
-                    batch_descriptor,
-                ) = (
-                    self._determine_batch_execution_and_padding(
-                        num_tokens, use_cudagraphs=use_cudagraphs
-                    )
+        if spec_step_idx is not None:
+            fwd_indices = range(spec_step_idx, spec_step_idx + 1)
+        elif self._uses_spec_step_idx():
+            fwd_indices = range(self.num_speculative_tokens)
+        else:
+            only_one_forward_pass = is_graph_capturing or self.parallel_drafting
+            fwd_indices = range(
+                1 if only_one_forward_pass else self.num_speculative_tokens
+            )
+
+        for fwd_idx in fwd_indices:
+            (
+                cudagraph_runtime_mode,
+                num_input_tokens,
+                num_tokens_across_dp,
+                batch_descriptor,
+            ) = (
+                self._determine_batch_execution_and_padding(
+                    num_tokens, use_cudagraphs=use_cudagraphs
                 )
+            )
+            batch_descriptor = self._batch_descriptor_for_spec_step(
+                batch_descriptor, fwd_idx
+            )
 
             # Make sure to use EAGLE's own buffer during cudagraph capture.
             if (
@@ -1957,6 +2140,7 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
+                kwargs = self._add_spec_step_idx(kwargs, fwd_idx)
                 kwargs = self._prepare_model_kwargs_for_aot(kwargs)
                 self.model(**kwargs)
 
@@ -2137,10 +2321,12 @@ def compute_probs_and_sample_next_token(
         sampling_metadata.top_k,
         logits.shape[0],
     )
-    top_p = _expand_sampling_param_for_logits(
-        sampling_metadata.top_p,
-        logits.shape[0],
-    )
+    # Match the validated 0.0.3 Qwen MTP proposal semantics: when top-k is
+    # configured, sample draft tokens from the top-k proposal only. The target
+    # sampler still applies the official top-p policy; rejection sampling
+    # corrects the final distribution.
+    draft_top_p = None if sampling_metadata.top_k is not None else sampling_metadata.top_p
+    top_p = _expand_sampling_param_for_logits(draft_top_p, logits.shape[0])
     logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
@@ -2154,6 +2340,7 @@ def compute_probs_and_sample_next_token(
         greedy_token_ids = probs.argmax(dim=-1)
         assert is_greedy is not None
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
+    next_token_ids = _sync_draft_token_ids_across_tp(next_token_ids)
     return next_token_ids, probs
 
 

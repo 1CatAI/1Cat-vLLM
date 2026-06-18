@@ -24,6 +24,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.sm70_decode_trace import sm70_trace_call
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -394,6 +395,12 @@ class CUDAGraphWrapper:
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
-        get_offloader().sync_prev_onload()
-        entry.cudagraph.replay()
+        sm70_trace_call(
+            f"cudagraph.{self.runtime_mode.name}.sync_prev_onload",
+            get_offloader().sync_prev_onload,
+        )
+        sm70_trace_call(
+            f"cudagraph.{self.runtime_mode.name}.replay",
+            entry.cudagraph.replay,
+        )
         return entry.output

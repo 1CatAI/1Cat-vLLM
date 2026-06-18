@@ -546,6 +546,112 @@ class TestPostprocessMambaFusedKernel:
             msg="num_accepted_tokens mismatch",
         )
 
+    def test_mtp4_boundary_rollover_counts_1_to_5(self, device, test_config):
+        """Accepted counts 1..5 must match CPU rollover at block boundaries."""
+        cfg = _TestConfig(num_blocks=80, max_num_reqs=16)
+        torch.manual_seed(20260617)
+
+        accepted = [1, 2, 3, 4, 5]
+        req_ids = [f"same_{i}" for i in accepted] + [
+            f"cross_{i}" for i in accepted
+        ]
+        num_accepted_tokens = accepted + accepted
+        # scheduled=5 and draft=4 gives running_state = computed + 1.
+        num_scheduled_tokens = {req_id: 5 for req_id in req_ids}
+        num_draft_tokens = {req_id: 4 for req_id in req_ids}
+        same_block_running = [33 - value for value in accepted]
+        cross_block_running = [49 - value for value in accepted]
+        num_computed_tokens = [
+            value - 1 for value in same_block_running + cross_block_running
+        ]
+        # same_* rows materialize into dest block 1 from source block 1.
+        # cross_* rows materialize into dest block 2 from source block 1.
+        mamba_state_idx = [1] * len(req_ids)
+        block_ids_per_req = [
+            list(range(i * 8, (i + 1) * 8)) for i in range(len(req_ids))
+        ]
+        layer_names = [f"layer_{i}" for i in range(cfg.num_layers)]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+
+        (
+            conv_states_py,
+            temporal_states_py,
+            conv_states_gpu,
+            temporal_states_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_states(cfg, layer_names, device)
+
+        scheduler_output = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {req_id: [None] * 4 for req_id in req_ids},
+        )
+        input_batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            input_batch_py,
+            requests,
+            forward_context_py,
+            _COPY_FUNCS,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
+        block_table_gpu = torch.zeros(
+            len(req_ids), 8, dtype=torch.int32, device=device
+        )
+        for i, block_ids in enumerate(block_ids_per_req):
+            block_table_gpu[i, : len(block_ids)] = torch.tensor(
+                block_ids, dtype=torch.int32, device=device
+            )
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
+        )
+
+        for i in range(cfg.num_layers):
+            torch.testing.assert_close(
+                conv_states_gpu[i],
+                conv_states_py[i],
+                msg=f"Conv state mismatch at layer {i}",
+            )
+            torch.testing.assert_close(
+                temporal_states_gpu[i],
+                temporal_states_py[i],
+                msg=f"Temporal state mismatch at layer {i}",
+            )
+
+        expected_accepted = torch.tensor(
+            input_batch_py.num_accepted_tokens_cpu[: len(req_ids)],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.testing.assert_close(
+            gpu_ctx.num_accepted_tokens_out[: len(req_ids)],
+            expected_accepted,
+            msg="num_accepted_tokens rollover mismatch",
+        )
+        assert input_batch_py.num_accepted_tokens_cpu[:5].tolist() == [1] * 5
+        assert input_batch_py.num_accepted_tokens_cpu[5:].tolist() == accepted
+
     def test_no_copy_when_not_needed(self, device, test_config):
         """Kernel should not modify state when no copy is needed."""
         cfg = test_config
