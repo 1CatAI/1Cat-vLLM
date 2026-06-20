@@ -332,6 +332,7 @@ python -m pip install -e . --no-build-isolation
 - [vLLM](https://github.com/vllm-project/vllm)
 - [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
 - [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)
+- [marlin_v100](https://github.com/zhinianqin/marlin_v100)
 
 ## License
 
