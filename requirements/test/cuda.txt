@@ -725,7 +725,7 @@ pystemmer==3.0.0
     # via mteb
 pytablewriter==1.2.0
     # via lm-eval
-pytest==8.3.5
+pytest==9.1.0
     # via
     #   -r requirements/test/cuda.in
     #   buildkite-test-collector
