@@ -298,6 +298,30 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
     ]
 
 
+def test_sm70_mtp_defaults_treat_zero_env_as_disabled(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        env={"VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "0"},
+    )
+
+    assert args.speculative_config is None
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
+
+
+def test_sm70_mtp_defaults_treat_zero_disable_env_as_disabled(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        env={
+            "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1",
+            "VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS": "0",
+        },
+    )
+
+    assert args.speculative_config is not None
+    assert args.speculative_config["method"] == "mtp"
+
+
 def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,

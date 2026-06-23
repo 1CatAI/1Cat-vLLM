@@ -1717,8 +1717,8 @@ class EngineArgs:
     ) -> None:
         """Apply the 1Cat SM70 MTP baseline knobs that affect decode speed."""
         if (
-            os.getenv("VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS")
-            or os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS")
+            envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
+            or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
         ):
             return
         if not current_platform.is_cuda_alike():
@@ -1752,8 +1752,8 @@ class EngineArgs:
 
         if self.speculative_config is None:
             enable_auto_mtp = (
-                os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS")
-                or os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS")
+                envs.VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS
+                or envs.VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS
             )
             if (
                 enable_auto_mtp
@@ -1863,8 +1863,9 @@ class EngineArgs:
         if profile_updates:
             logger.info_once(
                 "Applied 1Cat SM70 MTP defaults: %s. "
-                "Unset VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS or pass an "
-                "explicit non-MTP speculative config to disable automatic MTP.",
+                "Unset VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS, set it to 0, "
+                "or pass an explicit non-MTP speculative config to disable "
+                "automatic MTP.",
                 ", ".join(profile_updates),
             )
 
