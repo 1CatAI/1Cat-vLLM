@@ -816,6 +816,26 @@ def _extract_contiguous_kv_from_paged_cache(
 
     key_cache, value_cache = _split_paged_kv_cache(kv_cache)
 
+    # fp8 (uint8) caches: the gather kernel is typed for fp16, but a gather is
+    # a bitwise copy, so we can view 2 uint8 bytes as one fake half, run the
+    # fast kernel, and view the result back. This avoids the very slow
+    # per-block Python loop below, which is the dominant chunked-prefill cost
+    # for fp8-KV models (e.g. fp8 checkpoints + --kv-cache-dtype fp8_e5m2 on
+    # SM70/Volta).
+    if (paged_kv_utils is not None
+            and key_cache.dtype == torch.uint8
+            and head_dim % 2 == 0
+            and hasattr(paged_kv_utils, "paged_kv_to_contiguous")):
+        kc_h = key_cache.view(torch.float16)
+        vc_h = value_cache.view(torch.float16)
+        k_h, v_h = paged_kv_utils.paged_kv_to_contiguous(
+            kc_h, vc_h, block_table, seq_lens)
+        if total_tokens is None:
+            total_tokens = int(seq_lens.sum().item())
+        k_cont = k_h.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        v_cont = v_h.view(torch.uint8).view(-1, num_kv_heads, head_dim)
+        return k_cont[:total_tokens], v_cont[:total_tokens]
+
     if paged_kv_utils is not None and key_cache.dtype != torch.uint8:
         if hasattr(paged_kv_utils, "paged_kv_to_contiguous"):
             k_cont, v_cont = paged_kv_utils.paged_kv_to_contiguous(
