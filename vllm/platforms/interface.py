@@ -224,7 +224,7 @@ class Platform:
         import vllm.kernels  # noqa: F401
 
     @classmethod
-    def device_id_to_physical_device_id(cls, device_id: int):
+    def device_id_to_physical_device_id(cls, device_id: int) -> int | str:
         # Treat empty device control env var as unset. This is a valid
         # configuration in Ray setups where the engine is launched in
         # a CPU-only placement group located on a GPU node.
@@ -234,7 +234,25 @@ class Platform:
         ):
             device_ids = os.environ[cls.device_control_env_var].split(",")
             physical_device_id = device_ids[device_id]
-            return int(physical_device_id)
+            try:
+                return int(physical_device_id)
+            except ValueError:
+                # The CUDA runtime also accepts device UUIDs
+                # ("GPU-<uuid>" / "MIG-<uuid>") in CUDA_VISIBLE_DEVICES.
+                # Those cannot be converted to a physical index here, so
+                # return the raw entry. Consumers that only rebuild a
+                # visibility env var for child processes can use it
+                # as-is; platform code that needs a physical handle must
+                # resolve it (e.g. NvmlCudaPlatform resolves UUIDs via
+                # nvmlDeviceGetHandleByUUID).
+                if physical_device_id.startswith(("GPU-", "MIG-")):
+                    return physical_device_id
+                raise ValueError(
+                    f"Invalid entry {physical_device_id!r} in "
+                    f"{cls.device_control_env_var}: expected a numeric "
+                    "device index or a device UUID of the form "
+                    "'GPU-<uuid>' / 'MIG-<uuid>'."
+                ) from None
         else:
             return device_id
 
