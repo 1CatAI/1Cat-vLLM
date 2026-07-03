@@ -1211,6 +1211,24 @@ if _is_cpu():
 if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
     if _is_cuda() or _is_hip():
+        # vllm._C_stable_libtorch owns ALL generic ops (activations,
+        # rms_norm, rotary_embedding, the whole _C_cache_ops namespace,
+        # CUTLASS scaled_mm/MoE helpers, ...). It builds against the
+        # torch stable ABI introduced for this target in torch 2.10.
+        # Do NOT silently skip it on older torch: a wheel built without
+        # it imports fine but cannot load ANY model (the first symptom
+        # is `'_OpNamespace' '_C' object has no attribute
+        # 'silu_and_mul'` at model init).
+        torch_base_version = Version(torch.__version__.split("+", 1)[0])
+        if torch_base_version < Version("2.10.0"):
+            raise RuntimeError(
+                "1Cat-vLLM requires torch>=2.10 to build the stable-ABI "
+                f"op library (vllm._C_stable_libtorch); found torch "
+                f"{torch.__version__}. Building without it produces a "
+                "wheel that cannot load any model. Upgrade the build "
+                "environment's torch (e.g. torch 2.10.0+cu128 still "
+                "ships sm_70 kernels for V100) and rebuild."
+            )
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
 
 package_data = {
