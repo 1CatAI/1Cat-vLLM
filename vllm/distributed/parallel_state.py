@@ -155,6 +155,33 @@ def all_reduce_sum2_fake(
     return torch.empty_like(tensor_a)
 
 
+def sm70_tp2_all_reduce_gemma_rms_norm(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._sm70_tp2_all_reduce_gemma_rms_norm_out_place(
+        tensor, residual, weight, epsilon
+    )
+
+
+def sm70_tp2_all_reduce_gemma_rms_norm_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, epsilon, group_name
+    return torch.empty_like(tensor), torch.empty_like(residual, dtype=torch.float32)
+
+
 def sm70_awq_mlp_down_tile_all_reduce(
     tensor: torch.Tensor, group_name: str
 ) -> torch.Tensor:
@@ -336,6 +363,12 @@ direct_register_custom_op(
     op_name="all_reduce_sum2",
     op_func=all_reduce_sum2,
     fake_impl=all_reduce_sum2_fake,
+)
+
+direct_register_custom_op(
+    op_name="sm70_tp2_all_reduce_gemma_rms_norm",
+    op_func=sm70_tp2_all_reduce_gemma_rms_norm,
+    fake_impl=sm70_tp2_all_reduce_gemma_rms_norm_fake,
 )
 
 direct_register_custom_op(
@@ -643,6 +676,24 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce_sum2(input_a, input_b)
+
+    def _sm70_tp2_all_reduce_gemma_rms_norm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        fused_op = getattr(
+            self.device_communicator,
+            "sm70_tp2_all_reduce_gemma_rms_norm",
+            None,
+        )
+        if fused_op is None:
+            raise RuntimeError("Device communicator lacks SM70 fused AR RMSNorm")
+        return fused_op(input_, residual, weight, epsilon)
 
     def sm70_awq_mlp_down_tile_all_reduce(
         self, input_: torch.Tensor

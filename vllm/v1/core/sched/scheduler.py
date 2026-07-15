@@ -387,6 +387,22 @@ class Scheduler(SchedulerInterface):
         )
         return payload
 
+    @staticmethod
+    def _ddtree_payload_max_output_tokens(payload: object) -> int:
+        node_depths = tuple(getattr(payload, "node_depths", ()))
+        if not node_depths:
+            return 1
+        return max(int(depth) for depth in node_depths) + 1
+
+    @staticmethod
+    def _remaining_output_tokens(request: Request) -> int:
+        return max(
+            0,
+            request.max_tokens
+            - request.num_output_tokens
+            - request.num_output_placeholders,
+        )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -502,18 +518,23 @@ class Scheduler(SchedulerInterface):
             ddtree_payload_for_tree_schedule = (
                 self._ddtree_payload_for_tree_schedule(request)
             )
+            ddtree_payload_fits_output_budget = True
             if ddtree_payload_for_tree_schedule is not None:
                 flat_len = len(request.spec_token_ids)
                 tree_len = len(
                     getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
                 )
                 tree_num_new_tokens = num_new_tokens + max(0, tree_len - flat_len)
+                tree_max_output_tokens = self._ddtree_payload_max_output_tokens(
+                    ddtree_payload_for_tree_schedule
+                )
+                remaining_output_tokens = self._remaining_output_tokens(request)
                 threshold = self.scheduler_config.long_prefill_token_threshold
                 max_len_tokens = self.max_model_len - 1 - request.num_computed_tokens
                 _ddtree_debug_log(
                     "schedule candidate req=%s base_new=%d tree_new=%d "
                     "flat_len=%d tree_len=%d token_budget=%d threshold=%d "
-                    "max_len_tokens=%d",
+                    "max_len_tokens=%d remaining_output=%d tree_max_output=%d",
                     request.request_id,
                     num_new_tokens,
                     tree_num_new_tokens,
@@ -522,9 +543,15 @@ class Scheduler(SchedulerInterface):
                     token_budget,
                     threshold,
                     max_len_tokens,
+                    remaining_output_tokens,
+                    tree_max_output_tokens,
+                )
+                ddtree_payload_fits_output_budget = (
+                    tree_max_output_tokens <= remaining_output_tokens
                 )
                 if (
                     tree_len > flat_len
+                    and ddtree_payload_fits_output_budget
                     and (threshold <= 0 or tree_num_new_tokens <= threshold)
                     and tree_num_new_tokens <= token_budget
                     and tree_num_new_tokens <= max_len_tokens
@@ -686,6 +713,7 @@ class Scheduler(SchedulerInterface):
                     )
                     if (
                         ddtree_payload is not None
+                        and ddtree_payload_fits_output_budget
                         and num_scheduled_spec_tokens == len(ddtree_tree_token_ids)
                     ):
                         spec_token_ids = list(ddtree_tree_token_ids)
@@ -708,6 +736,7 @@ class Scheduler(SchedulerInterface):
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
                     if (
                         ddtree_payload is not None
+                        and ddtree_payload_fits_output_budget
                         and tuple(spec_token_ids)
                         == getattr(ddtree_payload, "flat_draft_token_ids", ())
                     ):

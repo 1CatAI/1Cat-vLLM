@@ -237,3 +237,29 @@ def greedy_sample_from_compact_logits(
         return int(target_argmax[path_to_compact_index[path]].item())
 
     return greedy_tree_walk(tree, next_token_for_path)
+
+
+def greedy_sample_from_compact_top_tokens(
+    *,
+    tree: DDTree,
+    compact_top_tokens: torch.Tensor,
+) -> GreedyDDTreeWalk:
+    """Greedy tree sampler over compact root-plus-node argmax tokens."""
+
+    if compact_top_tokens.ndim != 1:
+        raise ValueError("compact_top_tokens must have shape [rows]")
+    expected_rows = len(tree.non_root_nodes) + 1
+    if compact_top_tokens.shape[0] != expected_rows:
+        raise ValueError(
+            f"compact_top_tokens row mismatch: expected {expected_rows}, "
+            f"got {compact_top_tokens.shape[0]}")
+
+    target_tokens = compact_top_tokens.detach().cpu().tolist()
+    path_to_compact_index: dict[tuple[int, ...], int] = {(): 0}
+    for node in tree.non_root_nodes:
+        path_to_compact_index[tree.path_token_ids(node.index)] = node.index
+
+    def next_token_for_path(path: tuple[int, ...]) -> int:
+        return int(target_tokens[path_to_compact_index[path]])
+
+    return greedy_tree_walk(tree, next_token_for_path)

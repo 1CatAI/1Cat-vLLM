@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import json
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -25,6 +27,33 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 logger = init_logger(__name__)
 _DEBUG_MAMBA_ALIGN = envs.VLLM_MAMBA_ALIGN_DEBUG
+
+
+def _ddtree_trace_path() -> str | None:
+    return os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL")
+
+
+def _trace_tensor(value: torch.Tensor | None) -> object:
+    if value is None:
+        return None
+    return value.detach().cpu().tolist()
+
+
+def _write_ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
+    trace_path = _ddtree_trace_path()
+    if not trace_path:
+        return
+    record = {
+        "event": event,
+        "pid": os.getpid(),
+        **payload,
+    }
+    try:
+        with open(trace_path, "a", encoding="utf-8") as trace_file:
+            json.dump(record, trace_file, ensure_ascii=True, sort_keys=True)
+            trace_file.write("\n")
+    except OSError:
+        logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
 def _debug_mamba_align(event: str, **kwargs: Any) -> None:
@@ -107,6 +136,7 @@ def postprocess_mamba_fused_kernel(
     accept_token_bias = aligned_new_computed - num_tokens_running_state
     dest_block_idx = aligned_new_computed // block_size - 1
     state_slot_bias = accept_token_bias
+    use_ddtree_state_slot = accept_token_bias < 0
     if HAS_DDTREE_ACCEPTED_NODES:
         if accept_token_bias == 0:
             state_slot_bias = 0
@@ -115,9 +145,11 @@ def postprocess_mamba_fused_kernel(
                 ddtree_accepted_node_indices_ptr
                 + req_idx * ddtree_accepted_node_indices_stride
                 + accept_token_bias
-                - 1
             )
-            state_slot_bias = tl.where(accepted_node_idx >= 1, accepted_node_idx, 0)
+            use_ddtree_state_slot = accepted_node_idx >= 1
+            state_slot_bias = tl.where(
+                use_ddtree_state_slot, accepted_node_idx, accept_token_bias
+            )
 
     # Load state metadata for this layer/state_type
     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
@@ -150,13 +182,28 @@ def postprocess_mamba_fused_kernel(
 
     if is_conv_state:
         if HAS_DDTREE_ACCEPTED_NODES:
-            actual_src_block_idx = src_block_idx + state_slot_bias
-            actual_src_block_id = tl.load(block_table_base + actual_src_block_idx).to(
-                tl.int64
-            )
-            src_addr = state_base_addr + actual_src_block_id * state_block_stride
-            dst_addr = state_base_addr + dest_block_id * state_block_stride
-            copy_size = conv_width.to(tl.int64) * state_inner_size * state_elem_size
+            if use_ddtree_state_slot:
+                actual_src_block_idx = src_block_idx + state_slot_bias
+                actual_src_block_id = tl.load(
+                    block_table_base + actual_src_block_idx
+                ).to(tl.int64)
+                src_addr = state_base_addr + actual_src_block_id * state_block_stride
+                dst_addr = state_base_addr + dest_block_id * state_block_stride
+                copy_size = (
+                    conv_width.to(tl.int64) * state_inner_size * state_elem_size
+                )
+            else:
+                src_offset = (
+                    accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
+                )
+                src_addr = (
+                    state_base_addr + src_block_id * state_block_stride + src_offset
+                )
+                dst_addr = state_base_addr + dest_block_id * state_block_stride
+                num_elems_to_copy = (conv_width - accept_token_bias).to(
+                    tl.int64
+                ) * state_inner_size
+                copy_size = num_elems_to_copy * state_elem_size
         else:
             # Conv state: copy
             #   state[block_table[req_idx, src_block_idx],  accept_token_bias:]
@@ -215,29 +262,36 @@ def postprocess_mamba_fused_kernel(
 @triton.jit
 def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
+    chunk = tl.program_id(1)
 
     src_ptr = tl.load(src_ptrs + pid)
     dst_ptr = tl.load(dst_ptrs + pid)
     size = tl.load(sizes + pid)
 
+    chunk_start = chunk * BLOCK_SIZE
     offsets = tl.arange(0, BLOCK_SIZE)
-    for i in range(0, size, BLOCK_SIZE):
-        mask = (i + offsets) < size
+    mask = (chunk_start + offsets) < size
 
-        curr_src_ptr = (src_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
-        curr_dst_ptr = (dst_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
+    curr_src_ptr = (src_ptr + chunk_start + offsets).to(tl.pointer_type(tl.uint8))
+    curr_dst_ptr = (dst_ptr + chunk_start + offsets).to(tl.pointer_type(tl.uint8))
 
-        data = tl.load(curr_src_ptr, mask=mask)
-        tl.store(curr_dst_ptr, data, mask=mask)
+    data = tl.load(curr_src_ptr, mask=mask)
+    tl.store(curr_dst_ptr, data, mask=mask)
 
 
-def batch_memcpy(src_ptrs, dst_ptrs, sizes):
+def batch_memcpy(src_ptrs, dst_ptrs, sizes, max_size: int | None = None):
     batch = src_ptrs.shape[0]
     assert dst_ptrs.shape[0] == batch
     assert sizes.shape[0] == batch
+    if batch == 0:
+        return
 
-    grid = (batch,)
     BLOCK_SIZE = 1024
+    if max_size is None:
+        max_size = int(sizes.max().item())
+    if max_size <= 0:
+        return
+    grid = (batch, cdiv(max_size, BLOCK_SIZE))
     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
 
 
@@ -270,13 +324,14 @@ class MambaCopyBuffers:
         kv_cache_config: KVCacheConfig,
         copy_funcs: tuple[MambaStateCopyFunc, ...],
         make_buffer: Callable[..., CpuGpuBuffer],
+        copies_per_req: int = 1,
     ) -> "MambaCopyBuffers":
         mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
         entries_per_req = sum(
             len(kv_cache_config.kv_cache_groups[gid].layer_names)
             for gid in mamba_group_ids
         ) * len(copy_funcs)
-        n = max_num_reqs * entries_per_req
+        n = max_num_reqs * entries_per_req * copies_per_req
         return cls(
             src_ptrs=make_buffer(n, dtype=torch.int64),
             dst_ptrs=make_buffer(n, dtype=torch.int64),
@@ -644,8 +699,11 @@ def collect_mamba_copy_meta(
     accept_token_bias: int,
     req_state: CachedRequestState,
     forward_context: dict[str, Any],
+    state_slot_bias: int | None = None,
 ) -> None:
-    if src_block_idx == dest_block_idx and accept_token_bias == 0:
+    if state_slot_bias is None:
+        state_slot_bias = accept_token_bias
+    if src_block_idx == dest_block_idx and state_slot_bias == 0:
         return
 
     src_ptrs_np = copy_bufs.src_ptrs.np
@@ -661,8 +719,13 @@ def collect_mamba_copy_meta(
             attention = forward_context[layer_name]
             kv_caches: list[torch.Tensor] = attention.kv_cache
             for state, state_copy_func in zip(kv_caches, mamba_state_copy_funcs):
+                copy_src_block_idx = src_block_idx
+                copy_num_accepted_tokens = accept_token_bias + 1
+                if state_slot_bias != accept_token_bias:
+                    copy_src_block_idx = src_block_idx + state_slot_bias
+                    copy_num_accepted_tokens = 1
                 copy_spec = state_copy_func(
-                    state, block_ids, src_block_idx, accept_token_bias + 1
+                    state, block_ids, copy_src_block_idx, copy_num_accepted_tokens
                 )
 
                 src_ptrs_np[offset] = copy_spec.start_addr
@@ -677,10 +740,12 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
     n = copy_bufs.offset
     if n == 0:
         return
+    max_size = int(copy_bufs.sizes.np[:n].max(initial=0))
     batch_memcpy(
         copy_bufs.src_ptrs.copy_to_gpu(n),
         copy_bufs.dst_ptrs.copy_to_gpu(n),
         copy_bufs.sizes.copy_to_gpu(n),
+        max_size=max_size,
     )
 
 
@@ -754,6 +819,8 @@ def preprocess_mamba(
         mamba_state_idx[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             accept_token_bias = input_batch.num_accepted_tokens_cpu[i] - 1
+            state_slot_selector = input_batch.spec_num_accepted_tokens_cpu[i]
+            state_slot_bias = state_slot_selector - 1
             _debug_mamba_align(
                 "pre_copy",
                 req_id=req_id,
@@ -765,7 +832,9 @@ def preprocess_mamba(
                 prev_state_idx=prev_state_idx,
                 curr_state_idx=curr_state_idx,
                 num_accepted_tokens_cpu=int(input_batch.num_accepted_tokens_cpu[i]),
+                spec_num_accepted_tokens_cpu=int(state_slot_selector),
                 accept_token_bias=int(accept_token_bias),
+                state_slot_bias=int(state_slot_bias),
             )
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -777,6 +846,7 @@ def preprocess_mamba(
                 accept_token_bias,
                 req_state,
                 forward_context,
+                state_slot_bias,
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
             input_batch.spec_num_accepted_tokens_cpu[i] = 1
@@ -831,6 +901,7 @@ def postprocess_mamba(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
+    ddtree_accepted_node_indices: torch.Tensor | None = None,
 ):
     """0.0.3-compatible CPU reference for align-mode spec postprocess.
 
@@ -859,6 +930,19 @@ def postprocess_mamba(
         )
         if aligned_new_computed_tokens >= num_tokens_running_state:
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
+            state_slot_bias = accept_token_bias
+            if ddtree_accepted_node_indices is not None:
+                if accept_token_bias == 0:
+                    state_slot_bias = 0
+                else:
+                    node_idx = int(
+                        ddtree_accepted_node_indices[i, accept_token_bias]
+                        .detach()
+                        .cpu()
+                        .item()
+                    )
+                    if node_idx >= 1:
+                        state_slot_bias = node_idx
             src_block_idx = mamba_state_idx[req_id]
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
             _debug_mamba_align(
@@ -876,6 +960,7 @@ def postprocess_mamba(
                 new_num_computed_tokens=new_num_computed_tokens,
                 aligned_new_computed_tokens=aligned_new_computed_tokens,
                 accept_token_bias=accept_token_bias,
+                state_slot_bias=state_slot_bias,
                 src_block_idx=src_block_idx,
                 dest_block_idx=dest_block_idx,
                 block_size=mamba_spec.block_size,
@@ -890,6 +975,7 @@ def postprocess_mamba(
                 accept_token_bias,
                 req_state,
                 forward_context,
+                state_slot_bias,
             )
             if src_block_idx == dest_block_idx:
                 num_accepted_tokens_cpu[i] = 1
@@ -981,6 +1067,41 @@ def postprocess_mamba_align_gpu(
         num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
         ddtree_accepted_node_indices=ddtree_accepted_node_indices,
     )
+    if _ddtree_trace_path():
+        _write_ddtree_trace_event(
+            "mamba_postprocess_gpu",
+            {
+                "num_reqs": num_reqs,
+                "block_size": ctx.block_size,
+                "num_accepted_tokens_in": _trace_tensor(
+                    num_accepted_tokens_gpu[:num_reqs]
+                ),
+                "spec_state_slot_selectors_in": _trace_tensor(
+                    spec_state_slot_selectors_gpu[:num_reqs]
+                ),
+                "num_accepted_tokens_out": _trace_tensor(
+                    ctx.num_accepted_tokens_out[:num_reqs]
+                ),
+                "spec_state_slot_selectors_out": _trace_tensor(
+                    ctx.spec_state_slot_selectors_out[:num_reqs]
+                ),
+                "mamba_state_idx": _trace_tensor(
+                    ctx.mamba_state_idx_buf.gpu[:num_reqs]
+                ),
+                "num_scheduled_tokens": _trace_tensor(
+                    ctx.num_scheduled_tokens_buf.gpu[:num_reqs]
+                ),
+                "num_computed_tokens": _trace_tensor(
+                    ctx.num_computed_tokens_buf.gpu[:num_reqs]
+                ),
+                "num_draft_tokens": _trace_tensor(
+                    ctx.num_draft_tokens_buf.gpu[:num_reqs]
+                ),
+                "ddtree_accepted_node_indices": _trace_tensor(
+                    ddtree_accepted_node_indices
+                ),
+            },
+        )
 
     # ``num_accepted_tokens_out`` is pre-initialized from
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1

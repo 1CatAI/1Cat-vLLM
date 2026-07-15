@@ -11,6 +11,30 @@ using namespace cache_policy;
 using S = cache_policy::Stream;
 using D = cache_policy::Default;
 
+namespace {
+
+// Keep shape-specific small-N tactics out of prefill and unrelated CUDA graph shapes.
+template<class Gemm, int ExactM>
+class ExactMKernelImpl final: public KernelImpl<Gemm> {
+public:
+    bool is_feasible(const GemmDesc& desc) const noexcept override
+    {
+        return desc.m == ExactM && KernelImpl<Gemm>::is_feasible(desc);
+    }
+};
+
+template<class Gemm, int ExactM, int ExactN, int ExactK>
+class ExactMnkKernelImpl final: public KernelImpl<Gemm> {
+public:
+    bool is_feasible(const GemmDesc& desc) const noexcept override
+    {
+        return desc.m == ExactM && desc.n == ExactN && desc.k == ExactK
+               && KernelImpl<Gemm>::is_feasible(desc);
+    }
+};
+
+}  // namespace
+
 void Registry::sm70_884_4()
 {
     if constexpr (1) {
@@ -31,6 +55,16 @@ void Registry::sm70_884_4()
         Add<C::Type<  8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 128>>();
         Add<C::Type<  8, 128, 32, 1, 4, 1, D, S, 2, true, 1, 128>>();
         Add<C::Type<  8, 256, 64, 1, 4, 1, D, S, 2, true, 1, 128>>();
+        Add<C::Type<  8, 256, 64, 1, 4, 2, D, S, 2, true, 1, 128>>();
+
+        using CS = Config_U4_d_A8x64Swizzle<kColMajor>;
+        using C32 = CS::Type< 8, 32, 64, 1, 1, 1, D, S, 2, true, 1, 128>;
+        using C64 = CS::Type< 8, 64, 64, 1, 2, 1, D, S, 2, true, 1, 128, -1, -1, 2>;
+        Add(std::make_unique<ExactMKernelImpl<typename C32::Kernel, 5>>());
+        Add(std::make_unique<ExactMKernelImpl<typename C64::Kernel, 5>>());
+        Add(std::make_unique<ExactMnkKernelImpl<typename C64::Kernel, 1, 8704, 5120>>());
+        Add(std::make_unique<ExactMnkKernelImpl<typename C64::Kernel, 1, 4096, 5120>>());
+
         // clang-format on
     }
 

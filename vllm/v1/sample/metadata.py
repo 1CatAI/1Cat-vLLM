@@ -50,6 +50,11 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
+    # CPU-side top-k snapshot for small specialized samplers that need the
+    # scalar k value without introducing a GPU synchronization.
+    top_k_cpu: tuple[int, ...] | None = None
+    temperature_cpu: tuple[float, ...] | None = None
+    top_p_cpu: tuple[float, ...] | None = None
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None

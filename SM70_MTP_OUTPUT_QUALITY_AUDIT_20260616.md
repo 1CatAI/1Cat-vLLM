@@ -1,5 +1,26 @@
 # SM70 MTP Output Quality Audit - 2026-06-16
 
+## Superseded Note - 2026-07-01
+
+The June rows that treated `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1` as a possible
+quality fix are superseded by the July 1 fixed-quality gate. Under official
+sampling (`temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`), the
+input-core route fails long output, while the accepted 27B-AWQ native MTP4
+route is:
+
+```text
+VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1
+VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=0
+VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0
+VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1
+VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0
+```
+
+Primary artifact:
+`bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_seed20260620/summary.md`.
+See `docs/design/sm70_v100_migration_control.md` for the full route table and
+the rejected input-core/output-op evidence.
+
 ## Scope
 
 This log records the latest-vLLM Qwen3.6 27B AWQ MTP output-collapse

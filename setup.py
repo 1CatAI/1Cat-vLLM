@@ -1219,6 +1219,7 @@ package_data = {
     ],
     "vllm": [
         "py.typed",
+        "assets/*.pt",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
@@ -1229,7 +1230,7 @@ package_data = {
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",
         "third_party/deep_gemm/include/**/*.hpp",
-    ]
+    ],
 }
 
 

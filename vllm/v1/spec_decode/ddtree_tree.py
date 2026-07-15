@@ -13,6 +13,10 @@ import heapq
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import count
+from typing import Literal
+
+
+DDTreeBuildMode = Literal["best_first", "root_leaf", "spine_leaf"]
 
 
 @dataclass(frozen=True)
@@ -99,7 +103,11 @@ class DDTree:
 
 @dataclass(frozen=True)
 class GreedyDDTreeWalk:
+    # Compact tree node indices accepted by the verifier walk. Matches the
+    # official DDTree helper: includes root index 0, excludes the bonus token.
     accepted_node_indices: tuple[int, ...]
+    # Accepted non-root draft token ids. The root/current token is not included
+    # because DDTree instances built in tests may use a synthetic root id.
     accepted_token_ids: tuple[int, ...]
     bonus_token_id: int
     visited_node_indices: tuple[int, ...]
@@ -116,7 +124,7 @@ def greedy_tree_walk(
     """Walk a draft tree with a target-model next-token oracle."""
 
     cursor = 0
-    accepted_nodes: list[int] = []
+    accepted_nodes: list[int] = [0]
     accepted_tokens: list[int] = []
     visited_nodes: list[int] = [0]
 
@@ -171,8 +179,9 @@ def build_ddtree(
     candidates_by_depth: Iterable[Iterable[DraftCandidate | tuple[int, float]]],
     *,
     budget: int,
-    top_k: int = 8,
-    chain_seed: bool = True,
+    top_k: int | None = None,
+    chain_seed: bool = False,
+    tree_mode: DDTreeBuildMode = "best_first",
     min_root_branches: int = 0,
     root_token_id: int = -1,
 ) -> DDTree:
@@ -185,7 +194,8 @@ def build_ddtree(
     if budget < 1:
         raise ValueError("budget must be >= 1")
 
-    candidates = _normalize_candidates(candidates_by_depth, top_k)
+    requested_top_k = budget if top_k is None else top_k
+    candidates = _normalize_candidates(candidates_by_depth, requested_top_k)
     nodes: list[DDTreeNode] = [
         DDTreeNode(
             index=0,
@@ -216,6 +226,40 @@ def build_ddtree(
         nodes.append(node)
         return node
 
+    if tree_mode not in ("best_first", "root_leaf", "spine_leaf"):
+        raise ValueError(f"unsupported DDTree build mode: {tree_mode}")
+
+    if tree_mode in ("root_leaf", "spine_leaf"):
+        spine_indices = [0]
+        cursor = 0
+        while len(nodes) - 1 < budget and nodes[cursor].depth < len(candidates):
+            cursor = add_child(cursor, candidates[nodes[cursor].depth][0]).index
+            spine_indices.append(cursor)
+
+        order = count()
+        heap: list[tuple[float, int, int, DraftCandidate]] = []
+        for depth_idx, depth_candidates in enumerate(candidates):
+            if depth_idx >= len(spine_indices):
+                break
+            parent_index = spine_indices[depth_idx]
+            parent = nodes[parent_index]
+            for candidate in depth_candidates[1:]:
+                edge = (parent_index, parent.depth + 1, candidate.token_id)
+                if edge in child_edges:
+                    continue
+                score = parent.score + candidate.logprob
+                heapq.heappush(heap, (-score, next(order), parent_index, candidate))
+
+        while len(nodes) - 1 < budget and heap:
+            _, _, parent_index, candidate = heapq.heappop(heap)
+            parent = nodes[parent_index]
+            edge = (parent_index, parent.depth + 1, candidate.token_id)
+            if edge in child_edges:
+                continue
+            add_child(parent_index, candidate)
+
+        return DDTree(nodes=tuple(nodes))
+
     if chain_seed:
         cursor = 0
         while len(nodes) - 1 < budget and nodes[cursor].depth < len(candidates):
@@ -227,31 +271,76 @@ def build_ddtree(
                 break
             add_child(0, candidate)
 
-    order = count()
-    heap: list[tuple[float, int, int, DraftCandidate]] = []
+    if chain_seed or min_root_branches > 0:
+        order = count()
+        seeded_heap: list[tuple[float, int, int, DraftCandidate]] = []
 
-    def push_children(parent_index: int) -> None:
-        parent = nodes[parent_index]
-        if parent.depth >= len(candidates):
-            return
-        depth = parent.depth + 1
-        for candidate in candidates[parent.depth]:
-            edge = (parent_index, depth, candidate.token_id)
+        def push_children(parent_index: int) -> None:
+            parent = nodes[parent_index]
+            if parent.depth >= len(candidates):
+                return
+            depth = parent.depth + 1
+            for candidate in candidates[parent.depth]:
+                edge = (parent_index, depth, candidate.token_id)
+                if edge in child_edges:
+                    continue
+                score = parent.score + candidate.logprob
+                heapq.heappush(
+                    seeded_heap, (-score, next(order), parent_index, candidate))
+
+        for node in tuple(nodes):
+            push_children(node.index)
+
+        while len(nodes) - 1 < budget and seeded_heap:
+            _, _, parent_index, candidate = heapq.heappop(seeded_heap)
+            parent = nodes[parent_index]
+            edge = (parent_index, parent.depth + 1, candidate.token_id)
             if edge in child_edges:
                 continue
-            score = parent.score + candidate.logprob
-            heapq.heappush(heap, (-score, next(order), parent_index, candidate))
+            node = add_child(parent_index, candidate)
+            push_children(node.index)
 
-    for node in tuple(nodes):
-        push_children(node.index)
+        return DDTree(nodes=tuple(nodes))
+
+    order = count()
+    heap: list[tuple[float, int, int, int, int, float]] = []
+    first_candidate = candidates[0][0]
+    heapq.heappush(
+        heap,
+        (-first_candidate.logprob, next(order), 0, 0, 0,
+         first_candidate.logprob),
+    )
 
     while len(nodes) - 1 < budget and heap:
-        _, _, parent_index, candidate = heapq.heappop(heap)
+        _, _, parent_index, depth_index, rank, _ = heapq.heappop(heap)
+        if rank >= len(candidates[depth_index]):
+            continue
+        candidate = candidates[depth_index][rank]
         parent = nodes[parent_index]
         edge = (parent_index, parent.depth + 1, candidate.token_id)
         if edge in child_edges:
             continue
+
         node = add_child(parent_index, candidate)
-        push_children(node.index)
+
+        next_rank = rank + 1
+        if next_rank < len(candidates[depth_index]):
+            sibling = candidates[depth_index][next_rank]
+            sibling_score = parent.score + sibling.logprob
+            heapq.heappush(
+                heap,
+                (-sibling_score, next(order), parent_index, depth_index,
+                 next_rank, sibling_score),
+            )
+
+        next_depth_index = depth_index + 1
+        if next_depth_index < len(candidates):
+            child = candidates[next_depth_index][0]
+            child_score = node.score + child.logprob
+            heapq.heappush(
+                heap,
+                (-child_score, next(order), node.index, next_depth_index, 0,
+                 child_score),
+            )
 
     return DDTree(nodes=tuple(nodes))

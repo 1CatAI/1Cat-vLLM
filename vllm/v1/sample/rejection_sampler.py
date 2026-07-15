@@ -19,7 +19,7 @@ from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
@@ -31,12 +31,76 @@ logger = init_logger(__name__)
 
 _SPEC_ALIGNMENT_DUMP_COUNT = 0
 _SPEC_ALIGNMENT_STEP_COUNTER = 0
+_REJECTION_PROFILE_INTERVAL_SUMS: dict[str, float] = {}
+_REJECTION_PROFILE_INTERVAL_CALLS = 0
 
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _rejection_profile_enabled() -> bool:
+    return os.getenv("VLLM_SM70_REJECTION_PROFILE", "0") == "1"
+
+
+def _rejection_profile_interval() -> int:
+    try:
+        return max(1, int(os.getenv("VLLM_SM70_REJECTION_PROFILE_INTERVAL", "20")))
+    except ValueError:
+        return 20
+
+
+def _rejection_profile_start(
+    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+) -> torch.cuda.Event | None:
+    if events is None or not torch.cuda.is_available():
+        return None
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
+
+def _rejection_profile_finish(
+    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+    name: str,
+    start: torch.cuda.Event | None,
+) -> None:
+    if events is None or start is None:
+        return
+    end = torch.cuda.Event(enable_timing=True)
+    end.record()
+    events.append((name, start, end))
+
+
+def _rejection_profile_report(
+    events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+) -> None:
+    if not events:
+        return
+    global _REJECTION_PROFILE_INTERVAL_CALLS
+    for name, start, end in events:
+        end.synchronize()
+        _REJECTION_PROFILE_INTERVAL_SUMS[name] = _REJECTION_PROFILE_INTERVAL_SUMS.get(
+            name, 0.0
+        ) + start.elapsed_time(end)
+    _REJECTION_PROFILE_INTERVAL_CALLS += 1
+    interval = _rejection_profile_interval()
+    if _REJECTION_PROFILE_INTERVAL_CALLS < interval:
+        return
+
+    parts = [
+        f"{name}={total / _REJECTION_PROFILE_INTERVAL_CALLS:.3f}"
+        for name, total in sorted(_REJECTION_PROFILE_INTERVAL_SUMS.items())
+    ]
+    logger.warning(
+        "SM70 rejection sampler profile interval_avg_ms calls=%d %s",
+        _REJECTION_PROFILE_INTERVAL_CALLS,
+        ", ".join(parts),
+    )
+    _REJECTION_PROFILE_INTERVAL_SUMS.clear()
+    _REJECTION_PROFILE_INTERVAL_CALLS = 0
 
 
 def _parse_step_filter(raw_steps: str | None) -> set[int] | None:
@@ -100,6 +164,39 @@ def _token_matching_sampling_enabled(
     return True
 
 
+def _combined_bonus_sampling_enabled(
+    sampling_metadata: SamplingMetadata,
+    needs_output_logprobs: bool,
+) -> bool:
+    """Fast path for the common no-logprobs MTP verifier sampling case."""
+    if os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1") == "0":
+        return False
+    if needs_output_logprobs:
+        return False
+    if not sampling_metadata.all_random:
+        return False
+    if not sampling_metadata.no_penalties:
+        return False
+    if sampling_metadata.allowed_token_ids_mask is not None:
+        return False
+    if sampling_metadata.bad_words_token_ids:
+        return False
+    holder = sampling_metadata.thinking_budget_state_holder
+    if holder is not None and holder.has_tracked_requests():
+        return False
+    if any(
+        not _token_matching_processor_safe(processor)
+        for processor in sampling_metadata.logitsprocs.argmax_invariant
+    ):
+        return False
+    if any(
+        not _token_matching_processor_safe(processor)
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant
+    ):
+        return False
+    return True
+
+
 class RejectionSampler(nn.Module):
     """
     The implementation strictly follows the algorithm described in
@@ -149,6 +246,25 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self._last_target_candidate_ids: torch.Tensor | None = None
+
+    def _capture_dynamic_draft_candidates(
+        self,
+        target_logits: torch.Tensor,
+    ) -> None:
+        if envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE <= 0:
+            return
+        k = min(20, target_logits.shape[-1])
+        topk = torch.topk(target_logits, k=k, dim=-1)
+        self._last_target_candidate_ids = topk.indices.masked_fill(
+            ~torch.isfinite(topk.values),
+            -1,
+        )
+
+    def take_last_target_candidate_ids(self) -> torch.Tensor | None:
+        candidate_ids = self._last_target_candidate_ids
+        self._last_target_candidate_ids = None
+        return candidate_ids
 
     def forward(
         self,
@@ -182,6 +298,7 @@ class RejectionSampler(nn.Module):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        self._last_target_candidate_ids = None
 
         if (
             draft_probs is None
@@ -190,53 +307,100 @@ class RejectionSampler(nn.Module):
         ):
             return self._sample_by_token_matching(metadata, logits, sampling_metadata)
 
+        profile_events = [] if _rejection_profile_enabled() else None
+        profile_total_start = _rejection_profile_start(profile_events)
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
+        assert logits is not None
+        needs_output_logprobs = sampling_metadata.max_num_logprobs is not None or bool(
+            sampling_metadata.logprob_token_ids
+        )
+        if (
+            draft_probs is not None
+            and not self.synthetic_mode
+            and bonus_logits_indices.numel() == len(metadata.num_draft_tokens)
+            and _combined_bonus_sampling_enabled(
+                sampling_metadata, needs_output_logprobs
+            )
+        ):
+            return self._forward_combined_bonus(
+                metadata=metadata,
+                draft_probs=draft_probs,
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+                target_logits_indices=target_logits_indices,
+                bonus_logits_indices=bonus_logits_indices,
+                profile_events=profile_events,
+                profile_total_start=profile_total_start,
+            )
         # When indexing with a tensor (bonus_logits_indices), PyTorch
         # creates a new tensor with separate storage from the original
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
-        assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
-        bonus_sampler_output = self.sampler(
-            logits=bonus_logits,
-            sampling_metadata=replace(
+        bonus_sampling_metadata = (
+            replace(
                 sampling_metadata,
                 max_num_logprobs=-1,
-            ),
-            predict_bonus_token=True,
+            )
+            if needs_output_logprobs
+            else sampling_metadata
+        )
+        bonus_logprobs_mode_override = None
+        if needs_output_logprobs:
             # Override the logprobs mode to return logits because they are
             # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
+            bonus_logprobs_mode_override = (
+                "processed_logits" if self.is_processed_logprobs_mode else "raw_logits"
+            )
+        profile_bonus_start = _rejection_profile_start(profile_events)
+        bonus_sampler_output = self.sampler(
+            logits=bonus_logits,
+            sampling_metadata=bonus_sampling_metadata,
+            predict_bonus_token=True,
+            logprobs_mode_override=bonus_logprobs_mode_override,
         )
+        _rejection_profile_finish(profile_events, "bonus_sample", profile_bonus_start)
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
+        profile_target_prepare_start = _rejection_profile_start(profile_events)
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = raw_target_logits
-        if not self.is_processed_logprobs_mode:
+        if not self.is_processed_logprobs_mode and needs_output_logprobs:
             # Clone raw_target_logits before applying processors to preserve
             # the original raw logits for logprobs computation, since
             # apply_logits_processors modifies the tensor in-place.
             target_logits = target_logits.clone()
+        _rejection_profile_finish(
+            profile_events, "target_prepare", profile_target_prepare_start
+        )
+        profile_processors_start = _rejection_profile_start(profile_events)
         target_logits = self.apply_logits_processors(
             target_logits, sampling_metadata, metadata
+        )
+        _rejection_profile_finish(
+            profile_events, "logits_processors", profile_processors_start
         )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
+        profile_constraints_start = _rejection_profile_start(profile_events)
         target_logits = apply_sampling_constraints(
             target_logits,
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+        self._capture_dynamic_draft_candidates(target_logits)
+        _rejection_profile_finish(
+            profile_events, "sampling_constraints", profile_constraints_start
+        )
+        profile_rejection_start = _rejection_profile_start(profile_events)
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
@@ -248,7 +412,13 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
+            profile_events=profile_events,
         )
+        _rejection_profile_finish(
+            profile_events, "rejection_sample_total", profile_rejection_start
+        )
+        _rejection_profile_finish(profile_events, "forward_total", profile_total_start)
+        _rejection_profile_report(profile_events)
         self._maybe_dump_alignment(
             metadata=metadata,
             draft_probs=draft_probs,
@@ -274,6 +444,78 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+        )
+
+    def _forward_combined_bonus(
+        self,
+        *,
+        metadata: SpecDecodeMetadata,
+        draft_probs: torch.Tensor,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        target_logits_indices: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+        profile_total_start: torch.cuda.Event | None,
+    ) -> SamplerOutput:
+        profile_constraints_start = _rejection_profile_start(profile_events)
+        sampled_logits = logits.to(torch.float32)
+        sampled_logits = apply_sampling_constraints(
+            sampled_logits,
+            metadata.cu_num_sampled_tokens,
+            sampling_metadata,
+        )
+        target_logits = sampled_logits[target_logits_indices]
+        self._capture_dynamic_draft_candidates(target_logits)
+        _rejection_profile_finish(
+            profile_events, "sampling_constraints", profile_constraints_start
+        )
+
+        profile_bonus_start = _rejection_profile_start(profile_events)
+        bonus_logits = sampled_logits[bonus_logits_indices]
+        bonus_probs = bonus_logits.softmax(dim=-1, dtype=torch.float32)
+        bonus_token_ids = (
+            random_sample(
+                bonus_probs,
+                sampling_metadata.generators,
+            )
+            .to(torch.int32)
+            .unsqueeze(-1)
+        )
+        _rejection_profile_finish(profile_events, "bonus_sample", profile_bonus_start)
+
+        profile_rejection_start = _rejection_profile_start(profile_events)
+        output_token_ids = rejection_sample(
+            metadata.draft_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.cu_num_draft_tokens,
+            draft_probs,
+            target_logits,
+            bonus_token_ids,
+            sampling_metadata,
+            synthetic_mode=False,
+            synthetic_conditional_rates=None,
+            profile_events=profile_events,
+        )
+        _rejection_profile_finish(
+            profile_events, "rejection_sample_total", profile_rejection_start
+        )
+        _rejection_profile_finish(profile_events, "forward_total", profile_total_start)
+        _rejection_profile_report(profile_events)
+        self._maybe_dump_alignment(
+            metadata=metadata,
+            draft_probs=draft_probs,
+            target_logits=target_logits,
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            bonus_token_ids=bonus_token_ids,
+            output_token_ids=output_token_ids,
+            sampling_metadata=sampling_metadata,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
         )
 
     def _sample_by_token_matching(
@@ -352,7 +594,12 @@ class RejectionSampler(nn.Module):
             return
 
         with torch.no_grad():
-            k = min(10, target_logits.shape[-1])
+            requested_top_ks = [
+                int(value)
+                for value in (sampling_metadata.top_k_cpu or [])
+                if 0 < int(value) <= target_logits.shape[-1]
+            ]
+            k = min(max(requested_top_ks, default=20), 64, target_logits.shape[-1])
             target_topk = torch.topk(target_logits, k=k, dim=-1)
             target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
             draft_token_ids_i64 = metadata.draft_token_ids.to(torch.int64)
@@ -367,9 +614,7 @@ class RejectionSampler(nn.Module):
             draft_target_probs = target_probs.gather(
                 1, draft_token_ids_i64.view(-1, 1)
             ).squeeze(1)
-            target_topk_matches = target_topk.indices == draft_token_ids_i64.view(
-                -1, 1
-            )
+            target_topk_matches = target_topk.indices == draft_token_ids_i64.view(-1, 1)
             target_topk_rank = torch.where(
                 target_topk_matches.any(dim=-1),
                 target_topk_matches.to(torch.int32).argmax(dim=-1) + 1,
@@ -404,6 +649,7 @@ class RejectionSampler(nn.Module):
                 "bonus_token_ids": bonus_token_ids.detach().cpu(),
                 "all_greedy": sampling_metadata.all_greedy,
                 "all_random": sampling_metadata.all_random,
+                "diagnostic_topk_k": k,
                 "sampling_output_token_ids_tail": [
                     list(ids[-32:]) for ids in sampling_metadata.output_token_ids
                 ],
@@ -432,15 +678,21 @@ class RejectionSampler(nn.Module):
                 payload["draft_topk_ids"] = draft_topk.indices.detach().cpu()
                 payload["draft_topk_values"] = draft_topk.values.detach().cpu()
             _SPEC_ALIGNMENT_DUMP_COUNT += 1
-            dump_path = (
-                f"/tmp/spec_alignment_pid{os.getpid()}_"
+            dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
+            os.makedirs(dump_dir, exist_ok=True)
+            raw_tag = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG", "")
+            safe_tag = "".join(
+                ch if ch.isalnum() or ch in "._-" else "_" for ch in raw_tag
+            )
+            tag_part = f"{safe_tag}_" if safe_tag else ""
+            dump_path = os.path.join(
+                dump_dir,
+                f"spec_alignment_{tag_part}pid{os.getpid()}_"
                 f"step{_SPEC_ALIGNMENT_STEP_COUNTER:06d}_"
-                f"{_SPEC_ALIGNMENT_DUMP_COUNT}.pt"
+                f"{_SPEC_ALIGNMENT_DUMP_COUNT}.pt",
             )
             torch.save(payload, dump_path)
-            logger.warning(
-                "Dumped speculative alignment diagnostics to %s", dump_path
-            )
+            logger.warning("Dumped speculative alignment diagnostics to %s", dump_path)
 
     def _get_logprobs_tensors(
         self,
@@ -660,6 +912,7 @@ def rejection_sample(
     sampling_metadata: SamplingMetadata,
     synthetic_mode: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
+    profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = None,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -694,15 +947,20 @@ def rejection_sample(
     # [num_tokens]
     uniform_probs: torch.Tensor | None = None
     if synthetic_mode or not sampling_metadata.all_greedy:
+        profile_uniform_start = _rejection_profile_start(profile_events)
         uniform_probs = generate_uniform_probs(
             num_tokens,
             num_draft_tokens,
             sampling_metadata.generators,
             device,
         )
+        _rejection_profile_finish(
+            profile_events, "rs_uniform_probs", profile_uniform_start
+        )
 
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
+        profile_greedy_start = _rejection_profile_start(profile_events)
         target_argmax = target_logits.argmax(dim=-1)
         rejection_greedy_sample_kernel[(batch_size,)](
             output_token_ids,
@@ -716,15 +974,23 @@ def rejection_sample(
             synthetic_conditional_rates,
             SYNTHETIC_MODE=synthetic_mode,
         )
+        _rejection_profile_finish(
+            profile_events, "rs_greedy_branch", profile_greedy_start
+        )
         if sampling_metadata.all_greedy:
             return output_token_ids
 
     # Compute probability distribution from target logits.
+    profile_softmax_start = _rejection_profile_start(profile_events)
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     assert target_probs.is_contiguous()
+    _rejection_profile_finish(
+        profile_events, "rs_target_softmax", profile_softmax_start
+    )
 
     # Sample recovered tokens for each position.
     # [num_tokens]
+    profile_recovered_start = _rejection_profile_start(profile_events)
     recovered_token_ids = sample_recovered_tokens(
         max_spec_len,
         num_draft_tokens,
@@ -735,9 +1001,13 @@ def rejection_sample(
         sampling_metadata,
         device,
     )
+    _rejection_profile_finish(
+        profile_events, "rs_recovered_tokens", profile_recovered_start
+    )
 
     # Rejection sampling for random sampling requests.
     assert uniform_probs is not None
+    profile_random_start = _rejection_profile_start(profile_events)
     rejection_random_sample_kernel[(batch_size,)](
         output_token_ids,
         cu_num_draft_tokens,
@@ -754,6 +1024,7 @@ def rejection_sample(
         NO_DRAFT_PROBS=draft_probs is None,
         SYNTHETIC_MODE=synthetic_mode,
     )
+    _rejection_profile_finish(profile_events, "rs_random_kernel", profile_random_start)
     return output_token_ids
 
 

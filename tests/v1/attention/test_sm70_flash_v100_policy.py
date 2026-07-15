@@ -399,6 +399,95 @@ def test_flash_v100_smallq_cudagraph_metadata_uses_persistent_buffers(
     )
 
 
+def test_flash_v100_smallq_capture_can_bound_workspace_to_context_bucket(
+    monkeypatch,
+    local_flash_v100_model,
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=2048,
+        max_num_seqs=1,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1024], query_lens=[5]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.max_seq_len = 1024
+    common.block_table_tensor = torch.zeros(
+        (1, 2048), dtype=torch.int32, device=torch.device("cpu")
+    )
+
+    capture_metadata = builder.build_for_cudagraph_capture(common)
+
+    # Capture normalizes the active small-query rows to q=5; the graph key's
+    # bounded common max_seq_len controls the static workspace independently.
+    assert capture_metadata.smallq_decode_max_seq_len_hint == 5
+    assert capture_metadata.smallq_decode_workspace_seq_capacity_hint == 1024
+
+
+def test_flash_v100_smallq_context_bucket_can_preserve_partition_size(
+    monkeypatch,
+    local_flash_v100_model,
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+    monkeypatch.setenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE", "1024")
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=2048,
+        max_num_seqs=1,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1024], query_lens=[5]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common.max_seq_len = 1024
+    common.block_table_tensor = torch.zeros(
+        (1, 2048), dtype=torch.int32, device=torch.device("cpu")
+    )
+
+    capture_metadata = builder.build_for_cudagraph_capture(common)
+
+    assert capture_metadata.smallq_decode_workspace_seq_capacity_hint == 1024
+    assert capture_metadata.smallq_decode_partition_size_hint == 1024
+
+
 def test_flash_v100_smallq_metadata_masks_cudagraph_padding(
     monkeypatch,
     local_flash_v100_model,
@@ -715,6 +804,106 @@ def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch)
     assert result is output
     assert calls == ["xqa"]
     assert torch.all(output == 1)
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "seq_len", "expected_route"),
+    (
+        (6, 4096, "scalar"),
+        (6, 8192, "xqa"),
+        (4, 65536, "scalar"),
+        (8, 65536, "xqa"),
+    ),
+)
+def test_flash_v100_fp8_e5m2_decode_xqa_long_context_gate(
+    monkeypatch, num_heads, seq_len, expected_route
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", raising=False)
+    impl = FlashAttnV100Impl(
+        num_heads=num_heads,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+
+    calls: list[str] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append("xqa")
+        kwargs["out"].fill_(1)
+
+    def hit_scalar(*args, **kwargs):
+        calls.append("scalar")
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=seq_len,
+        flash_v100_decode_workspace_seq_capacity_hint=262144,
+        flash_v100_decode_active_num_partitions=torch.tensor([1], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((1, num_heads, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 4, 16, 1, 256), dtype=torch.uint8)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == [expected_route]
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_fp8_prefill_bridge_accepts_mtp_aligned_tail():
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.use_fp8_prefill_bridge = True
+    impl.use_flash_v100_prefill_paged = True
+    impl.kv_cache_dtype = "fp8_e5m2"
+    key_cache = torch.empty((1, 1616, 2, 256), dtype=torch.uint8)
+    value_cache = torch.empty_like(key_cache)
+
+    assert impl._should_use_fp8_prefill_bridge(
+        q_len=1616,
+        head_dim=256,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        causal=True,
+        window_size=(-1, -1),
+    )
+
+
+def test_flash_v100_fp8_xqa_graph_capture_marker_forces_xqa(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setattr(mod, "_is_cuda_graph_capturing", lambda query: False)
+    metadata = SimpleNamespace(
+        flash_v100_cudagraph_capture=True,
+        flash_v100_decode_max_seq_len_hint=1,
+        flash_v100_static_decode_seq_hint=262144,
+        flash_v100_decode_workspace_seq_capacity_hint=262144,
+    )
+
+    assert mod._decode_fp8_xqa_allowed(metadata, torch.empty(1))
 
 
 def test_flash_v100_decode_uses_xqa_for_qwen35_tp4_long_context(monkeypatch):

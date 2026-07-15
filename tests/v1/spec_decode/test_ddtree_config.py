@@ -41,3 +41,9 @@ def test_non_ddtree_state_tokens_use_num_speculative_tokens() -> None:
     config = _config(method="dflash", ddtree_budget=24)
 
     assert config.num_speculative_state_tokens() == 16
+
+
+def test_dflash_ddtree_defaults_match_reference_best_first() -> None:
+    assert SpeculativeConfig.ddtree_top_k is None
+    assert SpeculativeConfig.ddtree_chain_seed is False
+    assert SpeculativeConfig.ddtree_disable_tree_verify is False

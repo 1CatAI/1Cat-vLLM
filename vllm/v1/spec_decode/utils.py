@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
+
 import torch
 
 from vllm.platforms import current_platform
@@ -9,6 +11,78 @@ from vllm.v1.attention.backends.utils import (
 )
 
 PADDING_SLOT_ID = -1
+
+
+def dflash_query_positions_from_depths(
+    root_positions: torch.Tensor,
+    query_depths: torch.Tensor,
+) -> torch.Tensor:
+    """Return positions from root positions and per-query depths.
+
+    This helper is kept for verifier-style DDTree position checks. It is not
+    used by DFlashProposer first-pass draft logits: official DDTree builds
+    payloads from flat-position DFlash logits, then applies ``node_depths`` only
+    in the target verifier tree pass.
+    """
+
+    if root_positions.ndim != 1:
+        raise ValueError("root_positions must be 1D")
+    if query_depths.ndim != 2:
+        raise ValueError("query_depths must be 2D")
+    if query_depths.shape[0] != root_positions.shape[0]:
+        raise ValueError("query_depths batch dimension must match root_positions")
+    return root_positions[:, None] + query_depths
+
+
+def build_dflash_ddtree_query_depths(
+    payloads: Sequence[object | None] | None,
+    *,
+    batch_size: int,
+    num_query_per_req: int,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.int64,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Build flattened ``[0] + node_depths`` rows for DDTree checks.
+
+    Rows without a compatible DDTree payload keep flat DFlash depths
+    ``[0, 1, ...]``. Returns ``None`` when no compatible DDTree payload is
+    present. This is deliberately not wired into DFlash first-pass expansion.
+    """
+
+    if not payloads:
+        return None
+
+    total = batch_size * num_query_per_req
+    if out is None:
+        query_depths = torch.empty(total, dtype=dtype, device=device)
+    else:
+        if out.numel() < total:
+            raise ValueError(
+                f"DDTree query depth buffer too small: {out.numel()} < {total}"
+            )
+        query_depths = out[:total]
+        if query_depths.dtype != dtype:
+            raise ValueError("DDTree query depth buffer dtype mismatch")
+    query_depths = query_depths.view(batch_size, num_query_per_req)
+
+    flat_depths = torch.arange(num_query_per_req, dtype=dtype, device=device)
+    query_depths.copy_(flat_depths.expand(batch_size, num_query_per_req))
+
+    found_payload = False
+    max_rows = min(batch_size, len(payloads))
+    for row in range(max_rows):
+        payload = payloads[row]
+        if payload is None:
+            continue
+        node_depths = tuple(int(depth) for depth in getattr(payload, "node_depths", ()))
+        if len(node_depths) != num_query_per_req - 1:
+            continue
+        depths = torch.tensor((0, *node_depths), dtype=dtype, device=device)
+        query_depths[row].copy_(depths)
+        found_payload = True
+
+    return query_depths.reshape(-1) if found_payload else None
 
 
 def next_power_of_2(n: int) -> int:
@@ -460,7 +534,7 @@ def copy_and_expand_eagle_inputs_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "total_input_tokens"])
 def copy_and_expand_dflash_inputs_kernel(
     # Inputs
     next_token_ids_ptr,  # [num_reqs]
@@ -493,8 +567,9 @@ def copy_and_expand_dflash_inputs_kernel(
     Per request, this kernel:
       1. Copies context positions from target_positions to
          out_context_positions.
-      2. Computes query positions (last_target_pos + 1 + offset) and writes
-         them to out_query_positions.
+      2. Computes flat DFlash query positions
+         (last_target_pos + 1 + offset) and writes them to
+         out_query_positions.
       3. Writes input_ids for query tokens: [next_token, mask, mask, ...].
       4. Computes slot_mapping for context and query positions into separate
          buffers via block_table lookup.
@@ -520,7 +595,9 @@ def copy_and_expand_dflash_inputs_kernel(
     ctx_pos_idx = tl.minimum(ctx_start + j, total_input_tokens - 1)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
 
-    # Query: last_valid_pos + 1 + query_off
+    # Query: last_valid_pos + 1 + query_off.
+    # Official DDTree builds payloads from flat-position DFlash draft logits;
+    # node_depths are applied later by the target verifier tree pass.
     # In padded mode, ctx_end includes rejected tokens; use valid_ctx_end
     # to find the last accepted context position.
     if HAS_NUM_REJECTED:
@@ -530,13 +607,13 @@ def copy_and_expand_dflash_inputs_kernel(
         valid_ctx_end = ctx_end
     last_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
     query_pos = last_pos + 1 + query_off
+    query_out = req_idx * num_query_per_req + query_off
 
     positions = tl.where(is_ctx, ctx_pos, query_pos)
 
     # Context and query positions go to separate buffers.
     ctx_pos_out = ctx_start + j
     tl.store(out_context_positions_ptr + ctx_pos_out, ctx_pos, mask=is_ctx)
-    query_out = req_idx * num_query_per_req + query_off
     tl.store(out_query_positions_ptr + query_out, query_pos, mask=is_query)
 
     # --- Slot mapping (block_table lookup for all positions) ---

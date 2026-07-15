@@ -449,27 +449,82 @@ class EngineCore:
         was executed.
         """
 
+        profile_ddtree_engine = (
+            os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
+        )
+        profile_step = 0
+        profile_t0 = 0.0
+        profile_schedule_ms = 0.0
+        profile_execute_submit_ms = 0.0
+        profile_grammar_ms = 0.0
+        profile_wait_ms = 0.0
+        profile_sample_ms = 0.0
+        profile_update_ms = 0.0
+        if profile_ddtree_engine:
+            profile_step = getattr(
+                self, "_dflash_ddtree_engine_profile_step", 0
+            ) + 1
+            self._dflash_ddtree_engine_profile_step = profile_step
+            profile_t0 = time.perf_counter()
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
         scheduler_output = self.scheduler.schedule()
+        if profile_ddtree_engine:
+            profile_schedule_ms = (time.perf_counter() - profile_part_t0) * 1000.0
+            profile_part_t0 = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        if profile_ddtree_engine:
+            profile_execute_submit_ms = (
+                time.perf_counter() - profile_part_t0
+            ) * 1000.0
+            profile_part_t0 = time.perf_counter()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        if profile_ddtree_engine:
+            profile_grammar_ms = (time.perf_counter() - profile_part_t0) * 1000.0
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
             model_output = future.result()
+            if profile_ddtree_engine:
+                profile_wait_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             if model_output is None:
+                profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                if profile_ddtree_engine:
+                    profile_sample_ms = (
+                        time.perf_counter() - profile_part_t0
+                    ) * 1000.0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if profile_ddtree_engine:
+            profile_update_ms = (time.perf_counter() - profile_part_t0) * 1000.0
+            logger.info(
+                "DFLASH_DDTREE_ENGINE_PROFILE step=%d scheduled_tokens=%d "
+                "total_ms=%.3f schedule_ms=%.3f execute_submit_ms=%.3f "
+                "grammar_ms=%.3f model_wait_ms=%.3f sample_ms=%.3f "
+                "scheduler_update_ms=%.3f",
+                profile_step,
+                scheduler_output.total_num_scheduled_tokens,
+                (time.perf_counter() - profile_t0) * 1000.0,
+                profile_schedule_ms,
+                profile_execute_submit_ms,
+                profile_grammar_ms,
+                profile_wait_ms,
+                profile_sample_ms,
+                profile_update_ms,
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -478,10 +533,37 @@ class EngineCore:
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
         if not self.async_scheduling and self.use_spec_decode and model_executed:
+            profile_ddtree_engine = (
+                os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE", "0") == "1"
+            )
+            profile_step = getattr(self, "_dflash_ddtree_engine_profile_step", 0)
+            profile_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
             # Take the draft token ids.
+            profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
             draft_token_ids = self.model_executor.take_draft_token_ids()
+            profile_take_draft_ms = (
+                (time.perf_counter() - profile_part_t0) * 1000.0
+                if profile_ddtree_engine
+                else 0.0
+            )
+            profile_update_draft_ms = 0.0
             if draft_token_ids is not None:
+                profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+                if profile_ddtree_engine:
+                    profile_update_draft_ms = (
+                        time.perf_counter() - profile_part_t0
+                    ) * 1000.0
+            if profile_ddtree_engine:
+                logger.info(
+                    "DFLASH_DDTREE_ENGINE_PROFILE post_step=%d total_ms=%.3f "
+                    "take_draft_ms=%.3f update_draft_ms=%.3f has_draft=%s",
+                    profile_step,
+                    (time.perf_counter() - profile_t0) * 1000.0,
+                    profile_take_draft_ms,
+                    profile_update_draft_ms,
+                    draft_token_ids is not None,
+                )
 
     def step_with_batch_queue(
         self,

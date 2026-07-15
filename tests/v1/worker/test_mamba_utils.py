@@ -15,6 +15,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+from vllm.v1.worker import mamba_utils as worker_mamba_utils
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
@@ -149,6 +150,109 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
         )
 
     assert mamba_state_idx == {"keep": 99}
+
+
+def test_preprocess_mamba_preserves_ddtree_selector_without_rollover():
+    spec = MagicMock(block_size=4, num_speculative_blocks=0)
+    cache_config = MagicMock(enable_prefix_caching=True)
+    input_batch = MagicMock(req_ids=["req"])
+    input_batch.num_accepted_tokens_cpu = np.array([3], dtype=np.int32)
+    input_batch.spec_num_accepted_tokens_cpu = np.array([5], dtype=np.int32)
+    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
+    mamba_state_idx = {"req": 1}
+    req_state = MagicMock(num_computed_tokens=5, block_ids={0: [10, 11, 12]})
+    sched = _make_scheduler_output(set(), None, set())
+    sched.num_scheduled_tokens = {"req": 1}
+
+    with (
+        patch("vllm.v1.worker.mamba_utils.collect_mamba_copy_meta") as collect,
+        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
+    ):
+        preprocess_mamba(
+            sched,
+            MagicMock(),
+            cache_config,
+            mamba_state_idx,
+            input_batch,
+            {"req": req_state},
+            {},
+            (),
+            copy_bufs,
+        )
+
+    collect.assert_not_called()
+    assert input_batch.num_accepted_tokens_cpu.tolist() == [3]
+    assert input_batch.spec_num_accepted_tokens_cpu.tolist() == [5]
+
+
+def test_preprocess_mamba_uses_ddtree_selector_for_rollover_copy():
+    spec = MagicMock(block_size=4, num_speculative_blocks=0)
+    cache_config = MagicMock(enable_prefix_caching=True)
+    input_batch = MagicMock(req_ids=["req"])
+    input_batch.num_accepted_tokens_cpu = np.array([3], dtype=np.int32)
+    input_batch.spec_num_accepted_tokens_cpu = np.array([5], dtype=np.int32)
+    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
+    mamba_state_idx = {"req": 0}
+    req_state = MagicMock(num_computed_tokens=5, block_ids={0: [10, 11, 12]})
+    sched = _make_scheduler_output(set(), None, set())
+    sched.num_scheduled_tokens = {"req": 1}
+
+    with (
+        patch("vllm.v1.worker.mamba_utils.collect_mamba_copy_meta") as collect,
+        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
+    ):
+        preprocess_mamba(
+            sched,
+            MagicMock(),
+            cache_config,
+            mamba_state_idx,
+            input_batch,
+            {"req": req_state},
+            {},
+            (),
+            copy_bufs,
+        )
+
+    collect.assert_called_once()
+    assert collect.call_args.args[4:7] == (0, 1, 2)
+    assert collect.call_args.args[9] == 4
+    assert input_batch.num_accepted_tokens_cpu.tolist() == [1]
+    assert input_batch.spec_num_accepted_tokens_cpu.tolist() == [1]
+
+
+def test_postprocess_mamba_invalid_ddtree_row_keeps_flat_bias():
+    spec = MagicMock(block_size=4)
+    input_batch = MagicMock(req_ids=["req"])
+    input_batch.num_accepted_tokens_cpu = np.array([3], dtype=np.int32)
+    input_batch.spec_num_accepted_tokens_cpu = np.array([1], dtype=np.int32)
+    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
+    mamba_state_idx = {"req": 0}
+    req_state = MagicMock(num_computed_tokens=5, block_ids={0: [10, 11, 12]})
+    sched = _make_scheduler_output(set(), None, set())
+    sched.num_scheduled_tokens = {"req": 3}
+    sched.scheduled_spec_decode_tokens = {"req": [101, 102]}
+
+    with (
+        patch("vllm.v1.worker.mamba_utils.collect_mamba_copy_meta") as collect,
+        patch("vllm.v1.worker.mamba_utils.do_mamba_copy_block"),
+    ):
+        worker_mamba_utils.postprocess_mamba(
+            sched,
+            MagicMock(),
+            input_batch,
+            {"req": req_state},
+            mamba_state_idx,
+            {},
+            (),
+            copy_bufs,
+            ddtree_accepted_node_indices=torch.tensor(
+                [[-1, -1, -1]], dtype=torch.int32
+            ),
+        )
+
+    collect.assert_called_once()
+    assert collect.call_args.args[4:7] == (0, 1, 2)
+    assert collect.call_args.args[9] == 2
 
 
 # -----------------------------------------------------------------------------
@@ -380,6 +484,7 @@ def _run_gpu_postprocess(
     block_table: torch.Tensor,
     req_ids: list[str],
     num_accepted_tokens: list[int],
+    spec_state_slot_selectors: list[int] | None = None,
     mamba_state_idx: list[int],
     num_scheduled_tokens: dict[str, int],
     num_computed_tokens: list[int],
@@ -398,6 +503,11 @@ def _run_gpu_postprocess(
     gpu_ctx.run_fused_postprocess(
         num_reqs=len(req_ids),
         num_accepted_tokens_gpu=t(num_accepted_tokens),
+        spec_state_slot_selectors_gpu=t(
+            spec_state_slot_selectors
+            if spec_state_slot_selectors is not None
+            else num_accepted_tokens
+        ),
         mamba_state_idx_gpu=t(mamba_state_idx),
         num_scheduled_tokens_gpu=t([num_scheduled_tokens[r] for r in req_ids]),
         num_computed_tokens_gpu=t(num_computed_tokens),

@@ -17,6 +17,7 @@ DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
+_xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,10 @@ def _decode_dynamic_partitions_enabled() -> bool:
     return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
 
 
+def _xqa_staged_pv_enabled() -> bool:
+    return os.getenv("VLLM_FLASH_V100_XQA_STAGED_PV", "0") == "1"
+
+
 def _cuda_graph_capture_active() -> bool:
     is_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
     if is_capturing is None:
@@ -134,6 +139,7 @@ def _get_decode_plan(
     batch_size_hint: Optional[int] = None,
     workspace_seq_capacity_hint: Optional[int] = None,
     active_num_partitions: Optional[torch.Tensor] = None,
+    partition_size_hint: Optional[int] = None,
 ) -> _DecodePlan:
     batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
@@ -162,13 +168,20 @@ def _get_decode_plan(
             effective_max_seq_len,
             effective_workspace_seq_capacity,
         )
-    partition_size = _get_decode_partition_size(
-        max_seq_capacity=max_seq_capacity,
-        head_dim=head_dim,
-        num_q_heads=num_heads,
-        num_kv_heads=k_cache.shape[2],
-        max_seq_len_hint=effective_max_seq_len,
-        batch_size_hint=batch_capacity,
+    partition_size = (
+        _validate_decode_partition_size(
+            int(partition_size_hint),
+            "partition_size_hint",
+        )
+        if partition_size_hint is not None
+        else _get_decode_partition_size(
+            max_seq_capacity=max_seq_capacity,
+            head_dim=head_dim,
+            num_q_heads=num_heads,
+            num_kv_heads=k_cache.shape[2],
+            max_seq_len_hint=effective_max_seq_len,
+            batch_size_hint=batch_capacity,
+        )
     )
     runtime_num_partitions = max(
         1,
@@ -254,6 +267,41 @@ def _get_decode_workspace_for_plan(
         workspace.exp_sums[:, :, :workspace.max_num_partitions],
         active_num_partitions,
     )
+
+
+def _get_xqa_staged_rescale_workspace(
+    q: torch.Tensor,
+    *,
+    batch_capacity: int,
+    num_heads: int,
+    plan: _DecodePlan,
+) -> torch.Tensor:
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = _workspace_stream_id(q.device)
+    max_num_partitions = _round_decode_partition_capacity(
+        max(plan.workspace_num_partitions, plan.launch_num_partitions)
+    )
+    key = (
+        device_index,
+        stream_id,
+        batch_capacity,
+        num_heads,
+        plan.partition_size,
+    )
+    workspace = (
+        _xqa_staged_rescale_workspace_cache.get(key)
+        if _can_cache_workspace(q)
+        else None
+    )
+    if workspace is None or workspace.size(2) < max_num_partitions:
+        workspace = torch.empty(
+            (batch_capacity, num_heads, max_num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if _can_cache_workspace(q):
+            _xqa_staged_rescale_workspace_cache[key] = workspace
+    return workspace
 
 
 def _get_turboquant_decode_workspace(
@@ -679,6 +727,7 @@ def flash_attn_decode_paged(
     max_seq_len_hint: Optional[int] = None,
     workspace_seq_capacity_hint: Optional[int] = None,
     active_num_partitions: Optional[torch.Tensor] = None,
+    partition_size_hint: Optional[int] = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -705,6 +754,7 @@ def flash_attn_decode_paged(
         batch_size_hint=batch_capacity,
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
+        partition_size_hint=partition_size_hint,
     )
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
@@ -741,6 +791,10 @@ def flash_attn_decode_paged(
 
 def flash_attn_decode_paged_xqa_available() -> bool:
     return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd")
+
+
+def flash_attn_decode_paged_xqa_staged_available() -> bool:
+    return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
 
 
 def flash_attn_decode_paged_xqa(
@@ -797,6 +851,47 @@ def flash_attn_decode_paged_xqa(
             active_num_partitions=active_num_partitions,
         )
     )
+
+    q_per_kv = q.shape[1] // k_cache.shape[2]
+    use_staged_pv = (
+        _xqa_staged_pv_enabled()
+        and flash_attn_decode_paged_xqa_staged_available()
+        and os.getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM", "1") != "0"
+        and os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0") == "1"
+        and plan.partition_size == 256
+        and q.shape[2] == 256
+        and q_per_kv == 6
+        and k_cache.dtype == torch.float16
+        and v_cache.dtype == torch.float16
+    )
+    if use_staged_pv:
+        online_rescales = _get_xqa_staged_rescale_workspace(
+            q,
+            batch_capacity=batch_capacity,
+            num_heads=num_heads,
+            plan=plan,
+        )
+        return flash_attn_v100_cuda.decode_paged_xqa_staged_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            block_table,
+            seq_lens,
+            tmp_out,
+            max_logits,
+            exp_sums,
+            online_rescales,
+            active_num_partitions,
+            softmax_scale,
+            plan.partition_size,
+            plan.launch_num_partitions,
+            kv_cache_dtype,
+            float(k_scale),
+            float(v_scale),
+            int(window_size_left),
+            int(window_size_right),
+        )
 
     return flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
@@ -992,6 +1087,30 @@ def flash_attn_prefill_paged(
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
+def fp8_e5m2_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand paged E5M2 K/V into preallocated FP16 paged workspaces."""
+    flash_attn_v100_cuda.fp8_e5m2_paged_kv_to_fp16(
+        key_cache,
+        value_cache,
+        maybe_contiguous(block_table),
+        maybe_contiguous(seq_lens),
+        key_out,
+        value_out,
+        float(k_scale),
+        float(v_scale),
+    )
+    return key_out, value_out
+
+
 def flash_attn_prefill_paged_bfla(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1138,6 +1257,41 @@ def flash_attn_prefill_paged_bhmd(
     )
 
 
+def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    softmax_lse: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed causal SM70 D256 BM32 ALL_P pair-scratch entry.
+
+    Q and out use contiguous [B, H, M, D] layout. The native entry rejects
+    unsupported shapes and CUDA graph capture rather than allocating or
+    selecting another implementation. Supplying out and softmax_lse avoids
+    output allocations for this call outside CUDA graph capture.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    out_result, lse_result = (
+        flash_attn_v100_cuda.prefill_paged_d256_bm32_allp_pair_scratch_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            softmax_lse,
+            block_table,
+            seq_lens,
+            float(softmax_scale),
+        )
+    )
+    return out_result, lse_result
+
+
 __all__ = [
     "flash_attn_func",
     "flash_attn_lse",
@@ -1150,6 +1304,7 @@ __all__ = [
     "flash_attn_turboquant_decode_paged",
     "flash_attn_turboquant_decode_paged_available",
     "flash_attn_prefill_paged",
+    "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch",
     "flash_attn_prefill_paged_bfla",
     "flash_attn_prefill_paged_splitkv",
     "flash_attn_prefill_paged_bhmd",

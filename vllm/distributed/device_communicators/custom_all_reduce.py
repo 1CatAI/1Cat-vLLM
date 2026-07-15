@@ -275,6 +275,116 @@ class CustomAllreduce:
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
 
+    def sm70_tp2_all_reduce_gemma_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(
+            inp, residual, weight
+        ):
+            raise RuntimeError("SM70 TP2 fused all-reduce RMSNorm is unavailable")
+        normalized_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual, dtype=torch.float32)
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
+        reg_buffer_size = 0 if registered else self.max_size
+        ops.sm70_tp2_all_reduce_gemma_rms_norm(
+            self._ptr,
+            inp,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            reg_buffer,
+            reg_buffer_size,
+            epsilon,
+        )
+        return normalized_out, residual_out
+
+    def can_sm70_tp2_all_reduce_gemma_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        return (
+            not self.disabled
+            and self.world_size == 2
+            and self.should_custom_ar(inp)
+            and inp.is_cuda
+            and inp.dtype == torch.float16
+            and inp.ndim == 2
+            and 1 <= inp.shape[0] <= 64
+            and inp.shape[1] == 5120
+            and residual.shape == inp.shape
+            and residual.dtype in (torch.float16, torch.float32)
+            and weight.ndim == 1
+            and weight.numel() == 5120
+            and weight.dtype in (torch.float16, torch.float32)
+            and inp.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+            and inp.device == residual.device == weight.device
+        )
+
+    def sm70_tp4_all_reduce_gemma_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Explicit benchmark-only TP4 path; no automatic runtime dispatch."""
+        if not self.can_sm70_tp4_all_reduce_gemma_rms_norm(inp, residual, weight):
+            raise RuntimeError("SM70 TP4 fused all-reduce RMSNorm is unavailable")
+        normalized_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual, dtype=torch.float32)
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
+        reg_buffer_size = 0 if registered else self.max_size
+        ops.sm70_tp4_all_reduce_gemma_rms_norm(
+            self._ptr,
+            inp,
+            residual,
+            weight,
+            normalized_out,
+            residual_out,
+            reg_buffer,
+            reg_buffer_size,
+            epsilon,
+        )
+        return normalized_out, residual_out
+
+    def can_sm70_tp4_all_reduce_gemma_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> bool:
+        return (
+            not self.disabled
+            and self.world_size == 4
+            and self.fully_connected
+            and self.should_custom_ar(inp)
+            and inp.is_cuda
+            and inp.dtype == torch.float16
+            and inp.ndim == 2
+            and 1 <= inp.shape[0] <= 64
+            and inp.shape[1] == 5120
+            and residual.shape == inp.shape
+            and residual.dtype == torch.float32
+            and weight.ndim == 1
+            and weight.numel() == 5120
+            and weight.dtype in (torch.float16, torch.float32)
+            and inp.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+            and inp.device == residual.device == weight.device
+        )
+
     def top1_argmax(
         self,
         input_pair: torch.Tensor,

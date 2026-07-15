@@ -25,6 +25,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &flash_attention_decode_paged_xqa,
         "FlashAttention XQA decode over paged KV cache (Volta)");
     m.def(
+        "decode_paged_xqa_staged_fwd",
+        &flash_attention_decode_paged_xqa_staged,
+        "Staged FlashAttention XQA decode over paged KV cache (Volta)");
+    m.def(
         "decode_paged_wmma_fwd",
         &flash_attention_decode_paged_wmma,
         "FlashAttention single-query decode through paged-prefill WMMA order (Volta)");
@@ -41,6 +45,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &flash_attention_prefill_paged,
         "FlashAttention prefill over paged KV cache (Volta)");
     m.def(
+        "prefill_paged_d256_bm32_allp_pair_scratch_fwd",
+        &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch,
+        "Fixed causal D256 BM32 ALL_P pair-scratch paged prefill (SM70)");
+    m.def(
         "prefill_paged_bfla_fwd",
         &flash_attention_prefill_paged_bfla,
         "BFLA sparse FlashAttention prefill over paged KV cache (Volta)");
@@ -48,4 +56,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "prefill_paged_splitkv_fwd",
         &flash_attention_prefill_paged_splitkv,
         "FlashAttention split-KV prefill over paged KV cache (Volta)");
+    m.def(
+        "fp8_e5m2_paged_kv_to_fp16",
+        &flash_attention_fp8_e5m2_paged_kv_to_fp16,
+        "Expand paged FP8 E5M2 K/V into a preallocated FP16 paged workspace");
 }

@@ -10,7 +10,7 @@ long-context prefill kernel changes.
 Examples:
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
       python benchmarks/kernels/benchmark_flash_v100_prefill_decay.py \
-        --mode chunked --prompt-lens 4096 16384 65536 --chunk-size 16324
+        --mode chunked --prompt-lens 4096 16384 65536 --chunk-size 8096
 
     nsys profile -o /tmp/flash_v100_prefill_decay --trace=cuda,nvtx \
       python benchmarks/kernels/benchmark_flash_v100_prefill_decay.py \
@@ -23,13 +23,12 @@ import argparse
 import json
 import math
 import os
-from pathlib import Path
 import statistics
 import sys
+from pathlib import Path
 from typing import Any
 
 import torch
-
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 FLASH_V100_ROOT = SOURCE_ROOT / "flash-attention-v100"
@@ -50,6 +49,8 @@ except ImportError:  # pragma: no cover - old local builds.
 
 
 PROFILE_SHAPES = {
+    # Qwen3.6-27B TP4 full-attention shape.
+    "qwen36-27b-tp4": {"heads_q": 6, "heads_kv": 1, "head_dim": 256, "layers": 16},
     # Qwen3.6-35B-A3B TP1 local attention shape.
     "qwen35-tp1": {"heads_q": 16, "heads_kv": 2, "head_dim": 256, "layers": 40},
     # Qwen3.6-35B-A3B TP2 local attention shape.
@@ -66,14 +67,43 @@ def _sync() -> None:
     torch.cuda.synchronize()
 
 
-def _paged_block_m(head_dim: int) -> int:
-    if os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0") != "0":
+def _paged_block_m(
+    head_dim: int,
+    *,
+    q_len: int,
+    block_size: int,
+    paged_split_kv: bool,
+) -> int:
+    if paged_split_kv:
         return 16
-    low_smem = os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "0") != "0"
-    bm32 = os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0") != "0"
-    if head_dim == 256 and low_smem and bm32:
+    if head_dim == 16:
+        return 16
+    if head_dim == 32:
         return 32
-    return 16 if head_dim == 256 and low_smem else 32
+    if head_dim == 64:
+        return 64
+    if head_dim == 128:
+        return 32
+    if head_dim != 256:
+        return 32
+
+    # Match launcher_flash_attention_forward_paged's default-enabled D256
+    # low-SMEM route so reported CTA counts describe the dispatched kernel.
+    low_smem = (
+        q_len > 1
+        and block_size >= 16
+        and block_size % 16 == 0
+        and os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1") != "0"
+    )
+    bm32 = os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0") != "0"
+    bm32_phase = (
+        os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1") != "0"
+        and block_size == 784
+        and q_len >= 32
+    )
+    if low_smem and (bm32 or bm32_phase):
+        return 32
+    return 16 if low_smem else 32
 
 
 def _dynamic_reps(work_items: int) -> tuple[int, int]:
@@ -84,6 +114,19 @@ def _dynamic_reps(work_items: int) -> tuple[int, int]:
     if work_items <= 8192 * 131072:
         return 1, 4
     return 1, 2
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
 def _time_cuda(
@@ -124,9 +167,77 @@ def _time_cuda(
         "median_ms": statistics.median(times),
         "mean_ms": statistics.mean(times),
         "min_ms": min(times),
+        "p50_ms": _percentile(times, 0.50),
+        "p90_ms": _percentile(times, 0.90),
+        "p99_ms": _percentile(times, 0.99),
         "max_ms": max(times),
+        "samples_ms": times,
         "warmup": warmup,
         "reps": reps,
+    }
+
+
+def _time_low_smem_layout_ab(
+    fn,
+    *,
+    layout_env: str,
+    warmup_pairs: int,
+    rounds: int,
+) -> dict[str, float | int]:
+    """Alternates baseline/candidate to remove clock and thermal drift."""
+    saved_layout = os.environ.get(layout_env)
+    baseline_times: list[float] = []
+    candidate_times: list[float] = []
+    paired_deltas: list[float] = []
+
+    def run_timed(enabled: bool) -> float:
+        os.environ[layout_env] = "1" if enabled else "0"
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end)
+
+    try:
+        for _ in range(warmup_pairs):
+            os.environ[layout_env] = "0"
+            fn()
+            os.environ[layout_env] = "1"
+            fn()
+        _sync()
+
+        for round_idx in range(rounds):
+            order = (False, True) if round_idx % 2 == 0 else (True, False)
+            pair: dict[bool, float] = {}
+            for enabled in order:
+                pair[enabled] = run_timed(enabled)
+            baseline_times.append(pair[False])
+            candidate_times.append(pair[True])
+            paired_deltas.append(pair[True] - pair[False])
+    finally:
+        if saved_layout is None:
+            os.environ.pop(layout_env, None)
+        else:
+            os.environ[layout_env] = saved_layout
+
+    baseline_median = statistics.median(baseline_times)
+    candidate_median = statistics.median(candidate_times)
+    return {
+        "rounds": rounds,
+        "warmup_pairs": warmup_pairs,
+        "baseline_median_ms": baseline_median,
+        "candidate_median_ms": candidate_median,
+        "candidate_vs_baseline_median_pct": (
+            (candidate_median / baseline_median - 1.0) * 100.0
+        ),
+        "paired_delta_mean_ms": statistics.mean(paired_deltas),
+        "paired_delta_median_ms": statistics.median(paired_deltas),
+        "candidate_faster_pairs": sum(
+            candidate < baseline
+            for baseline, candidate in zip(baseline_times, candidate_times)
+        ),
     }
 
 
@@ -160,10 +271,19 @@ def _add_derived_metrics(
     q_len = int(result["q_len"])
     kv_len = int(result["kv_len"])
     median_ms = float(result["median_ms"])
-    flops = _effective_attention_flops(
-        q_len, kv_len, heads_q, head_dim, causal=causal
-    )
+    flops = _effective_attention_flops(q_len, kv_len, heads_q, head_dim, causal=causal)
     result["effective_tflops"] = flops / (median_ms / 1000.0) / 1e12
+    samples_ms = result.get("samples_ms")
+    if isinstance(samples_ms, list) and samples_ms:
+        launch_tflops = [
+            flops / (sample_ms / 1000.0) / 1e12 for sample_ms in samples_ms
+        ]
+        result["launch_effective_tflops_samples"] = launch_tflops
+        result["launch_effective_tflops_min"] = min(launch_tflops)
+        result["launch_effective_tflops_p50"] = _percentile(launch_tflops, 0.50)
+        result["launch_effective_tflops_p90"] = _percentile(launch_tflops, 0.90)
+        result["launch_effective_tflops_p99"] = _percentile(launch_tflops, 0.99)
+        result["launch_effective_tflops_max"] = max(launch_tflops)
     result["attention_layer_ms"] = median_ms
     result["attention_layers_scaled_s"] = median_ms * layers / 1000.0
 
@@ -176,6 +296,7 @@ def _make_paged_cache(
     head_dim: int,
     dtype: torch.dtype,
     device: torch.device,
+    reverse_block_table: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = math.ceil(kv_len / block_size)
     k_cache = torch.randn(
@@ -184,9 +305,11 @@ def _make_paged_cache(
         dtype=dtype,
     )
     v_cache = torch.randn_like(k_cache)
-    block_table = torch.arange(
-        num_blocks, device=device, dtype=torch.int32
-    ).view(1, num_blocks)
+    block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).view(
+        1, num_blocks
+    )
+    if reverse_block_table:
+        block_table = torch.flip(block_table, dims=(1,)).contiguous()
     seq_lens = torch.tensor([kv_len], device=device, dtype=torch.int32)
     return k_cache, v_cache, block_table, seq_lens
 
@@ -259,6 +382,10 @@ def bench_paged_step(
     paged_split_kv: bool,
     split_kv_tokens: int,
     check_reference: bool,
+    check_low_smem_layout_reference: bool,
+    layout_candidate_env: str | None,
+    layout_ab_rounds: int,
+    reverse_block_table: bool,
 ) -> dict[str, Any]:
     q = torch.randn((1, q_len, heads_q, head_dim), device=device, dtype=dtype)
     k_cache, v_cache, block_table, seq_lens = _make_paged_cache(
@@ -268,6 +395,7 @@ def bench_paged_step(
         head_dim=head_dim,
         dtype=dtype,
         device=device,
+        reverse_block_table=reverse_block_table,
     )
     holder: list[torch.Tensor | None] = [None]
 
@@ -297,6 +425,12 @@ def bench_paged_step(
         )
 
     grid_y = math.ceil(kv_len / split_kv_tokens) if paged_split_kv else 1
+    kernel_block_m = _paged_block_m(
+        head_dim,
+        q_len=q_len,
+        block_size=block_size,
+        paged_split_kv=paged_split_kv,
+    )
     result: dict[str, Any] = {
         "mode": "paged-step-splitkv" if paged_split_kv else "paged-step",
         "q_len": q_len,
@@ -306,11 +440,13 @@ def bench_paged_step(
         "head_dim": head_dim,
         "block_size": block_size,
         "cache_blocks": math.ceil(kv_len / block_size),
-        "grid_x": math.ceil(q_len / _paged_block_m(head_dim)),
+        "kernel_block_m": kernel_block_m,
+        "grid_x": math.ceil(q_len / kernel_block_m),
         "grid_y": grid_y,
         "grid_z": heads_q,
-        "ctas": math.ceil(q_len / _paged_block_m(head_dim)) * grid_y * heads_q,
+        "ctas": math.ceil(q_len / kernel_block_m) * grid_y * heads_q,
         "split_kv_tokens": split_kv_tokens if paged_split_kv else None,
+        "reverse_block_table": reverse_block_table,
     }
     result.update(
         _time_cuda(
@@ -343,6 +479,58 @@ def bench_paged_step(
         diff = (holder[0] - ref).abs()
         result["reference_max_diff"] = float(diff.max().item())
         result["reference_mean_diff"] = float(diff.mean().item())
+    if check_low_smem_layout_reference:
+        if paged_split_kv:
+            raise ValueError(
+                "--check-low-smem-layout-reference does not support split-KV"
+            )
+        if layout_candidate_env is None:
+            raise ValueError(
+                "--check-low-smem-layout-reference requires --layout-candidate-env"
+            )
+        layout_env = layout_candidate_env
+        saved_layout = os.environ.get(layout_env)
+        try:
+            os.environ[layout_env] = "0"
+            baseline = flash_attn_prefill_paged(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                seq_lens,
+                causal=True,
+            )
+            _sync()
+            os.environ[layout_env] = "1"
+            candidate = flash_attn_prefill_paged(
+                q,
+                k_cache,
+                v_cache,
+                block_table,
+                seq_lens,
+                causal=True,
+            )
+            _sync()
+        finally:
+            if saved_layout is None:
+                os.environ.pop(layout_env, None)
+            else:
+                os.environ[layout_env] = saved_layout
+        layout_diff = (candidate - baseline).abs()
+        result["layout_reference_equal"] = bool(torch.equal(candidate, baseline))
+        result["layout_reference_max_diff"] = float(layout_diff.max().item())
+        result["layout_reference_mean_diff"] = float(layout_diff.mean().item())
+    if layout_ab_rounds:
+        if paged_split_kv:
+            raise ValueError("--layout-ab-rounds does not support split-KV")
+        if layout_candidate_env is None:
+            raise ValueError("--layout-ab-rounds requires --layout-candidate-env")
+        result["layout_ab"] = _time_low_smem_layout_ab(
+            run,
+            layout_env=layout_candidate_env,
+            warmup_pairs=max(5, (warmup or 0) // 2),
+            rounds=layout_ab_rounds,
+        )
     return result
 
 
@@ -363,6 +551,10 @@ def bench_chunked_prompt(
     paged_split_kv: bool,
     split_kv_tokens: int,
     check_reference: bool,
+    check_low_smem_layout_reference: bool,
+    layout_candidate_env: str | None,
+    layout_ab_rounds: int,
+    reverse_block_table: bool,
 ) -> dict[str, Any]:
     chunk_results: list[dict[str, Any]] = []
     pos = 0
@@ -401,6 +593,10 @@ def bench_chunked_prompt(
                 paged_split_kv=paged_split_kv,
                 split_kv_tokens=split_kv_tokens,
                 check_reference=check_reference,
+                check_low_smem_layout_reference=check_low_smem_layout_reference,
+                layout_candidate_env=layout_candidate_env,
+                layout_ab_rounds=layout_ab_rounds,
+                reverse_block_table=reverse_block_table,
             )
             chunk["mode"] = (
                 "chunked-prefix-paged-splitkv"
@@ -468,7 +664,8 @@ def _emit(result: dict[str, Any], *, jsonl: bool) -> None:
     if result["mode"] == "chunked-summary":
         print(
             "chunked prompt={prompt_len} chunk={chunk_size} chunks={num_chunks} "
-            "layer={attention_layer_ms:.3f} ms scaled_layers={attention_layers_scaled_s:.3f} s "
+            "layer={attention_layer_ms:.3f} ms "
+            "scaled_layers={attention_layers_scaled_s:.3f} s "
             "tps={attention_layer_tps:.1f} eff={effective_tflops:.2f} TF/s".format(
                 **result
             )
@@ -476,15 +673,19 @@ def _emit(result: dict[str, Any], *, jsonl: bool) -> None:
         for chunk in result["chunks"]:
             print(
                 "  #{chunk_idx:02d} {mode} M={q_len} N={kv_len} "
-                "ctas={ctas} median={median_ms:.3f} ms eff={effective_tflops:.2f} TF/s".format(
-                    **chunk
-                )
+                "ctas={ctas} median={median_ms:.3f} ms eff={effective_tflops:.2f} TF/s "
+                "launch[min/p50/p90/max]={launch_effective_tflops_min:.2f}/"
+                "{launch_effective_tflops_p50:.2f}/{launch_effective_tflops_p90:.2f}/"
+                "{launch_effective_tflops_max:.2f}".format(**chunk)
             )
         return
     print(
         "{mode} M={q_len} N={kv_len} ctas={ctas} "
         "median={median_ms:.3f} ms scaled_layers={attention_layers_scaled_s:.3f} s "
-        "eff={effective_tflops:.2f} TF/s".format(**result)
+        "eff={effective_tflops:.2f} TF/s "
+        "launch[min/p50/p90/max]={launch_effective_tflops_min:.2f}/"
+        "{launch_effective_tflops_p50:.2f}/{launch_effective_tflops_p90:.2f}/"
+        "{launch_effective_tflops_max:.2f}".format(**result)
     )
 
 
@@ -499,7 +700,7 @@ def main() -> None:
     parser.add_argument(
         "--profile",
         choices=sorted(PROFILE_SHAPES),
-        default="qwen35-tp4",
+        default="qwen36-27b-tp4",
         help="Predefined local TP attention shape.",
     )
     parser.add_argument("--heads-q", type=int, default=None)
@@ -527,8 +728,13 @@ def main() -> None:
         default=[(1024, 16384), (4096, 65536)],
         help="Paged prefix cases as MxN.",
     )
-    parser.add_argument("--chunk-size", type=int, default=16324)
+    parser.add_argument("--chunk-size", type=int, default=8096)
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--reverse-block-table",
+        action="store_true",
+        help="Reverse the logical-to-physical paged-cache block mapping.",
+    )
     parser.add_argument("--dtype", type=_dtype_from_string, default=torch.float16)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -544,6 +750,25 @@ def main() -> None:
         "--check-reference",
         action="store_true",
         help="Compare the measured paged output against the legacy paged op.",
+    )
+    parser.add_argument(
+        "--check-low-smem-layout-reference",
+        action="store_true",
+        help=(
+            "Compare the low-SMEM candidate environment layout and baseline "
+            "within one process."
+        ),
+    )
+    parser.add_argument(
+        "--layout-candidate-env",
+        default=None,
+        help="Environment variable set to 0/1 for a low-SMEM layout A/B.",
+    )
+    parser.add_argument(
+        "--layout-ab-rounds",
+        type=int,
+        default=0,
+        help="Alternate low-SMEM baseline/candidate timing for this many pairs.",
     )
     parser.add_argument("--jsonl", action="store_true")
     parser.add_argument("--json-out", type=Path, default=None)
@@ -568,10 +793,18 @@ def main() -> None:
     props = torch.cuda.get_device_properties(device)
     if props.major != 7 or props.minor != 0:
         raise RuntimeError(
-            f"Flash-V100 kernels require sm70, got {props.name} sm{props.major}{props.minor}"
+            f"Flash-V100 kernels require sm70, got {props.name} "
+            f"sm{props.major}{props.minor}"
         )
 
     header = {
+        "python": {
+            "executable": sys.executable,
+            "version": sys.version.split()[0],
+        },
+        "flash_attn_v100_extension": getattr(
+            sys.modules.get("flash_attn_v100_cuda"), "__file__", None
+        ),
         "gpu": props.name,
         "capability": f"{props.major}.{props.minor}",
         "profile": args.profile,
@@ -586,6 +819,9 @@ def main() -> None:
             "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM": os.getenv(
                 "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM"
             ),
+            "prefill_d256_low_smem_effective": (
+                os.getenv("VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", "1") != "0"
+            ),
             "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM": os.getenv(
                 "VLLM_FLASH_V100_DENSE_D256_LOW_SMEM"
             ),
@@ -597,6 +833,60 @@ def main() -> None:
             ),
             "VLLM_FLASH_V100_PREFILL_D256_BM32": os.getenv(
                 "VLLM_FLASH_V100_PREFILL_D256_BM32"
+            ),
+            "prefill_d256_bm32_effective": (
+                os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32", "0") != "0"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE"
+            ),
+            "prefill_d256_bm32_phase_effective": (
+                os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", "1") != "0"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P"
+            ),
+            "prefill_d256_bm32_all_p_effective": (
+                os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P", "1") != "0"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH"
+            ),
+            "prefill_d256_bm32_pair_scratch_effective": (
+                os.getenv("VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH", "1") != "0"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268"
+            ),
+            "prefill_d256_output_stride_268_effective": (
+                os.getenv(
+                    "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268",
+                    "1",
+                )
+                != "0"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK"
+            ),
+            "prefill_d256_sw_pipeline_qk_effective": (
+                os.getenv(
+                    "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK",
+                    "1",
+                )
+                != "0"
+            ),
+            "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV": os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV"
+            ),
+            "prefill_d256_sw_pipeline_pv_effective": (
+                os.getenv(
+                    "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV",
+                    "1",
+                )
+                != "0"
             ),
             "VLLM_FLASH_V100_PREFILL_SCALAR_PV": os.getenv(
                 "VLLM_FLASH_V100_PREFILL_SCALAR_PV"
@@ -611,6 +901,10 @@ def main() -> None:
         "paged_split_kv": args.paged_split_kv,
         "split_kv_tokens": args.split_kv_tokens,
         "check_reference": args.check_reference,
+        "check_low_smem_layout_reference": (args.check_low_smem_layout_reference),
+        "layout_candidate_env": args.layout_candidate_env,
+        "layout_ab_rounds": args.layout_ab_rounds,
+        "reverse_block_table": args.reverse_block_table,
     }
     print(json.dumps({"run": header}, sort_keys=True))
 
@@ -652,6 +946,10 @@ def main() -> None:
                 paged_split_kv=args.paged_split_kv,
                 split_kv_tokens=args.split_kv_tokens,
                 check_reference=args.check_reference,
+                check_low_smem_layout_reference=(args.check_low_smem_layout_reference),
+                layout_candidate_env=args.layout_candidate_env,
+                layout_ab_rounds=args.layout_ab_rounds,
+                reverse_block_table=args.reverse_block_table,
             )
             results.append(result)
             _emit(result, jsonl=args.jsonl)
@@ -675,6 +973,10 @@ def main() -> None:
                 paged_split_kv=args.paged_split_kv,
                 split_kv_tokens=args.split_kv_tokens,
                 check_reference=args.check_reference,
+                check_low_smem_layout_reference=(args.check_low_smem_layout_reference),
+                layout_candidate_env=args.layout_candidate_env,
+                layout_ab_rounds=args.layout_ab_rounds,
+                reverse_block_table=args.reverse_block_table,
             )
             results.append(result)
             _emit(result, jsonl=args.jsonl)

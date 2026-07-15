@@ -101,6 +101,41 @@ DETERMINISM_PROMPT = (
 )
 
 
+def _load_quality_prompts(path: Path | None) -> list[dict[str, str]]:
+    if path is None:
+        return [dict(prompt) for prompt in QUALITY_PROMPTS]
+
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, list):
+        raise TypeError("--quality-prompts-json must contain a JSON list")
+
+    prompts: list[dict[str, str]] = []
+    for index, item in enumerate(loaded):
+        if isinstance(item, str):
+            prompt_id = f"external_{index + 1:02d}"
+            content = item
+        elif isinstance(item, dict):
+            raw_content = item.get("content", item.get("prompt"))
+            if not isinstance(raw_content, str):
+                raise TypeError(
+                    "--quality-prompts-json dict entries require string "
+                    "'content' or 'prompt'"
+                )
+            raw_id = item.get("id", f"external_{index + 1:02d}")
+            prompt_id = str(raw_id)
+            content = raw_content
+        else:
+            raise TypeError(
+                "--quality-prompts-json entries must be strings or objects"
+            )
+        prompts.append({"id": prompt_id, "content": content})
+
+    ids = [prompt["id"] for prompt in prompts]
+    if len(set(ids)) != len(ids):
+        raise ValueError("--quality-prompts-json contains duplicate ids")
+    return prompts
+
+
 def _sha256_ids(token_ids: list[int]) -> str:
     raw = ",".join(str(i) for i in token_ids).encode()
     return hashlib.sha256(raw).hexdigest()
@@ -429,7 +464,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         seed=args.sampling_seed,
         skip_special_tokens=False,
     )
-    quality_prompts = list(QUALITY_PROMPTS)
+    quality_prompts = _load_quality_prompts(args.quality_prompts_json)
     if args.quality_prompt_id:
         selected_quality_prompts = set(args.quality_prompt_id)
         quality_prompts = [
@@ -767,6 +802,11 @@ def _run_matrix(args: argparse.Namespace) -> int:
                 cmd.extend(["--engine-arg", engine_arg])
             for prompt_id in args.quality_prompt_id or []:
                 cmd.extend(["--quality-prompt-id", prompt_id])
+            if args.quality_prompts_json is not None:
+                cmd.extend([
+                    "--quality-prompts-json",
+                    str(args.quality_prompts_json),
+                ])
             print(f"[matrix] running {case_name}", flush=True)
             with log_path.open("w", encoding="utf-8") as log_file:
                 proc = subprocess.run(
@@ -817,6 +857,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--speed-output-len", type=int, default=1024)
     parser.add_argument("--quality-max-tokens", type=int, default=2048)
     parser.add_argument("--quality-prompt-id", action="append")
+    parser.add_argument("--quality-prompts-json", type=Path)
     parser.add_argument("--quality-repeat", type=int, default=1)
     parser.add_argument("--sampling-seed", type=int, default=20260617)
     parser.add_argument("--seed", type=int, default=0)

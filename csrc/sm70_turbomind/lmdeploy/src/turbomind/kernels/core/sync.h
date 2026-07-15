@@ -27,6 +27,18 @@ __inline__ __device__ void sem_wait(int* lock, int status, bool pred)
     __syncthreads();  // memory fence
 }
 
+__inline__ __device__ void sem_wait_lane0(int* lock, int status)
+{
+    // The first split has no predecessor, matching sem_wait's initial
+    // state==status fast path without issuing an unnecessary acquire load.
+    if (threadIdx.x == 0 && status != 0) {
+        while (sem_fetch(lock, true) != status) {
+        }
+    }
+
+    __syncthreads();  // CTA memory fence after lane 0's acquire load
+}
+
 __inline__ __device__ void sem_wait_many(int* lock, int count, bool pred)
 {
     int state = 0;

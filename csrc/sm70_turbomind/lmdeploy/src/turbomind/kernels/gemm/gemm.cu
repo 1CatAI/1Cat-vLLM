@@ -20,6 +20,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace turbomind::gemm {
@@ -65,6 +66,21 @@ bool Sm70AwqTp2FastSelectorEnabled()
     return !raw || std::atoi(raw) != 0;
 }
 
+// Keep the accepted QKVZ route enabled by default, while allowing an isolated
+// end-to-end A/B comparison without disabling the other exact small-M routes.
+bool Sm70AwqTp4QkvCta64Enabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_TP4_QKV_CTA64");
+    return !raw || std::atoi(raw) != 0;
+}
+
+// Default-on A/B gate for the exact TP4 MTP verifier M=5 routes.
+bool Sm70AwqMtpM5FastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
     int  n;
     int  k;
@@ -74,7 +90,70 @@ struct Sm70AwqTp2FastTarget {
     int  splits;
     int  swizzle;
     bool require_mgroup;
+    std::string name_contains;
 };
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(const GemmDesc&         desc,
+                                                               const std::string_view desc_str)
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_TARGETS");
+    if (!raw || !*raw) {
+        return std::nullopt;
+    }
+    const std::string targets(raw);
+    size_t            begin = 0;
+    while (begin <= targets.size()) {
+        const size_t end   = targets.find(';', begin);
+        const auto   entry = targets.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const size_t sep   = entry.find('|');
+        if (sep != std::string::npos && entry.substr(0, sep) == desc_str) {
+            std::string spec = entry.substr(sep + 1);
+            std::string name_contains;
+            if (const size_t name_sep = spec.find('@'); name_sep != std::string::npos) {
+                name_contains = spec.substr(name_sep + 1);
+                spec.resize(name_sep);
+            }
+            std::replace(spec.begin(), spec.end(), 'x', ',');
+            std::replace(spec.begin(), spec.end(), ':', ',');
+            for (char& ch : spec) {
+                if (ch == ',') {
+                    ch = ' ';
+                }
+            }
+            std::istringstream is(spec);
+            int                cta_m{};
+            int                cta_n{};
+            int                cta_k{};
+            int                splits{};
+            int                swizzle{};
+            int                require_mgroup{};
+            if (is >> cta_m >> cta_n >> cta_k >> splits >> swizzle >> require_mgroup) {
+                if (name_contains.empty()) {
+                    is >> name_contains;
+                }
+                return Sm70AwqTp2FastTarget{desc.n,
+                                            desc.k,
+                                            cta_m,
+                                            cta_n,
+                                            cta_k,
+                                            splits,
+                                            swizzle,
+                                            require_mgroup != 0,
+                                            name_contains};
+            }
+            if (GemmTraceEnabled() && GemmTraceFilterAllows(std::string(desc_str))) {
+                std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str
+                          << " stage=invalid_env_target entry=" << entry << std::endl;
+            }
+            return std::nullopt;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return std::nullopt;
+}
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc)
 {
@@ -82,11 +161,42 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc
         return std::nullopt;
     }
     const std::string desc_str = to_string(desc);
+    if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
+        return target;
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x17408x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 1, 0, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x8192x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 0, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x5120x3072_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 3, 0, false, ""};
+    }
+    if (Sm70AwqMtpM5FastSelectorEnabled()) {
+        // TP4 MTP verifier, M=5. Both routes are bitwise exact on all TP shards.
+        if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x8704x5120_1") {
+            return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 4, false, ""};
+        }
+        if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x4096x5120_1") {
+            return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 4, 4, false, ""};
+        }
+    }
     if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1") {
-        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 3, 3, false};
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 3, 3, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x8704x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 4, false, ""};
+    }
+    if (Sm70AwqTp4QkvCta64Enabled()
+        && desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x4096x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 4, 4, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x1536_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 12, 4, false, "s884_1x4x1"};
     }
     if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1") {
-        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 7, 0, false};
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 7, 0, false, ""};
     }
     return std::nullopt;
 }
@@ -99,7 +209,10 @@ bool MatchesSm70AwqTp2FastKernel(const Kernel& kernel, const Sm70AwqTp2FastTarge
     }
     const std::string name = kernel.name();
     const bool        is_mgroup = name.find("mgroup") != std::string::npos;
-    return is_mgroup == target.require_mgroup;
+    if (is_mgroup != target.require_mgroup) {
+        return false;
+    }
+    return target.name_contains.empty() || name.find(target.name_contains) != std::string::npos;
 }
 
 void MaybeTraceSm70AwqTp2FastSelector(const GemmDesc& desc, const char* stage, const LaunchSpec* spec = nullptr)
@@ -252,8 +365,11 @@ struct Gemm::Impl {
     LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size, size_t partials_size)
     {
         const auto& desc = ctx.desc();
+        const auto is_feasible = [&](const LaunchSpec& spec) {
+            return spec.kernel && spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
+        };
         if (policy & DispatchPolicy::kReuse) {
-            if (auto spec = cache_.LowerBound(desc)) {
+            if (auto spec = cache_.LowerBound(desc); spec && is_feasible(*spec)) {
                 return *spec;
             }
             if (warn_cache_miss_) {
@@ -262,7 +378,7 @@ struct Gemm::Impl {
             }
         }
 
-        if (auto spec = cache_.Find(desc)) {
+        if (auto spec = cache_.Find(desc); spec && is_feasible(*spec)) {
             return *spec;
         }
 

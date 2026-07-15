@@ -110,8 +110,9 @@ def test_compute_probs_uses_top_k_only_proposal_when_top_k_present(monkeypatch):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> torch.Tensor:
-        calls.append((k.clone() if k is not None else None,
-                      p.clone() if p is not None else None))
+        calls.append(
+            (k.clone() if k is not None else None, p.clone() if p is not None else None)
+        )
         return logits
 
     monkeypatch.setattr(
@@ -139,3 +140,63 @@ def test_compute_probs_uses_top_k_only_proposal_when_top_k_present(monkeypatch):
     assert k is not None
     assert torch.equal(k, metadata.top_k)
     assert p is None
+
+
+def test_draft_temperature_scale_flattens_proposal_probs(monkeypatch):
+    monkeypatch.setattr(
+        llm_base_proposer,
+        "_sync_draft_token_ids_across_tp",
+        lambda token_ids, tp_group=None: token_ids,
+    )
+
+    metadata = _random_sampling_metadata(batch_size=1)
+    logits = torch.tensor([[4.0, 0.0]], dtype=torch.float32)
+
+    monkeypatch.setenv("VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE", "1.0")
+    _, default_probs = compute_probs_and_sample_next_token(logits.clone(), metadata)
+
+    monkeypatch.setenv("VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE", "2.0")
+    _, scaled_probs = compute_probs_and_sample_next_token(logits.clone(), metadata)
+
+    expected_scaled = torch.softmax(
+        torch.tensor([[2.0, 0.0]], dtype=torch.float32),
+        dim=-1,
+    )
+    assert torch.allclose(scaled_probs, expected_scaled)
+    assert scaled_probs[0, 0] < default_probs[0, 0]
+    assert scaled_probs[0, 1] > default_probs[0, 1]
+
+
+def test_sparse_topk_draft_proposal_matches_dense_topk_probs(monkeypatch):
+    monkeypatch.setattr(
+        llm_base_proposer,
+        "_sync_draft_token_ids_across_tp",
+        lambda token_ids, tp_group=None: token_ids,
+    )
+
+    metadata = _random_sampling_metadata(batch_size=1)
+    metadata.top_k = torch.tensor([2], dtype=torch.int32)
+    metadata.top_k_cpu = (2,)
+    metadata.top_p = torch.tensor([0.95], dtype=torch.float32)
+    logits = torch.tensor([[0.1, 3.0, -4.0, 2.0, 0.0]], dtype=torch.float32)
+
+    monkeypatch.setenv("VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK", "0")
+    _, dense_probs = compute_probs_and_sample_next_token(logits.clone(), metadata)
+
+    monkeypatch.setenv("VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK", "1")
+
+    def fail_apply_top_k_top_p(*args, **kwargs):
+        raise AssertionError("sparse top-k proposal should bypass dense mask")
+
+    monkeypatch.setattr(
+        llm_base_proposer,
+        "apply_top_k_top_p",
+        fail_apply_top_k_top_p,
+    )
+    token_ids, sparse_probs = compute_probs_and_sample_next_token(
+        logits.clone(),
+        metadata,
+    )
+
+    assert torch.allclose(sparse_probs, dense_probs)
+    assert token_ids.item() in {1, 3}

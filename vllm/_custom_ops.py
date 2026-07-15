@@ -2966,6 +2966,54 @@ def all_reduce(
     torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
+def sm70_tp2_all_reduce_gemma_rms_norm(
+    fa: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    normalized_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    epsilon: float,
+) -> None:
+    torch.ops._C_custom_ar.sm70_tp2_all_reduce_gemma_rms_norm(
+        fa,
+        inp,
+        residual,
+        weight,
+        normalized_out,
+        residual_out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        epsilon,
+    )
+
+
+def sm70_tp4_all_reduce_gemma_rms_norm(
+    fa: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    normalized_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    epsilon: float,
+) -> None:
+    torch.ops._C_custom_ar.sm70_tp4_all_reduce_gemma_rms_norm(
+        fa,
+        inp,
+        residual,
+        weight,
+        normalized_out,
+        residual_out,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+        epsilon,
+    )
+
+
 def all_reduce_sum2(
     fa: int,
     inp_a: torch.Tensor,

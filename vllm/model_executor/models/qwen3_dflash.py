@@ -833,6 +833,19 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         logits_new[:, targets] = logits
         return logits_new
 
+    def get_topk_tokens_and_logprobs(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.draft_id_to_target_id is not None:
+            return None
+        return self.logits_processor.get_topk_tokens_and_logprobs(
+            self.lm_head,
+            hidden_states,
+            top_k,
+        )
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,

@@ -432,6 +432,100 @@ def test_token_matching_path_is_used_for_safe_mtp_stochastic_sampling(
     rejection_sampler.sampler.assert_called_once()
 
 
+def test_bonus_sampler_skips_full_logits_without_output_logprobs(rejection_sampler):
+    spec_tokens = [[1]]
+    output_tokens = [[1, 2]]
+    logits = create_logits_tensor(output_tokens)
+    metadata = create_sampling_metadata(all_greedy=True)
+    spec_decode_metadata = create_spec_decode_metadata(spec_tokens, logits)
+    bonus_token_tensor = torch.tensor([[2]], dtype=torch.int, device=logits.device)
+    mock_sampler_output(rejection_sampler, bonus_token_tensor)
+
+    rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=None,
+        logits=logits,
+        sampling_metadata=metadata,
+    )
+
+    _, kwargs = rejection_sampler.sampler.call_args
+    assert kwargs["sampling_metadata"].max_num_logprobs is None
+    assert kwargs["logprobs_mode_override"] is None
+
+
+def test_combined_bonus_fast_path_matches_legacy_sampling(monkeypatch):
+    device = torch.device(DEVICE_TYPE)
+    vocab_size = 64
+    num_draft_tokens = 3
+    logits = torch.randn(
+        num_draft_tokens + 1,
+        vocab_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    draft_probs = torch.randn(
+        num_draft_tokens,
+        vocab_size,
+        dtype=torch.float32,
+        device=device,
+    ).softmax(dim=-1)
+    draft_token_ids = torch.multinomial(draft_probs, num_samples=1).view(-1)
+    spec_decode_metadata = SpecDecodeMetadata(
+        draft_token_ids=draft_token_ids.to(torch.int32),
+        num_draft_tokens=[num_draft_tokens],
+        cu_num_draft_tokens=torch.tensor(
+            [num_draft_tokens], dtype=torch.int32, device=device
+        ),
+        cu_num_sampled_tokens=torch.tensor(
+            [num_draft_tokens + 1], dtype=torch.int32, device=device
+        ),
+        target_logits_indices=torch.arange(
+            num_draft_tokens, dtype=torch.int32, device=device
+        ),
+        bonus_logits_indices=torch.tensor(
+            [num_draft_tokens], dtype=torch.int32, device=device
+        ),
+        logits_indices=torch.arange(
+            num_draft_tokens + 1, dtype=torch.int32, device=device
+        ),
+    )
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.tensor([1.0], dtype=torch.float32, device=device),
+        top_k=torch.tensor([10], dtype=torch.int32, device=device),
+        top_p=torch.tensor([0.95], dtype=torch.float32, device=device),
+    )
+    rejection_sampler = RejectionSampler(Sampler())
+
+    if DEVICE_TYPE == "cuda":
+        rng_state = torch.cuda.get_rng_state(device)
+    else:
+        rng_state = torch.random.get_rng_state()
+
+    monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "0")
+    legacy = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=draft_probs,
+        logits=logits.clone(),
+        sampling_metadata=sampling_metadata,
+    ).sampled_token_ids
+
+    if DEVICE_TYPE == "cuda":
+        torch.cuda.set_rng_state(rng_state, device)
+    else:
+        torch.random.set_rng_state(rng_state)
+
+    monkeypatch.setenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1")
+    combined = rejection_sampler(
+        spec_decode_metadata,
+        draft_probs=draft_probs,
+        logits=logits.clone(),
+        sampling_metadata=sampling_metadata,
+    ).sampled_token_ids
+
+    assert torch.equal(combined, legacy)
+
+
 @pytest.mark.parametrize("k", [1, 3, 5])
 @pytest.mark.parametrize("vocab_size", [1000])
 @pytest.mark.parametrize("batch_size", [1, 4, 8])

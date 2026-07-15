@@ -13,6 +13,7 @@ import json
 import math
 import os
 import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,16 @@ def _hash_ids(token_ids: list[int]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _normalize_token_ids(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [int(item) for item in value if item is not None]
+    return []
+
+
 def _make_prompt_token_ids(
     tokenizer: Any,
     prompt_base: str,
@@ -82,6 +93,121 @@ def _make_prompt_token_ids(
     while len(repeated) < input_len:
         repeated.extend(chunk)
     return repeated[:input_len]
+
+
+def _prompt_generation_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "input_len": args.input_len,
+        "uses_repeated_prompt_base": args.input_len is not None,
+    }
+    if args.input_len is None:
+        return metadata
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(args.model),
+        trust_remote_code=args.trust_remote_code,
+    )
+    prompt_base_token_ids = tokenizer.encode(
+        args.prompt_base,
+        add_special_tokens=False,
+    )
+    metadata.update(
+        {
+            "prompt_base": args.prompt_base,
+            "prompt_base_token_count": len(prompt_base_token_ids),
+            "prompt_base_token_hash": _hash_ids(prompt_base_token_ids),
+        }
+    )
+    return metadata
+
+
+def _eos_token_ids_for_model(args: argparse.Namespace) -> list[int]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(args.model),
+        trust_remote_code=args.trust_remote_code,
+    )
+    eos_token_ids = set(_normalize_token_ids(getattr(tokenizer, "eos_token_id", None)))
+    generation_config = getattr(tokenizer, "generation_config", None)
+    if generation_config is not None:
+        eos_token_ids.update(
+            _normalize_token_ids(getattr(generation_config, "eos_token_id", None))
+        )
+    return sorted(eos_token_ids)
+
+
+def _first_token_index(token_ids: list[int], candidates: set[int]) -> int | None:
+    if not candidates:
+        return None
+    for index, token_id in enumerate(token_ids):
+        if token_id in candidates:
+            return index
+    return None
+
+
+def _metric_snapshot(llm: Any) -> list[dict[str, Any]]:
+    try:
+        metrics = llm.get_metrics()
+    except (AssertionError, AttributeError):
+        return []
+    records: list[dict[str, Any]] = []
+    for metric in metrics:
+        if is_dataclass(metric):
+            records.append(asdict(metric))
+        else:
+            records.append({"repr": repr(metric)})
+    return records
+
+
+def _spec_decoding_summary(
+    metrics: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    num_drafts = 0
+    num_draft_tokens = 0
+    num_accepted_tokens = 0
+    accepted_tokens_per_pos: list[int] = []
+
+    for metric in metrics:
+        name = metric.get("name")
+        if name == "vllm:spec_decode_num_drafts":
+            num_drafts += int(metric.get("value") or 0)
+        elif name == "vllm:spec_decode_num_draft_tokens":
+            num_draft_tokens += int(metric.get("value") or 0)
+        elif name == "vllm:spec_decode_num_accepted_tokens":
+            num_accepted_tokens += int(metric.get("value") or 0)
+        elif name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            values = metric.get("values")
+            if isinstance(values, list):
+                if len(values) > len(accepted_tokens_per_pos):
+                    accepted_tokens_per_pos.extend(
+                        [0] * (len(values) - len(accepted_tokens_per_pos))
+                    )
+                for idx, value in enumerate(values):
+                    accepted_tokens_per_pos[idx] += int(value)
+
+    if num_drafts == 0:
+        return None
+
+    avg_accepted_tokens = num_accepted_tokens / num_drafts
+    return {
+        "num_drafts": num_drafts,
+        "num_draft_tokens": num_draft_tokens,
+        "num_accepted_tokens": num_accepted_tokens,
+        "avg_accepted_tokens_no_bonus": avg_accepted_tokens,
+        "mean_acceptance_length": 1 + avg_accepted_tokens,
+        "draft_acceptance_rate": (
+            num_accepted_tokens / num_draft_tokens
+            if num_draft_tokens
+            else None
+        ),
+        "accepted_tokens_per_pos": accepted_tokens_per_pos,
+        "per_position_acceptance_rate": [
+            value / num_drafts for value in accepted_tokens_per_pos
+        ],
+    }
 
 
 def _load_prompts(args: argparse.Namespace) -> list[Any]:
@@ -178,6 +304,8 @@ def _tracked_env() -> dict[str, str]:
         "CUDA_VISIBLE_DEVICES",
         "CUDA_DEVICE_ORDER",
         "VLLM_SM70_",
+        "VLLM_DFLASH_",
+        "VLLM_MAMBA_",
         "VLLM_MQ_",
         "VLLM_USE_",
         "VLLM_DISABLE_",
@@ -705,6 +833,18 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED",
         True,
     )
+    prefill_d256_output_stride_268 = _env_bool(
+        "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268",
+        True,
+    )
+    prefill_d256_sw_pipeline_qk = _env_bool(
+        "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK",
+        True,
+    )
+    prefill_d256_sw_pipeline_pv = _env_bool(
+        "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV",
+        True,
+    )
     if selector_enabled:
         expected_sm70_priority = [
             "FLASH_ATTN_V100",
@@ -746,6 +886,20 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED"
         ),
         "decode_scalar_paged_effective": decode_scalar_paged,
+        "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268": os.environ.get(
+            "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268"
+        ),
+        "prefill_d256_output_stride_268_effective": (
+            prefill_d256_output_stride_268
+        ),
+        "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK": os.environ.get(
+            "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK"
+        ),
+        "prefill_d256_sw_pipeline_qk_effective": prefill_d256_sw_pipeline_qk,
+        "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV": os.environ.get(
+            "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV"
+        ),
+        "prefill_d256_sw_pipeline_pv_effective": prefill_d256_sw_pipeline_pv,
         "full_flash_default_policy": full_flash_default_policy,
         "kv_cache_dtype": kv_cache_dtype_str,
         "fp8_kv_cache_requested_effective": fp8_kv_cache_requested,
@@ -907,6 +1061,9 @@ def _sm70_comm_policy(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
         "VLLM_SM70_TOP1_CUSTOM_AR": os.environ.get("VLLM_SM70_TOP1_CUSTOM_AR"),
         "top1_custom_allreduce_effective": top1_custom_ar,
         "top1_only_custom_allreduce_effective": top1_only_custom_ar,
+        "VLLM_SM70_TP4_M5_AR_THREADS": os.environ.get(
+            "VLLM_SM70_TP4_M5_AR_THREADS"
+        ),
         "route_hit_oracle": (
             "Production TP communication evidence must show "
             "`disable_custom_all_reduce=false` in engine kwargs and runtime "
@@ -1337,12 +1494,32 @@ def _dump(args: argparse.Namespace) -> int:
 
     from vllm import LLM, SamplingParams
 
+    capture_decode_after_prefix_warmup = (
+        args.cuda_profiler_capture_decode_after_prefix_warmup
+    )
+    if capture_decode_after_prefix_warmup and args.sequential_prompts:
+        raise ValueError(
+            "--cuda-profiler-capture-decode-after-prefix-warmup does not "
+            "support --sequential-prompts"
+        )
+    if capture_decode_after_prefix_warmup and args.prompt_logprobs != 0:
+        raise ValueError(
+            "--cuda-profiler-capture-decode-after-prefix-warmup does not "
+            "support --prompt-logprobs because it bypasses prefix-cache reads"
+        )
+
     prompts = _load_prompts(args)
+    if capture_decode_after_prefix_warmup and len(prompts) != 1:
+        raise ValueError(
+            "--cuda-profiler-capture-decode-after-prefix-warmup requires "
+            "exactly one prompt"
+        )
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
+        stop=args.stop or None,
         seed=args.sampling_seed,
         ignore_eos=args.ignore_eos,
         skip_special_tokens=False,
@@ -1371,6 +1548,14 @@ def _dump(args: argparse.Namespace) -> int:
         "attention_backend": args.attention_backend,
     }
     llm_kwargs.update(engine_kwargs)
+    if capture_decode_after_prefix_warmup:
+        if llm_kwargs.get("enforce_eager"):
+            raise ValueError(
+                "--cuda-profiler-capture-decode-after-prefix-warmup requires "
+                "CUDA graphs; do not set --enforce-eager or "
+                "--engine-arg enforce_eager=true"
+            )
+        llm_kwargs["enable_prefix_caching"] = True
     llm_kwargs = {k: v for k, v in llm_kwargs.items() if v is not None}
 
     start = time.perf_counter()
@@ -1378,18 +1563,44 @@ def _dump(args: argparse.Namespace) -> int:
     load_seconds = time.perf_counter() - start
     _enable_sampler_logits_dump_after_load()
 
+    prime_generate_seconds: float | None = None
+    if capture_decode_after_prefix_warmup:
+        import torch
+
+        prime_start = time.perf_counter()
+        llm.generate(prompts, sampling_params)
+        torch.cuda.synchronize()
+        prime_generate_seconds = time.perf_counter() - prime_start
+        torch.cuda.cudart().cudaProfilerStart()
+    elif args.cuda_profiler_capture_generate:
+        import torch
+
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStart()
     start = time.perf_counter()
-    if args.sequential_prompts:
-        outputs = []
-        for prompt in prompts:
-            outputs.extend(llm.generate([prompt], sampling_params))
-    else:
-        outputs = llm.generate(prompts, sampling_params)
+    try:
+        if args.sequential_prompts:
+            outputs = []
+            for prompt in prompts:
+                outputs.extend(llm.generate([prompt], sampling_params))
+        else:
+            outputs = llm.generate(prompts, sampling_params)
+    finally:
+        if args.cuda_profiler_capture_generate or capture_decode_after_prefix_warmup:
+            import torch
+
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
     generate_seconds = time.perf_counter() - start
+    metrics_snapshot = _metric_snapshot(llm)
 
     import torch
 
     import vllm
+
+    prompt_generation = _prompt_generation_metadata(args)
+    eos_token_ids = _eos_token_ids_for_model(args)
+    eos_token_id_set = set(eos_token_ids)
 
     records = []
     total_output_tokens = 0
@@ -1398,6 +1609,12 @@ def _dump(args: argparse.Namespace) -> int:
         completions = []
         for completion in request_output.outputs:
             token_ids = list(completion.token_ids)
+            first_eos_index = _first_token_index(token_ids, eos_token_id_set)
+            forced_tokens_after_eos = (
+                max(len(token_ids) - first_eos_index - 1, 0)
+                if args.ignore_eos and first_eos_index is not None
+                else 0
+            )
             total_output_tokens += len(token_ids)
             completions.append({
                 "index": completion.index,
@@ -1405,6 +1622,9 @@ def _dump(args: argparse.Namespace) -> int:
                 "text": completion.text,
                 "finish_reason": completion.finish_reason,
                 "stop_reason": completion.stop_reason,
+                "contains_eos": first_eos_index is not None,
+                "first_eos_token_index": first_eos_index,
+                "forced_tokens_after_eos": forced_tokens_after_eos,
                 "cumulative_logprob": completion.cumulative_logprob,
                 "logprobs": _serialize_logprobs(completion.logprobs),
             })
@@ -1451,11 +1671,16 @@ def _dump(args: argparse.Namespace) -> int:
         "sm70_moe_policy": _sm70_moe_policy(),
         "sm70_sampling_policy": _sm70_sampling_policy(),
         "engine_kwargs": llm_kwargs,
+        "prompt_generation": prompt_generation,
+        "eos_token_ids": eos_token_ids,
+        "metrics_snapshot": metrics_snapshot,
+        "spec_decoding_metrics": _spec_decoding_summary(metrics_snapshot),
         "sampling_params": {
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
+            "stop": args.stop,
             "seed": args.sampling_seed,
             "ignore_eos": args.ignore_eos,
             "skip_special_tokens": False,
@@ -1470,6 +1695,29 @@ def _dump(args: argparse.Namespace) -> int:
         "total_output_tokens": total_output_tokens,
         "records": records,
     }
+    if prime_generate_seconds is not None:
+        payload["cuda_profiler_capture"] = {
+            "mode": "decode_after_prefix_warmup",
+            "enable_prefix_caching": llm_kwargs["enable_prefix_caching"],
+            "enforce_eager": llm_kwargs["enforce_eager"],
+            "prime": {
+                "prompt_count": len(prompts),
+                "same_prompt_as_capture": True,
+                "cuda_profiler_enabled": False,
+                "generate_seconds": prime_generate_seconds,
+                "excluded_from": [
+                    "generate_seconds",
+                    "request_metrics",
+                    "outputs",
+                ],
+            },
+            "capture": {
+                "prompt_count": len(prompts),
+                "cuda_profiler_enabled": True,
+                "gpu_synchronized_before_start": True,
+                "generate_seconds": generate_seconds,
+            },
+        }
     payload = _json_safe(payload)
     args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(json.dumps({k: v for k, v in payload.items() if k != "records"},
@@ -2155,10 +2403,37 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate each prompt in a separate llm.generate call.",
     )
+    cuda_profiler_group = parser.add_mutually_exclusive_group()
+    cuda_profiler_group.add_argument(
+        "--cuda-profiler-capture-generate",
+        action="store_true",
+        help=(
+            "Call cudaProfilerStart/Stop around llm.generate so nsys can "
+            "capture only the measured generation window."
+        ),
+    )
+    cuda_profiler_group.add_argument(
+        "--cuda-profiler-capture-decode-after-prefix-warmup",
+        action="store_true",
+        help=(
+            "Prime one prompt with prefix caching while the CUDA profiler is "
+            "off, then capture only the second matching llm.generate call. "
+            "Requires one non-sequential prompt and CUDA graphs."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument(
+        "--stop",
+        action="append",
+        default=[],
+        help=(
+            "Stop string for generation. May be passed multiple times. "
+            "Useful for HumanEval-style code-completion probes."
+        ),
+    )
     parser.add_argument(
         "--sampling-seed",
         type=int,

@@ -1018,6 +1018,11 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         Override the default vLLM placeholder scales with the llm-compressor loaded
         scales. Zero points are not used as only symmetric quantization is supported.
         """
+        if getattr(layer, "_force_unit_fp8_e5m2_kv_scales", False):
+            layer.k_scale.data.fill_(1.0)
+            layer.v_scale.data.fill_(1.0)
+            layer.q_scale.data.fill_(1.0)
+
         layer._k_scale = layer.k_scale
         layer._v_scale = layer.v_scale
         layer._q_scale = layer.q_scale

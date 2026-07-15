@@ -17,6 +17,8 @@ from vllm.triton_utils import tl, triton
 @triton.jit
 def _ddtree_paged_attention_kernel(
     query,
+    key,
+    value,
     key_cache,
     value_cache,
     output,
@@ -48,6 +50,12 @@ def _ddtree_paged_attention_kernel(
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
+    k_cur_stride_t: tl.constexpr,
+    k_cur_stride_h: tl.constexpr,
+    k_cur_stride_d: tl.constexpr,
+    v_cur_stride_t: tl.constexpr,
+    v_cur_stride_h: tl.constexpr,
+    v_cur_stride_d: tl.constexpr,
     o_stride_t: tl.constexpr,
     o_stride_h: tl.constexpr,
     o_stride_d: tl.constexpr,
@@ -124,23 +132,45 @@ def _ddtree_paged_attention_kernel(
         )
         block_ids = tl.load(block_ptrs, mask=n_mask, other=0).to(tl.int64)
 
-        k_ptrs = (
+        prefix_mask = n_mask & (offs_n < prefix_len)
+        k_cache_ptrs = (
             key_cache
             + block_ids[:, None] * k_stride_b
             + block_offsets[:, None] * k_stride_t
             + kv_head * k_stride_h
             + offs_d[None, :] * k_stride_d
         )
-        v_ptrs = (
+        v_cache_ptrs = (
             value_cache
             + block_ids[:, None] * v_stride_b
             + block_offsets[:, None] * v_stride_t
             + kv_head * v_stride_h
             + offs_d[None, :] * v_stride_d
         )
-        kv_mask = n_mask[:, None] & d_mask[None, :]
-        k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
-        v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        cache_kv_mask = prefix_mask[:, None] & d_mask[None, :]
+        k_cache_vals = tl.load(k_cache_ptrs, mask=cache_kv_mask, other=0.0)
+        v_cache_vals = tl.load(v_cache_ptrs, mask=cache_kv_mask, other=0.0)
+
+        current_mask = n_mask & (local >= 0) & (local < q_len)
+        safe_local = tl.maximum(tl.minimum(local, q_len - 1), 0)
+        k_cur_ptrs = (
+            key
+            + (q_start + safe_local[:, None]) * k_cur_stride_t
+            + kv_head * k_cur_stride_h
+            + offs_d[None, :] * k_cur_stride_d
+        )
+        v_cur_ptrs = (
+            value
+            + (q_start + safe_local[:, None]) * v_cur_stride_t
+            + kv_head * v_cur_stride_h
+            + offs_d[None, :] * v_cur_stride_d
+        )
+        current_kv_mask = current_mask[:, None] & d_mask[None, :]
+        k_cur_vals = tl.load(k_cur_ptrs, mask=current_kv_mask, other=0.0)
+        v_cur_vals = tl.load(v_cur_ptrs, mask=current_kv_mask, other=0.0)
+
+        k = tl.where(current_mask[:, None], k_cur_vals, k_cache_vals).to(tl.float32)
+        v = tl.where(current_mask[:, None], v_cur_vals, v_cache_vals).to(tl.float32)
 
         scores = tl.sum(k * q_vec[None, :], axis=1) * scale
         scores = tl.where(visible, scores, -3.4028234663852886e38)
@@ -182,6 +212,8 @@ def ddtree_branch_attention_correction(
     *,
     impl,
     query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     output: torch.Tensor,
@@ -197,12 +229,21 @@ def ddtree_branch_attention_correction(
         raise ValueError("DDTree Triton branch attention does not support softcap")
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported query dtype {query.dtype}")
+    if key.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported key dtype {key.dtype}")
+    if value.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"unsupported value dtype {value.dtype}")
     if key_cache.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported key cache dtype {key_cache.dtype}")
     if value_cache.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"unsupported value cache dtype {value_cache.dtype}")
     if parent_ids is None or parent_ids.ndim != 2 or parent_ids.shape[1] <= 0:
         return True
+    if key.ndim != 3 or value.ndim != 3:
+        raise ValueError(
+            "DDTree Triton branch attention expects current key/value "
+            f"[tokens, heads, dim], got {tuple(key.shape)} and {tuple(value.shape)}"
+        )
 
     _validate_paged_key_value_cache(key_cache)
     _validate_paged_key_value_cache(value_cache)
@@ -233,12 +274,24 @@ def ddtree_branch_attention_correction(
 
     num_heads = int(query.shape[1])
     num_kv_heads = int(key_cache.shape[2])
+    if int(key.shape[1]) != num_kv_heads or int(value.shape[1]) != num_kv_heads:
+        raise ValueError(
+            "DDTree Triton branch attention current KV head count mismatch: "
+            f"key={tuple(key.shape)}, value={tuple(value.shape)}, "
+            f"cache_kv_heads={num_kv_heads}"
+        )
     if num_heads % num_kv_heads != 0:
         raise ValueError(
             "DDTree Triton branch attention requires Q heads divisible by KV "
             f"heads, got {num_heads} and {num_kv_heads}"
         )
     head_size = int(query.shape[2])
+    if int(key.shape[2]) != head_size or int(value.shape[2]) != head_size:
+        raise ValueError(
+            "DDTree Triton branch attention current KV head dim mismatch: "
+            f"query={tuple(query.shape)}, key={tuple(key.shape)}, "
+            f"value={tuple(value.shape)}"
+        )
     block_d = triton.next_power_of_2(head_size)
     if block_d > 256:
         raise ValueError(f"unsupported rounded head size {block_d}")
@@ -247,6 +300,8 @@ def ddtree_branch_attention_correction(
     grid = (num_reqs, max_q_len, num_heads)
     _ddtree_paged_attention_kernel[grid](
         query,
+        key,
+        value,
         key_cache,
         value_cache,
         output,
@@ -278,6 +333,12 @@ def ddtree_branch_attention_correction(
         q_stride_t=query.stride(0),
         q_stride_h=query.stride(1),
         q_stride_d=query.stride(2),
+        k_cur_stride_t=key.stride(0),
+        k_cur_stride_h=key.stride(1),
+        k_cur_stride_d=key.stride(2),
+        v_cur_stride_t=value.stride(0),
+        v_cur_stride_h=value.stride(1),
+        v_cur_stride_d=value.stride(2),
         o_stride_t=output.stride(0),
         o_stride_h=output.stride(1),
         o_stride_d=output.stride(2),

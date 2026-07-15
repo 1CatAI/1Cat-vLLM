@@ -25,6 +25,7 @@ def get_ext_modules():
                 "kernel/fused_mha_api.cpp",
                 "kernel/fused_mha_forward.cu",
                 "kernel/fused_mha_forward_paged.cu",
+                "kernel/fp8_kv_bridge.cu",
                 "kernel/flash_decode_paged.cu",
                 "kernel/flash_decode_turboquant.cu",
                 "kernel/fused_mha_backward.cu",

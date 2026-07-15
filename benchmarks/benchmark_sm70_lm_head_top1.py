@@ -96,20 +96,24 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
-    if args.m != 1:
-        raise ValueError("SM70 LM-head top1 kernels currently support only m=1.")
     if args.pad < 0 or args.pad >= args.n:
         raise ValueError("--pad must be in [0, n).")
 
     device = torch.device(args.device)
     _require_sm70(device)
-    _require_torch_op("sm70_f16_lm_head_top1_out")
+    if args.m == 1:
+        _require_torch_op("sm70_f16_lm_head_top1_out")
+    else:
+        _require_torch_op("sm70_f16_lm_head_top1_tc_out")
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
     x = torch.randn((args.m, args.k), device=device, dtype=torch.float16)
     weight = torch.randn((args.n, args.k), device=device, dtype=torch.float16)
+    torch_logits_out = torch.empty(
+        (args.m, args.n), device=device, dtype=torch.float16
+    )
     prepared = sm70_ops.sm70_f16_prepare(weight)
     tm_weight = prepared[0]
     k_ld = int(prepared[1][0].item())
@@ -121,30 +125,35 @@ def main() -> int:
         values, indices = logits.max(dim=-1)
         return values, indices.to(torch.int64) + args.vocab_start
 
+    def torch_mm_only() -> torch.Tensor:
+        return torch.mm(x, weight.t(), out=torch_logits_out)
+
     ref_values, ref_indices = torch_mm_max()
     torch.cuda.synchronize(device)
 
-    values = torch.empty((args.m,), device=device, dtype=torch.float32)
-    indices = torch.empty((args.m,), device=device, dtype=torch.int64)
+    results = []
 
-    def scalar_top1() -> None:
-        sm70_ops.sm70_f16_lm_head_top1_out(
-            values,
-            indices,
-            x,
-            weight,
-            int(weight.stride(0)),
-            args.vocab_start,
-            args.pad,
+    if args.m == 1:
+        values = torch.empty((args.m,), device=device, dtype=torch.float32)
+        indices = torch.empty((args.m,), device=device, dtype=torch.int64)
+
+        def scalar_top1() -> None:
+            sm70_ops.sm70_f16_lm_head_top1_out(
+                values,
+                indices,
+                x,
+                weight,
+                int(weight.stride(0)),
+                args.vocab_start,
+                args.pad,
+            )
+
+        scalar_top1()
+        torch.cuda.synchronize(device)
+        scalar_ms = _bench_cuda_ms(scalar_top1, args.warmup, args.iters)
+        results.append(
+            _stats("scalar", values, indices, ref_values, ref_indices, scalar_ms)
         )
-
-    scalar_top1()
-    torch.cuda.synchronize(device)
-    scalar_ms = _bench_cuda_ms(scalar_top1, args.warmup, args.iters)
-
-    results = [
-        _stats("scalar", values, indices, ref_values, ref_indices, scalar_ms)
-    ]
 
     if hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         tc_values = torch.empty((args.m,), device=device, dtype=torch.float32)
@@ -192,6 +201,7 @@ def main() -> int:
     )
 
     torch_mm_ms = _bench_cuda_ms(lambda: torch_mm_max(), args.warmup, args.iters)
+    torch_mm_only_ms = _bench_cuda_ms(torch_mm_only, args.warmup, args.iters)
     strict_pass = all(
         result["index_equal"]
         and result["value_equal"]
@@ -206,6 +216,7 @@ def main() -> int:
         "vocab_start": args.vocab_start,
         "device_capability": list(torch.cuda.get_device_capability(device)),
         "torch_mm_max_ms": torch_mm_ms,
+        "torch_mm_only_ms": torch_mm_only_ms,
         "results": results,
     }
     text = json.dumps(report, indent=2, sort_keys=True)

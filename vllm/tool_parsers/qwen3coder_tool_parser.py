@@ -199,20 +199,36 @@ class Qwen3CoderToolParser(ToolParser):
                 positions.append(func_idx)
         return positions
 
+    def _trailing_tool_marker_prefix(self, text: str) -> str:
+        """Return the unfinished suffix of a possible tool-call marker."""
+        markers = (self.tool_call_start_token, self.tool_call_prefix)
+        for marker in markers:
+            max_len = min(len(marker) - 1, len(text))
+            for prefix_len in range(max_len, 0, -1):
+                if text.endswith(marker[:prefix_len]):
+                    return marker[:prefix_len]
+        return ""
+
     def _pending_tool_marker_delta_prefix(
         self, previous_text: str, current_text: str, delta_text: str
     ) -> str | None:
-        markers = (self.tool_call_start_token, self.tool_call_prefix)
-        for marker in markers:
-            max_len = min(len(marker) - 1, len(current_text))
-            for prefix_len in range(max_len, 0, -1):
-                if current_text.endswith(marker[:prefix_len]):
-                    pending_start = len(current_text) - prefix_len
-                    emit_len = pending_start - len(previous_text)
-                    if emit_len > 0:
-                        return delta_text[:emit_len]
-                    return ""
-        return None
+        """Hold only an unfinished marker prefix without dropping plain text.
+
+        A streamed ``<`` may be the first token of ``<tool_call>`` or a
+        normal HTML tag. The old code held the prefix but emitted only the
+        next delta when it stopped matching a marker, permanently dropping
+        the ``<``. Reconstruct the previously held suffix before emitting the
+        newly confirmed non-tool text.
+        """
+        previous_prefix = self._trailing_tool_marker_prefix(previous_text)
+        current_prefix = self._trailing_tool_marker_prefix(current_text)
+        if not previous_prefix and not current_prefix:
+            return None
+
+        pending_and_delta = previous_prefix + delta_text
+        if current_prefix:
+            return pending_and_delta[: -len(current_prefix)]
+        return pending_and_delta
 
     def extract_tool_calls(
         self,
@@ -349,7 +365,10 @@ class Qwen3CoderToolParser(ToolParser):
                 self.is_tool_call_started = True
                 # Return any content before the tool call
                 if tool_start > len(previous_text):
-                    content_before = delta_text[: tool_start - len(previous_text)]
+                    content_before = (
+                        self._trailing_tool_marker_prefix(previous_text)
+                        + delta_text[: tool_start - len(previous_text)]
+                    )
                     if content_before:
                         return DeltaMessage(content=content_before)
                 return None

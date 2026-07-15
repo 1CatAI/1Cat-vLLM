@@ -152,21 +152,15 @@ def _tune_enabled_default_true(raw: str | None) -> bool:
 
 def _sm70_tune_policy() -> dict[str, Any]:
     awq_tune_raw = os.environ.get("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES")
-    awq_preserve_splits_raw = os.environ.get(
-        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS"
-    )
+    awq_preserve_splits_raw = os.environ.get("VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS")
     awq_preserve_splits_only_raw = os.environ.get(
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY"
     )
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
-    fp8_safe_fast_selector_raw = os.environ.get(
-        "VLLM_SM70_FP8_SAFE_FAST_SELECTOR"
-    )
-    fp8_preserve_splits_raw = os.environ.get(
-        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS"
-    )
+    fp8_safe_fast_selector_raw = os.environ.get("VLLM_SM70_FP8_SAFE_FAST_SELECTOR")
+    fp8_preserve_splits_raw = os.environ.get("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS")
     fp8_preserve_splits_only_raw = os.environ.get(
         "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY"
     )
@@ -178,15 +172,11 @@ def _sm70_tune_policy() -> dict[str, Any]:
     return {
         "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": awq_tune_raw,
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS": awq_preserve_splits_raw,
-        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": (
-            awq_preserve_splits_only_raw
-        ),
+        "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": (awq_preserve_splits_only_raw),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": fp8_safe_fast_selector_raw,
         "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": fp8_preserve_splits_raw,
-        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": (
-            fp8_preserve_splits_only_raw
-        ),
+        "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY": (fp8_preserve_splits_only_raw),
         "VLLM_SM70_FP8_DENSE_TUNE_MAX_M": os.environ.get(
             "VLLM_SM70_FP8_DENSE_TUNE_MAX_M"
         ),
@@ -194,24 +184,16 @@ def _sm70_tune_policy() -> dict[str, Any]:
         "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": nvfp4_tune_raw,
         "awq_tune0_pinned_effective": awq_tune0_pinned,
         "awq_preserve_default_splits_effective": (
-            awq_preserve_splits_raw is None
-            or _atoi_nonzero(awq_preserve_splits_raw)
+            awq_preserve_splits_raw is None or _atoi_nonzero(awq_preserve_splits_raw)
         ),
         "awq_preserve_default_splits_only_effective": _atoi_nonzero(
             awq_preserve_splits_only_raw
         ),
-        "awq_moe_safe_default_selector_effective": (
-            awq_moe_safe_default_selector
-        ),
-        "fp8_safe_default_selector_effective": (
-            not fp8_dynamic_measure_enabled
-        ),
-        "fp8_safe_fast_selector_effective": _atoi_nonzero(
-            fp8_safe_fast_selector_raw
-        ),
+        "awq_moe_safe_default_selector_effective": (awq_moe_safe_default_selector),
+        "fp8_safe_default_selector_effective": (not fp8_dynamic_measure_enabled),
+        "fp8_safe_fast_selector_effective": _atoi_nonzero(fp8_safe_fast_selector_raw),
         "fp8_preserve_default_splits_effective": (
-            fp8_preserve_splits_raw is None
-            or _atoi_nonzero(fp8_preserve_splits_raw)
+            fp8_preserve_splits_raw is None or _atoi_nonzero(fp8_preserve_splits_raw)
         ),
         "fp8_preserve_default_splits_only_effective": _atoi_nonzero(
             fp8_preserve_splits_only_raw
@@ -220,12 +202,8 @@ def _sm70_tune_policy() -> dict[str, Any]:
             "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
             16,
         ),
-        "mxfp4_safe_default_selector_effective": (
-            not mxfp4_dynamic_measure_enabled
-        ),
-        "nvfp4_safe_default_selector_effective": (
-            not nvfp4_dynamic_measure_enabled
-        ),
+        "mxfp4_safe_default_selector_effective": (not mxfp4_dynamic_measure_enabled),
+        "nvfp4_safe_default_selector_effective": (not nvfp4_dynamic_measure_enabled),
         "awq_dense_dynamic_measure_enabled": (
             awq_tune_raw is not None and _atoi_nonzero(awq_tune_raw)
         ),
@@ -264,9 +242,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
     awq_tune0_pinned = awq_tune_raw == "0"
     awq_moe_safe_default_selector = awq_tune_raw is None or awq_tune0_pinned
     fp8_tune_raw = os.environ.get("VLLM_SM70_FP8_TUNE_SMALL_SHAPES")
-    fp8_safe_fast_selector = _env_bool(
-        "VLLM_SM70_FP8_SAFE_FAST_SELECTOR", False
-    )
+    fp8_safe_fast_selector = _env_bool("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", False)
     mxfp4_tune_raw = os.environ.get("VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES")
     nvfp4_tune_raw = os.environ.get("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES")
     fp8_safe_default_selector = not _tune_enabled_default_true(fp8_tune_raw)
@@ -314,25 +290,17 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
     f16_dense = _env_bool("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", False)
     dense_cudagraph = _env_bool("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", False)
     return {
-        "VLLM_SM70_AWQ_TURBOMIND": os.environ.get(
-            "VLLM_SM70_AWQ_TURBOMIND"
-        ),
+        "VLLM_SM70_AWQ_TURBOMIND": os.environ.get("VLLM_SM70_AWQ_TURBOMIND"),
         "awq_turbomind_effective": awq_turbomind,
-        "VLLM_SM70_FP8_TURBOMIND": os.environ.get(
-            "VLLM_SM70_FP8_TURBOMIND"
-        ),
+        "VLLM_SM70_FP8_TURBOMIND": os.environ.get("VLLM_SM70_FP8_TURBOMIND"),
         "fp8_turbomind_effective": fp8_turbomind,
         "VLLM_SM70_FP8_DENSE_GATED_SILU": os.environ.get(
             "VLLM_SM70_FP8_DENSE_GATED_SILU"
         ),
         "fp8_dense_gated_silu_effective": fp8_dense_gated_silu,
-        "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get(
-            "VLLM_SM70_NVFP4_TURBOMIND"
-        ),
+        "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get("VLLM_SM70_NVFP4_TURBOMIND"),
         "nvfp4_turbomind_effective": nvfp4_turbomind,
-        "VLLM_SM70_MXFP4_TURBOMIND": os.environ.get(
-            "VLLM_SM70_MXFP4_TURBOMIND"
-        ),
+        "VLLM_SM70_MXFP4_TURBOMIND": os.environ.get("VLLM_SM70_MXFP4_TURBOMIND"),
         "mxfp4_turbomind_effective": mxfp4_turbomind,
         "VLLM_SM70_FP8_DEQUANT_FALLBACK": os.environ.get(
             "VLLM_SM70_FP8_DEQUANT_FALLBACK"
@@ -345,14 +313,10 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": os.environ.get(
             "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG"
         ),
-        "unquantized_moe_0dot3_config_effective": (
-            unquantized_moe_0dot3_config
-        ),
+        "unquantized_moe_0dot3_config_effective": (unquantized_moe_0dot3_config),
         "VLLM_SM70_AWQ_WARMUP": os.environ.get("VLLM_SM70_AWQ_WARMUP"),
         "awq_warmup_effective": awq_warmup,
-        "VLLM_SM70_AWQ_WARMUP_MAX_M": os.environ.get(
-            "VLLM_SM70_AWQ_WARMUP_MAX_M"
-        ),
+        "VLLM_SM70_AWQ_WARMUP_MAX_M": os.environ.get("VLLM_SM70_AWQ_WARMUP_MAX_M"),
         "awq_warmup_max_m_effective": _env_int(
             "VLLM_SM70_AWQ_WARMUP_MAX_M",
             16,
@@ -421,9 +385,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS",
             128,
         ),
-        "awq_moe_safe_default_selector_effective": (
-            awq_moe_safe_default_selector
-        ),
+        "awq_moe_safe_default_selector_effective": (awq_moe_safe_default_selector),
         "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": fp8_tune_raw,
         "fp8_safe_default_selector_effective": fp8_safe_default_selector,
         "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": os.environ.get(
@@ -452,16 +414,10 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             16,
         ),
         "VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES": mxfp4_tune_raw,
-        "mxfp4_safe_default_selector_effective": (
-            mxfp4_safe_default_selector
-        ),
+        "mxfp4_safe_default_selector_effective": (mxfp4_safe_default_selector),
         "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": nvfp4_tune_raw,
-        "nvfp4_safe_default_selector_effective": (
-            nvfp4_safe_default_selector
-        ),
-        "VLLM_SM70_AWQ_MOE_DISABLE": os.environ.get(
-            "VLLM_SM70_AWQ_MOE_DISABLE"
-        ),
+        "nvfp4_safe_default_selector_effective": (nvfp4_safe_default_selector),
+        "VLLM_SM70_AWQ_MOE_DISABLE": os.environ.get("VLLM_SM70_AWQ_MOE_DISABLE"),
         "awq_moe_disable_effective": awq_moe_disable,
         "VLLM_SM70_AWQ_MOE_BATCHED_GEMM": os.environ.get(
             "VLLM_SM70_AWQ_MOE_BATCHED_GEMM"
@@ -470,9 +426,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT": os.environ.get(
             "VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT"
         ),
-        "awq_moe_legacy_single_token_compact_effective": (
-            awq_moe_legacy_single_token
-        ),
+        "awq_moe_legacy_single_token_compact_effective": (awq_moe_legacy_single_token),
         "VLLM_SM70_FP8_MOE_BATCHED_GEMM": os.environ.get(
             "VLLM_SM70_FP8_MOE_BATCHED_GEMM"
         ),
@@ -492,15 +446,11 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH": os.environ.get(
             "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH"
         ),
-        "fp8_moe_permute_with_scratch_effective": (
-            fp8_moe_permute_with_scratch
-        ),
+        "fp8_moe_permute_with_scratch_effective": (fp8_moe_permute_with_scratch),
         "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT": os.environ.get(
             "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT"
         ),
-        "fp8_moe_legacy_single_token_compact_effective": (
-            fp8_moe_legacy_single_token
-        ),
+        "fp8_moe_legacy_single_token_compact_effective": (fp8_moe_legacy_single_token),
         "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH": os.environ.get(
             "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH"
         ),
@@ -511,9 +461,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_MOE_DENSE_ALLOWLIST": os.environ.get(
             "VLLM_SM70_MOE_DENSE_ALLOWLIST"
         ),
-        "VLLM_SM70_F16_DENSE_MAX_M": os.environ.get(
-            "VLLM_SM70_F16_DENSE_MAX_M"
-        ),
+        "VLLM_SM70_F16_DENSE_MAX_M": os.environ.get("VLLM_SM70_F16_DENSE_MAX_M"),
         "f16_dense_max_m_effective": _env_int("VLLM_SM70_F16_DENSE_MAX_M", 64),
         "VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE": os.environ.get(
             "VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE"
@@ -628,6 +576,14 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN",
         32768,
     )
+    fp8_prefill_bridge = _env_bool(
+        "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE",
+        True,
+    )
+    decode_fp8_xqa_min_seq_len = _env_int(
+        "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
+        8192,
+    )
     if selector_enabled:
         expected_sm70_priority = [
             "FLASH_ATTN_V100",
@@ -652,9 +608,7 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         and decode_scalar_paged
     )
     return {
-        "VLLM_SM70_FLASH_ATTN_V100": os.environ.get(
-            "VLLM_SM70_FLASH_ATTN_V100"
-        ),
+        "VLLM_SM70_FLASH_ATTN_V100": os.environ.get("VLLM_SM70_FLASH_ATTN_V100"),
         "selector_enabled_effective": selector_enabled,
         "expected_sm70_priority": expected_sm70_priority,
         "VLLM_FLASH_V100_PREFILL_USE_TRITON": os.environ.get(
@@ -687,6 +641,14 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN"
         ),
         "decode_xqa_q4_min_seq_len_effective": decode_xqa_q4_min_seq_len,
+        "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": os.environ.get(
+            "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE"
+        ),
+        "fp8_prefill_bridge_effective": fp8_prefill_bridge,
+        "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": os.environ.get(
+            "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN"
+        ),
+        "decode_fp8_xqa_min_seq_len_effective": decode_fp8_xqa_min_seq_len,
         "full_flash_default_policy": full_flash_default_policy,
         "kv_cache_dtype": kv_cache_dtype_str,
         "fp8_kv_cache_requested_effective": fp8_kv_cache_requested,
@@ -697,9 +659,9 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "This records effective defaults even when env vars are unset; "
             "route-hit still requires backend logs or route_summary evidence. "
             "FP8 KV cache route-hit requires kv_cache_dtype=fp8* plus runtime "
-            "Flash-V100 prefill, FP8 cache write, and FP8 KV scalar-paged "
-            "decode logs; FP8 weight quantization alone is not FP8 KV cache "
-            "evidence."
+            "Flash-V100 prefill, FP8 cache write, and either FP8 XQA or "
+            "scalar-paged decode logs; FP8 weight quantization alone is not "
+            "FP8 KV cache evidence."
         ),
     }
 
@@ -742,9 +704,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
             "VLLM_SM70_USE_BREAKABLE_CUDAGRAPH"
         ),
         "sm70_breakable_requested_effective": sm70_breakable,
-        "VLLM_USE_BREAKABLE_CUDAGRAPH": os.environ.get(
-            "VLLM_USE_BREAKABLE_CUDAGRAPH"
-        ),
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH"),
         "breakable_cudagraph_effective": generic_breakable,
         "sm70_breakable_mapping_effective": sm70_breakable and generic_breakable,
         "VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE": os.environ.get(
@@ -767,9 +727,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
         "sm70_flash_v100_0dot3_benchmark_combo_kernel_requested": (
             flash_0dot3_benchmark_combo
         ),
-        "sm70_flash_v100_0dot3_benchmark_combo_kernel_effective": (
-            flash_0dot3_compile
-        ),
+        "sm70_flash_v100_0dot3_benchmark_combo_kernel_effective": (flash_0dot3_compile),
         "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE": os.environ.get(
             "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE"
         ),
@@ -778,9 +736,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
         ),
         "VLLM_USE_AOT_COMPILE": os.environ.get("VLLM_USE_AOT_COMPILE"),
         "use_aot_compile_effective": use_aot_compile,
-        "VLLM_DISABLE_COMPILE_CACHE": os.environ.get(
-            "VLLM_DISABLE_COMPILE_CACHE"
-        ),
+        "VLLM_DISABLE_COMPILE_CACHE": os.environ.get("VLLM_DISABLE_COMPILE_CACHE"),
         "disable_compile_cache_effective": disable_compile_cache,
         "sm70_flash_v100_0dot3_in_memory_aot_compile_effective": (
             flash_0dot3_compile and use_aot_compile and disable_compile_cache
@@ -839,12 +795,8 @@ def _sm70_comm_policy(engine_kwargs: dict[str, Any]) -> dict[str, Any]:
         "disable_custom_all_reduce": disable_custom_all_reduce,
         "custom_all_reduce_enabled_effective": not disable_custom_all_reduce,
         "hidden_state_custom_allreduce_effective": not disable_custom_all_reduce,
-        "production_custom_allreduce_default_policy": (
-            not disable_custom_all_reduce
-        ),
-        "VLLM_SM70_MOE_ADD_ALLREDUCE": os.environ.get(
-            "VLLM_SM70_MOE_ADD_ALLREDUCE"
-        ),
+        "production_custom_allreduce_default_policy": (not disable_custom_all_reduce),
+        "VLLM_SM70_MOE_ADD_ALLREDUCE": os.environ.get("VLLM_SM70_MOE_ADD_ALLREDUCE"),
         "all_reduce_sum2_requested_effective": moe_sum2,
         "VLLM_SM70_TOP1_CUSTOM_AR": os.environ.get("VLLM_SM70_TOP1_CUSTOM_AR"),
         "top1_custom_allreduce_effective": top1_custom_ar,
@@ -915,15 +867,9 @@ def _sm70_gdn_fla_policy() -> dict[str, Any]:
         "VLLM_SM70_FLA_BV": os.environ.get("VLLM_SM70_FLA_BV"),
         "VLLM_SM70_FLA_WARPS": os.environ.get("VLLM_SM70_FLA_WARPS"),
         "VLLM_SM70_FLA_STAGES": os.environ.get("VLLM_SM70_FLA_STAGES"),
-        "VLLM_SM70_FLA_TARGET_WAVES": os.environ.get(
-            "VLLM_SM70_FLA_TARGET_WAVES"
-        ),
-        "VLLM_SM70_FLA_BV_CANDIDATES": os.environ.get(
-            "VLLM_SM70_FLA_BV_CANDIDATES"
-        ),
-        "VLLM_SM70_GDN_KKT_SCHEDULE": os.environ.get(
-            "VLLM_SM70_GDN_KKT_SCHEDULE"
-        ),
+        "VLLM_SM70_FLA_TARGET_WAVES": os.environ.get("VLLM_SM70_FLA_TARGET_WAVES"),
+        "VLLM_SM70_FLA_BV_CANDIDATES": os.environ.get("VLLM_SM70_FLA_BV_CANDIDATES"),
+        "VLLM_SM70_GDN_KKT_SCHEDULE": os.environ.get("VLLM_SM70_GDN_KKT_SCHEDULE"),
         "gdn_kkt_schedule_effective": gdn_kkt,
         "VLLM_SM70_GDN_KKT_BK": os.environ.get("VLLM_SM70_GDN_KKT_BK"),
         "VLLM_SM70_GDN_KKT_WARPS": os.environ.get("VLLM_SM70_GDN_KKT_WARPS"),
@@ -932,27 +878,17 @@ def _sm70_gdn_fla_policy() -> dict[str, Any]:
             "VLLM_SM70_GDN_DELTA_H_SCHEDULE"
         ),
         "gdn_delta_h_schedule_effective": gdn_delta_h,
-        "VLLM_SM70_GDN_DELTA_H_BV": os.environ.get(
-            "VLLM_SM70_GDN_DELTA_H_BV"
-        ),
-        "VLLM_SM70_GDN_DELTA_H_WARPS": os.environ.get(
-            "VLLM_SM70_GDN_DELTA_H_WARPS"
-        ),
-        "VLLM_SM70_GDN_DELTA_H_STAGES": os.environ.get(
-            "VLLM_SM70_GDN_DELTA_H_STAGES"
-        ),
+        "VLLM_SM70_GDN_DELTA_H_BV": os.environ.get("VLLM_SM70_GDN_DELTA_H_BV"),
+        "VLLM_SM70_GDN_DELTA_H_WARPS": os.environ.get("VLLM_SM70_GDN_DELTA_H_WARPS"),
+        "VLLM_SM70_GDN_DELTA_H_STAGES": os.environ.get("VLLM_SM70_GDN_DELTA_H_STAGES"),
         "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": os.environ.get(
             "VLLM_SM70_GDN_CHUNK_O_SCHEDULE"
         ),
         "gdn_chunk_o_schedule_effective": gdn_chunk_o,
         "VLLM_SM70_GDN_CHUNK_O_BK": os.environ.get("VLLM_SM70_GDN_CHUNK_O_BK"),
         "VLLM_SM70_GDN_CHUNK_O_BV": os.environ.get("VLLM_SM70_GDN_CHUNK_O_BV"),
-        "VLLM_SM70_GDN_CHUNK_O_WARPS": os.environ.get(
-            "VLLM_SM70_GDN_CHUNK_O_WARPS"
-        ),
-        "VLLM_SM70_GDN_CHUNK_O_STAGES": os.environ.get(
-            "VLLM_SM70_GDN_CHUNK_O_STAGES"
-        ),
+        "VLLM_SM70_GDN_CHUNK_O_WARPS": os.environ.get("VLLM_SM70_GDN_CHUNK_O_WARPS"),
+        "VLLM_SM70_GDN_CHUNK_O_STAGES": os.environ.get("VLLM_SM70_GDN_CHUNK_O_STAGES"),
         "VLLM_SM70_FUSED_SIGMOID_GATING_SCHED": os.environ.get(
             "VLLM_SM70_FUSED_SIGMOID_GATING_SCHED"
         ),
@@ -988,16 +924,10 @@ def _sm70_gdn_fla_policy() -> dict[str, Any]:
         "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG": os.environ.get(
             "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG"
         ),
-        "gdn_decode_flashqla_route_debug_effective": (
-            flashqla_decode_route_debug
-        ),
-        "VLLM_SM70_GDN_EMPTY_CORE_OUT": os.environ.get(
-            "VLLM_SM70_GDN_EMPTY_CORE_OUT"
-        ),
+        "gdn_decode_flashqla_route_debug_effective": (flashqla_decode_route_debug),
+        "VLLM_SM70_GDN_EMPTY_CORE_OUT": os.environ.get("VLLM_SM70_GDN_EMPTY_CORE_OUT"),
         "gdn_empty_core_out_effective": empty_core_out,
-        "VLLM_SM70_GDN_Z_CONTIGUOUS": os.environ.get(
-            "VLLM_SM70_GDN_Z_CONTIGUOUS"
-        ),
+        "VLLM_SM70_GDN_Z_CONTIGUOUS": os.environ.get("VLLM_SM70_GDN_Z_CONTIGUOUS"),
         "gdn_z_contiguous_effective": gdn_z_contiguous,
         "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": os.environ.get(
             "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE"
@@ -1079,9 +1009,7 @@ def _sm70_moe_policy() -> dict[str, Any]:
         False,
     )
     return {
-        "VLLM_SM70_MOE_ADD_ALLREDUCE": os.environ.get(
-            "VLLM_SM70_MOE_ADD_ALLREDUCE"
-        ),
+        "VLLM_SM70_MOE_ADD_ALLREDUCE": os.environ.get("VLLM_SM70_MOE_ADD_ALLREDUCE"),
         "moe_add_allreduce_effective": add_allreduce,
         "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": os.environ.get(
             "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH"
@@ -1098,9 +1026,7 @@ def _sm70_moe_policy() -> dict[str, Any]:
         "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH": os.environ.get(
             "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH"
         ),
-        "single_token_indexed_stage_fastpath_effective": (
-            single_token_indexed_stage
-        ),
+        "single_token_indexed_stage_fastpath_effective": (single_token_indexed_stage),
         "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH": os.environ.get(
             "VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_W13_FASTPATH"
         ),
@@ -1155,9 +1081,7 @@ def _sm70_sampling_policy() -> dict[str, Any]:
     )
     greedy_fastpath = _env_bool("VLLM_SM70_GREEDY_TOKEN_FASTPATH", True)
     greedy_trace = _env_bool("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", False)
-    lm_head_top1 = _env_bool(
-        "VLLM_SM70_LM_HEAD_TOP1", not flash_0dot3_compile
-    )
+    lm_head_top1 = _env_bool("VLLM_SM70_LM_HEAD_TOP1", not flash_0dot3_compile)
     lm_head_top1_tc = _env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
     custom_top1_ar = _env_bool("VLLM_SM70_TOP1_CUSTOM_AR", False)
     full_lm_head = _env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
@@ -1173,9 +1097,7 @@ def _sm70_sampling_policy() -> dict[str, Any]:
         "greedy_token_fastpath_trace_effective": greedy_trace,
         "VLLM_SM70_LM_HEAD_TOP1": os.environ.get("VLLM_SM70_LM_HEAD_TOP1"),
         "lm_head_top1_effective": lm_head_top1,
-        "VLLM_SM70_LM_HEAD_TOP1_TC": os.environ.get(
-            "VLLM_SM70_LM_HEAD_TOP1_TC"
-        ),
+        "VLLM_SM70_LM_HEAD_TOP1_TC": os.environ.get("VLLM_SM70_LM_HEAD_TOP1_TC"),
         "lm_head_top1_tc_effective": lm_head_top1_tc,
         "VLLM_SM70_TOP1_CUSTOM_AR": os.environ.get("VLLM_SM70_TOP1_CUSTOM_AR"),
         "top1_custom_ar_effective": custom_top1_ar,
@@ -1352,23 +1274,17 @@ def _compute_spec_metrics(raw: dict[str, Any]) -> dict[str, Any]:
         "num_draft_tokens": num_draft_tokens,
         "num_accepted_tokens": num_accepted_tokens,
         "acceptance_length": (
-            1.0 + (num_accepted_tokens / num_drafts)
-            if num_drafts > 0
-            else None
+            1.0 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else None
         ),
         "draft_tokens_per_step": (
             num_draft_tokens / num_drafts if num_drafts > 0 else None
         ),
         "overall_acceptance_rate": (
-            num_accepted_tokens / num_draft_tokens
-            if num_draft_tokens > 0
-            else None
+            num_accepted_tokens / num_draft_tokens if num_draft_tokens > 0 else None
         ),
         "per_pos_accepted": per_pos_accepted,
         "per_pos_acceptance_rates": (
-            [v / num_drafts for v in per_pos_accepted]
-            if num_drafts > 0
-            else []
+            [v / num_drafts for v in per_pos_accepted] if num_drafts > 0 else []
         ),
     }
 
@@ -1391,21 +1307,16 @@ def _spec_metrics_snapshot(llm: Any) -> dict[str, Any] | None:
         if name == "vllm:spec_decode_num_drafts" and hasattr(metric, "value"):
             raw["num_drafts"] += int(metric.value)
             seen = True
-        elif (
-            name == "vllm:spec_decode_num_draft_tokens"
-            and hasattr(metric, "value")
-        ):
+        elif name == "vllm:spec_decode_num_draft_tokens" and hasattr(metric, "value"):
             raw["num_draft_tokens"] += int(metric.value)
             seen = True
-        elif (
-            name == "vllm:spec_decode_num_accepted_tokens"
-            and hasattr(metric, "value")
+        elif name == "vllm:spec_decode_num_accepted_tokens" and hasattr(
+            metric, "value"
         ):
             raw["num_accepted_tokens"] += int(metric.value)
             seen = True
-        elif (
-            name == "vllm:spec_decode_num_accepted_tokens_per_pos"
-            and hasattr(metric, "values")
+        elif name == "vllm:spec_decode_num_accepted_tokens_per_pos" and hasattr(
+            metric, "values"
         ):
             values = [int(v) for v in metric.values]
             if len(raw["per_pos_accepted"]) < len(values):
@@ -1506,8 +1417,8 @@ def _summarize(repeats: list[dict]) -> dict[str, Any]:
             metric_summary[f"{metric_name}_values"] = metric_values
             metric_summary[f"{metric_name}_min"] = min(metric_values)
             metric_summary[f"{metric_name}_max"] = max(metric_values)
-            metric_summary[f"{metric_name}_mean"] = (
-                sum(metric_values) / len(metric_values)
+            metric_summary[f"{metric_name}_mean"] = sum(metric_values) / len(
+                metric_values
             )
     if not values:
         return {"output_tps_values": [], **metric_summary}
@@ -1518,6 +1429,57 @@ def _summarize(repeats: list[dict]) -> dict[str, Any]:
         "output_tps_mean": sum(values) / len(values),
         **metric_summary,
     }
+
+
+def _write_results(
+    args: argparse.Namespace,
+    vllm: Any,
+    torch: Any,
+    llm_kwargs: dict[str, Any],
+    load_seconds: float,
+    case_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    first_case = case_results[0]
+    payload = {
+        "model": str(args.model),
+        "vllm": {
+            "version": getattr(vllm, "__version__", None),
+            "file": getattr(vllm, "__file__", None),
+        },
+        "torch": {
+            "version": torch.__version__,
+            "cuda": torch.version.cuda,
+        },
+        "cuda_device_count": torch.cuda.device_count(),
+        "device_capabilities": [
+            list(torch.cuda.get_device_capability(i))
+            for i in range(torch.cuda.device_count())
+        ],
+        "env": _tracked_env(),
+        "sm70_tune_policy": _sm70_tune_policy(),
+        "sm70_turbomind_policy": _sm70_turbomind_policy(),
+        "sm70_attention_policy": _sm70_attention_policy(
+            llm_kwargs.get("kv_cache_dtype")
+        ),
+        "sm70_graph_policy": _sm70_graph_policy(),
+        "sm70_comm_policy": _sm70_comm_policy(llm_kwargs),
+        "sm70_gdn_fla_policy": _sm70_gdn_fla_policy(),
+        "sm70_moe_policy": _sm70_moe_policy(),
+        "sm70_sampling_policy": _sm70_sampling_policy(),
+        "engine_kwargs": llm_kwargs,
+        "sampling_params": first_case["sampling_params"],
+        "cuda_profile_repeat": args.cuda_profile_repeat,
+        "prompt": first_case["prompt"],
+        "load_seconds": load_seconds,
+        "warmups": first_case["warmups"],
+        "repeats": first_case["repeats"],
+        "summary": first_case["summary"],
+        "cases": case_results,
+    }
+    payload = _json_safe(payload)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return payload
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1536,6 +1498,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument(
+        "--checkpoint-after-case",
+        action="store_true",
+        help=(
+            "Rewrite --out after each completed case so a long context sweep "
+            "retains completed measurements if a later case is interrupted."
+        ),
+    )
     parser.add_argument(
         "--prompt-base",
         default=(
@@ -1641,6 +1611,7 @@ def main() -> int:
                     ignore_eos=args.ignore_eos,
                     skip_special_tokens=False,
                     logprobs=args.logprobs if args.logprobs != 0 else None,
+                    seed=args.seed,
                 ),
             }
         )
@@ -1694,6 +1665,7 @@ def main() -> int:
                     "ignore_eos": args.ignore_eos,
                     "skip_special_tokens": False,
                     "logprobs": args.logprobs if args.logprobs != 0 else None,
+                    "seed": args.seed,
                 },
                 "warmups": warmups,
                 "repeats": [],
@@ -1708,7 +1680,7 @@ def main() -> int:
             raise RuntimeError(
                 "--cuda-profile-repeat requires a worker profiler for "
                 "multiprocess TP runs. Pass "
-                "--engine-arg 'profiler_config={\"profiler\":\"cuda\"}' "
+                '--engine-arg \'profiler_config={"profiler":"cuda"}\' '
                 "so Nsight Compute/Systems capture the TP worker kernels."
             ) from exc
     try:
@@ -1719,52 +1691,27 @@ def main() -> int:
             ]
             result["repeats"] = repeats
             result["summary"] = _summarize(repeats)
+            if args.checkpoint_after_case:
+                _write_results(
+                    args,
+                    vllm,
+                    torch,
+                    llm_kwargs,
+                    load_seconds,
+                    case_results,
+                )
     finally:
         if args.cuda_profile_repeat:
             llm.stop_profile()
 
-    first_case = case_results[0]
-
-    payload = {
-        "model": str(args.model),
-        "vllm": {
-            "version": getattr(vllm, "__version__", None),
-            "file": getattr(vllm, "__file__", None),
-        },
-        "torch": {
-            "version": torch.__version__,
-            "cuda": torch.version.cuda,
-        },
-        "cuda_device_count": torch.cuda.device_count(),
-        "device_capabilities": [
-            list(torch.cuda.get_device_capability(i))
-            for i in range(torch.cuda.device_count())
-        ],
-        "env": _tracked_env(),
-        "sm70_tune_policy": _sm70_tune_policy(),
-        "sm70_turbomind_policy": _sm70_turbomind_policy(),
-        "sm70_attention_policy": _sm70_attention_policy(
-            llm_kwargs.get("kv_cache_dtype")
-        ),
-        "sm70_graph_policy": _sm70_graph_policy(),
-        "sm70_comm_policy": _sm70_comm_policy(llm_kwargs),
-        "sm70_gdn_fla_policy": _sm70_gdn_fla_policy(),
-        "sm70_moe_policy": _sm70_moe_policy(),
-        "sm70_sampling_policy": _sm70_sampling_policy(),
-        "engine_kwargs": llm_kwargs,
-        "sampling_params": first_case["sampling_params"],
-        "cuda_profile_repeat": args.cuda_profile_repeat,
-        "prompt": first_case["prompt"],
-        "load_seconds": load_seconds,
-        "warmups": first_case["warmups"],
-        "repeats": first_case["repeats"],
-        "summary": first_case["summary"],
-        "cases": case_results,
-    }
-
-    payload = _json_safe(payload)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    payload = _write_results(
+        args,
+        vllm,
+        torch,
+        llm_kwargs,
+        load_seconds,
+        case_results,
+    )
     printable = {
         key: value
         for key, value in payload.items()

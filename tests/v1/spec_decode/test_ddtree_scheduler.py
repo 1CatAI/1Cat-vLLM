@@ -15,9 +15,16 @@ class _Request:
         self.is_prefill_chunk = is_prefill_chunk
         self.spec_token_ids: list[int] = []
         self.structured_output_request = None
+        self.max_tokens = 8
+        self._output_token_ids: list[int] = []
+        self.num_output_placeholders = 0
 
     def is_finished(self) -> bool:
         return False
+
+    @property
+    def num_output_tokens(self) -> int:
+        return len(self._output_token_ids)
 
 
 class _StructuredOutputManager:
@@ -227,3 +234,18 @@ def test_ddtree_payload_for_tree_schedule_can_allow_branched_payload() -> None:
     scheduler.ddtree_payloads_by_req_id = {"r0": payload}
 
     assert scheduler._ddtree_payload_for_tree_schedule(request) is payload
+
+
+def test_ddtree_tree_max_output_uses_max_depth_plus_bonus() -> None:
+    payload = _token_matching_branched_payload()
+
+    assert Scheduler._ddtree_payload_max_output_tokens(payload) == 3
+
+
+def test_ddtree_remaining_output_subtracts_placeholders() -> None:
+    request = _Request()
+    request.max_tokens = 8
+    request._output_token_ids = [1, 2, 3, 4, 5]
+    request.num_output_placeholders = 2
+
+    assert Scheduler._remaining_output_tokens(request) == 1

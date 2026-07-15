@@ -113,6 +113,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
   } else {
     reg_buffer = inp.data_ptr();
   }
+
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
       fa->allreduce<float>(stream, reinterpret_cast<float*>(reg_buffer),
@@ -137,6 +138,143 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
       throw std::runtime_error(
           "custom allreduce only supports float32, float16 and bfloat16");
   }
+}
+
+namespace {
+
+template <int kWorldSize>
+void sm70_all_reduce_gemma_rms_norm_impl(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(normalized_out.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual_out.scalar_type(), at::ScalarType::Float);
+  if constexpr (kWorldSize == 4) {
+    TORCH_CHECK(residual.scalar_type() == at::ScalarType::Float,
+                "SM70 TP4 Gemma RMSNorm prototype residual must be float32.");
+  } else {
+    TORCH_CHECK(residual.scalar_type() == at::ScalarType::Half ||
+                residual.scalar_type() == at::ScalarType::Float,
+                "SM70 Gemma RMSNorm prototype residual must be float16 or "
+                "float32.");
+  }
+  TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half ||
+              weight.scalar_type() == at::ScalarType::Float,
+              "SM70 Gemma RMSNorm prototype weight must be float16 or "
+              "float32.");
+  TORCH_CHECK_EQ(inp.dim(), 2);
+  TORCH_CHECK_EQ(inp.size(1), kHiddenSize);
+  TORCH_CHECK(residual.sizes() == inp.sizes(),
+              "SM70 Gemma RMSNorm prototype residual shape must match inp.");
+  TORCH_CHECK(normalized_out.sizes() == inp.sizes(),
+              "SM70 Gemma RMSNorm prototype normalized_out shape must match "
+              "inp.");
+  TORCH_CHECK(residual_out.sizes() == inp.sizes(),
+              "SM70 Gemma RMSNorm prototype residual_out shape must match inp.");
+  TORCH_CHECK_EQ(weight.dim(), 1);
+  TORCH_CHECK_EQ(weight.numel(), kHiddenSize);
+  TORCH_CHECK_EQ(residual.get_device(), inp.get_device());
+  TORCH_CHECK_EQ(weight.get_device(), inp.get_device());
+  TORCH_CHECK_EQ(normalized_out.get_device(), inp.get_device());
+  TORCH_CHECK_EQ(residual_out.get_device(), inp.get_device());
+  TORCH_CHECK(inp.is_contiguous());
+  TORCH_CHECK(residual.is_contiguous());
+  TORCH_CHECK(weight.is_contiguous());
+  TORCH_CHECK(normalized_out.is_contiguous());
+  TORCH_CHECK(residual_out.is_contiguous());
+
+  const auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.data_ptr();
+  }
+
+  const int num_tokens = static_cast<int>(inp.size(0));
+  const int hidden_size = static_cast<int>(inp.size(1));
+  const float epsilon_f = static_cast<float>(epsilon);
+
+  if constexpr (kWorldSize == 4) {
+    static const bool trace_enabled = sm70_profile_trace_enabled();
+    static std::atomic<bool> logged_route{false};
+    if (trace_enabled) {
+      cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+      AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+      bool expected = false;
+      if (capture_status == cudaStreamCaptureStatusActive &&
+          logged_route.compare_exchange_strong(expected, true)) {
+        std::cerr << "SM70 TP4 all_reduce_gemma_rms_norm op reached"
+                  << " rank=" << fa->rank_ << " num_tokens=" << num_tokens
+                  << " residual=" << scalar_type_name(residual.scalar_type())
+                  << " capture=" << capture_status_name(capture_status)
+                  << std::endl;
+      }
+    }
+  }
+
+  auto input_ptr = reinterpret_cast<half*>(reg_buffer);
+  auto normalized_out_ptr = reinterpret_cast<half*>(normalized_out.data_ptr());
+  auto residual_out_ptr = reinterpret_cast<float*>(residual_out.data_ptr());
+
+  if (residual.scalar_type() == at::ScalarType::Float) {
+    auto residual_ptr = reinterpret_cast<const float*>(residual.data_ptr());
+    if (weight.scalar_type() == at::ScalarType::Float) {
+      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, float>(
+          stream, input_ptr, residual_ptr,
+          reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+    } else {
+      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, float, half>(
+          stream, input_ptr, residual_ptr,
+          reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+    }
+  } else if constexpr (kWorldSize == 2) {
+    auto residual_ptr = reinterpret_cast<const half*>(residual.data_ptr());
+    if (weight.scalar_type() == at::ScalarType::Float) {
+      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, float>(
+          stream, input_ptr, residual_ptr,
+          reinterpret_cast<const float*>(weight.data_ptr()), normalized_out_ptr,
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+    } else {
+      fa->sm70_allreduce_gemma_rms_norm<kWorldSize, half, half>(
+          stream, input_ptr, residual_ptr,
+          reinterpret_cast<const half*>(weight.data_ptr()), normalized_out_ptr,
+          residual_out_ptr, num_tokens, hidden_size, epsilon_f);
+    }
+  }
+}
+
+}  // namespace
+
+void sm70_tp2_all_reduce_gemma_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  sm70_all_reduce_gemma_rms_norm_impl<2>(
+      _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+      reg_buffer_sz_bytes, epsilon);
+}
+
+void sm70_tp4_all_reduce_gemma_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon) {
+  sm70_all_reduce_gemma_rms_norm_impl<4>(
+      _fa, inp, residual, weight, normalized_out, residual_out, _reg_buffer,
+      reg_buffer_sz_bytes, epsilon);
 }
 
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,

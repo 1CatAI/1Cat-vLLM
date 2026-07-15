@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
@@ -11,6 +12,27 @@ from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
 
 logger = init_logger(__name__)
+
+
+def _get_sm70_mtp_context_buckets() -> tuple[int, ...]:
+    """Parse optional one-request MTP attention graph context buckets."""
+    raw = os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", "").strip()
+    if not raw:
+        return ()
+
+    try:
+        buckets = tuple(sorted({int(value.strip()) for value in raw.split(",")}))
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_SM70_MTP_CONTEXT_BUCKETS must be a comma-separated list "
+            f"of positive integers, got {raw!r}"
+        ) from exc
+    if not buckets or buckets[0] <= 0:
+        raise ValueError(
+            "VLLM_SM70_MTP_CONTEXT_BUCKETS must contain only positive integers, "
+            f"got {raw!r}"
+        )
+    return buckets
 
 
 class CudagraphDispatcher:
@@ -40,6 +62,8 @@ class CudagraphDispatcher:
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
+        self.sm70_mtp_context_buckets = _get_sm70_mtp_context_buckets()
+        self._logged_sm70_mtp_context_bucket = False
 
         # Dict to store valid cudagraph dispatching keys.
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
@@ -147,7 +171,11 @@ class CudagraphDispatcher:
 
         if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):
             num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
-            assert num_tokens_padded % uniform_decode_query_len == 0
+            assert num_tokens_padded % uniform_decode_query_len == 0, (
+                f"num_tokens_padded={num_tokens_padded} must be divisible by "
+                f"uniform_decode_query_len={uniform_decode_query_len} "
+                f"for num_tokens={num_tokens}"
+            )
         else:
             uniform_decode = False
             num_reqs = min(num_tokens_padded, max_num_seqs)
@@ -168,12 +196,50 @@ class CudagraphDispatcher:
         )
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
+    def _add_mtp_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
+        """Add short-context graphs only for the single-request MTP verifier."""
+        if (
+            not self.sm70_mtp_context_buckets
+            or self.uniform_decode_query_len <= 1
+            or not batch_descriptor.uniform
+            or batch_descriptor.num_tokens != self.uniform_decode_query_len
+        ):
+            return
+
+        for bucket in self.sm70_mtp_context_buckets:
+            self.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                replace(batch_descriptor, attention_context_bucket=bucket),
+            )
+
+    def _get_mtp_context_bucket_descriptor(
+        self,
+        batch_descriptor: BatchDescriptor,
+        attention_context_len: int | None,
+    ) -> BatchDescriptor:
+        """Return a bounded MTP graph key only when its capacity is sufficient."""
+        if (
+            attention_context_len is None
+            or attention_context_len <= 0
+            or not self.sm70_mtp_context_buckets
+            or self.uniform_decode_query_len <= 1
+            or not batch_descriptor.uniform
+            or batch_descriptor.num_tokens != self.uniform_decode_query_len
+        ):
+            return batch_descriptor
+
+        for bucket in self.sm70_mtp_context_buckets:
+            if attention_context_len <= bucket:
+                return replace(batch_descriptor, attention_context_bucket=bucket)
+        return batch_descriptor
+
     def initialize_cudagraph_keys(
         self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int = 1
     ):
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        self.uniform_decode_query_len = uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:
@@ -238,17 +304,22 @@ class CudagraphDispatcher:
             cudagraph_capture_sizes_for_decode = [
                 x
                 for x in self.compilation_config.cudagraph_capture_sizes
-                if x <= max_num_tokens and x >= uniform_decode_query_len
+                if x <= max_num_tokens
+                and x >= uniform_decode_query_len
+                and (
+                    self._bs_to_padded_graph_size[x]
+                    % uniform_decode_query_len
+                    == 0
+                )
             ]
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases
             ):
-                self.add_cudagraph_key(
-                    CUDAGraphMode.FULL,
-                    self._create_padded_batch_descriptor(
-                        bs, True, num_active_loras > 0, num_active_loras
-                    ),
+                batch_descriptor = self._create_padded_batch_descriptor(
+                    bs, True, num_active_loras > 0, num_active_loras
                 )
+                self.add_cudagraph_key(CUDAGraphMode.FULL, batch_descriptor)
+                self._add_mtp_context_bucket_keys(batch_descriptor)
 
         self.keys_initialized = True
 
@@ -258,6 +329,7 @@ class CudagraphDispatcher:
         uniform_decode: bool = False,
         has_lora: bool = False,
         num_active_loras: int = 0,
+        attention_context_len: int | None = None,
         valid_modes: AbstractSet[CUDAGraphMode] | None = None,
         invalid_modes: AbstractSet[CUDAGraphMode] | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
@@ -273,6 +345,8 @@ class CudagraphDispatcher:
                 length is uniform_decode_query_len).
             has_lora: Whether LoRA is active.
             num_active_loras: Number of distinct active LoRA adapters.
+            attention_context_len: Maximum active KV length for optional
+                attention-specialized MTP graph selection.
             valid_modes: Set of cudagraph modes that are allowed. None means
                 all modes are allowed.
             invalid_modes: Set of cudagraph modes to exclude. Subtracted from
@@ -326,9 +400,27 @@ class CudagraphDispatcher:
 
         if CUDAGraphMode.FULL in allowed_modes:
             # check if key exists for full cudagraph
-            batch_desc_to_check = batch_desc
+            batch_desc_to_check = self._get_mtp_context_bucket_descriptor(
+                batch_desc, attention_context_len
+            )
             if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:
+                if (
+                    batch_desc_to_check.attention_context_bucket is not None
+                    and not self._logged_sm70_mtp_context_bucket
+                ):
+                    logger.info(
+                        "Using bounded SM70 MTP attention CUDA graph: "
+                        "context=%d bucket=%d descriptor=%s",
+                        attention_context_len,
+                        batch_desc_to_check.attention_context_bucket,
+                        batch_desc_to_check,
+                    )
+                    self._logged_sm70_mtp_context_bucket = True
                 return CUDAGraphMode.FULL, batch_desc_to_check
+            # A bounded graph might be absent because capture-size policy
+            # excluded it. Preserve the existing full-context graph then.
+            if batch_desc in self.cudagraph_keys[CUDAGraphMode.FULL]:
+                return CUDAGraphMode.FULL, batch_desc
 
         if CUDAGraphMode.PIECEWISE in allowed_modes:
             # also check if the relaxed key exists for more "general"
@@ -360,9 +452,16 @@ class CudagraphDispatcher:
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
             descs = list(self.cudagraph_keys[mode])
             if descs:
-                # Sort by (num_tokens, num_active_loras) descending
+                # Capture the generic full-context graph before smaller
+                # context-specialized graphs so its allocations seed the pool.
                 descs.sort(
-                    key=lambda d: (d.num_tokens, d.num_active_loras),
+                    key=lambda d: (
+                        d.num_tokens,
+                        d.attention_context_bucket
+                        if d.attention_context_bucket is not None
+                        else float("inf"),
+                        d.num_active_loras,
+                    ),
                     reverse=True,
                 )
                 result.append((mode, descs))

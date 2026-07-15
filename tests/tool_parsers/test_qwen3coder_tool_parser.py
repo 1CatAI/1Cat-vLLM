@@ -1381,6 +1381,39 @@ def test_streaming_multi_param_single_chunk(qwen3_tool_parser, qwen3_tokenizer):
     assert args["unit"] == "fahrenheit"
 
 
+@pytest.mark.parametrize(
+    "deltas, expected_content",
+    [
+        (["<", "meta charset=\"UTF-8\">"], '<meta charset="UTF-8">'),
+        (["<t", "itle>macOS</title>"], "<title>macOS</title>"),
+        (["<", "<", "span>text</span>"], "<<span>text</span>"),
+    ],
+)
+def test_pending_non_tool_marker_prefix_preserves_content(
+    deltas: list[str],
+    expected_content: str,
+):
+    """Do not drop HTML prefixes while waiting for a possible tool marker."""
+    parser = object.__new__(Qwen3CoderToolParser)
+    parser.tool_call_start_token = "<tool_call>"
+    parser.tool_call_prefix = "<function="
+
+    previous_text = ""
+    emitted = []
+    for delta_text in deltas:
+        current_text = previous_text + delta_text
+        content = parser._pending_tool_marker_delta_prefix(
+            previous_text,
+            current_text,
+            delta_text,
+        )
+        if content:
+            emitted.append(content)
+        previous_text = current_text
+
+    assert "".join(emitted) == expected_content
+
+
 def test_no_double_serialization_string_args(qwen3_tool_parser):
     """Regression: string arguments must not be double-serialized (PR #35615)."""
     tools = [

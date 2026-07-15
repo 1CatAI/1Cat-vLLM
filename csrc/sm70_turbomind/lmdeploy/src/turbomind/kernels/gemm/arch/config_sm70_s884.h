@@ -56,7 +56,8 @@ struct Sm70_s884 {
              int  GroupSizeU = 1,
              int  GroupSizeV = 1,
              int  TILE_C_M_  = -1,
-             int  TILE_C_N_  = -1>
+             int  TILE_C_N_  = -1,
+             int  GmemLookahead = 1>
     struct Type {
 
         // (TM, TN, TK) = R(MMA_Atom, SmemCopy_Atom)
@@ -79,7 +80,8 @@ struct Sm70_s884 {
                                       V,
                                       GroupSizeV,
                                       Stages,
-                                      true>;  // FusePrefetch_
+                                      true,
+                                      GmemLookahead>;  // FusePrefetch_
 
         static constexpr int CHUNK_K = std::lcm(std::lcm(GroupSizeU, GroupSizeV), CTA_K);
 
@@ -114,6 +116,18 @@ using Config_U4_d = Sm70_s884<typename GetOperand<HMMA_884, OPERAND_A, half, kRo
                               half,
                               raster_order,
                               -1>;
+
+template<Order raster_order>
+using Config_U4_d_A8x64Swizzle = Sm70_s884<Operand_A_Swizzle_8x64<half>,
+                                           Transform_Default,
+                                           VoidOperand,
+                                           typename GetOperand<HMMA_884, OPERAND_B, uint4_t, kRowMajor, true>::Operand,
+                                           Transform_HMMA_SIMT_B,
+                                           typename GetOperand<HMMA_884, OPERAND_V, uint32_t, kColMajor, true>::Operand,
+                                           kRowMajor,
+                                           half,
+                                           raster_order,
+                                           -1>;
 
 template<Order raster_order>
 using Config_U4_g = Sm70_s884<Operand_A<half>,           // A

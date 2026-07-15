@@ -22,6 +22,9 @@ from vllm.model_executor.layers.quantization.fp8 import (
     Fp8LinearMethod,
     Fp8MoEMethod,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsKVCacheMethod,
+)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
@@ -509,12 +512,10 @@ def test_fp8_e5m2_checkpoint_override_forces_unit_scales():
 
 def test_fp8_e5m2_checkpoint_override_init_gate(monkeypatch):
     class DummyQuantConfig:
-
         def get_quant_method(self, layer, prefix):
             return BaseKVCacheMethod(self)
 
     class DummySM70Platform:
-
         @staticmethod
         def is_cuda():
             return True
@@ -537,6 +538,42 @@ def test_fp8_e5m2_checkpoint_override_init_gate(monkeypatch):
     assert layer.v_scale.item() == -1.0
     assert layer.q_scale.item() == -1.0
     assert layer.prob_scale.item() == -1.0
+
+
+def test_fp8_e5m2_compressed_checkpoint_without_kv_scheme_uses_unit_scales(
+    monkeypatch,
+):
+    class DummyCompressedQuantConfig:
+        kv_cache_scheme = None
+
+        def get_quant_method(self, layer, prefix):
+            return CompressedTensorsKVCacheMethod(self)
+
+    class DummySM70Platform:
+        @staticmethod
+        def is_cuda():
+            return True
+
+        @staticmethod
+        def has_device_capability(capability):
+            return capability <= 70
+
+    layer = torch.nn.Module()
+    layer.kv_cache_dtype = "fp8_e5m2"
+
+    monkeypatch.setattr(attention_module, "current_platform", DummySM70Platform())
+    monkeypatch.setattr(attention_module.envs, "VLLM_SM70_FLASH_ATTN_V100", True)
+
+    attention_module._init_kv_cache_quant(layer, DummyCompressedQuantConfig(), "attn")
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert layer._force_unit_fp8_e5m2_kv_scales is True
+    assert layer._k_scale_float == 1.0
+    assert layer._v_scale_float == 1.0
+    assert layer._q_scale_float == 1.0
+    assert not hasattr(layer, "k_scale")
+    assert not hasattr(layer, "v_scale")
+    assert not hasattr(layer, "q_scale")
 
 
 @pytest.mark.skipif(

@@ -16,7 +16,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["L"])
 def _fused_post_conv_kernel(
     # ---- inputs ----
     mixed_qkv_ptr,  # [L, qkv_dim] conv'd output (contiguous)

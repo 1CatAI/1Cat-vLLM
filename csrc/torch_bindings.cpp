@@ -239,6 +239,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_gemm_sm70_out", torch::kCUDA, &nvfp4_gemm_sm70_out);
 
   ops.def(
+      "nvfp4_gemv_sm70_raw_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _scaling_factors, Tensor(b!) partials, "
+      "int group_size, int split_k) -> ()");
+  ops.impl("nvfp4_gemv_sm70_raw_out", torch::kCUDA,
+           &nvfp4_gemv_sm70_raw_out);
+
+  ops.def(
+      "nvfp4_gemv_sm70_warp_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _scaling_factors, int group_size) -> ()");
+  ops.impl("nvfp4_gemv_sm70_warp_out", torch::kCUDA,
+           &nvfp4_gemv_sm70_warp_out);
+
+  ops.def(
+      "nvfp4_gemv_sm70_h2_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _scaling_factors, Tensor(b!) partials, "
+      "int group_size, int split_k) -> ()");
+  ops.impl("nvfp4_gemv_sm70_h2_out", torch::kCUDA,
+           &nvfp4_gemv_sm70_h2_out);
+
+  ops.def(
       "fp8_gemm_sm70_out_auto(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors) -> ()");
   ops.impl("fp8_gemm_sm70_out_auto", torch::kCUDA,
@@ -269,6 +289,43 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int vocab_start_index, int num_vocab_padding) -> ()");
   ops.impl("sm70_f16_lm_head_top1_tc_out", torch::kCUDA,
            &sm70_f16_lm_head_top1_tc_out);
+
+  ops.def(
+      "sm70_f16_lm_head_top20_tc_out(Tensor(a!) values_out, "
+      "Tensor(b!) indices_out, Tensor _in_feats, Tensor _kernel, int k_ld, "
+      "int vocab_start_index, int num_vocab_padding) -> ()");
+  ops.impl("sm70_f16_lm_head_top20_tc_out", torch::kCUDA,
+           &sm70_f16_lm_head_top20_tc_out);
+
+  ops.def(
+      "sm70_merge_tail_top20_pack_out(Tensor(a!) pairs_out, "
+      "Tensor base_values, Tensor base_indices, Tensor base_token_id_map, "
+      "Tensor tail_logits, Tensor tail_token_ids, int tail_row_start) -> ()");
+  ops.impl("sm70_merge_tail_top20_pack_out", torch::kCUDA,
+           &sm70_merge_tail_top20_pack_out);
+
+  ops.def(
+      "sm70_sample_packed_top20_out(Tensor(a!) sampled_token_out, "
+      "Tensor(b!) sparse_ids_out, Tensor(c!) sparse_probs_out, "
+      "Tensor gathered_pairs, Tensor exponential, float top_p) -> ()");
+  ops.impl("sm70_sample_packed_top20_out", torch::kCUDA,
+           &sm70_sample_packed_top20_out);
+
+  ops.def(
+      "sm70_dynamic_draft_vocab_update_tail_out(Tensor(a!) lru_token_ids, "
+      "Tensor(b!) local_tail_token_ids, Tensor(c!) source_row_indices, "
+      "Tensor observed_output_ids, Tensor target_candidate_ids, "
+      "Tensor base_token_mask, int full_vocab_size, int local_shard_start, "
+      "int local_shard_end) -> ()");
+  ops.impl("sm70_dynamic_draft_vocab_update_tail_out", torch::kCUDA,
+           &sm70_dynamic_draft_vocab_update_tail_out);
+
+  ops.def(
+      "sm70_dynamic_draft_vocab_refresh_tail_weight_out("
+      "Tensor(a!) local_tail_weight, Tensor source_weight, "
+      "Tensor source_row_indices) -> ()");
+  ops.impl("sm70_dynamic_draft_vocab_refresh_tail_weight_out", torch::kCUDA,
+           &sm70_dynamic_draft_vocab_refresh_tail_weight_out);
 
   ops.def(
       "sm70_f16_gate_mul_out(Tensor(a!) out, Tensor _in_feats, "
@@ -556,6 +613,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("all_reduce", torch::kCUDA, &all_reduce);
+  custom_ar.def(
+      "sm70_tp2_all_reduce_gemma_rms_norm(int fa, Tensor inp, Tensor "
+      "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
+      "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp2_all_reduce_gemma_rms_norm", torch::kCUDA,
+                 &sm70_tp2_all_reduce_gemma_rms_norm);
+  custom_ar.def(
+      "sm70_tp4_all_reduce_gemma_rms_norm(int fa, Tensor inp, Tensor "
+      "residual, Tensor weight, Tensor! normalized_out, Tensor! residual_out, "
+      "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm", torch::kCUDA,
+                 &sm70_tp4_all_reduce_gemma_rms_norm);
   custom_ar.def(
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);

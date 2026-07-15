@@ -162,6 +162,32 @@ def test_static_decode_cuda_graph_capture_runtime_active_keeps_short_plan(
     assert plan.workspace_num_partitions == 32
 
 
+def test_static_decode_short_workspace_can_preserve_partition_boundaries(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    monkeypatch.setattr(flash_attn_v100, "_cuda_graph_capture_active", lambda: True)
+    _clear_decode_caches()
+
+    q = torch.empty((5, 6, 256), dtype=torch.float16)
+    k_cache = torch.empty((16448, 16, 1, 256), dtype=torch.float16)
+    block_table = torch.zeros((5, 16448), dtype=torch.int32)
+
+    plan = flash_attn_v100._get_decode_plan(
+        q,
+        k_cache,
+        block_table,
+        max_seq_len_hint=4096,
+        workspace_seq_capacity_hint=4096,
+        partition_size_hint=1024,
+    )
+
+    assert plan.partition_size == 1024
+    assert plan.actual_num_partitions == 4
+    assert plan.launch_num_partitions == 4
+    assert plan.workspace_num_partitions == 4
+
+
 @torch.inference_mode()
 def test_stale_active_num_partitions_does_not_truncate_decode(
     monkeypatch,

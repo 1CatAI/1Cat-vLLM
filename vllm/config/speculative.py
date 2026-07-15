@@ -53,6 +53,7 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
+DDTreeBuildMode = Literal["best_first", "root_leaf", "spine_leaf"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -155,13 +156,19 @@ class SpeculativeConfig:
     ddtree_budget: int | None = Field(default=None, ge=1)
     """Maximum number of non-root DDTree verifier nodes. Defaults to
     num_speculative_tokens for method='dflash_ddtree'."""
-    ddtree_top_k: int = Field(default=8, ge=1)
-    """Per-depth DFlash candidate count used to build DDTree branches."""
-    ddtree_chain_seed: bool = True
-    """Seed the DDTree with the top-1 chain before best-first branch expansion."""
-    ddtree_disable_tree_verify: bool = True
-    """Keep method='dflash_ddtree' on the flat DFlash path until tree verifier
-    correctness and Qwen GDN state commit are proven."""
+    ddtree_top_k: int | None = Field(default=None, ge=1)
+    """Per-depth DFlash candidate count used to build DDTree branches. Defaults
+    to the DDTree node budget, matching the reference implementation."""
+    ddtree_chain_seed: bool = False
+    """Seed the DDTree with the top-1 chain before best-first branch expansion.
+    Defaults to ``False`` to match the reference DDTree best-first expansion.
+    Set to ``True`` to force a top-1 spine before branch expansion."""
+    ddtree_tree_mode: DDTreeBuildMode = "best_first"
+    """DDTree topology. ``best_first`` preserves cumulative-score expansion.
+    ``root_leaf``/``spine_leaf`` preserve the top-1 chain and attach alternative
+    candidates only as leaves under the top-1 spine."""
+    ddtree_disable_tree_verify: bool = False
+    """Use the flat DFlash path instead of DDTree tree verification."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -312,6 +319,7 @@ class SpeculativeConfig:
                     self.ddtree_budget,
                     self.ddtree_top_k,
                     self.ddtree_chain_seed,
+                    self.ddtree_tree_mode,
                 )
             )
 

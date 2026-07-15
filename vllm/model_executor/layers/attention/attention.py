@@ -175,16 +175,22 @@ def _init_kv_cache_quant(
                 type(quant_method).process_weights_after_loading
                 is BaseKVCacheMethod.process_weights_after_loading
             )
-            if not sm70_flash_v100 or not uses_base_scale_processing:
+            has_checkpoint_kv_scheme = (
+                getattr(quant_method.quant_config, "kv_cache_scheme", None) is not None
+            )
+            unit_scale_compatible = (
+                uses_base_scale_processing or not has_checkpoint_kv_scheme
+            )
+            if not sm70_flash_v100 or not unit_scale_compatible:
                 raise ValueError(
-                    "fp8_e5m2 kv-cache is not supported with fp8 checkpoints "
-                    "outside the SM70 Flash-V100 unit-scale override path."
+                    "fp8_e5m2 kv-cache is not supported with checkpoint KV "
+                    "scales outside the SM70 Flash-V100 unit-scale override path."
                 )
             layer._force_unit_fp8_e5m2_kv_scales = True
             logger.info_once(
-                "Using explicit fp8_e5m2 KV cache with an FP8 checkpoint on "
-                "SM70 Flash-V100; checkpoint KV/q/prob scales will be ignored "
-                "and unit scales will be used."
+                "Using explicit fp8_e5m2 KV cache with a quantized checkpoint "
+                "on SM70 Flash-V100; checkpoint KV/q/prob scales, when present, "
+                "will be ignored and unit scales will be used."
             )
         # If quantization is enabled, we make "k_scale" and "v_scale"
         # parameters so that it can be loaded from the model checkpoint.

@@ -1787,7 +1787,13 @@ class EngineArgs:
             return
 
         if "draft_sample_method" not in self.speculative_config:
-            draft_sample_method = "greedy" if spec_method == "mtp" else "probabilistic"
+            # For SM70 native MTP, official Qwen sampling is non-greedy
+            # (temperature=1.0/top_p=0.95/top_k=20). Probabilistic draft
+            # sampling provides draft_probs for standard rejection sampling and
+            # is the validated high-acceptance path. Greedy requests still take
+            # the argmax fast path inside the proposer when sampling metadata is
+            # all-greedy, so this default does not penalize deterministic runs.
+            draft_sample_method = "probabilistic"
             self.speculative_config["draft_sample_method"] = draft_sample_method
             profile_updates.append(
                 f"speculative_config.draft_sample_method={draft_sample_method}"
@@ -1835,8 +1841,22 @@ class EngineArgs:
             num_speculative_tokens = int(
                 self.speculative_config.get("num_speculative_tokens") or 0
             )
-            if num_speculative_tokens > 0:
-                decode_query_len = num_speculative_tokens + 1
+            num_speculative_state_tokens = num_speculative_tokens
+            if (
+                self.speculative_config.get("method") == "dflash_ddtree"
+                and not self.speculative_config.get(
+                    "ddtree_disable_tree_verify", False
+                )
+            ):
+                ddtree_budget = int(
+                    self.speculative_config.get("ddtree_budget")
+                    or num_speculative_tokens
+                )
+                num_speculative_state_tokens = max(
+                    num_speculative_tokens, ddtree_budget
+                )
+            if num_speculative_state_tokens > 0:
+                decode_query_len = num_speculative_state_tokens + 1
                 max_num_seqs = max(int(self.max_num_seqs or 1), 1)
                 cudagraph_capture_sizes = sorted(
                     set(cudagraph_capture_sizes)
@@ -2252,7 +2272,7 @@ class EngineArgs:
             and scheduler_config.max_num_batched_tokens
             < (
                 scheduler_config.max_num_seqs
-                * (speculative_config.num_speculative_tokens + 1)
+                * (speculative_config.num_speculative_state_tokens() + 1)
             )
         ):
             raise ValueError(

@@ -944,6 +944,17 @@ class InputBatch:
             repetition_penalties=self.repetition_penalties[:num_reqs],
             output_token_ids=output_token_ids,
             spec_token_ids=self.spec_token_ids,
+            top_k_cpu=(
+                None
+                if self.no_top_k
+                else tuple(int(v) for v in self.top_k_cpu[:num_reqs])
+            ),
+            temperature_cpu=tuple(float(v) for v in self.temperature_cpu[:num_reqs]),
+            top_p_cpu=(
+                None
+                if self.no_top_p
+                else tuple(float(v) for v in self.top_p_cpu[:num_reqs])
+            ),
             no_penalties=self.no_penalties,
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,

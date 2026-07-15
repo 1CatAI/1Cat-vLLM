@@ -4,6 +4,7 @@
 
 import json
 import os
+import time
 
 import torch
 
@@ -20,6 +21,48 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _ddtree_worker_profile_enabled() -> bool:
+    return os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
+
+
+def _cuda_profile_enabled(tensor: torch.Tensor) -> bool:
+    return (
+        _ddtree_worker_profile_enabled()
+        and torch.cuda.is_available()
+        and tensor.is_cuda
+    )
+
+
+def _cuda_sync_breakdown_ms(tensor: torch.Tensor) -> tuple[float, float]:
+    t0 = time.perf_counter()
+    torch.cuda.current_stream(tensor.device).synchronize()
+    current_stream_ms = (time.perf_counter() - t0) * 1000.0
+    t0 = time.perf_counter()
+    torch.cuda.synchronize(tensor.device)
+    device_extra_ms = (time.perf_counter() - t0) * 1000.0
+    return current_stream_ms, device_extra_ms
+
+
+def _cuda_stage_start(enabled: bool) -> torch.cuda.Event | None:
+    if not enabled:
+        return None
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    return event
+
+
+def _cuda_stage_ms(
+    enabled: bool,
+    start_event: torch.cuda.Event | None,
+) -> float:
+    if not enabled or start_event is None:
+        return 0.0
+    end_event = torch.cuda.Event(enable_timing=True)
+    end_event.record()
+    end_event.synchronize()
+    return start_event.elapsed_time(end_event)
 
 
 def _parse_step_filter(raw: str | None) -> set[int] | None:
@@ -207,15 +250,48 @@ class LogitsProcessor(PluggableLayer):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
+        profile_enabled = _cuda_profile_enabled(hidden_states)
+        pre_stream_sync_ms = 0.0
+        pre_device_extra_sync_ms = 0.0
+        if profile_enabled:
+            pre_stream_sync_ms, pre_device_extra_sync_ms = (
+                _cuda_sync_breakdown_ms(hidden_states)
+            )
+        pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
+
         # Get the logits for the next tokens.
+        stage_start = _cuda_stage_start(profile_enabled)
         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
         # Gather logits for TP
+        stage_start = _cuda_stage_start(profile_enabled)
         logits = self._gather_logits(logits)
+        gather_logits_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
         # Remove paddings in vocab (if any).
+        stage_start = _cuda_stage_start(profile_enabled)
         if logits is not None:
             logits = logits[..., : self.org_vocab_size]
+        trim_vocab_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        if profile_enabled:
+            logger.info(
+                "DFLASH_DDTREE_WORKER_PROFILE full_logits_split "
+                "pre_sync_ms=%.3f local_lm_head_ms=%.3f "
+                "gather_logits_ms=%.3f trim_vocab_ms=%.3f rows=%d "
+                "local_vocab=%d output_vocab=%d use_all_gather=%s "
+                "pre_stream_sync_ms=%.3f pre_device_extra_sync_ms=%.3f",
+                pre_sync_ms,
+                local_lm_head_ms,
+                gather_logits_ms,
+                trim_vocab_ms,
+                int(hidden_states.shape[0]),
+                int(lm_head.num_embeddings_per_partition),
+                int(logits.shape[-1]) if logits is not None else -1,
+                self.use_all_gather,
+                pre_stream_sync_ms,
+                pre_device_extra_sync_ms,
+            )
         return logits
 
     def get_top_tokens(
@@ -292,6 +368,259 @@ class LogitsProcessor(PluggableLayer):
             lm_head, hidden_states, embedding_bias, top_tokens
         )
         return top_tokens
+
+    def get_topk_tokens_and_logprobs(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vocab-parallel top-k with exact global logprobs.
+
+        This keeps DDTree candidate extraction on the compact TP path: each
+        rank computes local top-k and a local logsumexp, then gathers only
+        ``top_k`` pairs plus one normalizer scalar per row.
+        """
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.scale <= 0.0 and self.scale != 1.0:
+            raise ValueError(
+                "The local top-k reduction optimization is not supported for "
+                "non-positive logit scaling factors."
+            )
+
+        profile_enabled = _cuda_profile_enabled(hidden_states)
+        pre_stream_sync_ms = 0.0
+        pre_device_extra_sync_ms = 0.0
+        if profile_enabled:
+            pre_stream_sync_ms, pre_device_extra_sync_ms = (
+                _cuda_sync_breakdown_ms(hidden_states)
+            )
+        pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
+        stage_start = _cuda_stage_start(profile_enabled)
+        logits = lm_head.quant_method.apply(
+            lm_head, hidden_states, bias=embedding_bias
+        )
+        local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+        stage_start = _cuda_stage_start(profile_enabled)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+
+        # Mask out padding entries beyond org_vocab_size on this shard.
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+
+        logits_float = logits.float()
+        postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        local_k = min(top_k, logits_float.shape[-1])
+        stage_start = _cuda_stage_start(profile_enabled)
+        local_vals, local_indices = torch.topk(
+            logits_float,
+            k=local_k,
+            dim=-1,
+        )
+        local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        stage_start = _cuda_stage_start(profile_enabled)
+        vocab_start = lm_head.shard_indices.org_vocab_start_index
+        local_global_indices = local_indices + vocab_start
+        local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        stage_start = _cuda_stage_start(profile_enabled)
+        local_log_z = torch.logsumexp(logits_float, dim=-1, keepdim=True)
+        local_logsumexp_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+        tp_size = get_tensor_model_parallel_world_size()
+        gather_vals_ms = 0.0
+        gather_indices_ms = 0.0
+        gather_logz_ms = 0.0
+        global_logz_ms = 0.0
+        merge_topk_ms = 0.0
+        if tp_size > 1:
+            stage_start = _cuda_stage_start(profile_enabled)
+            gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
+            gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            stage_start = _cuda_stage_start(profile_enabled)
+            gathered_indices = tensor_model_parallel_all_gather(
+                local_global_indices, dim=-1
+            )
+            gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            stage_start = _cuda_stage_start(profile_enabled)
+            gathered_log_z = tensor_model_parallel_all_gather(local_log_z, dim=-1)
+            gather_logz_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            stage_start = _cuda_stage_start(profile_enabled)
+            global_log_z = torch.logsumexp(
+                gathered_log_z.float(),
+                dim=-1,
+                keepdim=True,
+            )
+            global_logz_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            effective_k = min(top_k, gathered_vals.shape[-1])
+            stage_start = _cuda_stage_start(profile_enabled)
+            top_vals, top_positions = torch.topk(
+                gathered_vals.float(),
+                k=effective_k,
+                dim=-1,
+            )
+            top_indices = gathered_indices.gather(-1, top_positions)
+            merge_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        else:
+            global_log_z = local_log_z
+            top_vals = local_vals
+            top_indices = local_global_indices
+
+        stage_start = _cuda_stage_start(profile_enabled)
+        top_logprobs = top_vals.float() - global_log_z
+        logprob_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        if profile_enabled:
+            logger.info(
+                "DFLASH_DDTREE_WORKER_PROFILE compact_topk_split "
+                "pre_sync_ms=%.3f local_lm_head_ms=%.3f "
+                "postprocess_ms=%.3f local_topk_ms=%.3f "
+                "local_indices_ms=%.3f local_logsumexp_ms=%.3f "
+                "gather_vals_ms=%.3f gather_indices_ms=%.3f "
+                "gather_logz_ms=%.3f global_logz_ms=%.3f "
+                "merge_topk_ms=%.3f logprob_ms=%.3f rows=%d "
+                "local_vocab=%d top_k=%d local_k=%d tp_size=%d "
+                "pre_stream_sync_ms=%.3f pre_device_extra_sync_ms=%.3f",
+                pre_sync_ms,
+                local_lm_head_ms,
+                postprocess_ms,
+                local_topk_ms,
+                local_indices_ms,
+                local_logsumexp_ms,
+                gather_vals_ms,
+                gather_indices_ms,
+                gather_logz_ms,
+                global_logz_ms,
+                merge_topk_ms,
+                logprob_ms,
+                int(hidden_states.shape[0]),
+                int(logits_float.shape[-1]),
+                top_k,
+                local_k,
+                tp_size,
+                pre_stream_sync_ms,
+                pre_device_extra_sync_ms,
+            )
+        return top_indices.to(torch.int64), top_logprobs
+
+    def get_topk_tokens_and_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        top_k: int,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vocab-parallel global top-k logits without gathering full vocab."""
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.scale <= 0.0 and self.scale != 1.0:
+            raise ValueError(
+                "The local top-k reduction optimization is not supported for "
+                "non-positive logit scaling factors."
+            )
+
+        profile_enabled = _cuda_profile_enabled(hidden_states)
+        pre_stream_sync_ms = 0.0
+        pre_device_extra_sync_ms = 0.0
+        if profile_enabled:
+            pre_stream_sync_ms, pre_device_extra_sync_ms = (
+                _cuda_sync_breakdown_ms(hidden_states)
+            )
+        pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
+
+        stage_start = _cuda_stage_start(profile_enabled)
+        logits = lm_head.quant_method.apply(
+            lm_head, hidden_states, bias=embedding_bias
+        )
+        local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+        stage_start = _cuda_stage_start(profile_enabled)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+
+        logits_float = logits.float()
+        postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+        local_k = min(top_k, logits_float.shape[-1])
+        stage_start = _cuda_stage_start(profile_enabled)
+        local_vals, local_indices = torch.topk(
+            logits_float,
+            k=local_k,
+            dim=-1,
+        )
+        local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+        stage_start = _cuda_stage_start(profile_enabled)
+        vocab_start = lm_head.shard_indices.org_vocab_start_index
+        local_global_indices = local_indices + vocab_start
+        local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+        tp_size = get_tensor_model_parallel_world_size()
+        gather_vals_ms = 0.0
+        gather_indices_ms = 0.0
+        merge_topk_ms = 0.0
+        if tp_size > 1:
+            stage_start = _cuda_stage_start(profile_enabled)
+            gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
+            gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+            stage_start = _cuda_stage_start(profile_enabled)
+            gathered_indices = tensor_model_parallel_all_gather(
+                local_global_indices,
+                dim=-1,
+            )
+            gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+
+            effective_k = min(top_k, gathered_vals.shape[-1])
+            stage_start = _cuda_stage_start(profile_enabled)
+            top_vals, top_positions = torch.topk(
+                gathered_vals.float(),
+                k=effective_k,
+                dim=-1,
+            )
+            top_indices = gathered_indices.gather(-1, top_positions)
+            merge_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        else:
+            top_vals = local_vals
+            top_indices = local_global_indices
+
+        if profile_enabled:
+            logger.info(
+                "DFLASH_DDTREE_WORKER_PROFILE compact_topk_logits_split "
+                "pre_sync_ms=%.3f local_lm_head_ms=%.3f "
+                "postprocess_ms=%.3f local_topk_ms=%.3f "
+                "local_indices_ms=%.3f gather_vals_ms=%.3f "
+                "gather_indices_ms=%.3f merge_topk_ms=%.3f rows=%d "
+                "local_vocab=%d top_k=%d local_k=%d tp_size=%d "
+                "pre_stream_sync_ms=%.3f pre_device_extra_sync_ms=%.3f",
+                pre_sync_ms,
+                local_lm_head_ms,
+                postprocess_ms,
+                local_topk_ms,
+                local_indices_ms,
+                gather_vals_ms,
+                gather_indices_ms,
+                merge_topk_ms,
+                int(hidden_states.shape[0]),
+                int(logits_float.shape[-1]),
+                top_k,
+                local_k,
+                tp_size,
+                pre_stream_sync_ms,
+                pre_device_extra_sync_ms,
+            )
+        return top_indices.to(torch.int64), top_vals.float()
 
     def _maybe_dump_top_token_margin(
         self,

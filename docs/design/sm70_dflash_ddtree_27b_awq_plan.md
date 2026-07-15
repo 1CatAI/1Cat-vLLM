@@ -73,10 +73,13 @@ Parts that should not be copied directly into the hot path:
 
 ## Local Patch Surface
 
-The local vLLM path is still chain-shaped in the engine hot path:
+The early local vLLM path was chain-shaped in the engine hot path. This section
+records the bring-up surface; the current runtime defaults are summarized in
+the 2026-06-25 ledger below.
 
-- `vllm/config/speculative.py` accepts `method="dflash_ddtree"`, but the
-  default `ddtree_disable_tree_verify=True` keeps it on the flat DFlash path.
+- `vllm/config/speculative.py` accepts `method="dflash_ddtree"`. Current
+  `dflash_ddtree` defaults enable tree verification; set
+  `ddtree_disable_tree_verify=True` explicitly for the flat DFlash fallback.
 - `vllm/v1/spec_decode/dflash.py::DFlashProposer` asserts
   `speculative_config.use_dflash()` and still produces one top-1 chain of
   length `num_speculative_tokens`.
@@ -126,15 +129,18 @@ Pass criteria:
 
 ### M2: Experimental Config Alias With Flat Fallback
 
-Status: flat-fallback entry complete; no tree verifier is active yet.
+Status: historical flat-fallback milestone complete; current DDTree runtime
+defaults were changed after M6 and are listed in the 2026-06-25 ledger.
 
 Add `method="dflash_ddtree"` and explicit DDTree fields:
 
 - `ddtree_budget`: default `None`; if unset, use
   `num_speculative_tokens`.
-- `ddtree_top_k`: default `4` for early tests, then sweep.
-- `ddtree_chain_seed`: default `True`.
-- `ddtree_disable_tree_verify`: default `True` until M3/M4 pass.
+- `ddtree_top_k`: current default `None`; if unset, use the DDTree budget,
+  matching the reference implementation.
+- `ddtree_chain_seed`: current default `False`, matching reference best-first.
+- `ddtree_disable_tree_verify`: current default `False`; set it only when
+  explicitly requesting the flat fallback.
 
 Make `dflash_ddtree` instantiate the same DFlash proposer and return the same
 flat `draft_token_ids` while carrying optional tree payload out-of-band. This is
@@ -169,10 +175,11 @@ DFlash block distribution:
   `tree_token_ids`, `parent_indices`, `node_depths`, `node_scores`,
   `top1_chain_token_ids`, `flat_draft_token_ids`, `budget`, `top_k`, and
   `chain_seed`.
-- First local default for 27B-AWQ:
+- Historical flat-chain parity probe, not the current default:
   `num_speculative_tokens=16`, `ddtree_budget=16`, `ddtree_top_k=1`,
   `ddtree_chain_seed=True`.
-- First useful sweep after parity:
+- Historical first sweep after parity, superseded by the trace-guided guardrails
+  below:
   `ddtree_budget in {16, 24, 32, 48}`, `ddtree_top_k in {2, 4}`.
 
 Pass criteria:
@@ -451,8 +458,10 @@ Interpretation:
   This points to candidate/tree coverage, not a compact-logit sampler bug.
 - Reference comparison:
   official DDTree takes `topk = min(budget, vocab)`, while AEON's deployable
-  Qwen3.6 profile uses `DDTREE_TOP_K=8`. The local default was raised from `4`
-  to `8`; explicit benchmark configs still override it.
+  Qwen3.6 profile uses `DDTREE_TOP_K=8`. The local default was temporarily
+  raised from `4` to `8` during bring-up, but this was superseded on
+  2026-06-25 by `ddtree_top_k=None`, which uses the DDTree budget and matches
+  the reference path.
 - Follow-up `top_k=8/32` validation was blocked by a separate TP4 OpenAI API
   server occupying all four V100s:
   `python -m vllm.entrypoints.openai.api_server ... --tensor-parallel-size 4`.
@@ -501,3 +510,373 @@ flat benchmarking:
   no-spec graph baseline as the comparison.
 - Keep hash parity and route summary (`prefill_ddtree_triton`, no
   `prefill_ddtree_dense`) as required acceptance checks.
+
+## 2026-06-25 DDTree Experiment Ledger And Guardrails
+
+This section supersedes the ad hoc DDTree runs from 2026-06-24/25. The main
+API target is non-greedy Qwen3.6-27B sampling, not greedy. Greedy DDTree runs
+may still be used for correctness and kernel isolation, but they must not be
+used to claim normal API acceleration.
+
+Canonical sampling policy for the 27B coding path:
+
+- `temperature=0.6`, `top_p=0.95`, `top_k=20`.
+- `min_p=0.0`, `presence_penalty=0.0`, and `repetition_penalty=1.0` are no-op
+  model defaults for this comparison. `min_p` is currently disabled by vLLM
+  speculative decoding, so do not pass it as an active requirement.
+- For community-style calibration, use HumanEval prompts with
+  `temperature=1.0`, `top_p=0.95`, `top_k=20`, `max_tokens=256`, and the
+  `qwen_chat_solution_nothink` prompt style. This is now the preferred
+  acceptance sweep dataset; single handcrafted coding prompts are only
+  prompt-specific probes.
+- Use free generation for output quality checks. Do not force extra text only
+  to extend the token count; if EOS stops early, record that and compare pure
+  decode separately from end-to-end output tok/s.
+
+Required proof before a run can be counted as branched DDTree evidence:
+
+- Qwen3.6 hybrid models must run with
+  `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE=1`. Without this, the scheduler
+  can reject branched payloads and execute the flat DFlash path.
+- Logs must prove the intended route, for example `prefill_ddtree_triton` for
+  tree attention and DDTree stochastic verifier trace when tracing is enabled.
+- Do not enable `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD=1` for accepted
+  HumanEval evidence. The cached GDN DDTree fast-build metadata path caused
+  cross-request NaN verifier logits and repeated `!` output on HumanEval. The
+  default path is now the safe metadata builder; the fast-build switch is only
+  a diagnostic regression toggle until its cache key/state refresh is fixed.
+- Unknown environment variables in the startup log are not evidence that a
+  feature is active. Either register the env var or prove the route from code
+  and metrics.
+- Every accepted experiment must record json/log paths, prompt, sampling
+  policy, DDTree knobs, graph/capture state, acceptance metrics, and the reason
+  for the next run. Console-only results are useful for debugging but are not
+  final performance artifacts.
+
+Current useful artifacts:
+
+| Artifact | Sampling | Prompt class | Result | Use |
+| --- | --- | --- | --- | --- |
+| `bench_results/ddtree_smoke_20260624/baseline_official_coding_t06_o256.json` | `temp=0.6/top_p=0.95/top_k=20` | deterministic LIS code completion | `162` output tokens, total `50.24 tok/s`, steady decode `53.59 tok/s` | current normal no-spec coding baseline for the matching short prompt |
+| `bench_results/ddtree_smoke_20260624/ddtree_qla_official_coding_t06_o256.json` | `temp=0.6/top_p=0.95/top_k=20` | deterministic LIS code completion | `mean_acceptance_length=10.22`, `83` accepted over `9` drafts, total `95.48 tok/s`, steady decode `163.87 tok/s` | proves official-sampling DDTree can reach the expected coding acceptance on a low-entropy code-completion prompt; pure decode is about `3.06x` the baseline, end-to-end is about `1.90x` because prefill/EOS/output length differ |
+| `bench_results/ddtree_smoke_20260624/ddtree_qla_gdn_fastpath_prod_coding_o256.json` and `ddtree_qla_gdn_cg4_prod_coding_o256.json` | greedy | coding | `mean_acceptance_length=8.75`, total `114-115 tok/s` | kernel/proposer health only; not normal API evidence |
+| `bench_results/ddtree_budget_sweep_20260625/ballgame_budget_sweep_summary.tsv` | `temp=0.6/top_p=0.95/top_k=20` | open-ended pygame ball-eating game code prompt, thinking disabled | formal budget sweep: `16 -> 4.16`, `22 -> 4.83`, `24 -> 4.13`, `32 -> 4.34`, `36 -> 4.34`, `40 -> 4.32`, `64 -> 3.94` mean acceptance length | current acceptance-only budget evidence; `budget=22` is the longest-AL candidate before verifier-cost optimization |
+| `bench_results/ddtree_humaneval_sweep_20260625/humaneval32_qwen_chat_solution_nothink_t1p0_o256_safe_default_budget_sweep_summary.tsv` | `temp=1.0/top_p=0.95/top_k=20` | HumanEval-32, Qwen chat solution/no-think | `budget=16 -> AL 11.54, steady 122.11 tok/s`; `22 -> 10.49, 98.67`; `32 -> 10.12, 73.64`; `48 -> 9.03, 53.79`; `64 -> 8.09, 46.58`; all `bang_repeat_outputs=0` | preferred community-calibrated budget evidence; `budget=16` is the current best balance and larger budgets are slower with lower acceptance |
+| `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.json` and `realcode6_ddtree_budget16_t1p0_o256_noprofile.json` | `temp=1.0/top_p=0.95/top_k=20` | six realistic codebase repair/implementation prompts, Qwen chat/no-think, `max_tokens=256` | profile run: `AL 7.32`, no-bonus `6.32`, total generation `57.91 tok/s`, per-request steady mean `64.06 tok/s`; no-profile run: `AL 7.36`, no-bonus `6.36`, warmed per-request steady mean excluding first JIT-contaminated request `74.18 tok/s`; target verifier profile `45.78 ms`, target+state `51.86 ms`, draft `17.45 ms` | realistic-context check; HumanEval's `122 tok/s` does not generalize to open-ended repo tasks because acceptance is lower and verifier+state cost is still above the new `<=40 ms` target |
+
+Trace-only findings that should not be repeated without a new hypothesis:
+
+- True branched DDTree on official sampling with `budget=16`, `top_k=20`,
+  `chain_seed=false`, and `best_first` reached only about `4.9` effective
+  acceptance on the open-ended coding/game prompt. Stochastic trace showed the
+  sampled target token was usually present in the per-depth draft top-k but was
+  not a child under the currently accepted prefix. This points to tree topology
+  and prefix coverage, not simple top-k candidate quality.
+- Increasing to `budget=64` made cost much worse and acceptance lower on the
+  same trace family because best-first spent many nodes shallowly. Do not
+  repeat large-budget sweeps until trace data shows missing shallow siblings
+  are the blocker.
+- The formal 2026-06-25 ballgame budget sweep confirms this non-monotonic
+  behavior under the normal API sampling target. `budget=22` reached the
+  highest mean acceptance length (`4.8333`, no-bonus `3.8333`), while
+  `budget=32/36/40` stayed near `4.32-4.34` and `budget=64` fell to `3.9385`.
+  Treat this as prompt-specific evidence only. The HumanEval calibration sweep
+  supersedes it for the default DDTree budget decision.
+- HumanEval-32 with the safe GDN metadata path restores coding-scene acceptance
+  to the expected range: `budget=16` reached `mean_acceptance_length=11.5361`
+  and `draft_acceptance_rate=0.6585`, with per-position acceptance
+  `0.985/0.969/0.941/0.902/0.863/0.822/0.781/0.732/...`. Increasing budget was
+  strictly worse in both acceptance length and steady decode. Do not repeat
+  larger budget sweeps until the tree-builder hypothesis changes.
+- Realistic repo-style code repair prompts are materially harder than
+  HumanEval. The six-prompt `realcode6` check at the same `budget=16` and
+  official sampling reached only `mean_acceptance_length=7.3602` with
+  per-position acceptance
+  `0.915/0.820/0.735/0.626/0.555/0.488/0.417/0.374/...`. The first no-profile
+  request was polluted by inference-time Triton JIT
+  (`copy_and_expand_dflash_inputs_kernel`, `_topk_topp_kernel`,
+  `eagle_prepare_next_token_padded_kernel`, `expand_kernel`), so use the
+  warmed post-first-request mean `74.18 tok/s` as the cleaner speed read for
+  this artifact.
+- The `realcode6` profile run fixed a profile-only `NameError` in
+  `DFlashProposer._sample_draft_tokens`: the payload-stage log must read
+  `logits.shape`, not a stale `payload_logits` name. This changed only
+  instrumentation and does not alter sampling.
+- Current realistic-context verifier cost is still high: the last
+  `SM70 spec runner profile avg_ms` line reported `target_forward=40.540 ms`,
+  `target_logits=2.848 ms`, `target_rejection_sample=2.394 ms`,
+  `state_update_wall_cpu=6.082 ms`, and `draft_wall_cpu=17.450 ms`. Use
+  `45.78 ms` for target verifier cost and `51.86 ms` when state update is
+  included. The active near-term target is now `target verifier + state update
+  <=40 ms`, so improvements may come from AWQ, attention, Torch small kernels,
+  all-reduce, sampler, GDN, or accepted-state update rather than one kernel
+  family alone.
+- HumanEval diagnosis root cause: with the GDN DDTree fast-build cache enabled,
+  the first request could finish normally, then the next request's first
+  verifier step saw NaN compact logits and sampled token id `0`, causing
+  repeated `!`. Disabling that fast-build path produced normal HumanEval code
+  and no NaN trace events.
+- `chain_seed=true` and `spine_leaf` preserved a deeper top-1 path but did not
+  recover the open-ended prompt to the official coding target. Do not keep
+  toggling these options without a changed tree-building hypothesis.
+- Horizon `15` versus `16` did not materially change acceptance in earlier
+  DFlash tests, so block-size-minus-one is not the current primary suspect.
+
+Current code-state notes:
+
+- `ddtree_top_k` now defaults to `None`, meaning the builder uses the DDTree
+  budget as the reference top-k. `ddtree_chain_seed` defaults to `False` to
+  match the official best-first expansion, and tree verify defaults to enabled
+  for `dflash_ddtree`.
+- The sampler now has stochastic DDTree trace events, including sampled target
+  tokens, accepted nodes, child matches, top-k rank, and tree topology.
+- A pending sampling-alignment change warps draft logits with the request
+  `temperature/top_k/top_p` before building the DDTree payload. This is the
+  next thing to validate; do not start another parameter sweep before checking
+  whether this fixes the open-ended coding acceptance collapse.
+
+Next experiments:
+
+- Treat `budget=16` as the current default HumanEval-calibrated DDTree setting.
+  The next work item is total verifier-plus-state reduction on this setting,
+  not another baseline run.
+- Split `state_update_wall_cpu=6.082 ms` before optimizing it. Record whether
+  it is CPU waiting on GPU, accepted-state copy/commit kernels, metadata
+  construction, or graph replay synchronization.
+- `gpu_model_runner.py` now reports state-update sub-buckets in the existing
+  `SM70 spec runner profile avg_ms` line:
+  `state_update_validate_cpu`, `state_update_attn_compact_cpu`,
+  `state_update_mamba_compact_cpu`, `state_update_input_batch_cpu`, and
+  `state_update_drafter_context_cpu`.
+- Use the selected target-forward Nsight hierarchy to target non-AWQ buckets
+  as well: DDTree attention (`~4.65 ms/rank`), Torch native small kernels
+  (`~3.9 ms/rank`), TP all-reduce rank imbalance (`3.86 ms` vs `1.90 ms`),
+  and GDN delta/gating (`~3.30 ms/rank`).
+- Once verifier cost is materially lower, rerun a narrow balance sweep
+  (`budget=16/22/32` first) and choose by accepted tokens per verifier
+  millisecond, not by acceptance length alone.
+- Compare only against the already-recorded baseline unless the baseline code
+  path or sampling policy changes.
+
+## 2026-06-30 AWQ Verifier GEMM Microbench
+
+The next optimization target is the DDTree target verifier plus state-update
+wall time:
+
+```text
+target verifier + state update: 51.86 ms -> <= 40 ms
+```
+
+Nsight graph replay still attributed about `18.6 ms/rank` of the `~40 ms`
+target-forward wall time to TurboMind AWQ uint4 GEMM kernels, so AWQ remains
+the largest bucket. It is no longer the only accepted route to the target:
+DDTree attention, Torch native small kernels, TP all-reduce imbalance, GDN
+delta/gating, sampler work, and accepted-state update are also in scope.
+
+New microbench harness:
+
+- `benchmarks/benchmark_sm70_awq_verifier_micro.py`
+- Default model: `/home/ymzx/models/Qwen3.6-27B-AWQ`
+- Default shape: `m=17`, matching `budget=16` plus root for the verifier
+  dense pass.
+- Default weighted suite models one Qwen3.6-27B-AWQ TP rank verifier forward:
+  `63` gate/up MLP calls, `63` down MLP calls, `47` linear-attention qkv
+  calls, `47` linear-attention z calls, and `16` full-attention o-proj calls.
+- The harness times only `awq_gemm_sm70_out` after `awq_sm70_prepare` and warmup.
+  It intentionally excludes Python, tree build, logits, sampling, and state
+  update overhead.
+
+Use this command shape for candidate validation:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=$PWD \
+VLLM_SM70_AWQ_TP2_FAST_SELECTOR=1 \
+VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1 \
+VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17 \
+VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE=0 \
+VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0 \
+VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0 \
+/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python \
+  benchmarks/benchmark_sm70_awq_verifier_micro.py \
+  --json-out bench_results/ddtree_awq_micro_20260630/nopreserve_m17.json \
+  --csv-out bench_results/ddtree_awq_micro_20260630/nopreserve_m17.csv
+```
+
+Current microbench result:
+
+| Artifact | Total weighted AWQ GEMM time | Notes |
+| --- | ---: | --- |
+| `bench_results/ddtree_awq_micro_20260630/preserve_m17.json` | `34.04 ms` | Default split preservation is too conservative for verifier small-M. |
+| `bench_results/ddtree_awq_micro_20260630/nopreserve_m17.json` | `25.03 ms` | Current best dynamic-selector microbench total. |
+| `bench_results/ddtree_awq_micro_20260630/all_shapes_m17_dynamic_nopreserve_recheck.json` | `24.80 ms` | Current best rechecked microbench comparison point. |
+| `bench_results/ddtree_awq_micro_20260630/restored_default_recheck_200.json` | `27.97 ms` | Restored non-forced default after failed experiments were removed. |
+| `bench_results/ddtree_awq_micro_20260630/all_shapes_m17_forced_mgroup_c32x128_recheck.json` | `28.14 ms` | `c32x128` mgroup candidate; useful Nsight evidence but reverted. |
+
+Current best breakdown from `all_shapes_m17_dynamic_nopreserve_recheck.json`:
+
+| Bucket | Mean kernel time | Weighted time |
+| --- | ---: | ---: |
+| `mlp_gate_up` (`17x17408x5120`) | `132.20 us` | `8.33 ms` |
+| `mlp_down` (`17x5120x17408`) | `129.22 us` | `8.14 ms` |
+| `linear_attn_in_proj_qkv` (`17x10240x5120`) | `88.28 us` | `4.15 ms` |
+| `linear_attn_in_proj_z` (`17x6144x5120`) | `65.32 us` | `3.07 ms` |
+| `full_attn_o_proj` (`17x5120x6144`) | `69.25 us` | `1.11 ms` |
+
+Important interpretation:
+
+- The microbench's absolute weighted total is higher than the Nsight graph
+  replay AWQ bucket. Use it for per-shape breakdown and candidate ranking, not
+  as a replacement for graph replay.
+- The main bottlenecks are the two MLP buckets. Together they account for about
+  two thirds of the microbench AWQ time.
+- The current dynamic selector's best gate/up route is still the existing
+  `32x256x32` mgroup family. A formal recheck measured `131.44 us` for the
+  gate/up bucket.
+- Nsight Compute on the gate/up shape shows the useful mgroup route improves
+  grid fill (`68` CTAs -> `136` CTAs, waves/SM `0.47` -> `0.94`) and SM
+  throughput (`44.31%` -> `58.42%`), but remains register-limited at allocated
+  `192` registers/thread. It is not a pure DRAM bandwidth bottleneck
+  (`~33%` DRAM on the mgroup route).
+- The `c32x128` mgroup candidate halves shared memory versus `c32x256`
+  (`~16.4 KiB` vs `~32.8 KiB`) but keeps the same register cap and does not
+  improve the full weighted suite.
+- A dense-fp16-output epilogue diagnostic was also tested and reverted. It
+  measured `140.65 us` CUDA-event mean for the gate/up shape, while NCU showed
+  `124.99 us`, `190` registers/thread, SM `59.12%`, and DRAM `33.91%`. This
+  proves epilogue-only cleanup does not remove the verifier GEMM limiter.
+
+Negative results that should not be repeated without a changed hypothesis:
+
+- Smaller CTA-M candidates did not help. The best `16x256x32` candidate was
+  about `166 us` for gate/up, slower than the current `~131 us`.
+- A `24x256x32` verifier-focused CTA-M experiment and the required temporary
+  `12B` helper support selected and ran, but was slower on gate/up
+  (`~183 us` for `24x256x32`, worse for `24x128x32`). It was reverted.
+- CTA-N `128` and `8x*` small-M candidates were also slower in the gate/up
+  sweep.
+- Experimental `TG_N=2` and `TG_N=8` registry variants did not improve the
+  dynamic gate/up result and were reverted.
+- Ordinary AWQ Marlin GEMM was much slower on the same synthetic 27B shapes
+  (`~284 us` gate/up and `~674 us` down in the direct comparison), so routing
+  the DDTree verifier dense AWQ path away from TurboMind is not the fix.
+- A direct verifier launch/epilogue branch without changing the mainloop was
+  slower overall: `m17_direct_dense_verifier_probe.json` measured `40.09 ms`
+  weighted and regressed MLP down to `293.79 us`. It was reverted.
+- Forcing `__launch_bounds__(..., 3)` to chase three active blocks per SM was
+  counterproductive: `gate_up_m17_mgroup_c32x128_launchbounds3.json` measured
+  `187.48 us`. It was reverted. Register pressure must be reduced at the
+  source/live-range level, not by compiler pressure alone.
+- A no-prefetch low-live-range mainloop probe compiled and selected correctly,
+  but `gate_up_m17_mgroup_c32x128_noprefetch_probe.json` measured
+  `189.07 us`. It was reverted. The next low-register design must preserve
+  the current prefetch/transform overlap instead of making the loop fully
+  synchronous.
+
+Current code support:
+
+- `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu` has a
+  default-off environment override,
+  `VLLM_SM70_AWQ_TP2_FAST_TARGETS`, for exact descriptor-to-kernel candidate
+  testing.
+- The override is a microbench/profiling tool only. Production behavior remains
+  unchanged unless the environment variable is set.
+- Format:
+  `<desc>|<cta_m>x<cta_n>x<cta_k>:<splits>:<swizzle>:<require_mgroup>`, with
+  multiple entries separated by `;`.
+- No experimental `c32x128` or no-prefetch candidate is retained in
+  `sm70_884_4.cu`. Their artifacts remain useful because they show shared
+  memory reduction and naive live-range reduction do not recover the target
+  while register allocation stays near `192` registers/thread or pipeline
+  overlap is lost.
+- The shared operator maintenance ledger is
+  `docs/design/sm70_nvfp4_turbomind_operator_optimization.md`; despite the
+  historical file name, it now also tracks this AWQ verifier operator route.
+
+Decision:
+
+- Existing TurboMind selector/config sweeps and epilogue-only changes are not
+  enough to move the full `51.86 ms` path to `<=40 ms`.
+- The next implementation work should be chosen by expected total-path
+  contribution. AWQ mainloop work remains valid, especially verifier-specific
+  V-scale reuse or `CTA_K=64` experiments, but it no longer has to supply the
+  entire reduction alone.
+- Before coding another AWQ kernel, split `state_update_wall_cpu` and identify
+  whether it can remove several milliseconds through fewer syncs, fewer
+  accepted-state kernels, or graph-safe batching.
+
+2026-06-30 state-update split and DDTree compact probes:
+
+- The runner now reports `state_update_validate_cpu`,
+  `state_update_attn_compact_cpu`, `state_update_mamba_compact_cpu`,
+  `state_update_input_batch_cpu`, and
+  `state_update_drafter_context_cpu` in the SM70 spec profile line.
+- Text-only official-sampling profile:
+  `bench_results/ddtree_total_target_20260630/realcode2_o128_mamba_fused_cache_profile.json`
+  and `.log`. Setup: Qwen3.6-27B-AWQ TP2, DDTree `budget=16/top_k=20`,
+  `temperature=1.0/top_p=0.95/top_k=20`, `max_tokens=128` for two prompts,
+  `limit_mm_per_prompt={"image":0,"video":0}`, Flash-V100, CUDA graph enabled.
+  Result: `256` output tokens in `3.4808 s`, mean acceptance `12.86`,
+  draft acceptance rate `0.741`. The profile did not meet the `<=40 ms` target:
+  `target_forward=56.583 ms`, `target_logits=3.120 ms`,
+  `target_rejection_sample=4.031 ms`, and
+  `state_update_wall_cpu=5.941 ms` at the `calls=20` average.
+- Active 27B-AWQ serving uses `mamba_cache_mode=none`, not `align`. Therefore
+  the align-mode DDTree-aware fused Mamba postprocess can safely defer legacy
+  compact only for align-mode tests/runs; it does not remove the current
+  `none`-mode explicit compact path.
+- A whole-block Mamba compact batch-memcpy experiment was implemented, tested,
+  and reverted. Artifact:
+  `bench_results/ddtree_total_target_20260630/realcode2_o128_mamba_batchcopy_cache_profile.json`.
+  It preserved acceptance (`mean_acceptance_length=12.85`) but worsened
+  profile cost (`state_update_wall_cpu=16.311 ms`,
+  `state_update_mamba_compact_cpu=6.696 ms`,
+  `state_update_drafter_context_cpu=7.350 ms` at `calls=20`). Do not use this
+  as the state-update optimization route.
+- Current profiling points to target-forward GPU wait as the dominant remaining
+  limiter. `full_logits_split` repeatedly shows `pre_sync_ms` around
+  `31-36 ms` for `rows=17`; this is the target forward completing before
+  verifier logits, and it is larger than all state-update sub-buckets combined
+  in the non-experimental run.
+
+2026-06-30 verifier+state <=40 ms milestone:
+
+- Runner state update now keeps DDTree accepted rows, sampled-token counts,
+  current request indices, and current positions in CPU sidecars. This lets
+  accepted-state update avoid several D2H reads from GPU metadata in the hot
+  path.
+- `_update_states_after_model_execute` uses the CPU sidecar to build
+  `num_accepted_tokens` and `spec_state_slot_selectors` on CPU. It stages those
+  tensors back to GPU only when align-mode GPU postprocess needs them.
+- DDTree clamp has a no-clamp fast path based on sidecar sampled-token counts
+  and request `max_tokens`, avoiding the GPU contiguous-token count and
+  `torch.equal` synchronization when every request is already within limits.
+- Attention KV compaction has a CPU slot-pair fast path for the common CP/DCP=1
+  case. It computes physical KV slots from CPU positions and the CPU block
+  table instead of calling `slot_mapping.detach().cpu().tolist()` every spec
+  step. The old D2H slot-mapping path remains as fallback.
+- Validation passed:
+  `python -m py_compile vllm/v1/worker/gpu_model_runner.py`,
+  `pytest -q tests/v1/spec_decode/test_ddtree_sampler.py tests/v1/worker/test_gpu_input_batch.py`,
+  and
+  `pytest -q tests/v1/spec_decode/test_ddtree_gpu_runner_positions.py tests/v1/worker/test_mamba_utils.py -k 'not shared_storage'`.
+- Official-sampling, text-only, 256-output-token coding benchmark artifacts:
+
+  | artifact | mode | final hot verifier+state |
+  | --- | --- | --- |
+  | `bench_results/ddtree_total_target_20260630/realcode2_o256_statecpu_slotsidecar_16k.*` | default `mamba_cache_mode=none` | best hot `40.100 ms`, last hot `40.489 ms`; `state_update_wall_cpu` fell to `2.108-2.709 ms` |
+  | `bench_results/ddtree_total_target_20260630/realcode2_o256_slotsidecar_mambadirect_16k.*` | direct Mamba compact A/B | worse: last hot `41.422 ms`, `state_update_wall_cpu=3.992 ms`; do not use |
+  | `bench_results/ddtree_total_target_20260630/realcode2_o256_slotsidecar_align_16k.*` | `enable_prefix_caching=true`, `mamba_cache_mode=align` | last hot `39.388 ms`: `target_forward=33.270`, `target_logits=2.890`, `target_rejection_sample=1.290`, `state_update_wall_cpu=1.938` |
+
+- The accepted milestone configuration for this target-cost gate is:
+  DDTree `budget=16/top_k=20`, official Qwen sampling
+  `temperature=1.0/top_p=0.95/top_k=20`, `max_tokens=256`,
+  `max_num_batched_tokens=16384`, visual disabled with
+  `limit_mm_per_prompt={"image":0,"video":0}`, Flash-V100, CUDA graph enabled,
+  `enable_prefix_caching=true`, and `mamba_cache_mode=align`.
+- Caveat: the `<=40 ms` goal is satisfied for the steady verifier+state hot
+  interval. End-to-end generation time did not yet improve in the align run
+  (`generate_seconds=8.5076` for `512` output tokens) because warm/capture and
+  early align costs are still high. The next serving-speed gate should measure
+  steady throughput after warmup and reduce align staging/warm costs before
+  claiming an end-to-end speed win.

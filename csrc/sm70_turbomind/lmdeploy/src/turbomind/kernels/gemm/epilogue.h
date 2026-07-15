@@ -217,7 +217,6 @@ struct Epilogue_ {
     static constexpr auto kOrder = OperandC::kOrder;
     static constexpr auto kMode  = mode_C;
     static constexpr bool SplitK = SplitK_;
-
     using Tc = Tc_;
 
     static constexpr int TM = TM_;
@@ -728,6 +727,128 @@ struct Epilogue_ {
             else if (!StoreTailAllReduceC(tile_offset, is_last, param)) {
                 PublishTileAllReduceFlag(tile_offset, tile_id, is_last, param);
                 StoreTileAllReduceC(tmp_C, c, cs0, tile_offset, is_last, pred, param);
+            }
+        }
+    }
+};
+
+// Opt-in wrapper that changes only the serial split-K wait policy.
+template<class Base>
+struct EpilogueLane0Wait : Base {
+    using Base::Base;
+
+    using Dtype = typename Base::Dtype;
+    using Tc    = typename Base::Tc;
+
+    static constexpr auto kOrder = Base::kOrder;
+    static constexpr auto kMode  = Base::kMode;
+    static constexpr bool SplitK = Base::SplitK;
+
+    using SharedStorage = typename Base::SharedStorage;
+    using Map           = typename Base::Map;
+
+    static constexpr int S       = Base::S;
+    static constexpr int C       = Base::C;
+    static constexpr int kAccess = Base::kAccess;
+    static constexpr int2 kMN    = cs2mk<kOrder>(Map::kDimC, Map::kDimS);
+
+    template<class T>
+    using OutputC = typename Base::template OutputC<T>;
+
+    template<class FragC>
+    __device__ void operator()(FragC&               frag_C,
+                               const int4&          tile_offset,
+                               const int2&          extents,
+                               int                  splits,
+                               int                  tile_id,
+                               bool                 is_last,
+                               const EpilogueParam& param,
+                               SharedStorage&       storage)
+    {
+        const int2 cta_cs = mk2cs<kOrder>(tile_offset.x * kMN.x, tile_offset.y * kMN.y);
+        const int2 end_cs = mk2cs<kOrder>(extents);
+
+        OutputC<Dtype> tmp_C[S][C];
+
+        this->Rearrange(frag_C, storage, tmp_C);
+
+        Predicate<S, C, false, false> pred{};
+
+        const int2 thr_cs = Map::get_offset(threadIdx.x / WARP_SIZE, threadIdx.x % WARP_SIZE);
+        const int2 cs0    = {cta_cs.x + thr_cs.x, cta_cs.y + thr_cs.y};
+
+        PRAGMA_UNROLL
+        for (int s = 0; s < S; ++s) {
+            PRAGMA_UNROLL
+            for (int c = 0; c < C; ++c) {
+                const int ss = thr_cs.y + s * Map::kDeltaS;
+                const int cc = thr_cs.x + c * Map::kDeltaC;
+                if (ss < end_cs.y && cc < end_cs.x) {
+                    pred.set(s, c);
+                }
+            }
+        }
+
+        if (SplitK && splits > 1) {
+            int* barrier = &param.locks[tile_id];
+
+            sem_wait_lane0(barrier, tile_offset.z);
+
+            const MatrixData p = resolve<Dtype, kMode>(param.partials, tile_offset.w);
+
+            this->Reduce(tmp_C, p, tile_offset.z == 0, is_last, cs0, pred);
+
+            const int post_id = is_last ? 0 : tile_offset.z + 1;
+            sem_post(barrier, post_id, threadIdx.x == 0);
+
+            if (!is_last) {
+                return;
+            }
+        }
+
+        constexpr pair<Map::kDeltaC, Map::kDeltaS> delta_cs{};
+
+        param.combine_mat((Tc*)0, constant<kMode>{}, tmp_C, cs0, tile_offset.w, delta_cs, pred);
+
+        const MatrixData c = resolve<Tc, kMode>(param.c, tile_offset.w);
+
+        bool publish_tile_allreduce = false;
+        if (param.moe_weighted_reduce) {
+            if constexpr (std::is_same_v<Tc, half_t>) {
+                this->StoreMoeWeightedReduce(tmp_C, cs0, tile_offset.w, pred, param);
+            }
+        }
+        else if (param.silu_act) {
+            constexpr int dc  = sizeof(Tc) * Map::kDeltaC / 2;
+            const int     ds  = sizeof(Tc) * Map::kDeltaS * c.ptr.stride;
+            auto          ptr = (char*)c.ptr.ptr + sizeof(Tc) * dot({cs0.x / 2, cs0.y}, long2{1, c.ptr.stride});
+            PRAGMA_UNROLL
+            for (int s = 0; s < S; ++s) {
+                PRAGMA_UNROLL
+                for (int c = 0; c < C; ++c) {
+                    GatedActivation<Silu>::template apply<Tc>(tmp_C[s][c]);
+                    if (pred(s, c)) {
+                        const auto tmp = cast<Tc>((Array<Dtype, kAccess / 2>&)tmp_C[s][c]);
+                        Store(reinterpret_cast<Tc*>(ptr), tmp);
+                    }
+                    ptr += dc;
+                }
+                ptr -= dc * C;
+                ptr += ds;
+            }
+        }
+        else {
+            this->template StoreC<Tc>(tmp_C, c, cs0, pred);
+            publish_tile_allreduce = true;
+        }
+
+        if (publish_tile_allreduce) {
+            if (param.tile_allreduce && param.tile_allreduce_param.kernel_reducer_blocks > 0) {
+                this->PublishTileAllReduceFlag(tile_offset, tile_id, is_last, param);
+            }
+            else if (!this->StoreTailAllReduceC(tile_offset, is_last, param)) {
+                this->PublishTileAllReduceFlag(tile_offset, tile_id, is_last, param);
+                this->StoreTileAllReduceC(tmp_C, c, cs0, tile_offset, is_last, pred, param);
             }
         }
     }

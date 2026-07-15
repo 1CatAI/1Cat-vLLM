@@ -38,6 +38,18 @@ struct Operand_A {
 };
 
 template<class T>
+struct Operand_A_Swizzle_8x64: Operand_A<T> {
+    struct GetSmemLayout {
+        template<int M, int K>
+        static constexpr auto apply(pair<M, K>)
+        {
+            static_assert(M == 8 && K == 64);
+            return SmemLayoutV2<M, K, M, K, Swizzle<3, 3, 3>>{};
+        }
+    };
+};
+
+template<class T>
 struct Operand_B {
     using Dtype = T;
 

@@ -100,6 +100,7 @@ _SM70_GDN_GRAPH_META: dict[str, dict[str, object]] = {}
 _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS: dict[str, int] = {}
 _SM70_GDN_PREFILL_PROFILE_COUNTS: dict[str, int] = {}
 _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
+_DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
 def _ddtree_parent_ids_require_branch(
@@ -116,6 +117,68 @@ def _ddtree_parent_ids_require_branch(
 def _dflash_ddtree_fused_gdn_enabled() -> bool:
     raw = os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1")
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _dflash_ddtree_serial_gdn_enabled() -> bool:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_SERIAL_GDN", "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dflash_ddtree_linear_gdn_enabled() -> bool:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_LINEAR_GDN", "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dflash_ddtree_qla_gdn_enabled() -> bool:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_QLA_GDN", "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dflash_ddtree_conv_kernel_enabled() -> bool:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_CONV_KERNEL", "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dflash_ddtree_path_probe_enabled() -> bool:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE", "0")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dflash_ddtree_path_probe_layer_matches(prefix: str) -> bool:
+    layer_filter = os.getenv(
+        "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER",
+        "language_model.model.layers.0.linear_attn",
+    ).strip()
+    return not layer_filter or layer_filter in prefix
+
+
+def _dflash_ddtree_path_probe_max_reports() -> int:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS", "32")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 32
+
+
+def _dflash_ddtree_path_probe_node_limit() -> int:
+    raw = os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT", "16")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 16
+
+
+def _sm70_spec_cache_stride_from_config() -> int:
+    try:
+        spec_config = get_current_vllm_config().speculative_config
+    except Exception:
+        return 1
+    if spec_config is None:
+        return 1
+    num_speculative_tokens = getattr(spec_config, "num_speculative_tokens", None)
+    if not num_speculative_tokens:
+        return 1
+    return max(1, int(num_speculative_tokens) + 1)
 
 
 def _ddtree_queries_have_prefix_row(
@@ -169,12 +232,11 @@ def _ddtree_depth_batches(
         if query_len == num_tree_tokens + 1:
             token_start = int(starts[req_row]) + 1
             prefix_rows.append((token_start - 1, req_row))
-        elif query_len == num_tree_tokens:
-            token_start = int(starts[req_row])
         else:
             raise RuntimeError(
-                "DDTree GDN metadata mismatch: query length must equal tree "
-                "node count or tree node count + 1 for pure-spec tree replay, "
+                "DDTree GDN metadata mismatch: official DDTree verifier "
+                "requires root + tree nodes, so query length must equal tree "
+                "node count + 1 for pure-spec tree replay, "
                 f"got {query_len} and {num_tree_tokens} for request row "
                 f"{req_row}."
             )
@@ -512,6 +574,25 @@ def _sm70_assert_standard_core_not_active_spec(
         f"num_spec_decodes={attn_metadata.num_spec_decodes}, "
         f"num_spec_decode_tokens={attn_metadata.num_spec_decode_tokens})"
     )
+
+
+def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config: object) -> bool:
+    return (
+        _sm70_qwen_gdn_num_speculative_tokens(vllm_config) >= 3
+        and _sm70_qwen_gdn_spec_method(vllm_config) == "mtp"
+        and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+        and not envs.VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP
+    )
+
+
+def _sm70_qwen_gdn_num_speculative_tokens(vllm_config: object) -> int:
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    return int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+
+
+def _sm70_qwen_gdn_spec_method(vllm_config: object) -> str | None:
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    return getattr(spec_config, "method", None)
 
 
 def _sm70_qwen_gdn_full_forward_enabled(
@@ -2116,6 +2197,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._sm70_spec_cache_stride = 1
+        if vllm_config.speculative_config is not None:
+            self._sm70_spec_cache_stride = max(
+                1,
+                1
+                + int(
+                    vllm_config.speculative_config.num_speculative_state_tokens()
+                ),
+            )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -2129,14 +2219,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.force_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_QWEN_GDN_FULL_FORWARD
         )
+        num_speculative_tokens = _sm70_qwen_gdn_num_speculative_tokens(
+            vllm_config
+        )
+        block_003_deep_mtp = (
+            _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config)
+        )
+        if block_003_deep_mtp:
+            logger.warning_once(
+                "Blocking SM70 Qwen GDN 0.0.3-style spec recurrent-core "
+                "route for native MTP%d. Long official-sampling validation "
+                "showed this verifier path can enter a sustained all-accept "
+                "repeat loop for num_speculative_tokens >= 3. Using the "
+                "full-Qwen-GDN verifier guard instead. Set "
+                "VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP=1 only for "
+                "diagnostic reruns of the unsafe route.",
+                num_speculative_tokens,
+            )
         self.disable_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD
+            and not block_003_deep_mtp
         )
         self.auto_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             and vllm_config.speculative_config is not None
             and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
-            and not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+            and (
+                not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+                or block_003_deep_mtp
+            )
         )
         self.auto_sm70_qwen_gdn_spec_core = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
@@ -2147,6 +2258,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             and vllm_config.speculative_config is not None
             and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+            and not block_003_deep_mtp
         )
         self.maybe_sm70_qwen_gdn_full_forward = (
             not self.disable_sm70_qwen_gdn_full_forward
@@ -2582,6 +2694,327 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def _probe_ddtree_path_replay_states(
+        self,
+        *,
+        mixed_qkv_spec: torch.Tensor,
+        a_spec: torch.Tensor,
+        b_spec: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        spec_query_start_loc: torch.Tensor,
+        spec_state_indices_tensor: torch.Tensor,
+        ddtree_parent_ids: torch.Tensor,
+        ddtree_num_tree_tokens_cpu: torch.Tensor,
+        num_spec_decodes: int,
+        initial_conv_state: torch.Tensor,
+        initial_ssm_state: torch.Tensor,
+    ) -> None:
+        global _DFLASH_DDTREE_PATH_PROBE_REPORTS
+
+        max_reports = _dflash_ddtree_path_probe_max_reports()
+        if _DFLASH_DDTREE_PATH_PROBE_REPORTS >= max_reports:
+            return
+
+        parent_rows = ddtree_parent_ids[:num_spec_decodes].detach().cpu()
+        lengths = ddtree_num_tree_tokens_cpu[:num_spec_decodes].detach().cpu()
+        starts = spec_query_start_loc[: num_spec_decodes + 1].detach().cpu()
+        node_limit = _dflash_ddtree_path_probe_node_limit()
+        device = mixed_qkv_spec.device
+        conv_state_width = min(
+            int(conv_weights.shape[1]) - 1,
+            int(conv_state.shape[-1]),
+        )
+        zero_idx = torch.zeros(1, dtype=torch.int32, device=device)
+        one_idx = torch.ones(1, dtype=torch.int32, device=device)
+        worst: tuple[float, float, int, int, list[int], int] | None = None
+
+        for req_row in range(num_spec_decodes):
+            num_tree_tokens = int(lengths[req_row].item())
+            if num_tree_tokens <= 0:
+                continue
+            query_start = int(starts[req_row].item())
+            query_len = int(starts[req_row + 1].item()) - query_start
+            if query_len != num_tree_tokens + 1:
+                continue
+            token_start = query_start + 1
+            root_state_idx = int(spec_state_indices_tensor[req_row, 0].item())
+            if root_state_idx >= 0:
+                local_conv_state = conv_state.new_empty(
+                    (2, conv_state.shape[1], conv_state.shape[2])
+                )
+                local_conv_state[0].copy_(initial_conv_state[req_row])
+                row_idx = torch.tensor([query_start], dtype=torch.long, device=device)
+                x_row = mixed_qkv_spec.index_select(0, row_idx)
+                conv_state_indices = torch.tensor(
+                    [[0, 1]],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                y_row = causal_conv1d_update(
+                    x_row,
+                    local_conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=conv_state_indices,
+                    block_idx_last_scheduled_token=one_idx,
+                    initial_state_idx=zero_idx,
+                    validate_data=False,
+                )
+                query_path, key_path, value_path = self.rearrange_mixed_qkv(y_row)
+                path_token_idx = torch.tensor(
+                    [query_start], dtype=torch.long, device=device
+                )
+                g_path, beta_path = fused_gdn_gating(
+                    self.A_log,
+                    a_spec.index_select(0, path_token_idx),
+                    b_spec.index_select(0, path_token_idx),
+                    self.dt_bias,
+                )
+                local_ssm_state = initial_ssm_state[
+                    req_row : req_row + 1
+                ].clone()
+                _, root_final_state = fused_recurrent_gated_delta_rule(
+                    q=query_path,
+                    k=key_path,
+                    v=value_path,
+                    g=g_path,
+                    beta=beta_path,
+                    initial_state=local_ssm_state,
+                    inplace_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                conv_diff = (
+                    conv_state[root_state_idx, :, :conv_state_width].float()
+                    - local_conv_state[1, :, :conv_state_width].float()
+                ).abs().max()
+                ssm_diff = (
+                    ssm_state[root_state_idx].float()
+                    - root_final_state[-1].float()
+                ).abs().max()
+                conv_diff_value = float(conv_diff.item())
+                ssm_diff_value = float(ssm_diff.item())
+                if worst is None or max(conv_diff_value, ssm_diff_value) > max(
+                    worst[0], worst[1]
+                ):
+                    worst = (
+                        conv_diff_value,
+                        ssm_diff_value,
+                        req_row,
+                        0,
+                        [],
+                        root_state_idx,
+                    )
+
+            max_node = min(num_tree_tokens, node_limit)
+            for node_slot in range(1, max_node + 1):
+                path_slots: list[int] = []
+                current_slot = node_slot
+                seen_slots: set[int] = set()
+                while current_slot > 0:
+                    if current_slot in seen_slots or current_slot > num_tree_tokens:
+                        path_slots = []
+                        break
+                    seen_slots.add(current_slot)
+                    path_slots.append(current_slot)
+                    parent_slot = int(parent_rows[req_row, current_slot].item())
+                    current_slot = 0 if parent_slot < 0 else parent_slot
+                if not path_slots:
+                    continue
+                path_slots.reverse()
+                token_rows = [query_start]
+                token_rows.extend(token_start + slot - 1 for slot in path_slots)
+
+                local_conv_state = conv_state.new_empty(
+                    (len(token_rows) + 1, conv_state.shape[1], conv_state.shape[2])
+                )
+                local_conv_state[0].copy_(initial_conv_state[req_row])
+                processed_rows: list[torch.Tensor] = []
+                for step_idx, token_row in enumerate(token_rows):
+                    row_idx = torch.tensor([token_row], dtype=torch.long, device=device)
+                    x_row = mixed_qkv_spec.index_select(0, row_idx)
+                    conv_state_indices = torch.tensor(
+                        [[step_idx, step_idx + 1]],
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    y_row = causal_conv1d_update(
+                        x_row,
+                        local_conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=conv_state_indices,
+                        block_idx_last_scheduled_token=one_idx,
+                        initial_state_idx=zero_idx,
+                        validate_data=False,
+                    )
+                    processed_rows.append(y_row.squeeze(0))
+
+                path_mixed_qkv = torch.stack(processed_rows, dim=0)
+                query_path, key_path, value_path = self.rearrange_mixed_qkv(
+                    path_mixed_qkv
+                )
+                path_token_idx = torch.tensor(
+                    token_rows, dtype=torch.long, device=device
+                )
+                g_path, beta_path = fused_gdn_gating(
+                    self.A_log,
+                    a_spec.index_select(0, path_token_idx),
+                    b_spec.index_select(0, path_token_idx),
+                    self.dt_bias,
+                )
+                local_ssm_state = initial_ssm_state[
+                    req_row : req_row + 1
+                ].clone()
+                _, path_final_state = fused_recurrent_gated_delta_rule(
+                    q=query_path,
+                    k=key_path,
+                    v=value_path,
+                    g=g_path,
+                    beta=beta_path,
+                    initial_state=local_ssm_state,
+                    inplace_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                local_ssm_final = path_final_state[-1]
+
+                actual_state_idx = int(
+                    spec_state_indices_tensor[req_row, node_slot].item()
+                )
+                if actual_state_idx < 0:
+                    continue
+                conv_diff = (
+                    conv_state[
+                        actual_state_idx, :, :conv_state_width
+                    ].float()
+                    - local_conv_state[
+                        len(token_rows), :, :conv_state_width
+                    ].float()
+                ).abs().max()
+                ssm_diff = (
+                    ssm_state[actual_state_idx].float()
+                    - local_ssm_final.float()
+                ).abs().max()
+                conv_diff_value = float(conv_diff.item())
+                ssm_diff_value = float(ssm_diff.item())
+                if worst is None or max(conv_diff_value, ssm_diff_value) > max(
+                    worst[0], worst[1]
+                ):
+                    worst = (
+                        conv_diff_value,
+                        ssm_diff_value,
+                        req_row,
+                        node_slot,
+                        path_slots,
+                        actual_state_idx,
+                    )
+
+        if worst is None:
+            return
+        if _DFLASH_DDTREE_PATH_PROBE_REPORTS >= max_reports:
+            return
+        _DFLASH_DDTREE_PATH_PROBE_REPORTS += 1
+        conv_diff_value, ssm_diff_value, req_row, node_slot, path_slots, state_idx = (
+            worst
+        )
+        logger.info(
+            "DFlash DDTree path probe layer=%s req=%d node=%d path=%s "
+            "state_idx=%d conv_max=%.6g ssm_max=%.6g",
+            self.prefix,
+            req_row,
+            node_slot,
+            tuple(path_slots),
+            state_idx,
+            conv_diff_value,
+            ssm_diff_value,
+            )
+
+    def _forward_ddtree_gdn_pure_spec_flashqla(
+        self,
+        *,
+        mixed_qkv_spec: torch.Tensor,
+        a_spec: torch.Tensor,
+        b_spec: torch.Tensor,
+        ssm_state: torch.Tensor,
+        spec_query_start_loc: torch.Tensor,
+        spec_state_indices_tensor: torch.Tensor,
+        spec_state_slot_selectors: torch.Tensor,
+        ddtree_parent_ids: torch.Tensor,
+        num_spec_decodes: int,
+    ) -> torch.Tensor | None:
+        if not self.enable_flashqla_decode:
+            _log_runtime_route_once(
+                "DDTree FlashQLA GDN requested but SM70 FlashQLA decode "
+                "route is disabled."
+            )
+            return None
+        if (
+            not mixed_qkv_spec.is_cuda
+            or mixed_qkv_spec.dtype != torch.float16
+            or self.head_k_dim != 128
+            or self.head_v_dim != 128
+        ):
+            return None
+        if self.num_k_heads % self.tp_size != 0 or self.num_v_heads % self.tp_size != 0:
+            return None
+        try:
+            from flash_qla.ops.gated_delta_rule.chunk.sm70.fused_fwd import (
+                gdn_decode_mixed_qkv_ddtree_state_sm70,
+            )
+        except ImportError:
+            _log_runtime_route_once(
+                "DDTree FlashQLA GDN requested but flash_qla DDTree decode "
+                "extension is not importable."
+            )
+            return None
+
+        state_indices = spec_state_indices_tensor[:num_spec_decodes]
+        parent_ids = ddtree_parent_ids[:num_spec_decodes]
+        accepted = spec_state_slot_selectors[:num_spec_decodes]
+        cu_seqlens = spec_query_start_loc[: num_spec_decodes + 1]
+        if state_indices.dtype != torch.int32:
+            state_indices = state_indices.to(dtype=torch.int32)
+        if parent_ids.dtype != torch.int32:
+            parent_ids = parent_ids.to(dtype=torch.int32)
+        if accepted.dtype != torch.int32:
+            accepted = accepted.to(dtype=torch.int32)
+        if cu_seqlens.dtype != torch.int32:
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32)
+
+        state_indices = state_indices.contiguous()
+        parent_ids = parent_ids.contiguous()
+        accepted = accepted.contiguous()
+        cu_seqlens = cu_seqlens.contiguous()
+        output = mixed_qkv_spec.new_empty(
+            (
+                mixed_qkv_spec.shape[0],
+                self.num_v_heads // self.tp_size,
+                self.head_v_dim,
+            )
+        )
+        gdn_decode_mixed_qkv_ddtree_state_sm70(
+            mixed_qkv_spec,
+            a_spec.contiguous(),
+            b_spec.contiguous(),
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            state_indices,
+            parent_ids,
+            accepted,
+            cu_seqlens,
+            output,
+            scale=self.head_k_dim**-0.5,
+            use_qk_l2norm_in_kernel=True,
+        )
+        _log_runtime_route_once(
+            "Using FlashQLA DDTree Qwen GDN pure-spec verifier path."
+        )
+        return output.unsqueeze(0)
+
     def _forward_ddtree_gdn_pure_spec(
         self,
         *,
@@ -2623,6 +3056,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
             )
+            if _dflash_ddtree_qla_gdn_enabled():
+                core_attn_out_spec = (
+                    self._forward_ddtree_gdn_pure_spec_flashqla(
+                        mixed_qkv_spec=mixed_qkv_spec,
+                        a_spec=a_spec,
+                        b_spec=b_spec,
+                        ssm_state=ssm_state,
+                        spec_query_start_loc=spec_query_start_loc,
+                        spec_state_indices_tensor=spec_state_indices_tensor,
+                        spec_state_slot_selectors=spec_state_slot_selectors,
+                        ddtree_parent_ids=ddtree_parent_ids,
+                        num_spec_decodes=num_spec_decodes,
+                    )
+                )
+                if core_attn_out_spec is not None:
+                    _sm70_gdn_prefill_profile_end(
+                        layer_name,
+                        "ddtree_pure_spec_flashqla",
+                        profile_start,
+                        tokens=mixed_qkv_spec.shape[0],
+                        details=(
+                            f"requests={num_spec_decodes} "
+                            "backend=flashqla_ddtree "
+                            "tree_tokens="
+                            f"{int(ddtree_num_tree_tokens_cpu.sum().item())}"
+                        ),
+                    )
+                    return core_attn_out_spec
             core_attn_out_spec, _ = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
                 A_log=self.A_log,
                 a=a_spec,
@@ -2677,7 +3138,67 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_v_dim,
             )
         )
+        if _dflash_ddtree_linear_gdn_enabled():
+            mixed_qkv_linear = causal_conv1d_update(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0],
+                num_accepted_tokens=spec_state_slot_selectors,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
+            query_linear, key_linear, value_linear = self.rearrange_mixed_qkv(
+                mixed_qkv_linear
+            )
+            g_linear, beta_linear = fused_gdn_gating(
+                self.A_log,
+                a_spec,
+                b_spec,
+                self.dt_bias,
+            )
+            core_attn_out_linear, _ = fused_recurrent_gated_delta_rule(
+                q=query_linear,
+                k=key_linear,
+                v=value_linear,
+                g=g_linear,
+                beta=beta_linear,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=spec_query_start_loc[:num_spec_decodes + 1],
+                ssm_state_indices=spec_state_indices_tensor,
+                num_accepted_tokens=spec_state_slot_selectors,
+                use_qk_l2norm_in_kernel=True,
+            )
+            _sm70_gdn_prefill_profile_end(
+                layer_name,
+                "ddtree_pure_spec_linear_diagnostic",
+                profile_start,
+                tokens=total_spec_tokens,
+                details=(
+                    f"requests={num_spec_decodes} "
+                    f"tree_tokens={int(ddtree_num_tree_tokens_cpu.sum().item())}"
+                ),
+            )
+            return core_attn_out_linear
+
         device = mixed_qkv_spec.device
+        conv_already_updated = _dflash_ddtree_conv_kernel_enabled()
+        if conv_already_updated:
+            mixed_qkv_spec = causal_conv1d_update_ddtree(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor,
+                parent_ids=ddtree_parent_ids,
+                num_accepted_tokens=spec_state_slot_selectors,
+                query_start_loc=spec_query_start_loc,
+            )
         max_state_slot = max(0, spec_state_indices_tensor.shape[1] - 1)
         if spec_state_slot_selectors is None:
             selector_offsets = torch.zeros(
@@ -2702,7 +3223,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ]
         root_state_indices = spec_state_indices_tensor[:, 0]
         parent_zero_state_indices = selected_root_state_indices.clone()
-
+        path_probe_initial_conv_state: torch.Tensor | None = None
+        path_probe_initial_ssm_state: torch.Tensor | None = None
+        if (
+            not conv_already_updated
+            and _dflash_ddtree_path_probe_enabled()
+            and _dflash_ddtree_path_probe_layer_matches(self.prefix)
+        ):
+            root_indices = selected_root_state_indices.to(torch.long)
+            path_probe_initial_conv_state = conv_state.index_select(
+                0, root_indices
+            ).clone()
+            path_probe_initial_ssm_state = ssm_state.index_select(
+                0, root_indices
+            ).clone()
         if prefix_rows:
             token_rows, req_rows = zip(*prefix_rows, strict=True)
             token_idx = torch.tensor(token_rows, dtype=torch.long, device=device)
@@ -2720,17 +3254,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             one_idx = torch.ones_like(zero_idx)
 
             mixed_qkv_prefix = mixed_qkv_spec.index_select(0, token_idx)
-            mixed_qkv_prefix = causal_conv1d_update(
-                mixed_qkv_prefix,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=conv_state_indices,
-                block_idx_last_scheduled_token=one_idx,
-                initial_state_idx=zero_idx,
-                validate_data=False,
-            )
+            if not conv_already_updated:
+                mixed_qkv_prefix = causal_conv1d_update(
+                    mixed_qkv_prefix,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=conv_state_indices,
+                    block_idx_last_scheduled_token=one_idx,
+                    initial_state_idx=zero_idx,
+                    validate_data=False,
+                )
             query_prefix, key_prefix, value_prefix = self.rearrange_mixed_qkv(
                 mixed_qkv_prefix
             )
@@ -2769,79 +3304,109 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             core_attn_out_spec.index_copy_(1, token_idx, core_prefix)
 
+        serial_tree_replay = _dflash_ddtree_serial_gdn_enabled()
         for depth_batch in depth_batches:
             if not depth_batch:
                 continue
-            token_rows, req_rows, parent_slots, node_slots = zip(
-                *depth_batch, strict=True
+            replay_batches = (
+                ((entry,) for entry in depth_batch)
+                if serial_tree_replay
+                else (tuple(depth_batch),)
             )
-            device = mixed_qkv_spec.device
-            token_idx = torch.tensor(token_rows, dtype=torch.long, device=device)
-            req_idx = torch.tensor(req_rows, dtype=torch.long, device=device)
-            parent_idx = torch.tensor(parent_slots, dtype=torch.long, device=device)
-            node_idx = torch.tensor(node_slots, dtype=torch.long, device=device)
+            for replay_batch in replay_batches:
+                token_rows, req_rows, parent_slots, node_slots = zip(
+                    *replay_batch, strict=True
+                )
+                device = mixed_qkv_spec.device
+                token_idx = torch.tensor(token_rows, dtype=torch.long, device=device)
+                req_idx = torch.tensor(req_rows, dtype=torch.long, device=device)
+                parent_idx = torch.tensor(
+                    parent_slots, dtype=torch.long, device=device
+                )
+                node_idx = torch.tensor(node_slots, dtype=torch.long, device=device)
 
-            parent_state_indices = spec_state_indices_tensor[req_idx, parent_idx]
-            parent_state_indices = torch.where(
-                parent_idx == 0,
-                parent_zero_state_indices[req_idx],
-                parent_state_indices,
-            )
-            node_state_indices = spec_state_indices_tensor[req_idx, node_idx]
-            conv_state_indices = torch.stack(
-                (parent_state_indices, node_state_indices), dim=1
-            ).to(torch.int32)
-            zero_idx = torch.zeros(
-                conv_state_indices.shape[0],
-                dtype=torch.int32,
-                device=device,
-            )
-            one_idx = torch.ones_like(zero_idx)
+                parent_state_indices = spec_state_indices_tensor[req_idx, parent_idx]
+                parent_state_indices = torch.where(
+                    parent_idx == 0,
+                    parent_zero_state_indices[req_idx],
+                    parent_state_indices,
+                )
+                node_state_indices = spec_state_indices_tensor[req_idx, node_idx]
+                conv_state_indices = torch.stack(
+                    (parent_state_indices, node_state_indices), dim=1
+                ).to(torch.int32)
+                zero_idx = torch.zeros(
+                    conv_state_indices.shape[0],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                one_idx = torch.ones_like(zero_idx)
 
-            mixed_qkv_depth = mixed_qkv_spec.index_select(0, token_idx)
-            mixed_qkv_depth = causal_conv1d_update(
-                mixed_qkv_depth,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=conv_state_indices,
-                block_idx_last_scheduled_token=one_idx,
-                initial_state_idx=zero_idx,
-                validate_data=False,
+                mixed_qkv_depth = mixed_qkv_spec.index_select(0, token_idx)
+                if not conv_already_updated:
+                    mixed_qkv_depth = causal_conv1d_update(
+                        mixed_qkv_depth,
+                        conv_state,
+                        conv_weights,
+                        self.conv1d.bias,
+                        self.activation,
+                        conv_state_indices=conv_state_indices,
+                        block_idx_last_scheduled_token=one_idx,
+                        initial_state_idx=zero_idx,
+                        validate_data=False,
+                    )
+                query_depth, key_depth, value_depth = self.rearrange_mixed_qkv(
+                    mixed_qkv_depth
+                )
+                g_depth, beta_depth = fused_gdn_gating(
+                    self.A_log,
+                    a_spec.index_select(0, token_idx),
+                    b_spec.index_select(0, token_idx),
+                    self.dt_bias,
+                )
+                cu_seqlens = torch.arange(
+                    conv_state_indices.shape[0] + 1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                core_depth, final_state = fused_recurrent_gated_delta_rule(
+                    q=query_depth,
+                    k=key_depth,
+                    v=value_depth,
+                    g=g_depth,
+                    beta=beta_depth,
+                    initial_state=ssm_state,
+                    inplace_final_state=False,
+                    cu_seqlens=cu_seqlens,
+                    ssm_state_indices=parent_state_indices.to(torch.int32),
+                    use_qk_l2norm_in_kernel=True,
+                )
+                ssm_state.index_copy_(
+                    0,
+                    node_state_indices.to(torch.long),
+                    final_state.to(ssm_state.dtype),
+                )
+                core_attn_out_spec.index_copy_(1, token_idx, core_depth)
+
+        if (
+            path_probe_initial_conv_state is not None
+            and path_probe_initial_ssm_state is not None
+        ):
+            self._probe_ddtree_path_replay_states(
+                mixed_qkv_spec=mixed_qkv_spec,
+                a_spec=a_spec,
+                b_spec=b_spec,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                conv_weights=conv_weights,
+                spec_query_start_loc=spec_query_start_loc,
+                spec_state_indices_tensor=spec_state_indices_tensor,
+                ddtree_parent_ids=ddtree_parent_ids,
+                ddtree_num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu,
+                num_spec_decodes=num_spec_decodes,
+                initial_conv_state=path_probe_initial_conv_state,
+                initial_ssm_state=path_probe_initial_ssm_state,
             )
-            query_depth, key_depth, value_depth = self.rearrange_mixed_qkv(
-                mixed_qkv_depth
-            )
-            g_depth, beta_depth = fused_gdn_gating(
-                self.A_log,
-                a_spec.index_select(0, token_idx),
-                b_spec.index_select(0, token_idx),
-                self.dt_bias,
-            )
-            cu_seqlens = torch.arange(
-                conv_state_indices.shape[0] + 1,
-                dtype=torch.int32,
-                device=device,
-            )
-            core_depth, final_state = fused_recurrent_gated_delta_rule(
-                q=query_depth,
-                k=key_depth,
-                v=value_depth,
-                g=g_depth,
-                beta=beta_depth,
-                initial_state=ssm_state,
-                inplace_final_state=False,
-                cu_seqlens=cu_seqlens,
-                ssm_state_indices=parent_state_indices.to(torch.int32),
-                use_qk_l2norm_in_kernel=True,
-            )
-            ssm_state.index_copy_(
-                0,
-                node_state_indices.to(torch.long),
-                final_state.to(ssm_state.dtype),
-            )
-            core_attn_out_spec.index_copy_(1, token_idx, core_depth)
 
         _sm70_gdn_prefill_profile_end(
             layer_name,
@@ -3200,7 +3765,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 layer_name,
                 core_attn_out,
             )
-            torch.ops.vllm.qwen_gdn_input_projection_core(
+            z, core_attn_out = torch.ops.vllm.qwen_gdn_input_projection_core(
                 hidden_states,
                 z,
                 core_attn_out,
@@ -3489,37 +4054,86 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if conv_state.size(0) == 0:
             return False
 
-        T = FLA_CHUNK_SIZE
         device = conv_state.device
         dtype = conv_state.dtype
-        dummy_conv_in = torch.randn(
-            T, conv_weights.shape[0], device=device, dtype=dtype
-        ).transpose(0, 1)
-        query_start_loc = torch.tensor([0, T], device=device, dtype=torch.int32)
-        query_start_loc_cpu = torch.tensor([0, T], dtype=torch.int32)
-        nums_dict, batch_ptr, token_chunk_offset_ptr = (
-            compute_causal_conv1d_metadata(query_start_loc_cpu, device=device)
+        qkv_dim = conv_weights.shape[0]
+        qkvz_width = qkv_dim + self.value_dim // self.tp_size
+        observed_qkv_row_stride = int(
+            getattr(self, "_sm70_gdn_prefill_qkv_row_stride", qkvz_width)
         )
-        conv_metadata = SimpleNamespace(
-            nums_dict=nums_dict,
-            batch_ptr=batch_ptr,
-            token_chunk_offset_ptr=token_chunk_offset_ptr,
+        qkv_row_strides = sorted(
+            {
+                qkv_dim,
+                qkvz_width,
+                max(qkv_dim, observed_qkv_row_stride),
+            }
         )
-        cache_indices = torch.zeros(1, device=device, dtype=torch.int32)
+        prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
+        spec_cache_stride = max(
+            1,
+            int(getattr(self, "num_spec", 1)),
+            int(getattr(self, "_sm70_spec_cache_stride", 1)),
+            _sm70_spec_cache_stride_from_config(),
+        )
+        cache_indices_variants = [
+            torch.zeros(1, device=device, dtype=torch.int32)
+        ]
+        if spec_cache_stride > 1:
+            strided_cache_base = torch.zeros(
+                spec_cache_stride, device=device, dtype=torch.int32
+            )
+            cache_indices_variants.append(
+                torch.as_strided(
+                    strided_cache_base,
+                    size=(1,),
+                    stride=(spec_cache_stride,),
+                )
+            )
         has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
         conv_state_line = conv_state[:1]
         try:
-            causal_conv1d_fn(
-                dummy_conv_in,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state_line,
-                cache_indices=cache_indices,
-                has_initial_state=has_initial_state,
-                query_start_loc=query_start_loc,
-                metadata=conv_metadata,
-            )
+            for prefill_tokens in prefill_token_counts:
+                dummy_conv_inputs = []
+                for qkv_row_stride in qkv_row_strides:
+                    dummy_qkv = torch.randn(
+                        prefill_tokens,
+                        qkv_row_stride,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    dummy_conv_inputs.append(
+                        dummy_qkv[:, :qkv_dim].transpose(0, 1)
+                    )
+                query_start_loc = torch.tensor(
+                    [0, prefill_tokens], device=device, dtype=torch.int32
+                )
+                query_start_loc_cpu = torch.tensor(
+                    [0, prefill_tokens], dtype=torch.int32
+                )
+                nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                    compute_causal_conv1d_metadata(
+                        query_start_loc_cpu, device=device
+                    )
+                )
+                conv_metadata = SimpleNamespace(
+                    nums_dict=nums_dict,
+                    batch_ptr=batch_ptr,
+                    token_chunk_offset_ptr=token_chunk_offset_ptr,
+                )
+                for dummy_conv_in in dummy_conv_inputs:
+                    for cache_indices in cache_indices_variants:
+                        causal_conv1d_fn(
+                            dummy_conv_in,
+                            conv_weights,
+                            self.conv1d.bias,
+                            activation=self.activation,
+                            conv_states=conv_state,
+                            cache_indices=cache_indices,
+                            has_initial_state=has_initial_state,
+                            query_start_loc=query_start_loc,
+                            metadata=conv_metadata,
+                        )
+                        conv_state_line.zero_()
         except Exception:
             logger.warning(
                 "SM70 GDN causal-conv real-state warmup failed for layer %s. "
@@ -3531,7 +4145,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         finally:
             conv_state_line.zero_()
 
-        qkvz_width = conv_weights.shape[0] + self.value_dim // self.tp_size
         try:
             for decode_tokens in (1, 2):
                 dummy_decode_inputs = [
@@ -3612,6 +4225,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
+        qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
+        qkv_row_stride = (
+            qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
+        )
+        self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(qkv_row_stride))
+        prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
         warmup_key = (
             qkv_or_qkvz.device.type,
             qkv_or_qkvz.device.index,
@@ -3625,8 +4244,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_v_heads,
             self.head_k_dim,
             self.head_v_dim,
-            qkv_or_qkvz.shape[-1] - v_dim,
-            FLA_CHUNK_SIZE,
+            qkv_dim,
+            qkv_row_stride,
+            prefill_token_counts,
             is_conv_state_dim_first(),
         )
         if warmup_key in _SM70_GDN_PREFILL_WARMUP_KEYS:
@@ -3644,13 +4264,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # conv1d prefill kernel once; otherwise Qwen3.5/Next can still JIT
         # _causal_conv1d_fwd_kernel on the first real request after the JIT
         # monitor has been activated.
-        T = FLA_CHUNK_SIZE
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
-        dummy_conv_in = torch.randn(
-            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
-        ).transpose(0, 1)
         if is_conv_state_dim_first():
             dummy_conv_state = torch.zeros(
                 1,
@@ -3667,60 +4283,134 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 device=device,
                 dtype=dtype,
             ).transpose(-1, -2)
-        dummy_cache_indices = torch.zeros(1, device=device, dtype=torch.int32)
-        dummy_has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
-        try:
-            causal_conv1d_fn(
-                dummy_conv_in,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=dummy_conv_state,
-                cache_indices=dummy_cache_indices,
-                has_initial_state=dummy_has_initial_state,
-                query_start_loc=cu_seqlens,
+        spec_cache_stride = max(
+            1,
+            int(getattr(self, "num_spec", 1)),
+            int(getattr(self, "_sm70_spec_cache_stride", 1)),
+            _sm70_spec_cache_stride_from_config(),
+        )
+        dummy_cache_indices_variants = [
+            torch.zeros(1, device=device, dtype=torch.int32)
+        ]
+        if spec_cache_stride > 1:
+            dummy_cache_base = torch.zeros(
+                spec_cache_stride, device=device, dtype=torch.int32
             )
+            dummy_cache_indices_variants.append(
+                torch.as_strided(
+                    dummy_cache_base,
+                    size=(1,),
+                    stride=(spec_cache_stride,),
+                )
+            )
+        dummy_has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
+        try:
+            for prefill_tokens in prefill_token_counts:
+                dummy_conv_inputs = [
+                    torch.randn(
+                        prefill_tokens,
+                        qkv_dim,
+                        device=device,
+                        dtype=dtype,
+                    ).transpose(0, 1)
+                ]
+                if qkv_row_stride > qkv_dim:
+                    dummy_qkv = torch.randn(
+                        prefill_tokens,
+                        qkv_row_stride,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    dummy_conv_inputs.append(dummy_qkv[:, :qkv_dim].transpose(0, 1))
+                cu_seqlens = torch.tensor(
+                    [0, prefill_tokens], device=device, dtype=torch.int32
+                )
+                for dummy_conv_in in dummy_conv_inputs:
+                    for dummy_cache_indices in dummy_cache_indices_variants:
+                        causal_conv1d_fn(
+                            dummy_conv_in,
+                            conv_weights,
+                            self.conv1d.bias,
+                            activation=self.activation,
+                            conv_states=dummy_conv_state,
+                            cache_indices=dummy_cache_indices,
+                            has_initial_state=dummy_has_initial_state,
+                            query_start_loc=cu_seqlens,
+                        )
+                        dummy_conv_state.zero_()
         except Exception:
             logger.warning(
-                "GDN causal-conv prefill warmup (T=%d) failed for layer %s. "
+                "GDN causal-conv prefill warmup failed for layer %s. "
                 "First inference may JIT _causal_conv1d_fwd_kernel.",
-                T,
                 self.prefix,
                 exc_info=True,
             )
         else:
             logger.debug(
-                "GDN causal-conv prefill warmup (T=%d) completed for layer %s",
-                T,
+                "GDN causal-conv prefill warmup completed for layer %s",
                 self.prefix,
             )
 
         # Mirror the real prefill path here: build q/k/v/g/beta via
         # fused_post_conv_prep and then run chunk_gated_delta_rule with
         # in-kernel L2 norm disabled.
-        dummy_mixed_qkv = torch.randn(
-            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
-        )
-        dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        q, k, v, g, beta = fused_post_conv_prep(
-            conv_output=dummy_mixed_qkv,
-            a=dummy_a,
-            b=dummy_b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            num_k_heads=num_k_heads,
-            head_k_dim=self.head_k_dim,
-            head_v_dim=self.head_v_dim,
-            apply_l2norm=True,
-            output_g_exp=False,
-        )
-        del q, k, v, g, beta
+        for prefill_tokens in prefill_token_counts:
+            compact_a = torch.randn(
+                prefill_tokens, num_v_heads, device=device, dtype=dtype
+            )
+            compact_b = torch.randn(
+                prefill_tokens, num_v_heads, device=device, dtype=dtype
+            )
+            gate_inputs = [(compact_a, compact_b)]
+            gate_row_stride = 2 * num_v_heads
+            if gate_row_stride > num_v_heads:
+                dummy_ba = torch.randn(
+                    prefill_tokens,
+                    gate_row_stride,
+                    device=device,
+                    dtype=dtype,
+                )
+                # Split-projection Qwen keeps b as a view into [b, a], while
+                # a is contiguous when compile-graph slicing uses index_select.
+                gate_inputs.append((compact_a, dummy_ba[:, :num_v_heads]))
+                # Keep the pure view case warmed as well for non-graph runs.
+                gate_inputs.append(
+                    (
+                        dummy_ba[:, num_v_heads:gate_row_stride],
+                        dummy_ba[:, :num_v_heads],
+                    )
+                )
+            dummy_post_conv_inputs = [
+                torch.randn(prefill_tokens, qkv_dim, device=device, dtype=dtype)
+            ]
+            if qkv_row_stride > qkv_dim:
+                dummy_qkv_post = torch.randn(
+                    prefill_tokens,
+                    qkv_row_stride,
+                    device=device,
+                    dtype=dtype,
+                )
+                dummy_post_conv_inputs.append(dummy_qkv_post[:, :qkv_dim])
+            for dummy_mixed_qkv in dummy_post_conv_inputs:
+                for dummy_a, dummy_b in gate_inputs:
+                    q, k, v, g, beta = fused_post_conv_prep(
+                        conv_output=dummy_mixed_qkv,
+                        a=dummy_a,
+                        b=dummy_b,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        num_k_heads=num_k_heads,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        apply_l2norm=True,
+                        output_g_exp=False,
+                    )
+                    del q, k, v, g, beta
         # The warmup is only meant to compile/autotune the GDN prefill
         # kernels. Keep the actual kernel inputs deterministic and bounded so
         # random profile tensors cannot trigger pathological TileLang runtime
         # waits before real inference starts.
+        T = FLA_CHUNK_SIZE
         q = torch.full(
             (1, T, num_k_heads, self.head_k_dim),
             1.0e-3,
@@ -6078,7 +6768,7 @@ def qwen_gdn_input_projection_core(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run Qwen GDN input projection and recurrent core outside Inductor."""
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -6140,6 +6830,7 @@ def qwen_gdn_input_projection_core(
         conv_state_cache=conv_state_cache,
         ssm_state_cache=ssm_state_cache,
     )
+    return z_out, core_attn_out
 
 
 def qwen_gdn_input_projection_core_fake(
@@ -6149,8 +6840,9 @@ def qwen_gdn_input_projection_core_fake(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for torch.compile."""
+    return z_out, core_attn_out
 
 
 def qwen_gdn_input_projection(

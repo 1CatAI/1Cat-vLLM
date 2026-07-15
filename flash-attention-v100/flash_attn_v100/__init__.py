@@ -1,6 +1,7 @@
 __version__ = "1.2.0"
 
 from flash_attn_v100.flash_attn_interface import (
+    fp8_e5m2_paged_kv_to_fp16,
     flash_attn_decode_qk_scores,
     flash_attn_decode_paged,
     flash_attn_decode_paged_xqa,
@@ -12,6 +13,7 @@ from flash_attn_v100.flash_attn_interface import (
     flash_attn_func,
     flash_attn_lse,
     flash_attn_prefill_paged,
+    flash_attn_prefill_paged_d256_bm32_allp_pair_scratch,
     flash_attn_prefill_paged_bfla,
     flash_attn_prefill_paged_bhmd,
     flash_attn_prefill_paged_splitkv,
@@ -19,6 +21,7 @@ from flash_attn_v100.flash_attn_interface import (
 )
 
 __all__ = [
+    "fp8_e5m2_paged_kv_to_fp16",
     "flash_attn_decode_qk_scores",
     "flash_attn_decode_paged",
     "flash_attn_decode_paged_xqa",
@@ -30,6 +33,7 @@ __all__ = [
     "flash_attn_func",
     "flash_attn_lse",
     "flash_attn_prefill_paged",
+    "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch",
     "flash_attn_prefill_paged_bfla",
     "flash_attn_prefill_paged_bhmd",
     "flash_attn_prefill_paged_splitkv",

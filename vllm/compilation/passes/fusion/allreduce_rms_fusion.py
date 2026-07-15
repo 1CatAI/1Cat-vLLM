@@ -12,6 +12,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
 import vllm.ir.ops
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.passes.fusion.rms_quant_fusion import (
     _rms_input_weight_dtype_match,
@@ -420,6 +421,98 @@ class AllReduceFusedAddRMSNormPattern(BasePattern):
         )
 
 
+_ALL_REDUCE_OP = torch.ops.vllm.all_reduce.default
+
+
+def _sm70_ar_gemma_rms_match(match: pm.Match) -> bool:
+    for node in match.nodes:
+        if node.target != _ALL_REDUCE_OP:
+            continue
+        input_node = node.args[0]
+        if not isinstance(input_node, fx.Node):
+            return False
+        value = input_node.meta.get("val")
+        if value is None:
+            return False
+        return (
+            value.dtype == torch.float16
+            and value.dim() == 2
+            and value.shape[-1] == 5120
+        )
+    return False
+
+
+class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
+    def __init__(
+        self,
+        epsilon: float,
+        dtype: torch.dtype,
+        device: str | None,
+        residual_dtype: torch.dtype,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+        self.group_name = get_tp_group().unique_name
+        self.residual_dtype = residual_dtype
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        residual = (
+            self.empty_f32(5, 5120)
+            if self.residual_dtype == torch.float32
+            else self.empty(5, 5120)
+        )
+        return [
+            residual,
+            self.empty(5, 5120),
+            self.empty(5120),
+        ]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            reduced = tensor_model_parallel_all_reduce(input)
+            residual_out = reduced.float() + residual.float()
+            variance = residual_out.pow(2).mean(dim=-1, keepdim=True)
+            normalized = residual_out * torch.rsqrt(variance + self.epsilon)
+            normalized = normalized * (1.0 + weight.float())
+            return normalized.to(input.dtype), residual_out
+
+        def replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm(
+                input,
+                residual,
+                weight,
+                self.epsilon,
+                group_name=self.group_name,
+            )
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_sm70_ar_gemma_rms_match,
+        )
+
+        first_return_only = lambda fn: lambda a, b, c: fn(a, b, c)[0]
+        pm.register_replacement(
+            first_return_only(pattern),  # type: ignore[no-untyped-call]
+            first_return_only(replacement),  # type: ignore[no-untyped-call]
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_sm70_ar_gemma_rms_match,
+        )
+
+
 class AllReduceFusedRMSNormStaticQuantFP8Pattern(BasePattern):
     """
     This pattern replaces the allreduce + rms norm (without residual)
@@ -781,6 +874,37 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.hidden_dim = config.model_config.get_hidden_size()
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
+        sm70_common = (
+            self.hidden_dim == 5120
+            and self.model_dtype == torch.float16
+            and current_platform.is_device_capability(70)
+        )
+        self.sm70_tp2_mode = (
+            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+            and self.tp_size == 2
+            and sm70_common
+        )
+        self.sm70_mode = self.sm70_tp2_mode
+        if self.sm70_mode:
+            device_comm = get_tp_group().device_communicator
+            ca_comm = (
+                None if device_comm is None else getattr(device_comm, "ca_comm", None)
+            )
+            if not isinstance(ca_comm, CustomAllreduce) or ca_comm.disabled:
+                logger.warning_once(
+                    "SM70 TP%d allreduce-Gemma-RMS fusion requires active custom AR.",
+                    self.tp_size,
+                )
+                return
+            self.max_token_num = config.scheduler_config.max_num_batched_tokens
+            self.register_sm70_patterns()
+            self.dump_patterns(config, self.patterns)
+            self.disabled = False
+            logger.info_once(
+                "Enabled experimental SM70 TP%d allreduce + Gemma RMSNorm fusion.",
+                self.tp_size,
+            )
+            return
         if flashinfer_comm is None:
             logger.warning(
                 "Flashinfer is not installed or comm module not found, "
@@ -845,6 +969,17 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.dump_patterns(config, self.patterns)
 
     @enable_fake_mode
+    def register_sm70_patterns(self) -> None:
+        for residual_dtype in (torch.float16, torch.float32):
+            Sm70AllReduceGemmaRMSNormPattern(
+                1e-6,
+                self.model_dtype,
+                self.device,
+                residual_dtype,
+            ).register(self.patterns)
+        self.disabled = False
+
+    @enable_fake_mode
     def register_patterns(self) -> None:
         for epsilon in [1e-5, 1e-6]:
             if self.supports_quant_fusion:
@@ -906,9 +1041,15 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
+        if getattr(self, "sm70_mode", False):
+            logger.info(
+                "SM70 TP%d allreduce-Gemma-RMS fusion replaced %d patterns.",
+                self.tp_size,
+                self.matched_count,
+            )
 
     def __del__(self) -> None:
-        if getattr(self, "disabled", True):
+        if getattr(self, "disabled", True) or getattr(self, "sm70_mode", False):
             return
         with contextlib.suppress(Exception):
             destroy_fi_ar_workspace()

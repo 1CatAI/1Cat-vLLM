@@ -2566,6 +2566,347 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
     return 0 if strict_ok else 1
 
 
+def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this benchmark")
+
+    from vllm.model_executor.layers.fla.ops.fused_recurrent import (
+        fused_recurrent_gated_delta_rule,
+    )
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        fused_gdn_gating,
+        fused_sigmoid_gating_delta_rule_update_mixed_qkv,
+    )
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+        causal_conv1d_update,
+    )
+
+    inputs = _load_or_create_spec_decode_cudagraph_inputs(args)
+    cuda_inputs, _ = _to_cuda_inputs(inputs)
+    mixed_qkv_seq = cuda_inputs["mixed_qkv_seq"]
+    a_seq = cuda_inputs["a_seq"]
+    b_seq = cuda_inputs["b_seq"]
+    state_indices_seq = cuda_inputs["state_indices_seq"]
+    num_accepted_tokens_seq = cuda_inputs["num_accepted_tokens_seq"]
+    query_start_loc_seq = cuda_inputs["query_start_loc_seq"]
+    initial_conv_state = cuda_inputs["conv_state"]
+    initial_ssm_state = cuda_inputs["ssm_state"]
+    steps = mixed_qkv_seq.shape[0]
+    max_query_len = mixed_qkv_seq.shape[1]
+    graph_rows = query_start_loc_seq.shape[1] - 1
+    scale = args.scale
+    if scale is None:
+        scale = args.head_k_dim**-0.5
+    activation = "silu" if args.silu else None
+
+    def run_conv(
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        return causal_conv1d_update(
+            mixed_qkv,
+            conv_state,
+            cuda_inputs["conv_weight"],
+            cuda_inputs["conv_bias"],
+            activation,
+            conv_state_indices=state_indices[:, 0],
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=query_start_loc,
+            max_query_len=max_query_len,
+            validate_data=False,
+        )
+
+    def launch_split(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        out: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        mixed_qkv_conv = run_conv(
+            mixed_qkv,
+            conv_state,
+            state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+        )
+        query, key, value = _split_packed_mixed_qkv(
+            mixed_qkv_conv,
+            k_heads=args.k_heads,
+            v_heads=args.v_heads,
+            head_k_dim=args.head_k_dim,
+            head_v_dim=args.head_v_dim,
+        )
+        g, beta = fused_gdn_gating(
+            cuda_inputs["A_log"],
+            a,
+            b,
+            cuda_inputs["dt_bias"],
+        )
+        core_out, _ = fused_recurrent_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=ssm_state,
+            inplace_final_state=True,
+            cu_seqlens=query_start_loc,
+            ssm_state_indices=state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=args.l2norm_inputs,
+        )
+        out.copy_(core_out.squeeze(0))
+
+    def launch_mixed_qkv(
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        out: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        mixed_qkv_conv = run_conv(
+            mixed_qkv,
+            conv_state,
+            state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+        )
+        core_out, _ = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+            A_log=cuda_inputs["A_log"],
+            a=a,
+            b=b,
+            dt_bias=cuda_inputs["dt_bias"],
+            mixed_qkv=mixed_qkv_conv,
+            num_q_heads=args.k_heads,
+            num_v_heads=args.v_heads,
+            head_k_dim=args.head_k_dim,
+            head_v_dim=args.head_v_dim,
+            initial_state=ssm_state,
+            inplace_final_state=True,
+            cu_seqlens=query_start_loc,
+            ssm_state_indices=state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            use_qk_l2norm_in_kernel=args.l2norm_inputs,
+        )
+        out.copy_(core_out.squeeze(0))
+
+    def run_eager_sequence(launch_fn: Any) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        conv_state = initial_conv_state.clone()
+        ssm_state = initial_ssm_state.clone()
+        out_seq = torch.empty(
+            (steps, max_query_len, args.v_heads, args.head_v_dim),
+            device=mixed_qkv_seq.device,
+            dtype=mixed_qkv_seq.dtype,
+        )
+        mixed_after = torch.empty_like(mixed_qkv_seq)
+        for step in range(steps):
+            mixed_step = mixed_qkv_seq[step].clone()
+            step_out = torch.empty_like(out_seq[step])
+            launch_fn(
+                mixed_step,
+                a_seq[step],
+                b_seq[step],
+                conv_state,
+                ssm_state,
+                step_out,
+                state_indices_seq[step],
+                num_accepted_tokens_seq[step],
+                query_start_loc_seq[step],
+            )
+            out_seq[step].copy_(step_out)
+            mixed_after[step].copy_(mixed_step)
+        return out_seq, mixed_after, conv_state, ssm_state
+
+    def time_graph_sequence(launch_fn: Any) -> float:
+        conv_state = initial_conv_state.clone()
+        ssm_state = initial_ssm_state.clone()
+        mixed_buf = mixed_qkv_seq[0].clone()
+        a_buf = a_seq[0].clone()
+        b_buf = b_seq[0].clone()
+        state_indices_buf = state_indices_seq[0].clone()
+        num_accepted_tokens_buf = num_accepted_tokens_seq[0].clone()
+        query_start_loc_buf = query_start_loc_seq[0].clone()
+        step_out = torch.empty(
+            (max_query_len, args.v_heads, args.head_v_dim),
+            device=mixed_qkv_seq.device,
+            dtype=mixed_qkv_seq.dtype,
+        )
+        launch_fn(
+            mixed_buf,
+            a_buf,
+            b_buf,
+            conv_state,
+            ssm_state,
+            step_out,
+            state_indices_buf,
+            num_accepted_tokens_buf,
+            query_start_loc_buf,
+        )
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch_fn(
+                mixed_buf,
+                a_buf,
+                b_buf,
+                conv_state,
+                ssm_state,
+                step_out,
+                state_indices_buf,
+                num_accepted_tokens_buf,
+                query_start_loc_buf,
+            )
+        torch.cuda.synchronize()
+        conv_state.copy_(initial_conv_state)
+        ssm_state.copy_(initial_ssm_state)
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for step in range(steps):
+            mixed_buf.copy_(mixed_qkv_seq[step])
+            a_buf.copy_(a_seq[step])
+            b_buf.copy_(b_seq[step])
+            state_indices_buf.copy_(state_indices_seq[step])
+            num_accepted_tokens_buf.copy_(num_accepted_tokens_seq[step])
+            query_start_loc_buf.copy_(query_start_loc_seq[step])
+            graph.replay()
+        torch.cuda.synchronize()
+        return time.perf_counter() - start
+
+    with torch.inference_mode():
+        split_out, split_mixed_after, split_conv, split_ssm = run_eager_sequence(
+            launch_split
+        )
+        mixed_out, mixed_after, mixed_conv, mixed_ssm = run_eager_sequence(
+            launch_mixed_qkv
+        )
+        torch.cuda.synchronize()
+        split_graph_s = time_graph_sequence(launch_split)
+        mixed_graph_s = time_graph_sequence(launch_mixed_qkv)
+
+    query_lens = inputs["query_lens"].to(torch.int64)
+    live_token_mask = (
+        torch.arange(max_query_len, dtype=torch.int64)[None, :]
+        < query_lens[:, None]
+    )
+    outputs: dict[str, torch.Tensor] = {
+        "split_live_out": split_out.detach().cpu()[live_token_mask],
+        "mixed_live_out": mixed_out.detach().cpu()[live_token_mask],
+        "split_out": split_out.detach().cpu(),
+        "mixed_out": mixed_out.detach().cpu(),
+        "split_mixed_after": split_mixed_after.detach().cpu(),
+        "mixed_after": mixed_after.detach().cpu(),
+        "split_conv_state": split_conv.detach().cpu(),
+        "mixed_conv_state": mixed_conv.detach().cpu(),
+        "split_ssm_state": split_ssm.detach().cpu(),
+        "mixed_ssm_state": mixed_ssm.detach().cpu(),
+    }
+    comparisons = {
+        "live_out": _compare_tensor(
+            outputs["split_live_out"], outputs["mixed_live_out"]
+        ),
+        "full_out": _compare_tensor(outputs["split_out"], outputs["mixed_out"]),
+        "mixed_after": _compare_tensor(
+            outputs["split_mixed_after"], outputs["mixed_after"]
+        ),
+        "conv_state": _compare_tensor(
+            outputs["split_conv_state"], outputs["mixed_conv_state"]
+        ),
+        "ssm_state": _compare_tensor(
+            outputs["split_ssm_state"], outputs["mixed_ssm_state"]
+        ),
+    }
+    strict_keys = ("live_out", "mixed_after", "conv_state", "ssm_state")
+    strict_ok = all(
+        comparisons[name]["torch_equal"] and comparisons[name]["max_diff"] == 0.0
+        for name in strict_keys
+    )
+    accepted_hist = torch.bincount(
+        inputs["num_accepted_tokens_seq"][:, 0].to(torch.int64),
+        minlength=max_query_len + 1,
+    )
+    query_len_hist = torch.bincount(
+        inputs["query_lens"].to(torch.int64),
+        minlength=max_query_len + 1,
+    )
+    saved_inputs = {name: tensor.cpu() for name, tensor in inputs.items()}
+    timing = {
+        "steps": steps,
+        "split_graph_total_s": split_graph_s,
+        "mixed_qkv_graph_total_s": mixed_graph_s,
+        "split_graph_mean_us": split_graph_s * 1_000_000.0 / steps,
+        "mixed_qkv_graph_mean_us": mixed_graph_s * 1_000_000.0 / steps,
+        "delta_mean_us": (split_graph_s - mixed_graph_s) * 1_000_000.0 / steps,
+    }
+    payload = {
+        "metadata": _metadata(args),
+        "config": {
+            "op": "qwen_gdn_pure_spec_mixed_qkv_candidate",
+            "steps": steps,
+            "num_spec": max_query_len - 1,
+            "graph_rows": graph_rows,
+            "state_slots": initial_ssm_state.shape[0],
+            "k_heads": args.k_heads,
+            "v_heads": args.v_heads,
+            "head_k_dim": args.head_k_dim,
+            "head_v_dim": args.head_v_dim,
+            "conv_width": args.conv_width,
+            "dtype": args.dtype,
+            "state_dtype": args.state_dtype,
+            "seed": args.seed,
+            "scale": scale,
+            "silu": args.silu,
+            "l2norm_inputs": args.l2norm_inputs,
+            "random_initial_state": args.random_initial_state,
+            "vary_query_lens": args.vary_query_lens,
+            "slot_stride": args.slot_stride,
+            "accepted_hist": accepted_hist.tolist(),
+            "query_len_hist": query_len_hist.tolist(),
+            "pad_slot_id": -1,
+        },
+        "strict_ok": strict_ok,
+        "timing": timing,
+        "inputs": saved_inputs,
+        "input_summaries": {
+            name: _tensor_summary(tensor) for name, tensor in saved_inputs.items()
+        },
+        "outputs": outputs,
+        "output_summaries": {
+            name: _tensor_summary(tensor) for name, tensor in outputs.items()
+        },
+        "comparisons": comparisons,
+    }
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, out_path)
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "timing": timing,
+        "config": payload["config"],
+        "comparisons": comparisons,
+    }, indent=2))
+    return 0 if strict_ok else 1
+
+
 def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
@@ -4140,6 +4481,49 @@ def make_parser() -> argparse.ArgumentParser:
     spec_cg.add_argument("--no-silu", dest="silu", action="store_false")
     spec_cg.set_defaults(
         func=run_spec_decode_cudagraph_case,
+        l2norm_inputs=True,
+        silu=True,
+    )
+
+    spec_mixed = subparsers.add_parser("run-spec-mixed-qkv-candidate")
+    spec_mixed.add_argument("--out", required=True)
+    spec_mixed.add_argument("--input-file")
+    spec_mixed.add_argument(
+        "--case-name", default="gdn_spec_mixed_qkv_candidate"
+    )
+    spec_mixed.add_argument("--steps", type=int, default=512)
+    spec_mixed.add_argument("--num-spec", type=int, default=4)
+    spec_mixed.add_argument("--graph-rows", type=int)
+    spec_mixed.add_argument("--state-slots", type=int, default=64)
+    spec_mixed.add_argument("--slot-stride", type=int, default=3)
+    spec_mixed.add_argument("--k-heads", type=int, default=4)
+    spec_mixed.add_argument("--v-heads", type=int, default=8)
+    spec_mixed.add_argument("--head-k-dim", type=int, default=128)
+    spec_mixed.add_argument("--head-v-dim", type=int, default=128)
+    spec_mixed.add_argument("--conv-width", type=int, default=4)
+    spec_mixed.add_argument(
+        "--dtype", choices=("float16", "bfloat16"), default="float16"
+    )
+    spec_mixed.add_argument(
+        "--state-dtype",
+        choices=("same", "float16", "bfloat16", "float32"),
+        default="same",
+    )
+    spec_mixed.add_argument("--seed", type=int, default=1234)
+    spec_mixed.add_argument("--input-scale", type=float, default=0.02)
+    spec_mixed.add_argument("--gate-scale", type=float, default=0.01)
+    spec_mixed.add_argument("--beta-scale", type=float, default=0.25)
+    spec_mixed.add_argument("--scale", type=float)
+    spec_mixed.add_argument("--fixed-query-len", type=int)
+    spec_mixed.add_argument("--fixed-accepted", type=int)
+    spec_mixed.add_argument("--vary-query-lens", action="store_true")
+    spec_mixed.add_argument("--random-initial-state", action="store_true")
+    spec_mixed.add_argument(
+        "--no-l2norm-inputs", dest="l2norm_inputs", action="store_false"
+    )
+    spec_mixed.add_argument("--no-silu", dest="silu", action="store_false")
+    spec_mixed.set_defaults(
+        func=run_spec_mixed_qkv_candidate_case,
         l2norm_inputs=True,
         silu=True,
     )

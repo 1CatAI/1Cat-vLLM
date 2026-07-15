@@ -81,7 +81,8 @@ template<class MMA,
          class OperandV_,
          int  GroupSizeV_,
          int  Stages_,
-         bool FusePrefetch_>
+         bool FusePrefetch_,
+         int  GmemLookahead_ = 1>
 struct MainloopSm70 {
 
     using MMA_Atom = typename MMA::Atom;
@@ -89,7 +90,10 @@ struct MainloopSm70 {
 
     using FragC = typename MMA_Atom::FragC[MMA::kMmaIterM][MMA::kMmaIterN];
 
-    static constexpr int Stages = Stages_;
+    static constexpr int Stages       = Stages_;
+    static constexpr int GmemLookahead = GmemLookahead_;
+
+    static_assert(GmemLookahead >= 1 && GmemLookahead <= 2);
 
     static constexpr int CTA_M = MMA::M;
     static constexpr int CTA_N = MMA::N;
@@ -225,6 +229,11 @@ struct MainloopSm70 {
         typename GmemIterU::Fragments rmem_U;
         typename GmemIterV::Fragments rmem_V;
 
+        typename GmemIterA::Fragments rmem_A2;
+        typename GmemIterB::Fragments rmem_B2;
+        typename GmemIterU::Fragments rmem_U2;
+        typename GmemIterV::Fragments rmem_V2;
+
         GroupIter<ceil_div(GroupSizeU_, CTA_K)> gmem_group_iter_U{};
         GroupIter<ceil_div(GroupSizeV_, CTA_K)> gmem_group_iter_V{};
 
@@ -238,6 +247,7 @@ struct MainloopSm70 {
         Binding gmem_iters{gmem_A, gmem_B, gmem_U, gmem_V};
         Binding smem_iters{smem_A, smem_B, smem_U, smem_V};
         Binding rmem{rmem_A, rmem_B, rmem_U, rmem_V};
+        Binding rmem2{rmem_A2, rmem_B2, rmem_U2, rmem_V2};
 
         // r0,w_
 
@@ -293,6 +303,12 @@ struct MainloopSm70 {
 
         Store(gmem_iters, rmem);  // rmem -> smem
 
+        if constexpr (GmemLookahead == 2) {
+            // Keep the next K tile in registers while the current tile is
+            // consumed from shared memory.
+            fetch_stage(rmem);
+        }
+
         advance_and_wait_smem_stage();
         // r0,w1
 
@@ -301,52 +317,85 @@ struct MainloopSm70 {
         TransformA::apply(frag_A, 0, data_A, data_U, UU);
         TransformB::apply(frag_B, 0, data_B, data_V, VV);
 
-        PRAGMA_NO_UNROLL
-        for (; tile_iter > 0; --tile_iter) {
-            constexpr int ITER_K = MMA::kTileIterK;
-            static_assert(ITER_K > 1);
+        constexpr int ITER_K = MMA::kTileIterK;
+        static_assert(ITER_K > 1);
 
-            PRAGMA_UNROLL
-            for (int k = 0; k < ITER_K; ++k) {
-                // The last iter, store prefetched fragments to smem
-                if (k == ITER_K - 1) {
-                    Store(gmem_iters, rmem);
-                    advance_and_wait_smem_stage();  // swap rw
-                    smem_group_iter_U.Advance();
-                    smem_group_iter_V.Advance();
-                }
-
-                // Preload for next iter, smem -> data_[A,B,U,V]
-                preload((k + 1) % ITER_K);
-
-                // The first iter, issue the prefetching of next stage
-                if (k == 0) {
-                    fetch_stage(rmem);
-                }
-
-                // PRAGMA_UNROLL
-                // for (int n = 0; n < MMA::kMmaIterN; ++n) {
-                //     PRAGMA_UNROLL
-                //     for (int m = 0; m < MMA::kMmaIterM; ++m) {
-                //         int mm = n % 2 ? MMA::kMmaIterM - m - 1 : m;
-                //         MMA_Atom::fma(frag_C[mm][n], frag_A[k][mm], frag_B[k][n], frag_C[mm][n]);
-                //     }
-                // }
-
+        if constexpr (GmemLookahead == 1) {
+            PRAGMA_NO_UNROLL
+            for (; tile_iter > 0; --tile_iter) {
                 PRAGMA_UNROLL
-                for (int m = 0; m < MMA::kMmaIterM; ++m) {
-                    PRAGMA_UNROLL
-                    for (int n = 0; n < MMA::kMmaIterN; ++n) {
-                        int nn = m % 2 ? MMA::kMmaIterN - n - 1 : n;
-                        MMA_Atom::fma(frag_C[m][nn], frag_A[k][m], frag_B[k][nn], frag_C[m][nn]);
+                for (int k = 0; k < ITER_K; ++k) {
+                    // The last iter, store prefetched fragments to smem
+                    if (k == ITER_K - 1) {
+                        Store(gmem_iters, rmem);
+                        advance_and_wait_smem_stage();  // swap rw
+                        smem_group_iter_U.Advance();
+                        smem_group_iter_V.Advance();
                     }
-                }
 
-                TransformA::apply(frag_A, (k + 1) % ITER_K, data_A, data_U, UU);
-                TransformB::apply(frag_B, (k + 1) % ITER_K, data_B, data_V, VV);
+                    // Preload for next iter, smem -> data_[A,B,U,V]
+                    preload((k + 1) % ITER_K);
+
+                    // The first iter, issue the prefetching of next stage
+                    if (k == 0) {
+                        fetch_stage(rmem);
+                    }
+
+                    PRAGMA_UNROLL
+                    for (int m = 0; m < MMA::kMmaIterM; ++m) {
+                        PRAGMA_UNROLL
+                        for (int n = 0; n < MMA::kMmaIterN; ++n) {
+                            int nn = m % 2 ? MMA::kMmaIterN - n - 1 : n;
+                            MMA_Atom::fma(frag_C[m][nn], frag_A[k][m], frag_B[k][nn], frag_C[m][nn]);
+                        }
+                    }
+
+                    TransformA::apply(frag_A, (k + 1) % ITER_K, data_A, data_U, UU);
+                    TransformB::apply(frag_B, (k + 1) % ITER_K, data_B, data_V, VV);
+                }
             }
         }
+        else if constexpr (GmemLookahead == 2) {
+            auto compute_stage = [&](auto& store_rmem, auto& fetch_rmem) {
+                PRAGMA_UNROLL
+                for (int k = 0; k < ITER_K; ++k) {
+                    if (k == 0) {
+                        fetch_stage(fetch_rmem);
+                    }
 
+                    // The last iter, store prefetched fragments to smem
+                    if (k == ITER_K - 1) {
+                        Store(gmem_iters, store_rmem);
+                        advance_and_wait_smem_stage();  // swap rw
+                        smem_group_iter_U.Advance();
+                        smem_group_iter_V.Advance();
+                    }
+
+                    // Preload for next iter, smem -> data_[A,B,U,V]
+                    preload((k + 1) % ITER_K);
+
+                    PRAGMA_UNROLL
+                    for (int m = 0; m < MMA::kMmaIterM; ++m) {
+                        PRAGMA_UNROLL
+                        for (int n = 0; n < MMA::kMmaIterN; ++n) {
+                            int nn = m % 2 ? MMA::kMmaIterN - n - 1 : n;
+                            MMA_Atom::fma(frag_C[m][nn], frag_A[k][m], frag_B[k][nn], frag_C[m][nn]);
+                        }
+                    }
+
+                    TransformA::apply(frag_A, (k + 1) % ITER_K, data_A, data_U, UU);
+                    TransformB::apply(frag_B, (k + 1) % ITER_K, data_B, data_V, VV);
+                }
+            };
+
+            PRAGMA_NO_UNROLL
+            for (; tile_iter > 0; tile_iter -= 2) {
+                compute_stage(rmem, rmem2);
+                if (tile_iter > 1) {
+                    compute_stage(rmem2, rmem);
+                }
+            }
+        }
         __syncthreads();
     }
 };

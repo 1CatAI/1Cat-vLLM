@@ -172,14 +172,22 @@ def _maybe_sm70_lm_head_top1(
         return None
     if torch.cuda.get_device_capability(x.device) != (7, 0):
         return None
-    if x.reshape(-1, x.shape[-1]).size(0) != 1:
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    num_rows = x_2d.size(0)
+    if num_rows <= 0:
+        return None
+    if num_rows != 1 and not (
+        lm_head_top1_tc
+        and num_rows <= 17
+        and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out")
+    ):
         return None
 
     weight = layer.weight
     if weight.dtype != torch.float16 or not weight.is_cuda or weight.stride(1) != 1:
         return None
 
-    x_2d = x.reshape(-1, x.shape[-1])
     if not x_2d.is_contiguous():
         x_2d = x_2d.contiguous()
 
@@ -202,6 +210,11 @@ def _maybe_sm70_lm_head_top1(
             )
             logger.info_once("SM70 Tensor Core LM head top1 epilogue path enabled.")
             return values.reshape(*x.shape[:-1]), indices.reshape(*x.shape[:-1])
+        if num_rows != 1:
+            return None
+
+    if num_rows != 1:
+        return None
 
     if not lm_head_top1 or not hasattr(
         torch.ops._C, "sm70_f16_lm_head_top1_out"

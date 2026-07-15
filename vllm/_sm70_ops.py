@@ -36,9 +36,7 @@ def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
 if hasattr(torch.ops._C, "silu_and_mul_interleaved"):
 
     @register_fake("_C::silu_and_mul_interleaved")
-    def _silu_and_mul_interleaved_fake(
-        out: torch.Tensor, input: torch.Tensor
-    ) -> None:
+    def _silu_and_mul_interleaved_fake(out: torch.Tensor, input: torch.Tensor) -> None:
         del out, input
         return None
 
@@ -124,9 +122,7 @@ def fp8_sm70_prepare(
     group_size: int,
     interleave_gated_silu: bool = False,
 ) -> list[torch.Tensor]:
-    return _op("fp8_sm70_prepare")(
-        qweight, scales, group_size, interleave_gated_silu
-    )
+    return _op("fp8_sm70_prepare")(qweight, scales, group_size, interleave_gated_silu)
 
 
 if hasattr(torch.ops._C, "fp8_sm70_prepare"):
@@ -158,9 +154,7 @@ def mxfp4_sm70_prepare(
     group_size: int,
     interleave_gated_silu: bool = False,
 ) -> list[torch.Tensor]:
-    return _op("mxfp4_sm70_prepare")(
-        qweight, scales, group_size, interleave_gated_silu
-    )
+    return _op("mxfp4_sm70_prepare")(qweight, scales, group_size, interleave_gated_silu)
 
 
 if hasattr(torch.ops._C, "mxfp4_sm70_prepare"):
@@ -196,9 +190,7 @@ def nvfp4_sm70_prepare(
     group_size: int,
     interleave_gated_silu: bool = False,
 ) -> list[torch.Tensor]:
-    return _op("nvfp4_sm70_prepare")(
-        qweight, scales, group_size, interleave_gated_silu
-    )
+    return _op("nvfp4_sm70_prepare")(qweight, scales, group_size, interleave_gated_silu)
 
 
 if hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
@@ -447,6 +439,87 @@ if hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
         return None
 
 
+def nvfp4_gemv_sm70_raw_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight_packed: torch.Tensor,
+    scales: torch.Tensor,
+    partials: torch.Tensor,
+    group_size: int,
+    split_k: int,
+) -> None:
+    _op("nvfp4_gemv_sm70_raw_out")(
+        out, input, qweight_packed, scales, partials, group_size, split_k
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_gemv_sm70_raw_out"):
+
+    @register_fake("_C::nvfp4_gemv_sm70_raw_out")
+    def _nvfp4_gemv_sm70_raw_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight_packed: torch.Tensor,
+        scales: torch.Tensor,
+        partials: torch.Tensor,
+        group_size: int,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_gemv_sm70_warp_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight_packed: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> None:
+    _op("nvfp4_gemv_sm70_warp_out")(out, input, qweight_packed, scales, group_size)
+
+
+if hasattr(torch.ops._C, "nvfp4_gemv_sm70_warp_out"):
+
+    @register_fake("_C::nvfp4_gemv_sm70_warp_out")
+    def _nvfp4_gemv_sm70_warp_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight_packed: torch.Tensor,
+        scales: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_gemv_sm70_h2_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight_packed: torch.Tensor,
+    scales: torch.Tensor,
+    partials: torch.Tensor,
+    group_size: int,
+    split_k: int,
+) -> None:
+    _op("nvfp4_gemv_sm70_h2_out")(
+        out, input, qweight_packed, scales, partials, group_size, split_k
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_gemv_sm70_h2_out"):
+
+    @register_fake("_C::nvfp4_gemv_sm70_h2_out")
+    def _nvfp4_gemv_sm70_h2_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight_packed: torch.Tensor,
+        scales: torch.Tensor,
+        partials: torch.Tensor,
+        group_size: int,
+        split_k: int,
+    ) -> None:
+        return None
+
+
 def fp8_gemm_sm70_out_auto(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -574,6 +647,172 @@ if hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         k_ld: int,
         vocab_start_index: int,
         num_vocab_padding: int,
+    ) -> None:
+        return None
+
+
+def sm70_f16_lm_head_top20_tc_out(
+    values_out: torch.Tensor,
+    indices_out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    k_ld: int,
+    vocab_start_index: int,
+    num_vocab_padding: int,
+) -> None:
+    _op("sm70_f16_lm_head_top20_tc_out")(
+        values_out,
+        indices_out,
+        input,
+        weight,
+        k_ld,
+        vocab_start_index,
+        num_vocab_padding,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
+
+    @register_fake("_C::sm70_f16_lm_head_top20_tc_out")
+    def _sm70_f16_lm_head_top20_tc_out_fake(
+        values_out: torch.Tensor,
+        indices_out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        k_ld: int,
+        vocab_start_index: int,
+        num_vocab_padding: int,
+    ) -> None:
+        return None
+
+
+def sm70_merge_tail_top20_pack_out(
+    pairs_out: torch.Tensor,
+    base_values: torch.Tensor,
+    base_indices: torch.Tensor,
+    base_token_id_map: torch.Tensor,
+    tail_logits: torch.Tensor,
+    tail_token_ids: torch.Tensor,
+    tail_row_start: int,
+) -> None:
+    _op("sm70_merge_tail_top20_pack_out")(
+        pairs_out,
+        base_values,
+        base_indices,
+        base_token_id_map,
+        tail_logits,
+        tail_token_ids,
+        tail_row_start,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_merge_tail_top20_pack_out"):
+
+    @register_fake("_C::sm70_merge_tail_top20_pack_out")
+    def _sm70_merge_tail_top20_pack_out_fake(
+        pairs_out: torch.Tensor,
+        base_values: torch.Tensor,
+        base_indices: torch.Tensor,
+        base_token_id_map: torch.Tensor,
+        tail_logits: torch.Tensor,
+        tail_token_ids: torch.Tensor,
+        tail_row_start: int,
+    ) -> None:
+        return None
+
+
+def sm70_sample_packed_top20_out(
+    sampled_token_out: torch.Tensor,
+    sparse_ids_out: torch.Tensor,
+    sparse_probs_out: torch.Tensor,
+    gathered_pairs: torch.Tensor,
+    exponential: torch.Tensor,
+    top_p: float,
+) -> None:
+    _op("sm70_sample_packed_top20_out")(
+        sampled_token_out,
+        sparse_ids_out,
+        sparse_probs_out,
+        gathered_pairs,
+        exponential,
+        top_p,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_sample_packed_top20_out"):
+
+    @register_fake("_C::sm70_sample_packed_top20_out")
+    def _sm70_sample_packed_top20_out_fake(
+        sampled_token_out: torch.Tensor,
+        sparse_ids_out: torch.Tensor,
+        sparse_probs_out: torch.Tensor,
+        gathered_pairs: torch.Tensor,
+        exponential: torch.Tensor,
+        top_p: float,
+    ) -> None:
+        return None
+
+
+def sm70_dynamic_draft_vocab_update_tail_out(
+    lru_token_ids: torch.Tensor,
+    local_tail_token_ids: torch.Tensor,
+    source_row_indices: torch.Tensor,
+    observed_output_ids: torch.Tensor,
+    target_candidate_ids: torch.Tensor,
+    base_token_mask: torch.Tensor,
+    full_vocab_size: int,
+    local_shard_start: int,
+    local_shard_end: int,
+) -> None:
+    _op("sm70_dynamic_draft_vocab_update_tail_out")(
+        lru_token_ids,
+        local_tail_token_ids,
+        source_row_indices,
+        observed_output_ids,
+        target_candidate_ids,
+        base_token_mask,
+        full_vocab_size,
+        local_shard_start,
+        local_shard_end,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_dynamic_draft_vocab_update_tail_out"):
+
+    @register_fake("_C::sm70_dynamic_draft_vocab_update_tail_out")
+    def _sm70_dynamic_draft_vocab_update_tail_out_fake(
+        lru_token_ids: torch.Tensor,
+        local_tail_token_ids: torch.Tensor,
+        source_row_indices: torch.Tensor,
+        observed_output_ids: torch.Tensor,
+        target_candidate_ids: torch.Tensor,
+        base_token_mask: torch.Tensor,
+        full_vocab_size: int,
+        local_shard_start: int,
+        local_shard_end: int,
+    ) -> None:
+        return None
+
+
+def sm70_dynamic_draft_vocab_refresh_tail_weight_out(
+    local_tail_weight: torch.Tensor,
+    source_weight: torch.Tensor,
+    source_row_indices: torch.Tensor,
+) -> None:
+    _op("sm70_dynamic_draft_vocab_refresh_tail_weight_out")(
+        local_tail_weight,
+        source_weight,
+        source_row_indices,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_dynamic_draft_vocab_refresh_tail_weight_out"):
+
+    @register_fake("_C::sm70_dynamic_draft_vocab_refresh_tail_weight_out")
+    def _sm70_dynamic_draft_vocab_refresh_tail_weight_out_fake(
+        local_tail_weight: torch.Tensor,
+        source_weight: torch.Tensor,
+        source_row_indices: torch.Tensor,
     ) -> None:
         return None
 

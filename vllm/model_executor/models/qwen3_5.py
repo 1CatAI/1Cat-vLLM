@@ -750,6 +750,17 @@ class Qwen3_5ForCausalLMBase(
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
+    def get_topk_tokens_and_logits(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.logits_processor.get_topk_tokens_and_logits(
+            self.lm_head,
+            hidden_states,
+            top_k,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -924,6 +935,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
+
+    def get_topk_tokens_and_logits(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.language_model.get_topk_tokens_and_logits(
+            hidden_states,
+            top_k,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

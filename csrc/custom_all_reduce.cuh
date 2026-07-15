@@ -20,6 +20,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <cstring>
 #include <string>
 
+#include "cub_helpers.h"
 #include "sm70_tile_runtime_signal.cuh"
 
 namespace vllm {
@@ -49,6 +50,17 @@ inline hipPointer_attribute rangeStartAddrAttr =
 #endif
 
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
+constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
+constexpr int kSm70GemmaRmsNormThreads = 1024;
+
+inline int sm70_gemma_rms_norm_threads() {
+  const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
+  if (raw == nullptr) return kSm70GemmaRmsNormThreads;
+  const int threads = std::atoi(raw);
+  return threads == 256 || threads == 512 || threads == 1024
+             ? threads
+             : kSm70GemmaRmsNormThreads;
+}
 
 inline bool custom_allreduce_current_device_is_sm70() {
 #ifndef USE_ROCM
@@ -92,6 +104,28 @@ inline int custom_allreduce_block_limit(int default_limit,
   return static_cast<int>(parsed);
 }
 
+inline int sm70_tp4_m5_allreduce_threads(int world_size,
+                                         bool fully_connected,
+                                         size_t bytes) {
+  const char* raw = std::getenv("VLLM_SM70_TP4_M5_AR_THREADS");
+  if (raw == nullptr || raw[0] == '\0') return 512;
+
+  char* end = nullptr;
+  const long parsed = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' ||
+      (parsed != 128 && parsed != 256 && parsed != 512)) {
+    throw std::runtime_error(
+        "Invalid VLLM_SM70_TP4_M5_AR_THREADS: " + std::string(raw) +
+        ". Expected one of 128, 256, 512.");
+  }
+  if (world_size != 4 || !fully_connected ||
+      bytes != 5 * kSm70GemmaRmsNormHiddenSize * sizeof(half) ||
+      !custom_allreduce_current_device_is_sm70()) {
+    return 512;
+  }
+  return static_cast<int>(parsed);
+}
+
 // Counter may overflow, but unsigned integer overflow is well-defined.
 using FlagType = sm70_tile_runtime::FlagType;
 using Signal = sm70_tile_runtime::Signal;
@@ -120,6 +154,11 @@ struct packed_t {
 
 // scalar cast functions
 DINLINE float upcast_s(half val) { return __half2float(val); }
+
+DINLINE float sm70_gemma_rms_norm_to_float(float val) { return val; }
+DINLINE float sm70_gemma_rms_norm_to_float(half val) {
+  return __half2float(val);
+}
 
 template <typename T>
 DINLINE T downcast_s(float val);
@@ -373,6 +412,89 @@ __global__ void __launch_bounds__(512, 1)
        idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+// This prototype deliberately stays narrow: it mirrors the FP32 Gemma RMSNorm
+// reduction order for a [tokens, 5120] FP16 projection. Each CTA handles one
+// row, retains the normal all-reduce peer order, and applies only its local
+// residual after the peer reduction.
+template <int Threads, int ngpus, typename ResidualT, typename WeightT>
+__global__ void __launch_bounds__(Threads, 1)
+    sm70_peer_reduce_gemma_rms_norm(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        const ResidualT* __restrict__ residual,
+        const WeightT* __restrict__ weight, half* __restrict__ normalized_out,
+        float* __restrict__ residual_out, int rank, float epsilon) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  constexpr int kPackedWidth = P::size;
+  constexpr int kVarianceVectorWidth = 4;
+
+  __shared__ float residual_values[kSm70GemmaRmsNormHiddenSize];
+  __shared__ float inverse_rms;
+  using BlockReduce = cub::BlockReduce<float, Threads>;
+  __shared__ typename BlockReduce::TempStorage reduce_store;
+
+  const int row = blockIdx.x;
+  const int row_offset = row * kSm70GemmaRmsNormHiddenSize;
+  const int packed_per_row = kSm70GemmaRmsNormHiddenSize / kPackedWidth;
+  const int tid = threadIdx.x;
+  auto dp = *_dp;
+
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  for (int packed_idx = tid; packed_idx < packed_per_row;
+       packed_idx += blockDim.x) {
+    const P reduced =
+        packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0],
+                                    row * packed_per_row + packed_idx);
+    const int element_offset = row_offset + packed_idx * kPackedWidth;
+#pragma unroll
+    for (int i = 0; i < kPackedWidth; ++i) {
+      const float value = __half2float(reduced.data[i]) +
+                          sm70_gemma_rms_norm_to_float(
+                              residual[element_offset + i]);
+      residual_values[packed_idx * kPackedWidth + i] = value;
+      residual_out[element_offset + i] = value;
+    }
+  }
+  __syncthreads();
+
+  // Match rms_norm_kernel<float, 4, 2>: each thread consumes vector indices
+  // tid, tid + blockDim.x, ... and CUB reduces the resulting partial sums.
+  float variance = 0.0f;
+  for (int vector_idx = tid;
+       vector_idx < kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
+       vector_idx += blockDim.x) {
+    const int element_offset = vector_idx * kVarianceVectorWidth;
+#pragma unroll
+    for (int i = 0; i < kVarianceVectorWidth; ++i) {
+      const float value = residual_values[element_offset + i];
+      variance += value * value;
+    }
+  }
+  variance = BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
+
+  if (tid == 0) {
+    inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
+  }
+  __syncthreads();
+
+  for (int vector_idx = tid;
+       vector_idx < kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
+       vector_idx += blockDim.x) {
+    const int element_offset = vector_idx * kVarianceVectorWidth;
+#pragma unroll
+    for (int i = 0; i < kVarianceVectorWidth; ++i) {
+      const int column = element_offset + i;
+      const float gemma_weight =
+          sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f;
+      normalized_out[row_offset + column] = __float2half_rn(
+          residual_values[column] * inverse_rms * gemma_weight);
+    }
+  }
+
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
 
@@ -891,6 +1013,8 @@ class CustomAllreduce {
 
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
+    threads = sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_,
+                                            bytes);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
     // Check environment variable once
@@ -949,6 +1073,64 @@ class CustomAllreduce {
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  template <int ngpus, typename ResidualT, typename WeightT>
+  void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
+                                      const ResidualT* residual,
+                                      const WeightT* weight,
+                                      half* normalized_out,
+                                      float* residual_out, int num_tokens,
+                                      int hidden_size, float epsilon) {
+    if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
+      throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
+                               std::to_string(ngpus) + " on an SM70 device.");
+    }
+    if (hidden_size != kSm70GemmaRmsNormHiddenSize) {
+      throw std::runtime_error(
+          "SM70 Gemma RMSNorm prototype requires hidden_size=" +
+          std::to_string(kSm70GemmaRmsNormHiddenSize) + ".");
+    }
+    constexpr int kMaxTokens = ngpus == 4 ? 64 : kMaxBlocks;
+    if (num_tokens <= 0 || num_tokens > kMaxTokens) {
+      throw std::runtime_error(
+          "SM70 Gemma RMSNorm prototype supports tokens in [1, " +
+          std::to_string(kMaxTokens) + "]. Got " +
+          std::to_string(num_tokens) + ".");
+    }
+
+    RankData* ptrs = rank_data_for_buffer(
+        stream, input, "SM70 Gemma RMSNorm prototype input");
+    if constexpr (ngpus == 4) {
+      // Keep the same 1024-thread CUB reduction topology as vLLM rms_norm.
+      // packed_reduce preserves the cross_device_reduce_1stage<half, 4>
+      // rank order before the FP32 residual add.
+      sm70_peer_reduce_gemma_rms_norm<kSm70GemmaRmsNormThreads, ngpus,
+                                       ResidualT, WeightT>
+          <<<num_tokens, kSm70GemmaRmsNormThreads, 0, stream>>>(
+              ptrs, sg_, self_sg_, residual, weight, normalized_out,
+              residual_out, rank_, epsilon);
+      return;
+    }
+
+    const int threads = sm70_gemma_rms_norm_threads();
+#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                         \
+  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>     \
+      <<<num_tokens, THREADS, 0, stream>>>(                               \
+          ptrs, sg_, self_sg_, residual, weight, normalized_out,          \
+          residual_out, rank_, epsilon)
+    switch (threads) {
+      case 256:
+        VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(256);
+        break;
+      case 512:
+        VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(512);
+        break;
+      default:
+        VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(1024);
+        break;
+    }
+#undef VLLM_LAUNCH_SM70_GEMMA_RMS_NORM
   }
 
   template <typename T>

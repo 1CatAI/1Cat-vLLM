@@ -266,6 +266,60 @@ class TestCudagraphDispatcher:
 
         assert dispatcher.get_capture_descs() == []
 
+    def test_mtp_context_bucket_selects_only_bounded_single_request_graph(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", "16384,4096")
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[5, 10],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=5,
+        )
+
+        base = BatchDescriptor(num_tokens=5, num_reqs=1, uniform=True)
+        bucket_4096 = replace(base, attention_context_bucket=4096)
+        bucket_16384 = replace(base, attention_context_bucket=16384)
+        assert bucket_4096 in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+        assert bucket_16384 in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=5,
+            uniform_decode=True,
+            attention_context_len=768,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == bucket_4096
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=5,
+            uniform_decode=True,
+            attention_context_len=4097,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == bucket_16384
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=5,
+            uniform_decode=True,
+            attention_context_len=16385,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == base
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=10,
+            uniform_decode=True,
+            attention_context_len=768,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == BatchDescriptor(num_tokens=10, num_reqs=2, uniform=True)
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:

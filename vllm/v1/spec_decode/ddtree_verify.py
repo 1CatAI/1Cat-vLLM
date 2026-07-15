@@ -14,7 +14,6 @@ import torch
 
 from vllm.v1.spec_decode.ddtree_metadata import (
     DDTreeVerifierMetadata,
-    greedy_sample_from_compact_logits,
     make_prefill_tree_attention_mask,
 )
 from vllm.v1.spec_decode.ddtree_payload import (
@@ -42,6 +41,92 @@ class DDTreeAttentionVerifierInputs:
     attention_mask: torch.Tensor
     compact_logits_indices: torch.Tensor
     metadata: DDTreeVerifierMetadata
+
+
+def _payload_child_maps(payload: DDTreeDraftPayload) -> tuple[dict[int, int], ...]:
+    """Build official-style row-index child maps from verifier payload arrays."""
+
+    num_nodes = payload.num_tree_nodes
+    if len(payload.parent_indices) != num_nodes:
+        raise ValueError("payload parent_indices length mismatch")
+    if len(payload.node_depths) != num_nodes:
+        raise ValueError("payload node_depths length mismatch")
+    if len(payload.node_scores) != num_nodes:
+        raise ValueError("payload node_scores length mismatch")
+
+    child_maps: list[dict[int, int]] = [dict() for _ in range(num_nodes + 1)]
+    for node_row, (token_id, parent_index, depth) in enumerate(
+        zip(
+            payload.tree_token_ids,
+            payload.parent_indices,
+            payload.node_depths,
+            strict=True,
+        ),
+        start=1,
+    ):
+        if parent_index < -1 or parent_index >= node_row - 1:
+            raise ValueError(
+                "payload parent_indices must reference an earlier verifier node"
+            )
+        parent_row = 0 if parent_index == -1 else parent_index + 1
+        parent_depth = 0 if parent_row == 0 else payload.node_depths[parent_row - 1]
+        expected_depth = int(parent_depth) + 1
+        if depth != expected_depth:
+            raise ValueError(
+                f"payload depth mismatch for node {node_row}: "
+                f"expected {expected_depth}, got {depth}"
+            )
+        child_maps[parent_row][int(token_id)] = node_row
+    return tuple(child_maps)
+
+
+def _greedy_verify_payload_from_target_tokens(
+    *,
+    payload: DDTreeDraftPayload,
+    target_tokens: list[int],
+) -> DDTreeVerificationResult:
+    """Follow the DDTree with one target token per compact verifier row."""
+
+    expected_rows = payload.num_tree_nodes + 1
+    if len(target_tokens) != expected_rows:
+        raise ValueError(
+            f"compact target token row mismatch: expected {expected_rows}, "
+            f"got {len(target_tokens)}"
+        )
+
+    child_maps = _payload_child_maps(payload)
+    cursor = 0
+    accepted_nodes: list[int] = [0]
+    accepted_tokens: list[int] = []
+
+    while True:
+        next_token = int(target_tokens[cursor])
+        child_index = child_maps[cursor].get(next_token)
+        if child_index is None:
+            output_tokens = accepted_tokens + [next_token]
+            return DDTreeVerificationResult(
+                accepted_node_indices=tuple(accepted_nodes),
+                accepted_token_ids=tuple(accepted_tokens),
+                bonus_token_id=next_token,
+                output_token_ids=tuple(output_tokens),
+            )
+
+        accepted_nodes.append(child_index)
+        accepted_tokens.append(next_token)
+        cursor = child_index
+
+
+def greedy_verify_payload_from_target_tokens(
+    *,
+    payload: DDTreeDraftPayload,
+    target_tokens: list[int],
+) -> DDTreeVerificationResult:
+    """Greedy-verify a DDTree payload from compact argmax token ids."""
+
+    return _greedy_verify_payload_from_target_tokens(
+        payload=payload,
+        target_tokens=target_tokens,
+    )
 
 
 def metadata_from_payload(
@@ -112,14 +197,38 @@ def greedy_verify_payload_from_compact_logits(
 ) -> DDTreeVerificationResult:
     """Greedy-verify a DDTree payload from compact root-plus-node logits."""
 
-    tree = tree_from_payload(payload)
-    walk = greedy_sample_from_compact_logits(
-        tree=tree,
-        compact_logits=compact_logits,
+    if compact_logits.ndim != 2:
+        raise ValueError("compact_logits must have shape [rows, vocab]")
+    expected_rows = payload.num_tree_nodes + 1
+    if compact_logits.shape[0] != expected_rows:
+        raise ValueError(
+            f"compact_logits row mismatch: expected {expected_rows}, "
+            f"got {compact_logits.shape[0]}"
+        )
+    target_tokens = compact_logits.argmax(dim=-1).detach().cpu().tolist()
+    return _greedy_verify_payload_from_target_tokens(
+        payload=payload,
+        target_tokens=target_tokens,
     )
-    return DDTreeVerificationResult(
-        accepted_node_indices=walk.accepted_node_indices,
-        accepted_token_ids=walk.accepted_token_ids,
-        bonus_token_id=walk.bonus_token_id,
-        output_token_ids=walk.output_token_ids,
+
+
+def greedy_verify_payload_from_compact_top_tokens(
+    *,
+    payload: DDTreeDraftPayload,
+    compact_top_tokens: torch.Tensor,
+) -> DDTreeVerificationResult:
+    """Greedy-verify a DDTree payload from compact root-plus-node argmax tokens."""
+
+    if compact_top_tokens.ndim != 1:
+        raise ValueError("compact_top_tokens must have shape [rows]")
+    expected_rows = payload.num_tree_nodes + 1
+    if compact_top_tokens.shape[0] != expected_rows:
+        raise ValueError(
+            f"compact_top_tokens row mismatch: expected {expected_rows}, "
+            f"got {compact_top_tokens.shape[0]}"
+        )
+    target_tokens = compact_top_tokens.detach().cpu().tolist()
+    return _greedy_verify_payload_from_target_tokens(
+        payload=payload,
+        target_tokens=target_tokens,
     )

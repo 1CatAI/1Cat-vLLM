@@ -121,7 +121,7 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1, PP == 1, Hopper/Blackwell, and flashinfer installed.
+    """Enable supported all-reduce + RMSNorm fusion routes.
 
     Gated off for PP > 1: the fused op's GPU-side peer-signal spin-wait
     assumes byte-identical kernel launches across TP peers, but concurrent
@@ -136,6 +136,20 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
         return (
             rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
+        )
+
+    sm70_gemma_tp = (
+        envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+        and cfg.parallel_config.tensor_parallel_size == 2
+    )
+    if sm70_gemma_tp:
+        return (
+            cfg.parallel_config.pipeline_parallel_size == 1
+            and cfg.model_config is not None
+            and cfg.model_config.get_hidden_size() == 5120
+            and cfg.model_config.dtype == torch.float16
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
         )
 
     return (
@@ -1185,7 +1199,8 @@ class VllmConfig:
         attention_backend = self.attention_config.backend
         attention_backend_name = getattr(attention_backend, "name", attention_backend)
         sm70_flash_v100_backend = (
-            attention_backend is None or attention_backend_name == "FLASH_ATTN_V100"
+            attention_backend is None
+            or attention_backend_name in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
         )
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
@@ -1318,7 +1333,8 @@ class VllmConfig:
                             else [1, 2, 4, 8, 9]
                         )
                         decode_query_len = (
-                            self.speculative_config.num_speculative_tokens + 1
+                            self.speculative_config.num_speculative_state_tokens()
+                            + 1
                         )
                         smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
                         if (
@@ -2087,7 +2103,9 @@ class VllmConfig:
                     self.speculative_config
                     and self.speculative_config.num_speculative_tokens
                 ):
-                    decode_query_len += self.speculative_config.num_speculative_tokens
+                    decode_query_len += (
+                        self.speculative_config.num_speculative_state_tokens()
+                    )
                 max_cudagraph_capture_size = min(
                     self.scheduler_config.max_num_seqs * decode_query_len * 2, 512
                 )

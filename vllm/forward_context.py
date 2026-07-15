@@ -62,6 +62,12 @@ class BatchDescriptor:
     shape but execute different model branches. The default keeps existing graph
     keys unchanged. MTP drafter uses this to separate per-step layer selection.
     """
+    attention_context_bucket: int | None = None
+    """
+    Optional maximum KV context captured by an attention-specialized CUDA graph.
+    ``None`` denotes the existing full-context graph. A replay must only select
+    a bucket whose capacity covers every active request.
+    """
 
 
 def _compute_sp_num_tokens(

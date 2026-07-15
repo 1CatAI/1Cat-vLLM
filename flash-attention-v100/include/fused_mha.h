@@ -72,6 +72,28 @@ at::Tensor flash_attention_decode_paged_xqa(
     const int window_size_right
 );
 
+at::Tensor flash_attention_decode_paged_xqa_staged(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    at::Tensor& tmp_out,
+    at::Tensor& max_logits,
+    at::Tensor& exp_sums,
+    at::Tensor& online_rescales,
+    const at::Tensor& active_num_partitions,
+    const float softmax_scale,
+    const int partition_size,
+    const int launch_num_partitions,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale,
+    const int window_size_left,
+    const int window_size_right
+);
+
 at::Tensor flash_attention_decode_paged_wmma(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -129,6 +151,18 @@ at::Tensor flash_attention_prefill_paged(
     const int window_size_right
 );
 
+std::vector<at::Tensor>
+flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& softmax_lse_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const float softmax_scale
+);
+
 at::Tensor flash_attention_prefill_paged_bfla(
     const at::Tensor& q,
     const at::Tensor& k_cache,
@@ -163,6 +197,17 @@ at::Tensor flash_attention_prefill_paged_splitkv(
     const int window_size_right,
     const int split_kv_tokens,
     const int max_seq_len_hint
+);
+
+void flash_attention_fp8_e5m2_paged_kv_to_fp16(
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    at::Tensor& key_out,
+    at::Tensor& value_out,
+    const float key_scale,
+    const float value_scale
 );
 
 std::vector<at::Tensor> flash_attention_backward(

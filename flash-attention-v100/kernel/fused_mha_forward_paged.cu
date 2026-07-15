@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -77,7 +78,10 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
 #define LOW_SMEM_PAGE_SIZE   16
 
 template<int D, bool LOW_SMEM = false, bool LOW_SMEM_SCALAR_QK = false,
-         bool LOW_SMEM_BM32 = false>
+         bool LOW_SMEM_BM32 = false,
+         bool D256_OUTPUT_STRIDE_268 = false,
+         bool D256_SW_PIPELINE_QK = false,
+         bool D256_SW_PIPELINE_PV = false>
 struct KernelConfig {
     static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (LOW_SMEM ? (LOW_SMEM_BM32 ? BLOCK_M_256 : BLOCK_M_256_LOW_SMEM) : BLOCK_M_256);
     static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (LOW_SMEM ? (LOW_SMEM_SCALAR_QK ? BLOCK_N_256_LOW_SMEM_SCALAR_QK : BLOCK_N_256_LOW_SMEM) : BLOCK_N_256);
@@ -93,13 +97,32 @@ struct KernelConfig {
     static constexpr int P_SUB_TILE        = 32;
     static constexpr int P_STRIDE          = P_SUB_TILE + PAD;
     static constexpr int P_STRICT_ELEMENTS = (D == 256) ? BLOCK_M * P_STRIDE : 1;
-    static constexpr int O_STRIDE          = D + PAD;
+    static constexpr int PIPELINE_S_ELEMENTS =
+        (D == 256 && LOW_SMEM && D256_SW_PIPELINE_QK
+         && D256_SW_PIPELINE_PV)
+            ? BLOCK_M * S_STRIDE
+            : 1;
+    static constexpr int PIPELINE_PAGE_ELEMENTS =
+        (D == 256 && LOW_SMEM && D256_SW_PIPELINE_QK
+         && D256_SW_PIPELINE_PV)
+            ? BLOCK_N / LOW_SMEM_PAGE_SIZE
+            : 1;
+    static constexpr bool PIPELINE_SWIZZLED_Q =
+        D == 256 && LOW_SMEM && D256_SW_PIPELINE_QK
+        && D256_SW_PIPELINE_PV;
+    static constexpr int Q_ELEMENTS =
+        PIPELINE_SWIZZLED_Q ? BLOCK_M * D : BLOCK_M * Q_STRIDE;
+    // The D256 low-SMEM candidate changes only the output accumulator pitch
+    // from 264 to 268 floats. This preserves all WMMA/softmax arithmetic and
+    // targets the largest 8-way shared-memory load/store groups.
+    static constexpr int OUTPUT_EXTRA_PAD =
+        (D == 256 && LOW_SMEM && D256_OUTPUT_STRIDE_268) ? 4 : 0;
+    static constexpr int O_STRIDE          = D + PAD + OUTPUT_EXTRA_PAD;
     static constexpr int PER_UINT4         = 8;
     static constexpr int LOW_SMEM_PAGE_COUNT =
         (D == 256 && LOW_SMEM) ? (BLOCK_N / LOW_SMEM_PAGE_SIZE) : 1;
-
     struct alignas(128) SmemLayout {
-        alignas(16) __half q      [BLOCK_M * Q_STRIDE];
+        alignas(16) __half q      [Q_ELEMENTS];
     union {
         alignas(16) __half k      [KV_STAGE_N * KV_STRIDE];
         alignas(16) __half v      [KV_STAGE_N * KV_STRIDE];
@@ -109,6 +132,9 @@ struct KernelConfig {
         alignas(16) __half p      [BLOCK_M * S_STRIDE];
     } reuse_sp;
         alignas(16) __half p_strict[P_STRICT_ELEMENTS];
+        alignas(16) float  pipeline_s[PIPELINE_S_ELEMENTS];
+        alignas(16) int    pipeline_page_idx[PIPELINE_PAGE_ELEMENTS];
+        alignas(16) int    pipeline_page_offset[PIPELINE_PAGE_ELEMENTS];
         alignas(16) float  o      [BLOCK_M * O_STRIDE];
         alignas(16) float  row_max[BLOCK_M];
         alignas(16) float  row_sum[BLOCK_M];
@@ -134,12 +160,209 @@ __device__ __forceinline__ void init_smem(char* smem_raw) {
     __syncthreads();
 }
 
+__device__ __forceinline__ int pipeline_swizzled_q_row_slot(int row) {
+    return (row & 3) | ((row & 8) >> 1) | ((row & 4) << 1);
+}
+
+__device__ __forceinline__ int pipeline_swizzled_matrix_a_offset(
+    int row,
+    int col) {
+    const int tile = col / WMMA_K;
+    const int within_tile = col - tile * WMMA_K;
+    const int plane = within_tile >> 3;
+    const int inner = within_tile & 7;
+    return tile * WMMA_M * WMMA_K + plane * WMMA_M * 8
+           + pipeline_swizzled_q_row_slot(row) * 8 + inner;
+}
+
+__device__ __forceinline__ void load_pipeline_swizzled_matrix_a_fragment(
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major>& frag,
+    const __half* __restrict__ matrix,
+    int k_offset) {
+    const int lane = threadIdx.x & 31;
+    const int row =
+        (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
+    const int slot = pipeline_swizzled_q_row_slot(row);
+    const int tile_offset = (k_offset / WMMA_K) * WMMA_M * WMMA_K;
+    uint32_t address = static_cast<uint32_t>(
+        __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
+    uint32_t* words = reinterpret_cast<uint32_t*>(&frag);
+    asm volatile(
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
+        : "r"(address)
+        : "memory");
+    address += WMMA_M * 8 * sizeof(__half);
+    asm volatile(
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
+        : "r"(address)
+        : "memory");
+}
+
+template<int Q_STRIDE, int S_STRIDE, int K_TILES, bool IS_CAUSAL,
+         bool SWIZZLED_Q = false>
+__device__ __forceinline__ void pipeline_qk_slice(
+    const __half* __restrict__ sQ,
+    float* __restrict__ score,
+    const __half* __restrict__ k_cache,
+    const int* __restrict__ page_idx,
+    const int* __restrict__ page_offset,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int kv_head_id,
+    int start_col,
+    int valid_k_rows,
+    int start_row,
+    int valid_q_rows,
+    int causal_q_offset,
+    int tile_n,
+    int k_begin,
+    bool load_partial,
+    bool finalize,
+    float softmax_scale,
+    int window_size_left,
+    int window_size_right,
+    float neg_inf) {
+    if (tile_n >= valid_k_rows) {
+        return;
+    }
+
+    const int page_slot = tile_n >> 4;
+    const int block_offset = page_offset[page_slot];
+    const int physical_block_idx = page_idx[page_slot];
+    const __half* k_tile_base =
+        k_cache + (int64_t)physical_block_idx * k_block_stride
+        + (int64_t)block_offset * k_token_stride
+        + (int64_t)kv_head_id * k_head_stride;
+
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+    if (load_partial) {
+        load_matrix_sync(
+            acc_frag, score + tile_n, S_STRIDE, mem_row_major);
+    } else {
+        fill_fragment(acc_frag, 0.0f);
+    }
+
+    #pragma unroll
+    for (int k_tile = 0; k_tile < K_TILES; ++k_tile) {
+        const int k_offset = k_begin + k_tile * WMMA_K;
+        if constexpr (SWIZZLED_Q) {
+            load_pipeline_swizzled_matrix_a_fragment(
+                a_frag, sQ, k_offset);
+        } else {
+            load_matrix_sync(a_frag, sQ + k_offset, Q_STRIDE);
+        }
+        load_matrix_sync(
+            b_frag, k_tile_base + k_offset, k_token_stride);
+        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+    }
+
+    if (finalize) {
+        const int lane_id = threadIdx.x & 31;
+        const unsigned row_causal =
+            (lane_id & 0b1) + ((lane_id >> 2) & 0b1) * 8
+            + ((lane_id >> 4) & 0b1) * 4;
+        const unsigned col_causal =
+            ((lane_id >> 1) & 0b1) * 2 + ((lane_id >> 3) & 0b1) * 8;
+
+        #pragma unroll
+        for (int i = 0; i < acc_frag.num_elements; ++i) {
+            const unsigned col =
+                col_causal + (i & 0b1) + ((i >> 2) & 0b1) * 4;
+            const unsigned row = row_causal + ((i >> 1) & 0b1) * 2;
+            const int global_m = start_row + row;
+            const int global_n = start_col + tile_n + col;
+            const int global_q_pos = global_m + causal_q_offset;
+
+            const bool is_valid =
+                global_m < start_row + valid_q_rows
+                && global_n < start_col + valid_k_rows;
+            bool is_causal_valid = true;
+            if constexpr (IS_CAUSAL) {
+                is_causal_valid = global_n <= global_q_pos;
+            }
+            bool is_window_valid = true;
+            if (window_size_left >= 0) {
+                is_window_valid =
+                    global_n >= global_q_pos - window_size_left;
+            }
+            if (window_size_right >= 0) {
+                is_window_valid =
+                    is_window_valid
+                    && global_n <= global_q_pos + window_size_right;
+            }
+            acc_frag.x[i] =
+                (is_valid && is_causal_valid && is_window_valid)
+                    ? acc_frag.x[i] * softmax_scale
+                    : neg_inf;
+        }
+    }
+
+    store_matrix_sync(score + tile_n, acc_frag, S_STRIDE, mem_row_major);
+}
+
+template<int P_STRIDE, int O_STRIDE, bool SWIZZLED_P = false>
+__device__ __forceinline__ void pipeline_pv_tile(
+    const __half* __restrict__ sP,
+    float* __restrict__ sO,
+    const __half* __restrict__ v_cache,
+    const int* __restrict__ page_idx,
+    const int* __restrict__ page_offset,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    int kv_head_id,
+    int sub_start,
+    int sub_valid_k_rows,
+    int tile_d) {
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag;
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_frag;
+    load_matrix_sync(
+        acc_frag, sO + tile_d, O_STRIDE, mem_row_major);
+
+    #pragma unroll
+    for (int tile_k = 0; tile_k < 2; ++tile_k) {
+        const int k_offset = tile_k * WMMA_K;
+        if (k_offset >= sub_valid_k_rows) {
+            break;
+        }
+        const int token_offset = sub_start + k_offset;
+        const int page_slot = token_offset >> 4;
+        const int block_offset =
+            page_offset[page_slot] + (token_offset & 15);
+        const int physical_block_idx = page_idx[page_slot];
+        const __half* v_tile_ptr =
+            v_cache + (int64_t)physical_block_idx * v_block_stride
+            + (int64_t)block_offset * v_token_stride
+            + (int64_t)kv_head_id * v_head_stride + tile_d;
+        if constexpr (SWIZZLED_P) {
+            load_pipeline_swizzled_matrix_a_fragment(
+                a_frag, sP, k_offset);
+        } else {
+            load_matrix_sync(a_frag, sP + k_offset, P_STRIDE);
+        }
+        load_matrix_sync(b_frag, v_tile_ptr, v_token_stride);
+        mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+    }
+    store_matrix_sync(sO + tile_d, acc_frag, O_STRIDE, mem_row_major);
+}
+
 template<int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
          bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32, bool SPLIT_KV,
-         bool IS_CAUSAL, int KV_DTYPE>
+         bool IS_CAUSAL, int KV_DTYPE, bool D256_OUTPUT_STRIDE_268 = false,
+         bool D256_SW_PIPELINE_QK = false,
+         bool D256_SW_PIPELINE_PV = false>
 __global__ void __launch_bounds__(
     KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK,
-                 LOW_SMEM_BM32>::THREADS_PER_BLOCK, 2)
+                 LOW_SMEM_BM32,
+                 D256_OUTPUT_STRIDE_268,
+                 D256_SW_PIPELINE_QK,
+                 D256_SW_PIPELINE_PV>::THREADS_PER_BLOCK, 2)
 flash_attention_forward_kernel_paged(
     const __half* __restrict__ Q,
     const void* __restrict__ K_cache,
@@ -177,7 +400,9 @@ flash_attention_forward_kernel_paged(
     const int split_kv_tiles
 ) {
     using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK,
-                                LOW_SMEM_BM32>;
+                                LOW_SMEM_BM32, D256_OUTPUT_STRIDE_268,
+                                D256_SW_PIPELINE_QK,
+                                D256_SW_PIPELINE_PV>;
     using Traits = FlashV100Traits<D>;
 
     constexpr int BLOCK_M           = Config::BLOCK_M;
@@ -192,6 +417,15 @@ flash_attention_forward_kernel_paged(
     constexpr int P_STRIDE          = Config::P_STRIDE;
     constexpr int O_STRIDE          = Config::O_STRIDE;
     constexpr int PER_UINT4         = Config::PER_UINT4;
+    constexpr bool USE_SW_PIPELINE =
+        D256_SW_PIPELINE_QK || D256_SW_PIPELINE_PV;
+    if constexpr (USE_SW_PIPELINE) {
+        static_assert(D == 256 && LOW_SMEM && !LOW_SMEM_CONTIG_FAST
+                          && !LOW_SMEM_SCALAR_QK && !LOW_SMEM_BM32
+                          && !SPLIT_KV && BLOCK_M == 16 && BLOCK_N == 128
+                          && WARPS_PER_BLOCK == 16,
+                      "software pipeline is specialized for D256 BM16 BN128");
+    }
     const float NEG_INF = -1e30f;
 
     const int batch_head_id = blockIdx.z;
@@ -293,11 +527,259 @@ flash_attention_forward_kernel_paged(
         if (row < valid_q_rows && vec_col < d_stride_uint4) {
             q_val = __ldg(&q_vec[row * d_stride_uint4 + vec_col]);
         }
-        sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
+        if constexpr (Config::PIPELINE_SWIZZLED_Q) {
+            const int k_tile = vec_col >> 1;
+            const int plane = vec_col & 1;
+            const int slot = pipeline_swizzled_q_row_slot(row);
+            sQ_vec[k_tile * (2 * BLOCK_M) + plane * BLOCK_M + slot] =
+                q_val;
+        } else {
+            sQ_vec[row * q_stride_uint4 + vec_col] = q_val;
+        }
     }
     __syncthreads();
 
-    int first_n_tile = 0;
+    int cross_block_first_n_tile = 0;
+    if constexpr (D256_SW_PIPELINE_QK && D256_SW_PIPELINE_PV) {
+        const bool use_cross_block_pipeline =
+            valid_q_rows == BLOCK_M && actual_N > 0
+            && page_block_size == 784 && bfla_block_mask == nullptr
+            && window_size_left < 0 && window_size_right < 0;
+        if (use_cross_block_pipeline) {
+            const __half* k_cache_h =
+                reinterpret_cast<const __half*>(K_cache);
+            const __half* v_cache_h =
+                reinterpret_cast<const __half*>(V_cache);
+
+            if (tid < Config::LOW_SMEM_PAGE_COUNT) {
+                const int global_token_idx = tid * LOW_SMEM_PAGE_SIZE;
+                const int virtual_block_idx =
+                    global_token_idx / page_block_size;
+                sPageIdx[tid] =
+                    __ldg(&block_table_seq[virtual_block_idx]);
+                sPageOffset[tid] =
+                    global_token_idx
+                    - virtual_block_idx * page_block_size;
+            }
+            __syncthreads();
+
+            if (warp_id < BLOCK_N / WMMA_N) {
+                const int valid_k_rows = min(BLOCK_N, actual_N);
+                pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K,
+                                  IS_CAUSAL, true>(
+                    sQ, sS, k_cache_h, sPageIdx, sPageOffset,
+                    k_block_stride, k_token_stride,
+                    k_head_stride, kv_head_id, 0, valid_k_rows, start_row,
+                    valid_q_rows, causal_q_offset, warp_id * WMMA_N, 0, false,
+                    true, softmax_scale, window_size_left, window_size_right,
+                    NEG_INF);
+            }
+            __syncthreads();
+
+            // Keep the hot loop on a compile-time steady-state path. The
+            // existing exact path below drains the final block, avoiding a
+            // loop-carried has_next predicate in every softmax/PV panel.
+            const int steady_n_tiles = num_n_tiles - 1;
+            for (int block_n = 0; block_n < steady_n_tiles; ++block_n) {
+                const int start_col = block_n * BLOCK_N;
+                const int valid_k_rows = BLOCK_N;
+                const int next_start_col = start_col + BLOCK_N;
+                const int next_valid_k_rows =
+                    min(BLOCK_N, actual_N - next_start_col);
+                const bool odd_block = (block_n & 1) != 0;
+                float* const score_current =
+                    odd_block ? smem.pipeline_s : sS;
+                float* const score_next =
+                    odd_block ? sS : smem.pipeline_s;
+                int* const page_idx_current =
+                    odd_block ? smem.pipeline_page_idx : sPageIdx;
+                int* const page_offset_current =
+                    odd_block ? smem.pipeline_page_offset : sPageOffset;
+                int* const page_idx_next =
+                    odd_block ? sPageIdx : smem.pipeline_page_idx;
+                int* const page_offset_next =
+                    odd_block ? sPageOffset : smem.pipeline_page_offset;
+
+                if (tid < Config::LOW_SMEM_PAGE_COUNT) {
+                    const int page_token_offset =
+                        tid * LOW_SMEM_PAGE_SIZE;
+                    const int global_token_idx =
+                        next_start_col + page_token_offset;
+                    const int virtual_block_idx =
+                        global_token_idx / page_block_size;
+                    page_idx_next[tid] =
+                        __ldg(&block_table_seq[virtual_block_idx]);
+                    page_offset_next[tid] =
+                        global_token_idx
+                        - virtual_block_idx * page_block_size;
+                }
+                __syncthreads();
+
+                for (int sub_start = 0; sub_start < valid_k_rows;
+                     sub_start += P_SUB_TILE) {
+                    const int sub_valid_k_rows =
+                        min(P_SUB_TILE, valid_k_rows - sub_start);
+                    const int row = warp_id;
+                    const int thread_in_row = lane_id;
+                    const unsigned mask = 0xFFFFFFFFU;
+                    float* sS_row_f =
+                        score_current + row * S_STRIDE + sub_start;
+
+                    const int vec_cols = sub_valid_k_rows >> 2;
+                    const int vecs_per_thread =
+                        (vec_cols + THREADS_PER_ROW - 1) / THREADS_PER_ROW;
+                    const int tail_start = vec_cols << 2;
+                    float thread_max = NEG_INF;
+                    float4* sS_vec4 = reinterpret_cast<float4*>(sS_row_f);
+
+                    #pragma unroll 4
+                    for (int j = 0; j < vecs_per_thread; ++j) {
+                        const int vc =
+                            thread_in_row + j * THREADS_PER_ROW;
+                        if (vc < vec_cols) {
+                            const float4 v4 = sS_vec4[vc];
+                            thread_max = fmaxf(
+                                thread_max,
+                                fmaxf(
+                                    fmaxf(v4.x, v4.y),
+                                    fmaxf(v4.z, v4.w)));
+                        }
+                    }
+                    #pragma unroll
+                    for (int c = tail_start + thread_in_row;
+                         c < sub_valid_k_rows; c += THREADS_PER_ROW) {
+                        thread_max = fmaxf(thread_max, sS_row_f[c]);
+                    }
+                    #pragma unroll
+                    for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1) {
+                        thread_max = fmaxf(
+                            thread_max,
+                            __shfl_down_sync(mask, thread_max, o));
+                    }
+
+                    const float row_max =
+                        __shfl_sync(mask, thread_max, 0);
+                    const float old_max = sRowMax[row];
+                    const float new_max = fmaxf(old_max, row_max);
+                    const float exp_diff = __expf(old_max - new_max);
+                    float thread_sum = 0.0f;
+                    int vc_base = thread_in_row;
+
+                    #pragma unroll 4
+                    for (int j = 0; j < vecs_per_thread;
+                         ++j, vc_base += THREADS_PER_ROW) {
+                        if (vc_base < vec_cols) {
+                            const float4 v4 = sS_vec4[vc_base];
+                            const float e0 =
+                                __expf(fmaxf(v4.x - new_max, -80.0f));
+                            const float e1 =
+                                __expf(fmaxf(v4.y - new_max, -80.0f));
+                            const float e2 =
+                                __expf(fmaxf(v4.z - new_max, -80.0f));
+                            const float e3 =
+                                __expf(fmaxf(v4.w - new_max, -80.0f));
+                            thread_sum += (e0 + e1) + (e2 + e3);
+                            const int p_col = vc_base * 4;
+                            __half2* p_half2 = reinterpret_cast<__half2*>(
+                                sP + pipeline_swizzled_matrix_a_offset(
+                                         row, p_col));
+                            p_half2[0] =
+                                __float22half2_rn(make_float2(e0, e1));
+                            p_half2[1] =
+                                __float22half2_rn(make_float2(e2, e3));
+                        }
+                    }
+                    #pragma unroll 4
+                    for (int c = tail_start + thread_in_row;
+                         c < sub_valid_k_rows; c += THREADS_PER_ROW) {
+                        const float e = __expf(
+                            fmaxf(sS_row_f[c] - new_max, -80.0f));
+                        thread_sum += e;
+                        sP[pipeline_swizzled_matrix_a_offset(row, c)] =
+                            __float2half_rn(e);
+                    }
+                    #pragma unroll
+                    for (int o = THREADS_PER_ROW / 2; o > 0; o >>= 1) {
+                        thread_sum +=
+                            __shfl_down_sync(mask, thread_sum, o);
+                    }
+                    const float row_sum =
+                        __shfl_sync(mask, thread_sum, 0);
+                    if (thread_in_row == 0) {
+                        sRowSum[row] = exp_diff * sRowSum[row] + row_sum;
+                        sRowMax[row] = new_max;
+                    }
+
+                    #pragma unroll 4
+                    for (int c = tail_start + thread_in_row;
+                        c < P_SUB_TILE; c += THREADS_PER_ROW) {
+                        if (c >= sub_valid_k_rows) {
+                            sP[pipeline_swizzled_matrix_a_offset(row, c)] =
+                                __float2half(0.0f);
+                        }
+                    }
+
+                    if (block_n > 0 || sub_start > 0) {
+                        float4* sO_vec = reinterpret_cast<float4*>(
+                            sO + row * O_STRIDE);
+                        #pragma unroll 4
+                        for (int ov = thread_in_row; ov < D / 4;
+                             ov += THREADS_PER_ROW) {
+                            float4 v = sO_vec[ov];
+                            v.x *= exp_diff;
+                            v.y *= exp_diff;
+                            v.z *= exp_diff;
+                            v.w *= exp_diff;
+                            sO_vec[ov] = v;
+                        }
+                    }
+                    __syncthreads();
+
+                    if (sub_start == 0) {
+                        if (warp_id < BLOCK_N / WMMA_N) {
+                            pipeline_qk_slice<
+                                Q_STRIDE, S_STRIDE, D / WMMA_K, IS_CAUSAL,
+                                true>(
+                                sQ, score_next, k_cache_h, page_idx_next,
+                                page_offset_next, k_block_stride,
+                                k_token_stride, k_head_stride, kv_head_id,
+                                next_start_col, next_valid_k_rows, start_row,
+                                valid_q_rows, causal_q_offset,
+                                warp_id * WMMA_N, 0, false, true,
+                                softmax_scale, window_size_left,
+                                window_size_right, NEG_INF);
+                        } else {
+                            const int pv_warp =
+                                warp_id - BLOCK_N / WMMA_N;
+                            pipeline_pv_tile<P_STRIDE, O_STRIDE, true>(
+                                sP, sO, v_cache_h, page_idx_current,
+                                page_offset_current, v_block_stride,
+                                v_token_stride, v_head_stride, kv_head_id,
+                                sub_start, sub_valid_k_rows,
+                                pv_warp * WMMA_N);
+                            pipeline_pv_tile<P_STRIDE, O_STRIDE, true>(
+                                sP, sO, v_cache_h, page_idx_current,
+                                page_offset_current, v_block_stride,
+                                v_token_stride, v_head_stride, kv_head_id,
+                                sub_start, sub_valid_k_rows,
+                                (pv_warp + BLOCK_N / WMMA_N) * WMMA_N);
+                        }
+                    } else {
+                        pipeline_pv_tile<P_STRIDE, O_STRIDE, true>(
+                            sP, sO, v_cache_h, page_idx_current,
+                            page_offset_current, v_block_stride,
+                            v_token_stride, v_head_stride, kv_head_id,
+                            sub_start, sub_valid_k_rows, warp_id * WMMA_N);
+                    }
+                    __syncthreads();
+                }
+
+            }
+            cross_block_first_n_tile = steady_n_tiles;
+        }
+    }
+
+    int first_n_tile = cross_block_first_n_tile;
     int last_n_tile = num_n_tiles;
     if constexpr (SPLIT_KV) {
         const int partition_id = blockIdx.y;
@@ -508,6 +990,18 @@ flash_attention_forward_kernel_paged(
                     }
                     sS[row * S_STRIDE + col] =
                         is_valid ? acc * softmax_scale : NEG_INF;
+                }
+            } else if constexpr (D256_SW_PIPELINE_QK) {
+                constexpr int QK_TILES = BLOCK_N / WMMA_N;
+                if (warp_id < QK_TILES) {
+                    pipeline_qk_slice<Q_STRIDE, S_STRIDE, D / WMMA_K,
+                                      IS_CAUSAL, D256_SW_PIPELINE_PV>(
+                        sQ, sS, K_cache_h, sPageIdx, sPageOffset,
+                        k_block_stride, k_token_stride, k_head_stride,
+                        kv_head_id, start_col, valid_k_rows, start_row,
+                        valid_q_rows, causal_q_offset, warp_id * WMMA_N, 0,
+                        false, true, softmax_scale, window_size_left,
+                        window_size_right, NEG_INF);
                 }
             } else {
                 const int num_tiles_m_qk = (BLOCK_M + WMMA_M - 1) / WMMA_M;
@@ -924,6 +1418,7 @@ flash_attention_forward_kernel_paged(
                 int h2_idx = 0;
                 int tail_col = -1;
                 __half tail_value = __float2half(0.f);
+                __half2* sP_half2 = reinterpret_cast<__half2*>(sP_row_h);
 
                 #pragma unroll 4
                 for (int j = 0; j < vecs_per_thread; ++j,
@@ -938,10 +1433,20 @@ flash_attention_forward_kernel_paged(
 
                         thread_sum += (e0 + e1) + (e2 + e3);
 
-                        half_buffer[h2_idx++] =
+                        const __half2 p01 =
                             __float22half2_rn(make_float2(e0, e1));
-                        half_buffer[h2_idx++] =
+                        const __half2 p23 =
                             __float22half2_rn(make_float2(e2, e3));
+                        if constexpr (D256_SW_PIPELINE_PV) {
+                            // D256 owns a separate probability buffer, so the
+                            // values can leave registers before row reduction.
+                            const int base_offset = vc_base * 2;
+                            sP_half2[base_offset] = p01;
+                            sP_half2[base_offset + 1] = p23;
+                        } else {
+                            half_buffer[h2_idx++] = p01;
+                            half_buffer[h2_idx++] = p23;
+                        }
                     }
                 }
 
@@ -951,8 +1456,12 @@ flash_attention_forward_kernel_paged(
                     float v = sS_row_f[c];
                     float e = __expf(fmaxf(v - new_max, -80.0f));
                     thread_sum += e;
-                    tail_col = c;
-                    tail_value = __float2half_rn(e);
+                    if constexpr (D256_SW_PIPELINE_PV) {
+                        sP_row_h[c] = __float2half_rn(e);
+                    } else {
+                        tail_col = c;
+                        tail_value = __float2half_rn(e);
+                    }
                 }
 
                 #pragma unroll
@@ -969,22 +1478,22 @@ flash_attention_forward_kernel_paged(
                     sRowMax[row] = new_max;
                 }
 
-                h2_idx = 0;
-                vc_base = thread_in_row;
-                __half2* sP_half2 = reinterpret_cast<__half2*>(sP_row_h);
-
-                #pragma unroll 4
-                for (int j = 0; j < vecs_per_thread; ++j,
-                         vc_base += THREADS_PER_ROW) {
-                    if (vc_base < vec_cols) {
-                        int base_offset = vc_base * 2;
-                        sP_half2[base_offset] = half_buffer[h2_idx++];
-                        sP_half2[base_offset + 1] = half_buffer[h2_idx++];
+                if constexpr (!D256_SW_PIPELINE_PV) {
+                    h2_idx = 0;
+                    vc_base = thread_in_row;
+                    #pragma unroll 4
+                    for (int j = 0; j < vecs_per_thread; ++j,
+                             vc_base += THREADS_PER_ROW) {
+                        if (vc_base < vec_cols) {
+                            int base_offset = vc_base * 2;
+                            sP_half2[base_offset] = half_buffer[h2_idx++];
+                            sP_half2[base_offset + 1] = half_buffer[h2_idx++];
+                        }
                     }
-                }
 
-                if (tail_col >= 0) {
-                    sP_row_h[tail_col] = tail_value;
+                    if (tail_col >= 0) {
+                        sP_row_h[tail_col] = tail_value;
+                    }
                 }
 
                 #pragma unroll 4
@@ -998,7 +1507,7 @@ flash_attention_forward_kernel_paged(
                 if (block_n > 0 || sub_start > 0) {
                     float*  sO_row = sO + row * O_STRIDE;
                     float4* sO_vec = reinterpret_cast<float4*>(sO_row);
-                    const int o_vec_count = (O_STRIDE + 3) >> 2;
+                    const int o_vec_count = D / 4;
                     float scale = exp_diff;
 
                     #pragma unroll 4
@@ -1159,7 +1668,10 @@ inline bool env_flag_default_enabled(const char* name) {
 }
 
 template<int D, int KV_DTYPE, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
-         bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32>
+         bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32,
+         bool D256_OUTPUT_STRIDE_268 = false,
+         bool D256_SW_PIPELINE_QK = false,
+         bool D256_SW_PIPELINE_PV = false>
 void launcher_flash_attention_forward_paged_impl(
     const torch::Tensor& Q,
     const torch::Tensor& K_cache,
@@ -1183,7 +1695,9 @@ void launcher_flash_attention_forward_paged_impl(
     cudaStream_t stream
 ) {
     using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK,
-                                LOW_SMEM_BM32>;
+                                LOW_SMEM_BM32, D256_OUTPUT_STRIDE_268,
+                                D256_SW_PIPELINE_QK,
+                                D256_SW_PIPELINE_PV>;
 
     const int B = Q.size(0);
     const int H = Q.size(1);
@@ -1211,18 +1725,21 @@ void launcher_flash_attention_forward_paged_impl(
                       ? (void*)flash_attention_forward_kernel_paged<
                             D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                             LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32, false, true,
-                            KV_DTYPE>
+                            KV_DTYPE, D256_OUTPUT_STRIDE_268,
+                            D256_SW_PIPELINE_QK, D256_SW_PIPELINE_PV>
                       : (void*)flash_attention_forward_kernel_paged<
                             D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                             LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32, false, false,
-                            KV_DTYPE>;
+                            KV_DTYPE, D256_OUTPUT_STRIDE_268,
+                            D256_SW_PIPELINE_QK, D256_SW_PIPELINE_PV>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          smem);
 
     if (is_causal) {
         flash_attention_forward_kernel_paged<
             D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK,
-            LOW_SMEM_BM32, false, true, KV_DTYPE>
+            LOW_SMEM_BM32, false, true, KV_DTYPE, D256_OUTPUT_STRIDE_268,
+            D256_SW_PIPELINE_QK, D256_SW_PIPELINE_PV>
             <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             K_cache.data_ptr(),
@@ -1262,7 +1779,8 @@ void launcher_flash_attention_forward_paged_impl(
     } else {
         flash_attention_forward_kernel_paged<
             D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK,
-            LOW_SMEM_BM32, false, false, KV_DTYPE>
+            LOW_SMEM_BM32, false, false, KV_DTYPE, D256_OUTPUT_STRIDE_268,
+            D256_SW_PIPELINE_QK, D256_SW_PIPELINE_PV>
             <<<grid, block, smem, stream>>>(
             reinterpret_cast<const __half*>(Q.data_ptr()),
             K_cache.data_ptr(),
@@ -1556,6 +2074,910 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             num_partitions);
 }
 
+constexpr int D256_BM32_PHASE_BLOCK_M = 32;
+constexpr int D256_BM32_PHASE_BLOCK_N = 128;
+constexpr int D256_BM32_PHASE_PANEL_M = 16;
+constexpr int D256_BM32_PHASE_SOFTMAX_N = 32;
+constexpr int D256_BM32_PHASE_D = 256;
+constexpr int D256_BM32_PHASE_THREADS = 512;
+constexpr int D256_BM32_PHASE_PAGE_SIZE = 16;
+constexpr int D256_BM32_PHASE_PAGE_BLOCK_SIZE = 784;
+constexpr int D256_BM32_PHASE_PAGE_SLOTS =
+    D256_BM32_PHASE_BLOCK_N / D256_BM32_PHASE_PAGE_SIZE;
+constexpr int D256_BM32_PHASE_PANELS =
+    D256_BM32_PHASE_BLOCK_N / D256_BM32_PHASE_SOFTMAX_N;
+constexpr int D256_BM32_PHASE_PROBABILITY_ELEMENTS =
+    D256_BM32_PHASE_PANEL_M * D256_BM32_PHASE_SOFTMAX_N;
+
+template<int PROBABILITY_PANELS>
+struct alignas(16) D256BM32PhaseSharedStorage {
+    __half query[D256_BM32_PHASE_BLOCK_M * D256_BM32_PHASE_D];
+    float score[D256_BM32_PHASE_BLOCK_M * D256_BM32_PHASE_BLOCK_N];
+    __half probability_top[PROBABILITY_PANELS
+                           * D256_BM32_PHASE_PROBABILITY_ELEMENTS];
+    __half probability_bottom[PROBABILITY_PANELS
+                              * D256_BM32_PHASE_PROBABILITY_ELEMENTS];
+    float row_max[D256_BM32_PHASE_BLOCK_M];
+    float row_sum[D256_BM32_PHASE_BLOCK_M];
+    float row_exp_diff[PROBABILITY_PANELS * D256_BM32_PHASE_BLOCK_M];
+    int page_idx[D256_BM32_PHASE_PAGE_SLOTS];
+    int page_offset[D256_BM32_PHASE_PAGE_SLOTS];
+    uint64_t k_tile_ptr[D256_BM32_PHASE_PAGE_SLOTS];
+    uint64_t v_tile_ptr[D256_BM32_PHASE_PAGE_SLOTS];
+    int block_index;
+    int batch_id;
+    int kv_head_id;
+    int actual_n;
+};
+
+using D256BM32PhaseSharedStorageSingle = D256BM32PhaseSharedStorage<1>;
+using D256BM32PhaseSharedStorageAllP =
+    D256BM32PhaseSharedStorage<D256_BM32_PHASE_PANELS>;
+
+static_assert(sizeof(D256BM32PhaseSharedStorageSingle) == 35408,
+              "D256 BM32 phase shared layout changed unexpectedly");
+static_assert(sizeof(D256BM32PhaseSharedStorageAllP) == 41936,
+              "D256 BM32 all-P shared layout changed unexpectedly");
+static_assert(sizeof(D256BM32PhaseSharedStorageAllP) <= 48 * 1024,
+              "D256 BM32 phase shared storage exceeds 48 KiB");
+
+using D256BM32PhaseMatrixAFragment =
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major>;
+using D256BM32PhaseQKMatrixBFragment =
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major>;
+using D256BM32PhasePVMatrixBFragment =
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major>;
+using D256BM32PhaseAccumulatorFragment =
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float>;
+
+__device__ __forceinline__ int d256_bm32_phase_swizzled_row_slot(int row) {
+    return (row & 3) | ((row & 8) >> 1) | ((row & 4) << 1);
+}
+
+__device__ __forceinline__ int d256_bm32_phase_matrix_a_offset(
+    int row,
+    int column) {
+    const int tile = column / WMMA_K;
+    const int within_tile = column - tile * WMMA_K;
+    const int plane = within_tile >> 3;
+    const int inner = within_tile & 7;
+    return tile * WMMA_M * WMMA_K + plane * WMMA_M * 8
+           + d256_bm32_phase_swizzled_row_slot(row) * 8 + inner;
+}
+
+__device__ __forceinline__ void d256_bm32_phase_stage_query(
+    const __half* __restrict__ source,
+    __half* __restrict__ destination) {
+    constexpr int HALF_PER_UINT4 = sizeof(uint4) / sizeof(__half);
+    constexpr int VECTORS_PER_ROW = D256_BM32_PHASE_D / HALF_PER_UINT4;
+    constexpr int VECTORS_PER_PANEL =
+        D256_BM32_PHASE_PANEL_M * VECTORS_PER_ROW;
+    constexpr int QUERY_VECTORS =
+        D256_BM32_PHASE_BLOCK_M * VECTORS_PER_ROW;
+
+    const uint4* source_vectors = reinterpret_cast<const uint4*>(source);
+    uint4* destination_vectors = reinterpret_cast<uint4*>(destination);
+
+    #pragma unroll
+    for (int index = threadIdx.x; index < QUERY_VECTORS;
+         index += D256_BM32_PHASE_THREADS) {
+        const int row = index / VECTORS_PER_ROW;
+        const int vector_column = index % VECTORS_PER_ROW;
+        const int panel = row / D256_BM32_PHASE_PANEL_M;
+        const int panel_row = row - panel * D256_BM32_PHASE_PANEL_M;
+        const int k_tile = vector_column >> 1;
+        const int plane = vector_column & 1;
+        const int slot = d256_bm32_phase_swizzled_row_slot(panel_row);
+        destination_vectors[panel * VECTORS_PER_PANEL
+                            + k_tile * (2 * D256_BM32_PHASE_PANEL_M)
+                            + plane * D256_BM32_PHASE_PANEL_M + slot] =
+            __ldg(source_vectors + index);
+    }
+}
+
+__device__ __forceinline__ void d256_bm32_phase_stage_query_partial(
+    const __half* __restrict__ source,
+    __half* __restrict__ destination,
+    int valid_rows) {
+    constexpr int HALF_PER_UINT4 = sizeof(uint4) / sizeof(__half);
+    constexpr int VECTORS_PER_ROW = D256_BM32_PHASE_D / HALF_PER_UINT4;
+    constexpr int VECTORS_PER_PANEL =
+        D256_BM32_PHASE_PANEL_M * VECTORS_PER_ROW;
+    constexpr int QUERY_VECTORS =
+        D256_BM32_PHASE_BLOCK_M * VECTORS_PER_ROW;
+
+    const uint4* source_vectors = reinterpret_cast<const uint4*>(source);
+    uint4* destination_vectors = reinterpret_cast<uint4*>(destination);
+
+    #pragma unroll
+    for (int index = threadIdx.x; index < QUERY_VECTORS;
+         index += D256_BM32_PHASE_THREADS) {
+        const int row = index / VECTORS_PER_ROW;
+        const int vector_column = index % VECTORS_PER_ROW;
+        const int panel = row / D256_BM32_PHASE_PANEL_M;
+        const int panel_row = row - panel * D256_BM32_PHASE_PANEL_M;
+        const int k_tile = vector_column >> 1;
+        const int plane = vector_column & 1;
+        const int slot = d256_bm32_phase_swizzled_row_slot(panel_row);
+        uint4 value = {0, 0, 0, 0};
+        if (row < valid_rows) {
+            value = __ldg(source_vectors + index);
+        }
+        destination_vectors[panel * VECTORS_PER_PANEL
+                            + k_tile * (2 * D256_BM32_PHASE_PANEL_M)
+                            + plane * D256_BM32_PHASE_PANEL_M + slot] = value;
+    }
+}
+
+__device__ __forceinline__ void d256_bm32_phase_load_matrix_a(
+    D256BM32PhaseMatrixAFragment& fragment,
+    const __half* __restrict__ matrix,
+    int k_offset) {
+    const int lane = threadIdx.x & 31;
+    const int row =
+        (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
+    const int slot = d256_bm32_phase_swizzled_row_slot(row);
+    const int tile_offset = (k_offset / WMMA_K) * WMMA_M * WMMA_K;
+    uint32_t address = static_cast<uint32_t>(
+        __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
+    uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
+    asm volatile(
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
+        : "r"(address)
+        : "memory");
+    address += WMMA_M * 8 * sizeof(__half);
+    asm volatile(
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
+        : "r"(address)
+        : "memory");
+}
+
+__device__ __forceinline__ int d256_bm32_phase_accumulator_row(
+    int lane,
+    int element) {
+    const int row_base =
+        (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
+    return row_base + ((element >> 1) & 1) * 2;
+}
+
+__device__ __forceinline__ int d256_bm32_phase_accumulator_column(
+    int lane,
+    int element) {
+    const int column_base = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8;
+    return column_base + (element & 1) + ((element >> 2) & 1) * 4;
+}
+
+__device__ __forceinline__ void d256_bm32_phase_spill_pair_scratch(
+    float* __restrict__ score,
+    D256BM32PhaseAccumulatorFragment& accumulator_top,
+    D256BM32PhaseAccumulatorFragment& accumulator_bottom) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp_pair = warp >> 1;
+    const int warp_in_pair = warp & 1;
+    const int pair_column = warp_pair * 32 + (lane & 15) * 2;
+    const int lane_row = lane >> 4;
+
+    #pragma unroll
+    for (int element_pair = 0; element_pair < 4; ++element_pair) {
+        const int element = element_pair * 2;
+        const int offset =
+            (warp_in_pair * 16 + element_pair * 2 + lane_row)
+                * D256_BM32_PHASE_BLOCK_N
+            + pair_column;
+        const uint32_t address = static_cast<uint32_t>(
+            __cvta_generic_to_shared(score + offset));
+        asm volatile(
+            "st.shared.v2.u32 [%0], {%1, %2};"
+            :
+            : "r"(address),
+              "r"(__float_as_uint(accumulator_top.x[element])),
+              "r"(__float_as_uint(accumulator_top.x[element + 1]))
+            : "memory");
+        asm volatile(
+            "st.shared.v2.u32 [%0+4096], {%1, %2};"
+            :
+            : "r"(address),
+              "r"(__float_as_uint(accumulator_bottom.x[element])),
+              "r"(__float_as_uint(accumulator_bottom.x[element + 1]))
+            : "memory");
+    }
+}
+
+__device__ __forceinline__ void d256_bm32_phase_reload_pair_scratch(
+    const float* __restrict__ score,
+    D256BM32PhaseAccumulatorFragment& accumulator_top,
+    D256BM32PhaseAccumulatorFragment& accumulator_bottom) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp_pair = warp >> 1;
+    const int warp_in_pair = warp & 1;
+    const int pair_column = warp_pair * 32 + (lane & 15) * 2;
+    const int lane_row = lane >> 4;
+
+    #pragma unroll
+    for (int element_pair = 0; element_pair < 4; ++element_pair) {
+        const int element = element_pair * 2;
+        const int offset =
+            (warp_in_pair * 16 + element_pair * 2 + lane_row)
+                * D256_BM32_PHASE_BLOCK_N
+            + pair_column;
+        const uint32_t address = static_cast<uint32_t>(
+            __cvta_generic_to_shared(score + offset));
+        uint32_t first_word;
+        uint32_t second_word;
+        asm volatile(
+            "ld.shared.v2.u32 {%0, %1}, [%2];"
+            : "=r"(first_word), "=r"(second_word)
+            : "r"(address)
+            : "memory");
+        accumulator_top.x[element] = __uint_as_float(first_word);
+        accumulator_top.x[element + 1] = __uint_as_float(second_word);
+        asm volatile(
+            "ld.shared.v2.u32 {%0, %1}, [%2+4096];"
+            : "=r"(first_word), "=r"(second_word)
+            : "r"(address)
+            : "memory");
+        accumulator_bottom.x[element] = __uint_as_float(first_word);
+        accumulator_bottom.x[element + 1] = __uint_as_float(second_word);
+    }
+}
+
+__device__ __forceinline__ void d256_bm32_phase_sync_warp_pair(int warp_pair) {
+    const int barrier_id = warp_pair + 1;
+    asm volatile("bar.sync %0, 64;" : : "r"(barrier_id) : "memory");
+}
+
+__device__ __forceinline__ float d256_bm32_phase_make_probability_row(
+    const float* __restrict__ score_row,
+    __half* __restrict__ probability,
+    int probability_row,
+    float* __restrict__ row_max,
+    float* __restrict__ row_sum,
+    int state_row,
+    int panel,
+    float neg_inf) {
+    const int lane = threadIdx.x & 31;
+    const float* panel_score =
+        score_row + panel * D256_BM32_PHASE_SOFTMAX_N;
+    float thread_max = neg_inf;
+    if (lane < D256_BM32_PHASE_SOFTMAX_N / 4) {
+        const float4 values =
+            reinterpret_cast<const float4*>(panel_score)[lane];
+        thread_max = fmaxf(fmaxf(values.x, values.y),
+                           fmaxf(values.z, values.w));
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_max = fmaxf(
+            thread_max, __shfl_down_sync(0xffffffffU, thread_max, offset));
+    }
+    const float panel_max = __shfl_sync(0xffffffffU, thread_max, 0);
+    const float old_max = row_max[state_row];
+    const float new_max = fmaxf(old_max, panel_max);
+    const float exp_diff = __expf(old_max - new_max);
+
+    float thread_sum = 0.0f;
+    if (lane < D256_BM32_PHASE_SOFTMAX_N / 4) {
+        float4 values = reinterpret_cast<const float4*>(panel_score)[lane];
+        values.x = __expf(fmaxf(values.x - new_max, -80.0f));
+        values.y = __expf(fmaxf(values.y - new_max, -80.0f));
+        values.z = __expf(fmaxf(values.z - new_max, -80.0f));
+        values.w = __expf(fmaxf(values.w - new_max, -80.0f));
+        thread_sum = (values.x + values.y) + (values.z + values.w);
+        const int column = lane * 4;
+        __half2* first_pair = reinterpret_cast<__half2*>(
+            probability + d256_bm32_phase_matrix_a_offset(
+                              probability_row, column));
+        __half2* second_pair = reinterpret_cast<__half2*>(
+            probability + d256_bm32_phase_matrix_a_offset(
+                              probability_row, column + 2));
+        *first_pair = __float22half2_rn(make_float2(values.x, values.y));
+        *second_pair = __float22half2_rn(make_float2(values.z, values.w));
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_sum +=
+            __shfl_down_sync(0xffffffffU, thread_sum, offset);
+    }
+    const float panel_sum = __shfl_sync(0xffffffffU, thread_sum, 0);
+    if (lane == 0) {
+        row_sum[state_row] = exp_diff * row_sum[state_row] + panel_sum;
+        row_max[state_row] = new_max;
+    }
+    return exp_diff;
+}
+
+__device__ __forceinline__ void d256_bm32_phase_scale_accumulator_rows(
+    D256BM32PhaseAccumulatorFragment& accumulator,
+    float first_row_scale,
+    float second_row_scale) {
+    accumulator.x[0] *= first_row_scale;
+    accumulator.x[1] *= first_row_scale;
+    accumulator.x[2] *= second_row_scale;
+    accumulator.x[3] *= second_row_scale;
+    accumulator.x[4] *= first_row_scale;
+    accumulator.x[5] *= first_row_scale;
+    accumulator.x[6] *= second_row_scale;
+    accumulator.x[7] *= second_row_scale;
+}
+
+__device__ __forceinline__ void d256_bm32_phase_scale_accumulators(
+    D256BM32PhaseAccumulatorFragment& accumulator_top,
+    D256BM32PhaseAccumulatorFragment& accumulator_bottom,
+    const float* __restrict__ row_exp_diff) {
+    const int row = d256_bm32_phase_accumulator_row(threadIdx.x & 31, 0);
+    d256_bm32_phase_scale_accumulator_rows(
+        accumulator_top, row_exp_diff[row], row_exp_diff[row + 2]);
+    d256_bm32_phase_scale_accumulator_rows(
+        accumulator_bottom,
+        row_exp_diff[D256_BM32_PHASE_PANEL_M + row],
+        row_exp_diff[D256_BM32_PHASE_PANEL_M + row + 2]);
+}
+
+__device__ __forceinline__ void d256_bm32_phase_update_pv_panel(
+    const __half* __restrict__ probability_top,
+    const __half* __restrict__ probability_bottom,
+    const __half* __restrict__ value_k0,
+    const __half* __restrict__ value_k16,
+    int64_t value_token_stride,
+    int d_offset,
+    int valid_columns,
+    D256BM32PhaseAccumulatorFragment& accumulator_top,
+    D256BM32PhaseAccumulatorFragment& accumulator_bottom) {
+    D256BM32PhaseMatrixAFragment a_fragment;
+    D256BM32PhasePVMatrixBFragment b_fragment;
+
+    load_matrix_sync(b_fragment, value_k0 + d_offset, value_token_stride);
+    d256_bm32_phase_load_matrix_a(a_fragment, probability_top, 0);
+    mma_sync(accumulator_top, a_fragment, b_fragment, accumulator_top);
+    d256_bm32_phase_load_matrix_a(a_fragment, probability_bottom, 0);
+    mma_sync(accumulator_bottom, a_fragment, b_fragment, accumulator_bottom);
+    if (valid_columns > WMMA_K) {
+        load_matrix_sync(
+            b_fragment, value_k16 + d_offset, value_token_stride);
+        d256_bm32_phase_load_matrix_a(a_fragment, probability_top, WMMA_K);
+        mma_sync(accumulator_top, a_fragment, b_fragment, accumulator_top);
+        d256_bm32_phase_load_matrix_a(a_fragment, probability_bottom, WMMA_K);
+        mma_sync(accumulator_bottom, a_fragment, b_fragment,
+                 accumulator_bottom);
+    }
+}
+
+__device__ __forceinline__ void d256_bm32_phase_store_output(
+    const D256BM32PhaseAccumulatorFragment& accumulator,
+    __half* __restrict__ output,
+    const float* __restrict__ row_sum,
+    int row_offset,
+    int d_offset) {
+    const int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int element = 0; element < accumulator.num_elements; ++element) {
+        const int row = row_offset
+                        + d256_bm32_phase_accumulator_row(lane, element);
+        const int column = d_offset
+                           + d256_bm32_phase_accumulator_column(lane, element);
+        const float inverse_sum = 1.0f / fmaxf(row_sum[row], 1e-24f);
+        output[row * D256_BM32_PHASE_D + column] =
+            __float2half_rn(accumulator.x[element] * inverse_sum);
+    }
+}
+
+__device__ __forceinline__ void d256_bm32_phase_store_output_partial(
+    const D256BM32PhaseAccumulatorFragment& accumulator,
+    __half* __restrict__ output,
+    const float* __restrict__ row_sum,
+    int row_offset,
+    int d_offset,
+    int valid_rows) {
+    const int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int element = 0; element < accumulator.num_elements; ++element) {
+        const int row = row_offset
+                        + d256_bm32_phase_accumulator_row(lane, element);
+        if (row < valid_rows) {
+            const int column =
+                d_offset
+                + d256_bm32_phase_accumulator_column(lane, element);
+            const float inverse_sum = 1.0f / fmaxf(row_sum[row], 1e-24f);
+            output[row * D256_BM32_PHASE_D + column] =
+                __float2half_rn(accumulator.x[element] * inverse_sum);
+        }
+    }
+}
+
+template<bool IS_CAUSAL, bool ALL_P = false, bool PAIR_SCRATCH = false>
+__global__ __launch_bounds__(D256_BM32_PHASE_THREADS, 2)
+void flash_attention_forward_paged_d256_bm32_phase_kernel(
+    const __half* __restrict__ Q,
+    const __half* __restrict__ K_cache,
+    const __half* __restrict__ V_cache,
+          __half* __restrict__ Out,
+           float* __restrict__ softmax_lse,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seqused_k,
+    int H,
+    int M,
+    int max_num_blocks_per_seq,
+    int num_kv_heads,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    float softmax_scale) {
+    constexpr float NEG_INF = -1e30f;
+    __shared__ __align__(16)
+        D256BM32PhaseSharedStorage<ALL_P ? D256_BM32_PHASE_PANELS : 1>
+            shared;
+
+    const int start_row = blockIdx.x * D256_BM32_PHASE_BLOCK_M;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane_id = tid & 31;
+    const int valid_q_rows =
+        min(D256_BM32_PHASE_BLOCK_M, M - start_row);
+
+    {
+        const __half* q_ptr =
+            Q + static_cast<size_t>(blockIdx.z) * M * D256_BM32_PHASE_D
+            + start_row * D256_BM32_PHASE_D;
+        if (valid_q_rows == D256_BM32_PHASE_BLOCK_M) {
+            d256_bm32_phase_stage_query(q_ptr, shared.query);
+        } else {
+            d256_bm32_phase_stage_query_partial(
+                q_ptr, shared.query, valid_q_rows);
+        }
+    }
+    if (tid < D256_BM32_PHASE_BLOCK_M) {
+        shared.row_max[tid] = NEG_INF;
+        shared.row_sum[tid] = 0.0f;
+    }
+    if (tid == 0) {
+        shared.block_index = 0;
+        shared.batch_id = blockIdx.z / H;
+        shared.kv_head_id =
+            (blockIdx.z % H) / (H / num_kv_heads);
+        shared.actual_n = seqused_k[shared.batch_id];
+    }
+    __syncthreads();
+
+    D256BM32PhaseAccumulatorFragment accumulator_top;
+    D256BM32PhaseAccumulatorFragment accumulator_bottom;
+    fill_fragment(accumulator_top, 0.0f);
+    fill_fragment(accumulator_bottom, 0.0f);
+
+    for (;;) {
+        const int start_col =
+            shared.block_index * D256_BM32_PHASE_BLOCK_N;
+        if (start_col >= shared.actual_n) {
+            break;
+        }
+        const int valid_k_rows = min(D256_BM32_PHASE_BLOCK_N,
+                                     shared.actual_n - start_col);
+
+        if (tid < D256_BM32_PHASE_PAGE_SLOTS) {
+            const int token_offset = tid * D256_BM32_PHASE_PAGE_SIZE;
+            if (token_offset < valid_k_rows) {
+                const int global_token_idx = start_col + token_offset;
+                const int virtual_block_idx =
+                    global_token_idx / D256_BM32_PHASE_PAGE_BLOCK_SIZE;
+                shared.page_idx[tid] =
+                    __ldg(&block_table[shared.batch_id
+                                       * max_num_blocks_per_seq
+                                       + virtual_block_idx]);
+                shared.page_offset[tid] =
+                    global_token_idx
+                    - virtual_block_idx * D256_BM32_PHASE_PAGE_BLOCK_SIZE;
+                shared.k_tile_ptr[tid] = reinterpret_cast<uint64_t>(
+                    K_cache
+                    + (int64_t)shared.page_idx[tid] * k_block_stride
+                    + (int64_t)shared.page_offset[tid] * k_token_stride
+                    + (int64_t)shared.kv_head_id * k_head_stride);
+                shared.v_tile_ptr[tid] = reinterpret_cast<uint64_t>(
+                    V_cache
+                    + (int64_t)shared.page_idx[tid] * v_block_stride
+                    + (int64_t)shared.page_offset[tid] * v_token_stride
+                    + (int64_t)shared.kv_head_id * v_head_stride);
+            } else {
+                shared.page_idx[tid] = -1;
+                shared.page_offset[tid] = 0;
+                shared.k_tile_ptr[tid] = 0;
+                shared.v_tile_ptr[tid] = 0;
+            }
+        }
+        __syncthreads();
+
+        if (warp_id < D256_BM32_PHASE_BLOCK_N / WMMA_N
+            && warp_id * WMMA_N < valid_k_rows) {
+            const int tile_n = warp_id * WMMA_N;
+            const __half* k_tile =
+                reinterpret_cast<const __half*>(shared.k_tile_ptr[warp_id]);
+            if constexpr (PAIR_SCRATCH) {
+                d256_bm32_phase_spill_pair_scratch(
+                    shared.score, accumulator_top, accumulator_bottom);
+            } else {
+                store_matrix_sync(shared.score + tile_n, accumulator_top,
+                                  D256_BM32_PHASE_BLOCK_N, mem_row_major);
+                store_matrix_sync(
+                    shared.score + D256_BM32_PHASE_PANEL_M
+                                       * D256_BM32_PHASE_BLOCK_N + tile_n,
+                    accumulator_bottom, D256_BM32_PHASE_BLOCK_N,
+                    mem_row_major);
+            }
+            asm volatile("" ::: "memory");
+
+            D256BM32PhaseAccumulatorFragment qk_top;
+            D256BM32PhaseAccumulatorFragment qk_bottom;
+            {
+                D256BM32PhaseMatrixAFragment a_fragment;
+                D256BM32PhaseQKMatrixBFragment b_fragment;
+                fill_fragment(qk_top, 0.0f);
+                fill_fragment(qk_bottom, 0.0f);
+
+                #pragma unroll
+                for (int k_offset = 0; k_offset < D256_BM32_PHASE_D;
+                     k_offset += WMMA_K) {
+                    load_matrix_sync(b_fragment, k_tile + k_offset,
+                                     k_token_stride);
+                    d256_bm32_phase_load_matrix_a(
+                        a_fragment, shared.query, k_offset);
+                    mma_sync(qk_top, a_fragment, b_fragment, qk_top);
+                    d256_bm32_phase_load_matrix_a(
+                        a_fragment,
+                        shared.query
+                            + D256_BM32_PHASE_PANEL_M
+                                  * D256_BM32_PHASE_D,
+                        k_offset);
+                    mma_sync(qk_bottom, a_fragment, b_fragment, qk_bottom);
+                }
+            }
+            asm volatile("" ::: "memory");
+
+            if constexpr (PAIR_SCRATCH) {
+                d256_bm32_phase_reload_pair_scratch(
+                    shared.score, accumulator_top, accumulator_bottom);
+                const int partner_warp = warp_id ^ 1;
+                if (partner_warp * WMMA_N < valid_k_rows) {
+                    d256_bm32_phase_sync_warp_pair(warp_id >> 1);
+                }
+            } else {
+                load_matrix_sync(accumulator_top, shared.score + tile_n,
+                                 D256_BM32_PHASE_BLOCK_N, mem_row_major);
+                load_matrix_sync(
+                    accumulator_bottom,
+                    shared.score + D256_BM32_PHASE_PANEL_M
+                                       * D256_BM32_PHASE_BLOCK_N + tile_n,
+                    D256_BM32_PHASE_BLOCK_N, mem_row_major);
+            }
+
+            store_matrix_sync(shared.score + tile_n, qk_top,
+                              D256_BM32_PHASE_BLOCK_N, mem_row_major);
+            store_matrix_sync(
+                shared.score + D256_BM32_PHASE_PANEL_M
+                                   * D256_BM32_PHASE_BLOCK_N + tile_n,
+                qk_bottom, D256_BM32_PHASE_BLOCK_N, mem_row_major);
+        }
+        __syncthreads();
+
+        const int causal_q_offset = max(shared.actual_n - M, 0);
+        #pragma unroll 1
+        for (int index = tid;
+             index < D256_BM32_PHASE_BLOCK_M * D256_BM32_PHASE_BLOCK_N;
+             index += D256_BM32_PHASE_THREADS) {
+            const int row = index / D256_BM32_PHASE_BLOCK_N;
+            const int column = index - row * D256_BM32_PHASE_BLOCK_N;
+            const int global_m = start_row + row;
+            const int global_n = start_col + column;
+            const bool is_valid = global_m < M
+                                  && global_n < start_col + valid_k_rows;
+            if constexpr (IS_CAUSAL) {
+                if (is_valid && global_n <= global_m + causal_q_offset) {
+                    shared.score[index] *= softmax_scale;
+                } else {
+                    shared.score[index] = NEG_INF;
+                }
+            } else {
+                if (is_valid) {
+                    shared.score[index] *= softmax_scale;
+                } else {
+                    shared.score[index] = NEG_INF;
+                }
+            }
+        }
+        __syncthreads();
+
+        if constexpr (ALL_P) {
+            #pragma unroll
+            for (int panel = 0; panel < D256_BM32_PHASE_PANELS;
+                 ++panel) {
+                const int panel_start =
+                    panel * D256_BM32_PHASE_SOFTMAX_N;
+                const int valid_panel_columns =
+                    min(D256_BM32_PHASE_SOFTMAX_N,
+                        valid_k_rows - panel_start);
+                if (valid_panel_columns > 0) {
+                    __half* probability_top =
+                        shared.probability_top
+                        + panel * D256_BM32_PHASE_PROBABILITY_ELEMENTS;
+                    __half* probability_bottom =
+                        shared.probability_bottom
+                        + panel * D256_BM32_PHASE_PROBABILITY_ELEMENTS;
+                    float* row_exp_diff =
+                        shared.row_exp_diff
+                        + panel * D256_BM32_PHASE_BLOCK_M;
+                    const float top_exp_diff =
+                        d256_bm32_phase_make_probability_row(
+                            shared.score
+                                + warp_id * D256_BM32_PHASE_BLOCK_N,
+                            probability_top, warp_id, shared.row_max,
+                            shared.row_sum, warp_id, panel, NEG_INF);
+                    const float bottom_exp_diff =
+                        d256_bm32_phase_make_probability_row(
+                            shared.score
+                                + (D256_BM32_PHASE_PANEL_M + warp_id)
+                                      * D256_BM32_PHASE_BLOCK_N,
+                            probability_bottom, warp_id, shared.row_max,
+                            shared.row_sum,
+                            D256_BM32_PHASE_PANEL_M + warp_id, panel,
+                            NEG_INF);
+                    if (lane_id == 0) {
+                        row_exp_diff[warp_id] = top_exp_diff;
+                        row_exp_diff[D256_BM32_PHASE_PANEL_M + warp_id] =
+                            bottom_exp_diff;
+                    }
+                }
+                // Publish lane 0's online-softmax state to this warp before
+                // it advances to the next panel.
+                __syncwarp();
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int panel = 0; panel < D256_BM32_PHASE_PANELS;
+                 ++panel) {
+                const int panel_start =
+                    panel * D256_BM32_PHASE_SOFTMAX_N;
+                const int valid_panel_columns =
+                    min(D256_BM32_PHASE_SOFTMAX_N,
+                        valid_k_rows - panel_start);
+                if (valid_panel_columns > 0) {
+                    const __half* probability_top =
+                        shared.probability_top
+                        + panel * D256_BM32_PHASE_PROBABILITY_ELEMENTS;
+                    const __half* probability_bottom =
+                        shared.probability_bottom
+                        + panel * D256_BM32_PHASE_PROBABILITY_ELEMENTS;
+                    const float* row_exp_diff =
+                        shared.row_exp_diff
+                        + panel * D256_BM32_PHASE_BLOCK_M;
+                    if (shared.block_index != 0 || panel != 0) {
+                        d256_bm32_phase_scale_accumulators(
+                            accumulator_top, accumulator_bottom,
+                            row_exp_diff);
+                    }
+                    const int page_slot_k0 = panel_start >> 4;
+                    const __half* value_k0 =
+                        reinterpret_cast<const __half*>(
+                            shared.v_tile_ptr[page_slot_k0]);
+                    const __half* value_k16 = nullptr;
+                    if (valid_panel_columns > WMMA_K) {
+                        const int page_slot_k16 =
+                            (panel_start + WMMA_K) >> 4;
+                        value_k16 =
+                            reinterpret_cast<const __half*>(
+                                shared.v_tile_ptr[page_slot_k16]);
+                    }
+                    d256_bm32_phase_update_pv_panel(
+                        probability_top, probability_bottom,
+                        value_k0, value_k16, v_token_stride,
+                        warp_id * WMMA_N,
+                        valid_panel_columns,
+                        accumulator_top, accumulator_bottom);
+                }
+            }
+            // Protect the current V pointers and block index from the next
+            // iteration while slower warps finish the last PV panel.
+            __syncthreads();
+        } else {
+            #pragma unroll
+            for (int panel = 0; panel < D256_BM32_PHASE_PANELS;
+                 ++panel) {
+                const int panel_start =
+                    panel * D256_BM32_PHASE_SOFTMAX_N;
+                const int valid_panel_columns =
+                    min(D256_BM32_PHASE_SOFTMAX_N,
+                        valid_k_rows - panel_start);
+                if (valid_panel_columns > 0) {
+                    const float top_exp_diff =
+                        d256_bm32_phase_make_probability_row(
+                            shared.score
+                                + warp_id * D256_BM32_PHASE_BLOCK_N,
+                            shared.probability_top, warp_id, shared.row_max,
+                            shared.row_sum, warp_id, panel, NEG_INF);
+                    const float bottom_exp_diff =
+                        d256_bm32_phase_make_probability_row(
+                            shared.score
+                                + (D256_BM32_PHASE_PANEL_M + warp_id)
+                                      * D256_BM32_PHASE_BLOCK_N,
+                            shared.probability_bottom, warp_id,
+                            shared.row_max, shared.row_sum,
+                            D256_BM32_PHASE_PANEL_M + warp_id, panel,
+                            NEG_INF);
+                    if (lane_id == 0) {
+                        shared.row_exp_diff[warp_id] = top_exp_diff;
+                        shared.row_exp_diff[
+                            D256_BM32_PHASE_PANEL_M + warp_id] =
+                            bottom_exp_diff;
+                    }
+                }
+                __syncthreads();
+
+                if (valid_panel_columns > 0) {
+                    if (shared.block_index != 0 || panel != 0) {
+                        d256_bm32_phase_scale_accumulators(
+                            accumulator_top, accumulator_bottom,
+                            shared.row_exp_diff);
+                    }
+                    const int page_slot_k0 = panel_start >> 4;
+                    const __half* value_k0 =
+                        reinterpret_cast<const __half*>(
+                            shared.v_tile_ptr[page_slot_k0]);
+                    const __half* value_k16 = nullptr;
+                    if (valid_panel_columns > WMMA_K) {
+                        const int page_slot_k16 =
+                            (panel_start + WMMA_K) >> 4;
+                        value_k16 =
+                            reinterpret_cast<const __half*>(
+                                shared.v_tile_ptr[page_slot_k16]);
+                    }
+                    d256_bm32_phase_update_pv_panel(
+                        shared.probability_top,
+                        shared.probability_bottom,
+                        value_k0, value_k16, v_token_stride,
+                        warp_id * WMMA_N,
+                        valid_panel_columns,
+                        accumulator_top, accumulator_bottom);
+                }
+                __syncthreads();
+            }
+        }
+
+        if (tid == 0) {
+            ++shared.block_index;
+        }
+        __syncthreads();
+    }
+
+    {
+        const size_t q_head_linear = static_cast<size_t>(blockIdx.z);
+        __half* out_ptr =
+            Out + q_head_linear * M * D256_BM32_PHASE_D
+            + start_row * D256_BM32_PHASE_D;
+        float* softmax_lse_ptr = softmax_lse + q_head_linear * M + start_row;
+        if (valid_q_rows == D256_BM32_PHASE_BLOCK_M) {
+            d256_bm32_phase_store_output(
+                accumulator_top, out_ptr, shared.row_sum, 0,
+                warp_id * WMMA_N);
+            d256_bm32_phase_store_output(
+                accumulator_bottom, out_ptr, shared.row_sum,
+                D256_BM32_PHASE_PANEL_M, warp_id * WMMA_N);
+        } else {
+            d256_bm32_phase_store_output_partial(
+                accumulator_top, out_ptr, shared.row_sum, 0,
+                warp_id * WMMA_N, valid_q_rows);
+            d256_bm32_phase_store_output_partial(
+                accumulator_bottom, out_ptr, shared.row_sum,
+                D256_BM32_PHASE_PANEL_M, warp_id * WMMA_N, valid_q_rows);
+        }
+
+        if (tid < valid_q_rows) {
+            const float sum = fmaxf(shared.row_sum[tid], 1e-24f);
+            softmax_lse_ptr[tid] = shared.row_max[tid] + logf(sum);
+        }
+    }
+}
+
+template<bool IS_CAUSAL, bool ALL_P, bool PAIR_SCRATCH>
+void launch_flash_attention_forward_paged_d256_bm32_phase_kernel(
+    const torch::Tensor& Q,
+    const torch::Tensor& K_cache,
+    const torch::Tensor& V_cache,
+    torch::Tensor& Out,
+    torch::Tensor& softmax_lse,
+    const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens,
+    float softmax_scale,
+    cudaStream_t stream) {
+    const int H = Q.size(1);
+    const int M = Q.size(2);
+    const int num_kv_heads = K_cache.size(2);
+    const int max_num_blocks_per_seq = block_table.size(1);
+    const int64_t k_block_stride = K_cache.stride(0);
+    const int64_t k_token_stride = K_cache.stride(1);
+    const int64_t k_head_stride = K_cache.stride(2);
+    const int64_t v_block_stride = V_cache.stride(0);
+    const int64_t v_token_stride = V_cache.stride(1);
+    const int64_t v_head_stride = V_cache.stride(2);
+    const dim3 grid((M + D256_BM32_PHASE_BLOCK_M - 1)
+                        / D256_BM32_PHASE_BLOCK_M,
+                    1, Q.size(0) * H);
+    const dim3 block(D256_BM32_PHASE_THREADS);
+    flash_attention_forward_paged_d256_bm32_phase_kernel<
+        IS_CAUSAL, ALL_P, PAIR_SCRATCH><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __half*>(Q.data_ptr()),
+            reinterpret_cast<const __half*>(K_cache.data_ptr()),
+            reinterpret_cast<const __half*>(V_cache.data_ptr()),
+            reinterpret_cast<__half*>(Out.data_ptr()),
+            softmax_lse.data_ptr<float>(), block_table.data_ptr<int>(),
+            seq_lens.data_ptr<int>(), H, M, max_num_blocks_per_seq,
+            num_kv_heads, k_block_stride, k_token_stride, k_head_stride,
+            v_block_stride, v_token_stride, v_head_stride, softmax_scale);
+}
+
+void launcher_flash_attention_forward_paged_d256_bm32_phase(
+    const torch::Tensor& Q,
+    const torch::Tensor& K_cache,
+    const torch::Tensor& V_cache,
+    torch::Tensor& Out,
+    torch::Tensor& softmax_lse,
+    const torch::Tensor& block_table,
+    const torch::Tensor& seq_lens,
+    float softmax_scale,
+    bool is_causal,
+    cudaStream_t stream) {
+    const bool use_all_p =
+        env_flag_default_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P");
+    const bool use_pair_scratch =
+        use_all_p
+        && env_flag_default_enabled(
+            "VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH");
+
+    if (is_causal) {
+        if (use_all_p) {
+            if (use_pair_scratch) {
+                launch_flash_attention_forward_paged_d256_bm32_phase_kernel<
+                    true, true, true>(
+                    Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                    seq_lens, softmax_scale, stream);
+            } else {
+                launch_flash_attention_forward_paged_d256_bm32_phase_kernel<
+                    true, true, false>(
+                    Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                    seq_lens, softmax_scale, stream);
+            }
+        } else {
+            launch_flash_attention_forward_paged_d256_bm32_phase_kernel<
+                true, false, false>(
+                Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+                softmax_scale, stream);
+        }
+        return;
+    }
+
+    if (use_all_p) {
+        if (use_pair_scratch) {
+            launch_flash_attention_forward_paged_d256_bm32_phase_kernel<
+                false, true, true>(
+                Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+                softmax_scale, stream);
+        } else {
+            launch_flash_attention_forward_paged_d256_bm32_phase_kernel<
+                false, true, false>(
+                Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+                softmax_scale, stream);
+        }
+    } else {
+        launch_flash_attention_forward_paged_d256_bm32_phase_kernel<
+            false, false, false>(
+            Q, K_cache, V_cache, Out, softmax_lse, block_table, seq_lens,
+            softmax_scale, stream);
+    }
+}
+
 template<int D, int KV_DTYPE>
 void launcher_flash_attention_forward_paged(
     const torch::Tensor& Q,
@@ -1587,6 +3009,19 @@ void launcher_flash_attention_forward_paged(
             && env_flag_default_enabled(
                 "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM");
         if (use_low_smem) {
+            const bool use_d256_bm32_phase =
+                env_flag_default_enabled(
+                    "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE")
+                && page_block_size == D256_BM32_PHASE_PAGE_BLOCK_SIZE
+                && M >= D256_BM32_PHASE_BLOCK_M
+                && bfla_mask_ptr == nullptr && window_size_left < 0
+                && window_size_right < 0;
+            if (use_d256_bm32_phase) {
+                launcher_flash_attention_forward_paged_d256_bm32_phase(
+                    Q, K_cache, V_cache, Out, softmax_lse, block_table,
+                    seq_lens, softmax_scale, is_causal, stream);
+                return;
+            }
             const bool use_low_smem_contig_fast =
                 page_block_size == 16 ||
                 env_flag_enabled("VLLM_FLASH_V100_PREFILL_CONTIG_FAST");
@@ -1594,6 +3029,28 @@ void launcher_flash_attention_forward_paged(
                 env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_SCALAR_QK");
             const bool use_low_smem_bm32 =
                 env_flag_enabled("VLLM_FLASH_V100_PREFILL_D256_BM32");
+            // Default only for the measured hybrid-cache page size. Other
+            // page sizes retain the prior layout unless explicitly enabled.
+            const bool use_low_smem_output_stride_268 =
+                page_block_size == 784
+                    ? env_flag_default_enabled(
+                          "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268")
+                    : env_flag_enabled(
+                          "VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268");
+            const bool use_sw_pipeline =
+                page_block_size == 784
+                && env_flag_enabled(
+                    "VLLM_FLASH_V100_PREFILL_D256_SOFTWARE_PIPELINE");
+            const bool use_sw_pipeline_qk =
+                page_block_size == 784
+                && (use_sw_pipeline
+                    || env_flag_default_enabled(
+                        "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK"));
+            const bool use_sw_pipeline_pv =
+                page_block_size == 784
+                && (use_sw_pipeline
+                    || env_flag_default_enabled(
+                        "VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_PV"));
             if (use_low_smem_contig_fast) {
                 if (use_low_smem_scalar_qk) {
                     if (use_low_smem_bm32) {
@@ -1668,14 +3125,72 @@ void launcher_flash_attention_forward_paged(
                             softmax_scale, is_causal, k_scale, v_scale,
                             window_size_left, window_size_right, stream);
                     } else {
-                        launcher_flash_attention_forward_paged_impl<
-                            D, KV_DTYPE, true, false, false, false>(
-                            Q, K_cache, V_cache, Out, softmax_lse, block_table,
-                            seq_lens, bfla_mask_ptr, bfla_mask_block_n,
-                            bfla_mask_stride_b, bfla_mask_stride_h,
-                            bfla_mask_stride_q, bfla_mask_stride_k,
-                            softmax_scale, is_causal, k_scale, v_scale,
-                            window_size_left, window_size_right, stream);
+                        if (use_low_smem_output_stride_268) {
+                            if (use_sw_pipeline_qk) {
+                                if (use_sw_pipeline_pv) {
+                                    launcher_flash_attention_forward_paged_impl<
+                                        D, KV_DTYPE, true, false, false,
+                                        false, true, true, true>(
+                                        Q, K_cache, V_cache, Out,
+                                        softmax_lse, block_table, seq_lens,
+                                        bfla_mask_ptr, bfla_mask_block_n,
+                                        bfla_mask_stride_b,
+                                        bfla_mask_stride_h,
+                                        bfla_mask_stride_q,
+                                        bfla_mask_stride_k, softmax_scale,
+                                        is_causal, k_scale, v_scale,
+                                        window_size_left,
+                                        window_size_right, stream);
+                                } else {
+                                    launcher_flash_attention_forward_paged_impl<
+                                        D, KV_DTYPE, true, false, false, false,
+                                        true, true, false>(
+                                        Q, K_cache, V_cache, Out, softmax_lse,
+                                        block_table, seq_lens, bfla_mask_ptr,
+                                        bfla_mask_block_n, bfla_mask_stride_b,
+                                        bfla_mask_stride_h,
+                                        bfla_mask_stride_q,
+                                        bfla_mask_stride_k, softmax_scale,
+                                        is_causal, k_scale, v_scale,
+                                        window_size_left, window_size_right,
+                                        stream);
+                                }
+                            } else if (use_sw_pipeline_pv) {
+                                launcher_flash_attention_forward_paged_impl<
+                                    D, KV_DTYPE, true, false, false, false,
+                                    true, false, true>(
+                                    Q, K_cache, V_cache, Out, softmax_lse,
+                                    block_table, seq_lens, bfla_mask_ptr,
+                                    bfla_mask_block_n, bfla_mask_stride_b,
+                                    bfla_mask_stride_h, bfla_mask_stride_q,
+                                    bfla_mask_stride_k, softmax_scale,
+                                    is_causal, k_scale, v_scale,
+                                    window_size_left, window_size_right,
+                                    stream);
+                            } else {
+                                launcher_flash_attention_forward_paged_impl<
+                                    D, KV_DTYPE, true, false, false, false,
+                                    true>(
+                                    Q, K_cache, V_cache, Out, softmax_lse,
+                                    block_table, seq_lens, bfla_mask_ptr,
+                                    bfla_mask_block_n, bfla_mask_stride_b,
+                                    bfla_mask_stride_h, bfla_mask_stride_q,
+                                    bfla_mask_stride_k, softmax_scale,
+                                    is_causal, k_scale, v_scale,
+                                    window_size_left, window_size_right,
+                                    stream);
+                            }
+                        } else {
+                            launcher_flash_attention_forward_paged_impl<
+                                D, KV_DTYPE, true, false, false, false>(
+                                Q, K_cache, V_cache, Out, softmax_lse,
+                                block_table, seq_lens, bfla_mask_ptr,
+                                bfla_mask_block_n, bfla_mask_stride_b,
+                                bfla_mask_stride_h, bfla_mask_stride_q,
+                                bfla_mask_stride_k, softmax_scale, is_causal,
+                                k_scale, v_scale, window_size_left,
+                                window_size_right, stream);
+                        }
                     }
                 }
             }
@@ -1937,6 +3452,126 @@ at::Tensor flash_attention_prefill_paged(
     #undef LAUNCH_PAGED_TYPED
 
     return out_fp16;
+}
+
+std::vector<at::Tensor>
+flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& softmax_lse_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const float softmax_scale
+) {
+    TORCH_CHECK(q.dim() == 4, "q must have shape [B, H, M, D]");
+    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
+                "k_cache and v_cache must have shape [blocks, page, Hkv, D]");
+    TORCH_CHECK(block_table.dim() == 2,
+                "block_table must have shape [B, max_num_blocks]");
+    TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must have shape [B]");
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k_cache.dtype() == torch::kFloat16,
+                "k_cache must be fp16");
+    TORCH_CHECK(v_cache.dtype() == torch::kFloat16,
+                "v_cache must be fp16");
+    TORCH_CHECK(block_table.dtype() == torch::kInt32,
+                "block_table must be int32");
+    TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+                "q, k_cache, and v_cache must be CUDA tensors");
+    TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
+                "block_table and seq_lens must be CUDA tensors");
+    TORCH_CHECK(
+        q.device() == k_cache.device() && q.device() == v_cache.device()
+            && q.device() == block_table.device() && q.device() == seq_lens.device(),
+        "all input tensors must be on the q device");
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous [B, H, M, D]");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(seq_lens.is_contiguous(), "seq_lens must be contiguous");
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(),
+                "k_cache and v_cache must have the same shape");
+    TORCH_CHECK(k_cache.stride(-1) == 1 && v_cache.stride(-1) == 1,
+                "K/V head dimensions must be contiguous");
+    TORCH_CHECK(k_cache.stride(1) % 8 == 0 && k_cache.stride(2) % 8 == 0
+                    && v_cache.stride(1) % 8 == 0
+                    && v_cache.stride(2) % 8 == 0,
+                "K/V strides must be divisible by 8 half elements");
+
+    const int B = q.size(0);
+    const int H = q.size(1);
+    const int M = q.size(2);
+    const int D = q.size(3);
+    const int num_kv_heads = k_cache.size(2);
+
+    TORCH_CHECK(B > 0 && H > 0, "q batch and head dimensions must be positive");
+    TORCH_CHECK(M >= D256_BM32_PHASE_BLOCK_M,
+                "fixed BM32 prefill requires M >= ",
+                D256_BM32_PHASE_BLOCK_M);
+    TORCH_CHECK(D == D256_BM32_PHASE_D,
+                "fixed BM32 prefill requires D=", D256_BM32_PHASE_D);
+    TORCH_CHECK(k_cache.size(0) > 0 && num_kv_heads > 0,
+                "K/V cache block and head dimensions must be positive");
+    TORCH_CHECK(k_cache.size(1) == D256_BM32_PHASE_PAGE_BLOCK_SIZE,
+                "fixed BM32 prefill requires page size ",
+                D256_BM32_PHASE_PAGE_BLOCK_SIZE);
+    TORCH_CHECK(k_cache.size(3) == D256_BM32_PHASE_D,
+                "K/V cache head dimension must be D=",
+                D256_BM32_PHASE_D);
+    TORCH_CHECK(H % num_kv_heads == 0,
+                "num_q_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(block_table.size(0) == B && seq_lens.size(0) == B,
+                "block_table and seq_lens batch dimensions must equal q batch");
+    TORCH_CHECK(block_table.size(1) > 0,
+                "block_table must provide at least one page index");
+
+    if (out_.has_value()) {
+        const at::Tensor& out = out_.value();
+        TORCH_CHECK(out.is_cuda() && out.device() == q.device(),
+                    "out must be a CUDA tensor on the q device");
+        TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
+        TORCH_CHECK(out.sizes() == q.sizes(), "out must have shape [B, H, M, D]");
+        TORCH_CHECK(out.is_contiguous(), "out must be contiguous [B, H, M, D]");
+    }
+    if (softmax_lse_.has_value()) {
+        const at::Tensor& softmax_lse = softmax_lse_.value();
+        TORCH_CHECK(softmax_lse.is_cuda() && softmax_lse.device() == q.device(),
+                    "softmax_lse must be a CUDA tensor on the q device");
+        TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32,
+                    "softmax_lse must be fp32");
+        TORCH_CHECK(softmax_lse.dim() == 3 && softmax_lse.size(0) == B
+                        && softmax_lse.size(1) == H && softmax_lse.size(2) == M,
+                    "softmax_lse must have shape [B, H, M]");
+        TORCH_CHECK(softmax_lse.is_contiguous(),
+                    "softmax_lse must be contiguous [B, H, M]");
+    }
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_error = cudaStreamIsCapturing(stream, &capture_status);
+    TORCH_CHECK(capture_error == cudaSuccess, "cudaStreamIsCapturing failed: ",
+                cudaGetErrorString(capture_error));
+    TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+                "fixed BM32 prefill CUDA graph capture is not validated");
+
+    auto props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props->major == 7 && props->minor == 0,
+                "fixed BM32 prefill supports only SM70 GPUs");
+
+    at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::empty_like(q);
+    at::Tensor softmax_lse =
+        softmax_lse_.has_value()
+            ? softmax_lse_.value()
+            : torch::empty({B, H, M},
+                           torch::dtype(torch::kFloat32).device(q.device()));
+
+    launch_flash_attention_forward_paged_d256_bm32_phase_kernel<true, true, true>(
+        q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,
+        softmax_scale, stream);
+
+    return {out_fp16, softmax_lse};
 }
 
 at::Tensor flash_attention_prefill_paged_bfla(

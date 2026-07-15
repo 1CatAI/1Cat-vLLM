@@ -399,6 +399,76 @@ Default-on XQA decode update, 2026-06-22:
   `--language-model-only`, V100 serving sets `image=1`, `video=0`. Config-only
   checks confirmed this for local Qwen3.6-27B-AWQ and Qwen3.5-27B-NVFP4.
 
+Exact p256/G6 padded-XQA layout update, 2026-07-13:
+
+- NCU source counters on the real Qwen3.6-27B-AWQ TP4 per-rank decode shape
+  (`Hq=6`, `Hkv=1`, `D=256`, p256, 65,539 tokens) localized the long-context
+  waste to the Volta WMMA Q/K shared loads: dense leading dimensions 256/128
+  caused 16/32-way bank conflicts and `2,642,976` excessive shared
+  wavefronts.
+- Added a padded but arithmetic-identical layout: Q leading dimension
+  `256 -> 264`, K/V `128 -> 136`. It preserves p256, all KV tokens, online
+  softmax order, fp16 probability storage, and the cross-partition reduction.
+- Direct exact microbenchmark: output is bitwise equal at 4K, 64K, and 256K;
+  64K partition-plus-reduction improves `0.34078 -> 0.29438 ms` (`1.158x`).
+  NCU confirms excessive shared wavefronts `2,642,976 -> 279,072` (`-89.4%`),
+  partition duration `280.03 -> 255.87 us`, and registers `186 -> 184`.
+- Full no-MTP TP4 CUDA-graph validation reused six historical official-sampling
+  prompts and produced exactly equal output token sequences. The 65,539-token
+  steady decode point improved `17.320 -> 16.993 ms` (`57.737 -> 58.848
+  tok/s`, `+1.92%`).
+- Default scope is deliberately narrow: p256 plus `q_per_kv=6` only.
+  `VLLM_FLASH_V100_XQA_PADDED_SMEM=0` rolls it back; p512/p1024 and G4/G8 keep
+  the old layout until independently validated. The residual one-CTA,
+  local-spill, and long-scoreboard bottleneck remains the next P1 target.
+- Evidence and reproducible procedure are maintained in
+  `docs/design/sm70_tp4_nomtp_long_context_decode.md`.
+
+Native block784 XQA correction, 2026-07-13:
+
+- Qwen3.6-27B-AWQ TP4 hybrid allocation resolves the live full-attention KV
+  page to `784` tokens, not the 16-token synthetic page used by the earlier
+  block16 index microbenchmark. The worker route trace is
+  `decode_xqa_paged`, `Hq=6/Hkv=1/D=256`, `page_size=784`, p256. Do not
+  project block16-only microbenchmarks onto this endpoint.
+- Added the exact native `BLOCK_SIZE=784` XQA index specialization, gated by
+  the already-accepted p256/G6/padded route and reversible with
+  `VLLM_FLASH_V100_XQA_BLOCK784_INDEX=0`. It retains runtime K/V strides and
+  block-table semantics; direct sequential/reverse/permuted-tail tests are
+  bitwise equal.
+- At 128K direct microbenchmark/NCU, partition-plus-reduction improves
+  `0.40925 -> 0.37471 ms`; NCU partition duration `362.59 -> 336.03 us`,
+  instructions `42.55M -> 38.39M`, and DRAM throughput `387.59 -> 418.28
+  GB/s`, with registers/shared/occupancy unchanged. This is address-work and
+  memory-feed improvement, not an occupancy claim.
+- Same-source 128K no-MTP TP4 endpoint with official sampling, CUDA graphs,
+  TurboMind AWQ, and 64 output tokens improves pure TPOT `19.36346 ->
+  18.92318 ms` (`-2.27%`), `51.64367 -> 52.84523 tok/s`, with all token IDs
+  equal and P7 trace active on all ranks. P7 is default-on only inside its
+  exact route gate. Do not repeat a 256K run for this candidate; use 128K
+  operator/route gates until a materially larger candidate emerges.
+- `VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16=1` remains experimental/default-off:
+  it virtual-splits each 784-token manager page into 49 attention blocks but
+  does not reduce KV bytes and has no accepted Qwen3.6 no-MTP endpoint result.
+  Full reasoning and artifacts stay in
+  `docs/design/sm70_tp4_nomtp_long_context_decode.md`.
+- A one-shot P7 `__ldcg(uint4)` cache-policy candidate is rejected despite a
+  small sequential microbenchmark gain: reverse 784-page mapping at a tail
+  length produces nonzero output difference (`7.629e-06`). Its dispatch was
+  removed before NCU/model testing; do not treat a cache hint as numerically
+  free on this Volta path.
+- P8, a transposed QK Tensor Core shape (`m8n32k16 -> m32n8k16`), is also
+  rejected before NCU/model testing: it is bitwise equal on sequential 128K but
+  changes output on reverse 131,071-token paging (`max_abs_diff=7.629e-06`).
+  The experimental dispatch was removed; the detailed evidence and the
+  do-not-retry boundary are in `sm70_tp4_nomtp_long_context_decode.md`.
+- Quality correction: repeated 131,071-token reverse-page self-comparisons
+  reveal that the G6 192-thread p256 base path itself is intermittently
+  non-bitwise-equal, with or without P2/P7. The earlier P7 endpoint remains
+  performance evidence only and must not be used as a quality-accepted default.
+  G6 requires an aligned shared-pitch repair before further endpoint work; the
+  full audit is in `sm70_tp4_nomtp_long_context_decode.md`.
+
 Stability follow-up, 2026-06-22:
 
 - Made FlashInfer allreduce fusion a true optional import. If `flashinfer.comm`
@@ -36866,12 +36936,46 @@ Interpretation:
   outside `top_k=4`, or are in per-depth top-k but absent under the budgeted
   parent. This shifts the next experiment to reference-shaped tree coverage,
   not sampler rewrites.
-- Default `ddtree_top_k` is now `8`, matching AEON's deployable Qwen3.6 DDTree
-  profile. Official DDTree uses `topk=min(budget,vocab)`, so a `top_k=16/32`
-  check is still needed when GPUs are free.
+- `ddtree_top_k` was temporarily raised to `8` during this bring-up, matching
+  AEON's deployable Qwen3.6 profile. This was superseded on 2026-06-25:
+  current `ddtree_top_k=None` uses the DDTree budget, matching the official
+  reference. Explicit `top_k=8` should now be treated as an experiment, not the
+  default.
 - Attempts to run `top_k=8` and `top_k=32` after the debug smoke failed only
   because a separate TP4 API server occupied all V100 memory. These startup
   failures are not DDTree correctness or performance evidence.
+
+### DDTree 2026-06-25 experiment guardrails
+
+- The DDTree target is now normal non-greedy API sampling for Qwen3.6-27B-AWQ,
+  not greedy. Use the model coding policy
+  `temperature=0.6, top_p=0.95, top_k=20`; `min_p=0.0` is a no-op and is not
+  supported as an active speculative parameter.
+- For Qwen3.6 hybrid models, a run is not valid branched DDTree evidence unless
+  `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE=1` is present and logs/metrics
+  prove the tree route. Runs that silently reject branched payloads and execute
+  flat DFlash must not be reused as DDTree performance data.
+- Official-sampling DDTree can reach the expected coding acceptance on the
+  low-entropy LIS completion artifact:
+  `bench_results/ddtree_smoke_20260624/ddtree_qla_official_coding_t06_o256.json`
+  reports `mean_acceptance_length=10.22`, `83` accepted tokens across `9`
+  drafts, total `95.48 tok/s`, and steady decode `163.87 tok/s`. The matching
+  no-spec artifact
+  `bench_results/ddtree_smoke_20260624/baseline_official_coding_t06_o256.json`
+  reports total `50.24 tok/s` and steady decode `53.59 tok/s`. Treat this as a
+  good short-prompt smoke, not a final 256-token long-output result, because
+  EOS stopped the DDTree run at `93` output tokens and the baseline at `162`.
+- Greedy artifacts around `114-115 tok/s` remain kernel/proposer health checks
+  only. They do not answer the user's normal API-sampling requirement.
+- The open-ended coding/game prompt still needs a saved artifact after the
+  sampling-aligned tree-build change. Trace-only runs showed low acceptance
+  around `4-5` and mostly failed because the sampled token was in per-depth
+  draft top-k but absent under the currently accepted tree prefix. Do not rerun
+  budget sweeps until that trace classification changes.
+- Baseline should not be re-run unless the baseline path, CUDA graph policy,
+  sampling policy, model, prompt, or output-length criterion changes. Every new
+  DDTree run must write json/log/trace paths and state its hypothesis before
+  the next run is launched.
 
 ## 2026-06-21 TileRT-Style 27B-AWQ MLP Down-Proj Experiment
 
@@ -36975,3 +37079,3660 @@ Interpretation:
   - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer1_compile_fallback_i512_o32_r2.json`
   - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o32_r2.json`
   - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_compile_fallback_i512_o32_r2.json`
+
+### DDTree 27B-AWQ budget acceptance sweep
+
+- Ran a normal-API DDTree acceptance-only budget sweep on GPU0/1 with
+  Qwen3.6-27B-AWQ TP2, DFlash FP16 drafter, `max_tokens=256`,
+  `temperature=0.6`, `top_p=0.95`, `top_k=20`, tree verify enabled, graph
+  enabled, `num_speculative_tokens=16`, `max_num_batched_tokens=1024`, and the
+  open-ended pygame ball-eating game code prompt with thinking disabled.
+- Formal artifacts are in
+  `bench_results/ddtree_budget_sweep_20260625/`. The valid summary is
+  `ballgame_budget_sweep_summary.tsv`; the earlier
+  `ballgame_budget16_mbt2048_o256.*` and `ballgame_budget16_nospeccore_o256.*`
+  files are invalid setup probes and must not be included in the formal
+  ranking.
+- Mean acceptance length results:
+  `budget=16 -> 4.1613`, `22 -> 4.8333`, `24 -> 4.1290`,
+  `32 -> 4.3443`, `36 -> 4.3390`, `40 -> 4.3167`,
+  `64 -> 3.9385`.
+- Decision: `budget=22` is the current longest-acceptance candidate for the
+  ballgame coding prompt. Larger budgets did not improve acceptance and reduce
+  available KV/cache headroom, so the next DDTree work should lower verifier
+  cost on `budget=22` before any further broad budget sweep.
+
+### DDTree 27B-AWQ HumanEval calibration sweep
+
+- HumanEval is now the preferred DDTree acceptance-calibration dataset because
+  it is closer to community coding-eval practice than a single open-ended
+  pygame prompt. The ballgame sweep above remains prompt-specific evidence and
+  no longer determines the default budget.
+- Fixed the latest HumanEval quality blocker by making the GDN DDTree
+  fast-build metadata cache default-off. With the fast-build cache enabled, a
+  sequential HumanEval run could complete request 0, then request 1's first
+  verifier step saw NaN compact logits and sampled token id `0`, producing
+  repeated `!`. The safe metadata path restored normal code output and no NaN
+  trace events. `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD=1` is diagnostic
+  only until that cache key/state refresh is fixed.
+- Ran HumanEval-32 on GPU0/1 with Qwen3.6-27B-AWQ TP2, DFlash FP16 drafter,
+  `max_tokens=256`, `temperature=1.0`, `top_p=0.95`, `top_k=20`,
+  `qwen_chat_solution_nothink`, tree verify enabled, graph enabled,
+  `num_speculative_tokens=16`, and `max_num_batched_tokens=1024`.
+- Formal artifacts are in
+  `bench_results/ddtree_humaneval_sweep_20260625/`; the summary is
+  `humaneval32_qwen_chat_solution_nothink_t1p0_o256_safe_default_budget_sweep_summary.tsv`.
+- Results:
+  - `budget=16`: mean acceptance length `11.5361`, no-bonus `10.5361`,
+    draft acceptance `0.6585`, steady decode `122.11 tok/s`,
+    `bang_repeat_outputs=0`.
+  - `budget=22`: mean acceptance length `10.4905`, draft acceptance `0.4325`,
+    steady decode `98.67 tok/s`.
+  - `budget=32`: mean acceptance length `10.1213`, draft acceptance `0.2870`,
+    steady decode `73.64 tok/s`.
+  - `budget=48`: mean acceptance length `9.0323`, draft acceptance `0.1673`,
+    steady decode `53.79 tok/s`.
+  - `budget=64`: mean acceptance length `8.0851`, draft acceptance `0.1116`,
+    steady decode `46.58 tok/s`.
+- Decision: use `ddtree_budget=16` as the current HumanEval-calibrated default
+  for Qwen3.6-27B-AWQ. Larger budgets are worse on both acceptance and speed;
+  do not run broad budget sweeps again until the tree-building hypothesis or
+  verifier cost model changes.
+
+### DDTree 27B-AWQ realistic coding-context check
+
+- Ran six realistic codebase repair/implementation prompts on GPU0/1 with
+  Qwen3.6-27B-AWQ TP2, DFlash FP16 drafter, `max_tokens=256`,
+  `temperature=1.0`, `top_p=0.95`, `top_k=20`, Qwen chat/no-think prompt
+  style, tree verify enabled, graph enabled, `num_speculative_tokens=16`,
+  `ddtree_budget=16`, and `max_num_batched_tokens=4096`.
+- Artifacts:
+  - `bench_results/ddtree_realcode_20260625/realcode_prompts_6_qwen_chat_nothink.json`
+  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.json`
+  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.log`
+  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_noprofile.json`
+  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_noprofile.log`
+- The run also fixed a profile-only instrumentation bug in
+  `vllm/v1/spec_decode/dflash.py`: the payload-stage log referenced stale
+  `payload_logits`; it now logs `logits.shape`. This does not change sampling.
+- Results:
+  - Profile run: mean acceptance length `7.3160`, no-bonus `6.3160`, draft
+    acceptance `0.3948`, total generation `57.91 tok/s`, per-request steady
+    mean `64.06 tok/s`.
+  - No-profile run: mean acceptance length `7.3602`, no-bonus `6.3602`, draft
+    acceptance `0.3975`. Per-request steady decode was `18.31`, `65.64`,
+    `90.61`, `87.45`, `50.03`, and `77.17 tok/s`; the first request was
+    contaminated by inference-time Triton JIT, so the warmed mean excluding the
+    first request is `74.18 tok/s`.
+  - The no-profile run logged first-request JIT for
+    `copy_and_expand_dflash_inputs_kernel`, `_topk_topp_kernel`,
+    `eagle_prepare_next_token_padded_kernel`, and `expand_kernel`. Treat the
+    all-request `45.09 tok/s` total generation number as cold/JIT-contaminated,
+    not steady serving speed.
+  - Last profile summary line:
+    `target_forward=40.540 ms`, `target_logits=2.848 ms`,
+    `target_rejection_sample=2.394 ms`, `state_update_wall_cpu=6.082 ms`,
+    `draft_wall_cpu=17.450 ms`. Therefore target verifier cost is about
+    `45.78 ms`, or `51.86 ms` including state update; approximate full
+    speculative iteration cost is `69.51 ms` including drafter/bookkeeping.
+- Interpretation:
+  - The HumanEval `budget=16` result (`AL 11.54`, `122.11 tok/s`) is a valid
+    community-calibration artifact but does not generalize to open-ended
+    repo-style coding prompts.
+  - Realistic code repair currently lands around `AL 7.3` and warmed
+    `~74 tok/s`; both acceptance and verifier cost still need work before
+    claiming recovered DDTree speed for normal coding workloads.
+
+## 2026-06-28 35B-AWQ TP2 serving-concurrency knee probe
+
+- Route: Qwen3.6-35B-A3B-AWQ, AWQ, TP2, V100 GPU2/3, no-MTP,
+  `FLASH_ATTN_V100`, custom all-reduce enabled, 256K model length.
+- Benchmark: `vllm bench serve`, random dataset, `input_len=1024`,
+  `output_len=128`, `temperature=0.0`, concurrency sweep `4..32`.
+- Extra acceleration flags tested on top of the clean TP2 route:
+  `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP=1` and
+  `VLLM_SM70_MOE_ADD_ALLREDUCE=1`.
+- Server had `--max-num-seqs 32`, `--max-num-batched-tokens 32768`, and
+  `--cudagraph-capture-sizes 1 2 4 8 16 24 32`.
+- Raw logs and summary were saved under
+  `bench_results/sm70_serving_concurrency_20260628/35b_awq_tp2_ab32/` and
+  `bench_results/sm70_serving_concurrency_20260628/README.md`.
+- Results:
+  - c4: output `223.56 tok/s`, mean TPOT `14.83 ms`, pure decode estimate
+    `269.7 tok/s`;
+  - c8: `335.79`, `18.33 ms`, `436.4`;
+  - c12: `384.11`, `22.87 ms`, `524.7`;
+  - c16: `475.15`, `23.86 ms`, `670.6`;
+  - c20: `509.01`, `27.40 ms`, `729.9`;
+  - c24: `564.56`, `28.13 ms`, `853.2`;
+  - c28: `567.33`, `33.25 ms`, `842.1`;
+  - c32: `638.93`, `32.96 ms`, `970.9`.
+- Decision: no stable aggregate decode throughput knee was reached through
+  concurrency 32. c28 showed a plateau and tail-latency spike, but c32 recovered
+  to the best aggregate throughput in the sweep. Treat this as a concurrency
+  knee probe, not the final 256K-capacity serving baseline, because graph32 and
+  `max_num_batched_tokens=32768` reduce KV headroom relative to the graph16
+  clean TP2 service.
+
+## 2026-06-29 35B/27B AWQ serving-concurrency knee follow-up
+
+- Common benchmark shape: `vllm bench serve`, random dataset,
+  `input_len=1024`, `output_len=128`, `temperature=0.0`, no MTP,
+  `FLASH_ATTN_V100`, custom all-reduce enabled, 256K model length.
+- Raw logs and full tables are in
+  `bench_results/sm70_serving_concurrency_20260628/README.md`.
+- 35B-AWQ TP4:
+  - graph64 service used `--max-num-seqs 64`,
+    `--max-num-batched-tokens 65536`, capture sizes through `64`.
+  - graph96 probe used `--max-num-seqs 96`,
+    `--max-num-batched-tokens 98304`, capture sizes through `96`.
+  - Pure decode estimate peaked at c64: output `1029.79 tok/s`, mean TPOT
+    `37.61 ms`, pure decode estimate `1701.7 tok/s`.
+  - c80/c96 had worse TPOT/tail latency (`54.27/57.40 ms`) and lower pure
+    decode estimate than c64, even though c96 end-to-end output throughput rose
+    to `1076.19 tok/s`; decode knee remains c64.
+- 27B-AWQ TP2:
+  - Capacity-preserving service used `--max-num-seqs 64`,
+    `--max-num-batched-tokens 16384`, capture sizes through `64`.
+  - End-to-end output throughput peaked at c8: `178.20 tok/s`.
+  - Pure decode estimate peaked at c20: mean TPOT `52.69 ms`, pure decode
+    estimate `379.6 tok/s`, then fell at c24 to `336.7 tok/s`.
+  - This TP2 route is constrained by the 256K-preserving 16K batch-token budget;
+    it is not a best-case 1K-input concurrency route.
+- 27B-AWQ TP4:
+  - graph96 service used `--max-num-seqs 96`,
+    `--max-num-batched-tokens 98304`, capture sizes through `96`; it passed KV
+    validation with about `2.41x` full 256K concurrency.
+  - End-to-end output throughput peaked at c12: `339.69 tok/s`.
+  - Pure decode estimate peaked at c28: mean TPOT `28.50 ms`, pure decode
+    estimate `982.5 tok/s`, then fell at c32/c40 (`721.2` and `665.1 tok/s`).
+
+## 2026-06-30 DDTree 27B-AWQ verifier control point
+
+- Superseding objective: reduce total target verifier plus accepted-state
+  update from `51.86 ms` to `<=40 ms`. The earlier narrower target of pushing
+  rank-local TurboMind AWQ uint4 GEMM from about `18.6 ms/rank` toward
+  `10 ms/rank` remains a useful subtarget, but it is no longer the only
+  accepted path to the required `~10-12 ms` reduction.
+- Last realistic-code profile line: `target_forward=40.540 ms`,
+  `target_logits=2.848 ms`, `target_rejection_sample=2.394 ms`,
+  `state_update_wall_cpu=6.082 ms`, and `draft_wall_cpu=17.450 ms`. Use
+  `45.78 ms` as target verifier subtotal and `51.86 ms` including state update.
+- Target-forward Nsight hierarchy shows actionable non-AWQ buckets as well:
+  DDTree paged attention about `4.65 ms/rank`, Torch native elementwise/scatter
+  about `3.9 ms/rank`, TP all-reduce imbalance `3.86 ms` on rank 0 versus
+  `1.90 ms` on rank 1, and GDN delta/gating about `3.30 ms/rank`.
+- Added `benchmarks/benchmark_sm70_awq_verifier_micro.py`. It loads real
+  Qwen3.6-27B-AWQ weights and times only `awq_gemm_sm70_out` after prepare and
+  warmup. The default weighted suite models one TP-rank verifier forward with
+  `m=17`: `63` MLP gate/up calls, `63` MLP down calls, `47` linear-attention
+  qkv calls, `47` linear-attention z calls, and `16` full-attention o-proj
+  calls.
+- Current evidence is under `bench_results/ddtree_awq_micro_20260630/`.
+  `preserve_m17.json` measured `34.04 ms` weighted AWQ GEMM time,
+  `nopreserve_m17.json` measured `25.03 ms`, and the current best recheck
+  `all_shapes_m17_dynamic_nopreserve_recheck.json` measured `24.80 ms`.
+  This microbench total overestimates the Nsight graph replay bucket, so use it
+  for per-shape ranking and candidate comparison rather than as an absolute
+  target-forward replacement.
+- Current best microbench breakdown:
+  - MLP gate/up `17x17408x5120`: `132.20 us`, weighted `8.33 ms`.
+  - MLP down `17x5120x17408`: `129.22 us`, weighted `8.14 ms`.
+  - linear-attention qkv `17x10240x5120`: `88.28 us`, weighted `4.15 ms`.
+  - linear-attention z `17x6144x5120`: `65.32 us`, weighted `3.07 ms`.
+  - full-attention o-proj `17x5120x6144`: `69.25 us`, weighted `1.11 ms`.
+- Nsight Compute gate/up attribution:
+  - Default non-mgroup route: `167.168 us`, `68` CTAs, waves/SM `0.47`,
+    `192` registers/thread, SM throughput `44.31%`, DRAM `25.10%`.
+  - Existing mgroup `c32x256`: `126.240 us`, `136` CTAs, waves/SM `0.94`,
+    `187` registers/thread allocated as `192`, shared memory `32.8 KiB`,
+    SM throughput `58.42%`, DRAM `33.27%`.
+  - Tested-and-reverted mgroup `c32x128`: `126.464 us`, same register cap and
+    utilization but shared memory drops to `16.4 KiB`. This proves shared
+    memory alone is not the remaining limiter; the hot route is
+    register/occupancy plus small-GEMM parallelism constrained, not pure DRAM
+    bandwidth.
+- Negative control results:
+  - Smaller CTA-M/N candidates did not beat the existing `32x256x32` mgroup
+    family. The best `16x256x32` gate/up candidate was about `166 us`, slower
+    than the current `~131 us`.
+  - A `24x256x32` verifier-focused CTA-M experiment and temporary `12B` helper
+    support were slower (`~183 us` gate/up for `24x256x32`) and were reverted.
+  - Temporary `TG_N=2` and `TG_N=8` registry variants did not improve the
+    dynamic gate/up result and were reverted.
+  - Ordinary AWQ Marlin is not a replacement for the verifier dense path on
+    V100. A direct comparison on 27B-like synthetic inputs was much slower:
+    about `284 us` for gate/up and `674 us` for down.
+  - A direct verifier launch/epilogue branch was slower:
+    `m17_direct_dense_verifier_probe.json` measured `40.09 ms` weighted and
+    regressed MLP down to `293.79 us`; it was reverted.
+  - Forcing `__launch_bounds__(..., 3)` was slower:
+    `gate_up_m17_mgroup_c32x128_launchbounds3.json` measured `187.48 us`;
+    it was reverted.
+  - A no-prefetch low-live-range mainloop probe was slower:
+    `gate_up_m17_mgroup_c32x128_noprefetch_probe.json` measured `189.07 us`;
+    it was reverted. The next low-register mainloop must preserve most of the
+    current prefetch/transform overlap.
+  - A dense-fp16-output epilogue diagnostic did not materially help:
+    `gate_up_m17_mgroup_denseout_probe.json` measured `140.65 us` for gate/up.
+    NCU report
+    `gate_up_m17_mgroup_denseout_gemm_full_sudo.ncu-rep` showed `124.99 us`,
+    `190` registers/thread, SM `59.12%`, and DRAM `33.91%`; the branch was
+    reverted because it did not lower the register/occupancy limiter.
+  - A two-slot K-buffer `lowreg2` mainloop was bitwise exact but slower:
+    `gate_up_m17_mgroup_lowreg2_200.json` measured `143.64 us` and NCU showed
+    registers/thread only dropped to `184`; it was reverted.
+  - Stream-store epilogues were also reverted. The mgroup variant had no stable
+    win, and the active best-family `fff c32x128` variant was bitwise exact but
+    slower (`183.10 us` versus same fast-selector default `166.46 us`).
+- Added a default-off exact candidate override in
+  `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu`:
+  `VLLM_SM70_AWQ_TP2_FAST_TARGETS`. Format:
+  `<desc>|<cta_m>x<cta_n>x<cta_k>:<splits>:<swizzle>:<require_mgroup>`, with
+  `;` between entries. It is a profiling/microbench tool, not an accepted
+  production default.
+- The shared operator maintenance document is now
+  `docs/design/sm70_nvfp4_turbomind_operator_optimization.md`. The file name is
+  historical; it tracks both the NVFP4 decode GEMM route and the AWQ DDTree
+  verifier GEMM route.
+- Decision: selector tuning and epilogue-only changes are exhausted. The next
+  accepted work should be chosen by total-path contribution toward
+  `51.86 ms -> <=40 ms`: first split `state_update_wall_cpu`, reduce graph
+  small-kernel/all-reduce/GDN overhead where possible, and keep AWQ mainloop
+  work focused on candidates with a credible microbench win such as
+  verifier-specific V-scale reuse or `CTA_K=64`.
+
+## 2026-06-30 Qwen3.5-27B-NVFP4 TP2 MTP health check
+
+- User request: test the current 27B-NVFP4 model with MTP on the TurboMind
+  NVFP4 path, without eager mode, using a long enough output cap so the model
+  can stop naturally if it emits EOS.
+- Model:
+  `/home/ymzx/.cache/huggingface/hub/models--apolo13x--Qwen3.5-27B-NVFP4/snapshots/f48cfc832696cccd195ac305ff7d2ffaeeab4d28`.
+- Run artifact:
+  `bench_results/mtp_27b_nvfp4_20260630/current_27b_nvfp4_mtp4_natural_o512.json`
+  and `.log`.
+- Command shape: TP2 on GPUs `2,3`, `quantization=compressed-tensors`,
+  `VLLM_SM70_NVFP4_TURBOMIND=1`,
+  `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`, `enforce_eager=False`,
+  `max_model_len=2048`, `max_num_batched_tokens=1024`,
+  `max_num_seqs=1`, greedy sampling, and
+  `speculative_config={"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":true}`.
+- Route evidence:
+  - Target model resolved to `Qwen3_5ForConditionalGeneration`.
+  - Draft model resolved to `Qwen3_5MTP`.
+  - Both ranks logged `Qwen3_5MultiTokenPredictor loaded 0 tensors into 33 params`.
+  - The runner shared target embedding and LM head with the draft model, but
+    the MTP body itself had no loaded checkpoint tensors.
+- Output result:
+  - Generated `512` output tokens and stopped by `finish_reason=length`, not
+    EOS (`contains_eos=False`).
+  - `generate_seconds=27.0357`, equivalent to about `52.8 ms/output token`
+    for this MTP run.
+  - The text was readable at the beginning but repeated earlier sections near
+    the cap, so this run is not evidence that MTP improves generation quality
+    or stopping behavior.
+- Speculative decoding metrics:
+  - `num_drafts=511`.
+  - `num_draft_tokens=2044`.
+  - `num_accepted_tokens=0`.
+  - `draft_acceptance_rate=0.0`.
+  - `accepted_tokens_per_pos=[0, 0, 0, 0]`.
+  - `mean_acceptance_length=1.0`, meaning every step fell back to target-only
+    acceptance of the normal next token.
+- Final steady profiler line at `calls=512`:
+  - `target_forward=22.584 ms`.
+  - `target_logits=2.040 ms`.
+  - `target_rejection_sample=0.085 ms`.
+  - `draft_total=17.420 ms`, `draft_wall_cpu=38.764 ms`.
+  - MTP proposer `total_gpu=16.905 ms`, `first_forward=4.449 ms`,
+    `loop0_forward=3.310 ms`, `loop1_forward=0.373 ms`,
+    `loop2_forward=0.372 ms`, and each sample stage about `2.0 ms`.
+- Interpretation:
+  - This MTP path is mechanically wired, graph-captured, and able to run, but
+    it is not a valid acceleration path for this checkpoint. The draft model is
+    effectively untrained or unloaded for the MTP body, and measured acceptance
+    is exactly zero.
+  - With zero accepted draft tokens, MTP only adds drafter/proposer overhead on
+    top of the target forward. It cannot improve TPOT until a real MTP
+    checkpoint or correct MTP tensor-loading/remapping path is available.
+  - Do not count this artifact as a positive MTP speed baseline. Treat it as a
+    failed health check for `Qwen3.5-27B-NVFP4` MTP4.
+- Matched no-MTP baseline attempts:
+  - `current_27b_nvfp4_baseline_natural_o512.log` failed during
+    `determine_available_memory()` after worker termination.
+  - `current_27b_nvfp4_baseline_textonly_natural_o512.log` failed during
+    graph capture / engine startup with `RuntimeError: cancelled`.
+  - `current_27b_nvfp4_baseline_textonly_gmem070_natural_o512.log` completed
+    graph capture with reduced `gpu_memory_utilization=0.70`, then failed in
+    `LLMEngine.__init__ -> reset_mm_cache()` after worker termination.
+  - These failures are no-MTP engine lifecycle issues and should be debugged
+    separately if an exact matched no-MTP baseline is needed. They do not
+    change the MTP conclusion because the MTP run itself directly reports zero
+    accepted draft tokens.
+- Next MTP work:
+  - First verify whether the target checkpoint contains any real MTP weights or
+    whether `qwen3_5_mtp.py::load_weights()` is dropping/remapping expected
+    names.
+  - Add a hard warning or guard for `method="mtp"` when the MTP body loads zero
+    tensors, unless a model explicitly declares that all required draft weights
+    are shared.
+  - Re-test only after the MTP body has nonzero loaded tensors, then require
+    acceptance-rate, output-quality, and matched no-MTP speed evidence before
+    optimizing MTP kernels.
+
+## 2026-06-30 MTP speed-test sampling rule
+
+- Formal MTP speed conclusions must use the checkpoint's official generation
+  sampling parameters, not greedy decoding. Greedy is allowed only as a
+  mechanical route-hit or diagnostic run.
+- For Qwen3.6 AWQ/FP8 checkpoints in this workstream, the official sampling
+  shape is `temperature=1.0`, `top_p=0.95`, `top_k=20`, `do_sample=True`, with
+  EOS token ids `[248046, 248044]`.
+- Accepted MTP comparisons must keep prompt family, output cap, TP size, GPU
+  set, quantization route, CUDA graph state, eager state, attention backend,
+  and profile logging state matched. Report both TPOT and speculative
+  acceptance metrics.
+
+## 2026-06-30 Qwen3.6-27B-FP8 TP2 MTP4 speed check
+
+- User request: use the FP8 27B checkpoint as the MTP path opener after the
+  current NVFP4 checkpoint proved to have no usable loaded MTP body weights.
+- Model:
+  `/home/ymzx/models/Qwen3.6-27B-FP8`.
+- Weight availability:
+  - `config.json` resolves to `Qwen3_5ForConditionalGeneration` with
+    `mtp_num_hidden_layers=1`.
+  - The checkpoint includes `mtp.safetensors` with real `mtp.*` keys.
+  - Debug MTP load run logged `Qwen3_5MultiTokenPredictor loaded 16 tensors
+    into 20 params` on both TP ranks, with the remaining missing params being
+    attention scale buffers:
+    `layers.0.self_attn.attn.{q,k,v,prob}_scale`.
+- Common command shape: TP2 on GPUs `2,3`, `quantization=fp8`,
+  `VLLM_SM70_QUANT_BACKEND=turbomind`, `VLLM_SM70_FP8_TURBOMIND=1`,
+  `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`, `enforce_eager=False`,
+  `max_model_len=2048`, `max_num_batched_tokens=1024`, `max_num_seqs=1`,
+  greedy sampling, output cap `512`.
+- Matched artifacts:
+  - no-MTP:
+    `bench_results/mtp_27b_fp8_20260630/qwen36_27b_fp8_nomtp_natural_o512.json`
+    and `.log`.
+  - MTP4 profiled with per-step MTP profile logging:
+    `bench_results/mtp_27b_fp8_20260630/qwen36_27b_fp8_mtp4_natural_o512.json`
+    and `.log`.
+  - MTP4 clean speed run, no MTP profile logging:
+    `bench_results/mtp_27b_fp8_20260630/qwen36_27b_fp8_mtp4_clean_natural_o512.json`
+    and `.log`.
+- Decode speed result for this prompt:
+  - no-MTP: `generate_seconds=11.9445`, `512` output tokens,
+    `23.329 ms/token`, `42.865 tok/s`.
+  - MTP4 profiled: `generate_seconds=8.7273`, `512` output tokens,
+    `17.046 ms/token`, `58.666 tok/s`. This run is useful for profile
+    breakdown but includes heavy `VLLM_SM70_MTP_PROFILE_INTERVAL=1` logging.
+  - MTP4 clean: `generate_seconds=7.7291`, `512` output tokens,
+    `15.096 ms/token`, `66.244 tok/s`.
+  - Clean MTP4 versus matched no-MTP: TPOT reduced by about `35.3%`
+    (`23.329 -> 15.096 ms/token`), throughput improved by about `54.5%`
+    (`42.865 -> 66.244 tok/s`).
+- Speculative decoding metrics for both MTP4 runs:
+  - `num_drafts=161`.
+  - `num_draft_tokens=644`.
+  - `num_accepted_tokens=353`.
+  - `draft_acceptance_rate=0.5481`.
+  - `accepted_tokens_per_pos=[124, 97, 75, 57]`.
+  - `per_position_acceptance_rate=[0.7702, 0.6025, 0.4658, 0.3540]`.
+  - `avg_accepted_tokens_no_bonus=2.1925`.
+  - `mean_acceptance_length=3.1925`.
+- Route evidence:
+  - Target dense route hit `SM70 FP8 TurboMind W8A16 dense path enabled`.
+  - Target fused gate-up route hit `SM70 FP8 dense gated-SiLU single-layout
+    path enabled`.
+  - Drafter used `AttentionBackendEnum.TRITON_ATTN`.
+  - Runner shared target embedding and LM head with the MTP draft model.
+  - Local argmax reduction was enabled for draft token generation.
+  - MTP clean run used graph capture sizes `[1, 2, 4, 5, 8, 9]`.
+- Caution:
+  - This FP8 entry used greedy sampling before the official-sampling rule above
+    was established. Keep it as positive route/load evidence and a diagnostic
+    speed reference; rerun with official sampling before using it as a formal
+    user-facing MTP speed conclusion.
+  - Both no-MTP and MTP4 runs stopped by `finish_reason=length`, not EOS; this
+    is a speed and route check, not a long-form quality acceptance gate.
+  - Do not compare these numbers directly to older synthetic input-length FP8
+    baselines unless the prompt/output length, sampling, MTP state, graph state,
+    and profile logging state all match.
+  - The next useful MTP step is not another "does it load" smoke. Start from
+    FP8 MTP4 clean as the positive baseline, then test MTP3/MTP2 or adaptive-K
+    against this same prompt family and record both TPOT and acceptance.
+
+## 2026-06-30 Qwen3.6-27B-AWQ TP2 MTP4 official-sampling speed check
+
+- User request: test the current 27B-AWQ checkpoint on the MTP path, using
+  official sampling parameters as the formal acceptance rule.
+- Model:
+  `/home/ymzx/models/Qwen3.6-27B-AWQ`.
+- Weight availability:
+  - `config.json` resolves to `Qwen3_5ForConditionalGeneration` with
+    `mtp_num_hidden_layers=1`.
+  - The checkpoint includes real `mtp.*` weights across the shard set:
+    `mtp.fc.weight`, MTP layernorms, MTP MLP projections, MTP attention
+    projections, `mtp.norm.weight`, `mtp.pre_fc_norm_embedding.weight`, and
+    `mtp.pre_fc_norm_hidden.weight`.
+  - `quantization_config.modules_to_not_convert` includes `mtp`, and runtime
+    logs show `Qwen3_5MTP: disabling quantization for MTP branch based on
+    config.quantization_config.modules_to_not_convert`.
+- Common command shape: TP2 on GPUs `0,1`, `quantization=awq`,
+  `VLLM_SM70_QUANT_BACKEND=turbomind`, `VLLM_SM70_AWQ_TURBOMIND=1`,
+  `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`, `enforce_eager=False`,
+  `max_model_len=2048`, `max_num_batched_tokens=1024`, `max_num_seqs=1`,
+  official sampling `temperature=1.0/top_p=0.95/top_k=20`, output cap `512`.
+- Matched formal artifacts:
+  - no-MTP:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_nomtp_official_o512.json`
+    and `.log`.
+  - MTP4 clean official-sampling speed run:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_o512.json`
+    and `.log`.
+- Decode speed result for this prompt:
+  - no-MTP: `generate_seconds=9.7550`, `512` output tokens,
+    `19.053 ms/token`, `52.486 tok/s`.
+  - MTP4 clean: `generate_seconds=8.4169`, `512` output tokens,
+    `16.439 ms/token`, `60.830 tok/s`.
+  - MTP4 versus matched no-MTP: TPOT reduced by about `13.7%`
+    (`19.053 -> 16.439 ms/token`), throughput improved by about `15.9%`
+    (`52.486 -> 60.830 tok/s`).
+- Speculative decoding metrics for the MTP4 run:
+  - `num_drafts=184`.
+  - `num_draft_tokens=736`.
+  - `num_accepted_tokens=329`.
+  - `draft_acceptance_rate=0.4470`.
+  - `accepted_tokens_per_pos=[132, 95, 57, 45]`.
+  - `per_position_acceptance_rate=[0.7174, 0.5163, 0.3098, 0.2446]`.
+  - `avg_accepted_tokens_no_bonus=1.7880`.
+  - `mean_acceptance_length=2.7880`.
+- Route evidence:
+  - Target route hit `SM70 AWQ TurboMind dense path enabled`.
+  - MTP draft route hit `SM70 MTP draft dense fp16 TurboMind fast path
+    requested`.
+  - Local argmax reduction was enabled.
+  - MTP run used graph capture sizes `[1, 2, 4, 5, 8, 9]`; no-MTP used
+    `[1, 2]`.
+- Caution:
+  - Both no-MTP and MTP4 runs stopped by `finish_reason=length`, not EOS; this
+    is a controlled speed comparison, not a natural-stop quality gate.
+  - A prior AWQ MTP4 greedy run exists at
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_clean_natural_o512.*`.
+    Treat it as diagnostic only. It reported higher acceptance
+    (`draft_acceptance_rate=0.5850`, `mean_acceptance_length=3.3399`) and
+    faster TPOT (`13.967 ms/token`), which is exactly why formal conclusions
+    must use official sampling.
+
+## 2026-07-01 Qwen3.6-27B-AWQ MTP4 verifier-cost candidate
+
+- Objective: first reduce the target verifier cost for Qwen3.6-27B-AWQ TP2
+  MTP4 under official sampling, before moving to acceptance-length work. The
+  long-term target remains `>=100 tok/s` decode with official
+  `temperature=1.0/top_p=0.95/top_k=20`.
+- Candidate tested:
+  - `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`;
+  - `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`;
+  - `VLLM_SM70_AWQ_WARMUP_MAX_M=17`;
+  - `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`;
+  - `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`.
+  This is an explicit diagnostic/optimization lane only. It changes AWQ dense
+  dispatch selection and does not preserve the default split policy.
+- Invalid or weak attempts:
+  - `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_o512.log` failed during
+    `determine_available_memory()` after a worker died. No json was produced;
+    do not treat it as speed data.
+  - `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_mm0_u072_gpu23_o512.log`
+    was accidentally run without `speculative_config`; it is not an MTP
+    result and must not be used.
+  - Unseeded official-sampling paired runs completed but produced different
+    acceptance lengths. They are useful startup evidence only, not a clean
+    verifier-cost comparison.
+- Matched official-sampling speed evidence with `--sampling-seed 0`,
+  GPUs `2,3`, `limit_mm_per_prompt={"image":0,"video":0}`,
+  `gpu_memory_utilization=0.72`, TP2, MTP4, CUDA graph, no eager:
+  - Default AWQ selector:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_baseline_mm0_u072_seed0_gpu23_o512.json`.
+    Result: `steady_decode_tps=65.9416`, `tpot=15.1649 ms/token`,
+    `num_drafts=184`, `num_accepted_tokens=329`,
+    `draft_acceptance_rate=0.4470`, `mean_acceptance_length=2.7880`.
+  - Dynamic/no-preserve selector:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_awqtune_nopreserve_mtp_mm0_u072_seed0_gpu23_o512.json`.
+    Result: `steady_decode_tps=69.6142`, `tpot=14.3649 ms/token`,
+    with the same `num_drafts=184`, `num_accepted_tokens=329`,
+    `draft_acceptance_rate=0.4470`, and
+    `mean_acceptance_length=2.7880`.
+  - The output token-id hash matched between the two seeded runs:
+    `62bc393d73d1b22bc2a5819f5d029b9e7079b9129fe0e6b0b6fe882bac9937ff`.
+  - Interpretation: with acceptance path and output held fixed, the candidate
+    improves TPOT by `0.800 ms/token` (`15.1649 -> 14.3649`) and throughput by
+    about `5.6%` (`65.94 -> 69.61 tok/s`). This is real progress, but it is
+    still far from the `100 tok/s` target.
+- Profile evidence:
+  - Baseline profile:
+    `qwen36_27b_awq_mtp4_official_profile_i20_mm0_u072_gpu23_o512.log`.
+    Last stable interval at `calls=180`: `target_forward=22.987 ms`,
+    `target_logits=2.039 ms`, `target_rejection_sample=1.354 ms`,
+    `state_update_wall_cpu=0.273 ms`, `bookkeeping=0.085 ms`,
+    `draft_total=11.176 ms`.
+  - Dynamic/no-preserve profile:
+    `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_profile_i20_mm0_u072_seed0_gpu23_o512.log`.
+    Last stable interval at `calls=180`: `target_forward=20.824 ms`,
+    `target_logits=2.037 ms`, `target_rejection_sample=1.364 ms`,
+    `state_update_wall_cpu=0.283 ms`, `bookkeeping=0.094 ms`,
+    `draft_total=11.186 ms`.
+  - The reduction is almost entirely target verifier forward:
+    `target_forward` drops by `2.163 ms/spec-step`. With the current
+    `mean_acceptance_length=2.788`, that is about `0.776 ms/token`, matching
+    the measured speed-run TPOT reduction.
+- AWQ verifier micro timing:
+  - Default:
+    `bench_results/mtp_27b_awq_20260630/awq_verifier_micro_m5_default_gpu2.json`,
+    `total_weighted_mean_ms=18.6364`.
+  - Dynamic/no-preserve:
+    `bench_results/mtp_27b_awq_20260630/awq_verifier_micro_m5_dynamic_nopreserve_gpu3.json`,
+    `total_weighted_mean_ms=15.7226`.
+  - The modeled AWQ verifier GEMM bucket improves by `2.914 ms` (`15.6%`).
+    Largest contributors: `mlp_gate_up` `6.861 -> 4.771 ms`,
+    `linear_attn_in_proj_z` `2.503 -> 2.170 ms`, and `mlp_down`
+    `5.563 -> 5.251 ms`.
+  - Dynamic selector trace
+    `awq_verifier_micro_m5_trace_dynamic_all.log` shows all five m=5
+    verifier descriptors selecting the same `8x256x64` kernel family, with
+    descriptor-specific splits/swizzles: gate/up `3/3`, down `7/1`,
+    linear-qkv `5/2`, linear-z `6/1`, and attention-o `7/2`.
+    Do not repeat blind CTA/epilogue sweeps without a new kernel idea.
+- Numeric and quality status:
+  - Real-layer m=5 AWQ checks were run for representative verifier shapes:
+    `mlp_gate`, `mlp_down`, `linear_qkv`, `linear_z`, and `attn_o`, both on
+    default and dynamic/no-preserve. Artifacts are
+    `awq_m5_exact_default_*_gpu2.json` and
+    `awq_m5_exact_dynamic_nopreserve_*_gpu3.json`.
+  - These checks are not strict-equal against the Torch AWQ reference on either
+    selector, consistent with earlier TurboMind AWQ notes. The candidate did
+    not materially enlarge `max_diff`: e.g. `attn_o` stayed at `0.01953125`,
+    `linear_qkv` stayed at `0.00390625`, `mlp_down` stayed at `0.0078125`,
+    and `mlp_gate` stayed at `0.0023193359375`.
+  - One seeded official-sampling full-model output hash matched, so this is a
+    viable optimization candidate, but not a default-enable route. It still
+    needs a broader model-quality gate before being accepted as production.
+- Next decision:
+  - Keep this lane as an explicit verifier-cost candidate. Do not repeat the
+    failed startup or unseeded comparison paths.
+  - To continue toward `100 tok/s`, this `~5.6%` gain is insufficient by
+    itself. Remaining work must combine more verifier reduction with either
+    lower drafter/proposer overhead or higher acceptance length. At the current
+    `mean_acceptance_length=2.788`, even a `~24.6 ms/spec-step` target-side
+    validator leaves too little budget for the `100 tok/s` goal.
+
+### 2026-07-01 m=5 AWQ verifier selector follow-up
+
+- Goal: see whether the dynamic/no-preserve m=5 AWQ verifier win can be turned
+  into a fixed, reproducible selector without relying on runtime measurement.
+- Fixed fast-target experiment:
+  - Injected these exact `VLLM_SM70_AWQ_TP2_FAST_TARGETS` entries:
+    `5x17408x5120 -> 8x256x64:3:3:0`,
+    `5x5120x17408 -> 8x256x64:7:1:0`,
+    `5x10240x5120 -> 8x256x64:5:2:0`,
+    `5x6144x5120 -> 8x256x64:6:1:0`,
+    `5x5120x6144 -> 8x256x64:7:2:0`.
+  - Trace artifact:
+    `bench_results/mtp_27b_awq_20260630/awq_verifier_micro_m5_fixed_fasttargets_trace_gpu2.log`.
+    It confirms the fixed selector chooses the same `8x256x64` kernel family
+    and the requested split/swizzle values.
+  - Micro artifacts:
+    `awq_verifier_micro_m5_fixed_fasttargets_gpu2.json` and
+    `awq_verifier_micro_m5_fixed_fasttargets_rerun2_gpu2.json`.
+    The modeled verifier AWQ bucket measured `16.96 ms` then `16.67 ms`,
+    versus same-GPU default rerun `19.07 ms` and same-GPU
+    dynamic/no-preserve rerun `15.73 ms`.
+  - Full official-sampling MTP4 speed artifacts:
+    `qwen36_27b_awq_mtp4_official_fixed_fasttargets_mm0_u072_seed0_gpu23_o512.txt`
+    and
+    `qwen36_27b_awq_mtp4_official_fixed_fasttargets_unset_tune_mm0_u072_seed0_gpu23_o512.json`.
+    The second run kept `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` unset so generic F16
+    dynamic tuning stayed aligned with the baseline. It measured
+    `steady_decode_tps=73.9961`, `tpot=13.5142 ms/token`, and
+    `mean_acceptance_length=3.0476`.
+  - Quality gate result: fixed fast-target output token hash was
+    `32d9c0c4284219a1df0f81b4f98a8847906e31bb67551740784f4b702b22d693`,
+    while the matched seeded baseline and dynamic/no-preserve runs both had
+    `62bc393d73d1b22bc2a5819f5d029b9e7079b9129fe0e6b0b6fe882bac9937ff`.
+    Therefore the `~74 tok/s` result is not accepted as a quality-equivalent
+    speed win. Do not hard-code these fixed fast targets until the hash drift is
+    explained or a broader quality gate accepts the numerical change.
+  - Follow-up op-level numeric artifacts:
+    `awq_m5_exact_fixed_fasttargets_*_gpu2.json`. On the five representative
+    real layers, fixed fast-target did not increase the recorded `max_diff`
+    relative to default/dynamic-no-preserve: `attn_o=0.01953125`,
+    `linear_qkv=0.00390625`, `linear_z=0.0040283203125`,
+    `mlp_down=0.0078125`, and `mlp_gate=0.0023193359375`. This narrows the
+    drift investigation, but it does not clear the full-model quality gate; the
+    observed official-sampling hash mismatch still wins over op-level similarity.
+- Conservative preserve-default split experiment:
+  - Artifact:
+    `awq_verifier_micro_m5_dynamic_preserve_rerun_gpu2.json`.
+  - Result: `total_weighted_mean_ms=21.20`, worse than default. Trace
+    `awq_verifier_micro_m5_dynamic_preserve_trace_gpu2.log` shows gate/up was
+    constrained to `splits=1`, losing the main verifier-forward benefit.
+  - Do not continue the `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=1` verifier
+    lane for this shape unless there is a new kernel idea.
+- Current decision:
+  - The only currently quality-equivalent verifier-cost speed evidence remains
+    the dynamic/no-preserve seeded run: `69.614 tok/s`,
+    `14.365 ms/token`, with hash matching the baseline on this prompt.
+  - Fixed m=5 selector is useful diagnostic evidence that split/swizzle choices
+    can cut verifier forward cost, but it is not safe to land as a default.
+  - Next verifier work should either explain the fixed-selector hash drift with
+    per-layer numeric comparisons or move below the selector level to a kernel
+    change that preserves the accepted full-model output gate.
+
+### 2026-07-01 target rejection-sampling path audit
+
+- Current MTP4 route uses `vllm/v1/sample/rejection_sampler.py`, not the newer
+  `vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py` path.
+- Under official sampling, `target_rejection_sample` is about
+  `1.36 ms/spec-step`. The path already sends large fp32 CUDA logits through
+  Triton top-k/top-p filtering; the remaining cost is mainly full-vocab softmax
+  and recovered-token sampling.
+- Existing `VLLM_MTP_STOCHASTIC_TOKEN_MATCHING=1` is a 0.0.3-style fast path,
+  but it changes stochastic speculative sampling semantics from exact rejection
+  sampling to token matching. Do not use it as an official-sampling-equivalent
+  speed result unless a separate quality gate explicitly accepts the semantic
+  change.
+- Reusing the newer Triton rejection sampler is not a drop-in change: it expects
+  input-batch position/seed metadata that the current `SpecDecodeMetadata` path
+  does not pass through this sampler. Treat that as a larger implementation
+  project, not a quick verifier-cost knob.
+- Decision for this round: no accepted low-risk change in the
+  `target_rejection_sample` bucket. The next practical speed target is the
+  drafter/proposer top1 LM-head cost, which is about `8 ms/spec-step` in the
+  current profile and can complement verifier-forward work without changing
+  target sampling semantics if argmax is preserved.
+
+### 2026-07-01 MTP drafter LM-head top1 TC candidate
+
+- Motivation: after the verifier-forward dynamic/no-preserve win, proposer
+  profile still spends about `8 ms/spec-step` across four draft sample/top1
+  calls. The existing SM70 Tensor Core LM-head top1 op is disabled by default
+  on the compile-graph lane but supports small `M<=17`.
+- Benchmark support:
+  - `benchmarks/benchmark_sm70_lm_head_top1.py` was extended so `m>1` can test
+    the Tensor Core top1 path against `torch.mm(...).max(...)`; the scalar
+    top1 check remains `m=1` only.
+  - Synthetic local LM-head shape for Qwen3.6-27B TP2:
+    `N=124160`, `K=5120`.
+  - Artifacts:
+    `bench_results/mtp_27b_awq_20260630/lm_head_top1_m1_n124160_gpu2.json`
+    and `lm_head_top1_m5_n124160_gpu3.json`.
+  - Result: TC top1 matched the reference argmax/value on the synthetic test.
+    For `m=5`, `tensor_core=1.327 ms`, `torch_mm_max=2.031 ms`,
+    and `sm70_gemm_then_max=1.268 ms`.
+- Full official-sampling MTP4 candidate:
+  - Artifact:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_dynamic_nopreserve_top1tc_mm0_u072_seed0_gpu23_o512.json`.
+  - Env combined dynamic/no-preserve verifier selector with
+    `VLLM_SM70_LM_HEAD_TOP1_TC=1`.
+  - Result: `steady_decode_tps=81.7641`, `tpot=12.2303 ms/token`,
+    `mean_acceptance_length=3.0476`, `draft_acceptance_rate=0.5119`.
+    Runtime log shows `SM70 Tensor Core LM head top1 epilogue path enabled`.
+  - Quality gate status: output token hash was
+    `32d9c0c4284219a1df0f81b4f98a8847906e31bb67551740784f4b702b22d693`,
+    not the baseline/dynamic-no-preserve hash
+    `62bc393d73d1b22bc2a5819f5d029b9e7079b9129fe0e6b0b6fe882bac9937ff`.
+    Therefore the `81.8 tok/s` result is a promising candidate, not an accepted
+    quality-equivalent speed result.
+- Reproducibility follow-up:
+  - A short O64 margin audit with TOP1_TC
+    `qwen36_27b_awq_mtp4_top1tc_margin_o64.*` recorded 48 real drafter
+    `get_top_tokens()` rows across TP ranks. All selected tokens were true
+    full-logits rank0 (`selected_top_ranks` histogram `{0: 48}`), with minimum
+    top1/top2 margin `0.421875`. The O64 no-TC control
+    `qwen36_27b_awq_mtp4_dynamic_nopreserve_notc_o64_seed0_gpu23.json`
+    produced the same O64 token hash and acceptance metrics, so early TOP1_TC
+    drift was not observed.
+  - A current O512 rerun of dynamic/no-preserve without TOP1_TC,
+    `qwen36_27b_awq_mtp4_official_dynamic_nopreserve_notc_rerun_mm0_u072_seed0_gpu23_o512.json`,
+    did not reproduce the earlier dynamic/no-preserve seeded hash. It measured
+    `steady_decode_tps=76.5702`, `tpot=13.0599 ms/token`,
+    `mean_acceptance_length=3.0964`, and output hash
+    `32d9e992adf47a97026cddb81f5d0a9b665b3ebfd97497a693056b83ac2f3bb4`.
+    This means the dynamic/no-preserve lane has runtime-measure or sampling
+    nondeterminism under the current benchmark conditions. Do not claim a
+    production-safe selector from a single seeded hash match.
+  - Compared with that current no-TC rerun, TOP1_TC still improves throughput
+    (`76.57 -> 81.76 tok/s`) and TPOT (`13.06 -> 12.23 ms/token`), but their
+    token streams first differ at output index `115`. Treat TOP1_TC as a
+    speed/acceptance candidate that requires quality-matrix validation, not as
+    an equivalence-preserving micro-optimization.
+  - TOP1_TC profile artifact:
+    `qwen36_27b_awq_mtp4_official_dynamic_nopreserve_top1tc_profile_i20_mm0_u072_seed0_gpu23_o512.log`.
+    The proposer profile at `calls=160` reported `total_gpu=8.544 ms`,
+    `first_sample=1.300 ms`, `loop0_sample=1.286 ms`,
+    `loop1_sample=1.284 ms`, and `loop2_sample=1.287 ms`. The earlier
+    dynamic/no-preserve no-TC profile at `calls=180` was
+    `total_gpu=11.134 ms`, `first_sample=2.063 ms`,
+    `loop0_sample=2.002 ms`, `loop1_sample=2.004 ms`,
+    `loop2_sample=2.004 ms`. This confirms TOP1_TC removes about
+    `2.85 ms/spec-step` from drafter sampling/top1 work.
+- Decision:
+  - Do not default-enable `VLLM_SM70_LM_HEAD_TOP1_TC` for official MTP4 yet.
+  - The initial O64 real-hidden-state margin audit did not show TC argmax drift.
+    The remaining gate is longer-step replay plus a broader output-quality
+    matrix. Until that passes, treat TOP1_TC as a speed/acceptance candidate
+    rather than a hash-equivalent micro-optimization.
+
+### 2026-07-01 MTP spec-token-count acceptance sweep
+
+- Goal: after TOP1_TC reduced drafter top1 cost, test whether increasing
+  `num_speculative_tokens` raises mean acceptance enough to approach
+  `100 tok/s`.
+- Common setup: Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, official sampling
+  `temperature=1.0/top_p=0.95/top_k=20/seed=0`, CUDA graph, TurboMind AWQ,
+  dynamic/no-preserve AWQ selector, `VLLM_SM70_LM_HEAD_TOP1_TC=1`,
+  `limit_mm_per_prompt={"image":0,"video":0}`.
+- O256 sweep:
+  - MTP4:
+    `qwen36_27b_awq_mtp4_top1tc_dynamic_nopreserve_o256_seed0_gpu23.json`.
+    `steady_decode_tps=80.5773`, `tpot=12.4104 ms/token`,
+    `mean_acceptance_length=3.0595`, per-position acceptance
+    `[0.8214, 0.5357, 0.3929, 0.3095]`.
+  - MTP5:
+    `qwen36_27b_awq_mtp5_top1tc_dynamic_nopreserve_o256_seed0_gpu23.json`.
+    `steady_decode_tps=95.8381`, `tpot=10.4343 ms/token`,
+    `mean_acceptance_length=3.9231`, per-position acceptance
+    `[0.8000, 0.6769, 0.5692, 0.4769, 0.4000]`.
+    This is the first short-output run close to the `100 tok/s` target.
+  - MTP6:
+    `qwen36_27b_awq_mtp6_top1tc_dynamic_nopreserve_o256_seed0_gpu23.json`.
+    `steady_decode_tps=87.1022`, `tpot=11.4808 ms/token`,
+    `mean_acceptance_length=3.7647`, per-position acceptance
+    `[0.8382, 0.6618, 0.4853, 0.3382, 0.2353, 0.2059]`.
+    The sixth draft position is too weak to offset the extra cost.
+- O512 confirmation for the best short-output candidate:
+  - MTP5:
+    `qwen36_27b_awq_mtp5_top1tc_dynamic_nopreserve_o512_seed0_gpu23.json`.
+    `steady_decode_tps=83.2694`, `tpot=12.0092 ms/token`,
+    `mean_acceptance_length=3.3377`, per-position acceptance
+    `[0.7468, 0.5519, 0.4416, 0.3442, 0.2532]`.
+  - Interpretation: MTP5 is better than MTP4 on O512, but the O256 acceptance
+    spike does not generalize. Do not use O256 alone as the target-speed
+    acceptance evidence.
+- Decision:
+  - MTP5+TOP1_TC is the best current acceptance/cost candidate, but it is still
+    only `83.3 tok/s` on O512 and remains quality-gated.
+  - MTP6 should not be pursued further unchanged.
+  - Next acceptance work should target draft quality or sampling policy, not
+    simply increasing the number of repeated MTP steps.
+
+### 2026-07-01 MTP validation-cost gate
+
+- Added a read-only fast gate:
+  `benchmarks/analyze_sm70_mtp_gate.py`.
+  It consumes `benchmark_sm70_model_tokens.py` artifacts and emits JSON/Markdown
+  summaries with official-sampling status, TP, output length, steady decode TPS,
+  TPOT, speedup vs no-MTP, MTP token count, acceptance length, draft acceptance,
+  output token hash, and cheap exact/prefix/drift comparison against a control
+  artifact.
+- Purpose: reduce validation cost before expensive quality matrix or Nsight
+  runs. New MTP/AWQ candidates should first run the light O256/O512 gate with
+  official sampling. Do not promote an O256-only win to a target-speed claim;
+  O512 is the minimum speed screen for this 100 tok/s objective.
+- O512 core gate command:
+  `python benchmarks/analyze_sm70_mtp_gate.py --require-official-sampling
+  --target-tps 100 --min-output-tokens 512 --speed-baseline
+  bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_nomtp_official_o512.json
+  --control
+  bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_dynamic_nopreserve_notc_rerun_mm0_u072_seed0_gpu23_o512.json
+  --json-out bench_results/mtp_27b_awq_20260630/mtp_fast_gate_o512_core.json
+  --md-out bench_results/mtp_27b_awq_20260630/mtp_fast_gate_o512_core.md
+  ...artifacts...`.
+- Generated gate artifacts:
+  - `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_o512_core.{json,md}`.
+  - `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_top1tc_sweep.{json,md}`.
+- O512 core gate result:
+  - Current MTP4 dynamic/no-TC control:
+    `76.570 tok/s`, `13.060 ms/token`, `mean_acceptance_length=3.096`,
+    exact token match to itself.
+  - MTP4 TOP1_TC:
+    `81.764 tok/s`, `12.230 ms/token`, `mean_acceptance_length=3.048`,
+    first token mismatch vs no-TC control at output index `115`.
+  - MTP5 TOP1_TC:
+    `83.269 tok/s`, `12.009 ms/token`, `mean_acceptance_length=3.338`,
+    first token mismatch vs no-TC control at output index `23`.
+- O256/O512 sweep gate result:
+  - MTP4 TOP1_TC O256 is prefix-equal to the no-TC O512 control for the first
+    `256` tokens, but only reaches `80.577 tok/s`.
+  - MTP5 TOP1_TC O256 reaches `95.838 tok/s`, but drifts at output index `23`
+    and its O512 confirmation is only `83.269 tok/s`.
+  - MTP6 TOP1_TC O256 reaches `87.102 tok/s` and drifts at output index `26`.
+- Promotion rule from this gate:
+  - `target-speed-candidate` requires official sampling, TP2, non-eager graph
+    path, at least O512 output, and `steady_decode_tps >= 100`.
+  - `exact` or `prefix` only proves a cheap deterministic screen; it is not a
+    full model-quality gate. Any `drift` result must pass a broader quality
+    matrix before default enablement.
+  - Current TOP1_TC/MTP5 results remain speed candidates, not accepted quality
+    or target-speed results.
+
+### 2026-07-01 MTP verifier-cost staged-verification check
+
+- Motivation: MTP4 currently verifies `4` draft positions plus one bonus row in
+  one target pass. A tempting idea is staged verification: verify the first few
+  draft positions, run rejection, and only verify later positions/bonus if the
+  early positions are accepted. This would reduce mathematical target rows when
+  early rejection is common.
+- Microbench setup: Qwen3.6-27B-AWQ, single V100, TurboMind AWQ,
+  dynamic/no-preserve selector
+  (`VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`,
+  `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`,
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`), real AWQ weights through
+  `benchmarks/benchmark_sm70_awq_verifier_micro.py`, `warmup=30`, `iters=200`.
+- Artifacts:
+  - `awq_verifier_micro_m1_dynamic_nopreserve_gpu2.json`
+  - `awq_verifier_micro_m2_dynamic_nopreserve_gpu2.json`
+  - `awq_verifier_micro_m3_dynamic_nopreserve_gpu2.json`
+  - `awq_verifier_micro_m4_dynamic_nopreserve_gpu2.json`
+  - `awq_verifier_micro_m5_dynamic_nopreserve_rerun3_gpu2.json`
+  - `awq_verifier_micro_m6_dynamic_nopreserve_gpu2.json`
+- Weighted AWQ GEMM curve:
+
+  | verifier rows M | weighted mean |
+  | ---: | ---: |
+  | 1 | `15.318 ms` |
+  | 2 | `15.031 ms` |
+  | 3 | `15.151 ms` |
+  | 4 | `15.537 ms` |
+  | 5 | `15.762 ms` |
+  | 6 | `15.623 ms` |
+
+- Interpretation: for this AWQ verifier bucket, small-M GEMM cost is nearly
+  flat from `M=1` to `M=6`. It is dominated by fixed kernel/tile cost rather
+  than row count. Therefore splitting one `M=5` verifier pass into two smaller
+  verifier passes does not reduce AWQ cost.
+- Staged two-pass model using current O512 per-position acceptance:
+  - MTP4 no-TC control has `P(first two drafts accepted)=0.5663`.
+    Cost model `M2 + P2*M3 = 23.610 ms`, versus one-pass `M5=15.762 ms`;
+    this is `+49.8%` worse.
+  - MTP4 TOP1_TC has `P2=0.5417`.
+    `M2 + P2*M3 = 23.237 ms`, `+47.4%` worse than one-pass `M5`.
+  - MTP5 TOP1_TC O512 has `P2=0.5519`.
+    `M2 + P2*M3 = 23.393 ms`, `+48.4%` worse than one-pass `M5`.
+- Decision: do not implement staged target verification for the current AWQ
+  MTP4 path. It adds graph/rejection complexity and is already negative before
+  counting the extra target-forward launch, sampler, CUDA graph, and state
+  update overhead. Verifier-cost work should focus on reducing the fixed
+  per-layer/per-kernel cost, improving fused verifier kernels, or raising
+  acceptance enough to amortize the flat verifier cost.
+
+### 2026-07-01 MTP probabilistic-draft acceptance sweep
+
+- Motivation: the MTP default in `arg_utils.py` is greedy draft sampling.
+  Under official non-greedy sampling (`temperature=1.0/top_p=0.95/top_k=20`),
+  greedy one-hot proposals limit acceptance. Standard rejection sampling can
+  preserve target sampling semantics when the draft proposal provides matching
+  `draft_probs`, so `draft_sample_method="probabilistic"` is the lowest-risk
+  acceptance-length lever.
+- Code changes:
+  - `compute_probs_and_sample_next_token()` now has a default-off SM70
+    experiment switch
+    `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1`, which applies draft top-p even
+    when top-k is configured.
+  - It also accepts
+    `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE=<float in (0,1]>` for proposal
+    sweeps such as `0.98`.
+  - The probabilistic draft sampler now uses `sampling_metadata.generators`
+    for seeded Gumbel/exponential sampling when available, matching the target
+    sampler/recovered-token sampler pattern. This only affects the
+    probabilistic draft path; the default greedy MTP path is unchanged.
+- Strong positive single-seed result:
+  - Artifact:
+    `qwen36_27b_awq_mtp5_prob_draft_dynamic_nopreserve_o512_seed0_gpu23.json`.
+  - Setup: Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, official sampling seed `0`,
+    `num_speculative_tokens=5`, `draft_sample_method="probabilistic"`,
+    TurboMind AWQ dynamic/no-preserve selector, CUDA graph, `limit_mm=0`.
+  - Result: `steady_decode_tps=121.170`, `tpot=8.253 ms/token`,
+    `mean_acceptance_length=5.495`, `draft_acceptance_rate=0.899`.
+  - This is the first O512 target-speed artifact above `100 tok/s`.
+- Multi-seed stability check:
+  - Same config with seed `1`:
+    `qwen36_27b_awq_mtp5_prob_draft_dynamic_nopreserve_o512_seed1_gpu23.json`
+    fell to `78.405 tok/s`, `mean_acceptance_length=3.556`.
+  - With the generator-aware draft sampling change:
+    `qwen36_27b_awq_mtp5_prob_draft_genfix_dynamic_nopreserve_o512_seed0_gpu23.json`
+    measured `75.774 tok/s`, `AL=3.436`, while
+    `qwen36_27b_awq_mtp5_prob_draft_genfix_dynamic_nopreserve_o512_seed1_gpu23.json`
+    measured `127.465 tok/s`, `AL=5.864`.
+  - Interpretation: probabilistic MTP5 can exceed the speed target, but the
+    sampled sequence/proposal path is still highly variable. Seeded generator
+    use is a correctness improvement for reproducibility, not by itself a
+    robust speed fix.
+- Static draft top-p proposal sweep:
+  - `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1` with seed `1` improved
+    `78.405 -> 106.692 tok/s` and `AL 3.556 -> 4.933`, but with seed `0`
+    measured only `80.056 tok/s`, `AL=3.664`.
+  - `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE=0.98` with seed `1` measured
+    `103.359 tok/s`, `AL=4.794`, but seed `0` measured only `80.435 tok/s`,
+    `AL=3.703`.
+  - `genfix + top_p=0.95` with seed `0` measured `74.194 tok/s`, `AL=3.497`.
+  - Decision: do not default-enable static draft top-p truncation. It can
+    rescue one sampled sequence while hurting another.
+- Gate artifacts:
+  - `mtp_fast_gate_prob_draft.json`
+  - `mtp_fast_gate_prob_draft_o512.json`
+  - `mtp_fast_gate_prob_draft_topp_o512_final.json`
+  - `mtp_fast_gate_prob_draft_proposal_sweep_o512.json`
+  - `mtp_fast_gate_prob_draft_genfix_o512.json`
+  - `mtp_fast_gate_prob_draft_all_o512.{json,md}`
+- Current status:
+  - Speed target is now reachable on a real O512 artifact, but not yet robust
+    enough to declare the goal complete.
+  - Quality is not yet accepted: all probabilistic runs are token-stream drift
+    relative to the greedy control, which is expected for non-greedy proposal
+    sampling but still requires a broader quality matrix.
+  - Next work should either build an adaptive proposal policy that avoids
+    seed-sensitive static top-p tradeoffs, or run a small quality/speed matrix
+    on the best probabilistic MTP5 candidate to decide whether distributional
+    output quality is acceptable before deeper optimization.
+
+### 2026-07-01 Strict MTP4 probabilistic verifier-cost and validation cost
+
+- Runtime verifier-cost result:
+  - Current MTP4 verifies `4` draft positions plus the bonus row in one target
+    pass (`M=5`). On the real AWQ verifier microbench, the dynamic/no-preserve
+    TurboMind AWQ bucket is nearly flat from `M=1` to `M=6`:
+    `15.318`, `15.031`, `15.151`, `15.537`, `15.762`, and `15.623 ms`.
+  - Therefore verifier cost is mostly fixed per target pass, not proportional
+    to the number of verified rows in this small-M range. The practical speed
+    lever is amortization: raise accepted tokens per verifier pass, or reduce
+    the fixed verifier kernel cost.
+  - Staged/two-pass verification is negative for this path. Using the current
+    O512 acceptance probabilities, `M2 + P(first2 accepted)*M3` is about
+    `23.2-23.6 ms` of AWQ verifier work versus one-pass `M5=15.762 ms`,
+    before counting the extra CUDA graph replay, rejection sampler, and state
+    update overhead. Do not implement staged verifier unless a future fused
+    verifier changes this flat-M cost curve.
+- Strict MTP4 probabilistic O512 speed gate:
+  - `qwen36_27b_awq_mtp4_prob_draft_dynamic_nopreserve_o512_seed0_gpu23.json`:
+    `steady_decode_tps=106.740`, `tpot=9.369 ms/token`,
+    `mean_acceptance_length=4.580`, `draft_acceptance_rate=89.5%`.
+  - `qwen36_27b_awq_mtp4_prob_draft_dynamic_nopreserve_o512_seed1_gpu23.json`:
+    `steady_decode_tps=115.763`, `tpot=8.638 ms/token`,
+    `mean_acceptance_length=4.913`, `draft_acceptance_rate=97.8%`.
+  - Gate summary:
+    `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_mtp4_prob_o512_2seed.{json,md}`.
+  - Interpretation: this is the first strict MTP4, official-sampling, O512,
+    non-eager CUDA-graph evidence above `100 tok/s` on two seeds. The gain
+    comes from amortizing the fixed verifier pass with high acceptance, not from
+    making the verifier itself cheaper.
+- Validation-cost gate result:
+  - Minimal two-prompt quality smokes passed for both seeds:
+    `qwen36_27b_awq_mtp4_prob_quality2_seed0_gpu23.json` and
+    `qwen36_27b_awq_mtp4_prob_quality2_seed1_gpu23.json`.
+    Each used official sampling, natural EOS behavior (`ignore_eos=false`),
+    `max_tokens=512`, and checked `code_snake` plus `structured_design`.
+  - The embedded short speed probes in those quality runs stayed above target:
+    `101.076 tok/s` for seed `0` and `101.235 tok/s` for seed `1` at O128.
+  - This clears only the fast validation gate. It is not a production/default
+    gate because probabilistic MTP intentionally drifts from the greedy control
+    token stream, and the current smoke covers only two prompts.
+- Promotion rule:
+  - Cheap candidate screen: O512 official-sampling speed gate on at least two
+    seeds plus the two-prompt quality smoke. The strict MTP4 probabilistic
+    route now passes this screen.
+  - Before default enablement: run the broader quality matrix with more prompt
+    families and longer natural-stop outputs, then repeat one O512 speed check.
+    Do not spend Nsight/NCU time on this route until that broader quality gate
+    passes, because the current bottleneck decision is semantic acceptance
+    quality, not unknown kernel composition.
+
+### 2026-07-01 Strict MTP4 probabilistic broader quality gate
+
+- Goal: upgrade the strict MTP4 probabilistic route from the two-prompt smoke to
+  a broader quality screen before spending more profiling or default-enablement
+  effort.
+- Common setup: Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, official sampling from
+  `generation_config.json` (`temperature=1.0`, `top_p=0.95`, `top_k=20`),
+  `ignore_eos=false`, `quality_max_tokens=1024`, CUDA graph, TurboMind AWQ,
+  dynamic/no-preserve AWQ selector, `VLLM_SM70_LM_HEAD_TOP1_TC=0`,
+  `draft_sample_method="probabilistic"`, and MTP4.
+- Artifacts:
+  - Seed `0`:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_prob_quality4_o1024_seed0_gpu23.json`.
+  - Seed `1`:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_prob_quality4_o1024_seed1_gpu23.json`.
+- Result:
+  - Both seeds passed all four prompt families: `code_macos`, `code_snake`,
+    `long_story_review`, and `structured_design`.
+  - Every quality prompt produced `1024` tokens and finished by length, with no
+    quality failures. Worst observed metrics stayed low: max same-token run
+    `3`, max digit run `6`, `repeat20<=5`, `repeat50<=2`, `repeat100=1`, and
+    max same-line run `1`.
+  - Greedy determinism checks were exact on both seeds.
+  - The embedded O128 speed probes reported `100.154 tok/s` for seed `0` and
+    `99.588 tok/s` for seed `1`. Treat these as quality-run diagnostics only;
+    the accepted speed evidence for this route remains the O512 gate above
+    (`106.740` and `115.763 tok/s`).
+- Fresh O512 speed rerun after the broader quality gate:
+  - Artifact:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_prob_fresh_o512_seed0_gpu23.txt`.
+  - Result: `steady_decode_tps=108.703`, `tpot=9.199 ms/token`,
+    `mean_acceptance_length=4.580`, `draft_acceptance_rate=89.5%`,
+    `total_output_tokens=512`.
+  - This confirms the current worktree still clears the `100 tok/s` target
+    after the broader quality gate. The run used official sampling, no
+    `ignore_eos`, TP2, CUDA graph, TurboMind AWQ, and MTP4 probabilistic draft
+    sampling.
+- Decision:
+  - The strict MTP4 probabilistic route now clears the current local quality
+    gate and the O512 speed target on two seeds.
+  - Remaining risk before default enablement is distributional quality outside
+    these four prompts, not obvious repetition/corruption. If this route is to
+    become the recommended 27B-AWQ MTP4 path, the next verification step should
+    be a small external/task-quality eval or wider prompt suite. No kernel
+    numeric gate is required for this change, because the accepted speed route
+    uses sampling/proposal policy changes, not a new kernel.
+
+### 2026-07-01 SM70 MTP default-probabilistic promotion check
+
+- Code change:
+  - SM70 MTP default filling in `vllm/engine/arg_utils.py` now sets
+    `speculative_config.draft_sample_method="probabilistic"` when the user did
+    not explicitly set a draft sample method.
+  - Explicit user configuration still wins. Greedy requests still use the
+    proposer's argmax fast path when `sampling_metadata.all_greedy` is true, so
+    this default is aimed at official non-greedy Qwen sampling without changing
+    deterministic request behavior.
+  - `benchmarks/run_sm70_quality_speed_matrix.py` now accepts
+    `--quality-prompts-json`, so future quality gates can extend prompt
+    coverage without editing the script.
+- Unit test:
+  - `python -m pytest -q tests/engine/test_arg_utils.py -k 'sm70_mtp_defaults or sm70_explicit_mtp'`
+    passed (`4 passed`).
+  - Full file after clearing invalid local proxy env:
+    `ALL_PROXY= all_proxy= HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= python -m pytest -q tests/engine/test_arg_utils.py`
+    passed (`81 passed`).
+- Default-filled O512 speed artifact:
+  - `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_o512_seed0_gpu23.txt`.
+  - The run omitted `draft_sample_method` from `speculative_config`; the log
+    confirms `speculative_config.draft_sample_method=probabilistic`.
+  - Result: `steady_decode_tps=107.914`, `tpot=9.267 ms/token`,
+    `mean_acceptance_length=4.580`, `draft_acceptance_rate=89.5%`,
+    `total_output_tokens=512`, official sampling, no `ignore_eos`.
+- Wider prompt-json quality artifact:
+  - `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_quality8_o512_seed0_gpu23.json`.
+  - Prompt source: `benchmarks/sm70_quality_prompts_qwen36.json` (`8` prompts).
+  - The run also omitted `draft_sample_method`; the log confirms the same
+    probabilistic default. The JSON `engine_kwargs` field records pre-default
+    kwargs, so use the log line as the authoritative default-fill evidence.
+  - Result: all `8` prompts passed at `512` output tokens with official
+    sampling and `ignore_eos=false`; greedy determinism was exact. Worst
+    observed quality metrics: max same-token run `2`, max digit run `4`,
+    `repeat20<=6`, `repeat50=1`, `repeat100=1`, and max same-line run `1`.
+  - Embedded O128 speed probe was `99.877 tok/s`; treat this as a quality-run
+    diagnostic only. The accepted speed evidence remains the O512 speed gate.
+- Serving-path quality artifact:
+  - `benchmarks/benchmark_sm70_serving_quality.py` dump mode now accepts prompt
+    JSON files, records the seed, computes the same lightweight repetition /
+    corruption metrics used by the offline quality matrix, and can fail the
+    process with `--require-quality-gate`.
+  - Server artifact:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_server_gpu23.log`.
+    The OpenAI-compatible server used
+    `VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1`, omitted manual
+    `draft_sample_method`, and logged
+    `speculative_config.draft_sample_method=probabilistic`.
+  - Serving quality result:
+    `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_serving_quality8_o512_seed0_gpu23.json`.
+    Setup used Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, TurboMind AWQ, CUDA graph,
+    official sampling (`temperature=1.0`, `top_p=0.95`, `top_k=20`),
+    `seed=0`, `max_tokens=512`, and `ignore_eos=false`.
+  - Result: all `8` serving requests passed the quality gate. Seven requests
+    finished by length at `512` output tokens, one stopped naturally at `227`
+    tokens. Worst observed serving metrics were max same-token run `2`, max
+    digit run `4`, and max same-line run `1`; no prompt failed.
+  - Do not use the serving quality run as the accepted speed baseline because
+    it intentionally mixes heterogeneous prompts and OpenAI serving overhead.
+    This note was later superseded by the 256k API serving correction below:
+    the offline O512 artifact is only a low-overhead speed screen, not the
+    accepted user-facing speed baseline.
+- Decision:
+  - The recommended SM70 Qwen3.6-27B-AWQ MTP4 route is now the default-filled
+    probabilistic MTP path, not manual `draft_sample_method` plumbing.
+  - The route has same-criterion offline speed evidence above `100 tok/s`,
+    offline prompt-matrix quality evidence, and serving-path quality evidence
+    using the same default-filled configuration. This is useful route evidence
+    but not final speed acceptance under the later 256k API real-prompt target.
+
+### 2026-07-01 256k API serving real-prompt baseline correction
+
+- Correction to the previous speed interpretation:
+  - The `107.914 tok/s` artifact above is a valid low-overhead offline
+    `steady_decode_tps` screen for the MTP4 path, but it is not a production
+    acceptance result for the new user-facing target.
+  - That run used `max_model_len=2048` and a synthetic repeated tokenized input
+    generated from:
+    `This fixed benchmark prompt is used to create a deterministic tokenized input for single-request decode measurement.`
+    The prompt was repeated/truncated to `512` prompt tokens. This raises MTP
+    acceptance (`mean_acceptance_length=4.580`) and should not be compared to
+    natural chat prompts.
+  - New acceptance target for Qwen3.6-27B-AWQ MTP4 is therefore:
+    real prompt collection, `max_model_len=262144`, OpenAI API serving path,
+    TP2, official sampling (`temperature=1.0`, `top_p=0.95`, `top_k=20`),
+    CUDA graph / non-eager, TurboMind AWQ, and no output-quality regression.
+- Benchmark harness update:
+  - `benchmarks/benchmark_sm70_serving_quality.py` dump mode now supports
+    `--endpoint chat|completions` and records per-request wall time,
+    prompt/completion token counts, completion tokens/s, aggregate tokens/s,
+    and request-level throughput statistics.
+  - For chat endpoint dumps, quality metrics use OpenAI `usage` completion
+    token counts when the server does not return token ids.
+  - The same dump mode can now record Prometheus counter deltas with
+    `--record-metrics-delta`, which captures per-request MTP drafts, draft
+    tokens, accepted tokens, per-position acceptance, prompt tokens, and
+    generation tokens. Use this only with one serial benchmark process and no
+    concurrent traffic.
+- 256k API server baseline:
+  - Server log:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_port8000.log`.
+    The server reported `max_model_len=262144`, default MTP4 probabilistic
+    filling, TurboMind AWQ, CUDA graph, TP2, and `/v1/models` returned
+    `max_model_len=262144`.
+  - Real prompt artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_chat_quality8_o512_seed0.json`.
+    Prompt source was `benchmarks/sm70_quality_prompts_qwen36.json` (`8`
+    natural short task prompts) via `/v1/chat/completions`, `max_tokens=512`,
+    official sampling, `seed=0`, and `ignore_eos=false`.
+  - Result: quality gate passed on all `8` prompts, but speed missed the
+    `100 tok/s` goal. Aggregate completion throughput was `62.142 tok/s`;
+    per-request completion tok/s min/mean/median/p90/max was
+    `54.996 / 64.263 / 61.426 / 86.090 / 86.090`.
+    Total completion tokens were `2959`.
+  - Per-prompt summary:
+
+    | prompt | completion tokens | finish | tok/s |
+    | --- | ---: | --- | ---: |
+    | external_01 | 155 | stop | 57.482 |
+    | external_02 | 512 | length | 59.537 |
+    | external_03 | 512 | length | 63.315 |
+    | external_04 | 166 | stop | 86.090 |
+    | external_05 | 285 | stop | 68.611 |
+    | external_06 | 512 | length | 65.857 |
+    | external_07 | 305 | stop | 54.996 |
+    | external_08 | 512 | length | 58.215 |
+
+  - Server-side metric windows during this run showed generation throughput in
+    the `~39-69 tok/s` range and MTP mean acceptance length around `2.6-3.2`,
+    far below the synthetic speed screen's `4.580`.
+- Metrics-delta rerun:
+  - Artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_chat_quality8_o512_seed0_metrics.json`.
+  - Result remained stable: aggregate completion throughput `62.338 tok/s`,
+    per-request min/mean/median/p90/max `55.466 / 64.859 / 61.622 / 87.643 /
+    87.643 tok/s`, total completion tokens `2959`, and all `8` quality gates
+    passed.
+  - Prometheus spec-decode deltas over the run:
+    `num_drafts=1050`, `num_draft_tokens=4200`, `num_accepted_tokens=1915`,
+    mean acceptance length `2.824`, draft acceptance rate `45.6%`, and
+    per-position acceptance `[0.768, 0.504, 0.340, 0.212]`.
+  - Per-prompt speed/acceptance split:
+
+    | prompt | tok/s | mean acceptance length | draft acceptance |
+    | --- | ---: | ---: | ---: |
+    | external_01 | 57.355 | 2.754 | 43.9% |
+    | external_02 | 59.791 | 2.677 | 41.9% |
+    | external_03 | 63.452 | 2.829 | 45.7% |
+    | external_04 | 87.643 | 4.175 | 79.4% |
+    | external_05 | 69.398 | 3.143 | 53.6% |
+    | external_06 | 66.192 | 2.960 | 49.0% |
+    | external_07 | 55.466 | 2.488 | 37.2% |
+    | external_08 | 59.571 | 2.648 | 41.2% |
+
+  - Simple throughput model from the corrected serving run:
+    `1050` verifier/draft rounds over `47.467 s` is about `22.1 rounds/s`.
+    At the current mean acceptance length `2.824`, this predicts the observed
+    `~62 tok/s`. With the same round rate, the `100 tok/s` goal would require
+    mean acceptance length about `100 / 22.1 = 4.52`, near the synthetic prompt
+    run's `4.580`. If mean acceptance stays at `2.824`, round rate must rise to
+    about `35.4 rounds/s` (`~60%` faster) to reach `100 tok/s`.
+- Decision:
+  - The active optimization goal remains open under the corrected 256k API
+    serving / real-prompt criterion.
+  - Immediate next optimization should target real-prompt MTP acceptance first,
+    because the fixed verifier pass cannot amortize to `100 tok/s` while mean
+    acceptance remains near `2.8`. Verifier-cost reduction remains useful but
+    is no longer sufficient by itself unless it delivers roughly `60%` more
+    verifier/draft rounds per second.
+  - Do not use `VLLM_MTP_STOCHASTIC_TOKEN_MATCHING=1` as an official accepted
+    result without a separate semantic/quality gate: the existing audit notes
+    that it changes exact stochastic rejection sampling into token matching.
+    It can be measured only as a diagnostic acceptance-speed upper bound.
+- Token-matching diagnostic:
+  - Diagnostic server artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_tokenmatch_port8001.log`.
+    It used the same 256k TP2 TurboMind AWQ / CUDA graph configuration on
+    GPUs `0,1`, with `VLLM_MTP_STOCHASTIC_TOKEN_MATCHING=1`.
+  - Diagnostic result:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_tokenmatch_chat_quality8_o512_seed0_metrics.json`.
+  - Result: quality gate passed but speed did not materially improve.
+    Aggregate throughput was `63.089 tok/s`, mean acceptance length `2.837`,
+    draft acceptance rate `45.9%`, and per-position acceptance
+    `[0.769, 0.504, 0.344, 0.220]`. This is within noise of the standard
+    rejection run (`62.338 tok/s`, mean acceptance `2.824`).
+  - Decision: token matching is not the missing speed lever for the corrected
+    real-prompt 256k serving target. Do not repeat this diagnostic unless the
+    sampler implementation changes.
+- Matched no-MTP control under the corrected serving criterion:
+  - Artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_nomtp_256k_chat_quality8_o512_seed0.json`.
+  - Same prompt source, `/v1/chat/completions`, `max_model_len=262144`,
+    TurboMind AWQ, TP2, CUDA graph / non-eager, official sampling, and
+    `seed=0`; only speculative decoding was disabled.
+  - Result: quality gate passed on all `8` prompts. Aggregate completion
+    throughput was `55.187 tok/s`, per-request min/mean/median/p90/max was
+    `52.170 / 54.926 / 55.316 / 55.526 / 55.526 tok/s`, and total completion
+    tokens were `2729`.
+  - Per-prompt no-MTP summary:
+
+    | prompt | completion tokens | finish | tok/s |
+    | --- | ---: | --- | ---: |
+    | external_01 | 125 | stop | 52.170 |
+    | external_02 | 512 | length | 55.484 |
+    | external_03 | 512 | length | 55.526 |
+    | external_04 | 177 | stop | 55.080 |
+    | external_05 | 226 | stop | 55.085 |
+    | external_06 | 512 | length | 55.431 |
+    | external_07 | 285 | stop | 55.258 |
+    | external_08 | 380 | stop | 55.374 |
+
+  - Corrected MTP4 speedup is therefore only `62.338 / 55.187 = 1.13x`;
+    token-matching diagnostic is `63.089 / 55.187 = 1.14x`. MTP is helping,
+    but the real-prompt API serving gain is much smaller than the synthetic
+    offline `107.914 tok/s` screen suggested.
+  - Root implication: the current blocker is not that no-MTP is already slow
+    enough to make any MTP gain look large. The corrected no-MTP floor is
+    `~55 tok/s`, and the accepted target is `>100 tok/s`, so the next phase
+    must lift real-prompt acceptance and/or reduce verifier/draft round cost
+    under the same 256k API serving path.
+- Rejection-sampler internal profile, same MTP4/default-probabilistic route:
+  - Added a default-off sampler profiler:
+    `VLLM_SM70_REJECTION_PROFILE=1` with
+    `VLLM_SM70_REJECTION_PROFILE_INTERVAL=<N>`. It only records CUDA-event
+    timing when enabled; the default sampling path remains unchanged.
+  - Added model-free microbenchmark:
+    `benchmarks/benchmark_sm70_rejection_sampler_micro.py`.
+  - Validation:
+    `python -m py_compile vllm/v1/sample/rejection_sampler.py
+    vllm/envs.py benchmarks/benchmark_sm70_rejection_sampler_micro.py` passed.
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python -m pytest -q
+    tests/v1/sample/test_rejection_sampler.py` passed (`67 passed`). A prior
+    unconstrained mixed-GPU run failed with `cudaErrorNoKernelImageForDevice`
+    after selecting the RTX 4060 Ti; that failure is environmental, not a
+    sampler regression.
+  - V100 micro artifact:
+    `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp4_vocab248320_topk20_v100_gpu0.json`.
+    For vocab `248320`, MTP4, `top_k=20/top_p=0.95`, means were:
+    `constraints_only=0.889 ms`, `dense_softmax_only=0.197 ms`,
+    `dense_recovered_only=0.240 ms`, `sparse_recovered_prototype=0.390 ms`,
+    and `full_current_rejection=0.421 ms`.
+  - Real serving profile summary:
+    `bench_results/api_server_27b_awq_20260701/rejection_sampler_profile_summary_20260701.md`.
+    Hot intervals showed runner `target_rejection_sample` around
+    `1.56 ms/spec-step`, while sampler internals were approximately
+    `forward_total=1.41-1.42 ms`, `sampling_constraints=0.52-0.53 ms`,
+    `bonus_sample=0.49 ms`, `rejection_sample_total=0.34 ms`,
+    `rs_target_softmax=0.152 ms`, `rs_recovered_tokens=0.157 ms`, and
+    `rs_random_kernel=0.007 ms`.
+  - Decision: the simple QUICK-style idea of only replacing recovered-token
+    sampling with a `top_k` sparse prototype is not worthwhile on this route;
+    it is slower than the current dense recovered kernel. The useful
+    sampler-side targets are top-k/top-p constraint work and bonus sampling.
+    Even eliminating the entire `target_rejection_sample` bucket would not
+    close the `63 -> 100 tok/s` gap by itself.
+- AWQ verifier dynamic-selector API candidate:
+  - Candidate env on the 256k OpenAI API serving path:
+    `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`,
+    `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`,
+    `VLLM_SM70_AWQ_WARMUP_MAX_M=17`,
+    `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`, and
+    `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`, with the same TP2,
+    TurboMind AWQ, Flash-V100, CUDA graph, MTP4 default-probabilistic,
+    `max_model_len=262144`, real prompt set, and official sampling.
+  - Warmup artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_chat_quality8_o128_seed0_warmup.json`.
+  - O512 metrics artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_chat_quality8_o512_seed0_metrics.json`.
+    Result: all `8` prompts passed quality; aggregate completion throughput
+    `66.629 tok/s`, total completion tokens `2959`, mean acceptance length
+    `2.834`, draft acceptance `45.85%`, and per-position acceptance
+    `[0.773, 0.507, 0.339, 0.215]`.
+  - Matched warmed default-code serving comparison:
+    `qwen36_27b_awq_mtp4_256k_fix_chat_quality8_o512_seed0_metrics_r2.json`
+    was `63.027 tok/s`, `2959` completion tokens, mean acceptance length
+    `2.824`, and draft acceptance `45.60%`.
+  - Interpretation: this candidate improves the corrected serving criterion by
+    about `+5.7%` (`63.027 -> 66.629 tok/s`) with essentially unchanged
+    acceptance. It is a verifier/round-cost win, not an acceptance-length win.
+    Keep it as an explicit candidate; do not make it the default until the
+    dynamic/no-preserve numerical and broader quality risk is closed. It still
+    leaves the route far below the `>100 tok/s` real-prompt 256k API target.
+- MTP drafter LM-head TOP1_TC on the corrected API route:
+  - Candidate env added `VLLM_SM70_LM_HEAD_TOP1_TC=1` on top of the
+    dynamic/no-preserve AWQ verifier settings, with the same 256k OpenAI API
+    serving path, TP2, TurboMind AWQ, Flash-V100, CUDA graph,
+    MTP4 default-probabilistic draft, real prompt set, and official sampling.
+  - Server log:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_top1tc_port8002.log`.
+    It logged `SM70 LM head top1 layout prepared` and local argmax reduction,
+    but did not log `SM70 Tensor Core LM head top1 epilogue path enabled`.
+  - O512 metrics artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_top1tc_chat_quality8_o512_seed0_metrics.json`.
+    Result: all `8` prompts passed quality; aggregate completion throughput
+    `66.557 tok/s`, total completion tokens `2959`, mean acceptance length
+    `2.837`, draft acceptance `45.93%`, and per-position acceptance
+    `[0.769, 0.504, 0.344, 0.220]`.
+  - Interpretation: TOP1_TC has no measurable win over the dynamic/no-TC
+    candidate (`66.629 tok/s`). The official probabilistic draft path requires
+    full logits/probabilities and bypasses the greedy/top1 epilogue, so this is
+    not the next lever for the corrected route. Do not repeat TOP1_TC under
+    official probabilistic MTP4 unless the drafter sampling path is redesigned.
+- Rejection-sampler combined-bonus fast path:
+  - Candidate added `VLLM_SM70_REJECTION_COMBINE_BONUS=1` (default-on,
+    `=0` kill switch). The fast path is limited to the no-output-logprobs
+    official random sampling route with no penalties/allowed-token/bad-word
+    processors. It runs target constraints once over the compact sampled rows
+    and samples bonus from the compact bonus row instead of invoking the full
+    bonus sampler over full-vocab logits.
+  - Validation:
+    `python -m py_compile vllm/v1/sample/rejection_sampler.py vllm/envs.py
+    benchmarks/benchmark_sm70_rejection_sampler_micro.py` passed.
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python -m pytest -q
+    tests/v1/sample/test_rejection_sampler.py` passed (`69 passed`). The
+    regression test compares legacy and combined paths with the same RNG state.
+  - V100 micro artifact:
+    `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp4_vocab248320_topk20_v100_gpu0_combined_bonus_20260701.json`.
+    For vocab `248320`, MTP4, `top_k=20/top_p=0.95`, full sampler forward
+    dropped from `2.014 ms/spec-step` to `1.377 ms/spec-step` (`-0.637 ms`).
+    Component means included `bonus_sample_old_full_logits=0.718 ms`,
+    `bonus_sample_no_logprobs=0.702 ms`, `target_prepare_with_clone=0.106 ms`,
+    and `target_prepare_no_clone=0.081 ms`.
+  - 256k API serving artifacts, same dynamic/no-preserve AWQ verifier route:
+    warmup
+    `qwen36_27b_awq_mtp4_256k_awqdyn_combinedbonus_chat_quality8_o128_seed0_warmup.json`,
+    O512
+    `qwen36_27b_awq_mtp4_256k_awqdyn_combinedbonus_chat_quality8_o512_seed0_metrics.json`,
+    and clean no-logprobs-label O512
+    `qwen36_27b_awq_mtp4_256k_awqdyn_combinedbonus_chat_quality8_o512_seed0_nologprobs_metrics.json`.
+    Result: all `8` prompts passed quality; clean O512 aggregate throughput
+    `66.200 tok/s`, total completion tokens `2959`, mean acceptance length
+    `2.817`, draft acceptance `45.41%`, and per-position acceptance
+    `[0.753, 0.496, 0.343, 0.224]`.
+  - Interpretation: this is a real microbenchmark reduction in sampler/verifier
+    overhead, but it does not produce a measurable end-to-end serving win over
+    the current dynamic/no-preserve AWQ corrected API baseline (`66.629 tok/s`).
+    Keep the guarded implementation as a low-risk cleanup, but do not count it
+    toward the `>100 tok/s` target and do not spend more time on bonus-sampler
+    micro-optimization unless a fresh per-token profile shows it has grown into
+    a dominant bucket.
+- Probabilistic draft sparse top-k proposal candidate:
+  - Candidate added `VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK=1` (default-off).
+    It only applies to the official-probabilistic MTP draft path when the
+    proposal is top-k-only (`top_k` present and draft top-p disabled). It
+    samples from the `top_k` logits and scatters an exact dense `draft_probs`
+    row for the existing rejection sampler, so the proposal distribution
+    matches the previous top-k-only proposal and the target sampler still uses
+    the official `temperature=1.0/top_p=0.95/top_k=20` parameters.
+  - Validation:
+    `python -m py_compile vllm/v1/spec_decode/llm_base_proposer.py vllm/envs.py
+    tests/v1/spec_decode/test_tp_draft_sampling_sync.py` passed.
+    `python -m pytest -q tests/v1/spec_decode/test_tp_draft_sampling_sync.py`
+    passed (`5 passed`). The new test checks that sparse top-k draft
+    probabilities match the dense top-k proposal and that the sparse path
+    bypasses the dense full-vocab mask.
+  - V100 operation microbench, vocab `248320`, top-k `20`, batch `1`:
+    old proposal p50 `0.530 ms/sample`, sparse top-k p50 `0.376 ms/sample`.
+    This is at most a small per-draft-step saving because it does not remove
+    the drafter LM-head/full-logits cost and still scatters dense `draft_probs`.
+  - 256k API serving artifacts, same dynamic/no-preserve AWQ verifier route:
+    warmup
+    `qwen36_27b_awq_mtp4_256k_awqdyn_sparsetopk_chat_quality8_o128_seed0_warmup.json`,
+    O512
+    `qwen36_27b_awq_mtp4_256k_awqdyn_sparsetopk_chat_quality8_o512_seed0_metrics.json`,
+    and server log
+    `qwen36_27b_awq_mtp4_256k_awqdyn_sparsetopk_port8002.log`.
+    Result: all `8` prompts passed quality; O512 aggregate throughput
+    `66.807 tok/s`, total completion tokens `2858`, mean acceptance length
+    `2.802`, draft acceptance `45.04%`, and per-position acceptance
+    `[0.741, 0.506, 0.339, 0.215]`.
+  - Interpretation: this is statistically-equivalent proposal plumbing and a
+    small sampler-operation win, but it does not materially improve the
+    corrected 256k API serving target versus the current `awqdyn` baseline
+    (`66.629 tok/s`, mean acceptance `2.834`). Keep it default-off. The next
+    native MTP4 work should focus on real-prompt acceptance-length calibration
+    or a genuinely sparse draft-probs/rejection representation that avoids the
+    dense `draft_probs` scatter; do not count this candidate toward the
+    `>100 tok/s` target.
+- Static draft top-p proposal under corrected 256k API serving:
+  - Candidate env:
+    `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1` on top of the same
+    dynamic/no-preserve AWQ verifier route. The knob was already present for
+    offline proposal sweeps; `vllm/envs.py` now registers it, along with
+    `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE`, so API-server env validation
+    records the route cleanly.
+  - Screen rule before the run: stop after O256 unless the candidate reaches
+    mean acceptance length `>=3.5` and throughput `>=75 tok/s` on the real
+    256k API prompt set.
+  - Artifacts:
+    server log
+    `qwen36_27b_awq_mtp4_256k_awqdyn_drafttopp_port8002.log`, warmup
+    `qwen36_27b_awq_mtp4_256k_awqdyn_drafttopp_chat_quality8_o128_seed0_warmup.json`,
+    and O256
+    `qwen36_27b_awq_mtp4_256k_awqdyn_drafttopp_chat_quality8_o256_seed0_metrics.json`.
+  - Result: quality passed, but O256 aggregate throughput was only
+    `66.187 tok/s`, total completion tokens `1859`, mean acceptance length
+    `2.922`, draft acceptance `48.04%`, and per-position acceptance
+    `[0.777, 0.529, 0.372, 0.243]`.
+  - Decision: do not continue to O512 and do not repeat static draft-top-p
+    sweeps for the corrected 256k API target. It slightly improves AL versus
+    the `awqdyn` O512 baseline shape, but nowhere near the `~4.2` AL required
+    to reach `100 tok/s` at the current round rate, and O256 throughput remains
+    around the existing `66 tok/s` plateau.
+
+- MTP alignment dump and draft-temperature scalar diagnostic:
+  - Context correction: the earlier `107.914 tok/s` result used the fixed
+    synthetic prompt
+    `This fixed benchmark prompt is used to create a deterministic tokenized input for single-request decode measurement.`
+    and `max_model_len=2048`. Treat it only as a low-overhead route screen,
+    not as accepted user-facing throughput. Accepted speed evidence for this
+    workstream must use the real prompt collection, `max_model_len=262144`,
+    OpenAI API serving, official sampling, CUDA graph / non-eager, TurboMind
+    AWQ, and must report completion/decode throughput separately from TTFT.
+  - Added `benchmarks/analyze_spec_alignment_dumps.py` to summarize
+    `VLLM_SPEC_DUMP_ALIGNMENT=1` payloads. It deduplicates TP rank dumps by
+    sampler step, checks rank mismatch, and reports per-position prefix
+    acceptance, proposal/target overlap, acceptance caps, target top-10 misses,
+    and `q(draft)>p(target)` rates.
+  - Alignment artifact:
+    `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_alignment_o128_seed0_summary.{json,md}`.
+    The input had `160` raw files from two TP ranks, `80` deduped sampler
+    steps, step range `3..82`, and `0` duplicate mismatches. Therefore the low
+    acceptance is not explained by TP ranks sampling divergent draft tokens.
+  - Alignment round summary: mean output tokens per round `2.7375`, mean
+    accepted draft tokens per round `1.7375`, total output tokens `219`, total
+    accepted draft tokens `139`, accepted-draft histogram
+    `{0:16, 1:27, 2:12, 3:12, 4:13}`, and finish histogram
+    `{all_accept_bonus:13, reject_or_recover:67}`.
+  - Per-position alignment summary:
+
+    | pos | prefix accept | mean overlap | cap < 0.5 | target top10 miss | q(draft)>p(target) |
+    | ---: | ---: | ---: | ---: | ---: | ---: |
+    | 0 | 80.0% | 80.8% | 20.0% | 15.0% | 30.0% |
+    | 1 | 46.2% | 63.0% | 36.2% | 26.2% | 46.2% |
+    | 2 | 31.2% | 61.4% | 42.5% | 33.8% | 53.8% |
+    | 3 | 16.2% | 56.9% | 50.0% | 42.5% | 60.0% |
+
+    Interpretation: native MTP4 is losing mostly on proposal/target
+    distribution mismatch in later draft slots. The deeper slots increasingly
+    pick tokens outside the target top-10 and overestimate the selected token
+    probability relative to the target distribution.
+  - Added guarded diagnostic env
+    `VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE` (default `1.0`) in the
+    probabilistic draft proposal path. It scales only non-greedy draft proposal
+    temperature; the target sampler stays on official sampling.
+  - Validation:
+    `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
+    vllm/envs.py vllm/v1/spec_decode/llm_base_proposer.py
+    benchmarks/analyze_spec_alignment_dumps.py
+    tests/v1/spec_decode/test_tp_draft_sampling_sync.py` passed.
+    The correct-env targeted pytest
+    `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m pytest -q
+    tests/v1/spec_decode/test_tp_draft_sampling_sync.py` passed
+    (`6 passed`). A default `python -m pytest` attempt failed before tests due
+    to the local `_C.abi3.so` Torch/CUDA ABI mismatch and is not a code failure.
+  - Draft-temperature A/B, same dynamic/no-preserve AWQ verifier route and
+    real 256k API prompt set:
+    `VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE=1.25` produced O128
+    `61.256 tok/s` and O256 `63.343 tok/s`, quality passed, total completion
+    tokens `1859`, mean acceptance length `2.729`, draft acceptance `43.23%`,
+    per-position `[0.731, 0.476, 0.318, 0.205]`. This is worse than baseline.
+    `VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE=0.85` produced O128
+    `64.503 tok/s` and O256 `67.673 tok/s`, quality passed, total completion
+    tokens `1840`, mean acceptance length `2.918`, draft acceptance `47.94%`,
+    per-position `[0.783, 0.541, 0.354, 0.239]`.
+  - Decision: keep the scalar default-off as a diagnostic only. Scale `0.85`
+    is a small positive A/B but still fails the O256 screen for a target-worthy
+    candidate (`>=3.5` mean acceptance length and `>=75 tok/s`) and remains on
+    the same `~66-68 tok/s` plateau. Do not spend more time on scalar/top-p
+    draft proposal sweeps for the `>100 tok/s` target. The next meaningful
+    branch is either a verifier/round-cost reduction large enough to lift
+    rounds/s materially, or a branched/tree/DFlash-DDTree-style proposal that
+    increases real-prompt effective acceptance length beyond native linear MTP4.
+
+- Native MTP verifier/sampler sparse-representation audit:
+  - Subagent read-only audit agreed with the corrected bottleneck model: at
+    real 256k API AL `~2.8`, reaching `100 tok/s` requires either AL near
+    `4.5` at the current round rate or roughly `60%` more rounds/s. It
+    recommended checking true sparse `draft_probs`/rejection representation
+    before spending more time on API sweeps, and explicitly warned not to
+    repeat staged verifier, token matching, TOP1_TC, combined-bonus,
+    current sparse-top-k dense scatter, static top-p, or scalar-temperature
+    sweeps unchanged.
+  - Extended `benchmarks/benchmark_sm70_rejection_sampler_micro.py` with
+    model-free timings for:
+    `sparse_bonus_topk_topp_prototype`,
+    `dense_draft_topk_proposal`,
+    `sparse_draft_topk_with_scatter`, and
+    `sparse_draft_topk_no_scatter`.
+  - Artifacts:
+    `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp4_sparse_draft_gpu0_20260701.json`
+    and
+    `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp5_sparse_draft_gpu1_20260701.json`.
+    Both used V100, vocab `248320`, official `top_k=20/top_p=0.95`, warmup
+    `20`, and `100` timing iterations.
+  - MTP4 micro result:
+
+    | bucket | mean |
+    | --- | ---: |
+    | dense draft top-k proposal | `0.807 ms` |
+    | sparse draft top-k with dense scatter | `0.328 ms` |
+    | sparse draft top-k no scatter | `0.276 ms` |
+    | bonus sample no-logprobs | `0.729 ms` |
+    | sparse bonus top-k/top-p prototype | `0.501 ms` |
+    | dense recovered only | `0.233 ms` |
+    | sparse recovered prototype | `0.406 ms` |
+    | full current rejection | `0.413 ms` |
+    | combined-bonus rejection sampler forward | `1.414 ms` |
+
+  - MTP5 micro result:
+
+    | bucket | mean |
+    | --- | ---: |
+    | dense draft top-k proposal | `1.022 ms` |
+    | sparse draft top-k with dense scatter | `0.317 ms` |
+    | sparse draft top-k no scatter | `0.272 ms` |
+    | bonus sample no-logprobs | `0.711 ms` |
+    | sparse bonus top-k/top-p prototype | `0.484 ms` |
+    | dense recovered only | `0.230 ms` |
+    | sparse recovered prototype | `0.394 ms` |
+    | full current rejection | `0.418 ms` |
+    | combined-bonus rejection sampler forward | `1.449 ms` |
+
+  - Interpretation: the current sparse-top-k proposal already captures most of
+    the proposal-side savings even though it scatters back to dense
+    `draft_probs`; removing only the scatter is worth just `~0.05 ms` in this
+    microbench. Sparse recovered-token sampling is slower than the current
+    dense recovered kernel. Sparse bonus sampling is positive but only saves
+    `~0.23 ms/round`. These are below the threshold for a target-worthy API
+    candidate and do not explain the `66-68 tok/s` plateau.
+  - Decision: do not implement a large sparse `draft_probs`/rejection data
+    structure change yet. A production implementation would add sampler data
+    plumbing and seeded-distribution validation but has too little additional
+    upside over the already-tested sparse-top-k API route. Keep this as a
+    low-priority cleanup unless a fresh profile shows draft proposal/rejection
+    has become a dominant bucket. Next high-yield work should return to fixed
+    target-forward cost reduction or to an acceptance-length route such as a
+    warmed DDTree/branched proposal validation.
+
+- AWQ M=5 verifier fast-target split/swizzle sweep:
+  - Purpose: after the dynamic/no-preserve selector remained the only
+    quality-equivalent verifier-cost win, test whether a narrow fixed
+    `8x256x64` split/swizzle sweep could beat it for the two dominant M=5
+    verifier GEMMs (`mlp_gate_up` and `mlp_down`).
+  - Baseline reruns on free V100 GPUs:
+    `bench_results/api_server_27b_awq_20260701/awq_verifier_micro_m5_default_gpu1_20260701_cont.json`
+    and
+    `bench_results/api_server_27b_awq_20260701/awq_verifier_micro_m5_dynamic_nopreserve_gpu0_20260701_cont.json`.
+    Default modeled verifier AWQ bucket was `18.903 ms`; dynamic/no-preserve
+    was `15.985 ms`. The dynamic/no-preserve top buckets were
+    `mlp_gate_up=4.776 ms`, `mlp_down=5.259 ms`,
+    `linear_qkv=2.722 ms`, `linear_z=2.418 ms`, and `attn_o=0.810 ms`.
+  - Narrow sweep artifacts:
+    `bench_results/api_server_27b_awq_20260701/fasttarget_sweep_m5/`.
+    It swept the same `8x256x64` family with split `2..8` and swizzle `0..3`
+    for `mlp_gate_up` and `mlp_down`, one shape at a time.
+  - Best fixed sweep points:
+
+    | shape | best fixed point | weighted mean | dynamic/no-preserve |
+    | --- | --- | ---: | ---: |
+    | `mlp_gate_up` | `gate_s3_w1.json` | `5.204 ms` | `4.776 ms` |
+    | `mlp_down` | `down_s7_w2.json` | `5.660 ms` | `5.259 ms` |
+
+    The combined best fixed gate+down subtotal is `10.864 ms`, worse than the
+    dynamic/no-preserve gate+down subtotal `10.035 ms`.
+  - Decision: do not continue fixed split/swizzle tuning for these M=5 verifier
+    shapes without a new kernel-level idea. The failure mode is not a missing
+    obvious split/swizzle point inside the current `8x256x64` family; the next
+    verifier-cost work must change the kernel/data path itself or move to a
+    higher-acceptance verifier amortization route.
+
+## 2026-06-30 DDTree verifier-state target follow-up
+
+- Objective under this workstream remains: reduce Qwen3.6-27B-AWQ DDTree
+  target verifier plus accepted-state update from `51.86 ms` to `<=40 ms`.
+- Runner instrumentation was extended so `SM70 spec runner profile avg_ms`
+  reports `state_update_validate_cpu`, `state_update_attn_compact_cpu`,
+  `state_update_mamba_compact_cpu`, `state_update_input_batch_cpu`, and
+  `state_update_drafter_context_cpu`.
+- Text-only DDTree profile with visual disabled:
+  `bench_results/ddtree_total_target_20260630/realcode2_o128_mamba_fused_cache_profile.json`
+  and `.log`. Setup used TP2 V100, Qwen3.6-27B-AWQ target,
+  Qwen3.6-27B-DFlash-FP16 drafter, DDTree `budget=16/top_k=20`, official
+  sampling `temperature=1.0/top_p=0.95/top_k=20`,
+  `limit_mm_per_prompt={"image":0,"video":0}`, Flash-V100, and CUDA graph.
+  Result: `256` output tokens, `generate_seconds=3.4808`, mean acceptance
+  `12.86`, draft acceptance `0.741`. It did not hit the `<=40 ms` verifier
+  target; the `calls=20` profile line was `target_forward=56.583 ms`,
+  `target_logits=3.120 ms`, `target_rejection_sample=4.031 ms`, and
+  `state_update_wall_cpu=5.941 ms`.
+- The run selected `mamba_cache_mode=none`, so the align-mode DDTree-aware
+  fused Mamba postprocess cannot replace the active explicit Mamba compact
+  path. The align deferral path is still covered by targeted tests, but it is
+  not counted as an active speed win for this route.
+- A whole-block DDTree Mamba compact `batch_memcpy` experiment was implemented
+  and reverted. Artifact:
+  `bench_results/ddtree_total_target_20260630/realcode2_o128_mamba_batchcopy_cache_profile.json`.
+  It preserved mean acceptance (`12.85`) but worsened profile cost:
+  `state_update_wall_cpu=16.311 ms`, `state_update_mamba_compact_cpu=6.696 ms`,
+  and `state_update_drafter_context_cpu=7.350 ms` at `calls=20`. Do not repeat
+  this exact batch-copy design.
+- The current dominant remaining bucket is target-forward GPU wait, not Mamba
+  compact. Worker profile shows `full_logits_split pre_sync_ms` around
+  `31-36 ms` for `rows=17`; this is the verifier forward completing before
+  logits and must be reduced to make the total `<=40 ms`.
+
+## 2026-06-30 DDTree verifier-state <=40 ms result
+
+- The Qwen3.6-27B-AWQ DDTree runner now has CPU sidecars for accepted rows,
+  sampled-token counts, current request indices, and current positions. These
+  sidecars are used by accepted-state update, no-clamp detection, and attention
+  KV compaction to avoid avoidable GPU-to-CPU metadata reads.
+- Attention KV compact now computes physical slot pairs from CPU positions and
+  the CPU block table when CP/DCP world size is one. This removed the hot
+  `slot_mapping.detach().cpu().tolist()` path for the active coding benchmark.
+- `mamba_cache_mode=none` with the sidecar changes nearly reached the target:
+  `realcode2_o256_statecpu_slotsidecar_16k.*` measured a best hot interval of
+  `40.100 ms` and a last hot interval of `40.489 ms`.
+- Direct Mamba copy was a negative A/B:
+  `realcode2_o256_slotsidecar_mambadirect_16k.*` measured `41.422 ms` last hot
+  with `state_update_wall_cpu=3.992 ms`. Keep batched Mamba compact enabled and
+  do not repeat this design unchanged.
+- The target was met with align-mode postprocess enabled:
+  `bench_results/ddtree_total_target_20260630/realcode2_o256_slotsidecar_align_16k.*`.
+  Last steady hot profile line: `target_forward=33.270 ms`,
+  `target_logits=2.890 ms`, `target_rejection_sample=1.290 ms`,
+  `state_update_wall_cpu=1.938 ms`, total `39.388 ms`. State-update split was
+  `validate=0.029`, `attn_compact=0.797`, `mamba_compact=0.013`,
+  `input_batch=0.772`, and `drafter_context=0.323 ms`.
+- Validation commands passed:
+  `python -m py_compile vllm/v1/worker/gpu_model_runner.py`,
+  `pytest -q tests/v1/spec_decode/test_ddtree_sampler.py tests/v1/worker/test_gpu_input_batch.py`,
+  and
+  `pytest -q tests/v1/spec_decode/test_ddtree_gpu_runner_positions.py tests/v1/worker/test_mamba_utils.py -k 'not shared_storage'`.
+- Current status: the `target verifier + state update <=40 ms` milestone is
+  achieved for the steady hot interval under DDTree `budget=16/top_k=20`,
+  official Qwen sampling, text-only visual-disabled serving, 16k batched
+  tokens, Flash-V100, and CUDA graphs.
+- Remaining risk: the align run's total `generate_seconds` is worse than the
+  default `none` run because warmup/capture/early align costs are still high.
+  Do not present this as an end-to-end throughput win until a warmed serving
+  benchmark confirms the same steady-state advantage.
+
+## 2026-07-01 DDTree16 corrected 256k API serving validation
+
+- Objective: validate DDTree/branched acceptance against the corrected
+  Qwen3.6-27B-AWQ target criterion instead of using 4k/offline or synthetic
+  evidence. This run used the real prompt collection, OpenAI chat serving,
+  official sampling, CUDA graph / non-eager, TP2, and `max_model_len=262144`.
+- Temporary server:
+  `bench_results/api_server_27b_awq_20260701/ddtree_256k/qwen36_27b_awq_ddtree16_256k_awqdyn_port8002.log`.
+  It ran on GPUs `0,1` and was stopped after measurement; the user-facing
+  port `8000` service was not touched.
+- Setup:
+  - target model `/home/ymzx/models/Qwen3.6-27B-AWQ`;
+  - drafter `/home/ymzx/models/Qwen3.6-27B-DFlash-FP16`;
+  - `speculative_config={"method":"dflash_ddtree","num_speculative_tokens":16,
+    "ddtree_budget":16,"ddtree_top_k":20,"ddtree_disable_tree_verify":false}`;
+  - `max_num_batched_tokens=16384`, `max_num_seqs=1`,
+    `gpu_memory_utilization=0.90`, `mamba_cache_mode=align`,
+    prefix caching enabled, Flash-V100 attention, no eager;
+  - same dynamic/no-preserve AWQ verifier candidate env as the corrected MTP4
+    API baseline.
+- Startup/route evidence:
+  - 256k capacity was valid: log reported GPU KV cache size `290,053` tokens
+    and max concurrency `1.11x` for `262,144` tokens.
+  - CUDA graph capture completed with `capture_sizes=(1, 2, 4, 8, 9, 17)`.
+  - Route logs showed `Using fused DDTree Qwen GDN pure-spec verifier path` and
+    `FLASH_ATTN_V100 DDTree branched verifier path active`.
+- Real 256k API artifacts:
+
+  | run | artifact | quality | completion tok/s | tokens | mean AL | draft accept |
+  | --- | --- | --- | ---: | ---: | ---: | ---: |
+  | O128 warmup | `qwen36_27b_awq_ddtree16_256k_awqdyn_chat_quality8_o128_seed0_warmup.json` | pass | `18.482` | `1024` | `2.726` | `10.79%` |
+  | O512 formal | `qwen36_27b_awq_ddtree16_256k_awqdyn_chat_quality8_o512_seed0_metrics.json` | pass | `19.131` | `2899` | `2.683` | `10.52%` |
+
+  Both runs used `benchmarks/sm70_quality_prompts_qwen36.json`, official
+  `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`, and no `ignore_eos`.
+- Hot profile evidence from the same 256k server:
+  - Representative steady intervals reported target verifier forward in the
+    `~33-36 ms` range, e.g. `calls=1200` had
+    `target_forward=32.916 ms`, `target_logits=2.251 ms`,
+    `target_rejection_sample=1.556 ms`, `state_update_wall_cpu=0.573 ms`,
+    and `draft_total=7.949 ms`.
+  - Other intervals still hit `~40-41 ms` target-forward when the interval
+    contained `15` spec steps rather than `16`, for example `calls=1280`
+    reported `target_forward=40.405 ms`.
+  - Runtime log metrics showed DDTree16 later positions rarely contribute on
+    this real prompt set. Most intervals stayed around mean acceptance length
+    `2.3-2.9`; one interval reached `4.33`, but it did not generalize.
+- Decision:
+  - DDTree16/branched verification is valid and graph-captured at 256k, but it
+    is not a speed candidate for the current target. It regresses far below the
+    corrected native MTP4 API baseline (`~66-68 tok/s`) and the `>100 tok/s`
+    goal.
+  - Do not repeat DDTree16 256k serving runs unchanged. Future DDTree work
+    needs a fundamentally lower target verifier cost or a draft/tree policy
+    that raises real-prompt mean acceptance well above the current `~2.7`; the
+    existing warmed 4k/16k hot-profile success is not sufficient acceptance
+    evidence for this goal.
+
+## 2026-07-01 AWQ M=5 gated-SiLU verifier candidate
+
+- Objective: test whether the existing SM70 AWQ `gate_up_proj` gated-SiLU
+  epilogue can reduce native MTP4 target verifier cost at the actual verifier
+  shape `M=5`. Previous AWQ wrapper logic only used the fused epilogue for
+  single-token inputs, so the MTP4 verifier fell back to `gate_up GEMM` plus a
+  separate `SiluAndMul` activation.
+- Code change:
+  - `vllm/model_executor/layers/quantization/awq.py` no longer rejects
+    `x_2d.shape[0] != 1` in `apply_fused_silu_and_mul`.
+  - The route remains gated by `VLLM_SM70_AWQ_MLP_ENGINE=1`, prepared
+    interleaved AWQ weights, and TP2. It is not default-enabled.
+  - `benchmarks/benchmark_sm70_awq_verifier_micro.py` now has an optional
+    `--gated-silu-candidate` mode that builds a TP-rank-equivalent merged
+    `gate_up_proj` from raw checkpoint `gate_proj/up_proj` AWQ tensors, checks
+    fused-vs-baseline numerical diff, and times `AWQ GEMM + silu_and_mul`
+    against the AWQ fused gated-SiLU epilogue.
+- Micro evidence, V100 SM70, Qwen3.6-27B-AWQ, `M=5`, TP2 rank-equivalent
+  merged `gate_up_proj`, official group size `128`:
+
+  | artifact | TP rank slice | baseline `gate_up+silu` | fused epilogue | weighted delta for 63 calls | diff |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | `verifier_candidates/awq_gated_silu_candidate_m5_gpu0_20260701.json` | 0 | `81.807 us` | `76.626 us` | `0.326 ms/token` | `0.0` |
+  | `verifier_candidates/awq_gated_silu_candidate_m5_gpu1_rank1_20260701.json` | 1 | `81.654 us` | `75.960 us` | `0.359 ms/token` | `0.0` |
+
+  Interpretation: the epilogue is numerically exact for this sampled shape and
+  removes about `5-6 us` from each MLP `gate_up` block, but its total
+  modeled-token gain is only about `0.3-0.4 ms`.
+- Corrected 256k API serving validation:
+  - Temporary 8002 server artifact:
+    `bench_results/api_server_27b_awq_20260701/gated_silu/qwen36_27b_awq_mtp4_256k_awqdyn_gatedsilu_port8002.log`.
+  - Startup route evidence: log showed `Applied 1Cat SM70 MTP defaults`,
+    `SM70 AWQ dense MLP gated-SiLU single-layout path enabled`, AWQ warmup
+    with `dense_m=[1, 2, 4, 5, 8, 16]`, and CUDA graph capture completed.
+  - Setup matched the corrected native MTP4 API criterion: real prompt
+    collection, OpenAI chat serving, `max_model_len=262144`, TP2,
+    Flash-V100, CUDA graph / non-eager, official
+    `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`, dynamic/no-preserve AWQ
+    selector env, plus `VLLM_SM70_AWQ_MLP_ENGINE=1`.
+  - O128 warmup artifact:
+    `gated_silu/qwen36_27b_awq_mtp4_256k_awqdyn_gatedsilu_chat_quality8_o128_seed0_warmup.json`.
+    Quality passed; aggregate completion throughput was `48.658 tok/s`.
+    This was treated as warmup/capture evidence only.
+  - O512 formal artifact:
+    `gated_silu/qwen36_27b_awq_mtp4_256k_awqdyn_gatedsilu_chat_quality8_o512_seed0_metrics.json`.
+    Quality passed on all `8` prompts, total completion tokens remained
+    `2959`, aggregate completion throughput was `66.636 tok/s`, mean
+    acceptance length was `2.824`, draft acceptance was `45.60%`, and
+    per-position acceptance was `[0.767, 0.504, 0.341, 0.212]`.
+- Decision:
+  - Keep the M>1 AWQ gated-SiLU hook as a small, exact, env-gated verifier-cost
+    improvement candidate, but do not count it as a material 256k API speed
+    win. The formal result is effectively tied with the current dynamic AWQ
+    baseline (`66.629 tok/s`, mean AL `2.834`).
+  - Do not spend more time on this route unless a future profile shows
+    `SiluAndMul`/MLP activation is again a top service-level bucket. It cannot
+    bridge the remaining gap to `>100 tok/s`; the next material work should
+    target either much larger verifier-forward cost reduction or real-prompt
+    acceptance length.
+
+## 2026-07-01 AWQ MTP4 max-num-batched-tokens 16k screen
+
+- Objective: test whether the vLLM scheduler warning about
+  `max_num_scheduled_tokens`/`max_num_batched_tokens` was hiding service-level
+  native MTP4 throughput. The corrected 256k API baseline used
+  `max_num_batched_tokens=1024`; this screen raised it to `16384` while keeping
+  the same real prompt collection and official sampling gate.
+- Temporary server:
+  `bench_results/api_server_27b_awq_20260701/batchtokens_16k/qwen36_27b_awq_mtp4_256k_awqdyn_bt16k_port8002.log`.
+  It ran on GPUs `0,1` and was stopped after measurement; the user-facing
+  port `8000` service was not touched.
+- Setup matched the corrected native MTP4 API criterion:
+  `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, TurboMind AWQ,
+  `max_model_len=262144`, `max_num_seqs=1`,
+  `gpu_memory_utilization=0.90`, Flash-V100, CUDA graph / non-eager,
+  dynamic/no-preserve AWQ selector env, and official
+  `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`.
+- Startup evidence:
+  - log reported `Chunked prefill is enabled with max_num_batched_tokens=16384`;
+  - no repeated low `max_num_scheduled_tokens=1024` warning was present after
+    this configuration;
+  - KV cache capacity was valid for 256k: `392,444` tokens and max concurrency
+    `1.50x`;
+  - AWQ warmup finished and CUDA graph capture completed.
+- Real 256k API artifacts:
+
+  | run | artifact | quality | completion tok/s | tokens | mean AL | draft accept | per-position accept |
+  | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+  | O128 warmup | `batchtokens_16k/qwen36_27b_awq_mtp4_256k_awqdyn_bt16k_chat_quality8_o128_seed0_warmup.json` | pass | `48.454` | `1024` | not used | not used | warmup only |
+  | O256 screen | `batchtokens_16k/qwen36_27b_awq_mtp4_256k_awqdyn_bt16k_chat_quality8_o256_seed0_metrics.json` | pass | `65.909` | `1857` | `2.831` | `45.78%` | `[0.760, 0.499, 0.347, 0.225]` |
+
+- Decision:
+  - This is a negative A/B for the current target. Raising
+    `max_num_batched_tokens` to `16384` did not improve acceptance length or
+    service throughput versus the corrected `1024` baseline
+    (`66.629 tok/s`, mean AL `2.834`, draft accept `45.85%`).
+  - Do not run the O512 formal pass and do not repeat larger batch-token
+    screens unchanged. The remaining `>100 tok/s` gap is not explained by this
+    scheduler-capacity knob; continue with verifier-forward cost reduction or
+    proposal/target acceptance-length work.
+
+## 2026-07-01 native MTP4 Qwen GDN spec-core cost probe
+
+- Objective: validate the subagent audit's highest-leverage verifier-cost
+  hypothesis: replacing the native MTP4 target verifier's quality-safe
+  full-Qwen-GDN boundary with the split `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`
+  recurrent-core boundary should lower the dominant `target_forward` bucket.
+  This was a cost/profile screen only, because earlier 2026-06-17/18 long
+  official-sampling evidence already showed this split boundary is not
+  quality-safe over 6k outputs.
+- Temporary server:
+  - Ran on GPUs `0,1`, port `8002`, and was stopped after measurement.
+  - The user-facing port `8000` service was not touched.
+  - Setup matched the corrected 256k API screen except for
+    `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`:
+    `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, TurboMind AWQ,
+    `max_model_len=262144`, `max_num_batched_tokens=1024`,
+    `max_num_seqs=1`, Flash-V100, CUDA graph / non-eager,
+    dynamic/no-preserve AWQ selector env, and official
+    `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`.
+  - Startup/capture reached `Application startup complete`; CUDA graph capture
+    completed. The run did not log the default
+    `SM70 Qwen GDN full-forward guard armed ... spec_core=False` route from
+    the quality-safe baseline.
+- Artifacts:
+  - Summary and profile excerpts:
+    `bench_results/api_server_27b_awq_20260701/gdn_spec_core_mtp4_probe/qwen36_27b_awq_mtp4_256k_awqdyn_gdnspec_profile_screen_summary.md`.
+  - O128 first screen:
+    `gdn_spec_core_mtp4_probe/qwen36_27b_awq_mtp4_256k_awqdyn_gdnspec_chat_quality8_o128_seed0_metrics.json`.
+  - O256 warmed screen:
+    `gdn_spec_core_mtp4_probe/qwen36_27b_awq_mtp4_256k_awqdyn_gdnspec_chat_quality8_o256_seed0_metrics.json`.
+- Real 256k API screen results:
+
+  | run | quality | completion tok/s | tokens | mean AL | draft accept | per-position accept |
+  | --- | --- | ---: | ---: | ---: | ---: | --- |
+  | O128 first screen | pass | `43.223` | `1024` | `2.885` | `47.12%` | `[0.758, 0.542, 0.362, 0.222]` |
+  | O256 warmed screen | pass | `62.138` | `1848` | `2.830` | `45.75%` | `[0.761, 0.528, 0.334, 0.207]` |
+
+- Profile result:
+  - The profile hypothesis is real: clean 20-spec-step intervals repeatedly
+    showed `target_forward` around `18.0-18.6 ms`, versus the corrected
+    quality-safe profile baseline's usual `~22.4-22.8 ms`.
+  - Representative lines from the console profile:
+    `target_forward=18.013`, `17.970`, `17.980`, `18.550`, and `17.987 ms`
+    with `target_logits ~=2.05 ms`, `target_rejection_sample ~=1.11 ms`, and
+    `draft_total ~=12.2 ms`.
+- Decision:
+  - Do not continue to O512 and do not treat
+    `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1` as an accepted speed route. The O256
+    service result is below the corrected native MTP4 baseline
+    (`66.629 tok/s`), and the route is already known long-output
+    quality-unsafe.
+  - Keep the result as directional evidence: a repaired, quality-safe narrower
+    Qwen GDN verifier boundary has enough `target_forward` headroom to be
+    worth future work, but the next useful step must be an exactness/quality
+    repair against the full-Qwen-GDN guard, not another short speed screen.
+
+## 2026-07-01 native MTP4 verifier-cost <=20ms microbench triage
+
+- Objective: reduce the Qwen3.6-27B-AWQ native MTP4 verifier cost below
+  `20 ms/spec-step` without changing official sampling quality. Full 256k model
+  service startup is expensive, so this pass used model-free or short offline
+  microbench evidence before considering another API server run.
+- Current best cost candidate remains
+  `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
+  `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
+  `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`:
+  - Artifact:
+    `bench_results/verifier20_20260701/qwen36_27b_awq_mtp4_inputcore003_macos512_profile.json`
+    and `.log`.
+  - Short offline MTP4 screen: `512` output tokens, official
+    `temperature=1.0/top_p=0.95/top_k=20`, mean acceptance length `2.988`,
+    draft acceptance `49.71%`, steady decode `67.462 tok/s`.
+  - Hot profile intervals:
+
+    | interval | target_forward | target_logits | target_rejection_sample | verifier subtotal |
+    | ---: | ---: | ---: | ---: | ---: |
+    | 1 | `17.449 ms` | `2.055 ms` | `1.159 ms` | `20.663 ms` |
+    | 2 | `17.609 ms` | `2.052 ms` | `1.114 ms` | `20.775 ms` |
+    | 3 | `17.847 ms` | `2.053 ms` | `1.115 ms` | `21.015 ms` |
+    | 4 | `17.908 ms` | `2.053 ms` | `1.113 ms` | `21.074 ms` |
+    | 5 | `17.936 ms` | `2.052 ms` | `1.108 ms` | `21.096 ms` |
+
+    Hot mean is `target_forward=17.750 ms`, `target_logits=2.053 ms`,
+    `target_rejection_sample=1.122 ms`, verifier subtotal `20.925 ms`.
+    This is close, but it is not below `20 ms` and is not long-output quality
+    evidence.
+- Sparse target top-k/top-p rejection sampler prototype:
+  - Added a model-free timing row to
+    `benchmarks/benchmark_sm70_rejection_sampler_micro.py`.
+  - Artifact:
+    `bench_results/verifier20_20260701/rejection_sampler_micro_sparse_target_topk_topp_mtp4_gpu0_20260701.json`.
+  - Result: current combined-bonus sampler `1.376 ms`; sparse target
+    top-k/top-p prototype `1.275 ms`; full current rejection core
+    `0.409 ms`.
+  - Decision: this saves only about `0.10 ms`, so do not spend the next
+    implementation pass rewriting the rejection sampler alone. It cannot close
+    the `~0.9 ms` gap to `20 ms`.
+- Pure-spec GDN mixed-QKV fused recurrent candidate:
+  - Added a model-free command to
+    `benchmarks/benchmark_sm70_gdn_exactness.py`:
+    `run-spec-mixed-qkv-candidate`.
+  - Artifact:
+    `bench_results/verifier20_20260701/gdn_pure_spec_mixed_qkv_candidate_steps256.pt`.
+  - Shape: `num_spec=4`, `graph_rows=5`, `k_heads=4`, `v_heads=8`,
+    `head_k_dim=128`, `head_v_dim=128`, random initial state.
+  - Result: graph mean was `93.592 us` for the current split
+    `conv + gating + recurrent` path and `92.840 us` for the fused mixed-QKV
+    path, only `0.753 us/layer` faster.
+  - Correctness result: not strict. Live output max diff was
+    `1.907e-06`, and SSM state max diff was `7.629e-06`.
+  - Decision: reject this as a verifier-cost fix. It is not bitwise-equivalent
+    and the measured win is far too small to justify quality risk.
+- LM-head/top1 route:
+  - The existing top1 path is a greedy-only optimization. It cannot replace the
+    official stochastic verifier logits path because native MTP4 must preserve
+    `temperature=1.0/top_p=0.95/top_k=20` sampling semantics.
+  - Do not use `VLLM_SM70_LM_HEAD_TOP1=1` for this acceptance target.
+- Cost model after this triage:
+  - `20.925 ms` current verifier subtotal.
+  - Already-measured AWQ gated-SiLU M>1 epilogue can save only about
+    `0.33-0.36 ms` in the modeled verifier MLP gate/up bucket and was
+    service-level neutral in the 256k API formal run.
+  - Sparse sampler saves only about `0.10 ms`.
+  - Combined known safe-ish micro gains still leave roughly `20.5 ms`, so the
+    next material candidate must be either:
+    1. a quality-safe larger reduction inside `target_forward`, especially AWQ
+       dense/logit projection work, or
+    2. a compact verifier-logits/rejection representation that avoids
+       full-vocab TP gather while keeping exact official top-k/top-p semantics.
+- Next microbench target:
+  - Prototype compact verifier logits for native MTP4: each TP rank computes
+    local full logits only locally, local top-k, local logsumexp, and
+    draft-token logits; communication gathers only small top-k/logsumexp/draft
+    tensors. The verifier then samples bonus/recovered tokens from the exact
+    global top-k/top-p distribution and computes draft acceptance from exact
+    target probabilities at draft token ids.
+  - Continue only if a model-free TP2 microbench predicts at least `0.5 ms`
+    end-to-end verifier subtotal reduction and preserves exact official
+    top-k/top-p probabilities for the no-penalty serving path.
+  - First single-GPU TP2-shard simulation was added to
+    `benchmarks/benchmark_sm70_rejection_sampler_micro.py` and run as:
+    `bench_results/verifier20_20260701/rejection_sampler_micro_compact_tp2_logits_mtp4_gpu0_20260701.json`.
+    It measured full-vocab top-k/top-p probability reference at `1.033 ms`
+    and compact TP2 prototype at `0.873 ms`, only `0.160 ms` faster before
+    real NCCL communication is modeled. Draft-token probability matched
+    exactly (`0.0` max diff), residual max diff was `1.244e-06`, and
+    `top_ids_equal=false` because zero-probability tail entries after top-p
+    truncation are not ordered identically. Treat this as directional only:
+    compact verifier logits needs a true two-rank communication microbench
+    showing at least another `~0.4 ms` saved from avoiding full-vocab gather
+    before production work is justified.
+
+## 2026-07-01 native MTP4 long-output quality repair for Qwen GDN verifier
+
+- Objective: resolve the long-output quality failure in the `~21 ms`
+  verifier-cost candidate before accepting it as a speed route. All runs used
+  Qwen3.6-27B-AWQ, TP2 on GPUs `0,1`, non-eager CUDA graph, TurboMind AWQ,
+  `max_model_len=8192`, `max_num_batched_tokens=1024`,
+  `mamba_cache_mode=align`, prefix caching, and official sampling
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`.
+- Repro failure for the previous candidate:
+  - Route:
+    `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
+    `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
+    `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
+    `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
+  - Full fixed-quality artifact:
+    `bench_results/verifier20_quality_20260701/inputcore003_release_quality_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+  - The failing `macos_6k_code` record had `repeat20=326`,
+    `repeat50=324`, `repeat100=320`, `max_same_line_run=327`, and tailed
+    into repeated `font-size: 0;`. This was route-specific: the full-GDN
+    control below passed the same prompt, seed, model, and sampling.
+- Full-GDN positive control:
+  - Route: all split/spec-core knobs off, allowing the MTP full-Qwen-GDN guard
+    to arm:
+    `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=0`,
+    `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
+    `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=0`,
+    `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
+  - Artifact:
+    `bench_results/verifier20_quality_20260701/fullgdn_release_macos_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+  - `macos_6k_code` passed with `steady_decode_tps=85.015`,
+    `repeat20=18`, `repeat50=5`, `repeat100=2`, and
+    `max_same_line_run=1`.
+- Input-core dependency repair attempt:
+  - `qwen_gdn_input_projection_core` now returns `(z_out, core_attn_out)`,
+    and `forward_cuda()` consumes those values before output projection. This
+    makes the compiled output projection depend on the opaque input/core op
+    value instead of only on a None-returning mutation side effect.
+  - It improved but did not fix the route. Artifact:
+    `bench_results/verifier20_quality_20260701/inputcore003_valuereturn_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+  - `macos_6k_code` still failed: `steady_decode_tps=92.509`,
+    `repeat20=36`, `repeat50=18`, `repeat100=13`,
+    `max_same_line_run=20`, tail repeated `padding: 0;`.
+  - Decision: keep this only as a diagnostic improvement for the rejected
+    input-core route. It is not a quality acceptance.
+- Output-projection custom-op attempt:
+  - A value-returning `qwen_gdn_output_projection` plus explicit final
+    `output.copy_()` passed a 512-token smoke but failed at 6000 tokens with a
+    worse all-zero tail.
+  - Artifact:
+    `bench_results/verifier20_quality_20260701/inputcore003_outputop_valuereturn_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+  - Failure metrics: `steady_decode_tps=97.055`, `repeat20=2379`,
+    `repeat50=2349`, `repeat100=2299`, `max_same_token_run=2398`,
+    `bad_marker_hits={'00000000000000000000': 119}`.
+  - Decision: reverted this code path. Do not use
+    `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=1` for quality or speed.
+- Input-core isolation:
+  - Route with input-core enabled but both spec-core knobs disabled, while
+    forcing no full-GDN guard:
+    `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1`,
+    `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
+    `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=0`,
+    `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
+  - Artifact:
+    `bench_results/verifier20_quality_20260701/inputcore_standardcore_valuereturn_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+  - This also failed, with `steady_decode_tps=100.745`, `repeat20=4557`,
+    `repeat50=4527`, `repeat100=4477`, `max_same_token_run=4576`, and a
+    repeated `2` tail. The log entered all-position acceptance
+    `1.000, 1.000, 1.000, 1.000`.
+  - Decision: `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1` is the long-output quality
+    trigger and remains rejected for 27B-AWQ native MTP4.
+- Accepted 27B-AWQ fixed-quality route:
+  - Route:
+    `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1`,
+    `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=0`,
+    `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
+    `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
+    `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
+  - Single `macos_6k_code` artifact:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+    It passed with `steady_decode_tps=91.350`, `repeat20=20`,
+    `repeat50=10`, `repeat100=2`, `max_same_line_run=3`, and mean
+    acceptance length about `4.08`.
+  - Full fixed-quality four-prompt artifact:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`;
+    summary:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_seed20260620/summary.md`.
+  - Four-prompt gate result: PASS, mean acceptance length `3.55`, KV tokens
+    `144913`. Per-prompt steady decode:
+
+    | prompt | tokens | steady decode | repeat20 | repeat50 | repeat100 | max same line |
+    | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+    | `macos_6k_code` | `6000` | `91.430 tok/s` | `19` | `3` | `1` | `3` |
+    | `python_service` | `2048` | `78.038 tok/s` | `5` | `1` | `1` | `1` |
+    | `database_design` | `2048` | `71.220 tok/s` | `9` | `2` | `1` | `1` |
+    | `long_chinese_report` | `2048` | `76.960 tok/s` | `10` | `4` | `1` | `5` |
+
+- Current decision:
+  - For Qwen3.6-27B-AWQ native MTP4 quality runs, use the accepted
+    no-input-core 003 route above. It is about `7.5%` faster than the
+    full-GDN control on the `macos_6k_code` quality run (`91.35` vs
+    `85.02 tok/s`) and only about `1.3%` slower than the rejected
+    input-core candidate (`91.35` vs `92.51 tok/s`) on that same prompt.
+  - Do not promote this to a global default until 35B-AWQ, FP8, and the
+    broader release quality matrix are checked. The existing full-GDN guard
+    remains the cross-route safety fallback.
+  - The next speed work should not revisit input-core without a strict
+    split-vs-full-GDN tensor exactness proof across late decode. To continue
+    toward verifier subtotal `<20 ms`, use this quality-safe no-input-core
+    003 route as the baseline and optimize logits/sampler or AWQ dense cost.
+
+### 2026-07-01 re-validation with verifier-cost profile
+
+- Re-ran the accepted no-input-core 003 route with
+  `VLLM_SM70_MTP_PROFILE=1` and `VLLM_SM70_MTP_PROFILE_INTERVAL=128` to check
+  quality and verifier cost in one run. Artifact:
+  `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_profile_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`;
+  summary:
+  `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_profile_seed20260620/summary.md`;
+  log:
+  `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_profile_seed20260620/logs/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.log`.
+- Quality remained PASS under official sampling:
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`,
+  `enable_thinking=True`. Four-prompt mean acceptance length was `3.52`.
+  Per-prompt quality:
+
+  | prompt | tokens | profiled steady decode | repeat20 | repeat50 | repeat100 | max same line | failures |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+  | `macos_6k_code` | `6000` | `83.035 tok/s` | `28` | `5` | `3` | `4` | none |
+  | `python_service` | `2048` | `69.901 tok/s` | `5` | `1` | `1` | `1` | none |
+  | `database_design` | `2048` | `60.524 tok/s` | `4` | `2` | `1` | `1` | none |
+  | `long_chinese_report` | `2048` | `67.824 tok/s` | `10` | `4` | `1` | `5` | none |
+
+- Verifier-cost parse used only steady `interval_spec_steps=128` profile
+  rows and excluded the cold `spec_steps=0` prefill/profile row plus partial
+  intervals. Across `23` valid steady intervals:
+
+  | item | mean | p50 | p90 | min | max |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | `target_forward` | `20.936 ms` | `20.514` | `22.604` | `19.956` | `23.492` |
+  | `target_logits` | `2.052 ms` | `2.051` | `2.053` | `2.049` | `2.056` |
+  | `target_rejection_sample` | `1.118 ms` | `1.114` | `1.128` | `1.109` | `1.137` |
+  | target verifier core (`forward+logits+rejection`) | `24.106 ms` | `23.702` | `25.763` | `23.126` | `26.653` |
+  | `state_update_wall_cpu` | `0.592 ms` | `0.592` | `0.607` | `0.577` | `0.610` |
+  | `bookkeeping` | `0.116 ms` | `0.116` | `0.118` | `0.113` | `0.118` |
+  | runner verifier subtotal without draft | `24.814 ms` | `24.430` | `26.470` | `23.842` | `27.362` |
+  | `draft_total` | `13.699 ms` | `13.404` | `15.479` | `12.568` | `16.293` |
+
+- Decision update:
+  - The output quality is confirmed again on the same accepted route.
+  - The quality-safe route does **not** meet the `<20 ms` verifier-cost target.
+    The remaining gap is mostly `target_forward` (`~20.94 ms`) plus logits
+    (`~2.05 ms`) and rejection sampling (`~1.12 ms`). The next optimization
+    should treat `24.1 ms` target verifier core, or `24.8 ms` including
+    state/bookkeeping, as the current measured quality-safe verifier-cost
+    baseline.
+
+### 2026-07-01 no-input-core 003 plus AWQ dynamic/no-preserve rejection
+
+- Goal: check whether the previously measured AWQ dynamic/no-preserve m=5
+  microbench win can be combined with the accepted no-input-core 003 GDN route
+  while preserving long-output quality.
+- Route:
+  `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1`,
+  `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=0`,
+  `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
+  `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
+  `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`,
+  plus `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`,
+  `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`,
+  `VLLM_SM70_AWQ_WARMUP_MAX_M=17`,
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`, and
+  `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`.
+- Artifact:
+  `bench_results/verifier20_quality_20260701/noinputcore_003_awqdyn_fixed_quality4_profile_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`;
+  summary:
+  `bench_results/verifier20_quality_20260701/noinputcore_003_awqdyn_fixed_quality4_profile_seed20260620/summary.md`;
+  log:
+  `bench_results/verifier20_quality_20260701/noinputcore_003_awqdyn_fixed_quality4_profile_seed20260620/logs/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.log`.
+- Result: route is rejected for quality. The fixed-quality gate failed on
+  `macos_6k_code`: `repeat20=2320`, `repeat50=2298`,
+  `repeat100=2290`, `bad_marker_hits={'rgba(rgba': 1}`, and the tail
+  repeated `display:`. The other three prompts passed, but the long-output
+  gate is the hard acceptance criterion.
+- Verifier-cost profile from `21` steady `interval_spec_steps=128` rows:
+
+  | item | mean | p50 | p90 | min | max |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | `target_forward` | `18.951 ms` | `18.486` | `20.602` | `17.969` | `21.571` |
+  | `target_logits` | `2.052 ms` | `2.052` | `2.054` | `2.050` | `2.055` |
+  | `target_rejection_sample` | `1.116 ms` | `1.112` | `1.133` | `1.107` | `1.134` |
+  | target verifier core | `22.119 ms` | `21.669` | `23.760` | `21.136` | `24.729` |
+  | runner verifier subtotal without draft | `22.836 ms` | `22.391` | `24.460` | `21.859` | `25.464` |
+
+- Interpretation:
+  - The AWQ dynamic/no-preserve selector gives a real forward-cost reduction
+    versus the accepted baseline (`target_forward` mean `20.936 -> 18.951 ms`),
+    but it still does not reach the `<20 ms` verifier-core target once logits
+    and rejection sampling are included.
+  - More importantly, it is not quality-safe on the long macOS/code prompt.
+    Do not use this route as the quality baseline and do not repeat it without
+    a numerical/root-cause fix for the AWQ selector output drift.
+  - The remaining quality-safe route remains the no-input-core 003 baseline
+    above: `24.106 ms` target verifier core / `24.814 ms` subtotal. The next
+    material path must either repair the faster input-core/GDN boundary with
+    strict late-decode tensor exactness, or introduce a larger exact verifier
+    forward/logits change. Sampler-only changes are too small for the target.
+
+### 2026-07-02 AWQ verifier quality-repair follow-up
+
+- Objective: keep the accepted no-input-core 003 GDN route, then recover some
+  of the AWQ verifier-forward speed without reintroducing long-output quality
+  collapse. All runs used official sampling
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`, TP2 on GPUs `0,1`,
+  Flash-V100, CUDA graph, and `mamba_cache_mode=align`.
+- Rechecked the fixed gate/up fast-target lane:
+  - `5x17408x5120 -> 8x256x64:3:3:0` looked fast in a single profiled
+    `macos_6k_code` run (`target_forward` around `20.05 ms`) but failed the
+    four-prompt gate:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_gateup_quality4_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+    The `macos_6k_code` record had `repeat20=151`, `repeat50=150`,
+    `repeat100=148`, `max_same_line_run=79`; reject.
+  - A more conservative `8x256x64:2:3:0` gate/up point passed one no-profile
+    four-prompt run, but failed the same `macos_6k_code` route when profiled:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_gateup_s2w3_macos6000_profile_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+    Failure metrics were `repeat20=719`, `repeat50=715`,
+    `repeat100=711`, `max_same_line_run=717`, with tail repeating
+    `content: '';`. Reject as unstable.
+  - The `s2w3` profile still showed real speed:
+    `target_forward=20.172 ms`, target verifier core `23.330 ms`, subtotal
+    `23.956 ms` across `9` steady intervals. This is not acceptable evidence
+    because the same run failed quality.
+- Micro checks:
+  - Gate/up split sweep on `M=5,N=17408,K=5120,count=63`:
+
+    | point | weighted mean |
+    | --- | ---: |
+    | default | `6.910 ms` |
+    | `s1w2` | `6.873 ms` |
+    | `s2w3` | `5.316 ms` |
+    | `s3w3` | `5.192 ms` |
+
+    The speed gain starts at split `2`, exactly where the long-output quality
+    instability appears. Split `1` is quality-conservative but has negligible
+    speed value.
+  - Removing gate/up from the fixed fast-target set and keeping only the other
+    four M=5 verifier descriptors was too small to matter:
+    `bench_results/verifier20_quality_20260701/awq_m5_nogate_fasttargets_micro_gpu0.json`
+    measured `18.459 ms` total modeled AWQ bucket vs same-GPU default
+    `18.661 ms`.
+- MLP gated-SiLU epilogue lane:
+  - `VLLM_SM70_AWQ_MLP_ENGINE=1` is exact in isolated real-weight checks. A
+    random-input probe over layers `1,2,32,62,63`, TP ranks `0,1`, and input
+    scales `0.25..16.0` found `max_abs_diff=0.0` between
+    `gate_up GEMM + torch.ops._C.silu_and_mul` and the fused AWQ gated-SiLU
+    epilogue.
+  - The isolated microbench remains only a small win:
+    `bench_results/verifier20_quality_20260701/awq_m5_gated_silu_candidate_micro_gpu0.json`
+    measured about `0.336 ms` weighted delta for `63` MLP calls.
+  - Combined with AWQ dynamic/no-preserve it still failed the macOS long-output
+    gate:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_awqdyn_mlpengine_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`,
+    `repeat20=357`, `repeat50=355`, `repeat100=353`, tail repeating
+    `:has(.traffic-light)`.
+  - MLP-engine only passed a single `macos_6k_code` run:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_mlpengine_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`,
+    `steady_decode_tps=92.372`, `repeat20=17`, `repeat50=5`,
+    `repeat100=2`.
+  - MLP-engine only failed the full four-prompt quality gate:
+    `bench_results/verifier20_quality_20260701/noinputcore_003_mlpengine_quality4_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
+    The `macos_6k_code` record had `repeat20=90`, `repeat50=30`,
+    `repeat100=1`, and `bad_marker_hits={'rgba(rgba': 1}`; reject.
+- Decision:
+  - Current accepted quality baseline is still the no-input-core 003 route
+    without AWQ dynamic/no-preserve, without fixed M=5 gate/up splitK fast
+    targets, and without `VLLM_SM70_AWQ_MLP_ENGINE=1`.
+  - The faster AWQ verifier lanes are real speed candidates, but none is
+    quality-safe under the current four-prompt gate. Do not count their
+    `22-23 ms` verifier-core numbers as accepted speed.
+  - The next useful repair is not another split/swizzle sweep. The failing
+    speed comes from changing the M=5 gate/up numerical/sampling path enough to
+    alter official-sampling long-output behavior. Continue only with a
+    root-cause harness that compares late-decode logits/distributions for the
+    accepted baseline vs the fast AWQ gate/up path, then either makes the fast
+    path bit/ULP-compatible at the logits boundary or abandons splitK gate/up
+    and moves to a different verifier-cost reduction.
+
+### 2026-07-02 MTP depth quality repair
+
+- Objective: fix the long-output quality collapse while preserving useful MTP
+  speedup. All runs used Qwen3.6-27B-AWQ, TurboMind AWQ, TP2 GPUs `0,1`,
+  Flash-V100, CUDA graph/non-eager, official sampling
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`, and the
+  `macos_6k_code` 6000-token quality prompt.
+- Current worktree target-only/no-spec is clean:
+  `bench_results/verifier20_quality_20260701/current_nospec_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-nospec.json`.
+  It passed with `steady_decode_tps=54.264`, `repeat20=16`,
+  `repeat50=6`, `repeat100=2`. Therefore the quality issue is not the target
+  model path alone.
+- Fixed-depth MTP2 is clean and keeps a real speedup:
+  `bench_results/verifier20_quality_20260701/current_mtp2_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp2.json`.
+  It passed with `steady_decode_tps=69.945`, `repeat20=14`,
+  `repeat50=4`, `repeat100=1`; this is `1.29x` over the same current no-spec
+  run.
+- Fixed-depth MTP3 is not quality-safe:
+  `bench_results/verifier20_quality_20260701/current_mtp3_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp3.json`.
+  It failed with `steady_decode_tps=97.061`, `repeat20=832`,
+  `repeat50=831`, `repeat100=828`, and the tail repeating
+  `<html lang="zh-CN">`. The log shows the same failure signature as MTP4:
+  acceptance reaches `0.996/0.996/0.996`, then sustained
+  `1.000/1.000/1.000` with mean acceptance length `4.00`.
+- Prior late alignment dumps showed the repeated loops are target/draft
+  self-consistent after the model enters the loop; this is not fixed by
+  sampler-only changes such as disabling the combined bonus path.
+- Follow-up root-cause isolation:
+
+  | run | artifact | result | interpretation |
+  | --- | --- | --- | --- |
+  | MTP3 legacy Qwen step index | `bench_results/verifier20_quality_20260701/current_mtp3_legacy_stepidx_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp3-legacy-stepidx.json` | FAIL, `steady_decode_tps=97.502`, `repeat20/50/100=832/831/828` | graph step specialization is not the trigger |
+  | MTP3 CPU GDN postprocess | `bench_results/verifier20_quality_20260702/current_mtp3_cpu_postprocess_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp3-cpu-postprocess.json` | FAIL, `steady_decode_tps=89.445`, `repeat20/50/100=832/831/828` | GPU postprocess is not the trigger |
+  | MTP3 draft temperature scale `0.50` | `bench_results/verifier20_quality_20260702/current_mtp3_draft_temp050_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp3-draft-temp050.json` | FAIL, `steady_decode_tps=86.005`, `repeat20/50/100=289/285/281` | sampler/proposal shape changes failure timing but does not fix target distribution |
+  | MTP3 draft temperature scale `0.25` | `bench_results/verifier20_quality_20260702/current_mtp3_draft_temp025_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp3-draft-temp025.json` | FAIL, `steady_decode_tps=87.990`, `repeat20/50/100=1656/1641/1616` | same conclusion |
+  | MTP3 full-Qwen-GDN verifier guard | `bench_results/verifier20_quality_20260702/current_mtp3_gdn_fullforward_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp3-gdn-fullforward.json` | PASS, `steady_decode_tps=82.566`, `repeat20/50/100=21/6/1` | root cause is in the split/003 GDN recurrent-core verifier boundary |
+  | MTP4 old 003 env after safety gate | `bench_results/verifier20_quality_20260702/current_mtp4_gdn003_gated_macos6000/run/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4-gdn003-gated.json` | PASS, `steady_decode_tps=89.907`, `repeat20/50/100=19/6/2` | the guard keeps MTP4 enabled while routing verifier through full-Qwen-GDN |
+
+- Root cause: the Qwen GDN `qwen_gdn_attention_core_003_spec` split
+  recurrent-core verifier route is quality-unsafe for native MTP with
+  `num_speculative_tokens >= 3`. It can produce a target/draft
+  self-consistent all-accept loop under official sampling, which is why the
+  rejection sampler later accepts every proposed position even while the text
+  degenerates. Full-Qwen-GDN verifier guard keeps the target verifier state
+  coherent and passes the same long prompt.
+- Decision:
+  - Restore the automatic 1Cat SM70 native-MTP serving default to MTP4, but
+    route deep native MTP through the full-Qwen-GDN verifier guard when
+    `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1` is present.
+  - Block `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1` for native MTP3/MTP4 by
+    default. `VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP=1` exists only for
+    diagnostic reruns of the unsafe route.
+  - Do not hard-truncate accepted tokens in the rejection sampler; that would
+    break the target distribution unless it resamples from the correct target
+    distribution. The correct fix is preserving target verifier semantics at
+    the GDN boundary.
+
+### 2026-07-10 live 256k MTP4 health check and no-MTP A/B
+
+- Objective: verify that the running user-facing Qwen3.6-27B-AWQ MTP4 service
+  is actually proposing and accepting tokens, retains long-output quality, and
+  produces a real decode win over a no-spec control. This is deliberately a
+  serving-path check, not a short synthetic route screen.
+- MTP service under test:
+  - Existing port `8000` service on physical GPUs `2,3`, TP2,
+    `qwen36-27b-awq-mtp4-256k`, `max_model_len=262144`, TurboMind AWQ,
+    Flash-V100, CUDA graph/non-eager, prefix caching with
+    `mamba_cache_mode=align`, and official sampling
+    `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`.
+  - Its process environment has MTP defaults enabled and leaves all Qwen GDN
+    split-core knobs unset, so it uses the full-Qwen-GDN verifier guard rather
+    than the rejected 003 split-core path. It also enables the current AWQ
+    small-shape dynamic/no-preserve selector.
+- Matched no-MTP control:
+  - A temporary port `8002` service ran on otherwise idle physical GPUs `0,1`
+    so the user-facing `8000` service was not restarted. It matched model,
+    TP2, 256k max length, TurboMind AWQ, Flash-V100, CUDA graph/non-eager,
+    prefix caching, `mamba_cache_mode=align`, scheduler capacity, and all
+    observed AWQ tuning environment values. It explicitly set
+    `VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS=1`; engine startup recorded
+    `speculative_config=None`.
+  - The V100 pairs are the same host/SKU but not the same physical device IDs,
+    so this is a close serving A/B rather than a same-process toggle.
+- Artifacts:
+  - MTP4 live record:
+    `bench_results/mtp_live_audit_20260710/mtp4_256k_awqdyn_live_macos6000_seed20260620.json`.
+  - No-MTP control directory:
+    `bench_results/mtp_live_audit_20260710/nomtp_control/`. The accepted
+    fully warmed record is
+    `nomtp_256k_fully_warm_macos6000_seed20260620.json`; the preceding
+    short warmup and two long records are retained to show JIT and run-to-run
+    variation rather than being silently discarded.
+- Both used the same macOS HTML/CSS/JavaScript generation prompt, `max_tokens=6000`,
+  and `ignore_eos=false`. Results:
+
+  | route | completion | finish | completion throughput | quality gate | MTP acceptance |
+  | --- | ---: | --- | ---: | --- | --- |
+  | MTP4 live | `5886` | natural `stop` | `80.111 tok/s` | pass (`repeat20/50/100=9/2/1`, no bad markers) | mean AL `4.016`; draft accept `75.41%`; per-position `92.56/79.95/69.30/59.82%` |
+  | no-MTP control | `6000` | length | `53.505-54.624 tok/s` | all passes (worst `repeat20/50/100=13/4/2`, no bad markers) | n/a |
+
+- The direct serving result is `1.47-1.50x` throughput (`+46.7-49.7%`) and
+  reduces completion-clock time from `18.307-18.690 ms/token` to
+  `12.483 ms/token` (`-5.824 to -6.207 ms/token`). This confirms that MTP is
+  live and useful on the current service; it is not a model-name-only
+  configuration.
+- Baseline stability handling:
+  - The first no-MTP long request JIT-compiled `batch_memcpy_kernel` during
+    inference. A short 128-token warmup did not cover that long-sequence
+    helper, so a second long request compiled it and a third long request ran
+    with no new inference-time JIT warning.
+  - The fully warm run measured `53.505 tok/s`; the three long no-MTP results
+    span `53.505-54.624 tok/s`. GPU0/1 were only `42/45 C` after the run,
+    versus `38/42 C` for the idle MTP pair, but the pairs cannot be treated as
+    perfectly identical thermal states. The reported A/B range keeps that
+    small uncertainty explicit.
+- Scope and residual risks:
+  - This is one long coding prompt. The earlier real 256k eight-prompt API
+    aggregate remained much lower: no-MTP `55.187 tok/s`, standard MTP4
+    `63.027 tok/s` with mean acceptance length `2.824`, and the faster AWQ
+    dynamic candidate `66.629 tok/s` with mean acceptance length `2.834`.
+    Do not generalize the `4.016` acceptance length or `1.467x` gain to all
+    production prompts.
+  - The direct MTP long output passed and naturally stopped, but the current
+    full-GDN plus AWQ dynamic/no-preserve combination has not yet completed a
+    four-prompt, 256k serving quality gate. The historical dynamic-selector
+    quality failure was coupled with the rejected 003 GDN route, so it does
+    not prove this live route bad, but it prevents a release-wide safety claim.
+  - The live environment explicitly has `VLLM_USE_AOT_COMPILE=0`; current
+    startup logs classify that Flash-V100 compile configuration as diagnostic
+    because regular torch.compile previously showed deterministic greedy token
+    drift. The stochastic serving gate above is positive evidence, not a
+    replacement for a greedy determinism gate.
+  - Seeded-repeat determinism is also pending for this server configuration.
+    Three serialized no-MTP requests used the identical prompt, request seed,
+    sampling parameters, and system fingerprint. The first two texts matched
+    through byte `21674` apart from a terminal-length difference, but the
+    fully warmed third request first differed at byte `13323`; all three still
+    passed the long-output quality gate. This occurs without MTP, so it is not
+    evidence that the MTP rejection path is wrong. It is late numerical/RNG
+    sensitivity in the current graph/AWQ configuration until a token-ID greedy
+    repeat and a seeded official-sampling repeat isolate the source.
+- Decision:
+  - Keep native MTP4 enabled with the full-Qwen-GDN verifier guard. Do not
+    revert to MTP2 or disable MTP based on the earlier MTP3/MTP4 split-core
+    failure.
+  - Before treating the current service configuration as a release-quality
+    default, run the existing four-prompt long-output gate and a token-ID
+    greedy repeat against the actual 256k API configuration. The next speed
+    investigation should then profile the quality-safe full-GDN verifier
+    round, not repeat this no-MTP A/B.
+
+## 2026-07-11 M=5 TurboMind AWQ CTA-local K parallelism
+
+- Detailed operator ledger:
+  `docs/design/qwen36_27b_awq_mtp_target_verifier_fastpaths.md`.
+- Corrected target contract: native MTP4 verifies five rows and executes 236
+  AWQ GEMMs/rank over the TP-local shapes `5x17408x5120` (63),
+  `5x5120x8704` (63), `5x8192x5120` (47), and `5x5120x3072` (63).
+  `benchmark_sm70_awq_verifier_micro.py --all-real-layers` now loads all real
+  checkpoint layers in runtime order; do not use old unsharded or 283-call
+  artifacts as this baseline.
+- New kernel prototype: keep the SM70 `8x256x64` CTA and packed W4A16 HMMA
+  path, but use `TG=1x4x2` so two warp groups partition K and combine FP32
+  partial accumulators inside the CTA. The current fixed gate/up NCU changed
+  from 159 to 120 registers/thread, eligible warps/scheduler from 0.343 to
+  0.637, and duration from 98.976 to 89.504 us.
+- Best component mix keeps gate/up on stock `TG=1x4x1` with split3/swizzle3
+  and uses `TG_K=2` for the other three shape descriptors at their original
+  split counts. Five same-GPU ABBA rounds over all 236 real weights measured
+  `11.3366 -> 9.4920 ms/rank`, saving `1.8446 ms` or 16.27%; the worst round
+  still saved `1.8324 ms`.
+- Isolated numerical gate is not exact: about 99.35% of output elements match
+  bitwise, maximum absolute difference is 0.001953125, and one rank observed
+  five near-zero sign flips over all 236 layers. This is sufficient to enter
+  official-sampling validation, not to default-enable the route.
+- Closed and removed: N-direction `TG=1x8x1` (occupancy rose but duration did
+  not), `TG_K=4` (shared-reduction/barrier regression), uniform low-register
+  tiles, and a plain/no-tile-allreduce specialization whose expected residency
+  threshold is already met by the current 159-register M=5 kernel.
+- The same-condition 6000-token gate rejects the `1.8446 ms` best mix despite
+  both outputs passing text-health checks. Fixed dispatch measured mean
+  acceptance length `3.96` and `94.014 tok/s`; the candidate measured `3.61`
+  and `88.381 tok/s`. The `8.84%` acceptance-length loss exceeds the agreed
+  `2%` limit. Artifacts are
+  `bench_results/awq_m5_structural_20260710/fullgdn_fixed_baseline_macos6000_seed20260620/`
+  and
+  `bench_results/awq_m5_structural_20260710/fullgdn_best_mix_macos6000_seed20260620_retry/`.
+  Gate/up `split3/swizzle3` is therefore rejected and must not be defaulted.
+- The follow-up user unit
+  `vllm-awq-m5-tgk2-native-quality-profile-20260711.service` keeps the original
+  split/swizzle for all four descriptors and changes only the CTA layout to
+  `TG=1x4x2`. The profiled 6000-token run reported mean acceptance length
+  `4.02` and no text-health failures, but the later unprofiled gate supersedes
+  that synchronized trajectory for release acceptance. The
+  all-real-weight same-GPU microbenchmark measured `11.3565 -> 10.8536 ms`,
+  saving `0.5029 ms` or `4.43%`; do not attribute the rejected split3 gain to
+  this cleaner candidate.
+- Candidate request throughput cannot be compared with the unprofiled fixed
+  quality run because the candidate synchronized CUDA timing events every
+  step. The completed fixed-profile control resolves the graph delta. At
+  aligned profiler calls `128/256/384/512`, fixed target forward measured
+  `24.206/24.506/25.384/25.483 ms` and original-split `TG_K=2` measured
+  `23.467/23.691/24.685/24.793 ms`. The four-point mean is
+  `24.895 -> 24.159 ms`, saving `0.736 ms` or `2.96%`; all four intervals win.
+  Artifacts are
+  `bench_results/awq_m5_structural_20260710/fullgdn_fixed_profile_macos2048_seed20260620/`
+  and
+  `bench_results/awq_m5_structural_20260710/fullgdn_tgk2_native_profile_macos6000_seed20260620/`.
+- The unprofiled four-prompt gate completed with healthy text on all four
+  prompts but rejects the selector for production acceptance. Aggregate mean
+  acceptance length was `3.32`; macOS steady decode was `88.529 tok/s`, below
+  the exact unprofiled fixed-dispatch macOS control at `94.014 tok/s`. The six
+  complete macOS metric windows before the next request boundary imply about
+  `3.65` weighted acceptance length versus fixed `3.96`. Artifact:
+  `bench_results/awq_m5_structural_20260710/fullgdn_tgk2_native_quality4_seed20260620/`.
+- Per-step CUDA event synchronization changed the sampling trajectory, so the
+  profiled single-prompt acceptance result (`4.02`) is not a release quality
+  gate. Keep original-split `TG_K=2` opt-in as component/graph evidence only;
+  do not default it or count the `0.736 ms` target-forward delta toward
+  accepted performance.
+- Structural follow-up: an isolated SM70 TP2 peer-read
+  `all-reduce + residual + Gemma RMSNorm` op now passes strict production-oracle
+  checks for `[5,5120]`. One join measured `0.029766 -> 0.023492 ms`; a CUDA
+  graph with 80 joins measured `2.186214 -> 1.453199 ms`, saving `0.733015 ms`
+  with both FP16 normalized output and FP32 residual bit-exact on both ranks.
+  The first generic/native RMSNorm comparison had one 1-ULP mismatch and was
+  discarded because the accepted graph uses `vllm_c`; no tolerance was added.
+  Artifacts are
+  `bench_results/awq_m5_structural_20260710/allreduce_rmsnorm_prototype_tp2_gpu01_vllmc_oracle.json`
+  and
+  `bench_results/awq_m5_structural_20260710/allreduce_rmsnorm_prototype_80joins_tp2_gpu01.json`.
+- The 80-join estimate covers 64 MLP-down plus 16 full-attention output
+  boundaries. Do not split the full-GDN op to chase its other 48 boundaries.
+  The fused op remains default off and does not count toward accepted target
+  forward until a compile matcher proves the route-hit count and a full-graph
+  A/B reproduces the component delta.
+
+## 2026-07-11 Exact two-register AWQ lookahead
+
+- The accepted conflict-free `8x64x64` TurboMind AWQ tactic now uses two
+  global-load register slots. It fetches the next K64 tile one full HMMA stage
+  earlier while retaining two shared stages, the original split counts, K
+  order, FP32 accumulation, and FP16 epilogue.
+- On all 236 real Qwen3.6-27B-AWQ TP2 rank-local M=5 calls, the same-GPU result
+  is `9.7679 -> 9.0439 ms` versus the previous N64/A-swizzle route, saving
+  `0.7240 ms` or `7.41%`. The original fixed TurboMind baseline is
+  `11.3419 ms`, so the accumulated accepted gain is `20.26%` (`1.254x`). All
+  236 output tensors remain bitwise exact.
+- Final gate/up NCU measures `73.696 us`, `649.6 GB/s`, 120 registers/thread,
+  6.69 KiB shared memory, and 11.66% achieved occupancy. Compared with the
+  previous N64 report, executed instructions fall `13.049 M -> 11.782 M` and
+  sampled long-scoreboard stalls fall `559 -> 334`; an SASS-identical replica
+  measured 232, so sample counts are not treated as deterministic.
+- Rejected paths: moving the old fetch earlier was noise; gate/up split 2 was
+  faster but produced 530 one-ULP differences; an A-first compiler memory
+  barrier regressed NCU; placing the default mainloop behind a generic lambda
+  regressed MLP down until the original branch was restored line-for-line.
+- Remaining gate/up stalls are concentrated on the cached activation load
+  feeding `STS.128`, not the steady streaming-weight store. The next valid
+  experiment is an A-only deeper lookahead that stays within the 128-register
+  residency boundary. MLP down remains unchanged and must preserve split 7.
+- Detailed implementation, commands, reports, and closed-path ledger:
+  `docs/design/sm70_awq_small_n_hmma_operator.md` and
+  `bench_results/awq_m5_smalln_hmma_20260711/summary.md`.
+
+## 2026-07-11 AWQ utilization follow-up
+
+- No follow-up candidate supersedes the exact two-register lookahead route.
+  The archived all-real baseline remains `9.0439 ms` for 236 M=5 rank-local
+  calls with 236/236 bitwise-exact outputs.
+- A third activation-prefetch stage compiled to 177 registers/thread plus a
+  64-byte stack and regressed representative time. Two-slot register rollover,
+  B/U/V-first stores, N32 lookahead 2, and final-K instruction reordering all
+  preserved exactness but lost wall time. These straightforward attempts to
+  hide the remaining activation load-to-store dependency are closed.
+- CTA_N=128 MLP down was a cache false positive: repeated use of one weight
+  measured about 9% faster, while two interleaved all-real controls regressed
+  by `0.029 ms` and `0.037 ms`. Stock lookahead 1 and all tested swizzle values
+  were slower as well. Repeated-weight timing is no longer an acceptance
+  benchmark for this weight-streaming operator.
+- Applying the two-warp A swizzle directly to the existing four-warp CTA_N=256
+  down kernel increased isolated time to `47.036 us` and registers to 163.
+  The next down attempt must introduce a four-warp warp-private operand layout,
+  or two independent N32 warp groups with narrower synchronization, while
+  retaining split 7 and exact reduction/K order.
+- Rejected registrations were removed. The restored source build measured
+  `9.0721 ms` over all real calls with exact outputs; this is a regression
+  sanity check, not a replacement for the archived accepted baseline.
+
+## 2026-07-11 Exact AWQ lookahead corrected MTP4 API check
+
+- The initial `91.660 tok/s`, acceptance `3.60-3.64` screen is not the July 10
+  dynamic-vocabulary API workload. It used direct `LLM.generate`, an explicit
+  thinking-enabled chat template, a 72-token prompt, an English reasoning
+  trajectory, and a 6000-token cap. Keep it only as a separate workload.
+- Corrected setup reproduces the OpenAI chat payload: 74 prompt tokens,
+  `max_tokens=12000`, EOS enabled, official
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`, and no thinking
+  override. Server settings remain Qwen3.6-27B-AWQ, TP2 GPUs 2/3, TurboMind,
+  MTP4, full-GDN, Flash-V100, non-eager CUDA graphs, and 256k max length.
+- Route-hit logs confirm the current default dynamic vocabulary: base 98,304,
+  512 shard-local GPU-LRU rows per rank, 1,024 gathered tail IDs, fused TP2
+  proposal, RNG width 99,328, and one-shot target prefill top-k 2048.
+- Two same-process natural-stop requests both emitted 5,376 tokens and had
+  identical text. Results were `100.222/100.753 tok/s`, acceptance
+  `3.972653`, draft acceptance `74.316%`, and per-position acceptance
+  `0.9076/0.7916/0.6940/0.5795`; both passed the quality gate.
+- Closest July 10 current-default evidence is `100.623 tok/s`, acceptance
+  `4.017836`, and draft acceptance `75.446%`. Current acceptance differs by
+  only `-1.125%`, within the 2% bound, and warm throughput differs by
+  `+0.129%`. There is no material dynamic-vocabulary regression.
+- Operational correction: current API startup no longer implicitly enables
+  MTP4. Exact baseline reproduction requires
+  `VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1`; otherwise only prefix/mamba serving
+  defaults are applied and the server runs without speculative decoding.
+- Corrected artifacts:
+  `bench_results/awq_m5_smalln_hmma_20260711/e2e_mtp4_api_dynamic_default_natural_seed20260620/`.
+  The test server was stopped and the original source-tree `_C` restored.
+
+## 2026-07-11 Strict AWQ kernel-to-endpoint A/B
+
+- The historical `100.623 -> 100.753 tok/s` comparison did not isolate the
+  M=5 kernel because the generated sequence and acceptance counters differed.
+  It is retained as a dynamic-vocabulary quality check, not as evidence for or
+  against the kernel speedup.
+- A current-source registration-only control removed the two A-swizzled
+  N32/N64 entries and measured `11.3379 ms` over all 236 real rank0 M=5 AWQ
+  calls. Restoring the optimized route measured `9.0476 ms`, saving
+  `2.2903 ms` or `20.201%`; all 10,634,240 compared elements were exact. An
+  independent rank1 check also compared all 236 outputs bitwise exact.
+- The initial unrestricted registration is rejected for deployment even
+  though it reached `101.0555 tok/s`. It exposed CTA-M8 tactics to a 74-token
+  prefill QKV/Z projection and changed 2,072 of 606,208 elements, maximum
+  absolute difference `0.00048828125`. This changed the dynamic-vocabulary
+  bootstrap and seeded response hash.
+- The accepted fix registers both tactics through
+  `ExactMKernelImpl<Gemm, 5>`. TurboMind dispatch now also revalidates
+  `kernel->is_feasible()` on exact and lower-bound cache hits, preventing
+  imported or cross-batch cache reuse from bypassing the verifier-only
+  contract. The 74-token representative prefill is again 5/5 bitwise exact.
+- Strict API A/B uses fresh servers, the same 74-token chat payload, official
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`, natural stop,
+  Qwen3.6-27B-AWQ TP2 GPUs 2/3, TurboMind, MTP4, full-GDN, Flash-V100,
+  non-eager CUDA graphs, 256k max length, and the default dynamic vocabulary.
+- Fixed and final both emitted 5,473 tokens with response hash
+  `a88dbb947f702b60172bd9f5912fb4a29a425c3767ffd777b6b3afc5cf8ddedf`,
+  acceptance length `3.965217`, draft acceptance `74.1304%`, 4,092 accepted
+  tokens, 5,520 draft tokens, 1,380 rounds, per-position counts
+  `1253/1097/948/794`, natural stop, and quality pass.
+- Stable throughput is `95.9467 -> 100.5474 tok/s`, an exact-trajectory gain
+  of `4.795%`. The MTP round falls `41.3273 -> 39.4363 ms`, saving
+  `1.8910 ms`. This realizes `82.6%` of the microbenchmark's absolute saving;
+  the remaining about `0.40 ms` is full-graph critical-path overlap and
+  scheduling composition, not a wrong-call or wrong-weight microbenchmark.
+- Accepted binary:
+  `bench_results/awq_m5_smalln_hmma_20260711/e2e_strict_current_source_ab/_C.optimized_m5_only_cache_guard.abi3.so`,
+  SHA-256
+  `7643aac62ad000f2e9d4ab17ac712387ae31685babb2df9ef909fb0493af6141`.
+  The active and build-tree `_C.abi3.so` files matched this hash during the
+  strict A/B; later TP4 sampler work changes the combined-library hash. The
+  validation API was stopped.
+- Full ledger:
+  `bench_results/awq_m5_smalln_hmma_20260711/e2e_strict_current_source_ab/summary.md`.
+
+## 2026-07-12 Qwen3.6-27B-AWQ TP4 MTP4
+
+- Four V100 GPUs 0-3 are pairwise connected by NVLink `NV2`. TP4 startup with
+  the default configuration correctly failed because the ranking artifact was
+  TP2: `Ranking artifact TP=2, runtime TP=4`. No dynamic-vocabulary-off result
+  is accepted as a TP4 comparison.
+- Added an explicit TP4 ranking artifact derived from the same global ranking,
+  with four 62,080-row shards. The default remains TP2; TP4 requires explicit
+  ranking and dynamic-vocabulary environment settings.
+- Generalized the packed top-20 sampler from a hard-coded 40 candidates to the
+  candidate count inferred from the gathered tensor. This supports TP2's 40
+  and TP4's 80 candidates. The initialization gate now accepts TP2 or TP4.
+- TP2 and TP4 fused-proposal microbenchmarks match reference sampled tokens and
+  sparse IDs; maximum probability difference is `7.45e-9`. Four-step CUDA
+  graph replay is `2.8756 ms` for TP2 and `1.9323 ms` for TP4 (`-32.8%`).
+- Full TP4 settings: Qwen3.6-27B-AWQ, TurboMind, MTP4, full-GDN,
+  Flash-V100, non-eager CUDA graphs, 256k length, official
+  `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`, and natural stop.
+- Stable TP4 median is `119.9241 tok/s`, acceptance `4.058069`, draft
+  acceptance `76.4517%`, and normalized MTP round `33.8386 ms`; quality passes.
+  Accepted TP2 is `100.5474 tok/s`, acceptance `3.965217`, and round
+  `39.4363 ms`. TP4 therefore gives `+19.27%` throughput, `+2.34%` acceptance,
+  and `-5.5976 ms`/`-14.19%` round time.
+- Acceptance is not an exact capacity-matched A/B: the 512-row per-rank GPU-LRU
+  policy yields a 2,048-row global tail on TP4 versus 1,024 on TP2. There is no
+  acceptance or quality regression, but do not attribute the favorable
+  acceptance delta solely to tensor parallelism.
+- Fresh-server first requests reproduce identical text/counters. Same-server
+  later requests differ in text because the GPU-LRU tail persists and evolves
+  across requests; their acceptance and warm speed remain stable.
+- Candidate combined-library SHA-256:
+  `466f41781e80c80524546c4d0a3172122c8dced34268112d604526663538e10c`.
+  Validation API stopped. Full evidence:
+  `bench_results/awq_m5_smalln_hmma_20260711/tp4_mtp4_api_20260712/summary.md`.
+
+## 2026-07-12 Qwen3.6-27B-AWQ no-MTP TP2/TP4 scaling diagnosis
+
+- Purpose: isolate whether the weak TP4 MTP4 endpoint gain comes from MTP
+  acceptance/draft work or the target decode itself. This diagnostic pair uses
+  Qwen3.6-27B-AWQ, TurboMind AWQ only, Flash-V100, non-eager FULL CUDA graphs,
+  custom all-reduce, one sequence, input/output `512/256`, and greedy
+  `temperature=0/top_p=1/top_k=-1/ignore_eos` sampling. Both results record
+  `spec_decode_metrics=null`; MTP is absent.
+- Low-overhead repeated result: TP2 is `55.5579 tok/s`, `17.9999 ms` TPOT;
+  TP4 is `70.7514 tok/s`, `14.1340 ms` TPOT. That is only `+27.35%` TPS and
+  `-21.48%` TPOT, realizing `43.0%` of the ideal two-to-four-rank latency
+  reduction. MTP is therefore not the primary cause of the limited TP4 speedup.
+- Nsight Systems stable graph-node composition: target AWQ packed-4bit GEMM
+  remains the dominant critical-path category, `10.765 -> 8.197 ms` (56.8% to
+  54.0%). FP16 projections save `1.334 ms`, but TP communication grows
+  `1.455 -> 1.860 ms`. Stable host slack is effectively zero. The parser's
+  legacy `TurboMind NVFP4 GEMM` category name refers to the AWQ W4A16 route in
+  this artifact, not NVFP4 weights.
+- Current-binary real-weight M=1 AWQ microbenchmark agrees: all 236 local AWQ
+  calls per rank fall only `8.9768 -> 7.1968 ms` (`-19.83%`). In the weighted
+  representative manifest, gate/up saves only `19.8%`, while two TP4 row
+  projection families regress by about `23%` despite their local K dimension
+  halving.
+- NCU establishes the leading gate/up root cause. TP2
+  `M=1,N=17408,K=5120` uses the `MMA_Map<8,256,64>` family with 216 CTAs,
+  18.15% achieved occupancy, 59.9% DRAM throughput, and 44.7% SM throughput.
+  TP4 `M=1,N=8704,K=5120` uses the same family but only 68 CTAs, fewer than
+  the 72 V100 SMs: achieved occupancy falls to 6.24%, DRAM to 37.4%, and SM
+  to 27.2%. Both show approximately 4.8-way shared-load bank conflicts.
+- Decision: prioritize an exact TP4 M=1 AWQ gate/up decomposition with more
+  CTAs (CTA-N 64/32 candidates), then a conflict-free shared layout. Treat the
+  TP4 `M=1,N=5120,K=1536` row path as a separate barrier/scheduler-stall
+  problem. Do not credit later MTP endpoint changes as AWQ scaling wins until
+  this no-MTP pair improves.
+- Full commands, raw low-overhead results, graph-node per-token tables,
+  real-weight microbenchmarks, and four NCU reports are in:
+  `bench_results/tp_scaling_nomtp_20260712/summary.md`.
+
+## 2026-07-12 Qwen3.6-27B-AWQ TP4 M=1 AWQ gate/up CTA fill
+
+- Implemented an exact-shape TurboMind AWQ selector for the TP4 merged gate/up
+  descriptor `sm70_f16_u4k128_f16_tnt_fff_1x8704x5120_1`. The selector chooses
+  `CTA=8x64x64`, split 2, swizzle 4. The candidate is registered with an
+  `ExactMnkKernelImpl` guard, so it is infeasible outside `M=1,N=8704,K=5120`;
+  no prefill, MTP verifier M=5, or row-projection route can reuse it.
+- The tactic turns the prior 68-CTA underfill into 288 CTAs. NCU moves
+  achieved occupancy `6.24% -> 11.51%`, DRAM peak `37.35% -> 48.67%`, and SM
+  throughput `27.23% -> 37.04%`; the dominant approximately 4.8-way shared
+  A-load conflict falls to 0.3433% excessive shared wavefronts.
+- All-real weight gates pass on both TP ranks. Rank 0 is
+  `7.1955 -> 6.4429 ms` (`-10.46%`) and rank 1 is
+  `7.1955 -> 6.4452 ms` (`-10.43%`), with 236/236 tensors and
+  1,385,984/1,385,984 output elements per rank exactly equal to baseline.
+- Same-binary, no-MTP TP4 endpoint A/B with non-eager FULL CUDA graphs,
+  TurboMind AWQ, Flash-V100, input/output `512/256`, and greedy sampling gives
+  `70.7158 -> 74.2807 tok/s` and `14.1411 -> 13.4624 ms` TPOT. The token IDs
+  and text are exact across all three repeats in both arms; both record
+  `spec_decode_metrics=null`. The `0.6787 ms` endpoint gain realizes 90.2% of
+  the rank-0 real-weight microbenchmark saving.
+- This is a diagnostic graph lane because it retains
+  `VLLM_USE_AOT_COMPILE=0`; do not claim it as an official-sampling, 256k, or
+  MTP quality acceptance result. It is nevertheless valid evidence that the
+  TP4 AWQ target-decode bottleneck was reduced rather than merely moving a
+  microbenchmark number.
+- Binary SHA-256: `4f5603244cd0dbbd3669c2d5001991f4c115f4d6c110d3ef92a2ee1281dbdb87`.
+  Full ledger: `bench_results/tp4_awq_m1_cta_fill_20260712/summary.md`.
+
+## 2026-07-12 Qwen3.6-27B-AWQ TP4 M=1 row projection K64
+
+- Accepted a second exact TP4 AWQ selector for
+  `sm70_f16_u4k128_f16_tnt_fff_1x5120x1536_1`, used 63 times/rank/token by
+  47 linear-attention output and 16 full-attention O projections. It selects
+  `CTA=8x256x64`, `MMA=1x4x1`, split 12, swizzle 4, and pins the
+  `s884_1x4x1` kernel name. The descriptor-specific rule excludes prefill,
+  MTP verifier M=5, and all other M=1 shapes.
+- All-real exactness passes on rank 0 and rank 1: each has 236/236 tensors and
+  1,385,984/1,385,984 output elements exactly equal to baseline. A paired
+  real-weight rank-0 control improves `6.4509 -> 6.1731 ms` (`-4.31%`) after
+  the already accepted gate/up tactic.
+- This is a K-stage/control reduction, not an achieved-occupancy win. NCU
+  shows instruction count `2.50M -> 1.78M` and barrier as no longer the top
+  warp stall, while occupancy falls `24.13% -> 16.08%` and shared-load bank
+  conflict rises 4.1-way to 4.7-way. The next row mechanism is a four-warp
+  conflict-free A layout; split counts other than 12 are excluded because they
+  alter the exact serial reduction contract.
+- Full no-MTP TP4 graph validation adds `74.2807 -> 75.9375 tok/s` and
+  `13.4624 -> 13.1687 ms` TPOT beyond gate/up. Relative to the original TP4
+  diagnostic baseline, the two tactics produce `70.7158 -> 75.9375 tok/s`
+  (`+7.38%`) and `14.1411 -> 13.1687 ms` (`-6.88%`). All three token sequences
+  remain exact and `spec_decode_metrics=null` in every arm.
+- The endpoint lane is still `VLLM_USE_AOT_COMPILE=0`, so it is not an
+  official-sampling, 256k, or MTP quality acceptance claim. Final active
+  binary SHA-256 is
+  `d2e41af2f9e4ce5575a06830e2ef7d3d02316d9f581bc2024f5aa2053a5cee4f`.
+  Full ledger: `bench_results/tp4_awq_m1_row_20260712/summary.md`.
+
+## 2026-07-12 TP4 row conflict-free A-layout result
+
+- Rejected the direct reuse of `Operand_A_Swizzle_8x64` for the accepted TP4
+  row `M=1,N=5120,K=1536` `8x256x64` route. The diagnostic route was uniquely
+  selected, and its real AWQ layer output was exactly equal (`5,120 / 5,120`
+  elements), so this is a performance decision rather than a correctness
+  failure.
+- NCU confirms that it fixes the intended A shared-memory issue: excessive
+  shared wavefronts fall `211,200 (47%) -> 15,360 (6%)`. The generic route's
+  nine 16-byte A loads each show 16-way conflicts; they are absent in the
+  swizzled report.
+- It does not reduce the main issue gap. Registers grow `159 -> 163`, executed
+  instructions `1.769M -> 1.860M`, no-eligible cycles remain about `81%`, and
+  NCU duration regresses `30.56 -> 31.90 us`. The temporary registration was
+  removed from the source and must not be enabled as a default tactic.
+- Future TP4 row work must target a lower-register dependency/synchronization
+  design, such as warp-private A staging or independent N32 warp groups, not
+  another whole-tile XOR swizzle. Full evidence:
+  `bench_results/tp4_awq_m1_row_20260712/summary.md` and
+  `bench_results/tp4_awq_m1_row_conflictfree_20260712/`.
+
+## 2026-07-12 TP4 row eight-warp decomposition result
+
+- Rejected a bare `TG_N=8` variant of the same `8x256x64`, split-12 row CTA.
+  It assigns one N32 footprint to each of eight warps and preserves exact
+  output, but does not change the count of CTAs or the reduction contract.
+- NCU gives better local utilization (`159 -> 115` registers/thread,
+  `16.03% -> 22.63%` occupancy, `81.29% -> 73.45%` no-eligible cycles), but
+  total instructions grow `1.769M -> 2.151M`. Alternating CUDA-event pairs
+  are `-0.45%` and `+0.44%`; no default selector was added.
+- The current mainloop duplicates staging/control work across added warp
+  groups. Future warp-private designs need explicit non-overlapping A/B/V
+  staging ownership; do not repeat the registration-only `TG_N=8` experiment.
+
+## 2026-07-12 TP4 gate/up M1 live-A HMMA result
+
+- The next high-leverage gate/up route is a separate exact mainloop for
+  `M=1,N=8704,K=5120`, not a CTA-size or swizzle sweep. The accepted N64 grid
+  has 272 useful work tiles; N32/N64/N128 alternatives have approximately the
+  same useful warp supply, so they cannot fix underfill by themselves.
+- The diagnostic preserved HMMA, K64 order, AWQ group-128 metadata cadence,
+  split-2 FP32 serial reduction, and the accepted B/U/V pipeline. It was
+  bitwise exact for the real gate/up layer (`8,704 / 8,704` elements).
+- Rejected at the first microbenchmark gate: `35.30 -> 41.42 us` (`+17.3%`).
+  NCU shows registers/thread `120 -> 168`, theoretical occupancy
+  `25% -> 18.75%`, instructions `5.919M -> 6.341M`, DRAM throughput
+  `48.67% -> 40.75%`, and no-eligible cycles `58.45% -> 60.55%`.
+- The temporary mainloop/config/registration were removed. Do not retry a
+  copied M1 mainloop that expands the register footprint; it fails the stated
+  admission criterion before any all-real or endpoint run.
+
+## 2026-07-12 TP4 QKVZ exact N64 selector
+
+- Added an exact TurboMind AWQ selector for
+  `sm70_f16_u4k128_f16_tnt_fff_1x4096x5120_1`. It uses `CTA=8x64x64`, split 4,
+  swizzle 4 and is guarded to `M=1,N=4096,K=5120`; it cannot affect TP2,
+  prefill, MTP M=5, MLP-down, or row projections.
+- The prior `8x256x64` route launches `(1,16,4)=64` CTAs. N64 launches
+  `(16,4,4)=256` CTAs. NCU reports registers/thread `159 -> 120`,
+  register-limited resident blocks/SM `3 -> 8`, active warps `6.23% -> 9.98%`,
+  DRAM `27.24% -> 32.18%`, SM throughput `20.51% -> 25.13%`, and attribution
+  duration `37.920 -> 32.416 us`.
+- One real QKVZ layer improves `27.896 -> 22.729 us`; the weighted 47-call
+  mix improves `1.3111 -> 1.0683 ms`. All-real rank 0 improves
+  `6.1747 -> 5.9398 ms` and rank 1 `6.1540 -> 5.9414 ms`, with every one of
+  the 236 rank-local tensors bitwise equal on both ranks.
+- Closed MLP-down N-shape tests: exact N64, N128, and N256/swizzle4 all regress
+  the `M=1,N=5120,K=4352`, split-7 path while remaining exact. Do not copy the
+  QKVZ rule to MLP-down; its split-K epilogue cost is separate.
+- Artifacts: `bench_results/tp4_awq_m1_cta_fill_20260712/qkv_down_*`,
+  `all_real_current_rank{0,1}_*`, and
+  `ncu_qkv_{baseline_256,cta64}.ncu-rep`.
+- The QKVZ rule now has a same-binary TP4 no-MTP CUDA-graph proof isolated by
+  `VLLM_SM70_AWQ_TP4_QKV_CTA64` (default on): `i512/o256` greedy decode moves
+  from `76.0039 tok/s, 13.1572 ms TPOT` to `77.3787 tok/s, 12.9235 ms TPOT`
+  (`+1.81%`, `-0.2338 ms`). All five token-id arrays and texts are identical;
+  the candidate graph-capture trace selects `8x64x64`, split 4, swizzle 4.
+  This realizes the expected `0.21-0.24 ms` all-real operator reduction rather
+  than relying on a synthetic measurement. Artifacts are in
+  `bench_results/tp4_awq_m1_cta_fill_20260712/endpoint_qkv_cta64/`.
+
+## 2026-07-12 TP4 gated-SiLU epilogue endpoint rejection
+
+- The existing TurboMind gated-SiLU epilogue was tested only for TP4 decode
+  `M=1,N=8704,K=5120`, retaining the accepted split-2 gate/up GEMM math and
+  leaving prefill and MTP verifier shapes on the baseline path. The direct
+  real-layer probe is exact and saves `6.152 us` on rank 0 and `6.260 us` on
+  rank 1, which extrapolates to `0.3876-0.3944 ms` for 63 gate/up calls.
+- The extrapolation is rejected by a same-config full non-eager CUDA-graph
+  `i512/o256` A/B: baseline is `77.4879 tok/s, 12.9052 ms TPOT`; candidate is
+  `77.3671 tok/s, 12.9254 ms TPOT`. Five of five output token-id arrays and
+  texts are exactly equal, so this is a performance rejection rather than a
+  quality failure.
+- The TP4-only Python route was removed rather than left default-off. Do not
+  re-open this epilogue route without a mechanism explaining why its local
+  saving reaches the graph critical path. Evidence:
+  `bench_results/tp4_awq_m1_cta_fill_20260712/tp4_gated_silu_probe/summary.md`.
+
+## 2026-07-12 TP4 gate/up producer-consumer rejection
+
+- A separate exact `M=1,N=8704,K=5120` TurboMind PC prototype used two producer
+  and two consumer warps while preserving CTA `8x64x64`, split 2, swizzle 4,
+  K order, AWQ group-128 cadence, FP32 split reduction, and FP16 output.
+  ptxas reduced registers `120 -> 95`, introduced no spills, and retained the
+  generic epilogue's pre-existing 64-byte stack frame. A real layer's 8,704
+  FP16 outputs are bitwise exact.
+- The no-trace three-pair timing gate rejects it: baseline `35.073 us`, PC
+  `46.008 us` (`+31.18%`, or `+0.6889 ms` over 63 calls). The trace-enabled
+  route-hit run is excluded from timing because its per-launch stderr logging
+  creates artificial host launch gaps.
+- The first PC version reconstructs producer iterators and performs four-warp
+  handoff work at every K64 stage; this control cost dominates. The temporary
+  header, exact registry entry, and selector gate were removed. Do not repeat
+  this non-persistent PC design. Any future PC work requires persistent
+  producer iterator state and a new microbenchmark admission argument.
+  Evidence: `bench_results/tp4_awq_m1_cta_fill_20260712/pc_gateup/summary.md`.
+
+## 2026-07-12 TP4 gate/up three-slot global-lookahead rejection
+
+- A default-off exact-MNK TurboMind AWQ experiment added a third complete
+  A/B/U/V global-load register slot for `M=1,N=8704,K=5120`. It was motivated
+  by the remaining `LDG -> STS.128` long-scoreboard sample, but preserves K64
+  order, group-128 metadata cadence, shared-store order, HMMA accumulation,
+  split-2 reduction, and every one of the real gate/up output's 8,704 FP16
+  elements exactly.
+- The first GPU-1 screen is not the timing authority because its absolute
+  control time is slower than the historical route. Clean physical-V100-GPU2
+  two-slot builds measure `34.3581` and `34.1828 us` (mean `34.2705 us`);
+  the exact three-slot candidate measures `46.4384` and `45.6967 us` (mean
+  `46.0676 us`, `+34.4%`). The candidate therefore fails before any all-real
+  or endpoint work.
+- `cuobjdump` shows clean two-slot `120` and three-slot `165`
+  registers/thread, with unchanged 64-byte stack, zero local memory, and
+  6,688-byte dynamic shared memory. More importantly, merely compiling the
+  generic three-slot branch makes its two-slot control `46.2771 us` (`+35.0%`)
+  even while it still reports 120 registers. This is a code-generation
+  perturbation, not a valid in-build A/B improvement.
+- The mainloop specialization and `_gmem_l3` registry entry were removed; the
+  restored two-slot route is bitwise exact, returns to 120 registers/thread,
+  and measures `34.1828 us` on GPU2. Do not retry generic three-slot lookahead
+  without isolating the candidate so clean two-slot code generation remains
+  unchanged, a new register/occupancy argument, and a repeatable at-least-2%
+  win against the clean microbenchmark control.
+  Evidence: `bench_results/tp4_awq_m1_cta_fill_20260712/gmem_l3/summary.md`.
+
+## 2026-07-12 TP4 custom all-reduce + Gemma RMSNorm microbenchmark
+
+- Added an explicit standalone TP4 custom op that retains the production
+  `cross_device_reduce_1stage<half,4>` accumulation order, then performs FP32
+  residual add and Gemma RMSNorm in the same CUDA-graph node. It is not yet
+  wired into a model compiler pass or automatic runtime dispatch.
+- All four V100 ranks pass `torch.equal` for both the normalized FP16 output
+  and residual FP32 output at `[1,5120]` and verifier-shaped `[5,5120]`.
+- Max-rank graph timing: M=1 `28.570 -> 20.801 us` (`-7.769 us`, `1.374x`);
+  M=5 `29.551 -> 23.442 us` (`-6.108 us`, `1.261x`). This is only a generic
+  C++ suffix baseline, not a production compiler baseline. The subsequent
+  compiler and endpoint gate is recorded below. Evidence:
+  `bench_results/tp4_ar_gemma_rms_20260712/summary.md`.
+
+## 2026-07-12 TP4 custom all-reduce + Gemma RMSNorm compiler-route rejection
+
+- The default-off TP4 compiler/runtime route was verified to enter CUDA graph
+  capture on all four ranks and preserves both FP16 normalized output and FP32
+  residual bitwise. It is nevertheless rejected and the automatic route has
+  been removed.
+- The decisive compiler/CUDA-graph microbenchmark compares the true compiled
+  suffix, not the generic C++ RMSNorm micro baseline: M=1 is
+  `16.483 -> 18.689 us` (`+2.205 us`, `+13.38%`), and M=5 is
+  `18.356 -> 23.321 us` (`+4.965 us`, `+27.05%`). The opaque fused op prevents
+  Inductor from retaining the faster native residual + Gemma RMSNorm fusion.
+- Full Qwen3.6-27B-AWQ TP4 no-MTP AOT CUDA-graph `i512/o256` confirms the
+  prediction: `77.733 tok/s, 12.865 ms TPOT` baseline versus
+  `76.967 tok/s, 12.993 ms` candidate (`-0.99%`, `+128.0 us/token`). Three of
+  three output token arrays/hashes are identical, so this is a performance
+  rejection, not a quality failure.
+- Keep only the explicit standalone `CustomAllreduce` operator and benchmark
+  as research material. Do not reconnect this path based on the
+  `28.570 -> 20.801 us` standalone M=1 result; any successor must first beat
+  the compiled `16.483 us` M=1 baseline. Evidence:
+  `bench_results/tp4_ar_gemma_rms_20260712/`.
+
+## 2026-07-12 TP4 MLP-down split-7 reducer rejection
+
+- The TurboMind AWQ target is the true TP4 decode down projection
+  `M=1,N=5120,K=4352`, production CTA `8x256x64`, `mma=1x4x1`, split 7. An
+  exact stage-only variant preserves K64 traversal and replays the seven FP32
+  partial planes in original order in a second same-stream reducer. A real
+  layer is bitwise exact: all `5120 / 5120` FP16 values match.
+- This path is rejected by the direct CUDA-event admission test on physical
+  V100 GPU2: restored production is `24.375 us` per call (`1.5356 ms` over 63
+  calls), whereas stage plus reducer is `38.7448 us` (`2.4409 ms`, `+58.9%`).
+  The previous adjacent clean baseline of `24.7139 us` confirms this is a large
+  regression rather than timing noise.
+- A standalone split-7 reducer's `10.4850 -> 5.5552 us` improvement is retained
+  as a synchronization experiment only. It must not be extrapolated to a GEMM:
+  materializing and re-reading all seven FP32 accumulator planes, plus the
+  extra kernel launch, dominates the saved serial semaphore tail.
+- NCU shows the separate reducer is only 20 CTAs (`0.03` waves/SM); its 12.4%
+  achieved occupancy cannot compensate for the added traffic. The stage kernel
+  remains at 158 registers/thread versus baseline 159. All candidate selector,
+  registry, epilogue, and CUDA-graph integrations were removed. Do not reopen
+  generic split-plane plus reducer or last-arrival paths without eliminating the
+  full plane round trip, bitwise proof, and a repeatable >=2% real-layer win.
+  Evidence: `bench_results/tp4_awq_m1_cta_fill_20260712/split7_deferred/summary.md`.
+
+- A no-source-change split-count screen forced the same `8x256x64` kernel to
+  `split=1`. Dispatch proof is valid, but the changed K partial boundary yields
+  only `5083 / 5120` bitwise-equal FP16 values (37 differ, maximum absolute
+  difference `0.00048828125`). It is rejected before timing. Do not use a
+  smaller split count as a performance shortcut; a valid successor must retain
+  all seven original K=128 partial groups and the baseline FP32 addition order.
+## 2026-07-12 TP4 MLP-down scheduling and TG_N screens
+
+- Forcing `split=1` on the unchanged `8x256x64` target is numerically
+  ineligible: it changes the original seven K=128 partial boundaries and only
+  `5083 / 5120` FP16 values remain bitwise equal (37 differ, maximum absolute
+  error `0.00048828125`). It was rejected before timing.
+- Swizzle 1 and 2 preserve every output bit but have no clean timing win. The
+  1600-iteration CUDA-event gate is `24.0165 us` for swizzle 0 and `24.2871 us`
+  for swizzle 2 (`+1.13%`); swizzle 1 is `24.5618 us`. The default remains
+  swizzle 0.
+- An opt-in `TG=1x8x1` route retained CTA `8x256x64`, K64, split 7, and the
+  serial FP32 z-order reduction. It is bitwise exact and has `REG=115, LOCAL=0`,
+  but its N32 warp tile regresses a real layer `24.1195 -> 28.3348 us` (`+17.5%`).
+  The experimental registration/gate was removed. Do not repeat bare TG_N=8;
+  a future route must retain four N64 ownership groups while reducing duplicated
+  staging or semaphore waiting. Evidence:
+  `bench_results/tp4_awq_m1_cta_fill_20260712/split7_split_sweep/summary.md` and
+  `bench_results/tp4_awq_m1_cta_fill_20260712/tgn8/summary.md`.
+
+## 2026-07-12 TP4 MTP4 M=5 verifier bridge and current latency gate
+
+- Default-on exact selector routes now cover TP4 MTP verifier gate/up
+  `5x8704x5120` (`8x64x64`, split 2, swizzle 4) and QKVZ `5x4096x5120`
+  (`8x64x64`, split 4, swizzle 4). The A/B-only gate is
+  `VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR`; default is enabled. The M=5 row route
+  remains rejected because it changed FP16 outputs.
+- All TP0--TP3 all-real checks are bitwise exact: 236 calls and 6,929,920 FP16
+  elements per rank, zero maximum error. Same-binary all-rank microbenchmark
+  critical path improves `6.8065 -> 5.8273 ms` (`-0.9792 ms`, `-14.39%`).
+- Latest TP4 natural-stop quality-pass observation is `124.24 tok/s`,
+  `8.049 ms/token`, `A=4.110`, and `33.077 ms/round` across two warm requests.
+  Do not report its difference from the pre-rebuild endpoint as isolated
+  selector gain until the same-binary endpoint off/on A/B is completed.
+- Current TP4 MTP event profile identifies target forward (`18.433 ms` p50) as
+  the P0 span; draft total is `4.713 ms`, with four samples at `1.981 ms`.
+  The next required evidence is a TP4 graph-node target-forward trace that
+  splits its non-AWQ remainder before further draft work. Full evidence:
+  `bench_results/mtp4_current_binary_20260712/latest_mtp4_latency_analysis.md`.
+
+## 2026-07-12 TP2 to TP4 MTP scaling gate
+
+- Same-current-binary MTP profiling shows measured GPU spans improve only
+  `32.560 -> 25.684 ms/round` (`-21.1%`). Target forward is the limiting span:
+  `22.670 -> 18.433 ms` (`-18.7%`) versus an ideal 50% reduction.
+- M=5 AWQ real-weight compute scales `9.085 -> 5.827 ms` (`-35.9%`) and
+  supplies 76.9% of the target-forward saving. The remaining non-AWQ chain is
+  `13.585 -> 12.606 ms` (`-7.2%`) and is the P0 multi-GPU scalability defect.
+- Exact TP4 row projection and MLP-down remain compute contributors (15.0% and
+  33.2% scaling). Do not spend the next cycle on draft sampling: its four
+  samples already scale `2.901 -> 1.981 ms`.
+- Existing target-only graph evidence shows TP communication grows under TP4,
+  but a small `[5,5120]` allreduce plus RMSNorm baseline is flat. Therefore do
+  not treat it as a generic NVLink bandwidth problem. Capture current MTP FULL
+  graph nodes and benchmark actual target-forward join shapes before changing
+  all-reduce semantics. Evidence:
+  `bench_results/mtp4_current_binary_20260712/tp2_tp4_mtp4_scaling_analysis.md`.
+
+## 2026-07-12 TP4 MTP Flash-V100 grid-cap rejection
+
+- The current MTP verifier graph is confirmed as scalar Flash-V100
+  `D=256, PARTITION_SIZE=1024`, `grid=(5,6,257)` on TP4. At an `i768`
+  request only one partition is live, so TP4 has 30 useful attention CTAs and
+  TP2 has 60; both are below the 80 V100 SMs. This is a real head-sharding
+  underfill, not an NVLink bandwidth limit.
+- A default-off persistent Z-grid prototype was bitwise exact from 768 through
+  262144 tokens and NSYS proved it changed the grid to `(5,6,8)`. It regressed
+  the actual partition kernel `115.312 -> 117.112 us` because registers rose
+  `44 -> 66`. Fixed caps also regress long context materially (`+25.6%` at 65K
+  with cap 64 and `+26.4%` at 262K with cap 192). The source prototype was
+  removed; do not resurrect a global grid cap.
+- The earlier 65K/P256 microbenchmark is invalid for this graph because graph
+  capture selected P1024 and Z=65 there. Do not cite its numbers. The next
+  valid direction is short-context CUDA-graph bucketing or a supported graph
+  kernel-node update, so a P256/P512 short graph can coexist with the 256K
+  fallback. Evidence:
+  `docs/design/sm70_tp4_mtp4_multigpu_scaling.md` and
+  `bench_results/mtp4_current_binary_20260712/flash_v100_m5_micro/nsys_grid_cap_v3/`.
+
+## 2026-07-12 TP4 MTP short-context CUDA-graph bucket candidate
+
+- Implemented an opt-in, fail-closed Flash-V100 MTP graph-bucket mechanism
+  for `VLLM_SM70_MTP_CONTEXT_BUCKETS=4096`. Its graph descriptor includes the
+  context capacity, dispatch uses the smallest safe bucket, and contexts above
+  the bucket use the original 256K graph. It never alters a graph's workspace
+  in place or silently truncates a longer context.
+- Correct physical-V100 graph replay at M=5/i768 improves the Flash partition
+  node `0.12426 -> 0.05319 ms` when its full P1024/263,168-slot workspace is
+  replaced by the P256/4,096-slot graph. The alternate reduction order is
+  replay-stable but has max layer difference `1.2207e-4`, so numerical quality
+  remains a mandatory endpoint gate.
+- A clean same-source TP4 MTP4 `i768/o64` diagnostic with TurboMind,
+  Flash-V100, non-eager CUDA graphs, dynamic vocabulary, and official
+  temperature/top-p/top-k/seed improves interval target forward
+  `17.720 -> 15.964 ms` (`-9.9%`) and steady throughput
+  `90.963 -> 94.199 tok/s` (`+3.56%`). The complete 64-token IDs, text, and
+  MTP acceptance metrics are identical; `ignore_eos` was used only for this
+  fixed-length diagnostic.
+- Do not default this setting yet. The next acceptance item is the existing
+  `macos_6k_code` natural-stop gate with EOS enabled, including a safe switch
+  from the P4096 graph to the long-context fallback. Full record:
+  `docs/design/sm70_tp4_mtp4_multigpu_scaling.md`.
+
+### 2026-07-13 TP4 MTP P256 bounded-graph quality gate
+
+- Fresh same-source evidence now completes the required natural-EOS
+  `macos_6k_code` validation. P256 changes the Flash reduction order, so
+  sampled IDs may diverge; the explicit acceptance criterion is healthy text
+  plus no more than 2% MTP-acceptance loss against the matching no-bucket
+  baseline.
+- Baseline: 5,994 EOS tokens, `A=4.03838`, `7.837 ms` TPOT,
+  `127.597 tok/s`; P4096/P256: 5,843 EOS tokens, `A=4.11989`, `7.439 ms`
+  TPOT, `134.436 tok/s`. Acceptance improves 2.018%, text-health passes, and
+  natural-stop steady decode improves 5.36%.
+- Fixed-length M=5 evidence is stronger: target verifier forward
+  `17.784 -> 16.065 ms` (-9.67%), TPOT `10.472 -> 9.423 ms` (-10.02%), and
+  all 64 output IDs plus MTP acceptance are equal.
+- Nsight confirms a real utilization route hit: TP4 Flash moves from
+  `D256/P1024 grid=(5,6,257)` with 30 useful CTAs at i768 to
+  `D256/P256 grid=(5,6,16)` with 90 useful CTAs. Partition-kernel mean falls
+  `157.715 -> 56.069 us`; graph-node Flash critical path falls
+  `2.587 -> 0.983 ms`. Do not use node-trace wall time as absolute throughput.
+- Decision: P256 is the current quality-passing short-context candidate, but
+  remains opt-in via `VLLM_SM70_MTP_CONTEXT_BUCKETS=4096` and
+  `VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE=256` until a >4096 fallback
+  and broader natural-prompt gate pass. Evidence and exact commands/results
+  are maintained in `docs/design/sm70_tp4_mtp4_multigpu_scaling.md`.
+
+### 2026-07-13 No-MTP 256K Flash-V100 exact reduction / residency gate
+
+- The first TP4 Qwen3.6-27B-AWQ no-MTP 256K P1/P2 endpoint comparison is
+  invalid for P1/P2 attribution: it omitted
+  `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=256`, so the >=32K default selected
+  p1024 and both p256-only candidates were inactive. The observed
+  `29.2652 -> 28.6604 ms` variation and equal token IDs are p1024 baseline
+  evidence only, not a P2 gain. Do not cite it as endpoint speed evidence.
+- P2 remains bitwise exact in the p256 direct operator microbenchmark
+  (`0.94694 -> 0.78510 ms` at 256K). The next required work is an explicit
+  p256 full-model baseline/P1/P2 quality and TPOT gate against accepted p1024
+  output, before any default decision.
+- The explicit p256 full-model gate now passes: same 262,080-token,
+  64-token, TP4, no-MTP, official-sampling run is `29.2652 -> 25.8120 ms`
+  (`-11.80%`) and `34.170 -> 38.742 tok/s` (`+13.38%`) versus p1024; all 64
+  output IDs are equal. This is combined p1024-to-p256 plus G6/P2 evidence,
+  not a P2-only claim. The matching 30%-TPOT objective is `20.486 ms`, so the
+  remaining work is a p256 partition utilization redesign. Broader
+  logit/logprob and natural-output quality evidence remains required before a
+  production default change.
+- The P3 G6 KV64 attempt achieved three CTAs/SM (`96` registers/thread,
+  `25.86 KB` shared, `27.71%` occupancy), but regressed because of local spill
+  and insufficient eligible warps: 256K partition `1.46 ms`, `216.30 GB/s`,
+  `81.22%` no-eligible cycles. P3+P2 also has a nonzero output difference.
+  It is rejected; do not repeat simple KV64 / launch-bound tuning.
+- Details, reproducible commands, and NCU artifacts are maintained in
+  `docs/design/sm70_tp4_nomtp_long_context_decode.md`.
+
+### 2026-07-13 No-MTP P1/P2 Correctness Correction
+
+- The historical G6/P1 monolithic partition implementation had a real
+  shared-memory race: its `sS` fp32 score buffer and `sP` fp16 probability
+  buffer were a union, allowing one softmax warp to overwrite probabilities
+  while another still consumed scores. Compute Sanitizer racecheck reports the
+  pre-fix write/read hazard; the 131,071-token reverse-page tail is a reliable
+  reproducer. This is not a Volta WMMA pitch or block784-index numerical issue.
+- The repair allocates separate score/probability storage (+2,048 bytes). On
+  the target 192-thread G6 kernel NCU still reports 168 registers/thread,
+  45.312 KB dynamic shared memory, two CTAs/SM under both resource limits,
+  18.52% active warps, and 336.352 us partition time at 128K.
+- P2 had a second correctness defect: D-tile 8/16 grid tiles launched 32
+  threads, so adjacent output CTAs wrote overlapping dimensions. The output
+  block is now exactly D_TILE threads. The repaired P2 D16 is bitwise equal to
+  the safe original reducer across ten 131,071-token reverse-page comparisons,
+  has zero racecheck hazards, and improves p50 direct partition+reduce
+  `0.44089 -> 0.37682 ms`.
+- The repaired P7/P1 path is also 10/10 bitwise self-stable and 10/10 bitwise
+  equal to the 256-thread non-G6 reference on that tail case. This accepts the
+  direct operator route only. The old 256K full-model P1/P2 token result was
+  generated before both race fixes, so it is historical timing context rather
+  than quality evidence for the current binary.
+- Next acceptance gate: one fresh 128K no-MTP TP4 CUDA-graph A/B with official
+  sampling and explicit G6/P2 route proof. Do not spend a 256K run until the
+  repaired 128K model gate passes.
+
+### 2026-07-13 No-MTP "128K" Gate Invalidated
+
+- The previous artifacts named `i131008` did not send 131,008 prompt tokens.
+  Their serialized request contains ten token IDs and their route summaries
+  lack `prefill_prefix_flash`; they are short-prompt measurements. The claimed
+  `14.568 -> 14.290 ms` / `68.64 -> 69.98 tok/s` G6/P2 full-model gain is
+  invalid for long context and must not be used in any acceptance table.
+- A fresh current-binary reproduction with 131,008 actual prompt tokens,
+  TP4, TurboMind AWQ, Flash-V100, non-eager graphs, p256, G6/P7/P2-D16,
+  `max_model_len=131072`, and the same official sampling measures
+  `19.306 ms` / `51.798 tok/s`. Its route summary contains 2,032 chunked
+  prefill Flash calls and decode `active=512`, proving a real 128K request.
+- The 256K-capacity sweep's nearby 131,072-token row is `19.274 ms` /
+  `51.883 tok/s`; this agreement shows max-model-length/workspace capacity is
+  not the explanation for the false 69.98 result. No valid post-race
+  full-model T256-versus-G6/P2 long-context A/B exists yet.
+- The direct operator microbenchmark `0.57286 -> 0.37682 ms` (`-34.22%`,
+  1.52x), racecheck, and exactness evidence remain valid. Only its former
+  end-to-end 1.91% mapping is withdrawn.
+
+### 2026-07-13 No-MTP 256K-Capacity Cold Sweep
+
+- Fresh repaired-binary evidence now maps the current 256K-capacity service
+  configuration rather than reusing pre-race endpoint figures. It uses TP4,
+  TurboMind AWQ, Flash-V100, non-eager CUDA graphs, p256, G6/P7/P2-D16,
+  `max_model_len=262144`, `max_num_batched_tokens=1024`, no MTP, and prefix
+  caching disabled. Every row produces 64 forced-length official-sampling
+  tokens; startup and graph capture are excluded.
+- Cold prefill degrades from `0.478 s / 2143.8 tok/s` at 1K to
+  `548.697 s / 477.6 tok/s` at 262,080 input tokens. This is a separate
+  high-priority prefill problem: the 1024-token chunked path grows `3.56x`
+  from 128K to 256K for only `2x` more input.
+- Decode also degrades, but on a different scale: TPOT is `13.350 ms` at 4K,
+  `19.274 ms` at 128K, and `27.804 ms` at 256K; steady decode is
+  `74.90 -> 51.88 -> 35.97 tok/s`. The p256 active partition counts are
+  `17 -> 513 -> 1024` respectively.
+- The former 128K-capacity `14.290 ms` comparison is invalid because it was a
+  ten-token prompt mislabeled as `i131008`. The fresh real-128K maxlen-131K
+  reproduction is `19.306 ms`, within 0.16% of this sweep's `19.274 ms`;
+  workspace capacity is not the source of that false comparison. Chunked cold
+  prefill remains a separate P0 route.
+- Artifacts and exact per-request metrics are maintained in
+  `bench_results/nomtp_long_context_20260713/current_tp4/q1_separate_sp/length_sweep_20260713/`
+  and `docs/design/sm70_tp4_nomtp_long_context_decode.md`.
+
+### 2026-07-13 TP4 64K Prefill Root Cause: Not HBM or Peak Compute
+
+- Exact current 27B-AWQ TP4 profiling now attributes `23.466 s` of the
+  instrumented `43.024 s` 64K prefill (`54.5%`) to the 16 full-attention
+  layers' 63 paged prefix chunks. Every TP rank logs exactly 1,008
+  `prefill_prefix_paged` calls. The last 32K contributes `75.3%` of that
+  attention subtotal, proving the structural `O(L^2)` full-attention growth
+  expressed through 1024-token chunks.
+- NCU on the exact local `M=1024,Hq=6,Hkv=1,D=256,page=784,N=65536` kernel
+  rejects both simple peak-HBM and peak-compute explanations: DRAM throughput
+  is only `0.48%`, while L1TEX is `88.60%`, L2 hit rate `99.68%`, and SM
+  throughput `29.33%`. The generic `81.27%` Memory Throughput headline is
+  L1TEX pressure, not HBM use.
+- This prefill kernel has two CTAs/SM and `47.04%` achieved occupancy, so do
+  not reuse the q=1 decode diagnosis of one CTA/SM and 12.5% occupancy. The
+  actual limiter is issue starvation: `67.65%` no-eligible cycles, with
+  long-scoreboard `7.03`, barrier `5.43`, short-scoreboard `3.13`, and MIO
+  throttle `2.61` cycles per issued instruction. Shared loads/stores have
+  `4.9x/4.6x` bank conflicts and 51% excessive shared wavefronts.
+- P0 is therefore an exact conflict-free shared-memory and dependency/barrier
+  redesign of paged Flash-V100 full attention. HBM coalescing is secondary;
+  do not make a bandwidth-only or generic AWQ GEMM change the first response.
+  Full conditions and artifacts are in
+  `docs/design/sm70_tp4_nomtp_long_context_decode.md`.
+- 2026-07-13 layout A/B control correction: the first score-pitch and output-
+  pitch pilots did not forward their template flag into the device kernel's
+  `KernelConfig`. Both therefore executed the baseline layout; their earlier
+  timing numbers are invalid and must not be reused.
+- After forwarding the flag through host launch and device `KernelConfig`, the
+  exact `sO` pitch `264 -> 268` candidate passes `torch.equal` (`maxdiff=0`)
+  at `M=1024,N=65536,Hq=6,Hkv=1,D=256,page=784`. A 200-pair alternating A/B
+  records `44.039 -> 40.222 ms` (`-8.67%`; candidate wins all 200 pairs).
+  NCU confirms shared excessive wavefronts `1.037B -> 637M` (`-38.6%`),
+  shared load/store conflicts `4.9/4.6 -> 4.4/3.4-way`, no-eligible cycles
+  `67.65 -> 64.47%`, and unchanged 64 registers/two CTA residency.
+- Exact 27B-AWQ TP4 64K full-model control is `42.811 -> 40.236 s` prefill
+  (`-6.02%`) with identical prompt hash, output token `16401`, and 1,008
+  paged-prefix calls per rank. Default-enable the candidate only for page-784
+  D256 low-SMEM non-contiguous, non-scalar, BM16 prefill; explicit
+  `VLLM_FLASH_V100_PREFILL_D256_OUTPUT_STRIDE_268=0` restores baseline, and
+  other page sizes remain opt-in pending separate evidence.
+- The follow-up exact `p_strict` layout of two `16x24` half WMMA slabs passes
+  bitwise comparison but loses `40.227 -> 40.686 ms` (`+1.14%`) at the same
+  `M=1024,N=65536` shape, winning only 1/200 alternating pairs. It was removed
+  after the micro gate; do not retry this slab mapping unchanged.
+- A simpler exact contiguous `p_strict` pitch `40 -> 48` half is also removed:
+  it is bitwise equal but records only `40.127 -> 40.125 ms` (`-0.006%`) and
+  wins 103/200 alternating pairs. This is timing noise, not a performance
+  result; do not spend NCU or full-model time on another pitch-only P variant.
+- A full current-V-subtile L1 prefetch is also removed: it emits nonblocking
+  `CCTL.E.PF1`, preserves 64 registers/two CTAs, and is bitwise equal, but
+  loses `40.173 -> 40.760 ms` (`+1.463%`) with 0/200 wins. V is already
+  L2-resident; adding 128 prefetches per 32-token subtile increases issue and
+  L1TEX traffic rather than hiding the bottleneck.
+- Source-correlated NCU attributes four residual 8-way `LDS.U.128`
+  operations to the `sP` WMMA-A load, each with `49.988M` excessive
+  wavefronts (`31.37%` of the accepted layout's total). `P_STRIDE=40` makes
+  rows `r` and `r+8` bank-alias exactly, so another legal pitch-only variant
+  is excluded. The aligned column-major P producer/consumer is bitwise exact
+  and retains 64 registers, but loses `40.285 -> 41.960 ms` (`+4.157%`) with
+  0/40 wins because row-owned softmax now performs scattered half stores. It
+  was removed; further P work needs different producer ownership or a custom
+  Volta fragment loader.
+- Accepted-layout prefill NCU rules out L2/HBM bandwidth saturation:
+  DRAM/L2 are `0.52%/22.28%`, while tensor-pipe active is only `9.95%`, SM
+  throughput `32.18%`, no-eligible cycles `64.47%`, and long-scoreboard
+  `6.997` cycles/issue. PC sampling places `89.58%` of long-scoreboard samples
+  on HMMA operand waits; `72.21%` of those are PV and `27.79%` QK.
+- The original 8-producer/8-consumer shared K/V staging plan is now closed:
+  exact QK and PV implementations regressed 33.56% and 6.31% respectively.
+  Lower-conflict PV pitches still regressed at least 3.60%. The added
+  global-to-shared round trip and barrier cost cannot be hidden on this path;
+  do not repeat it with another pitch or stage count.
+- Early probability stores are the current exact micro winner. They reduce the
+  compiler stack frame `144 -> 48 B`, eliminate approximately 14.06M local
+  loads and 12.50M local stores, and improve `40.230 -> 39.185 ms`
+  (`-2.596%`, 200/200 wins). Tail plus reversed-page-table output is bitwise
+  equal. This does not fix the HMMA chain: 94.81% of remaining
+  long-scoreboard samples land on HMMA, split 71.97% PV and 28.03% QK.
+- A QK-idle-warp L1-prefetch experiment is also closed. Although global L1
+  hit sectors increased by 15.67M, it regressed `39.219 -> 39.408 ms`, doubled
+  much of the local-load traffic, and increased PV HMMA long-scoreboard
+  `403,052 -> 462,351`. Do not tune prefetch panel count or ordering.
+- The next P0 is cross-`block_n` warp specialization: one warp group performs
+  required QK for the next score buffer while the other performs current
+  online-softmax/PV work. It must avoid an added global-to-shared path and
+  preserve exact block/K/FP32 accumulation order. The authoritative phase
+  table, rejected-path ledger, artifacts, and resource gates are in
+  `docs/design/sm70_flash_v100_prefill_operator_optimization.md`.
+
+### 2026-07-15 Flash-V100 Prefill Cross-Block And Q/P-Swizzle Gate
+
+- The cross-block implementation is now accepted in steady/drain form. A
+  compile-time `num_n_tiles-1` steady loop overlaps next-block QK with the
+  current first PV panel; the existing generic path drains the final block.
+  This removes the loop-carried spill: local loads fall `16.04M -> 3.58M`,
+  and alternating timing improves `39.153 -> 38.222 ms` (`-2.377%`).
+- An SM70 fragment probe recovered and bitwise-verified the WMMA matrix-A
+  lane/register layout. Compact row-bit-swizzled Q and P storage cuts
+  excessive shared wavefronts `637.8M -> 275.5M` (`-56.8%`) without changing
+  softmax, fp16 rounding, HMMA, or FP32 accumulation order.
+- The formal micro gate passes: `M1024,N65536,Hq6,Hkv1,D256,page784` improves
+  `39.064 -> 34.249 ms` (`-12.326%`, 200/200 alternating wins). Reverse-page
+  tail `N=65521` and 16K/32K/64K/128K scaling are all bitwise equal and retain
+  64 registers, 44.93 KB shared memory, two CTAs/SM, and unchanged local
+  instructions. Relative to the original `40.23 ms` operator this is about
+  `-14.87%`, so the first `<=35 ms` stage target is complete.
+- A locked-clock full-model propagation gate also passes. At fixed 1200 MHz,
+  same-binary Qwen3.6-27B-AWQ TP4 64K prefill changes only
+  `PV=1,QK=0 -> PV=1,QK=1`: `47.9785 -> 44.8346 s` (`-6.5526%`), with 1,008
+  paged-prefix calls per rank and all 64 output IDs equal. Unlocked 128K runs
+  varied by about 6.8 seconds, so they are diagnostic only and must not replace
+  the locked A/B result.
+- The page-784 D256 low-SMEM Q/P pipeline is now default-enabled. Explicit
+  `VLLM_FLASH_V100_PREFILL_D256_SW_PIPELINE_QK=0` or `...PV=0` remains the
+  rollback and A/B control; other page sizes retain their prior dispatch.
+- Closed paths now include `2+2+2+2` next-QK distribution (`+5.39%`), true
+  8+8 named-barrier specialization (`+4.84%`), direct global Q (`+28.09%`),
+  paired QK accumulators (only `-1.68%`), Q duplicate-lane shuffle (only
+  `-3.97%`), and source-level K/V-load-first ordering (no incremental gain).
+- Residual P0 is HMMA operand readiness: 94.73% of long-scoreboard samples land
+  on HMMA step 0, split 61.61% PV `ROW/ROW` and 33.12% QK `ROW/COL`. Earlier
+  entries had these phase labels reversed. The next allowed experiment is
+  now restricted to a raw-HMMA operand/order microprobe. The completed
+  matrix-B probe found the exact col-major mapping, but direct two-vector
+  fragment construction keeps duplicate-lane traffic and regresses
+  `43.584 -> 43.868 ms` (`+0.652%`, 0/100 wins) even after restoring
+  `LDG.E.128.SYS`; its main-kernel path was removed. A raw `BM8,BN256`
+  candidate may proceed only if QK row/col and PV row/row accumulation are
+  bitwise identical for all operand stress cases at one fixed K4 order. The
+  corrected full-16x32 probe passes: only canonical `[0,1,2,3]` matches both
+  layouts across all three stress inputs and all 512 FP32 output words. This
+  authorizes only the isolated raw QK panel gate, not integration.
+- A separate half-lane B-load reconstruction is closed at the panel gate. It
+  is bitwise equal and spill-free, but 128 extra SHFL instructions make the
+  `BM16,BN128,K256` panel regress `185.536 -> 199.296 us` (`+7.416%`, 0/100
+  wins). Do not run NCU or integrate this shuffle form.
+  The raw panel must still win with `<=64` registers and no local spills.
+  Full details and artifact paths are in
+  `docs/design/sm70_flash_v100_prefill_operator_optimization.md`.
+
+### 2026-07-15 Flash-V100 Prefill BM32 Phase-Reuse Promotion
+
+- The measured residual was HMMA operand readiness under duplicated K/V
+  traffic, not HBM saturation. The accepted production change therefore
+  increases reuse instead of adding generic prefetch: one M32 CTA reuses every
+  K and V fragment across top/bottom M16 panels while preserving HMMA count,
+  softmax, FP16 rounding, and FP32 accumulation order.
+- The strict page-784 D256 production kernel holds 64 registers/thread, zero
+  local spill, 35,408 bytes shared memory, and two CTAs/SM. NCU at four KV
+  panels records unchanged tensor instructions, `-49.74%` L1 global-load
+  requests, `-49.39%` L2 read sectors, and `+59.36%` eligible warps/cycle.
+- Fixed-1200-MHz paged-kernel A/B at `M1024,N65536,Hq6,Hkv1,D256` improves
+  `43.605 -> 34.759 ms` (`-20.29%`, 100/100 paired wins). The reverse
+  noncontiguous page-table tail is bitwise exact and gives the same result;
+  16K/32K/128K improve 18.99%/19.96%/20.42%.
+- The Qwen3.6-27B-AWQ TP4 64K full-model gate improves prefill
+  `44.8346 -> 40.4681 s` (`-9.74%`) and TTFT `44.8832 -> 40.6789 s`
+  (`-9.37%`). All 64 generated token IDs match the accepted Q/P baseline.
+- `VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE` is now default-on only for FP16
+  KV, D256, page 784, M32-aligned prefill without BFLA or sliding-window
+  masks. `=0` is the rollback; all unmatched shapes retain the old route.
+- Closed paths remain closed: the full 8+8 producer/consumer schedule spills
+  above the 64-register two-CTA budget, and splitting D128 across two CTAs
+  repeats QK/softmax and loses 21.82%. Any next experiment requires fresh NCU
+  evidence on the promoted production kernel and a resource-accounted reason
+  it can reduce the remaining issue stalls.
+
+### 2026-07-15 Flash-V100 Prefill All-P Promotion
+
+- Fresh production NCU changes the residual priority. The promoted BM32 kernel
+  reaches only 0.56% DRAM and 12.26% L2 throughput, but 86.95% L1/TEX;
+  scheduler no-eligible remains 62.96%. PC sampling attributes 27.2% of
+  samples to barriers, with 65.0% of barrier samples at the eight-warp QK
+  rendezvous. SourceCounters reports 184.20M excessive shared wavefronts.
+- The accepted all-P schedule retains four P32 panels plus four exp-diff vectors
+  and separates softmax from PV. A review-added pre-increment CTA barrier fixes
+  a shared block-index race; never remove it without replacing shared loop
+  state with a proven local-state protocol.
+- Race-fixed micro results are bitwise exact for random/alternating inputs at
+  one, two, and four blocks, retain 64 registers, zero spill, 41,744 bytes
+  shared and two CTAs/SM, and improve the accepted phase micro by 3.46%-3.54%
+  at four blocks. NCU confirms barrier stall `6.39 -> 5.51` cycles/issue.
+- Production A/B improves 64K `34.755 -> 33.482 ms` (`-3.66%`, 100/100),
+  reverse-tail `34.743 -> 33.491 ms` (`-3.60%`, 100/100), and 16K/32K/128K
+  by 3.86%/3.78%/3.66%; every output is bitwise equal. Compute Sanitizer finds
+  zero errors on a reverse-page-table tail.
+- Qwen3.6-27B-AWQ TP4 64K prefill improves `40.4681 -> 39.6948 s`
+  (`-1.91%`) and TTFT `40.6789 -> 39.8375 s` (`-2.07%`), with all 64 output
+  token IDs equal. `VLLM_FLASH_V100_PREFILL_D256_BM32_ALL_P` is default-on
+  inside the strict page-784 BM32 route; `=0` is the one-P rollback.
+- The current cumulative full-model prefill improvement from the early-store
+  47.9785 s reference is 17.26%, still below the 30% target. The next P0 is a
+  same-score-allocation temporary accumulator scratch derived from the exact
+  SourceCounters PCs. It must not claim to eliminate final row-major QK score
+  stores or the row-owned P-store conflicts.
+
+### 2026-07-15 Flash-V100 Pair-Scratch Promotion
+
+- The SourceCounters-derived temporary-accumulator layout is accepted. QK
+  warp pairs share disjoint 32-column score slabs, reducing 64-bit scratch
+  replay from the old 8-way row-major mapping toward the 2-way hardware
+  minimum. It allocates no additional shared memory and preserves every HMMA,
+  LDG, LDS, STS, FP16 rounding, and FP32 accumulation operation.
+- The formal standalone gate is bitwise exact for random/alternating input at
+  one, two, and four blocks. Both kernels remain 64 registers, zero
+  stack/local/spill, 41,744 bytes shared, and two CTAs/SM. Four-block timing
+  improves about 2.7%; NCU shared conflicts fall 34.0%.
+- Production `M1024,N65536,Hq6,Hkv1,D256,page784` improves
+  `33.411 -> 31.717 ms` (`-5.07%`). NCU independently measures
+  `30.72 -> 29.15 ms` and shared bank conflicts
+  `188.69M -> 117.94M` (`-37.50%`) with unchanged tensor instructions.
+  Barrier stall falls despite the one warp-pair handoff.
+- Reverse `N=65521` and deliberately unpaired `N=65505` tails are bitwise
+  exact and improve 5.18%-5.22%. A conditional pair barrier prevents deadlock
+  when only one warp in a pair is active. Racecheck shows the same 16
+  pre-existing conservative warnings and zero errors on both old and new
+  kernels; the candidate adds no hazard category.
+- The 16K/32K/128K operator gates improve 5.22%/5.21%/5.10%. The locked-clock
+  Qwen3.6-27B-AWQ TP4 64K full-model gate improves prefill
+  `39.6948 -> 38.7454 s` (`-2.39%`) and TTFT
+  `39.8375 -> 38.7997 s` (`-2.61%`); decode TPOT is neutral and all 64
+  official-sampling output IDs match.
+- `VLLM_FLASH_V100_PREFILL_D256_BM32_PAIR_SCRATCH` is default-on only inside
+  the strict BM32 all-P route; `=0` restores the prior row-major scratch. The
+  cumulative 64K prefill gain from 47.9785 s is 19.24%, still short of 30%.
+- The next P1 is a direct-fragment prologue/steady/drain microkernel only:
+  QK(n+1) on warps 0-7 may overlap PV(n) D128 on warps 8-15, after which
+  warps 0-7 finish PV(n). It may proceed only with 64 registers, zero spill,
+  two CTAs/SM, exact output, lower HMMA long-scoreboard, and at least 2% wall
+  improvement. Do not retry 8+8 shared K/V staging or persistent eight-warp
+  PV consumers.
+
+### 2026-07-15 Direct-Fragment Cross-Block Rejection
+
+- The cross-block prologue/steady/drain micro is closed. Production PTXAS emits
+  a 24-byte stack frame and 20-byte spill stores/loads per thread for the
+  candidate; the baseline remains 64 registers with zero stack/spill. It fails
+  the resource gate before production timing.
+- A diagnostic-only `ptxas -O1` build removes the spills and is bitwise exact,
+  but still regresses 0.85% at two KV blocks and 0.75% at four blocks, with only
+  1-2 candidate wins per 100 paired rounds. NCU was skipped by design after the
+  wall-time gate failed.
+- Do not integrate this D128 split, tune its barriers, or use diagnostic PTXAS
+  flags in production. The 8+8 shared K/V staging and persistent eight-consumer
+  variants remain closed as well.
+- The next gate is profile-first: SourceCounters plus PC sampling on the
+  promoted pair-scratch production kernel must identify the exact remaining
+  shared-conflict and scoreboard PCs. Only then may a narrower multistage
+  schedule be designed, with 64 registers, zero local spill, two CTAs/SM, exact
+  output, and a wall-time win as mandatory gates.
+
+### 2026-07-15 Pair-Scratch Residual PC Gate
+
+- Production SourceCounters on `<causal=1,allP=1,pairScratch=1>` reduces
+  excessive shared wavefronts `184.20M -> 113.42M` (`-38.43%`). The residual
+  is completely dominated by final outputs: 37.75M from eight 8-way FP32 QK
+  stores and 75.50M from sixteen 4-way probability stores. K/V loads are not
+  responsible for these shared conflicts.
+- PC sampling assigns 150,111 of 193,427 barrier samples (`77.61%`) to the
+  full-CTA rendezvous after QK. The pair-scratch named barrier contributes only
+  3,527 (`1.82%`). This confirms that temporary scratch is no longer P0.
+- HMMA long-scoreboard samples split `66,876` QK and `151,138` PV, or
+  `30.68%/69.32%` after excluding 3,999 non-HMMA samples. PV remains the larger
+  operand-readiness cost, but the measured QK window also leaves eight of
+  sixteen warps idle and creates the dominant CTA wait.
+- One new micro gate is authorized: 16-warp paired QK with one K global load
+  per pair and two 4KB software-pipeline stages aliased onto all-P probability
+  storage before P is produced. It must not increase the 41,936-byte shared
+  allocation or use unsupported SM80+ async instructions.
+- Production PTXAS `<=64` registers, zero stack/spill/local, two CTAs/SM,
+  bitwise FP32/FP16 output, at least 2% wall improvement, and at least 95/100
+  paired wins are hard gates. Failure closes this exact schedule before NCU or
+  production integration.
+
+### 2026-07-15 Sixteen-Warp Paired-QK Rejection
+
+- The profile-authorized paired-QK sketch is distinct from the old dedicated
+  8-producer/8-consumer path: every producer also computes top QK, its partner
+  computes bottom QK, and all 16 warps execute HMMA with one K global load per
+  pair. Its two K stages alias the existing 8KB all-P probability allocation.
+- Default `ptxas -O3` rejects it before execution. Baseline is 64 registers,
+  41,744B shared, and zero stack/spill; candidate has the same reported
+  registers/shared but an 8B stack plus 12B spill stores and 8B spill loads per
+  thread. No exact, timing, or NCU run is permitted.
+- The proposed QK-result scratch also aliases persistent `shared.query`, which
+  is needed again for every KV block. Correcting it would restage 16KB of Q and
+  add a CTA barrier per 128 tokens, defeating the intended overlap. Do not
+  continue through forced register caps, diagnostic PTXAS flags, or Q restage.
+- P0 moves to the measured 75.50M probability-store excessive wavefronts. The
+  initial authorized layout micro must retain exact FP16 rounding, native PV
+  HMMA order, and two-vector matrix-A loads.
+
+### 2026-07-15 Probability Group-Rotation Rejection
+
+- The same-capacity group-rotation bank mapping is mathematically valid, but
+  default PTXAS emits an 8B stack, 8B spill stores/loads, and one LDL/STL for
+  the candidate. Baseline remains 64 registers, 41,744B shared, and zero
+  local traffic. No kernel execution, exactness, timing, or NCU was allowed.
+- A reduced XOR/template address spelling spills more and is not a new path.
+  Do not retry per-group slot rotation or relax the compiler/resource gate.
+- One structurally different layout may proceed: 136-half group pitch, 536
+  physical half per logical 512-half P panel, and 42,128B total shared. It
+  trades only 384B shared for a constant `+272B` second-group address and must
+  retain two CTAs/SM, zero local traffic, exact output, and unchanged HMMA/LDG.
+
+### 2026-07-15 Probability Group-Pad Rejection
+
+- The 136-half P group pitch passes resources and exactness: 64 registers,
+  zero stack/spill/local, 42,128B shared, two CTAs/SM, identical SASS operation
+  counts, and bitwise output for random/alternating one/two/four-block cases.
+- Wall speedups are only 0.67%, 1.15%, and 1.43% at one, two, and four blocks.
+  Long cases win 100/100 pairs but remain below the mandatory 2% gate. NCU and
+  production integration are skipped; probability-only layouts are closed.
+- Fresh SASS attribution moves P0 to the second K16 PV load in each P32 panel:
+  its final V `LD.E.64` is one instruction before HMMA.STEP0 and those PCs each
+  carry 17K-24K long-scoreboard samples. A zero-SASS scheduling fence may be
+  tested only to move that existing load ahead of existing P LDS operations;
+  no second fragment, prefetch traffic, staging, or new barrier is allowed.
+
+### 2026-07-15 FP8 E5M2 KV TP4, 35B, And NVFP4 Coverage
+
+- The FP8 E5M2 page-to-FP16 bridge and FP8 XQA work is now tested beyond the
+  original 27B TP2 shape. TP4 operator coverage includes 27B
+  `Hq6/Hkv1/page1568`, 35B-A3B `Hq4/Hkv1/page1056`, and the 35B MTP
+  `page1088` shape. Fifteen V100 CUDA exactness tests pass. G4 FP8 XQA remains
+  disabled in production because it gave no endpoint gain or accepted quality
+  advantage. Fresh scalar processes also varied sampled hashes, so hash
+  variation is not attributed to XQA.
+- Matched TP4 no-MTP FP8-versus-FP16 KV results at 64K are:
+  27B AWQ `17.458 vs 17.283 ms` TPOT, 35B-A3B AWQ
+  `11.459 vs 11.328 ms`, 35B-A3B FP8 weights `12.101 vs 12.043 ms`, and
+  27B NVFP4 `18.050 vs 17.890 ms`. Residual FP8 decode overhead is therefore
+  0.49%-1.16% at 64K across the accepted matrix.
+- The 64K prefill comparison is `31.116 vs 30.213 s` for 27B AWQ,
+  `10.917 vs 14.111 s` for 35B AWQ, `10.120 vs 14.618 s` for 35B FP8
+  weights, and `33.961 vs 35.147 s` for 27B NVFP4. Route evidence confirms
+  TurboMind for AWQ, FP8 weights, and NVFP4; no Marlin route is credited.
+- Compressed-tensors checkpoints with no `kv_cache_scheme` are now allowed to
+  use the SM70 Flash-V100 explicit unit-scale E5M2 KV path. Explicit checkpoint
+  KV scale schemes remain rejected. This unblocks Qwen3.5-27B-NVFP4 without
+  weakening the scale-safety gate.
+- TP4 MTP now selects the TP4 dynamic-vocabulary asset from runtime TP size
+  instead of hard-coding TP2. The 27B AWQ MTP4 FP8/FP16 pair is
+  `7.577/7.393 ms` at 16K and `11.390/11.421 ms` at 64K. FP8 prefill is
+  12.21% and 28.89% faster, respectively. The 64K output hash and acceptance
+  length are equal; the one-shot 16K acceptance length differs by 4.76%, so
+  this is not yet a natural-prompt MTP quality promotion.
+- No valid MTP body exists in the available 27B NVFP4 checkpoint, no local 35B
+  NVFP4 checkpoint exists, and the current TP4 dynamic-vocabulary ranking is
+  27B-specific. Do not substitute AWQ results for those missing combinations or
+  label a 35B MTP run with the 27B shortlist as an accepted 35B baseline.
+- Detailed tables and artifact paths are in
+  `docs/design/sm70_flash_v100_fp8_kv_long_context.md`.
+
+### 2026-07-15 SM120 Reference And 8096-Chunk V100 Baseline
+
+- The locked Qwen3.6-27B-AWQ TP4 V100 baseline now uses
+  `max_num_batched_tokens=8096`, TurboMind, Flash-V100, FP16 KV, page 784,
+  CUDA graphs, no eager, and no MTP. At 64K it records 33.0984 s prefill
+  (1,978.1 tok/s) and 19.114 ms TPOT (52.32 tok/s). Output IDs are exactly
+  equal to the prior 1024-chunk run; prefill improves 14.57% while decode is
+  neutral.
+- A stale Python 3.13 extension produced an invalid generic-BM16 8096 result.
+  Accepted micro evidence uses the July 15 Python 3.12 extension. The
+  prefill benchmark now records Python and extension identity and defaults to
+  the correct 27B TP4 shape and 8096 chunk.
+- At `M8096,N121440`, production V100 BM32 is 325.886 ms / 17.92 TF/s per
+  rank; 5090 FlashInfer is 144.269 ms / 161.90 TF/s while doing four times the
+  head work. Model-level attention wall is therefore 2.26x slower on TP4
+  V100. V100 NCU shows Tensor active 20.97% with long/short/barrier stalls
+  4.684/4.638/4.393 cycles per issue; this is an HMMA feed problem, not HBM or
+  grid starvation.
+- Direct FlashInfer enablement is rejected because its backend is SM75+ and
+  its kernel depends on post-Volta async/load primitives. Port its planning
+  and pipeline structure into SM70-native kernels instead. PC-level
+  attribution now assigns 89.57% of prefill not-issued samples to
+  long/short-scoreboard, CTA barrier, and MIO stalls; 128K G6 decode assigns
+  62.00% to long scoreboard at KV-load-dependent `STS.128` instructions.
+- The first structural prefill gate is now a FlashInfer-shaped 128-thread M64
+  kernel: GQA-packed query rows, four query-owner warps, register-resident
+  online-softmax/output state, and 32KB Q plus 8KB K plus 8KB V shared stages.
+  It is not the rejected 512-thread M64 phase kernel. The compact eight-warp
+  BM32 sketch is fallback-only. Decode P0 keeps exact p256 boundaries while
+  adding early-LDG/delayed-STS KV pipelining, SM-count work planning, and an
+  ordered in-kernel semaphore reduction. All old 8+8, paired-QK, probability
+  layout, and single-load scheduling variants remain closed.
+- Full comparison, acceptance gates, and artifacts are in
+  `docs/design/sm70_sm120_long_context_attention_parity.md`.
+
+### 2026-07-15 Independent FLASHINFER_SM70 Route And M64 Closure
+
+- `FLASHINFER_SM70` is now an independent, explicit-only attention backend.
+  Its registry, SM70-only capability gate, graph-safe metadata boundary, and
+  resource-driven prefill/decode planner are implemented and covered by
+  targeted tests. Unpromoted shapes still delegate to `FLASH_ATTN_V100` with
+  an explicit warning; no delegated result may be claimed as a FlashInfer
+  kernel gain.
+- The route is pinned to FlashInfer `v0.6.13`, commit
+  `57ba7eeb7ea3003a2d6ad5d9a057c4f952709bac`. The architecture-independent
+  pieces to preserve are GQA-packed work descriptions, SM-count planning,
+  graph-stable workspace, split/merge metadata, and route instrumentation.
+  Unsupported instructions receive measured SM70 specializations rather than
+  weakened capability checks or generic synchronous-copy emulation.
+- The native Volta compatibility primitive passes random and alternating QK
+  row/col and PV row/row K256 bitwise gates. PTXAS reports 46 registers for QK
+  and 38 for PV, zero stack/spill/local traffic, and SASS contains the expected
+  256 HMMA instructions per kernel.
+- The complete M64 resource matrix is closed for the current exact arithmetic
+  contract. The literal four-warp form exceeds Volta's 255-register limit;
+  the eight-warp staged-K/V form is exact and spill-free but loses 11.3%-23.6%
+  on full-grid one-to-four-block tests; the 12-warp direct form emits an
+  816-byte stack and heavy local spill; the 16-warp/512-thread form permits
+  only one CTA/SM and loses about 2% on long shapes. Do not retry these forms
+  through forced register caps, alternative barrier spelling, or more staging.
+- The selected SM70 replacement for modern FlashInfer BM64 is therefore the
+  accepted native BM32 `ALL_P + PAIR_SCRATCH` body. It retains 32 resident
+  warps, direct Volta fragment loads, top/bottom operand reuse, zero local
+  traffic, and the strongest measured wall time. Modern architectures keep
+  upstream BM64; only the kernel selection is architecture-specific.
+- The next gate is backend/planner hookup around the selected BM32 body. It
+  must reproduce the accepted route's bitwise output and operator wall time
+  under the new backend name with explicit no-fallback route evidence before
+  any residual NCU experiment or endpoint speed claim.
+- Detailed rationale, resource tables, full-grid results, and artifact paths
+  are in `docs/design/sm70_flashinfer_native_backend.md`.

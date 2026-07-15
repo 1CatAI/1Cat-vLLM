@@ -183,6 +183,28 @@ void nvfp4_gemm_sm70_out(torch::Tensor out,
                          int64_t q_ld,
                          bool gated_silu);
 
+void nvfp4_gemv_sm70_raw_out(torch::Tensor out,
+                             torch::Tensor _in_feats,
+                             torch::Tensor _kernel,
+                             torch::Tensor _scaling_factors,
+                             torch::Tensor partials,
+                             int64_t group_size,
+                             int64_t split_k);
+
+void nvfp4_gemv_sm70_warp_out(torch::Tensor out,
+                              torch::Tensor _in_feats,
+                              torch::Tensor _kernel,
+                              torch::Tensor _scaling_factors,
+                              int64_t group_size);
+
+void nvfp4_gemv_sm70_h2_out(torch::Tensor out,
+                            torch::Tensor _in_feats,
+                            torch::Tensor _kernel,
+                            torch::Tensor _scaling_factors,
+                            torch::Tensor partials,
+                            int64_t group_size,
+                            int64_t split_k);
+
 void fp8_gemm_sm70_out_auto(torch::Tensor out,
                             torch::Tensor _in_feats,
                             torch::Tensor _kernel,
@@ -216,6 +238,45 @@ void sm70_f16_lm_head_top1_tc_out(torch::Tensor values_out,
                                   int64_t k_ld,
                                   int64_t vocab_start_index,
                                   int64_t num_vocab_padding);
+
+void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
+                                   torch::Tensor indices_out,
+                                   torch::Tensor _in_feats,
+                                   torch::Tensor _kernel,
+                                   int64_t k_ld,
+                                   int64_t vocab_start_index,
+                                   int64_t num_vocab_padding);
+
+void sm70_merge_tail_top20_pack_out(torch::Tensor pairs_out,
+                                    torch::Tensor base_values,
+                                    torch::Tensor base_indices,
+                                    torch::Tensor base_token_id_map,
+                                    torch::Tensor tail_logits,
+                                    torch::Tensor tail_token_ids,
+                                    int64_t tail_row_start);
+
+void sm70_sample_packed_top20_out(torch::Tensor sampled_token_out,
+                                  torch::Tensor sparse_ids_out,
+                                  torch::Tensor sparse_probs_out,
+                                  torch::Tensor gathered_pairs,
+                                  torch::Tensor exponential,
+                                  double top_p);
+
+void sm70_dynamic_draft_vocab_update_tail_out(
+    torch::Tensor lru_token_ids,
+    torch::Tensor local_tail_token_ids,
+    torch::Tensor source_row_indices,
+    torch::Tensor observed_output_ids,
+    torch::Tensor target_candidate_ids,
+    torch::Tensor base_token_mask,
+    int64_t full_vocab_size,
+    int64_t local_shard_start,
+    int64_t local_shard_end);
+
+void sm70_dynamic_draft_vocab_refresh_tail_weight_out(
+    torch::Tensor local_tail_weight,
+    torch::Tensor source_weight,
+    torch::Tensor source_row_indices);
 
 void sm70_f16_gate_mul_out(torch::Tensor out,
                            torch::Tensor _in_feats,
@@ -560,6 +621,16 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
                       bool fully_connected);
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void sm70_tp2_all_reduce_gemma_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon);
+void sm70_tp4_all_reduce_gemma_rms_norm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes, double epsilon);
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,

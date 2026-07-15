@@ -6,6 +6,7 @@ import torch
 from vllm.v1.spec_decode.ddtree_metadata import (
     DDTreeVerifierMetadata,
     greedy_sample_from_compact_logits,
+    greedy_sample_from_compact_top_tokens,
     make_batched_metadata,
     make_prefill_tree_attention_mask,
 )
@@ -88,13 +89,37 @@ def test_batched_metadata_offsets() -> None:
 
 def test_greedy_sample_from_compact_logits() -> None:
     tree = make_tree()
+    node_11 = tree.child_by_token(0)[11]
+    node_21 = tree.child_by_token(node_11)[21]
     vocab_size = 128
     logits = torch.full((len(tree.non_root_nodes) + 1, vocab_size), -1000.0)
     logits[0, 11] = 1.0
-    logits[1, 21] = 1.0
-    logits[2, 99] = 1.0
+    logits[node_11, 21] = 1.0
+    logits[node_21, 99] = 1.0
 
     walk = greedy_sample_from_compact_logits(tree=tree, compact_logits=logits)
+
+    assert walk.accepted_token_ids == (11, 21)
+    assert walk.bonus_token_id == 99
+    assert walk.output_token_ids == (11, 21, 99)
+
+
+def test_greedy_sample_from_compact_top_tokens() -> None:
+    tree = make_tree()
+    node_11 = tree.child_by_token(0)[11]
+    node_21 = tree.child_by_token(node_11)[21]
+    top_tokens = torch.zeros(
+        len(tree.non_root_nodes) + 1,
+        dtype=torch.int64,
+    )
+    top_tokens[0] = 11
+    top_tokens[node_11] = 21
+    top_tokens[node_21] = 99
+
+    walk = greedy_sample_from_compact_top_tokens(
+        tree=tree,
+        compact_top_tokens=top_tokens,
+    )
 
     assert walk.accepted_token_ids == (11, 21)
     assert walk.bonus_token_id == 99

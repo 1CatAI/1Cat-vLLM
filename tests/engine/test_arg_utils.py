@@ -278,7 +278,7 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
         "method": "mtp",
         "num_speculative_tokens": 4,
         "use_local_argmax_reduction": True,
-        "draft_sample_method": "greedy",
+        "draft_sample_method": "probabilistic",
         "attention_backend": "TRITON_ATTN",
     }
     assert args.enable_prefix_caching is True
@@ -331,7 +331,7 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     assert args.speculative_config == {
         "method": "mtp",
         "num_speculative_tokens": 2,
-        "draft_sample_method": "greedy",
+        "draft_sample_method": "probabilistic",
         "use_local_argmax_reduction": True,
         "attention_backend": "TRITON_ATTN",
     }

@@ -10,6 +10,7 @@ the slower prefill path during active MTP.
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -197,6 +198,14 @@ def _create_gdn_builder(
         vllm_config=vllm_config,
         device=DEVICE,
     )
+
+
+def _clear_envs_cache() -> None:
+    cache_clear = getattr(
+        getattr(qwen_gdn.envs, "__getattr__", None), "cache_clear", None
+    )
+    if cache_clear is not None:
+        cache_clear()
 
 
 def _build(
@@ -996,6 +1005,61 @@ def test_sm70_qwen_gdn_full_forward_auto_is_mtp_engine_scoped(
             disabled=False,
             auto_enabled=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("method", "num_speculative_tokens", "expected"),
+    [
+        ("mtp", 2, False),
+        ("mtp", 3, True),
+        ("mtp", 4, True),
+        ("ngram", 4, False),
+    ],
+)
+def test_sm70_qwen_gdn_blocks_003_spec_core_only_for_deep_native_mtp(
+    monkeypatch,
+    method,
+    num_speculative_tokens,
+    expected,
+):
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", "1")
+    monkeypatch.delenv(
+        "VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP", raising=False
+    )
+    _clear_envs_cache()
+
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+    )
+
+    assert (
+        qwen_gdn._sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
+            vllm_config
+        )
+        is expected
+    )
+
+
+def test_sm70_qwen_gdn_003_spec_core_deep_mtp_override_is_diagnostic(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP", "1")
+    _clear_envs_cache()
+
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            num_speculative_tokens=4,
+        )
+    )
+
+    assert not qwen_gdn._sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
+        vllm_config
+    )
 
 
 def test_sm70_qwen_gdn_003_spec_core_route_has_priority(

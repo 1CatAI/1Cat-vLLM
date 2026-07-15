@@ -71,10 +71,14 @@ class BlockTable:
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        self._block_table_dirty_until = 0
+        self._block_table_committed_until = 0
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
         )
+        self._slot_mapping_pad_initialized = False
+        self._slot_mapping_last_num_tokens = 0
 
         if self.use_hybrid_blocks:
             self._kernel_block_arange = np.arange(0, self.blocks_per_kv_block).reshape(
@@ -99,6 +103,11 @@ class BlockTable:
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
+    def _mark_dirty(self, row_idx: int) -> None:
+        self._block_table_dirty_until = max(
+            self._block_table_dirty_until, row_idx + 1
+        )
+
     def append_row(
         self,
         block_ids: list[int],
@@ -116,9 +125,11 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        self._mark_dirty(row_idx)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
+        self._mark_dirty(row_idx)
         self.append_row(block_ids, row_idx)
 
     def clear_row(self, row_idx: int) -> None:
@@ -126,17 +137,21 @@ class BlockTable:
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
+        self._mark_dirty(row_idx)
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        self._mark_dirty(tgt)
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        self._mark_dirty(src)
+        self._mark_dirty(tgt)
 
     def compute_slot_mapping(
         self,
@@ -147,21 +162,52 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        _compute_slot_mapping_kernel[(num_reqs + 1,)](
-            num_tokens,
-            self.max_num_batched_tokens,
-            query_start_loc,
-            positions,
-            self.block_table.gpu,
-            self.block_table.gpu.stride(0),
-            self.block_size,
-            self.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
-            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
-            PAD_ID=PAD_SLOT_ID,
-            BLOCK_SIZE=1024,
+        can_skip_padding = (
+            self._slot_mapping_pad_initialized
+            and num_tokens >= self._slot_mapping_last_num_tokens
         )
+        if can_skip_padding and num_reqs == 1 and total_cp_world_size == 1:
+            _compute_slot_mapping_single_req_no_pad_kernel[(1,)](
+                num_tokens,
+                positions,
+                self.block_table.gpu,
+                self.block_size,
+                self.slot_mapping.gpu,
+                BLOCK_SIZE=64,
+            )
+        elif can_skip_padding:
+            _compute_slot_mapping_no_pad_kernel[(num_reqs,)](
+                num_tokens,
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                self.block_size,
+                self.slot_mapping.gpu,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
+        else:
+            _compute_slot_mapping_kernel[(num_reqs + 1,)](
+                num_tokens,
+                self.max_num_batched_tokens,
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                self.block_size,
+                self.slot_mapping.gpu,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
+            self._slot_mapping_pad_initialized = True
+        self._slot_mapping_last_num_tokens = num_tokens
 
     def warmup_slot_mapping_kernel(self) -> None:
         """JIT the slot-mapping kernel without touching live block-table state."""
@@ -199,16 +245,62 @@ class BlockTable:
                 PAD_ID=PAD_SLOT_ID,
                 BLOCK_SIZE=1024,
             )
+            _compute_slot_mapping_no_pad_kernel[(1,)](
+                num_tokens,
+                query_start_loc,
+                positions,
+                block_table,
+                block_table.stride(0),
+                self.block_size,
+                slot_mapping,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
+            _compute_slot_mapping_single_req_no_pad_kernel[(1,)](
+                num_tokens,
+                positions,
+                block_table,
+                self.block_size,
+                slot_mapping,
+                BLOCK_SIZE=64,
+            )
 
     def commit_block_table(self, num_reqs: int) -> None:
+        if (
+            self._block_table_dirty_until == 0
+            and num_reqs <= self._block_table_committed_until
+        ):
+            return
         self.block_table.copy_to_gpu(num_reqs)
+        self._block_table_committed_until = max(
+            self._block_table_committed_until, num_reqs
+        )
+        if self._block_table_dirty_until <= num_reqs:
+            self._block_table_dirty_until = 0
 
     def commit_block_table_staged(self, num_reqs: int) -> None:
+        if (
+            self._block_table_dirty_until == 0
+            and num_reqs <= self._block_table_committed_until
+        ):
+            return
         self.block_table.copy_to_gpu_staged(num_reqs)
+        self._block_table_committed_until = max(
+            self._block_table_committed_until, num_reqs
+        )
+        if self._block_table_dirty_until <= num_reqs:
+            self._block_table_dirty_until = 0
 
     def clear(self) -> None:
+        self._slot_mapping_pad_initialized = False
+        self._slot_mapping_last_num_tokens = 0
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._block_table_dirty_until = 0
+        self._block_table_committed_until = self.max_num_reqs
 
     @staticmethod
     def map_to_kernel_blocks(
@@ -425,4 +517,69 @@ def _compute_slot_mapping_kernel(
 
         slot_ids = block_numbers * block_size + local_block_offsets
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit
+def _compute_slot_mapping_no_pad_kernel(
+    num_tokens,
+    query_start_loc_ptr,  # [num_reqs + 1], int32
+    positions_ptr,  # [num_tokens], int64
+    block_table_ptr,  # [max_num_reqs, max_num_blocks_per_req], int32 (flat)
+    block_table_stride,  # max_num_blocks_per_req
+    block_size,
+    slot_mapping_ptr,  # [max_num_tokens], int64
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
+
+    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+    row_offset = req_idx * block_table_stride
+    for i in range(start_idx, end_idx, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < end_idx
+        pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
+        block_indices = pos // virtual_block_size
+        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(
+            tl.int64
+        )
+
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+        local_block_offsets = (
+            virtual_block_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+        slot_ids = block_numbers * block_size + local_block_offsets
+        slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit
+def _compute_slot_mapping_single_req_no_pad_kernel(
+    num_tokens,
+    positions_ptr,  # [num_tokens], int64
+    block_table_ptr,  # first request row, int32
+    block_size,
+    slot_mapping_ptr,  # [max_num_tokens], int64
+    BLOCK_SIZE: tl.constexpr,
+):
+    for i in range(0, num_tokens, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < num_tokens
+        pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
+        block_indices = pos // block_size
+        block_numbers = tl.load(block_table_ptr + block_indices).to(tl.int64)
+        block_offsets = pos - block_indices * block_size
+        slot_ids = block_numbers * block_size + block_offsets
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)

@@ -9,6 +9,7 @@ from vllm.v1.spec_decode.ddtree_payload import (
 )
 from vllm.v1.spec_decode.ddtree_verify import (
     greedy_verify_payload_from_compact_logits,
+    greedy_verify_payload_from_compact_top_tokens,
     make_attention_verifier_inputs,
     metadata_from_payload,
 )
@@ -62,7 +63,32 @@ def test_greedy_verify_payload_full_accept() -> None:
         compact_logits=compact_logits,
     )
 
-    assert result.accepted_node_indices == (1, 2, 3)
+    assert result.accepted_node_indices == (0, 1, 2, 3)
+    assert result.accepted_token_ids == (11, 21, 31)
+    assert result.bonus_token_id == 99
+    assert result.output_token_ids == (11, 21, 31, 99)
+
+
+def test_greedy_verify_payload_from_top_tokens_full_accept() -> None:
+    logits = torch.full((3, 128), -100.0, dtype=torch.float32)
+    logits[0, 11] = 10.0
+    logits[1, 21] = 10.0
+    logits[2, 31] = 10.0
+    payload = build_ddtree_payloads_from_logits(
+        logits=logits,
+        batch_size=1,
+        num_speculative_tokens=3,
+        budget=3,
+        top_k=1,
+        chain_seed=True,
+    )[0]
+
+    result = greedy_verify_payload_from_compact_top_tokens(
+        payload=payload,
+        compact_top_tokens=torch.tensor([11, 21, 31, 99], dtype=torch.int64),
+    )
+
+    assert result.accepted_node_indices == (0, 1, 2, 3)
     assert result.accepted_token_ids == (11, 21, 31)
     assert result.bonus_token_id == 99
     assert result.output_token_ids == (11, 21, 31, 99)
@@ -96,7 +122,7 @@ def test_greedy_verify_payload_accepts_sibling_branch() -> None:
         compact_logits=compact_logits,
     )
 
-    assert result.accepted_node_indices == (sibling_node,)
+    assert result.accepted_node_indices == (0, sibling_node)
     assert result.accepted_token_ids == (12,)
     assert result.bonus_token_id == 99
     assert result.output_token_ids == (12, 99)
