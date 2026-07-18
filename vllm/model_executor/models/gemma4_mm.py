@@ -1194,9 +1194,30 @@ class Gemma4ForConditionalGeneration(
                 pad_tensor = (pp_tensor == -1).all(dim=-1)
 
                 inputs_embeds = vt.patch_embedder(pv_tensor, pp_tensor, pad_tensor)
+
+                # HF expands a 2D bool mask into a full (B, 1, N, N) bool
+                # mask, which makes torch SDPA fall back to the math backend
+                # and materialize N x N fp16 scores per head (a ~6 GiB single
+                # allocation for 2 images at 10080 patches — OOMs the worker
+                # on memory-tight SM70 cards). Build the additive key-padding
+                # mask ourselves in the query dtype (the tower runs bf16 on
+                # this checkpoint): broadcastable (B, 1, 1, N), keeps SDPA on
+                # the memory-efficient backend, and produces bit-identical
+                # outputs (verified offline). With no padding at all, pass
+                # None.
+                if pad_tensor.any():
+                    batch_size, num_patches = pad_tensor.shape
+                    attn_mask = torch.zeros(
+                        (batch_size, 1, 1, num_patches),
+                        dtype=inputs_embeds.dtype,
+                        device=pad_tensor.device,
+                    ).masked_fill_(pad_tensor.unsqueeze(1).unsqueeze(1), float("-inf"))
+                else:
+                    attn_mask = None
+
                 encoder_outputs = vt.encoder(
                     inputs_embeds=inputs_embeds,
-                    attention_mask=~pad_tensor,
+                    attention_mask=attn_mask,
                     pixel_position_ids=pp_tensor,
                 )
                 hidden_states = encoder_outputs.last_hidden_state
@@ -1570,7 +1591,21 @@ class Gemma4ForConditionalGeneration(
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+        # The HF vision/audio towers stay in the checkpoint's bf16 dtype
+        # (the fp16 cast applied to the vLLM language stack does not cover
+        # them). torch's memory-efficient SDPA kernel rejects bf16 on SM70
+        # (fp16/fp32 only), so a bf16 tower always falls back to the math
+        # backend and materializes N x N attention scores — several GiB per
+        # encoder pass at high patch counts, OOMing memory-tight workers.
+        # Cast the towers to the language model's dtype so SDPA can take
+        # the memory-efficient path.
+        model_dtype = self.language_model.model.embed_tokens.weight.dtype
+        for tower in (self.vision_tower, self.embed_vision, self.audio_tower, self.embed_audio):
+            if tower is not None:
+                tower.to(model_dtype)
+        return loaded
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping
