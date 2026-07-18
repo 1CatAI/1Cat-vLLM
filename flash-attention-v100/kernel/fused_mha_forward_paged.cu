@@ -68,6 +68,10 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
 #define BLOCK_N_256 64
 #define WARPS_256   16
 
+#define BLOCK_M_512 16
+#define BLOCK_N_512 32
+#define WARPS_512   16
+
 #define BLOCK_M_256_LOW_SMEM 16
 #define BLOCK_N_256_LOW_SMEM 128
 #define KV_STAGE_N_256_LOW_SMEM 1
@@ -79,9 +83,9 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
 template<int D, bool LOW_SMEM = false, bool LOW_SMEM_SCALAR_QK = false,
          bool LOW_SMEM_BM32 = false>
 struct KernelConfig {
-    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (LOW_SMEM ? (LOW_SMEM_BM32 ? BLOCK_M_256 : BLOCK_M_256_LOW_SMEM) : BLOCK_M_256);
-    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (LOW_SMEM ? (LOW_SMEM_SCALAR_QK ? BLOCK_N_256_LOW_SMEM_SCALAR_QK : BLOCK_N_256_LOW_SMEM) : BLOCK_N_256);
-    static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
+    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (D == 512) ? BLOCK_M_512 : (LOW_SMEM ? (LOW_SMEM_BM32 ? BLOCK_M_256 : BLOCK_M_256_LOW_SMEM) : BLOCK_M_256);
+    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (D == 512) ? BLOCK_N_512 : (LOW_SMEM ? (LOW_SMEM_SCALAR_QK ? BLOCK_N_256_LOW_SMEM_SCALAR_QK : BLOCK_N_256_LOW_SMEM) : BLOCK_N_256);
+    static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : (D == 512) ? WARPS_512 : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
 
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
@@ -1874,8 +1878,8 @@ at::Tensor flash_attention_prefill_paged(
     const int D = q.size(3);
     const int num_kv_heads = k_cache.size(2);
 
-    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
-                "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(D <= 512 && D % 8 == 0 && D % 2 == 0,
+                "D must be even, <=512, multiple of 8");
     TORCH_CHECK(H % num_kv_heads == 0,
                 "num_heads must be divisible by num_kv_heads");
     TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
@@ -1928,6 +1932,9 @@ at::Tensor flash_attention_prefill_paged(
             break;
         case 256:
             LAUNCH_PAGED_BY_KV(256);
+            break;
+        case 512:
+            LAUNCH_PAGED_BY_KV(512);
             break;
         default:
             TORCH_CHECK(false, "Unsupported D: ", D);
