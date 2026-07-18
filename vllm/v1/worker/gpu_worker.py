@@ -604,6 +604,27 @@ class Worker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
+            # torch's BACKED dynamic shapes (the default) specialize a
+            # symbol whose first-seen value is 0 or 1: if the first compiled
+            # forward runs with num_tokens == 1, batch=1 is baked into the
+            # compiled artifact, and every later guard-free call returns
+            # batch-1 outputs (e.g. hidden_states shaped [1, H] for a
+            # 4-token warmup run, tripping device-side asserts downstream).
+            # CUDA graph capture compiles largest-first, but a config whose
+            # compiled sizes are all 1 (e.g. cudagraph_capture_sizes=[1])
+            # still poisons the artifact. Prime compilation at num_tokens=2
+            # so the batch symbol stays dynamic. When max_num_batched_tokens
+            # is 1 no real batch can exceed 1, so priming is unnecessary.
+            compiled_sizes = set(cg_capture_sizes)
+            compiled_sizes.update(x for x in warmup_sizes if isinstance(x, int))
+            if (
+                compiled_sizes
+                and max(compiled_sizes) < 2
+                and (self.vllm_config.scheduler_config.max_num_batched_tokens or 0)
+                > 1
+            ):
+                warmup_sizes.append(2)
+
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
