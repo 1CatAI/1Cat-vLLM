@@ -86,7 +86,7 @@ DEFAULT_PUBLIC_QUALITY_DATASETS = ("humaneval", "mbpp", "ifeval")
 QUALITY_PROMPTS = (
     {
         "id": "macos_6k_code",
-        "max_tokens": 6000,
+        "max_tokens": 32768,
         "content": (
             "帮我用 HTML、CSS、JavaScript 做一个 macOS 桌面模拟器，"
             "功能尽可能完整：菜单栏、Dock、可拖动窗口、Finder、设置、"
@@ -1259,7 +1259,7 @@ def _run_quality_phase(
             _sync_cuda()
             elapsed_s = time.perf_counter() - start
             text, token_ids, finish_reason, stop_reason = _output_record(request)
-            records.append({
+            record = {
                 "id": prompt["id"],
                 "repeat": repeat_idx + 1,
                 "finish_reason": finish_reason,
@@ -1273,7 +1273,11 @@ def _run_quality_phase(
                 "metrics": _quality_metrics(text, token_ids),
                 "preview": text[:1200],
                 "tail": text[-1200:],
-            })
+            }
+            if args.quality_save_full_output:
+                record["text"] = text
+                record["token_ids"] = token_ids
+            records.append(record)
     return {
         "sampling": {
             **generation_config,
@@ -2288,6 +2292,8 @@ def _run_case_subprocess(
     ]
     if not args.enable_thinking:
         cmd.append("--disable-thinking")
+    if args.quality_save_full_output:
+        cmd.append("--quality-save-full-output")
     for engine_arg in args.engine_arg:
         cmd.extend(["--engine-arg", engine_arg])
     for prompt_id in args.quality_prompt_id or []:
@@ -2533,6 +2539,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quality-max-tokens", type=int, default=6000)
     parser.add_argument("--quality-repeat", type=int, default=1)
     parser.add_argument("--quality-prompt-id", action="append")
+    parser.add_argument(
+        "--quality-save-full-output",
+        action="store_true",
+        help="Store full quality text and token IDs instead of preview/tail only.",
+    )
     parser.add_argument("--public-dataset-cache-dir",
                         type=Path,
                         default=DEFAULT_PUBLIC_DATASET_CACHE_DIR)

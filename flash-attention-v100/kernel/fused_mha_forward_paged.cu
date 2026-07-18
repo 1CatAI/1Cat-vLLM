@@ -2082,6 +2082,7 @@ constexpr int D256_BM32_PHASE_D = 256;
 constexpr int D256_BM32_PHASE_THREADS = 512;
 constexpr int D256_BM32_PHASE_PAGE_SIZE = 16;
 constexpr int D256_BM32_PHASE_PAGE_BLOCK_SIZE = 784;
+constexpr int D256_BM32_PHASE_SPLIT_PARTS = 3;
 constexpr int D256_BM32_PHASE_PAGE_SLOTS =
     D256_BM32_PHASE_BLOCK_N / D256_BM32_PHASE_PAGE_SIZE;
 constexpr int D256_BM32_PHASE_PANELS =
@@ -2110,6 +2111,22 @@ struct alignas(16) D256BM32PhaseSharedStorage {
     int actual_n;
 };
 
+template<int PROBABILITY_PANELS>
+struct alignas(16) D256BM32PhaseSplitSharedStorage
+    : D256BM32PhaseSharedStorage<PROBABILITY_PANELS> {
+    int split_end_block;
+};
+
+template<bool SPLIT_KV, int PROBABILITY_PANELS>
+struct D256BM32PhaseSharedStorageSelector {
+    using Type = D256BM32PhaseSharedStorage<PROBABILITY_PANELS>;
+};
+
+template<int PROBABILITY_PANELS>
+struct D256BM32PhaseSharedStorageSelector<true, PROBABILITY_PANELS> {
+    using Type = D256BM32PhaseSplitSharedStorage<PROBABILITY_PANELS>;
+};
+
 using D256BM32PhaseSharedStorageSingle = D256BM32PhaseSharedStorage<1>;
 using D256BM32PhaseSharedStorageAllP =
     D256BM32PhaseSharedStorage<D256_BM32_PHASE_PANELS>;
@@ -2120,6 +2137,9 @@ static_assert(sizeof(D256BM32PhaseSharedStorageAllP) == 41936,
               "D256 BM32 all-P shared layout changed unexpectedly");
 static_assert(sizeof(D256BM32PhaseSharedStorageAllP) <= 48 * 1024,
               "D256 BM32 phase shared storage exceeds 48 KiB");
+static_assert(sizeof(D256BM32PhaseSplitSharedStorage<
+                      D256_BM32_PHASE_PANELS>) == 41952,
+              "D256 BM32 split shared layout changed unexpectedly");
 
 using D256BM32PhaseMatrixAFragment =
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major>;
@@ -2390,6 +2410,38 @@ __device__ __forceinline__ float d256_bm32_phase_make_probability_row(
     return exp_diff;
 }
 
+__device__ __forceinline__ float
+d256_bm32_phase_make_split_probability_row(
+    const float* __restrict__ score_row,
+    __half* __restrict__ probability,
+    int probability_row,
+    float* __restrict__ row_max,
+    float* __restrict__ row_sum,
+    int state_row,
+    int panel,
+    float neg_inf,
+    bool has_visible_value) {
+    if (!has_visible_value) {
+        const int lane = threadIdx.x & 31;
+        if (lane < D256_BM32_PHASE_SOFTMAX_N / 4) {
+            const int column = lane * 4;
+            __half2* first_pair = reinterpret_cast<__half2*>(
+                probability + d256_bm32_phase_matrix_a_offset(
+                                  probability_row, column));
+            __half2* second_pair = reinterpret_cast<__half2*>(
+                probability + d256_bm32_phase_matrix_a_offset(
+                                  probability_row, column + 2));
+            const __half2 zero = __float2half2_rn(0.0f);
+            *first_pair = zero;
+            *second_pair = zero;
+        }
+        return 1.0f;
+    }
+    return d256_bm32_phase_make_probability_row(
+        score_row, probability, probability_row, row_max, row_sum,
+        state_row, panel, neg_inf);
+}
+
 __device__ __forceinline__ void d256_bm32_phase_scale_accumulator_rows(
     D256BM32PhaseAccumulatorFragment& accumulator,
     float first_row_scale,
@@ -2488,9 +2540,30 @@ __device__ __forceinline__ void d256_bm32_phase_store_output_partial(
     }
 }
 
-template<bool IS_CAUSAL, bool ALL_P = false, bool PAIR_SCRATCH = false>
-__global__ __launch_bounds__(D256_BM32_PHASE_THREADS, 2)
-void flash_attention_forward_paged_d256_bm32_phase_kernel(
+__device__ __forceinline__ void d256_bm32_phase_store_unnormalized_partial(
+    const D256BM32PhaseAccumulatorFragment& accumulator,
+    float* __restrict__ output,
+    int row_offset,
+    int d_offset,
+    int valid_rows) {
+    const int lane = threadIdx.x & 31;
+    #pragma unroll
+    for (int element = 0; element < accumulator.num_elements; ++element) {
+        const int row = row_offset
+                        + d256_bm32_phase_accumulator_row(lane, element);
+        if (row < valid_rows) {
+            const int column =
+                d_offset
+                + d256_bm32_phase_accumulator_column(lane, element);
+            output[row * D256_BM32_PHASE_D + column] = accumulator.x[element];
+        }
+    }
+}
+
+template<bool IS_CAUSAL, bool ALL_P = false, bool PAIR_SCRATCH = false,
+         bool SPLIT_KV = false, bool CHECK_SPLIT_EMPTY = true>
+__device__ __forceinline__
+void flash_attention_forward_paged_d256_bm32_phase_body(
     const __half* __restrict__ Q,
     const __half* __restrict__ K_cache,
     const __half* __restrict__ V_cache,
@@ -2508,11 +2581,18 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
     int64_t v_block_stride,
     int64_t v_token_stride,
     int64_t v_head_stride,
-    float softmax_scale) {
+    float softmax_scale,
+    float* __restrict__ split_tmp_out,
+    float* __restrict__ split_tmp_row_max,
+    float* __restrict__ split_tmp_row_sum,
+    int split_actual_n) {
     constexpr float NEG_INF = -1e30f;
+    static_assert(!SPLIT_KV || (ALL_P && PAIR_SCRATCH),
+                  "BM32 split-KV requires the accepted all-P pair-scratch body");
     __shared__ __align__(16)
-        D256BM32PhaseSharedStorage<ALL_P ? D256_BM32_PHASE_PANELS : 1>
-            shared;
+        typename D256BM32PhaseSharedStorageSelector<
+            SPLIT_KV,
+            ALL_P ? D256_BM32_PHASE_PANELS : 1>::Type shared;
 
     const int start_row = blockIdx.x * D256_BM32_PHASE_BLOCK_M;
     const int tid = threadIdx.x;
@@ -2541,9 +2621,28 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
         shared.batch_id = blockIdx.z / H;
         shared.kv_head_id =
             (blockIdx.z % H) / (H / num_kv_heads);
-        shared.actual_n = seqused_k[shared.batch_id];
+        if constexpr (SPLIT_KV) {
+            shared.actual_n = split_actual_n;
+        } else {
+            shared.actual_n = seqused_k[shared.batch_id];
+        }
     }
     __syncthreads();
+
+    const int total_n_blocks =
+        (shared.actual_n + D256_BM32_PHASE_BLOCK_N - 1)
+        / D256_BM32_PHASE_BLOCK_N;
+    if constexpr (SPLIT_KV) {
+        if (tid == 0) {
+            shared.block_index =
+                static_cast<int>(blockIdx.y) * total_n_blocks
+                / D256_BM32_PHASE_SPLIT_PARTS;
+            shared.split_end_block =
+                (static_cast<int>(blockIdx.y) + 1) * total_n_blocks
+                / D256_BM32_PHASE_SPLIT_PARTS;
+        }
+        __syncthreads();
+    }
 
     D256BM32PhaseAccumulatorFragment accumulator_top;
     D256BM32PhaseAccumulatorFragment accumulator_bottom;
@@ -2551,11 +2650,17 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
     fill_fragment(accumulator_bottom, 0.0f);
 
     for (;;) {
+        if constexpr (SPLIT_KV) {
+            if (shared.block_index >= shared.split_end_block) {
+                break;
+            }
+        } else {
+            if (shared.block_index >= total_n_blocks) {
+                break;
+            }
+        }
         const int start_col =
             shared.block_index * D256_BM32_PHASE_BLOCK_N;
-        if (start_col >= shared.actual_n) {
-            break;
-        }
         const int valid_k_rows = min(D256_BM32_PHASE_BLOCK_N,
                                      shared.actual_n - start_col);
 
@@ -2709,21 +2814,55 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
                     float* row_exp_diff =
                         shared.row_exp_diff
                         + panel * D256_BM32_PHASE_BLOCK_M;
-                    const float top_exp_diff =
-                        d256_bm32_phase_make_probability_row(
+                    float top_exp_diff;
+                    float bottom_exp_diff;
+                    if constexpr (SPLIT_KV && CHECK_SPLIT_EMPTY) {
+                        const int first_global_n = start_col + panel_start;
+                        const bool top_has_visible_value =
+                            warp_id < valid_q_rows
+                            && (!IS_CAUSAL
+                                || first_global_n
+                                       <= start_row + warp_id
+                                              + causal_q_offset);
+                        const bool bottom_has_visible_value =
+                            D256_BM32_PHASE_PANEL_M + warp_id < valid_q_rows
+                            && (!IS_CAUSAL
+                                || first_global_n
+                                       <= start_row
+                                              + D256_BM32_PHASE_PANEL_M
+                                              + warp_id + causal_q_offset);
+                        top_exp_diff =
+                            d256_bm32_phase_make_split_probability_row(
+                                shared.score
+                                    + warp_id * D256_BM32_PHASE_BLOCK_N,
+                                probability_top, warp_id, shared.row_max,
+                                shared.row_sum, warp_id, panel, NEG_INF,
+                                top_has_visible_value);
+                        bottom_exp_diff =
+                            d256_bm32_phase_make_split_probability_row(
+                                shared.score
+                                    + (D256_BM32_PHASE_PANEL_M + warp_id)
+                                          * D256_BM32_PHASE_BLOCK_N,
+                                probability_bottom, warp_id, shared.row_max,
+                                shared.row_sum,
+                                D256_BM32_PHASE_PANEL_M + warp_id, panel,
+                                NEG_INF, bottom_has_visible_value);
+                    } else {
+                        top_exp_diff = d256_bm32_phase_make_probability_row(
                             shared.score
                                 + warp_id * D256_BM32_PHASE_BLOCK_N,
                             probability_top, warp_id, shared.row_max,
                             shared.row_sum, warp_id, panel, NEG_INF);
-                    const float bottom_exp_diff =
-                        d256_bm32_phase_make_probability_row(
-                            shared.score
-                                + (D256_BM32_PHASE_PANEL_M + warp_id)
-                                      * D256_BM32_PHASE_BLOCK_N,
-                            probability_bottom, warp_id, shared.row_max,
-                            shared.row_sum,
-                            D256_BM32_PHASE_PANEL_M + warp_id, panel,
-                            NEG_INF);
+                        bottom_exp_diff =
+                            d256_bm32_phase_make_probability_row(
+                                shared.score
+                                    + (D256_BM32_PHASE_PANEL_M + warp_id)
+                                          * D256_BM32_PHASE_BLOCK_N,
+                                probability_bottom, warp_id, shared.row_max,
+                                shared.row_sum,
+                                D256_BM32_PHASE_PANEL_M + warp_id, panel,
+                                NEG_INF);
+                    }
                     if (lane_id == 0) {
                         row_exp_diff[warp_id] = top_exp_diff;
                         row_exp_diff[D256_BM32_PHASE_PANEL_M + warp_id] =
@@ -2754,7 +2893,11 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
                     const float* row_exp_diff =
                         shared.row_exp_diff
                         + panel * D256_BM32_PHASE_BLOCK_M;
-                    if (shared.block_index != 0 || panel != 0) {
+                    if constexpr (SPLIT_KV) {
+                        d256_bm32_phase_scale_accumulators(
+                            accumulator_top, accumulator_bottom,
+                            row_exp_diff);
+                    } else if (shared.block_index != 0 || panel != 0) {
                         d256_bm32_phase_scale_accumulators(
                             accumulator_top, accumulator_bottom,
                             row_exp_diff);
@@ -2817,7 +2960,11 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
                 __syncthreads();
 
                 if (valid_panel_columns > 0) {
-                    if (shared.block_index != 0 || panel != 0) {
+                    if constexpr (SPLIT_KV) {
+                        d256_bm32_phase_scale_accumulators(
+                            accumulator_top, accumulator_bottom,
+                            shared.row_exp_diff);
+                    } else if (shared.block_index != 0 || panel != 0) {
                         d256_bm32_phase_scale_accumulators(
                             accumulator_top, accumulator_bottom,
                             shared.row_exp_diff);
@@ -2854,31 +3001,115 @@ void flash_attention_forward_paged_d256_bm32_phase_kernel(
 
     {
         const size_t q_head_linear = static_cast<size_t>(blockIdx.z);
-        __half* out_ptr =
-            Out + q_head_linear * M * D256_BM32_PHASE_D
-            + start_row * D256_BM32_PHASE_D;
-        float* softmax_lse_ptr = softmax_lse + q_head_linear * M + start_row;
-        if (valid_q_rows == D256_BM32_PHASE_BLOCK_M) {
-            d256_bm32_phase_store_output(
-                accumulator_top, out_ptr, shared.row_sum, 0,
-                warp_id * WMMA_N);
-            d256_bm32_phase_store_output(
-                accumulator_bottom, out_ptr, shared.row_sum,
-                D256_BM32_PHASE_PANEL_M, warp_id * WMMA_N);
-        } else {
-            d256_bm32_phase_store_output_partial(
-                accumulator_top, out_ptr, shared.row_sum, 0,
+        if constexpr (SPLIT_KV) {
+            const size_t partial_row_base =
+                (q_head_linear * D256_BM32_PHASE_SPLIT_PARTS
+                 + static_cast<int>(blockIdx.y))
+                    * M
+                + start_row;
+            float* partial_out =
+                split_tmp_out
+                + partial_row_base * D256_BM32_PHASE_D;
+            d256_bm32_phase_store_unnormalized_partial(
+                accumulator_top, partial_out, 0,
                 warp_id * WMMA_N, valid_q_rows);
-            d256_bm32_phase_store_output_partial(
-                accumulator_bottom, out_ptr, shared.row_sum,
+            d256_bm32_phase_store_unnormalized_partial(
+                accumulator_bottom, partial_out,
                 D256_BM32_PHASE_PANEL_M, warp_id * WMMA_N, valid_q_rows);
-        }
+            if (tid < valid_q_rows) {
+                split_tmp_row_max[partial_row_base + tid] =
+                    shared.row_max[tid];
+                split_tmp_row_sum[partial_row_base + tid] =
+                    shared.row_sum[tid];
+            }
+        } else {
+            __half* out_ptr =
+                Out + q_head_linear * M * D256_BM32_PHASE_D
+                + start_row * D256_BM32_PHASE_D;
+            float* softmax_lse_ptr =
+                softmax_lse + q_head_linear * M + start_row;
+            if (valid_q_rows == D256_BM32_PHASE_BLOCK_M) {
+                d256_bm32_phase_store_output(
+                    accumulator_top, out_ptr, shared.row_sum, 0,
+                    warp_id * WMMA_N);
+                d256_bm32_phase_store_output(
+                    accumulator_bottom, out_ptr, shared.row_sum,
+                    D256_BM32_PHASE_PANEL_M, warp_id * WMMA_N);
+            } else {
+                d256_bm32_phase_store_output_partial(
+                    accumulator_top, out_ptr, shared.row_sum, 0,
+                    warp_id * WMMA_N, valid_q_rows);
+                d256_bm32_phase_store_output_partial(
+                    accumulator_bottom, out_ptr, shared.row_sum,
+                    D256_BM32_PHASE_PANEL_M, warp_id * WMMA_N, valid_q_rows);
+            }
 
-        if (tid < valid_q_rows) {
-            const float sum = fmaxf(shared.row_sum[tid], 1e-24f);
-            softmax_lse_ptr[tid] = shared.row_max[tid] + logf(sum);
+            if (tid < valid_q_rows) {
+                const float sum = fmaxf(shared.row_sum[tid], 1e-24f);
+                softmax_lse_ptr[tid] = shared.row_max[tid] + logf(sum);
+            }
         }
     }
+}
+
+template<bool IS_CAUSAL, bool ALL_P = false, bool PAIR_SCRATCH = false>
+__global__ __launch_bounds__(D256_BM32_PHASE_THREADS, 2)
+void flash_attention_forward_paged_d256_bm32_phase_kernel(
+    const __half* __restrict__ Q,
+    const __half* __restrict__ K_cache,
+    const __half* __restrict__ V_cache,
+          __half* __restrict__ Out,
+           float* __restrict__ softmax_lse,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seqused_k,
+    int H,
+    int M,
+    int max_num_blocks_per_seq,
+    int num_kv_heads,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    float softmax_scale) {
+    flash_attention_forward_paged_d256_bm32_phase_body<
+        IS_CAUSAL, ALL_P, PAIR_SCRATCH, false>(
+            Q, K_cache, V_cache, Out, softmax_lse, block_table, seqused_k,
+            H, M, max_num_blocks_per_seq, num_kv_heads, k_block_stride,
+            k_token_stride, k_head_stride, v_block_stride, v_token_stride,
+            v_head_stride, softmax_scale, nullptr, nullptr, nullptr, 0);
+}
+
+template<bool CHECK_SPLIT_EMPTY>
+__global__ __launch_bounds__(D256_BM32_PHASE_THREADS, 2)
+void flash_attention_forward_paged_d256_bm32_splitkv3_partial_kernel(
+    const __half* __restrict__ Q,
+    const __half* __restrict__ K_cache,
+    const __half* __restrict__ V_cache,
+    const int* __restrict__ block_table,
+    int H,
+    int M,
+    int actual_n,
+    int max_num_blocks_per_seq,
+    int num_kv_heads,
+    int64_t k_block_stride,
+    int64_t k_token_stride,
+    int64_t k_head_stride,
+    int64_t v_block_stride,
+    int64_t v_token_stride,
+    int64_t v_head_stride,
+    float softmax_scale,
+    float* __restrict__ split_tmp_out,
+    float* __restrict__ split_tmp_row_max,
+    float* __restrict__ split_tmp_row_sum) {
+    flash_attention_forward_paged_d256_bm32_phase_body<
+        true, true, true, true, CHECK_SPLIT_EMPTY>(
+            Q, K_cache, V_cache, nullptr, nullptr, block_table, nullptr,
+            H, M, max_num_blocks_per_seq, num_kv_heads, k_block_stride,
+            k_token_stride, k_head_stride, v_block_stride, v_token_stride,
+            v_head_stride, softmax_scale, split_tmp_out,
+            split_tmp_row_max, split_tmp_row_sum, actual_n);
 }
 
 template<bool IS_CAUSAL, bool ALL_P, bool PAIR_SCRATCH>
@@ -2916,6 +3147,144 @@ void launch_flash_attention_forward_paged_d256_bm32_phase_kernel(
             seq_lens.data_ptr<int>(), H, M, max_num_blocks_per_seq,
             num_kv_heads, k_block_stride, k_token_stride, k_head_stride,
             v_block_stride, v_token_stride, v_head_stride, softmax_scale);
+}
+
+__global__ __launch_bounds__(256)
+void flash_attention_forward_paged_d256_bm32_splitkv3_merge_kernel(
+    const float* __restrict__ split_tmp_out,
+    const float* __restrict__ split_tmp_row_max,
+    const float* __restrict__ split_tmp_row_sum,
+    __half* __restrict__ Out,
+    float* __restrict__ softmax_lse,
+    int M) {
+    const int start_row = blockIdx.x * D256_BM32_PHASE_BLOCK_M;
+    const int row_local = threadIdx.x >> 3;
+    const int lane_in_row = threadIdx.x & 7;
+    const int row = start_row + row_local;
+    if (row >= M) {
+        return;
+    }
+
+    const size_t q_head_linear = static_cast<size_t>(blockIdx.z);
+    const size_t first_state =
+        (q_head_linear * D256_BM32_PHASE_SPLIT_PARTS) * M + row;
+    const float max_0 = split_tmp_row_max[first_state];
+    const float max_1 = split_tmp_row_max[first_state + M];
+    const float max_2 = split_tmp_row_max[first_state + 2 * M];
+    const float sum_0 = split_tmp_row_sum[first_state];
+    const float sum_1 = split_tmp_row_sum[first_state + M];
+    const float sum_2 = split_tmp_row_sum[first_state + 2 * M];
+    const float merged_max = fmaxf(max_0, fmaxf(max_1, max_2));
+    const float weight_0 =
+        sum_0 > 0.0f ? __expf(fmaxf(max_0 - merged_max, -80.0f)) : 0.0f;
+    const float weight_1 =
+        sum_1 > 0.0f ? __expf(fmaxf(max_1 - merged_max, -80.0f)) : 0.0f;
+    const float weight_2 =
+        sum_2 > 0.0f ? __expf(fmaxf(max_2 - merged_max, -80.0f)) : 0.0f;
+    const float denominator =
+        weight_0 * sum_0 + weight_1 * sum_1 + weight_2 * sum_2;
+    const float inverse_denominator =
+        1.0f / fmaxf(denominator, 1e-24f);
+
+    if (lane_in_row == 0) {
+        softmax_lse[q_head_linear * M + row] =
+            merged_max + logf(fmaxf(denominator, 1e-24f));
+    }
+
+    const size_t output_base =
+        (q_head_linear * M + row) * D256_BM32_PHASE_D;
+    const size_t partial_base_0 = first_state * D256_BM32_PHASE_D;
+    const size_t partial_base_1 =
+        (first_state + M) * D256_BM32_PHASE_D;
+    const size_t partial_base_2 =
+        (first_state + 2 * M) * D256_BM32_PHASE_D;
+    #pragma unroll
+    for (int column = lane_in_row; column < D256_BM32_PHASE_D; column += 8) {
+        const float numerator =
+            weight_0 * split_tmp_out[partial_base_0 + column]
+            + weight_1 * split_tmp_out[partial_base_1 + column]
+            + weight_2 * split_tmp_out[partial_base_2 + column];
+        Out[output_base + column] =
+            __float2half_rn(numerator * inverse_denominator);
+    }
+}
+
+void launch_flash_attention_forward_paged_d256_bm32_splitkv3_kernel(
+    const torch::Tensor& Q,
+    const torch::Tensor& K_cache,
+    const torch::Tensor& V_cache,
+    torch::Tensor& Out,
+    torch::Tensor& softmax_lse,
+    torch::Tensor& split_tmp_out,
+    torch::Tensor& split_tmp_row_max,
+    torch::Tensor& split_tmp_row_sum,
+    const torch::Tensor& block_table,
+    int actual_n,
+    float softmax_scale,
+    cudaStream_t stream) {
+    const int H = Q.size(1);
+    const int M = Q.size(2);
+    const int num_kv_heads = K_cache.size(2);
+    const int max_num_blocks_per_seq = block_table.size(1);
+    const int64_t k_block_stride = K_cache.stride(0);
+    const int64_t k_token_stride = K_cache.stride(1);
+    const int64_t k_head_stride = K_cache.stride(2);
+    const int64_t v_block_stride = V_cache.stride(0);
+    const int64_t v_token_stride = V_cache.stride(1);
+    const int64_t v_head_stride = V_cache.stride(2);
+    const dim3 partial_grid(
+        (M + D256_BM32_PHASE_BLOCK_M - 1) / D256_BM32_PHASE_BLOCK_M,
+        D256_BM32_PHASE_SPLIT_PARTS,
+        Q.size(0) * H);
+    const dim3 partial_block(D256_BM32_PHASE_THREADS);
+    const int64_t total_n_blocks =
+        (static_cast<int64_t>(actual_n) + D256_BM32_PHASE_BLOCK_N - 1)
+        / D256_BM32_PHASE_BLOCK_N;
+    const int64_t last_split_begin =
+        (D256_BM32_PHASE_SPLIT_PARTS - 1) * total_n_blocks
+        / D256_BM32_PHASE_SPLIT_PARTS * D256_BM32_PHASE_BLOCK_N;
+    const bool check_split_empty =
+        total_n_blocks < D256_BM32_PHASE_SPLIT_PARTS
+        || last_split_begin > static_cast<int64_t>(actual_n) - M;
+    if (check_split_empty) {
+        flash_attention_forward_paged_d256_bm32_splitkv3_partial_kernel<true>
+            <<<partial_grid, partial_block, 0, stream>>>(
+                reinterpret_cast<const __half*>(Q.data_ptr()),
+                reinterpret_cast<const __half*>(K_cache.data_ptr()),
+                reinterpret_cast<const __half*>(V_cache.data_ptr()),
+                block_table.data_ptr<int>(), H, M, actual_n,
+                max_num_blocks_per_seq, num_kv_heads, k_block_stride,
+                k_token_stride, k_head_stride, v_block_stride,
+                v_token_stride, v_head_stride, softmax_scale,
+                split_tmp_out.data_ptr<float>(),
+                split_tmp_row_max.data_ptr<float>(),
+                split_tmp_row_sum.data_ptr<float>());
+    } else {
+        flash_attention_forward_paged_d256_bm32_splitkv3_partial_kernel<false>
+            <<<partial_grid, partial_block, 0, stream>>>(
+            reinterpret_cast<const __half*>(Q.data_ptr()),
+            reinterpret_cast<const __half*>(K_cache.data_ptr()),
+            reinterpret_cast<const __half*>(V_cache.data_ptr()),
+                block_table.data_ptr<int>(), H, M, actual_n,
+                max_num_blocks_per_seq, num_kv_heads, k_block_stride,
+                k_token_stride, k_head_stride, v_block_stride,
+                v_token_stride, v_head_stride, softmax_scale,
+                split_tmp_out.data_ptr<float>(),
+                split_tmp_row_max.data_ptr<float>(),
+                split_tmp_row_sum.data_ptr<float>());
+    }
+
+    const dim3 merge_grid(
+        (M + D256_BM32_PHASE_BLOCK_M - 1) / D256_BM32_PHASE_BLOCK_M,
+        1,
+        Q.size(0) * H);
+    flash_attention_forward_paged_d256_bm32_splitkv3_merge_kernel
+        <<<merge_grid, 256, 0, stream>>>(
+            split_tmp_out.data_ptr<float>(),
+            split_tmp_row_max.data_ptr<float>(),
+            split_tmp_row_sum.data_ptr<float>(),
+            reinterpret_cast<__half*>(Out.data_ptr()),
+            softmax_lse.data_ptr<float>(), M);
 }
 
 void launcher_flash_attention_forward_paged_d256_bm32_phase(
@@ -3569,6 +3938,154 @@ flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
 
     launch_flash_attention_forward_paged_d256_bm32_phase_kernel<true, true, true>(
         q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,
+        softmax_scale, stream);
+
+    return {out_fp16, softmax_lse};
+}
+
+std::vector<at::Tensor>
+flash_attention_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& softmax_lse_,
+    at::Tensor& split_tmp_out,
+    at::Tensor& split_tmp_row_max,
+    at::Tensor& split_tmp_row_sum,
+    const at::Tensor& block_table,
+    const int64_t actual_n,
+    const float softmax_scale
+) {
+    TORCH_CHECK(q.dim() == 4, "q must have shape [B, H, M, D]");
+    TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4,
+                "k_cache and v_cache must have shape [blocks, page, Hkv, D]");
+    TORCH_CHECK(block_table.dim() == 2,
+                "block_table must have shape [B, max_num_blocks]");
+    TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+    TORCH_CHECK(k_cache.dtype() == torch::kFloat16,
+                "k_cache must be fp16");
+    TORCH_CHECK(v_cache.dtype() == torch::kFloat16,
+                "v_cache must be fp16");
+    TORCH_CHECK(block_table.dtype() == torch::kInt32,
+                "block_table must be int32");
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
+                "q, k_cache, and v_cache must be CUDA tensors");
+    TORCH_CHECK(block_table.is_cuda(), "block_table must be a CUDA tensor");
+    TORCH_CHECK(
+        q.device() == k_cache.device() && q.device() == v_cache.device()
+            && q.device() == block_table.device(),
+        "all input tensors must be on the q device");
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous [B, H, M, D]");
+    TORCH_CHECK(block_table.is_contiguous(), "block_table must be contiguous");
+    TORCH_CHECK(k_cache.sizes() == v_cache.sizes(),
+                "k_cache and v_cache must have the same shape");
+    TORCH_CHECK(k_cache.stride(-1) == 1 && v_cache.stride(-1) == 1,
+                "K/V head dimensions must be contiguous");
+    TORCH_CHECK(k_cache.stride(1) % 8 == 0 && k_cache.stride(2) % 8 == 0
+                    && v_cache.stride(1) % 8 == 0
+                    && v_cache.stride(2) % 8 == 0,
+                "K/V strides must be divisible by 8 half elements");
+
+    const int B = q.size(0);
+    const int H = q.size(1);
+    const int M = q.size(2);
+    const int D = q.size(3);
+    const int num_kv_heads = k_cache.size(2);
+
+    TORCH_CHECK(B == 1,
+                "fixed BM32 split-KV host-length path requires B=1");
+    TORCH_CHECK(H > 0, "q head dimension must be positive");
+    TORCH_CHECK(M >= D256_BM32_PHASE_BLOCK_M,
+                "fixed BM32 split-KV prefill requires M >= ",
+                D256_BM32_PHASE_BLOCK_M);
+    TORCH_CHECK(D == D256_BM32_PHASE_D,
+                "fixed BM32 split-KV prefill requires D=",
+                D256_BM32_PHASE_D);
+    TORCH_CHECK(k_cache.size(0) > 0 && num_kv_heads > 0,
+                "K/V cache block and head dimensions must be positive");
+    TORCH_CHECK(k_cache.size(1) == D256_BM32_PHASE_PAGE_BLOCK_SIZE,
+                "fixed BM32 split-KV prefill requires page size ",
+                D256_BM32_PHASE_PAGE_BLOCK_SIZE);
+    TORCH_CHECK(k_cache.size(3) == D256_BM32_PHASE_D,
+                "K/V cache head dimension must be D=",
+                D256_BM32_PHASE_D);
+    TORCH_CHECK(H % num_kv_heads == 0,
+                "num_q_heads must be divisible by num_kv_heads");
+    TORCH_CHECK(block_table.size(0) == B,
+                "block_table batch dimension must equal q batch");
+    TORCH_CHECK(actual_n >= M && actual_n <= 2147483647LL,
+                "actual_n must satisfy M <= actual_n <= INT_MAX");
+    const int64_t required_pages =
+        (actual_n + D256_BM32_PHASE_PAGE_BLOCK_SIZE - 1)
+        / D256_BM32_PHASE_PAGE_BLOCK_SIZE;
+    TORCH_CHECK(block_table.size(1) >= required_pages,
+                "block_table does not cover actual_n host length");
+
+    if (out_.has_value()) {
+        const at::Tensor& out = out_.value();
+        TORCH_CHECK(out.is_cuda() && out.device() == q.device(),
+                    "out must be a CUDA tensor on the q device");
+        TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
+        TORCH_CHECK(out.sizes() == q.sizes(), "out must have shape [B, H, M, D]");
+        TORCH_CHECK(out.is_contiguous(), "out must be contiguous [B, H, M, D]");
+    }
+    if (softmax_lse_.has_value()) {
+        const at::Tensor& softmax_lse = softmax_lse_.value();
+        TORCH_CHECK(softmax_lse.is_cuda() && softmax_lse.device() == q.device(),
+                    "softmax_lse must be a CUDA tensor on the q device");
+        TORCH_CHECK(softmax_lse.dtype() == torch::kFloat32,
+                    "softmax_lse must be fp32");
+        TORCH_CHECK(softmax_lse.dim() == 3 && softmax_lse.size(0) == B
+                        && softmax_lse.size(1) == H && softmax_lse.size(2) == M,
+                    "softmax_lse must have shape [B, H, M]");
+        TORCH_CHECK(softmax_lse.is_contiguous(),
+                    "softmax_lse must be contiguous [B, H, M]");
+    }
+
+    const std::vector<int64_t> expected_partial_out = {
+        B, H, D256_BM32_PHASE_SPLIT_PARTS, M, D};
+    const std::vector<int64_t> expected_partial_rows = {
+        B, H, D256_BM32_PHASE_SPLIT_PARTS, M};
+    for (const at::Tensor* workspace : {
+             &split_tmp_out, &split_tmp_row_max, &split_tmp_row_sum}) {
+        TORCH_CHECK(workspace->is_cuda() && workspace->device() == q.device(),
+                    "split-KV workspaces must be CUDA tensors on the q device");
+        TORCH_CHECK(workspace->dtype() == torch::kFloat32,
+                    "split-KV workspaces must be fp32");
+        TORCH_CHECK(workspace->is_contiguous(),
+                    "split-KV workspaces must be contiguous");
+    }
+    TORCH_CHECK(split_tmp_out.sizes() == expected_partial_out,
+                "split_tmp_out must have shape [B, H, 3, M, D]");
+    TORCH_CHECK(split_tmp_row_max.sizes() == expected_partial_rows,
+                "split_tmp_row_max must have shape [B, H, 3, M]");
+    TORCH_CHECK(split_tmp_row_sum.sizes() == expected_partial_rows,
+                "split_tmp_row_sum must have shape [B, H, 3, M]");
+
+    c10::cuda::CUDAGuard device_guard(q.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    const cudaError_t capture_error = cudaStreamIsCapturing(stream, &capture_status);
+    TORCH_CHECK(capture_error == cudaSuccess, "cudaStreamIsCapturing failed: ",
+                cudaGetErrorString(capture_error));
+    TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+                "fixed BM32 split-KV CUDA graph capture is not validated");
+
+    auto props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props->major == 7 && props->minor == 0,
+                "fixed BM32 split-KV prefill supports only SM70 GPUs");
+
+    at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::empty_like(q);
+    at::Tensor softmax_lse =
+        softmax_lse_.has_value()
+            ? softmax_lse_.value()
+            : torch::empty({B, H, M},
+                           torch::dtype(torch::kFloat32).device(q.device()));
+    launch_flash_attention_forward_paged_d256_bm32_splitkv3_kernel(
+        q, k_cache, v_cache, out_fp16, softmax_lse,
+        split_tmp_out, split_tmp_row_max, split_tmp_row_sum,
+        block_table, static_cast<int>(actual_n),
         softmax_scale, stream);
 
     return {out_fp16, softmax_lse};

@@ -517,6 +517,33 @@ def _run_gpu_postprocess(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("size_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_bytes", [1, 1024, 1025, 2048])
+def test_batch_memcpy_kernel(size_dtype: torch.dtype, num_bytes: int):
+    device = torch.device("cuda:0")
+    src = torch.arange(num_bytes, dtype=torch.uint8, device=device)
+    dst = torch.zeros_like(src)
+    src_ptrs = torch.tensor([src.data_ptr()], dtype=torch.int64, device=device)
+    dst_ptrs = torch.tensor([dst.data_ptr()], dtype=torch.int64, device=device)
+    sizes = torch.tensor([num_bytes], dtype=size_dtype, device=device)
+
+    worker_mamba_utils.batch_memcpy(
+        src_ptrs,
+        dst_ptrs,
+        sizes,
+        max_size=num_bytes,
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(dst, src)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_warmup_batch_memcpy_kernel():
+    assert worker_mamba_utils.warmup_batch_memcpy_kernel(torch.device("cuda:0"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestPostprocessMambaFusedKernel:
     """Tests for postprocess_mamba_fused_kernel comparing GPU vs CPU paths."""
 

@@ -295,6 +295,19 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes, max_size: int | None = None):
     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
 
 
+def warmup_batch_memcpy_kernel(device: torch.device) -> bool:
+    """Compile Mamba align copy signatures before the first long request."""
+    src = torch.arange(2048, dtype=torch.uint8, device=device)
+    dst = torch.empty_like(src)
+    src_ptrs = torch.tensor([src.data_ptr()], dtype=torch.int64, device=device)
+    dst_ptrs = torch.tensor([dst.data_ptr()], dtype=torch.int64, device=device)
+    for size_dtype in (torch.int32, torch.int64):
+        sizes = torch.tensor([src.numel()], dtype=size_dtype, device=device)
+        batch_memcpy(src_ptrs, dst_ptrs, sizes, max_size=src.numel())
+    torch.accelerator.synchronize()
+    return True
+
+
 def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
     mamba_group_ids: list[int] = []
     mamba_specs: list[MambaSpec] = []

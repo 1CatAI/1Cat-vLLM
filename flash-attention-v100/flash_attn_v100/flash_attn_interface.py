@@ -19,6 +19,7 @@ _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
+_prefill_splitkv3_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
@@ -36,6 +37,15 @@ class _DecodeWorkspace:
     exp_sums: torch.Tensor
     active_num_partitions: torch.Tensor
     max_num_partitions: int
+
+
+@dataclass
+class _PrefillSplitkv3Workspace:
+    tmp_out: torch.Tensor
+    row_max: torch.Tensor
+    row_sum: torch.Tensor
+    out: torch.Tensor
+    softmax_lse: torch.Tensor
 
 
 def maybe_contiguous(x):
@@ -360,6 +370,64 @@ def _get_turboquant_decode_workspace(
         _turboquant_decode_workspace_cache[key] = workspace
 
     return workspace, partition_size
+
+
+def _allocate_prefill_splitkv3_workspace(
+    q: torch.Tensor,
+) -> _PrefillSplitkv3Workspace:
+    batch_size, num_heads, query_len, head_dim = q.shape
+    return _PrefillSplitkv3Workspace(
+        tmp_out=torch.empty(
+            (batch_size, num_heads, 3, query_len, head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        row_max=torch.empty(
+            (batch_size, num_heads, 3, query_len),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        row_sum=torch.empty(
+            (batch_size, num_heads, 3, query_len),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        out=torch.empty(
+            (batch_size, num_heads, query_len, head_dim),
+            dtype=torch.float16,
+            device=q.device,
+        ),
+        softmax_lse=torch.empty(
+            (batch_size, num_heads, query_len),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+    )
+
+
+def _get_prefill_splitkv3_workspace(
+    q: torch.Tensor,
+) -> _PrefillSplitkv3Workspace:
+    if not _can_cache_workspace(q):
+        return _allocate_prefill_splitkv3_workspace(q)
+
+    batch_size, num_heads, query_len, head_dim = q.shape
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (
+        q.device.type,
+        device_index,
+        _workspace_stream_id(q.device),
+        batch_size,
+        num_heads,
+        query_len,
+        head_dim,
+        q.dtype,
+    )
+    workspace = _prefill_splitkv3_workspace_cache.get(key)
+    if workspace is None:
+        workspace = _allocate_prefill_splitkv3_workspace(q)
+        _prefill_splitkv3_workspace_cache[key] = workspace
+    return workspace
 
 
 def _get_decode_partition_size(
@@ -1292,6 +1360,49 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
     return out_result, lse_result
 
 
+def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    actual_n: int,
+    *,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    softmax_lse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the fixed causal SM70 D256 BM32 three-way split-KV entry.
+
+    Q is a contiguous FP16 tensor in [B, H, M, D] layout. The per-stream
+    workspace and omitted outputs are reused for matching shapes.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+
+    workspace = _get_prefill_splitkv3_workspace(q)
+    if out is None:
+        out = workspace.out
+    if softmax_lse is None:
+        softmax_lse = workspace.softmax_lse
+
+    out_result, lse_result = (
+        flash_attn_v100_cuda.prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            softmax_lse,
+            workspace.tmp_out,
+            workspace.row_max,
+            workspace.row_sum,
+            block_table,
+            int(actual_n),
+            float(softmax_scale),
+        )
+    )
+    return out_result, lse_result
+
+
 __all__ = [
     "flash_attn_func",
     "flash_attn_lse",
@@ -1305,6 +1416,7 @@ __all__ = [
     "flash_attn_turboquant_decode_paged_available",
     "flash_attn_prefill_paged",
     "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch",
+    "flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3",
     "flash_attn_prefill_paged_bfla",
     "flash_attn_prefill_paged_splitkv",
     "flash_attn_prefill_paged_bhmd",

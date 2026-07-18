@@ -2056,6 +2056,11 @@ class GPUModelRunner(
         if hasattr(self, "input_batch") and self.input_batch.block_table is not None:
             self.input_batch.block_table.warmup_slot_mapping_kernel()
             warmed.append("compute_slot_mapping")
+        if (
+            self.cache_config.mamba_cache_mode == "align"
+            and mamba_utils.warmup_batch_memcpy_kernel(self.device)
+        ):
+            warmed.append("mamba_batch_memcpy")
         drafter = getattr(self, "drafter", None)
         mtp_warmup = getattr(drafter, "warmup_sm70_mtp_hotpath_kernels", None)
         if mtp_warmup is not None:

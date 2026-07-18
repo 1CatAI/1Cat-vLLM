@@ -49,6 +49,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch,
         "Fixed causal D256 BM32 ALL_P pair-scratch paged prefill (SM70)");
     m.def(
+        "prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd",
+        &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3,
+        "Fixed causal D256 BM32 ALL_P pair-scratch three-way split-KV paged prefill (SM70)");
+    m.def(
         "prefill_paged_bfla_fwd",
         &flash_attention_prefill_paged_bfla,
         "BFLA sparse FlashAttention prefill over paged KV cache (Volta)");

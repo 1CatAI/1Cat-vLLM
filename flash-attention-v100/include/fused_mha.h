@@ -163,6 +163,21 @@ flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
     const float softmax_scale
 );
 
+std::vector<at::Tensor>
+flash_attention_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    std::optional<at::Tensor>& softmax_lse_,
+    at::Tensor& split_tmp_out,
+    at::Tensor& split_tmp_row_max,
+    at::Tensor& split_tmp_row_sum,
+    const at::Tensor& block_table,
+    const int64_t actual_n,
+    const float softmax_scale
+);
+
 at::Tensor flash_attention_prefill_paged_bfla(
     const at::Tensor& q,
     const at::Tensor& k_cache,

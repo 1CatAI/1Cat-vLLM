@@ -82,14 +82,13 @@ def test_fixed_bm32_entry_is_exact_and_ignores_dispatch_env(
     assert actual.data_ptr() == out.data_ptr()
     assert actual_lse.data_ptr() == softmax_lse.data_ptr()
     assert torch.equal(actual, expected)
+    assert torch.isfinite(actual_lse).all()
 
 
 @torch.inference_mode()
 def test_fixed_bm32_entry_rejects_unqualified_shapes() -> None:
     flash_attn_v100 = _require_sm70_flash_attn_v100()
-    query, key_cache, value_cache, block_table, seq_lens = _make_inputs(
-        query_len=16
-    )
+    query, key_cache, value_cache, block_table, seq_lens = _make_inputs(query_len=16)
 
     with pytest.raises(RuntimeError, match="M >= 32"):
         flash_attn_v100.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
@@ -100,9 +99,7 @@ def test_fixed_bm32_entry_rejects_unqualified_shapes() -> None:
             seq_lens,
         )
 
-    query, key_cache, value_cache, block_table, seq_lens = _make_inputs(
-        page_size=16
-    )
+    query, key_cache, value_cache, block_table, seq_lens = _make_inputs(page_size=16)
     with pytest.raises(RuntimeError, match="page size 784"):
         flash_attn_v100.flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
             query,

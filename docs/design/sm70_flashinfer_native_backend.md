@@ -17,11 +17,12 @@ the RTX 5090 `BM64/BN64`, four-warp, causal D256 prefill kernel recorded in:
 ## Route Isolation
 
 `AttentionBackendEnum.FLASHINFER_SM70` is an explicit-only backend.  It has a
-separate backend, metadata-builder, and implementation class.  During the
-bring-up phase it deliberately delegates to the accepted SM70 implementation;
-this proves serving and CUDA-graph plumbing without claiming a kernel gain.
-Individual FlashInfer-shaped kernels replace that delegation only after
-microbenchmark promotion.
+separate backend, metadata-builder, and implementation class.  The validated
+single-request prefix-prefill shape now uses a fixed SM70 entry that directly
+launches the accepted causal BM32 `ALL_P + PAIR_SCRATCH` specialization.
+Unsupported, graph-captured, decode, multi-request, and split-KV shapes still
+delegate explicitly to the accepted SM70 implementation and cannot be counted
+as `FLASHINFER_SM70` kernel gains.
 
 The accepted `FLASH_ATTN_V100` priority and default behavior must not change
 during development.  A failed candidate is removed from the new route or kept
@@ -281,29 +282,276 @@ the modern tile.  It retains 32 resident warps, native Volta WMMA ordering,
 direct K/V fragment loads, top/bottom operand reuse, zero local traffic, and
 the strongest measured wall time.
 
-The independent backend still ports FlashInfer's planner, GQA-aware work
-description, graph-stable workspace, split/merge metadata, and route
-instrumentation.  Kernel selection is architecture-specific: SM70 dispatches
-the BM32 body while modern GPUs retain upstream BM64.  This is the required
-"optimal unsupported-primitive replacement" policy; a slower shape is not
-accepted merely because it resembles upstream source more closely.
+The independent backend now generates FlashInfer-style per-request
+`request_indices`, `qo_tile_indices`, `kv_tile_indices`, `merge_indptr`, and
+`o_indptr`, including resource-derived split decisions, graph padding, and
+16-byte-aligned integer/float workspace sizes.  Exact CPU lengths and
+upper-bound plans are distinguished.  The description is attached to metadata
+but the graph-stable GPU workspace is not allocated yet.
 
-The next implementation step is planner/backend hookup around this selected
-body.  It must first reproduce the accepted kernel wall time exactly under the
-new backend name, with explicit route proof and no fallback.  Only then is a
-new residual NCU target admitted.
+Kernel selection is architecture-specific: the strict SM70 prefix shape
+dispatches the BM32 body while modern GPUs retain upstream BM64.  This is the
+required "optimal unsupported-primitive replacement" policy; a slower shape is
+not accepted merely because it resembles upstream source more closely.
+
+The fixed entry is plumbing, not a speedup: its operator p50 is intentionally
+neutral to the same BM32 body.  The next gate remains microbenchmark-only at
+the real `M8096,N121440,Hq6,Hkv1,D256,page784` shape.  A candidate must reduce
+p50 wall by at least 2% and win at least 95/100 paired rounds before any Qwen
+endpoint run is allowed.  A candidate that preserves reduction order must be
+bitwise exact.  Split-KV is the explicit exception because it changes the FP32
+reduction tree: it must instead pass output max/p99 absolute-error bounds,
+LSE bounds, fully-masked causal cases, and the later model-quality gate.  The
+comparison must include the inherited zero-copy contiguous-dense route when
+the page table permits it, so the fixed paged entry cannot displace a faster
+existing path unnoticed.
+
+## Fixed BM32 Entry Promotion
+
+`flash_attn_prefill_paged_d256_bm32_allp_pair_scratch` is a dedicated pybind
+entry.  It directly instantiates
+`flash_attention_forward_paged_d256_bm32_phase_kernel<true,true,true>` and does
+not read the generic BM32 environment switches.  It rejects non-FP16 KV,
+non-D256, non-page-784, `M < 32`, invalid GQA/layout, non-SM70, and unvalidated
+CUDA-graph capture instead of selecting another kernel.
+
+The formal CPython 3.12 build records 64 registers/thread, zero stack/local
+spill, 41,936 bytes shared memory, two resident CTAs/SM, 768 HMMA instructions,
+and zero `LDL/STL`.  Normal, reverse, and tail page tables are bitwise equal to
+the accepted generic entry even when all four generic BM32 switches are set to
+zero for the fixed call.
+
+The first 100-pair fixed-entry artifact is invalid as absolute performance
+evidence.  An unrelated TP4 process overlapped the run and inflated the
+`M1024,N65536,Hq6,Hkv1,D256,page784` p50 from the accepted approximately
+`31.7 ms` to `74.7 ms`.  The fixed/generic delta was still neutral, but neither
+its absolute time nor its win count is a promotion result.  A clean 20-pair
+calibration at 1200 MHz restored generic/fixed p50 to
+`31.8915/31.8336 ms` for normal pages, `31.8858/31.8403 ms` for reverse pages,
+and `31.8956/31.8351 ms` for the tail case.  This confirms that the pybind
+entry is neutral plumbing; it does not satisfy the acceleration gate.
+
+`FlashInferSM70Impl.forward` now bypasses the parent dispatcher only for exact,
+single-request, non-graph, causal prefix prefill with FP16 page-784 KV, D256,
+`M >= 32`, no BFLA/DDTree/sliding window, and no requested Triton or split-KV
+route.  A fixed-entry error propagates without fallback.  Runtime proof records
+the fixed pybind and `<true,true,true>` specialization only after a successful
+launch; all delegated shapes retain `kernel_promoted=false`.
+
+## Exact-Shape Clock And Process Gate
+
+The real acceptance baseline was re-established at
+`M8096,N121440,Hq6,Hkv1,D256,page784`.  A reset graphics-clock lock produced a
+false `255.6-257.0 ms` result while the device actually ran at
+`1515-1530 MHz`.  The ratio is exactly explained by frequency:
+`324.1 ms * 1200/1530 = 254.2 ms`.  This is not a kernel improvement.
+
+After relocking GPU0 to 1200 MHz, the paged BM32 pair-scratch path measures
+`324.109 ms` p50 over 20 launches.  One-second `nvidia-smi dmon` samples show
+1200 MHz throughout the load.  This matches the earlier `325.886 ms` baseline
+within 0.55%.  Future promotion artifacts must fail if another GPU0 compute
+process appears or if any load-period clock sample differs from 1200 MHz;
+before/after clock checks alone are insufficient.
+
+The physically contiguous dense path is not the fastest valid baseline at
+this shape.  With Hkv=1 its K/V tensors are genuine zero-copy views and its
+output is bitwise equal to paged attention, but a clean calibration measured
+approximately `548 ms` versus `256 ms` paged at the same temporarily unlocked
+1530-MHz condition.  It is therefore structurally more than 2x slower and is
+excluded from candidate promotion while remaining covered by route tests.
+
+## Three-Way Split-KV Feasibility Gate
+
+The first algorithmic candidate after the neutral fixed entry is the existing
+BM32-native three-way split-KV micro.  Its partial kernel compiles at
+64 registers/thread, 41,744 bytes shared, zero spill/local traffic, and two
+CTAs/SM; its merge kernel uses 32 registers/thread and no shared memory.
+These static results only prove resource feasibility, not paged correctness or
+speed.
+
+At the exact grid, unsplit has `1518 = 10*144 + 78` CTAs and consumes eleven
+waves.  Three-way partial has `4554 = 31*144 + 90` CTAs and consumes 32
+one-third-length waves.  Against the locked `324.109 ms` baseline, the ideal
+lower bound is `314.288 ms`, only 3.03% faster.  The combined partial plus
+merge p50 must therefore be at most `317.627 ms` to pass the 2% gate, leaving
+only 3.339 ms above the ideal wave model for partition and merge overhead.
+
+The first run uses 759 synthetic M64 groups so its baseline grid is exactly
+1518 CTAs.  It is a fast rejection test only.  A passing result must still be
+reimplemented and remeasured with the production paged kernel at exact
+`M8096,N121440`, causal masking, page size 784, the 96-token tail, normal and
+reverse page tables, softmax scale 1/16, and LSE comparison.  Split-KV changes
+the FP32 reduction order and cannot claim bitwise parity.  Therefore a speed
+pass is feasibility evidence only under the current bitwise promotion rule;
+it does not authorize endpoint timing.  Promotion would require an explicit
+exactness-policy decision backed by strict numerical bounds and the complete
+model-quality gate.
+
+### Production exact split-KV result
+
+The synthetic feasibility screen passed before the production port.  At 759
+groups and 1200 MHz, random input measured `313.220 -> 304.859 ms`
+(`-2.669%`, 100/100 wins), while alternating input measured
+`313.137 -> 304.775 ms` (`-2.671%`, 20/20 wins).  This established that the
+CTA-wave decomposition was viable, but it did not exercise paged addressing,
+causal masking, or the production softmax body.
+
+The production implementation uses a sibling global entry, leaving the
+accepted three-boolean kernel symbol and argument ABI intact.  Its partial
+kernel has 64 registers/thread, 41,952B shared memory, zero stack/local
+traffic, zero `LDL/STL`, and two resident CTAs/SM.  The merge has 32
+registers/thread and no shared/local traffic.  Workspace is fixed at
+`[B,H,3,M,D]` FP32 numerator plus `[B,H,3,M]` FP32 max and sum, or about
+143.4 MiB total at the exact shape.
+
+The first safe production form was correct but failed the speed gate:
+
+| page table | unsplit p50 | safe split p50 | delta | wins |
+|---|---:|---:|---:|---:|
+| normal | 322.715 ms | 318.086 ms | -1.434% | 100/100 |
+| reverse | 322.856 ms | 318.487 ms | -1.353% | 100/100 |
+| tail | 322.902 ms | 318.536 ms | -1.352% | 100/100 |
+
+Nsight Systems split the safe candidate into about 317.702 ms partial and
+0.538 ms merge, so merge optimization alone could not recover the missing
+percentage point.  A row-max sentinel attempt moved the causal-empty test out
+of integer address logic, but expanded the partial SASS from 3,432 to 3,504
+instructions and regressed it to 328.876 ms versus 322.370 ms unsplit in the
+same profile.  It was reverted and must not be retried by changing the
+sentinel spelling.
+
+The accepted micro candidate uses a host-length fast-visible specialization.
+It is restricted to `B=1`, receives the planner's scalar `actual_n`, and uses
+64-bit host arithmetic.  For `T=ceil(N/128)`, the fast body is selected only
+when `T>=3` and
+`floor(2*T/3)*128 <= N-M`.  This proves that every non-empty partition has a
+visible prefix for the earliest causal query; it does not claim that all later
+panels are visible, and it does not remove causal masking.  Shapes outside the
+condition retain the safe helper.  At `N=121440,M=8096`, `T=949`, the final
+split begins at 80,896 and the earliest cutoff is 113,344, so the fast body is
+valid.  Its SASS falls to 2,688 instructions, 47 branches, and 69 predicate
+instructions while retaining 768 HMMA and zero local-memory instructions.
+
+Formal 100-pair results at locked 1200 MHz are:
+
+| page table | unsplit p50 | fast split p50 | delta | wins | split p90/p99 |
+|---|---:|---:|---:|---:|---:|
+| normal | 322.736 ms | 315.723 ms | -2.173% | 100/100 | 315.780/316.276 ms |
+| reverse | 322.681 ms | 315.685 ms | -2.168% | 100/100 | 315.746/316.259 ms |
+| tail | 322.710 ms | 315.688 ms | -2.176% | 100/100 | 315.757/316.292 ms |
+
+Across all page tables, output max/p99 absolute error is
+`1.5259e-5/7.6294e-6`; LSE max is `3.8147e-6` to `4.7684e-6` and LSE p99 is
+`2.8610e-6`.  The dedicated `N=513,M=512` safe fallback test verifies that
+fully masked partitions write exactly zero numerator/sum.  The equality
+boundary `N=785,M=273` covers the 784-token page crossing, reverse pages, a
+17-token KV tail, and a partial BM32 query tile.
+
+Nsight Systems confirms the exact route launches
+`splitkv3_partial_kernel<false>`: 316.302 ms partial plus 0.561 ms merge,
+versus 324.415 ms unsplit under profiling.  The formal run contains 595
+background samples, all at 1200 MHz, with no external compute PID or monitor
+violation.
+
+### Validated chunk window and endpoint result
+
+The production route is not enabled from the first mathematically safe
+length.  A locked-clock normal-page screen found that the split overhead does
+not cross the 2% wall-time gate until the tenth 8,096-token chunk:
+
+| host N | unsplit p50 | split p50 | delta | wins | decision |
+|---:|---:|---:|---:|---:|---|
+| 24,288 | 64.626 ms | 63.988 ms | -0.988% | 20/20 | reject |
+| 32,384 | 86.145 ms | 84.958 ms | -1.377% | 20/20 | reject |
+| 64,768 | 172.125 ms | 168.803 ms | -1.930% | 20/20 | reject |
+| 72,864 | 193.661 ms | 189.833 ms | -1.977% | 20/20 | reject |
+| 80,960 | 215.178 ms | 210.812 ms | -2.029% | 20/20 | promote boundary |
+| 89,056 | 236.599 ms | 231.721 ms | -2.062% | 20/20 | promote |
+| 97,152 | 258.158 ms | 252.748 ms | -2.096% | 20/20 | promote |
+| 105,248 | 279.783 ms | 273.795 ms | -2.140% | 20/20 | promote |
+| 113,344 | 301.242 ms | 294.769 ms | -2.149% | 20/20 | promote |
+
+The weakest promoted length, `N=80960`, then passed the full 100-pair gate:
+normal `215.173 -> 210.797 ms` (`-2.034%`), reverse
+`215.142 -> 210.793 ms` (`-2.021%`), and tail
+`215.240 -> 210.905 ms` (`-2.014%`), all 100/100 wins.  Its output maximum
+absolute error is `1.5259e-5`, LSE maximum is `3.8147e-6`, and all 398 monitor
+samples passed at 1200 MHz.  Consequently the backend accepts only
+`N={80960,89056,97152,105248,113344,121440}` for `M=8096,Hq=6,Hkv=1`;
+it does not infer a wider range from the fast-visible predicate.
+
+The wrapper caches one approximately 143.4 MiB FP32 workspace per device and
+stream.  The explicit `FLASHINFER_SM70` backend records host `actual_n`, the
+executed `<false>+merge` kernel, and fails closed when the split entry is
+missing.  Backend/planner tests pass 32/32 and the real SM70 fixed/split
+operator tests pass 6/6.
+
+Matched Qwen3.6-27B-AWQ endpoint runs used TP4, TurboMind AWQ, FP16 KV,
+`max_model_len=131072`, chunk 8,096, CUDA graphs enabled, input 121,440,
+64 generated tokens, and the official `temperature=1.0,top_p=0.95,top_k=20`
+sampling parameters.  Startup and graph capture are excluded from request
+metrics:
+
+| run | backend | prefill | TTFT | decode TPOT |
+|---|---|---:|---:|---:|
+| baseline 1 | FLASH_ATTN_V100 | 79.638 s | 79.726 s | 23.445 ms |
+| candidate 1 | FLASHINFER_SM70 | 78.247 s | 78.283 s | 22.245 ms |
+| baseline 2 | FLASH_ATTN_V100 | 78.802 s | 78.961 s | 22.238 ms |
+| candidate 2 | FLASHINFER_SM70 | 78.205 s | 78.241 s | 22.379 ms |
+
+Using the faster baseline 2 as the conservative reference, the two candidate
+runs save 554-596 ms, or 0.704%-0.757% of prefill.  This matches the operator
+prediction: the six promoted chunks save about 34.1 ms per full-attention
+layer, or about 546 ms across the model's 16 full-attention layers.  Decode is
+unchanged within run noise.  Every TP rank reports exactly 96 split calls
+(`6 chunks * 16 layers`), 128 fixed-entry calls, and 16 first-chunk dense calls.
+
+All four endpoint runs produce identical 64-token sequences.  Baseline
+self-noise reaches `0.00131` on chosen-token logprob and `1.109` in the low-rank
+top-20 tail; baseline 2 versus candidate 2 is `0.00128` and `0.289`
+respectively.
+
+A separate production-memory quality A/B dumped the complete 248,320-element
+sampler logits for 16 generated steps on all four TP ranks.  All 64 shapes and
+argmax values match, with zero argmax mismatches and maximum absolute logits
+difference `0.12109375` against the pre-registered `0.125` bound.  The 16
+sampled tokens are identical; selected-token logprob max difference is
+`0.001277 < 0.02`, and top-20 max difference is `0.03125 < 0.125`.
+
+Full 121,440-token prompt-logprob collection is not feasible on these 32-GiB
+V100s with an 8,096 chunk: each chunk requires a 3.75-GiB full-vocabulary
+all-gather and the prompt results remain resident.  It OOMs at memory
+utilization 0.9 and 0.75; `expandable_segments` cannot be used because it
+breaks custom-all-reduce CUDA IPC graph registration.  Therefore the
+repository's aggregate model gate remains `B-pending` only for missing prompt
+logprob/perplexity evidence.  Operator-wide numeric checks plus output and
+sampler-logits gates pass, but the backend remains explicit-only until a
+bounded selective prompt-logprob observer or a broader long-context quality
+matrix closes that last evidence gap.
+
+Artifacts:
+
+- `bench_results/flashinfer_sm70_20260716/native_bm32_splitkv_realshape_ab100_random_g759_nb949_clock1200.json`
+- `bench_results/flashinfer_sm70_20260716/splitkv3_exact_ab100_m8096_n121440_clock1200.json`
+- `bench_results/flashinfer_sm70_20260716/splitkv3_fast_visible_ab100_m8096_n121440_clock1200.json`
+- `bench_results/flashinfer_sm70_20260716/splitkv3_fast_visible_ab100_m8096_n80960_clock1200.json`
+- `bench_results/flashinfer_sm70_20260716/splitkv3_fast_visible_exact_correctness_nsys.nsys-rep`
+- `bench_results/flashinfer_sm70_20260716/model_splitkv3_endpoint/`
+- `bench_results/flashinfer_sm70_20260716/model_splitkv3_quality/compare_sampler_only_baseline_vs_candidate.json`
 
 ## Promotion Sequence
 
 | stage | required evidence | status |
 |---|---|---|
-| independent backend registry and graph plumbing | targeted unit tests | implemented; delegates to baseline |
-| resource-driven SM70 planner | register/shared occupancy and split-KV unit matrix | implemented; kernel hookup pending |
+| independent backend registry and graph plumbing | targeted unit tests | implemented; explicit route, graph fixed entry still closed |
+| resource-driven SM70 planner | per-request indices, resource/split matrix, workspace sizing | host description implemented; GPU workspace pending |
 | SM70 instruction compatibility micro | K256 register-resident exact fragment mapping, SASS, no spill | passed |
 | paged prefill M64 trial | exactness, resource, full-grid wall gate | rejected; BM32 selected |
+| fixed BM32 pybind entry | exactness, no fallback, resource/SASS, operator A/B | passed |
 | paged decode micro | exactness, wall gate, NCU gate | pending |
-| per-layer integration | same-process A/B against accepted route | pending |
-| endpoint integration | fixed clocks, route counts, output IDs, TPOT/TTFT | pending |
+| Python implementation integration | cached workspace, real split entry, runtime proof, fail-closed route | passed; 32 backend/planner and 6 SM70 operator tests |
+| exact M8096 micro acceleration | strict numeric bounds, >=2% p50, >=95/100 wins against fastest valid baseline | passed for the explicit six-length promotion set |
+| endpoint integration | fixed clocks, route counts, output IDs, TPOT/TTFT | speed/route passed at +0.704% to +0.757% prefill; sampler/output quality passed, full prompt metric pending |
 | default promotion | full quality and long-context matrix | pending |
 
 Every failed experiment is recorded here with its exact shape, resource
@@ -312,3 +560,4 @@ report, wall result, and decision before the next design starts.
 Primitive compatibility evidence:
 
 - `bench_results/flashinfer_sm70_20260715/volta_mma_k256_smoke_clock1200.json`
+- `bench_results/flashinfer_sm70_20260715/fixed_entry_operator_ab100_m1024_n65536_clock1200.json`
