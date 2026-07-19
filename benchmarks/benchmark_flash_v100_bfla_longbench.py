@@ -13,15 +13,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import statistics
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
 from transformers import AutoTokenizer
-
 
 LONG_BENCH_ROOT = Path("third_party/LongBench/LongBench")
 NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
@@ -46,9 +45,7 @@ def _configure_flash_variant(args: argparse.Namespace) -> None:
     os.environ["VLLM_FLASH_V100_BFLA_KEEP_MASS"] = str(args.bfla_keep_mass)
     if args.bfla_keep_ratio is not None:
         os.environ["VLLM_FLASH_V100_BFLA_KEEP_RATIO"] = str(args.bfla_keep_ratio)
-    os.environ["VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS"] = str(
-        args.bfla_min_keep_blocks
-    )
+    os.environ["VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS"] = str(args.bfla_min_keep_blocks)
     os.environ["VLLM_FLASH_V100_BFLA_THRESHOLD"] = str(args.bfla_threshold)
     os.environ["VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS"] = str(args.bfla_local_blocks)
     os.environ["VLLM_FLASH_V100_BFLA_POOL"] = args.bfla_pool
@@ -168,9 +165,13 @@ def _score_one(dataset: str, prediction: str, row: dict[str, Any]) -> float:
     return float(score)
 
 
-def _request_metrics(output: Any, elapsed_s: float, prompt_tokens: int) -> dict[str, Any]:
+def _request_metrics(
+    output: Any, elapsed_s: float, prompt_tokens: int
+) -> dict[str, Any]:
     metrics = getattr(output, "metrics", None)
-    first_token_latency = getattr(metrics, "first_token_latency", None) if metrics else None
+    first_token_latency = (
+        getattr(metrics, "first_token_latency", None) if metrics else None
+    )
     ttft_s = first_token_latency or elapsed_s
     return {
         "elapsed_s": elapsed_s,
@@ -256,8 +257,12 @@ def _read_existing_records(out_dir: Path) -> list[dict[str, Any]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=Path("/home/ymzx/models/Qwen3.5-9B-AWQ"))
-    parser.add_argument("--data-dir", type=Path, default=Path("benchmark-data/longbench/data"))
+    parser.add_argument(
+        "--model", type=Path, default=Path("/home/ymzx/models/Qwen3.5-9B-AWQ")
+    )
+    parser.add_argument(
+        "--data-dir", type=Path, default=Path("benchmark-data/longbench/data")
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--limit", type=int, default=None)
@@ -266,7 +271,9 @@ def parse_args() -> argparse.Namespace:
         "--source-indexes",
         type=str,
         default="",
-        help="Comma-separated dataset source indexes to run after min-length filtering.",
+        help=(
+            "Comma-separated dataset source indexes to run after min-length filtering."
+        ),
     )
     parser.add_argument(
         "--sample-strategy",
@@ -284,7 +291,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--safetensors-load-strategy", default=None)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--variant", choices=("low_smem", "bfla_sparse"), required=True)
-    parser.add_argument("--chat-template", choices=("official", "always", "none"), default="official")
+    parser.add_argument(
+        "--chat-template", choices=("official", "always", "none"), default="official"
+    )
     parser.add_argument("--seed", type=int, default=20260619)
     parser.add_argument("--bfla-min-q", type=int, default=256)
     parser.add_argument("--bfla-min-kv", type=int, default=256)
@@ -378,10 +387,10 @@ def main() -> None:
                 max_input_tokens=args.max_input_tokens,
                 chat_template=args.chat_template,
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             outputs = llm.generate([prompt], sampling_params, use_tqdm=False)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             elapsed_s = time.perf_counter() - start
 
             output = outputs[0]

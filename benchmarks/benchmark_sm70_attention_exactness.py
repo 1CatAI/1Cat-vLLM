@@ -15,13 +15,13 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import torch
-import triton
-import triton.language as tl
 
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_attention_helpers import softmax_step
 
 FP16_NOMINAL_OUTPUT_BOUND = 2.0e-3
@@ -349,12 +349,8 @@ def run_source_parity(reference_dir: Path, candidate_dir: Path) -> dict[str, Any
         if path.startswith("kernel/") or path.startswith("include/")
     ]
     kernel_mismatched = [path for path in mismatched if path in kernel_paths]
-    kernel_reference_only = [
-        path for path in reference_only if path in kernel_paths
-    ]
-    kernel_candidate_only = [
-        path for path in candidate_only if path in kernel_paths
-    ]
+    kernel_reference_only = [path for path in reference_only if path in kernel_paths]
+    kernel_candidate_only = [path for path in candidate_only if path in kernel_paths]
     return {
         "reference_dir": str(reference_dir),
         "candidate_dir": str(candidate_dir),
@@ -627,7 +623,9 @@ def _flash_partitioned_decode_reference(
                 v_part,
                 softmax_scale=softmax_scale,
                 causal=False,
-            ).squeeze(0).squeeze(0)
+            )
+            .squeeze(0)
+            .squeeze(0)
         )
         lse = flash_attn_v100.flash_attn_lse(
             q,
@@ -911,9 +909,7 @@ def _single_qk_diff_detail(
         "torch_half_product_fp16_sum_scaled": _as_float(
             half_product_fp16_sum.float() * softmax_scale
         ),
-        "torch_k16_chunk_fp32_sum_scaled": _as_float(
-            chunk_acc * softmax_scale
-        ),
+        "torch_k16_chunk_fp32_sum_scaled": _as_float(chunk_acc * softmax_scale),
     }
     flash_float = _as_float(flash_value)
     triton_float = _as_float(triton_value)
@@ -1117,9 +1113,9 @@ def _make_paged_cache(
         end = min(start + block_size, seq_len)
         key_cache[block_idx, : end - start] = k[0, start:end]
         value_cache[block_idx, : end - start] = v[0, start:end]
-    block_table = torch.arange(
-        num_blocks, device=k.device, dtype=torch.int32
-    ).view(1, num_blocks)
+    block_table = torch.arange(num_blocks, device=k.device, dtype=torch.int32).view(
+        1, num_blocks
+    )
     seq_lens = torch.tensor([seq_len], device=k.device, dtype=torch.int32)
     return key_cache, value_cache, block_table, seq_lens
 
@@ -1130,8 +1126,9 @@ def _make_batched_paged_cache(
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     seq_lens_host = [int(k.shape[1]) for k in k_values]
-    blocks_per_seq = [(seq_len + block_size - 1) // block_size
-                      for seq_len in seq_lens_host]
+    blocks_per_seq = [
+        (seq_len + block_size - 1) // block_size for seq_len in seq_lens_host
+    ]
     total_blocks = sum(blocks_per_seq)
     max_blocks = max(blocks_per_seq)
     device = k_values[0].device
@@ -1343,7 +1340,7 @@ def _record_result(
     causal: bool,
     seed: int,
 ) -> CaseResult:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     equal = torch.equal(actual, expected)
     max_diff, mean_diff = _diff_stats(actual, expected)
     mismatch = _mismatch_stats(actual, expected)
@@ -1415,8 +1412,8 @@ def _triton_qk_scores(
         device=q.device,
         dtype=torch.float32,
     )
-    block_m = 16 if q_heads // kv_heads <= 16 else triton.next_power_of_2(
-        q_heads // kv_heads
+    block_m = (
+        16 if q_heads // kv_heads <= 16 else triton.next_power_of_2(q_heads // kv_heads)
     )
     block_n = 32
     grid = (
@@ -3161,9 +3158,7 @@ def run_softmax_update_trace_diagnostic_cases(
                     {
                         "key_idx": key_idx,
                         "max_diff_output_index_b_q_h": output_index,
-                        "flash_value_at_max": (
-                            flash_vs_triton["actual_at_max_diff"]
-                        ),
+                        "flash_value_at_max": (flash_vs_triton["actual_at_max_diff"]),
                         "triton_value_at_max": (
                             flash_vs_triton["expected_at_max_diff"]
                         ),
@@ -3509,34 +3504,33 @@ def run_decode_cudagraph_replay_diagnostic_cases(
         out_graph = torch.empty_like(q_static)
         out_eager = torch.empty_like(q_static)
 
-        def decode_graph_target() -> None:
-            flash_attn_v100.flash_attn_decode_paged(
-                q_static,
-                key_cache,
-                value_cache,
-                block_table_static,
-                seq_lens_static,
-                softmax_scale=softmax_scale,
-                out=out_graph,
-                kv_cache_dtype="auto",
-            )
-
-        def decode_eager_target() -> None:
-            flash_attn_v100.flash_attn_decode_paged(
-                q_static,
-                key_cache,
-                value_cache,
-                block_table_static,
-                seq_lens_static,
-                softmax_scale=softmax_scale,
-                out=out_eager,
-                kv_cache_dtype="auto",
-            )
+        decode_graph_target = partial(
+            flash_attn_v100.flash_attn_decode_paged,
+            q_static,
+            key_cache,
+            value_cache,
+            block_table_static,
+            seq_lens_static,
+            softmax_scale=softmax_scale,
+            out=out_graph,
+            kv_cache_dtype="auto",
+        )
+        decode_eager_target = partial(
+            flash_attn_v100.flash_attn_decode_paged,
+            q_static,
+            key_cache,
+            value_cache,
+            block_table_static,
+            seq_lens_static,
+            softmax_scale=softmax_scale,
+            out=out_eager,
+            kv_cache_dtype="auto",
+        )
 
         # Allocate extension-side workspaces and warm kernels before capture.
         for _ in range(3):
             decode_graph_target()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         side_stream = torch.cuda.Stream()
         side_stream.wait_stream(torch.cuda.current_stream())
@@ -3561,7 +3555,7 @@ def run_decode_cudagraph_replay_diagnostic_cases(
             seq_lens_static.copy_(seq_lens_steps[step])
             graph.replay()
             decode_eager_target()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             diff = torch.abs(out_graph.float() - out_eager.float())
             step_max_diff = float(diff.max().item())
@@ -3591,9 +3585,7 @@ def run_decode_cudagraph_replay_diagnostic_cases(
             for row in range(batch_size):
                 if first_mismatch_by_row[row] is not None:
                     continue
-                row_diff = torch.abs(
-                    out_graph[row].float() - out_eager[row].float()
-                )
+                row_diff = torch.abs(out_graph[row].float() - out_eager[row].float())
                 row_max = float(row_diff.max().item())
                 if row_max != 0.0:
                     flat_idx = int(row_diff.view(-1).argmax().item())
@@ -3637,7 +3629,7 @@ def run_decode_cudagraph_replay_diagnostic_cases(
 def _time_ms(fn: Any, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -3645,7 +3637,7 @@ def _time_ms(fn: Any, warmup: int, iters: int) -> float:
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return float(start.elapsed_time(end) / iters)
 
 
@@ -3784,9 +3776,7 @@ def _run_decode_timing_case(
                 (actual - dense_reference).abs().max().item()
             )
         if triton_reference is not None:
-            result[f"{name}_equal_triton"] = bool(
-                torch.equal(actual, triton_reference)
-            )
+            result[f"{name}_equal_triton"] = bool(torch.equal(actual, triton_reference))
             result[f"{name}_max_diff_triton"] = float(
                 (actual - triton_reference).abs().max().item()
             )
@@ -4609,9 +4599,9 @@ def run_long_decode_matched_diagnostic_cases(
                 num_qk_partitions = (
                     seq_len + workspace_partition_size - 1
                 ) // workspace_partition_size
-                triton_partition_qk_scores = triton_qk_scores[
-                    0, :, 0, :
-                ].reshape(q_heads, num_qk_partitions, workspace_partition_size)
+                triton_partition_qk_scores = triton_qk_scores[0, :, 0, :].reshape(
+                    q_heads, num_qk_partitions, workspace_partition_size
+                )
         wmma_decode = None
         if hasattr(flash_attn_v100, "flash_attn_decode_paged_wmma"):
             wmma_flat = torch.empty_like(q_flat)
@@ -4819,9 +4809,7 @@ def run_tensor_dump_replay(
     k = payload["raw_key"].unsqueeze(0).cuda().contiguous()
     v = payload["raw_value"].unsqueeze(0).cuda().contiguous()
     saved_flash = payload["candidate_output"].unsqueeze(0).cuda().contiguous()
-    saved_triton = (
-        payload["triton_reference_output"].unsqueeze(0).cuda().contiguous()
-    )
+    saved_triton = payload["triton_reference_output"].unsqueeze(0).cuda().contiguous()
     softmax_scale = float(payload.get("scale", 1.0 / math.sqrt(q.shape[-1])))
     causal = True
 
@@ -5395,21 +5383,15 @@ def _compact_tensor_dump_replay(replay: dict[str, Any]) -> dict[str, Any]:
         "triton_qk_p_half_vs_saved_triton_max_diff": (
             triton_qk_p_half_vs_triton["max_diff"]
         ),
-        "flash_lse_vs_flash_qk_lse_max_diff": (
-            flash_lse_vs_flash_qk_lse["max_diff"]
-        ),
-        "flash_lse_vs_triton_qk_lse_max_diff": (
-            flash_lse_vs_triton_qk_lse["max_diff"]
-        ),
+        "flash_lse_vs_flash_qk_lse_max_diff": (flash_lse_vs_flash_qk_lse["max_diff"]),
+        "flash_lse_vs_triton_qk_lse_max_diff": (flash_lse_vs_triton_qk_lse["max_diff"]),
         "flash_lse_vs_triton_lse_tile32_max_diff": (
             flash_lse_vs_triton_lse_tile32["max_diff"]
         ),
         "flash_lse_vs_triton_lse_tile64_max_diff": (
             flash_lse_vs_triton_lse_tile64["max_diff"]
         ),
-        "flash_lse_vs_torch_lse_max_diff": (
-            flash_lse_vs_torch_lse["max_diff"]
-        ),
+        "flash_lse_vs_torch_lse_max_diff": (flash_lse_vs_torch_lse["max_diff"]),
         "triton_lse_tile32_vs_triton_qk_lse_max_diff": (
             triton_lse_tile32_vs_triton_qk_lse["max_diff"]
         ),
@@ -5428,36 +5410,28 @@ def _compact_tensor_dump_replay(replay: dict[str, Any]) -> dict[str, Any]:
         "output_max_triton_row_reduce_refs": row_reduce_refs(triton_row_reduce),
         "output_max_lse_refs": lse_refs,
         "output_max_flash_qk_p_float_matches_saved_flash": (
-            qk_output_refs.get("flash_qk_scores_p_float_output")
-            == saved_flash_value
+            qk_output_refs.get("flash_qk_scores_p_float_output") == saved_flash_value
         ),
         "output_max_flash_qk_p_float_matches_saved_triton": (
-            qk_output_refs.get("flash_qk_scores_p_float_output")
-            == saved_triton_value
+            qk_output_refs.get("flash_qk_scores_p_float_output") == saved_triton_value
         ),
         "output_max_triton_qk_p_float_matches_saved_flash": (
-            qk_output_refs.get("triton_qk_scores_p_float_output")
-            == saved_flash_value
+            qk_output_refs.get("triton_qk_scores_p_float_output") == saved_flash_value
         ),
         "output_max_triton_qk_p_float_matches_saved_triton": (
-            qk_output_refs.get("triton_qk_scores_p_float_output")
-            == saved_triton_value
+            qk_output_refs.get("triton_qk_scores_p_float_output") == saved_triton_value
         ),
         "output_max_flash_qk_p_half_matches_saved_flash": (
-            qk_output_refs.get("flash_qk_scores_p_half_output")
-            == saved_flash_value
+            qk_output_refs.get("flash_qk_scores_p_half_output") == saved_flash_value
         ),
         "output_max_flash_qk_p_half_matches_saved_triton": (
-            qk_output_refs.get("flash_qk_scores_p_half_output")
-            == saved_triton_value
+            qk_output_refs.get("flash_qk_scores_p_half_output") == saved_triton_value
         ),
         "output_max_triton_qk_p_half_matches_saved_flash": (
-            qk_output_refs.get("triton_qk_scores_p_half_output")
-            == saved_flash_value
+            qk_output_refs.get("triton_qk_scores_p_half_output") == saved_flash_value
         ),
         "output_max_triton_qk_p_half_matches_saved_triton": (
-            qk_output_refs.get("triton_qk_scores_p_half_output")
-            == saved_triton_value
+            qk_output_refs.get("triton_qk_scores_p_half_output") == saved_triton_value
         ),
         "output_max_score_diff": max_score_diff.get("abs_diff"),
         "output_max_probability_diff": max_probability_diff.get("abs_diff"),
@@ -5723,7 +5697,7 @@ def run_tensor_dump_replay_dir(
             aggregate["max_triton_lse_tile32_vs_triton_qk_lse_diff"],
             summary["triton_lse_tile32_vs_triton_qk_lse_max_diff"],
         )
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
     aggregate["all_replays_reproduce_saved"] = (
         aggregate["num_flash_replay_mismatch"] == 0
@@ -5740,9 +5714,7 @@ def run_tensor_dump_replay_dir(
         aggregate["num_output_above_fp16_nominal_bound"]
         == aggregate["num_output_above_fp16_nominal_one_half_ulp"]
     )
-    aggregate["diff_decomposition"] = _decompose_tensor_dump_replay_dir_diff(
-        aggregate
-    )
+    aggregate["diff_decomposition"] = _decompose_tensor_dump_replay_dir_diff(aggregate)
     aggregate["classification"] = _classify_tensor_dump_replay_dir(aggregate)
     return {
         "name": "tensor_dump_replay_dir",
@@ -5751,9 +5723,7 @@ def run_tensor_dump_replay_dir(
     }
 
 
-def _decompose_tensor_dump_replay_dir_diff(
-    aggregate: dict[str, Any]
-) -> dict[str, Any]:
+def _decompose_tensor_dump_replay_dir_diff(aggregate: dict[str, Any]) -> dict[str, Any]:
     input_layout_bug_count = (
         aggregate["num_flash_replay_mismatch"]
         + aggregate["num_triton_replay_mismatch"]
@@ -5765,9 +5735,7 @@ def _decompose_tensor_dump_replay_dir_diff(
         "num_output_above_fp16_nominal_not_one_half_ulp"
     ]
     a_bug_suspect_count = (
-        input_layout_bug_count
-        + causal_mask_bug_count
-        + above_bound_not_half_ulp
+        input_layout_bug_count + causal_mask_bug_count + above_bound_not_half_ulp
     )
     within_bound_nonzero = (
         aggregate["num_output_nonzero"]
@@ -5811,8 +5779,7 @@ def _classify_tensor_dump_replay_dir(aggregate: dict[str, Any]) -> dict[str, Any
         )
     else:
         pending.append(
-            "bug-suspect component remains nonzero under replay/input/causal/ULP "
-            "checks"
+            "bug-suspect component remains nonzero under replay/input/causal/ULP checks"
         )
 
     max_output_diff = aggregate["max_output_diff"]
@@ -6026,9 +5993,7 @@ def run_partitioned_wmma_probe_cases(
             softmax_scale=softmax_scale,
             causal=False,
         )
-        partitioned_wmma = (
-            partitioned_wmma.squeeze(2).permute(1, 0, 2).contiguous()
-        )
+        partitioned_wmma = partitioned_wmma.squeeze(2).permute(1, 0, 2).contiguous()
         dense_partition_outputs = _flash_dense_partition_outputs(
             flash_attn_v100,
             q,
@@ -6121,14 +6086,10 @@ def run_partitioned_wmma_probe_cases(
             "scalar_decode": scalar_ms,
             "full_wmma_decode": wmma_decode_ms,
             "partitioned_wmma_vs_scalar_ratio": (
-                partitioned_ms / scalar_ms
-                if scalar_ms > 0.0
-                else float("inf")
+                partitioned_ms / scalar_ms if scalar_ms > 0.0 else float("inf")
             ),
             "full_wmma_vs_scalar_ratio": (
-                wmma_decode_ms / scalar_ms
-                if scalar_ms > 0.0
-                else float("inf")
+                wmma_decode_ms / scalar_ms if scalar_ms > 0.0 else float("inf")
             ),
         }
         comparisons = {
@@ -6155,8 +6116,7 @@ def run_partitioned_wmma_probe_cases(
                 "head_dim": head_dim,
                 "block_size": block_size,
                 "partition_size": partition_size,
-                "num_partitions": (seq_len + partition_size - 1)
-                // partition_size,
+                "num_partitions": (seq_len + partition_size - 1) // partition_size,
                 **comparisons,
                 "timing_ms": timing_ms,
             }
@@ -6199,9 +6159,7 @@ def run_noncontiguous_edge_cases(flash_attn_v100: Any) -> list[dict[str, Any]]:
         softmax_scale=softmax_scale,
     )
 
-    key_cache, value_cache, block_table, seq_lens = _make_paged_cache(
-        k, v, block_size
-    )
+    key_cache, value_cache, block_table, seq_lens = _make_paged_cache(k, v, block_size)
     key_cache_nc = _strided_view_along_dim(key_cache, 0)
     value_cache_nc = _strided_view_along_dim(value_cache, 0)
     block_table_nc = _strided_view_along_dim(block_table, 1)
@@ -6419,24 +6377,18 @@ def _summarize_attention_replay(path: Path) -> dict[str, Any]:
         "default_acceptance": classification.get("default_acceptance"),
         "input_alignment": {
             "all_raw_kv_cache_aligned": aggregate.get("all_raw_kv_cache_aligned"),
-            "num_raw_key_cache_mismatch": aggregate.get(
-                "num_raw_key_cache_mismatch"
-            ),
+            "num_raw_key_cache_mismatch": aggregate.get("num_raw_key_cache_mismatch"),
             "num_raw_value_cache_mismatch": aggregate.get(
                 "num_raw_value_cache_mismatch"
             ),
             "num_qk_max_invalid_causal": aggregate.get("num_qk_max_invalid_causal"),
             "num_flash_replay_mismatch": aggregate.get("num_flash_replay_mismatch"),
-            "num_triton_replay_mismatch": aggregate.get(
-                "num_triton_replay_mismatch"
-            ),
+            "num_triton_replay_mismatch": aggregate.get("num_triton_replay_mismatch"),
         },
         "diff_decomposition": diff_decomposition,
         "output": {
             "max_output_diff": aggregate.get("max_output_diff"),
-            "max_output_probability_diff": aggregate.get(
-                "max_output_probability_diff"
-            ),
+            "max_output_probability_diff": aggregate.get("max_output_probability_diff"),
             "max_output_score_diff": aggregate.get("max_output_score_diff"),
             "max_qk_diff": aggregate.get("max_qk_diff"),
             "fp16_nominal_output_bound": classification.get(
@@ -6494,9 +6446,9 @@ def _build_numeric_gate_summary(
         "fp16_nominal_output_bound",
         FP16_NOMINAL_OUTPUT_BOUND,
     )
-    dtype_bound_satisfied = (
-        max_output_diff is not None and float(max_output_diff) <= float(fp16_bound)
-    )
+    dtype_bound_satisfied = max_output_diff is not None and float(
+        max_output_diff
+    ) <= float(fp16_bound)
     matched_tiling_proven = attention["label"] == "B-accept"
     model_gate_passed = model is not None and model.get("label") == "model-pass"
 
@@ -6538,9 +6490,7 @@ def _build_numeric_gate_summary(
         "model_level": {
             "label": None if model is None else model.get("label"),
             "token_equal": None if model is None else model.get("token_equal"),
-            "selfnoise_label": None
-            if selfnoise is None
-            else selfnoise.get("label"),
+            "selfnoise_label": None if selfnoise is None else selfnoise.get("label"),
             "note": (
                 "model-pass is supporting evidence only; it cannot promote an "
                 "op-level B-pending attention residual to B-accept."
@@ -6683,8 +6633,7 @@ def parse_args() -> argparse.Namespace:
         "--compare-triton",
         action="store_true",
         help=(
-            "Also compare dense/paged Flash-V100 outputs with Triton "
-            "unified_attention."
+            "Also compare dense/paged Flash-V100 outputs with Triton unified_attention."
         ),
     )
     parser.add_argument("--benchmark-warmup", type=int, default=30)
@@ -6759,9 +6708,7 @@ def main() -> int:
 
     if args.mode == "tensor-dump-replay-dir":
         if args.tensor_dump_dir is None:
-            raise ValueError(
-                "--tensor-dump-dir is required for tensor-dump-replay-dir"
-            )
+            raise ValueError("--tensor-dump-dir is required for tensor-dump-replay-dir")
         replay_dir = run_tensor_dump_replay_dir(flash_attn_v100, args.tensor_dump_dir)
         payload = {
             "device": torch.cuda.get_device_name(),
@@ -6915,9 +6862,7 @@ def main() -> int:
         return 0
 
     if args.mode == "decode-cudagraph-replay-diagnostic":
-        diagnostics = run_decode_cudagraph_replay_diagnostic_cases(
-            flash_attn_v100
-        )
+        diagnostics = run_decode_cudagraph_replay_diagnostic_cases(flash_attn_v100)
         passed = all(result["equal"] for result in diagnostics)
         payload = {
             "device": torch.cuda.get_device_name(),

@@ -9,7 +9,6 @@ import csv
 import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import regex as re
 
 K_REQUIRED_VISIBLE_DEVICES = "2"
 K_REQUIRED_PHYSICAL_GPU = 2
@@ -155,13 +155,10 @@ def _build_binary(verbose: bool) -> tuple[Path, list[str], str]:
     if nvcc is None:
         raise RuntimeError("nvcc is required to build the SM70 panel microbenchmark.")
     source = (
-        Path(__file__).resolve().parent
-        / "csrc"
-        / "sm70_raw_hmma_qk_panel_micro.cu"
+        Path(__file__).resolve().parent / "csrc" / "sm70_raw_hmma_qk_panel_micro.cu"
     )
     build_dir = (
-        Path(tempfile.gettempdir())
-        / f"vllm-sm70-raw-hmma-qk-panel-micro-{os.getuid()}"
+        Path(tempfile.gettempdir()) / f"vllm-sm70-raw-hmma-qk-panel-micro-{os.getuid()}"
     )
     build_dir.mkdir(parents=True, exist_ok=True)
     binary = build_dir / "sm70_raw_hmma_qk_panel_micro_sm70"
@@ -184,9 +181,7 @@ def _build_binary(verbose: bool) -> tuple[Path, list[str], str]:
     return binary, command, result.stderr
 
 
-def _binary_command(
-    binary: Path, args: argparse.Namespace, variant: str
-) -> list[str]:
+def _binary_command(binary: Path, args: argparse.Namespace, variant: str) -> list[str]:
     return [
         str(binary),
         "--device",
@@ -223,7 +218,9 @@ def _run_variant(
         raise RuntimeError(f"Probe reported the wrong raw variant for {variant}.")
     expected_words = args.groups * 16 * 256
     if payload.get("exactness", {}).get("word_count") != expected_words:
-        raise RuntimeError("Probe did not compare the complete [groups, 16, 256] output.")
+        raise RuntimeError(
+            "Probe did not compare the complete [groups, 16, 256] output."
+        )
     return payload, command
 
 
@@ -243,9 +240,7 @@ def _instruction_count(sass: str, mnemonic: str) -> int:
 
 
 def _ldg_width_count(sass: str, width: int) -> int:
-    return len(
-        re.findall(rf"\bLDG(?:\.[A-Z0-9_]+)*\.{width}(?:\.|\b)", sass)
-    )
+    return len(re.findall(rf"\bLDG(?:\.[A-Z0-9_]+)*\.{width}(?:\.|\b)", sass))
 
 
 def _inspect_sass(binary: Path) -> dict[str, Any]:
@@ -373,7 +368,10 @@ def _load_gate(sass: dict[str, Any], variant: str) -> tuple[bool, list[str]]:
                 f"{instructions.get('ldg_64', 0)}, requires at least "
                 f"{K_EXPECTED_RAW_B_LDG64} for one vector B load per K4"
             )
-        if instructions.get("ldg", K_SCALAR_RAW_LDG_REFERENCE) >= K_SCALAR_RAW_LDG_REFERENCE:
+        if (
+            instructions.get("ldg", K_SCALAR_RAW_LDG_REFERENCE)
+            >= K_SCALAR_RAW_LDG_REFERENCE
+        ):
             reasons.append(
                 "raw_k4_vector total LDG="
                 f"{instructions.get('ldg')}, must be below scalar reference "
@@ -391,10 +389,11 @@ def _load_gate(sass: dict[str, Any], variant: str) -> tuple[bool, list[str]]:
             f"raw_k4_vector reference {K_K4_VECTOR_LDG_REFERENCE}"
         )
     if instructions.get("ldg_64", 0):
-        reasons.append(
-            f"{variant} has unexpected LDG.64={instructions.get('ldg_64')}"
-        )
-    if variant == "raw_m16n256_reuse_b" and instructions.get("hmma", 0) < K_EXPECTED_REUSE_B_HMMA:
+        reasons.append(f"{variant} has unexpected LDG.64={instructions.get('ldg_64')}")
+    if (
+        variant == "raw_m16n256_reuse_b"
+        and instructions.get("hmma", 0) < K_EXPECTED_REUSE_B_HMMA
+    ):
         reasons.append(
             f"reuse-B HMMA={instructions.get('hmma', 0)}, requires at least "
             f"{K_EXPECTED_REUSE_B_HMMA}"
@@ -432,9 +431,7 @@ def _candidate_artifact(
         rejection_reasons.append(structural_rejection)
     rejection_reasons.extend(resource_reasons)
     rejection_reasons.extend(load_reasons)
-    instructions = sass.get("kernels", {}).get(variant, {}).get(
-        "instructions", {}
-    )
+    instructions = sass.get("kernels", {}).get(variant, {}).get("instructions", {})
     if variant == "raw_k4_vector":
         load_artifact = {
             "implementation": "aligned inline PTX ld.global.v2.u32",
@@ -603,7 +600,11 @@ def _run_ncu_kernel(
     metrics = _parse_ncu_metrics(result.stdout)
     active = metrics.get("smsp__warps_active.avg.per_cycle_active")
     eligible = metrics.get("smsp__warps_eligible.avg.per_cycle_active")
-    no_eligible = max(active - eligible, 0.0) if active is not None and eligible is not None else None
+    no_eligible = (
+        max(active - eligible, 0.0)
+        if active is not None and eligible is not None
+        else None
+    )
     return {
         "status": "completed" if result.returncode == 0 else "failed",
         "command": command,
@@ -614,9 +615,7 @@ def _run_ncu_kernel(
             "long_scoreboard_per_warp_active": metrics.get(
                 "smsp__warp_issue_stalled_long_scoreboard_per_warp_active"
             ),
-            "tensor_instructions": metrics.get(
-                "smsp__inst_executed_pipe_tensor.sum"
-            ),
+            "tensor_instructions": metrics.get("smsp__inst_executed_pipe_tensor.sum"),
         },
         "stdout_tail": result.stdout[-3000:],
         "stderr_tail": result.stderr[-3000:],
@@ -664,9 +663,7 @@ def main() -> int:
     for variant in ("raw_k4_vector", "raw_k16_stage"):
         raw_payload, command = _run_variant(binary, args, variant)
         raw_payloads[variant] = raw_payload
-        candidates[variant] = _candidate_artifact(
-            raw_payload, sass, variant, command
-        )
+        candidates[variant] = _candidate_artifact(raw_payload, sass, variant, command)
 
     stage = candidates["raw_k16_stage"]
     if _stage_resources_allow_double(stage):
@@ -678,7 +675,10 @@ def main() -> int:
     else:
         candidates["raw_k16_double"] = {
             "status": "skipped_stage_resource_gate",
-            "requires": "raw_k16_stage REG<=64, LOCAL=0, 4 CTA/SM, 32 QK warps, and bitwise equality",
+            "requires": (
+                "raw_k16_stage REG<=64, LOCAL=0, 4 CTA/SM, 32 QK warps, "
+                "and bitwise equality"
+            ),
             "stage_resources": stage.get("resources", {}),
             "stage_gates": stage.get("gates", {}),
         }
@@ -739,9 +739,7 @@ def main() -> int:
         "measurement": reference["measurement"],
         "baseline": {
             "resources": reference["resources"]["baseline"],
-            "sass": sass.get("kernels", {}).get("baseline", {}).get(
-                "instructions", {}
-            ),
+            "sass": sass.get("kernels", {}).get("baseline", {}).get("instructions", {}),
             "timing_per_candidate": {
                 name: artifact["timing"]["baseline"]
                 for name, artifact in measured_candidates.items()

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -15,7 +16,10 @@ from vllm.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded_kernel,
     next_power_of_2,
 )
-from vllm.v1.worker.gpu_model_runner import _count_contiguous_spec_tokens
+from vllm.v1.worker.gpu_model_runner import (
+    _async_spec_decode_participating_prev_positions,
+    _count_contiguous_spec_tokens,
+)
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -64,7 +68,7 @@ def test_prepare_next_token_padded_counts_only_contiguous_prefix():
         sampled_token_ids.stride(0),
         BLOCK_SIZE_TOKENS=next_power_of_2(sampled_token_ids.shape[1]),
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert torch.equal(
         next_token_ids.cpu(),
@@ -90,9 +94,7 @@ def test_prepare_inputs_padded_does_not_alias_target_seq_lens():
         block_table_tensor=torch.zeros((3, 1), dtype=torch.int32, device=device),
         slot_mapping=torch.arange(9, dtype=torch.int64, device=device),
         seq_lens_cpu_upper_bound=torch.tensor([3, 3, 3], dtype=torch.int32),
-        dcp_local_seq_lens=torch.tensor(
-            [3, 3, 3], dtype=torch.int32, device=device
-        ),
+        dcp_local_seq_lens=torch.tensor([3, 3, 3], dtype=torch.int32, device=device),
     )
     spec_decode_metadata = SpecDecodeMetadata.make_dummy(
         draft_token_ids=[[0, 0], [0, 0], [0, 0]],
@@ -116,8 +118,7 @@ def test_prepare_inputs_padded_does_not_alias_target_seq_lens():
     )
 
     assert (
-        output_metadata.seq_lens.data_ptr()
-        != common_attn_metadata.seq_lens.data_ptr()
+        output_metadata.seq_lens.data_ptr() != common_attn_metadata.seq_lens.data_ptr()
     )
     assert (
         output_metadata.dcp_local_seq_lens.data_ptr()
@@ -189,4 +190,114 @@ def test_accepted_count_ignores_stale_tokens_after_first_rejection():
     assert torch.equal(
         accepted_counts.cpu(),
         torch.tensor([2, 0, 1, 5], dtype=torch.int32, device="cpu"),
+    )
+
+
+def test_async_spec_decode_skips_stale_counts_without_previous_drafts():
+    participating = _async_spec_decode_participating_prev_positions(
+        np.array([0], dtype=np.int32),
+        np.array([0], dtype=np.int32),
+    )
+
+    assert participating.size == 0
+
+
+def test_async_spec_decode_selects_only_previous_rows_with_drafts():
+    participating = _async_spec_decode_participating_prev_positions(
+        np.array([2, -1, 0, 1], dtype=np.int32),
+        np.array([0, 4, 2], dtype=np.int32),
+    )
+
+    assert participating.tolist() == [2, 1]
+
+
+def test_dynamic_vocab_sampler_handles_all_nonfinite_candidates():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 fused dynamic-vocabulary ops require a V100 GPU.")
+
+    from vllm import _sm70_ops
+
+    device = torch.device(DEVICE_TYPE)
+    hidden_states = torch.full((1, 64), torch.nan, dtype=torch.float16, device=device)
+    weight = torch.randn((256, 64), dtype=torch.float16, device=device)
+    prepared_weight, prepared_meta = _sm70_ops.sm70_f16_prepare(weight)
+    base_values = torch.empty((1, 20), dtype=torch.float32, device=device)
+    base_indices = torch.empty((1, 20), dtype=torch.int64, device=device)
+    _sm70_ops.sm70_f16_lm_head_top20_tc_out(
+        base_values,
+        base_indices,
+        hidden_states,
+        prepared_weight,
+        int(prepared_meta[0].item()),
+        0,
+        0,
+    )
+    base_token_ids = torch.arange(256, dtype=torch.int64, device=device)
+    tail_logits = torch.full((32,), torch.inf, dtype=torch.float16, device=device)
+    tail_token_ids = torch.arange(300, 332, dtype=torch.int64, device=device)
+    pairs = torch.empty((20, 3), dtype=torch.float32, device=device)
+
+    _sm70_ops.sm70_merge_tail_top20_pack_out(
+        pairs,
+        base_values[0],
+        base_indices[0],
+        base_token_ids,
+        tail_logits,
+        tail_token_ids,
+        20,
+    )
+    sampled_token = torch.empty(1, dtype=torch.int64, device=device)
+    sparse_ids = torch.empty(20, dtype=torch.int64, device=device)
+    sparse_probs = torch.empty(20, dtype=torch.float32, device=device)
+    exponential = torch.ones(64, dtype=torch.float32, device=device)
+    _sm70_ops.sm70_sample_packed_top20_out(
+        sampled_token,
+        sparse_ids,
+        sparse_probs,
+        pairs,
+        exponential,
+        0.95,
+    )
+    torch.accelerator.synchronize()
+
+    assert bool(((base_indices >= 0) & (base_indices < 256)).all())
+    assert bool(torch.isfinite(pairs[:, 0]).all())
+    assert bool(((sparse_ids >= 0) & (sparse_ids < 332)).all())
+    assert bool(torch.isfinite(sparse_probs).all())
+    assert float(sparse_probs.sum()) == pytest.approx(1.0, abs=1e-6)
+    assert int(sampled_token.item()) in sparse_ids.tolist()
+
+
+def test_dynamic_vocab_merge_preserves_finite_top20_order():
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 fused dynamic-vocabulary ops require a V100 GPU.")
+
+    from vllm import _sm70_ops
+
+    device = torch.device(DEVICE_TYPE)
+    base_values = torch.arange(40, 20, -1, dtype=torch.float32, device=device)
+    base_indices = torch.arange(20, dtype=torch.int64, device=device)
+    base_token_ids = torch.arange(100, 120, dtype=torch.int64, device=device)
+    tail_logits = torch.arange(32, dtype=torch.float16, device=device)
+    tail_token_ids = torch.arange(200, 232, dtype=torch.int64, device=device)
+    pairs = torch.empty((20, 3), dtype=torch.float32, device=device)
+
+    _sm70_ops.sm70_merge_tail_top20_pack_out(
+        pairs,
+        base_values,
+        base_indices,
+        base_token_ids,
+        tail_logits,
+        tail_token_ids,
+        20,
+    )
+    torch.accelerator.synchronize()
+
+    all_values = torch.cat((base_values, tail_logits.float()))
+    all_ids = torch.cat((base_token_ids, tail_token_ids))
+    expected_positions = torch.argsort(all_values, descending=True, stable=True)[:20]
+    assert torch.equal(pairs[:, 0].cpu(), all_values[expected_positions].cpu())
+    assert torch.equal(
+        pairs[:, 1].to(torch.int64).cpu(),
+        all_ids[expected_positions].cpu(),
     )

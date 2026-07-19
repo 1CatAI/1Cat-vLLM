@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rank SM70 TileRT-style GEMM/all-reduce candidates from nsys sqlite.
 
 This diagnostic is intentionally offline-only. It reads an Nsight Systems
@@ -29,8 +31,12 @@ def _load_strings(cur: sqlite3.Cursor) -> dict[int, str]:
     return {row[0]: row[1] for row in cur.execute("SELECT id, value FROM StringIds")}
 
 
-def _load_graph_pairs(cur: sqlite3.Cursor, strings: dict[int, str]) -> list[tuple[int, int]]:
-    graph_ids = [sid for sid, value in strings.items() if value == "cudaGraphLaunch_v10000"]
+def _load_graph_pairs(
+    cur: sqlite3.Cursor, strings: dict[int, str]
+) -> list[tuple[int, int]]:
+    graph_ids = [
+        sid for sid, value in strings.items() if value == "cudaGraphLaunch_v10000"
+    ]
     if not graph_ids:
         raise RuntimeError("no cudaGraphLaunch_v10000 rows found")
     placeholders = ",".join("?" for _ in graph_ids)
@@ -133,8 +139,7 @@ def analyze(sqlite_path: Path, skip_pairs: int, sm_count: int) -> dict[str, Any]
         raise RuntimeError("no steady graph windows found")
 
     token_ms = [
-        (windows[i + 1][1] - windows[i][1]) / 1e6
-        for i in range(len(windows) - 1)
+        (windows[i + 1][1] - windows[i][1]) / 1e6 for i in range(len(windows) - 1)
     ]
 
     stats: dict[tuple[int, str], dict[str, Any]] = defaultdict(
@@ -256,7 +261,8 @@ def write_markdown(payload: dict[str, Any], path: Path) -> None:
         f"- mean token start gap: `{payload['token_start_gap_ms']['mean']:.3f} ms`",
         f"- SM count threshold: `{payload['sm_count']}`",
         "",
-        "| rank | device | prev GEMM grid | CTAs | calls/token | AR us/token | GEMM us/token | overlap ceiling us/token | mean AR us | mean GEMM us | AWQ |",
+        "| rank | device | prev GEMM grid | CTAs | calls/token | AR us/token | "
+        "GEMM us/token | overlap ceiling us/token | mean AR us | mean GEMM us | AWQ |",
         "|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for idx, row in enumerate(payload["candidates"], 1):

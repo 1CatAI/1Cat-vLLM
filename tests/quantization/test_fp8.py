@@ -16,14 +16,14 @@ from vllm import _custom_ops as ops
 from vllm.config.model import ModelConfig
 from vllm.model_executor.layers.attention import attention as attention_module
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsKVCacheMethod,
+)
 from vllm.model_executor.layers.quantization.fp8 import (
     Fp8Config,
     Fp8KVCacheMethod,
     Fp8LinearMethod,
     Fp8MoEMethod,
-)
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsKVCacheMethod,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader

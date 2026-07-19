@@ -205,9 +205,9 @@ reference. Its shipped kernels are not a drop-in V100 solution.
 
 References:
 
-- https://github.com/flashinfer-ai/flashinfer
-- https://docs.flashinfer.ai/api/attention.html
-- https://docs.flashinfer.ai/generated/flashinfer.gdn_decode.gated_delta_rule_mtp.html
+- <https://github.com/flashinfer-ai/flashinfer>
+- <https://docs.flashinfer.ai/api/attention.html>
+- <https://docs.flashinfer.ai/generated/flashinfer.gdn_decode.gated_delta_rule_mtp.html>
 
 ## Compact TP Logit Transport: Real V100 TP2 Go/No-Go
 
@@ -1161,17 +1161,17 @@ corresponding baseline prompt suite.
 
 Primary references:
 
-- https://github.com/thunlp/FR-Spec
-- https://arxiv.org/abs/2502.14856
-- https://arxiv.org/abs/2506.22694
-- https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/speculative/eagle_worker_v2.py
-- https://github.com/csAugust/NanoSpec
-- https://arxiv.org/abs/2605.26444
-- https://arxiv.org/abs/2605.10453
-- https://arxiv.org/abs/2602.13836
-- https://arxiv.org/abs/2605.27390
-- https://github.com/Tencent-BAC/FastMTP
-- https://github.com/vllm-project/speculators
+- <https://github.com/thunlp/FR-Spec>
+- <https://arxiv.org/abs/2502.14856>
+- <https://arxiv.org/abs/2506.22694>
+- <https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/speculative/eagle_worker_v2.py>
+- <https://github.com/csAugust/NanoSpec>
+- <https://arxiv.org/abs/2605.26444>
+- <https://arxiv.org/abs/2605.10453>
+- <https://arxiv.org/abs/2602.13836>
+- <https://arxiv.org/abs/2605.27390>
+- <https://github.com/Tencent-BAC/FastMTP>
+- <https://github.com/vllm-project/speculators>
 
 ## Draft Route Decision Matrix
 
@@ -1415,3 +1415,208 @@ the original fast path for the first 50 full CTAs. With that fix, matched MTP4
 FP8 prefill is `9.972 s` at 16K and `56.441 s` at 64K, down 28.66% and 54.27%
 from the historical FP8 route. TPOT is `10.072/18.020 ms`, acceptance length
 remains `4.8679/4.8113`, and both token hashes are unchanged.
+
+## 2026-07-19 TP4 Long-Context Verifier XQA And Flash Drafter Default
+
+The current long-context regression was reproduced with Qwen3.6-27B-AWQ,
+TP4 V100, FP8 E5M2 KV, TurboMind, 256K model length, chunk size 8096,
+prefix caching, Mamba align, official sampling, and non-eager CUDA graphs.
+The previous release matrix explicitly pinned the MTP drafter to
+`TRITON_ATTN`, even though the Flash-V100 drafter metadata/replay repair had
+already passed the July 15 TP2 natural-output check.
+
+There were two independent route gaps:
+
+1. The target M=5 verifier already converted five causal query rows into five
+   paged-decode rows, but called only the scalar kernel. It did not inherit the
+   q=1 target's G6 XQA route.
+2. The four serial MTP draft forwards still used Triton attention. This was the
+   dominant long-context gap; target-verifier XQA alone was not sufficient.
+
+The exact TP4 M=5 FP8-KV microbenchmark uses `Hq=6,Hkv=1,D=256`, page 1616,
+five rows with sequence lengths `N-4..N`, and a fixed 262144-token workspace.
+
+| Context | Scalar median | XQA median | XQA change | max abs diff |
+|---:|---:|---:|---:|---:|
+| 768 | `0.1362 ms` | `0.1423 ms` | `+4.51%` | `2.44e-4` |
+| 4K | `0.2202 ms` | `0.1905 ms` | `-13.49%` | `6.10e-5` |
+| 64K | `1.6835 ms` | `1.2278 ms` | `-27.07%` | `1.53e-5` |
+| 128K | `3.1017 ms` | `2.1402 ms` | `-31.00%` | `7.63e-6` |
+| 261888 | `6.0232 ms` | `4.1748 ms` | `-30.69%` | `7.63e-6` |
+
+The production gate is deliberately narrower than generic q=1 XQA. It accepts
+only small-query `G=6/8,D=256`, FP16 or E5M2 KV, no sliding window, and no
+explicit context-bucket partition override. Existing P256/P512 bounded graphs
+therefore remain on scalar; this does not reopen the rejected P256 short-graph
+XQA experiment. `VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA=0` is the rollback.
+
+Matched endpoint results are:
+
+| Context | no MTP TPOT / TPS | Triton-drafter MTP4 TPOT / TPS | full-Flash MTP4 TPOT / TPS | full-Flash vs no MTP |
+|---:|---:|---:|---:|---:|
+| 64K | `17.507 / 57.121` | `19.941 / 50.149` | `9.944 / 100.564` | `+76.05%` |
+| 128K | `22.009 / 45.438` | `33.676 / 29.695` | `13.281 / 75.298` | `+65.72%` |
+| 261888 | `30.434 / 32.858` | `59.324 / 16.857` | `20.092 / 49.772` | `+51.47%` |
+
+At 128K, target-verifier XQA with the old Triton drafter reached only
+`30.598 ms / 32.682 tok/s`. Thus XQA saved `3.078 ms` but still lost to
+no-MTP. Enabling the already repaired Flash-V100 drafter reduced TPOT by a
+further `17.317 ms` and is the first-order fix.
+
+All fixed-length repeats were deterministic, reported `is_corrupted=false`,
+and retained the Triton/scalar token hashes. Acceptance was `4.981/99.52%` at
+64K and 128K and `5.000/100%` at 261888.
+
+The default-generated TP4 natural quality run also passed. It emitted 22,053
+tokens, stopped naturally, produced complete closed HTML/CSS/JavaScript,
+reported no bad markers or corruption, and decoded at `114.167 tok/s` with
+aggregate acceptance length `3.7896`. The previous Triton-drafter natural run
+decoded at `94.539 tok/s`, so the current default gains `20.77%` on that
+workload. `EngineArgs` and the release matrix now default an enabled SM70 MTP
+drafter to `FLASH_ATTN_V100`; explicit user backend selection remains
+authoritative.
+
+Artifacts:
+
+- `bench_results/mtp_verifier_xqa_20260719/tp4_fp8kv_m5_scalar_xqa_workspace262144.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_fp16kv_m5_scalar_xqa_workspace262144.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_awq_fp8kv_mtp4_i128k_candidate.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_awq_fp8kv_mtp4_i128k_targetxqa_drafterflash.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_awq_fp8kv_mtp4_i64k_i256k_targetxqa_drafterflash.json`
+- `bench_results/mtp_verifier_xqa_20260719/quality_tp4_awq_fp8kv_mtp4_flash_default/`
+
+## 2026-07-19 Exact-M5 P1024 Dual-CTA Verifier
+
+After the full-Flash repair, target attention remained the dominant source of
+long-context growth. Normalizing TPOT by accepted tokens gives approximately
+`49.5/66.1/100.5 ms` per MTP round at 64K/128K/261888. One rank executes 16
+full-attention layers, and the exact `M=5,Hq=6,Hkv=1,D=256`, page-1616 FP8
+E5M2 XQA microbenchmark accounts for almost all of the 64K-to-256K increase.
+
+The original P1024 partition kernel used 256 threads, 186 registers/thread,
+and 43.26 KiB dynamic shared memory. It could resident only one CTA per SM.
+NCU measured 12.49% achieved occupancy, 0.34 eligible warps/scheduler, and
+72.33% cycles with no eligible warp. DRAM throughput was only 3.05%; this was
+a register/residency and latency-hiding problem, not an HBM bandwidth limit.
+
+Two candidate families were tested:
+
+| TP4 context | P1024 baseline | P256 dual CTA | P1024 dual CTA |
+|---:|---:|---:|---:|
+| 64K | `1.3865 ms` | `0.918 ms` | `1.2093 ms` |
+| 128K | `2.2487 ms` | `1.626 ms` | `1.7439 ms` |
+| 261888 | `4.1805 ms` | `2.993 ms` | `3.0623 ms` |
+
+P256 was fastest, but it changes partition and final reduction order. A
+natural quality run diverged into a 19,930-token single-token repetition and
+did not stop at 32K. It is therefore rejected as a global default. Split
+reduction tiles 16 and 32 also regressed the 128K microbenchmark and remain
+disabled.
+
+The accepted path keeps P1024 and the existing reduction order, but specializes
+the exact M=5 TP4 shape to six warps (192 threads) with a two-CTA launch bound.
+Across contexts 72, 97, 128, 256, 512, 768, 1K, 4K, 16K, 32K, 64K, 128K,
+and 261888, direct P1024 baseline-versus-dual comparisons were bitwise equal.
+NCU confirms that the change improves residency without increasing work:
+
+| 128K partition metric | P1024 baseline | P1024 dual CTA |
+|---|---:|---:|
+| grid / threads | `1280 / 256` | `1280 / 192` |
+| registers/thread | `186` | `168` |
+| dynamic shared/CTA | `43.26 KiB` | `43.26 KiB` |
+| achieved occupancy | `12.49%` | `18.67%` |
+| eligible warps/scheduler | `0.34` | `0.58` |
+| no eligible cycles | `72.33%` | `63.39%` |
+| SM throughput | `27.28%` | `32.48%` |
+| NCU partition duration | `2.30 ms` | `1.85 ms` |
+
+The same specialization is valid for TP2. TP2 changes the per-rank shape from
+`Hq=6,Hkv=1` to `Hq=12,Hkv=2`, but preserves `q_per_kv=6`; each KV head is an
+independent `blockIdx.y` CTA. The production gate therefore keys on G6 rather
+than a hard-coded TP4 head count. Matched exact-M5 microbenchmarks are:
+
+| TP2 context | P1024 baseline | P1024 dual CTA | change |
+|---:|---:|---:|---:|
+| 64K | `2.4330 ms` | `1.7060 ms` | `-29.88%` |
+| 128K | `4.3761 ms` | `3.0106 ms` | `-31.20%` |
+| 261888 | `8.1997 ms` | `5.8409 ms` | `-28.77%` |
+
+Direct same-process comparisons at all three contexts are bitwise equal. The
+route test covers both TP4 `Hq=6,Hkv=1` and TP2 `Hq=12,Hkv=2`.
+
+The matched TP2 full-model gate uses the same 128K FP8-weight/FP8-KV/MTP4
+configuration as the TP4 quantization-independent gate. Only the dual-CTA
+rollback changes between processes:
+
+| TP2 128K route | TPOT | steady decode | acceptance length / rate |
+|---|---:|---:|---:|
+| original P1024 | `22.7660 ms` | `43.925 tok/s` | `4.94231 / 98.56%` |
+| P1024 dual CTA | `18.6244 ms` | `53.693 tok/s` | `4.94231 / 98.56%` |
+
+This is `-18.19%` TPOT and `+22.24%` throughput. Both measured repeats on
+both routes have the same token hash and report `is_corrupted=false`.
+
+The matched 128K TP4 endpoint used TurboMind AWQ, FP8 E5M2 KV, MTP4,
+Flash-V100 for target and drafter, official sampling, prefix caching, Mamba
+align, chunk size 8096, and non-eager CUDA graphs:
+
+| Route | TPOT | steady decode | acceptance length |
+|---|---:|---:|---:|
+| P1024 baseline | `13.2808 ms` | `75.298 tok/s` | `4.98077` |
+| P1024 dual CTA | `11.7291 ms` | `85.258 tok/s` | `4.98077` |
+
+This is `-11.68%` TPOT and `+13.23%` decode throughput. Both measured repeats
+have the same 256-token hash and per-position acceptance as the baseline. The
+round saving is `7.73 ms`; the 16-layer microbenchmark predicts `8.08 ms`, so
+the kernel gain is reflected in the endpoint rather than being hidden by a
+microbenchmark mismatch.
+
+The specialization is independent of weight quantization. A second matched
+128K run used Qwen3.6-27B-FP8 weights with TurboMind FP8 GEMMs and FP8 E5M2 KV;
+the log reported `0 AWQ / 35 FP8` warmup calls while all four ranks selected
+the same P1024 dual-CTA verifier route:
+
+| FP8-weight route | TPOT | steady decode | acceptance length |
+|---|---:|---:|---:|
+| original P1024 | `13.4579 ms` | `74.306 tok/s` | `4.94231` |
+| P1024 dual CTA | `11.9242 ms` | `83.864 tok/s` | `4.94231` |
+
+This is `-11.40%` TPOT and `+12.86%` throughput. Both measured repeats retain
+the same token hash and report no corruption. The gate depends only on the
+runtime attention/KV shape, not AWQ or FP8 weight metadata. Current production
+scope still requires FP8 E5M2 KV; FP8 weights with FP16 KV are a separate,
+not-yet-enabled kernel gate.
+
+The natural `macos_6k_code` gate stopped normally after 26,708 tokens, produced
+complete closed HTML/CSS/JavaScript plus a feature summary, and decoded at
+`118.674 tok/s` with aggregate acceptance length `3.92`. The old baseline was
+`114.167 tok/s` and `3.7896`, so acceptance did not pay for the speed gain.
+Its only initial gate failure was an absolute 20-character repetition check:
+the legitimate HTML fragment `class="settings-row` appeared 87 times in an
+83,391-character application. The check now scales with output length while
+the 50/100-character, same-token, same-character, malformed-tag, code-fence,
+HTML-closure, and natural-EOS checks remain unchanged. Re-evaluation passes
+this output and still rejects the P256 failure (`repeat20=19921`,
+`repeat50=19906`, `repeat100=19881`).
+
+Default scope is deliberately exact: five rows, G6, D256, page 1616, and FP8
+E5M2 KV. It covers TP2 and TP4 by deriving head count from G6 rather than the
+weight quantization or TP size. `VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA=0` restores the
+original planner and P1024 kernel. `VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE`
+exists for explicit experiments, but its production default is 1024; P256 is
+not quality-approved as a global route.
+
+Artifacts:
+
+- `bench_results/mtp_verifier_xqa_20260719/m5_p1024_dual.json`
+- `bench_results/mtp_verifier_xqa_20260719/m5_tp2_p1024_baseline.json`
+- `bench_results/mtp_verifier_xqa_20260719/m5_tp2_p1024_dual.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp2_fp8weights_fp8kv_mtp4_i128k_p1024_baseline.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp2_fp8weights_fp8kv_mtp4_i128k_p1024_dual_default.json`
+- `bench_results/mtp_verifier_xqa_20260719/m5_p256_dual.json`
+- `bench_results/mtp_verifier_xqa_20260719/ncu/m5_xqa_fp8_n128k_p1024_dual_full.ncu-rep`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_awq_fp8kv_mtp4_i128k_p1024_dual_steady.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_fp8weights_fp8kv_mtp4_i128k_p1024_baseline.json`
+- `bench_results/mtp_verifier_xqa_20260719/tp4_fp8weights_fp8kv_mtp4_i128k_p1024_dual_default.json`
+- `bench_results/mtp_verifier_xqa_20260719/quality_tp4_awq_fp8kv_mtp4_p1024_dual/`
+- `bench_results/mtp_verifier_xqa_20260719/quality_tp4_awq_fp8kv_mtp4_p256_dual/`

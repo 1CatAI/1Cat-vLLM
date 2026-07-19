@@ -103,9 +103,7 @@ def _verifier_row_trace(
         children = tree.child_by_token(node.index)
         parent_index = node.parent_index
         parent_row = None if parent_index is None else int(parent_index)
-        path_token_ids = [
-            int(token) for token in tree.path_token_ids(node.index)
-        ]
+        path_token_ids = [int(token) for token in tree.path_token_ids(node.index)]
         rows.append(
             {
                 "row": int(node.index),
@@ -114,8 +112,7 @@ def _verifier_row_trace(
                 "row_token_id": None if node.index == 0 else int(node.token_id),
                 "path_token_ids": path_token_ids,
                 "child_token_to_row": {
-                    str(int(token)): int(child)
-                    for token, child in children.items()
+                    str(int(token)): int(child) for token, child in children.items()
                 },
             }
         )
@@ -351,8 +348,7 @@ def _padded_int_tensor(
         )
 
     padded_rows = [
-        tuple(row) + (PLACEHOLDER_TOKEN_ID,) * (max_len - len(row))
-        for row in rows
+        tuple(row) + (PLACEHOLDER_TOKEN_ID,) * (max_len - len(row)) for row in rows
     ]
     return torch.tensor(padded_rows, dtype=torch.int32, device=device)
 
@@ -440,7 +436,7 @@ def warmup_ddtree_single_top_token_sampler(
         MAX_ROWS=max_rows,
         BLOCK_SIZE=_next_power_of_2(max_rows),
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return True
 
 
@@ -791,9 +787,7 @@ def stochastic_sample_ddtree_payloads(
         row_start = rows_consumed
         rows_consumed += num_rows
         row_req_indices.extend([req_index] * num_rows)
-        payload_rows.append(
-            (req_id, int(draft_len), row_start, rows_consumed, payload)
-        )
+        payload_rows.append((req_id, int(draft_len), row_start, rows_consumed, payload))
 
     if rows_consumed != compact_logits.shape[0]:
         raise ValueError(
@@ -801,9 +795,7 @@ def stochastic_sample_ddtree_payloads(
             f"got {compact_logits.shape[0]}"
         )
     validate_ms = (
-        (time.perf_counter() - validate_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - validate_t0) * 1000.0 if profile_enabled else 0.0
     )
 
     sample_t0 = time.perf_counter() if profile_enabled else 0.0
@@ -816,19 +808,11 @@ def stochastic_sample_ddtree_payloads(
         top_p=top_p,
         generators=generators,
     )
-    sample_ms = (
-        (time.perf_counter() - sample_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    sample_ms = (time.perf_counter() - sample_t0) * 1000.0 if profile_enabled else 0.0
 
     copy_t0 = time.perf_counter() if profile_enabled else 0.0
     target_tokens = target_tokens_tensor.detach().cpu().tolist()
-    copy_ms = (
-        (time.perf_counter() - copy_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    copy_ms = (time.perf_counter() - copy_t0) * 1000.0 if profile_enabled else 0.0
 
     output_token_rows: list[tuple[int, ...]] = []
     accepted_node_rows: list[tuple[int, ...]] = []
@@ -861,11 +845,7 @@ def stochastic_sample_ddtree_payloads(
         results.append(result)
         output_token_rows.append(result.output_token_ids)
         accepted_node_rows.append(result.accepted_node_indices)
-    verify_ms = (
-        (time.perf_counter() - verify_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    verify_ms = (time.perf_counter() - verify_t0) * 1000.0 if profile_enabled else 0.0
 
     tensor_t0 = time.perf_counter() if profile_enabled else 0.0
     sampled_token_ids = _padded_int_tensor(
@@ -876,11 +856,7 @@ def stochastic_sample_ddtree_payloads(
         accepted_node_rows,
         device=compact_logits.device,
     )
-    tensor_ms = (
-        (time.perf_counter() - tensor_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    tensor_ms = (time.perf_counter() - tensor_t0) * 1000.0 if profile_enabled else 0.0
 
     if profile_enabled:
         logger.info(
@@ -953,9 +929,7 @@ def stochastic_sample_ddtree_payloads_from_topk(
         row_start = rows_consumed
         rows_consumed += num_rows
         row_req_indices.extend([req_index] * num_rows)
-        payload_rows.append(
-            (req_id, int(draft_len), row_start, rows_consumed, payload)
-        )
+        payload_rows.append((req_id, int(draft_len), row_start, rows_consumed, payload))
 
     if rows_consumed != target_topk_logits.shape[0]:
         raise ValueError(
@@ -963,9 +937,7 @@ def stochastic_sample_ddtree_payloads_from_topk(
             f"got {target_topk_logits.shape[0]}"
         )
     validate_ms = (
-        (time.perf_counter() - validate_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - validate_t0) * 1000.0 if profile_enabled else 0.0
     )
 
     sample_t0 = time.perf_counter() if profile_enabled else 0.0
@@ -979,19 +951,11 @@ def stochastic_sample_ddtree_payloads_from_topk(
         top_p=top_p,
         generators=generators,
     )
-    sample_ms = (
-        (time.perf_counter() - sample_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    sample_ms = (time.perf_counter() - sample_t0) * 1000.0 if profile_enabled else 0.0
 
     copy_t0 = time.perf_counter() if profile_enabled else 0.0
     target_tokens = target_tokens_tensor.detach().cpu().tolist()
-    copy_ms = (
-        (time.perf_counter() - copy_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    copy_ms = (time.perf_counter() - copy_t0) * 1000.0 if profile_enabled else 0.0
 
     output_token_rows: list[tuple[int, ...]] = []
     accepted_node_rows: list[tuple[int, ...]] = []
@@ -1018,11 +982,7 @@ def stochastic_sample_ddtree_payloads_from_topk(
         results.append(result)
         output_token_rows.append(result.output_token_ids)
         accepted_node_rows.append(result.accepted_node_indices)
-    verify_ms = (
-        (time.perf_counter() - verify_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    verify_ms = (time.perf_counter() - verify_t0) * 1000.0 if profile_enabled else 0.0
 
     tensor_t0 = time.perf_counter() if profile_enabled else 0.0
     sampled_token_ids = _padded_int_tensor(
@@ -1033,11 +993,7 @@ def stochastic_sample_ddtree_payloads_from_topk(
         accepted_node_rows,
         device=target_topk_logits.device,
     )
-    tensor_ms = (
-        (time.perf_counter() - tensor_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    tensor_ms = (time.perf_counter() - tensor_t0) * 1000.0 if profile_enabled else 0.0
 
     if profile_enabled:
         logger.info(
@@ -1084,11 +1040,7 @@ def greedy_sample_ddtree_payloads_from_top_tokens(
     profile_enabled = _ddtree_worker_profile_enabled()
     profile_t0 = time.perf_counter() if profile_enabled else 0.0
     compact_top_tokens = _compact_top_token_ids_1d(compact_top_tokens)
-    compact_ms = (
-        (time.perf_counter() - profile_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    compact_ms = (time.perf_counter() - profile_t0) * 1000.0 if profile_enabled else 0.0
     if len(req_ids) != len(num_draft_tokens):
         raise ValueError("req_ids and num_draft_tokens length mismatch")
 
@@ -1102,9 +1054,7 @@ def greedy_sample_ddtree_payloads_from_top_tokens(
             return None
         row_start = rows_consumed
         rows_consumed += num_rows
-        payload_rows.append(
-            (req_id, int(draft_len), row_start, rows_consumed, payload)
-        )
+        payload_rows.append((req_id, int(draft_len), row_start, rows_consumed, payload))
 
     if rows_consumed != compact_top_tokens.shape[0]:
         raise ValueError(
@@ -1112,18 +1062,12 @@ def greedy_sample_ddtree_payloads_from_top_tokens(
             f"got {compact_top_tokens.shape[0]}"
         )
     validate_ms = (
-        (time.perf_counter() - validate_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - validate_t0) * 1000.0 if profile_enabled else 0.0
     )
 
     copy_t0 = time.perf_counter() if profile_enabled else 0.0
     target_tokens = compact_top_tokens.detach().cpu().tolist()
-    copy_ms = (
-        (time.perf_counter() - copy_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    copy_ms = (time.perf_counter() - copy_t0) * 1000.0 if profile_enabled else 0.0
 
     output_token_rows: list[tuple[int, ...]] = []
     accepted_node_rows: list[tuple[int, ...]] = []
@@ -1149,11 +1093,7 @@ def greedy_sample_ddtree_payloads_from_top_tokens(
         results.append(result)
         output_token_rows.append(result.output_token_ids)
         accepted_node_rows.append(result.accepted_node_indices)
-    verify_ms = (
-        (time.perf_counter() - verify_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    verify_ms = (time.perf_counter() - verify_t0) * 1000.0 if profile_enabled else 0.0
 
     tensor_t0 = time.perf_counter() if profile_enabled else 0.0
     sampled_token_ids = _padded_int_tensor(
@@ -1164,11 +1104,7 @@ def greedy_sample_ddtree_payloads_from_top_tokens(
         accepted_node_rows,
         device=compact_top_tokens.device,
     )
-    tensor_ms = (
-        (time.perf_counter() - tensor_t0) * 1000.0
-        if profile_enabled
-        else 0.0
-    )
+    tensor_ms = (time.perf_counter() - tensor_t0) * 1000.0 if profile_enabled else 0.0
     if profile_enabled:
         logger.info(
             "DFLASH_DDTREE_WORKER_PROFILE top_token_sampler "
@@ -1328,7 +1264,6 @@ def greedy_sample_ddtree_payloads_from_top_tokens_gpu(
 
         cursor = torch.zeros((), dtype=torch.int32, device=device)
         active = torch.ones((), dtype=torch.bool, device=device)
-        zero = torch.zeros((), dtype=torch.int32, device=device)
         for output_pos in range(max_rows):
             next_token = top_tokens.gather(0, cursor.to(torch.int64).view(1))[0]
             sampled_token_ids[:, output_pos] = torch.where(
@@ -1429,9 +1364,11 @@ def greedy_sample_ddtree_payloads_from_top_tokens_gpu(
             & (parents == cursor.unsqueeze(1))
             & (tree_tokens == next_tokens.unsqueeze(1))
         )
-        child = torch.where(matches, child_rows, torch.zeros_like(child_rows)).max(
-            dim=1
-        ).values
+        child = (
+            torch.where(matches, child_rows, torch.zeros_like(child_rows))
+            .max(dim=1)
+            .values
+        )
         matched = active & (child > 0)
         accepted_node_indices[:, output_pos + 1] = torch.where(
             matched,

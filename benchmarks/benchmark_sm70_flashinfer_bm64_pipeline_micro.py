@@ -7,13 +7,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 K_GROUPS = 72
 K_M = 64
@@ -417,7 +418,10 @@ def _runtime_resource_gate(payload: dict[str, Any]) -> list[str]:
         reasons.append("candidate exceeds 128 registers per thread")
     if candidate.get("static_shared_bytes") != K_CANDIDATE_SHARED_BYTES:
         reasons.append("candidate shared layout is not the specified 43,776B layout")
-    if candidate.get("static_shared_bytes", K_MAX_SHARED_BYTES + 1) > K_MAX_SHARED_BYTES:
+    if (
+        candidate.get("static_shared_bytes", K_MAX_SHARED_BYTES + 1)
+        > K_MAX_SHARED_BYTES
+    ):
         reasons.append("candidate shared memory exceeds 48 KiB")
     if candidate.get("dynamic_shared_bytes") != 0:
         reasons.append("candidate unexpectedly uses dynamic shared memory")
@@ -447,7 +451,9 @@ def _runtime_resource_gate(payload: dict[str, Any]) -> list[str]:
     }
     for key, expected in required_contract.items():
         if contract.get(key) != expected:
-            reasons.append(f"candidate contract {key}={contract.get(key)}, requires {expected}")
+            reasons.append(
+                f"candidate contract {key}={contract.get(key)}, requires {expected}"
+            )
     proof = str(contract.get("bn16_bitwise_incompatibility_proof", ""))
     if "max(N0,N1)" not in proof or "FP32 sum" not in proof:
         reasons.append("candidate does not declare the BN16-to-BN32 proof")
@@ -559,9 +565,7 @@ def _write_payload(payload: dict[str, Any], output: Path | None) -> None:
         output.write_text(text + "\n", encoding="utf-8")
 
 
-def _case_state(
-    args: argparse.Namespace, phase: str
-) -> dict[str, Any]:
+def _case_state(args: argparse.Namespace, phase: str) -> dict[str, Any]:
     return _require_execution_device(args, phase)
 
 
@@ -597,9 +601,7 @@ def main() -> int:
     ptxas_baseline = _ptxas_function_properties(ptxas_log, K_BASELINE_SYMBOL)
     ptxas_candidate = _ptxas_function_properties(ptxas_log, K_CANDIDATE_SYMBOL)
     sass = _inspect_sass(binary)
-    build_reasons = _build_gate(
-        build_command, ptxas_baseline, ptxas_candidate, sass
-    )
+    build_reasons = _build_gate(build_command, ptxas_baseline, ptxas_candidate, sass)
     if build_reasons:
         _write_payload(
             _preflight_payload(
@@ -625,9 +627,7 @@ def main() -> int:
         smoke_cases.append(case)
         gpu_states.extend((before, after))
 
-    smoke_hard_passed = all(
-        case["gates"]["hard_gates_passed"] for case in smoke_cases
-    )
+    smoke_hard_passed = all(case["gates"]["hard_gates_passed"] for case in smoke_cases)
     if args.smoke or not smoke_hard_passed:
         payload = {
             "benchmark": "sm70_flashinfer_bm64_pipeline_micro",
@@ -645,9 +645,7 @@ def main() -> int:
             "sass": sass,
             "runtime": {
                 "physical_gpu": args.physical_gpu,
-                "child_cuda_environment": _child_cuda_configuration(
-                    args.physical_gpu
-                ),
+                "child_cuda_environment": _child_cuda_configuration(args.physical_gpu),
                 "selected_gpu_states": gpu_states,
                 "required_clock_mhz": args.require_clock_mhz,
                 "allow_busy_gpu": args.allow_busy_gpu,

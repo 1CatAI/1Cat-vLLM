@@ -9,9 +9,9 @@ builder can be tested and evolved without changing scheduler semantics.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 import time
+from dataclasses import dataclass
 
 import torch
 
@@ -68,7 +68,7 @@ def payload_from_tree(
     top1_chain_token_ids: tuple[int, ...],
     flat_draft_token_ids: tuple[int, ...],
     budget: int,
-    top_k: int | None,
+    top_k: int,
     chain_seed: bool,
     tree_mode: DDTreeBuildMode = "best_first",
     topk_token_ids_by_depth: tuple[tuple[int, ...], ...] = (),
@@ -208,9 +208,7 @@ def build_ddtree_payloads_from_logits(
     profile_stage_t0 = profile_t0
     float_logits = logits.float()
     float_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
     topk_logits, topk_token_ids = torch.topk(
@@ -219,46 +217,44 @@ def build_ddtree_payloads_from_logits(
         dim=-1,
     )
     topk_launch_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
     log_normalizer = torch.logsumexp(float_logits, dim=-1, keepdim=True)
     logsumexp_launch_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
     topk_logprobs = topk_logits - log_normalizer
     logprob_launch_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
 
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    topk_token_ids_cpu = topk_token_ids.view(
-        batch_size,
-        num_speculative_tokens,
-        effective_top_k,
-    ).detach().cpu()
+    topk_token_ids_cpu = (
+        topk_token_ids.view(
+            batch_size,
+            num_speculative_tokens,
+            effective_top_k,
+        )
+        .detach()
+        .cpu()
+    )
     ids_cpu_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    topk_logprobs_cpu = topk_logprobs.view(
-        batch_size,
-        num_speculative_tokens,
-        effective_top_k,
-    ).detach().cpu()
+    topk_logprobs_cpu = (
+        topk_logprobs.view(
+            batch_size,
+            num_speculative_tokens,
+            effective_top_k,
+        )
+        .detach()
+        .cpu()
+    )
     logprobs_cpu_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
 
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
@@ -392,26 +388,30 @@ def build_ddtree_payloads_from_topk(
     profile_enabled = os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
     profile_t0 = time.perf_counter() if profile_enabled else 0.0
     profile_stage_t0 = profile_t0
-    topk_token_ids_cpu = topk_token_ids.view(
-        batch_size,
-        num_speculative_tokens,
-        effective_top_k,
-    ).detach().cpu()
+    topk_token_ids_cpu = (
+        topk_token_ids.view(
+            batch_size,
+            num_speculative_tokens,
+            effective_top_k,
+        )
+        .detach()
+        .cpu()
+    )
     ids_cpu_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    topk_logprobs_cpu = topk_logprobs.view(
-        batch_size,
-        num_speculative_tokens,
-        effective_top_k,
-    ).detach().cpu()
+    topk_logprobs_cpu = (
+        topk_logprobs.view(
+            batch_size,
+            num_speculative_tokens,
+            effective_top_k,
+        )
+        .detach()
+        .cpu()
+    )
     logprobs_cpu_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0
-        if profile_enabled
-        else 0.0
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
 
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0

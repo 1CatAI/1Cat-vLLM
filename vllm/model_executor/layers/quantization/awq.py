@@ -20,11 +20,11 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from vllm.platforms import current_platform
@@ -472,9 +472,7 @@ class AWQLinearMethod(LinearMethodBase):
         # num_tokens >= threshold
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
         if getattr(layer, "_awq_sm70_prepared", False):
-            out_shape = x.shape[:-1] + (
-                layer._awq_sm70_weight.shape[-1] * pack_factor,
-            )
+            out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * pack_factor,)
             out = torch.empty(
                 (reshaped_x.shape[0], out_shape[-1]),
                 dtype=x.dtype,

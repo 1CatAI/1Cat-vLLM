@@ -3,6 +3,7 @@
 
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -43,7 +44,10 @@ def _ddtree_debug_enabled() -> bool:
 
 def _ddtree_debug_log(message: str, *args: object) -> None:
     if _ddtree_debug_enabled():
-        logger.info("DFlash DDTree proposer debug: " + message, *args)
+        logger.info(
+            "DFlash DDTree proposer debug: %s",
+            message % args if args else message,
+        )
 
 
 def _ddtree_worker_profile_enabled() -> bool:
@@ -168,9 +172,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
             valid_sampled_tokens_count = None
             vocab_size = max(2, self.draft_model_config.get_vocab_size())
-            for num_sampled_tokens in sorted(
-                {1, self.num_speculative_tokens + 1}
-            ):
+            for num_sampled_tokens in sorted({1, self.num_speculative_tokens + 1}):
                 sampled_token_ids = torch.zeros(
                     (batch_size, num_sampled_tokens),
                     dtype=torch.int32,
@@ -199,11 +201,14 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 dtype=torch.int32,
                 device=self.device,
             )
-            query_start_loc = torch.arange(
-                batch_size + 1,
-                dtype=torch.int32,
-                device=self.device,
-            ) * num_sampled_tokens
+            query_start_loc = (
+                torch.arange(
+                    batch_size + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                * num_sampled_tokens
+            )
             token_indices_to_sample = torch.empty_like(next_token_ids)
             num_rejected_tokens_gpu = torch.empty_like(next_token_ids)
             eagle_prepare_inputs_padded_kernel[(batch_size,)](
@@ -218,7 +223,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_query_per_req = num_sampled_tokens
             block_size = max(1, int(self.block_size))
             block_table = torch.zeros(
-                (batch_size, max(1, (self.max_model_len + block_size - 1) // block_size)),
+                (
+                    batch_size,
+                    max(1, (self.max_model_len + block_size - 1) // block_size),
+                ),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -245,9 +253,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             # Cover both chunk-aligned and first-request prompt lengths. The
             # coding smoke prompt has 63 context tokens, which pairs with
             # BLOCK_SIZE=128 and used to trigger an inference-time JIT.
-            for num_context in sorted(
-                {1, self.num_speculative_tokens + 1, 63, 64}
-            ):
+            for num_context in sorted({1, self.num_speculative_tokens + 1, 63, 64}):
                 max_tokens_per_req = num_context + num_query_per_req
                 target_positions = torch.arange(
                     num_context,
@@ -296,7 +302,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
                         BLOCK_SIZE=copy_block_size,
                         HAS_NUM_REJECTED=has_num_rejected,
                     )
-            torch.cuda.synchronize(self.device)
+            torch.accelerator.synchronize(self.device)
         except Exception as err:  # pragma: no cover - best-effort warmup
             logger.warning_once("SM70 DFlash hotpath warmup skipped: %s", err)
             return ()
@@ -334,9 +340,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self._context_slot_mapping_buffers_by_gid = {}
         for idx, gid in enumerate(self._draft_kv_cache_group_ids()):
             if idx == 0:
-                self._query_slot_mapping_buffers_by_gid[gid] = (
-                    self._slot_mapping_buffer
-                )
+                self._query_slot_mapping_buffers_by_gid[gid] = self._slot_mapping_buffer
                 self._context_slot_mapping_buffers_by_gid[gid] = (
                     self._context_slot_mapping_buffer
                 )
@@ -391,13 +395,14 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 sampling_metadata,
                 logits,
                 spec_step_idx=spec_step_idx,
-        )
+            )
 
         self._last_ddtree_payloads = None
         profile_enabled = _ddtree_worker_profile_enabled()
         budget = self.ddtree_budget or self.num_speculative_tokens
         requested_top_k = self.ddtree_top_k or budget
-        topk_payload_fn = getattr(self.model, "get_topk_tokens_and_logprobs", None)
+        model = getattr(self, "model", None)
+        topk_payload_fn = getattr(model, "get_topk_tokens_and_logprobs", None)
         if (
             logits is None
             and sampling_metadata.all_greedy
@@ -406,9 +411,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             topk_t0 = time.perf_counter() if profile_enabled else 0.0
             topk_result = topk_payload_fn(hidden_states, requested_top_k)
             topk_extract_ms = (
-                (time.perf_counter() - topk_t0) * 1000.0
-                if profile_enabled
-                else 0.0
+                (time.perf_counter() - topk_t0) * 1000.0 if profile_enabled else 0.0
             )
             if topk_result is not None:
                 topk_token_ids, topk_logprobs = topk_result
@@ -457,6 +460,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         if logits is None:
             logits = self._compute_logits_for_step(hidden_states, spec_step_idx)
+        if not hasattr(self, "_static_draft_vocab"):
+            self._static_draft_vocab = None
         sample_t0 = time.perf_counter() if profile_enabled else 0.0
         draft_token_ids, draft_probs = super()._sample_draft_tokens(
             hidden_states,
@@ -465,9 +470,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             spec_step_idx=spec_step_idx,
         )
         sample_ms = (
-            (time.perf_counter() - sample_t0) * 1000.0
-            if profile_enabled
-            else 0.0
+            (time.perf_counter() - sample_t0) * 1000.0 if profile_enabled else 0.0
         )
 
         batch_size, remainder = divmod(
@@ -493,9 +496,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             ),
         )
         payload_ms = (
-            (time.perf_counter() - payload_t0) * 1000.0
-            if profile_enabled
-            else 0.0
+            (time.perf_counter() - payload_t0) * 1000.0 if profile_enabled else 0.0
         )
         if profile_enabled:
             logger.info(
@@ -515,8 +516,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         if self._last_ddtree_payloads:
             first_payload = self._last_ddtree_payloads[0]
             _ddtree_debug_log(
-                "built payloads batch=%s flat_len=%s tree_len=%s "
-                "has_extra_nodes=%s",
+                "built payloads batch=%s flat_len=%s tree_len=%s has_extra_nodes=%s",
                 len(self._last_ddtree_payloads),
                 len(first_payload.flat_draft_token_ids),
                 len(first_payload.tree_token_ids),
@@ -560,13 +560,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
             ):
                 self.kv_cache_gid = gid
 
-        attention_groups: dict[tuple[int, str], AttentionGroup] = {}
+        attention_groups: dict[tuple[int, tuple[str, str]], AttentionGroup] = {}
         for layer_name in self._draft_attn_layer_names:
             kv_cache_gid = layer_to_gid[layer_name]
             self.draft_layer_to_kv_cache_gid[layer_name] = kv_cache_gid
-            kv_cache_spec = kv_cache_config.kv_cache_groups[
-                kv_cache_gid
-            ].kv_cache_spec
+            kv_cache_spec = kv_cache_config.kv_cache_groups[kv_cache_gid].kv_cache_spec
             layer_kv_cache_spec = kv_cache_spec
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
@@ -642,7 +640,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
             return
         self.input_ids[num_query_tokens:num_input_tokens].zero_()
         self.positions[num_query_tokens:num_input_tokens].zero_()
-        buffers = self._query_slot_mapping_buffers_by_gid.values()
+        buffers: Iterable[torch.Tensor] = (
+            self._query_slot_mapping_buffers_by_gid.values()
+        )
         if not self._query_slot_mapping_buffers_by_gid:
             buffers = [self._slot_mapping_buffer]
         for buffer in buffers:
@@ -680,9 +680,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 "context_positions": self._context_positions_buffer[:num_context]
                 .detach()
                 .cpu(),
-                "context_slot_mapping": self._context_slot_mapping_buffer[
-                    :num_context
-                ]
+                "context_slot_mapping": self._context_slot_mapping_buffer[:num_context]
                 .detach()
                 .cpu(),
                 "query_positions": self.positions[:num_query_total].detach().cpu(),
@@ -769,9 +767,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         new_cad_by_gid: dict[int, CommonAttentionMetadata] = {}
         for gid in self._draft_kv_cache_group_ids():
             group_cad = common_metadata_by_gid.get(gid, cad)
-            context_slot_mapping_buffer = self._context_slot_mapping_buffer_for_gid(
-                gid
-            )
+            context_slot_mapping_buffer = self._context_slot_mapping_buffer_for_gid(gid)
             query_slot_mapping_buffer = self._query_slot_mapping_buffer_for_gid(gid)
             block_size = self._dflash_block_size_by_gid.get(gid, self.block_size)
             copy_and_expand_dflash_inputs_kernel[grid](
@@ -880,10 +876,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_input_tokens,
             num_tokens_across_dp,
             batch_descriptor,
-        ) = (
-            self._determine_batch_execution_and_padding(
-                num_query_tokens, use_cudagraphs=use_cudagraphs
-            )
+        ) = self._determine_batch_execution_and_padding(
+            num_query_tokens, use_cudagraphs=use_cudagraphs
         )
 
         # Slot mapping sized to num_input_tokens (query only), matching
@@ -943,11 +937,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_query_tokens=num_query_tokens,
             num_input_tokens=num_input_tokens,
         )
-        pad_ms = (
-            (time.perf_counter() - profile_t0) * 1000.0
-            if profile_enabled
-            else 0.0
-        )
+        pad_ms = (time.perf_counter() - profile_t0) * 1000.0 if profile_enabled else 0.0
         if envs.VLLM_DFLASH_PROFILE:
             self._profile_padded_query_tokens += num_input_tokens
             rounds = self._profile_rounds
@@ -979,16 +969,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
             self._context_positions_buffer[:num_context],
             {
-                layer_name: self._context_slot_mapping_buffer_for_gid(gid)[
-                    :num_context
-                ]
+                layer_name: self._context_slot_mapping_buffer_for_gid(gid)[:num_context]
                 for layer_name, gid in self.draft_layer_to_kv_cache_gid.items()
             },
         )
         precompute_ms = (
-            (time.perf_counter() - profile_t0) * 1000.0
-            if profile_enabled
-            else 0.0
+            (time.perf_counter() - profile_t0) * 1000.0 if profile_enabled else 0.0
         )
         if profile_enabled:
             logger.info(

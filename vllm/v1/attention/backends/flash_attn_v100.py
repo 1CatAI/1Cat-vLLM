@@ -11,11 +11,13 @@ plus Flash-decode runs do not count as the final SM70 FlashAttention route.
 from __future__ import annotations
 
 import atexit
-from collections.abc import Callable
 import inspect
 import json
 import os
 import time
+from collections.abc import Callable
+from functools import partial
+from typing import cast
 
 import torch
 
@@ -30,6 +32,40 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 
 logger = init_logger(__name__)
+
+
+class FlashAttnV100Metadata(TritonAttentionMetadata):
+    """Static view of Flash-V100 fields attached to Triton metadata."""
+
+    query_start_loc_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    causal: bool
+    max_model_len: int
+    flash_v100_cudagraph_capture: bool
+    flash_v100_contig_dense_cache: dict[tuple[int, int, int, int, int], int]
+    flash_v100_decode_max_seq_len_hint: int | None
+    flash_v100_decode_workspace_seq_capacity_hint: int | None
+    flash_v100_static_decode_seq_hint: int | None
+    flash_v100_decode_active_num_partitions: torch.Tensor | None
+    ddtree_parent_ids: torch.Tensor | None
+    ddtree_parent_ids_cpu: torch.Tensor | None
+    ddtree_num_tree_tokens_cpu: torch.Tensor | None
+    ddtree_seq_lens_restored_for_triton: bool
+    ddtree_query_start_loc_restored_for_triton: bool
+    smallq_decode_block_table: torch.Tensor | None
+    smallq_decode_seq_lens: torch.Tensor | None
+    smallq_query_start_loc: torch.Tensor | None
+    smallq_decode_max_seq_len_hint: int | None
+    smallq_decode_workspace_seq_capacity_hint: int | None
+    smallq_decode_partition_size_hint: int | None
+
+
+def _as_flash_v100_metadata(
+    attn_metadata: TritonAttentionMetadata,
+) -> FlashAttnV100Metadata:
+    # The inherited Triton builder creates the object; this backend attaches
+    # the fields above before any Flash-V100 path consumes them.
+    return cast(FlashAttnV100Metadata, attn_metadata)
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:
@@ -64,6 +100,7 @@ _logged_prefill_prefix_bfla = False
 _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
+_logged_prefill_smallq_decode_xqa = False
 _logged_prefill_triton_safe = False
 _logged_decode_flash = False
 _logged_decode_dense_reference = False
@@ -243,6 +280,25 @@ def _mtp_context_bucket_partition_size_hint() -> int | None:
     if value not in _VALID_DECODE_PARTITION_SIZES:
         raise ValueError(
             "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
+            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
+        )
+    return value
+
+
+def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
+    if os.getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
+        return None
+    raw = os.getenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
+            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
+        ) from exc
+    if value not in _VALID_DECODE_PARTITION_SIZES:
+        raise ValueError(
+            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
             f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
         )
     return value
@@ -570,6 +626,8 @@ def _log_fp8_kv_cache_route(stage: str, kv_cache_dtype: str, route: str) -> None
 
 
 def _callable_accepts_keyword(fn: object, name: str) -> bool:
+    if not callable(fn):
+        return False
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
@@ -677,7 +735,7 @@ def _get_fp8_prefill_bridge_workspace(
     device_index = (
         key_cache.device.index
         if key_cache.device.index is not None
-        else torch.cuda.current_device()
+        else torch.accelerator.current_device_index()
     )
     stream_id = int(torch.cuda.current_stream(key_cache.device).cuda_stream)
     cache_key = (
@@ -1075,7 +1133,9 @@ def _contiguous_paged_start_block(
     contig_cache = getattr(attn_metadata, "flash_v100_contig_dense_cache", None)
     if contig_cache is None:
         contig_cache = {}
-        attn_metadata.flash_v100_contig_dense_cache = contig_cache
+        _as_flash_v100_metadata(
+            attn_metadata
+        ).flash_v100_contig_dense_cache = contig_cache
 
     start_block = contig_cache.get(cache_key)
     if start_block is None:
@@ -1450,7 +1510,7 @@ def _ddtree_parent_ids_cpu(
     parent_ids_cpu = getattr(attn_metadata, "ddtree_parent_ids_cpu", None)
     if parent_ids_cpu is None:
         parent_ids_cpu = parent_ids.detach().cpu()
-        attn_metadata.ddtree_parent_ids_cpu = parent_ids_cpu
+        _as_flash_v100_metadata(attn_metadata).ddtree_parent_ids_cpu = parent_ids_cpu
     return parent_ids_cpu
 
 
@@ -1651,7 +1711,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._draft_block_table: torch.Tensor | None = None
         self._draft_seq_lens: torch.Tensor | None = None
         self._draft_query_start_loc: torch.Tensor | None = None
-        self._draft_buffer_shape: tuple[int, int] | None = None
+        self._flash_draft_buffer_shape: tuple[int, int] | None = None
         self._smallq_decode_block_table: torch.Tensor | None = None
         self._smallq_decode_seq_lens: torch.Tensor | None = None
         self._smallq_query_start_loc: torch.Tensor | None = None
@@ -1664,7 +1724,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata: TritonAttentionMetadata,
         common_attn_metadata,
     ) -> None:
-        attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
         if seq_lens_cpu is None:
             # Async speculative decode keeps device seq_lens authoritative and
@@ -1677,14 +1738,14 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 "seq_lens_cpu_upper_bound",
                 None,
             )
-        attn_metadata.seq_lens_cpu = (
+        flash_metadata.seq_lens_cpu = (
             seq_lens_cpu
             if seq_lens_cpu is not None
             else common_attn_metadata.seq_lens_cpu
         )
-        attn_metadata.causal = common_attn_metadata.causal
-        attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
-        attn_metadata.flash_v100_cudagraph_capture = False
+        flash_metadata.causal = common_attn_metadata.causal
+        flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
+        flash_metadata.flash_v100_cudagraph_capture = False
 
     def _attach_ddtree_metadata(
         self,
@@ -1693,11 +1754,12 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         ddtree_parent_ids: torch.Tensor | None,
         ddtree_num_tree_tokens_cpu: torch.Tensor | None,
     ) -> None:
-        attn_metadata.ddtree_parent_ids = None
-        attn_metadata.ddtree_parent_ids_cpu = None
-        attn_metadata.ddtree_num_tree_tokens_cpu = None
-        attn_metadata.ddtree_seq_lens_restored_for_triton = False
-        attn_metadata.ddtree_query_start_loc_restored_for_triton = False
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.ddtree_parent_ids = None
+        flash_metadata.ddtree_parent_ids_cpu = None
+        flash_metadata.ddtree_num_tree_tokens_cpu = None
+        flash_metadata.ddtree_seq_lens_restored_for_triton = False
+        flash_metadata.ddtree_query_start_loc_restored_for_triton = False
         if ddtree_parent_ids is None:
             return
         if ddtree_num_tree_tokens_cpu is None:
@@ -1708,7 +1770,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             raise ValueError("ddtree_parent_ids must have shape [batch, slots]")
         if ddtree_num_tree_tokens_cpu.ndim != 1:
             raise ValueError("ddtree_num_tree_tokens_cpu must be a 1D tensor")
-        num_reqs = int(getattr(attn_metadata, "query_start_loc").numel() - 1)
+        num_reqs = int(attn_metadata.query_start_loc.numel() - 1)
         if ddtree_parent_ids.shape[0] < num_reqs:
             raise ValueError(
                 "ddtree_parent_ids must cover active requests: "
@@ -1719,8 +1781,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 "ddtree_num_tree_tokens_cpu must cover active requests: "
                 f"{ddtree_num_tree_tokens_cpu.numel()} < {num_reqs}"
             )
-        attn_metadata.ddtree_parent_ids = ddtree_parent_ids
-        attn_metadata.ddtree_num_tree_tokens_cpu = ddtree_num_tree_tokens_cpu
+        flash_metadata.ddtree_parent_ids = ddtree_parent_ids
+        flash_metadata.ddtree_num_tree_tokens_cpu = ddtree_num_tree_tokens_cpu
         if bool(torch.any(ddtree_num_tree_tokens_cpu[:num_reqs] > 0).item()):
             seq_lens = getattr(attn_metadata, "seq_lens", None)
             seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
@@ -1733,7 +1795,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                         ),
                         non_blocking=True,
                     )
-                attn_metadata.ddtree_seq_lens_restored_for_triton = True
+                flash_metadata.ddtree_seq_lens_restored_for_triton = True
             query_start_loc = getattr(attn_metadata, "query_start_loc", None)
             query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
             if query_start_loc is not None and query_start_loc_cpu is not None:
@@ -1746,7 +1808,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                         ),
                         non_blocking=True,
                     )
-                attn_metadata.ddtree_query_start_loc_restored_for_triton = True
+                flash_metadata.ddtree_query_start_loc_restored_for_triton = True
 
     def _attach_decode_shape_hints(
         self,
@@ -1755,9 +1817,10 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         *,
         static_decode: bool = False,
     ) -> None:
-        attn_metadata.flash_v100_decode_max_seq_len_hint = None
-        attn_metadata.flash_v100_decode_workspace_seq_capacity_hint = None
-        attn_metadata.flash_v100_static_decode_seq_hint = None
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.flash_v100_decode_max_seq_len_hint = None
+        flash_metadata.flash_v100_decode_workspace_seq_capacity_hint = None
+        flash_metadata.flash_v100_static_decode_seq_hint = None
 
         max_query_len = int(getattr(common_attn_metadata, "max_query_len", 0) or 0)
         if max_query_len != 1:
@@ -1771,7 +1834,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         if max_seq_len_hint <= 0:
             return
 
-        attn_metadata.flash_v100_decode_max_seq_len_hint = max_seq_len_hint
+        flash_metadata.flash_v100_decode_max_seq_len_hint = max_seq_len_hint
         if not static_decode:
             return
 
@@ -1792,8 +1855,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             raw_seq_capacity > max_seq_len_hint
             or workspace_seq_capacity > max_seq_len_hint
         ):
-            attn_metadata.flash_v100_static_decode_seq_hint = workspace_seq_capacity
-        attn_metadata.flash_v100_decode_workspace_seq_capacity_hint = (
+            flash_metadata.flash_v100_static_decode_seq_hint = workspace_seq_capacity
+        flash_metadata.flash_v100_decode_workspace_seq_capacity_hint = (
             workspace_seq_capacity
         )
 
@@ -1812,7 +1875,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         *,
         stage: str,
     ) -> None:
-        attn_metadata.flash_v100_decode_active_num_partitions = None
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.flash_v100_decode_active_num_partitions = None
         if not _decode_dynamic_partitions_enabled():
             return
 
@@ -1839,7 +1903,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         active = max(1, (int(max_seq_len_hint) + partition_size - 1) // partition_size)
         active_num_partitions = self._ensure_decode_active_num_partitions()
         active_num_partitions.fill_(active)
-        attn_metadata.flash_v100_decode_active_num_partitions = active_num_partitions
+        flash_metadata.flash_v100_decode_active_num_partitions = active_num_partitions
         _trace_decode_active_metadata(
             stage=stage,
             max_seq_len_hint=int(max_seq_len_hint),
@@ -1902,7 +1966,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             ),
         )
 
-    def _ensure_draft_graph_buffers(
+    def _ensure_flash_draft_graph_buffers(
         self,
         required_reqs: int,
         block_table: torch.Tensor,
@@ -1914,14 +1978,12 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         block_cols = int(block_table.shape[1])
         shape = (req_capacity, block_cols)
-        if self._draft_buffer_shape == shape:
+        if self._flash_draft_buffer_shape == shape:
             return True
 
-        if self._draft_buffer_shape is not None:
-            old_reqs, old_block_cols = self._draft_buffer_shape
-            if required_reqs <= old_reqs and block_cols == old_block_cols:
-                return True
-            return False
+        if self._flash_draft_buffer_shape is not None:
+            old_reqs, old_block_cols = self._flash_draft_buffer_shape
+            return required_reqs <= old_reqs and block_cols == old_block_cols
 
         self._draft_block_table = torch.empty(
             (req_capacity, block_cols),
@@ -1938,7 +2000,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        self._draft_buffer_shape = shape
+        self._flash_draft_buffer_shape = shape
         return True
 
     def _stabilize_draft_graph_metadata(
@@ -1951,9 +2013,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             return
 
         block_table = attn_metadata.block_table[:num_reqs]
-        if not self._ensure_draft_graph_buffers(num_reqs, block_table):
-            assert self._draft_buffer_shape is not None
-            req_capacity, block_cols = self._draft_buffer_shape
+        if not self._ensure_flash_draft_graph_buffers(num_reqs, block_table):
+            assert self._flash_draft_buffer_shape is not None
+            req_capacity, block_cols = self._flash_draft_buffer_shape
             raise RuntimeError(
                 "FLASH_ATTN_V100 draft CUDA graph metadata shape exceeds "
                 "the captured persistent buffer capacity: "
@@ -2032,13 +2094,11 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
         if self._smallq_buffer_shape is not None:
             old_tokens, old_reqs, old_block_cols = self._smallq_buffer_shape
-            if (
+            return (
                 required_tokens <= old_tokens
                 and required_reqs <= old_reqs
                 and block_cols == old_block_cols
-            ):
-                return True
-            return False
+            )
 
         self._smallq_decode_block_table = torch.empty(
             (token_capacity, block_cols),
@@ -2067,12 +2127,13 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self,
         attn_metadata: TritonAttentionMetadata,
     ) -> None:
-        attn_metadata.smallq_decode_block_table = None
-        attn_metadata.smallq_decode_seq_lens = None
-        attn_metadata.smallq_query_start_loc = None
-        attn_metadata.smallq_decode_max_seq_len_hint = None
-        attn_metadata.smallq_decode_workspace_seq_capacity_hint = None
-        attn_metadata.smallq_decode_partition_size_hint = None
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.smallq_decode_block_table = None
+        flash_metadata.smallq_decode_seq_lens = None
+        flash_metadata.smallq_query_start_loc = None
+        flash_metadata.smallq_decode_max_seq_len_hint = None
+        flash_metadata.smallq_decode_workspace_seq_capacity_hint = None
+        flash_metadata.smallq_decode_partition_size_hint = None
 
     def _update_smallq_decode_metadata(
         self,
@@ -2083,6 +2144,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         workspace_seq_capacity_cap: int | None = None,
         partition_size_hint: int | None = None,
     ) -> None:
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
         profile_enabled = _dflash_ddtree_worker_profile_enabled()
         profile_t0 = time.perf_counter() if profile_enabled else 0.0
         profile_stage_t0 = profile_t0
@@ -2258,13 +2320,13 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
 
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        attn_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
+        flash_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
             :num_query_tokens
         ]
-        attn_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[
+        flash_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[
             :num_query_tokens
         ]
-        attn_metadata.smallq_query_start_loc = self._smallq_query_start_loc[
+        flash_metadata.smallq_query_start_loc = self._smallq_query_start_loc[
             : num_reqs + 1
         ]
         raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
@@ -2275,7 +2337,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             # the actual compute is paged decode over each tiny query row.
             # Keep graph replay capacity fixed while letting kernels skip
             # inactive partitions for the current runtime sequence length.
-            attn_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
+            flash_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
             if workspace_seq_capacity_cap is not None:
                 # A distinct CUDA graph key guarantees replay only below this
                 # bound. The block table remains full-width so runtime KV
@@ -2285,8 +2347,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                     raw_seq_capacity,
                     max(max_seq_len_hint, int(workspace_seq_capacity_cap)),
                 )
-            attn_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
-            attn_metadata.smallq_decode_partition_size_hint = partition_size_hint
+            flash_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
+            flash_metadata.smallq_decode_partition_size_hint = partition_size_hint
         hint_ms = (
             (time.perf_counter() - profile_stage_t0) * 1000.0
             if profile_enabled
@@ -2332,15 +2394,15 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 _format_tensor_debug(attn_metadata.seq_lens, "attn_seq"),
                 _format_tensor_debug(attn_metadata.block_table, "attn_bt"),
                 _format_tensor_debug(
-                    attn_metadata.smallq_decode_block_table,
+                    flash_metadata.smallq_decode_block_table,
                     "smallq_bt",
                 ),
                 _format_tensor_debug(
-                    attn_metadata.smallq_decode_seq_lens,
+                    flash_metadata.smallq_decode_seq_lens,
                     "smallq_seq",
                 ),
                 _format_tensor_debug(
-                    attn_metadata.smallq_query_start_loc,
+                    flash_metadata.smallq_query_start_loc,
                     "smallq_qsl",
                 ),
             )
@@ -2354,7 +2416,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
-        attn_metadata.seq_lens_cpu = capture_seq_lens_cpu
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata.seq_lens_cpu = capture_seq_lens_cpu
 
         # The Triton builder shortens capture seq_lens to 1 so full graph
         # capture stays cheap. That is valid for single-token decode, but the
@@ -2402,7 +2465,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             common_attn_metadata,
             static_decode=True,
         )
-        attn_metadata.flash_v100_cudagraph_capture = True
+        flash_metadata.flash_v100_cudagraph_capture = True
         self._update_decode_active_num_partitions(attn_metadata, stage="capture")
 
         return attn_metadata
@@ -2433,7 +2496,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         if (
             getattr(attn_metadata, "max_query_len", 1) == 1
-            and self._draft_buffer_shape is not None
+            and self._flash_draft_buffer_shape is not None
         ):
             # FULL graph capture binds q=1 decode to these persistent buffers.
             # Refresh them on every runtime decode step so replay sees the
@@ -2652,6 +2715,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             os.getenv("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0") == "1"
         )
         self.use_decode_xqa = os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1") == "1"
+        self.use_smallq_decode_xqa = (
+            self.use_decode_xqa
+            and os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
+        )
         decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
         self.compare_bhmd_out_dir = os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
@@ -2868,6 +2935,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         mode: str,
         extra: dict[str, object],
     ) -> None:
+        assert self.compare_bhmd_out_dir is not None
         diff = candidate_bmhd - reference_bmhd
         report = {
             "call_idx": call_idx,
@@ -2898,6 +2966,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         stage: str,
         extra: dict[str, object],
     ) -> None:
+        assert self.compare_triton_out_dir is not None
         diff = candidate.float() - reference.float()
         abs_diff = diff.abs()
         report = {
@@ -3156,7 +3225,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if query.is_cuda:
             # Diagnostic-only: the Triton reference path may update KV cache
             # asynchronously before this hook extracts raw-vs-cache tensors.
-            torch.cuda.synchronize(query.device)
+            torch.accelerator.synchronize(query.device)
         num_actual_tokens = int(attn_metadata.num_actual_tokens)
         extra = {
             "num_actual_tokens": num_actual_tokens,
@@ -3280,6 +3349,153 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             **kwargs,
         )
 
+    def _smallq_decode_xqa_allowed(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        window_size: tuple[int, int],
+        max_seq_len_hint: int | None,
+        workspace_seq_capacity_hint: int | None,
+        partition_size_hint: int | None,
+    ) -> bool:
+        if (
+            not self.use_smallq_decode_xqa
+            or self.flash_attn_decode_paged_xqa is None
+            or partition_size_hint is not None
+            or window_size != (-1, -1)
+            or query.shape[0] != seq_lens.shape[0]
+            or query.shape[2] != 256
+            or key_cache.shape[2] <= 0
+            or query.shape[1] % key_cache.shape[2] != 0
+        ):
+            return False
+
+        q_per_kv = query.shape[1] // key_cache.shape[2]
+        if q_per_kv not in (6, 8):
+            return False
+
+        fp16_kv = (
+            self.kv_cache_dtype in ("auto", "bfloat16")
+            and key_cache.dtype == torch.float16
+            and value_cache.dtype == torch.float16
+        )
+        fp8_e5m2_kv = (
+            self.kv_cache_dtype == "fp8_e5m2"
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+        )
+        if not (fp16_kv or fp8_e5m2_kv):
+            return False
+
+        graph_capture = bool(
+            getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
+        ) or _is_cuda_graph_capturing(query)
+        effective_seq_hint = max(
+            int(max_seq_len_hint or 0),
+            int(workspace_seq_capacity_hint or 0) if graph_capture else 0,
+        )
+        min_seq_len = int(
+            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN", "4096")
+        )
+        if fp8_e5m2_kv:
+            min_seq_len = max(min_seq_len, _decode_fp8_xqa_min_seq_len())
+        return effective_seq_hint >= max(1, min_seq_len)
+
+    def _call_flash_attn_smallq_decode_paged(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+        max_seq_len_hint: int | None,
+        workspace_seq_capacity_hint: int | None,
+        partition_size_hint: int | None,
+    ) -> None:
+        global _logged_prefill_smallq_decode_xqa
+        window_size = self._flash_v100_window_size(causal=True)
+        if self._smallq_decode_xqa_allowed(
+            query,
+            key_cache,
+            value_cache,
+            seq_lens,
+            attn_metadata,
+            window_size=window_size,
+            max_seq_len_hint=max_seq_len_hint,
+            workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+            partition_size_hint=partition_size_hint,
+        ):
+            verifier_partition_size_hint = (
+                _mtp5_xqa_dual_cta_partition_size_hint()
+                if (
+                    query.shape[0] == 5
+                    and query.shape[2] == 256
+                    and key_cache.shape[1] == 1616
+                    and key_cache.shape[2] > 0
+                    and query.shape[1] == 6 * key_cache.shape[2]
+                    and self.kv_cache_dtype == "fp8_e5m2"
+                    and key_cache.dtype == torch.uint8
+                    and value_cache.dtype == torch.uint8
+                )
+                else None
+            )
+            if not _logged_prefill_smallq_decode_xqa:
+                logger.info(
+                    "FLASH_ATTN_V100 MTP verifier XQA path active "
+                    "(rows=%d, q_per_kv=%d, partition_hint=%s, "
+                    "mtp5_dual_cta=%s).",
+                    int(query.shape[0]),
+                    int(query.shape[1] // key_cache.shape[2]),
+                    verifier_partition_size_hint,
+                    verifier_partition_size_hint is not None,
+                )
+                _logged_prefill_smallq_decode_xqa = True
+            _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "xqa_paged")
+            self.flash_attn_decode_paged_xqa(
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                softmax_scale=self.scale,
+                out=out,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                window_size=window_size,
+                max_seq_len_hint=max_seq_len_hint,
+                workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+                partition_size_hint=verifier_partition_size_hint,
+            )
+            _record_route("prefill_smallq_decode_xqa")
+            return
+
+        self._call_flash_attn_decode_paged(
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=self.scale,
+            out=out,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
+            window_size=window_size,
+            max_seq_len_hint=max_seq_len_hint,
+            workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+            partition_size_hint=partition_size_hint,
+        )
+        _record_route("prefill_smallq_decode_scalar")
+
     def _small_query_decode_enabled(
         self,
         attn_metadata: TritonAttentionMetadata,
@@ -3381,6 +3597,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output_block_scale,
             )
 
+        assert output is not None
         is_prefill = attn_metadata.max_query_len > 1
         is_capturing = _is_cuda_graph_capturing(query)
         layer_name = self._layer_debug_info(layer).get("layer_name")
@@ -4029,6 +4246,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         causal=True,
                     )
                     if safe_bmhd is not None:
+                        assert compare_call_idx is not None
                         self._write_bhmd_compare_report(
                             out_batch_view,
                             safe_bmhd,
@@ -4346,10 +4564,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
             and (
                 self.kv_cache_dtype != "fp8_e5m2"
-                or (
-                    q_per_kv != 4
-                    and _decode_fp8_xqa_allowed(attn_metadata, query)
-                )
+                or (q_per_kv != 4 and _decode_fp8_xqa_allowed(attn_metadata, query))
             )
             and window_size == (-1, -1)
         ):
@@ -4730,7 +4945,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if profile_start is not None and profile_end is not None:
             profile_end.record()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             logger.info(
                 "FLASH_ATTN_V100 prefill chunk profile: route=%s layer=%s "
                 "elapsed_ms=%.3f query_tokens=%d tree_tokens=%d max_seq_len=%d "
@@ -4822,18 +5037,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     ),
                     _format_tensor_debug(persistent_query_start_loc, "smallq_qsl"),
                 )
-            self._call_flash_attn_decode_paged(
+            self._call_flash_attn_smallq_decode_paged(
+                layer,
                 query,
                 key_cache,
                 value_cache,
                 persistent_decode_block_table[:num_query_tokens],
                 persistent_decode_seq_lens[:num_query_tokens],
-                softmax_scale=self.scale,
+                attn_metadata,
                 out=out_view,
-                kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
-                window_size=self._flash_v100_window_size(causal=True),
                 max_seq_len_hint=getattr(
                     attn_metadata,
                     "smallq_decode_max_seq_len_hint",
@@ -4936,24 +5148,22 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             torch.zeros_like(decode_block_table),
             decode_block_table,
         ).contiguous()
-        self._call_flash_attn_decode_paged(
+        self._call_flash_attn_smallq_decode_paged(
+            layer,
             query,
             key_cache,
             value_cache,
             decode_block_table,
             decode_seq_lens,
-            softmax_scale=self.scale,
+            attn_metadata,
             out=out_view,
-            kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
-            window_size=self._flash_v100_window_size(causal=True),
             max_seq_len_hint=(int(seq_lens.max().item()) if num_seqs > 0 else None),
             workspace_seq_capacity_hint=(
                 int(block_table.shape[1]) * int(key_cache.shape[1])
                 if num_seqs > 0
                 else None
             ),
+            partition_size_hint=None,
         )
         return output
 
@@ -5126,7 +5336,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         start_event.record()
         out = fn()
         end_event.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         logger.info(
             "FLASH_ATTN_V100 prefill chunk profile: route=%s q_len=%d "
             "seq_len=%d heads_q=%d heads_kv=%d head_dim=%d block_size=%d "
@@ -5340,7 +5550,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         heads_kv=num_kv_heads,
                         head_dim=head_dim,
                         block_size=block_size,
-                        fn=lambda: self.flash_attn_prefill_paged_bfla(
+                        fn=partial(
+                            self.flash_attn_prefill_paged_bfla,
                             q_seq,
                             key_cache,
                             value_cache,
@@ -5377,7 +5588,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         heads_kv=num_kv_heads,
                         head_dim=head_dim,
                         block_size=block_size,
-                        fn=lambda: self.flash_attn_bhmd_func(
+                        fn=lambda q_bhmd=q_bhmd,  # type: ignore[misc]
+                        k_bhmd=k_bhmd,
+                        v_bhmd=v_bhmd: self.flash_attn_bhmd_func(
                             q_bhmd,
                             k_bhmd,
                             v_bhmd,
@@ -5407,7 +5620,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         heads_kv=num_kv_heads,
                         head_dim=head_dim,
                         block_size=block_size,
-                        fn=lambda: self.flash_attn_func(
+                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                        k_dense=k_dense,
+                        v_dense=v_dense: self.flash_attn_func(
                             q_seq,
                             k_dense,
                             v_dense,
@@ -5472,7 +5687,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         heads_kv=num_kv_heads,
                         head_dim=head_dim,
                         block_size=block_size,
-                        fn=lambda: self.flash_attn_prefill_paged_splitkv(
+                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                        i=i,
+                        seq_len=seq_len: self.flash_attn_prefill_paged_splitkv(
                             q_seq,
                             key_cache,
                             value_cache,
@@ -5497,7 +5714,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         heads_kv=num_kv_heads,
                         head_dim=head_dim,
                         block_size=block_size,
-                        fn=lambda: self.flash_attn_prefill_paged(
+                        fn=lambda q_seq=q_seq, i=i: self.flash_attn_prefill_paged(  # type: ignore[misc]
                             q_seq,
                             key_cache,
                             value_cache,

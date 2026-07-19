@@ -11,8 +11,8 @@ import torch.fx as fx
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
-import vllm.ir.ops
 import vllm.envs as envs
+import vllm.ir.ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.passes.fusion.rms_quant_fusion import (
     _rms_input_weight_dtype_match,
@@ -880,9 +880,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             and current_platform.is_device_capability(70)
         )
         self.sm70_tp2_mode = (
-            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
-            and self.tp_size == 2
-            and sm70_common
+            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION and self.tp_size == 2 and sm70_common
         )
         self.sm70_mode = self.sm70_tp2_mode
         if self.sm70_mode:

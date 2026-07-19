@@ -7,8 +7,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -27,7 +28,7 @@ from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 def _bench_ms(fn: Callable[[], Any], warmup: int, repeat: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -67,14 +68,12 @@ def main() -> None:
         raise ValueError("SM70 FlashQLA path currently requires dim=128")
 
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     dtype = torch.float16
     torch.manual_seed(1234)
     scale = args.dim**-0.5
 
-    q = torch.randn(
-        1, args.tokens, args.q_heads, args.dim, device=device, dtype=dtype
-    )
+    q = torch.randn(1, args.tokens, args.q_heads, args.dim, device=device, dtype=dtype)
     k = torch.randn_like(q)
     q = torch.nn.functional.normalize(q.float(), p=2, dim=-1).to(dtype).contiguous()
     k = torch.nn.functional.normalize(k.float(), p=2, dim=-1).to(dtype).contiguous()
@@ -226,12 +225,10 @@ def main() -> None:
     qla_out, qla_state = qla_call()
     qla_direct_out_result, qla_direct_state = qla_direct_out_call()
     qla_exp_out, qla_exp_state = qla_exp_gate_call()
-    qla_exp_direct_out_result, qla_exp_direct_state = (
-        qla_exp_gate_direct_out_call()
-    )
+    qla_exp_direct_out_result, qla_exp_direct_state = qla_exp_gate_direct_out_call()
     qla_exp_copy_out, qla_exp_copy_state = qla_exp_gate_copy_to_core_call()
     fla_core_out_result, fla_core_state = fla_core_out_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     result = {
         "shape": {
@@ -249,9 +246,7 @@ def main() -> None:
             "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": os.environ.get(
                 "VLLM_SM70_GDN_CHUNK_O_SCHEDULE"
             ),
-            "VLLM_SM70_GDN_KKT_SCHEDULE": os.environ.get(
-                "VLLM_SM70_GDN_KKT_SCHEDULE"
-            ),
+            "VLLM_SM70_GDN_KKT_SCHEDULE": os.environ.get("VLLM_SM70_GDN_KKT_SCHEDULE"),
             "VLLM_SM70_GDN_DELTA_H_SCHEDULE": os.environ.get(
                 "VLLM_SM70_GDN_DELTA_H_SCHEDULE"
             ),
@@ -295,12 +290,8 @@ def main() -> None:
             "flashqla_direct_state": _diff(fla_state, qla_direct_state),
             "flashqla_exp_gate_out": _diff(fla_out, qla_exp_out),
             "flashqla_exp_gate_state": _diff(fla_state, qla_exp_state),
-            "flashqla_exp_gate_direct_out": _diff(
-                fla_out, qla_exp_direct_out_result
-            ),
-            "flashqla_exp_gate_direct_state": _diff(
-                fla_state, qla_exp_direct_state
-            ),
+            "flashqla_exp_gate_direct_out": _diff(fla_out, qla_exp_direct_out_result),
+            "flashqla_exp_gate_direct_state": _diff(fla_state, qla_exp_direct_state),
             "flashqla_exp_gate_copy_out": _diff(fla_out, qla_exp_copy_out),
             "flashqla_exp_gate_copy_state": _diff(fla_state, qla_exp_copy_state),
             "fla_core_out": _diff(fla_out, fla_core_out_result),

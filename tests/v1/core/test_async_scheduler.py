@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import deque
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
@@ -62,6 +64,43 @@ def test_stop_by_max_tokens(max_tokens: int):
     assert req1.num_output_tokens == max_tokens
     # Ensure we aren't scheduling more tokens than necessary.
     assert total_num_scheduled_tokens == expected_total_num_scheduled_tokens
+
+
+@pytest.mark.parametrize(
+    ("num_computed_tokens", "expected_num_spec_tokens"),
+    [(28, 4), (29, 0)],
+)
+def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    num_computed_tokens: int,
+    expected_num_spec_tokens: int,
+):
+    num_speculative_tokens = 4
+    scheduler = object.__new__(AsyncScheduler)
+    scheduler.num_spec_tokens = num_speculative_tokens
+    scheduler._spec_token_placeholders = (-1,) * num_speculative_tokens
+    scheduler._drafter_max_model_len = 32
+    request = SimpleNamespace(
+        is_prefill_chunk=False,
+        use_structured_output=False,
+        num_output_placeholders=0,
+        num_computed_tokens=num_computed_tokens,
+        spec_token_ids=[],
+    )
+    scheduler.requests = {"r0": request}
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"r0": 5}
+    scheduler_output.scheduled_spec_decode_tokens = {"r0": [-1] * 4}
+    monkeypatch.setattr(
+        Scheduler,
+        "_update_after_schedule",
+        lambda _self, _scheduler_output: None,
+    )
+
+    scheduler._update_after_schedule(scheduler_output)
+
+    assert request.num_output_placeholders == 5
+    assert len(request.spec_token_ids) == expected_num_spec_tokens
 
 
 def test_abort():

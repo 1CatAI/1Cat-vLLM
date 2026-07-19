@@ -114,7 +114,9 @@ def test_build_dflash_ddtree_query_depths_helper_mixes_tree_and_flat_rows() -> N
     ]
 
 
-def test_build_dflash_ddtree_query_depths_helper_returns_none_without_payloads() -> None:
+def test_build_dflash_ddtree_query_depths_helper_returns_none_without_payloads() -> (
+    None
+):
     assert (
         build_dflash_ddtree_query_depths(
             [None],

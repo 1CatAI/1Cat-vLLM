@@ -321,7 +321,7 @@ semantic/code-validity checks in addition to repetition checks.
 
 | path | result | decision |
 |---|---|---|
-| TP4 XQA Tensor Core small-query route | 0.0597 ms/layer vs scalar 0.0533 ms at compact 256 partition; max diff to paged-prefill 0.01184 | closed: fewer CTAs lower useful parallelism |
+| TP4 XQA Tensor Core small-query route in a compact P256 graph | 0.0597 ms/layer vs scalar 0.0533 ms at 768 tokens; max diff to paged-prefill 0.01184 | closed only for explicit compact context-bucket graphs; the accepted P1024 long-graph XQA route is documented in `sm70_qwen36_27b_awq_mtp4_optimization.md` |
 | fixed global persistent partition cap | route hit, bitwise exact, but `115.312 -> 117.112 us` under NSYS and large long-context regressions | removed and closed |
 | decode-as-paged-prefill | prior M=8/seq4096 gate is `0.593 ms` vs scalar `0.173 ms` | closed; do not repeat as a short-MTP shortcut |
 | TP4 custom all-reduce + RMS fusion | standalone gain did not reach compiled graph; endpoint regressed | closed |

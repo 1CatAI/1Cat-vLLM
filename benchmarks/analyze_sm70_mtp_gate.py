@@ -130,9 +130,7 @@ def _candidate_summary(
     mean_acceptance = _float_or_none(spec_metrics.get("mean_acceptance_length"))
     draft_acceptance = _float_or_none(spec_metrics.get("draft_acceptance_rate"))
     first_mismatch = (
-        _first_mismatch(control_tokens, tokens)
-        if control_tokens is not None
-        else None
+        _first_mismatch(control_tokens, tokens) if control_tokens is not None else None
     )
     exact_equal = (
         control_tokens is not None
@@ -169,16 +167,12 @@ def _candidate_summary(
         reasons.append("eager")
     if args.target_tps is not None and (tps is None or tps < args.target_tps):
         reasons.append(f"tps<{args.target_tps:g}")
-    if (
-        args.min_mean_acceptance is not None
-        and (mean_acceptance is None or mean_acceptance < args.min_mean_acceptance)
+    if args.min_mean_acceptance is not None and (
+        mean_acceptance is None or mean_acceptance < args.min_mean_acceptance
     ):
         reasons.append(f"accept<{args.min_mean_acceptance:g}")
 
-    if reasons:
-        status = "screen-only"
-    else:
-        status = "target-speed-candidate"
+    status = "screen-only" if reasons else "target-speed-candidate"
     if exact_equal:
         status = f"{status}+exact"
     elif prefix_equal:
@@ -242,7 +236,8 @@ def _candidate_summary(
 
 def _markdown_table(summaries: list[dict[str, Any]]) -> str:
     lines = [
-        "| artifact | status | out | tps | tpot ms | speedup | accept len | draft acc | mtp | token cmp | hash |",
+        "| artifact | status | out | tps | tpot ms | speedup | accept len | "
+        "draft acc | mtp | token cmp | hash |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for item in summaries:

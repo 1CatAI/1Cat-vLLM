@@ -24,8 +24,8 @@ from vllm.engine.arg_utils import (
     optional_type,
     parse_type,
 )
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 @pytest.mark.parametrize(
@@ -218,7 +218,6 @@ def test_hf_token_get_kwargs():
 
 
 class _FakeSM70Platform:
-
     @staticmethod
     def is_cuda_alike():
         return True
@@ -279,7 +278,7 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
         "num_speculative_tokens": 4,
         "use_local_argmax_reduction": True,
         "draft_sample_method": "probabilistic",
-        "attention_backend": "TRITON_ATTN",
+        "attention_backend": "FLASH_ATTN_V100",
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
@@ -333,7 +332,7 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
         "num_speculative_tokens": 2,
         "draft_sample_method": "probabilistic",
         "use_local_argmax_reduction": True,
-        "attention_backend": "TRITON_ATTN",
+        "attention_backend": "FLASH_ATTN_V100",
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"

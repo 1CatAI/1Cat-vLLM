@@ -1214,6 +1214,10 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
 
 package_data = {
+    "flash_qla": [
+        "LICENSE",
+        "ops/gated_delta_rule/chunk/sm70/csrc/*.cu",
+    ],
     "flash_attn_v100": [
         "*.so",
     ],
@@ -1285,7 +1289,7 @@ rust_extensions = [
 setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
-    packages=find_packages(include=["vllm*"]) + ["flash_attn_v100"],
+    packages=(find_packages(include=["vllm*", "flash_qla*"]) + ["flash_attn_v100"]),
     package_dir={
         "flash_attn_v100": str(FLASH_ATTN_V100_PACKAGE),
     },

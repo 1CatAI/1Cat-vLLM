@@ -4,8 +4,8 @@
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
 import vllm.model_executor.kernels.linear.nvfp4.emulation as nvfp4_emulation
+from vllm import envs
 from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
@@ -84,9 +84,7 @@ def test_nvfp4_min_capability_honors_legacy_emulation_env(monkeypatch):
 
 
 def test_flashinfer_nvfp4_backends_reject_sm70():
-    trtllm_supported, trtllm_reason = (
-        FlashInferTrtllmNvFp4LinearKernel.is_supported(70)
-    )
+    trtllm_supported, trtllm_reason = FlashInferTrtllmNvFp4LinearKernel.is_supported(70)
     cudnn_supported, cudnn_reason = FlashInferCudnnNvFp4LinearKernel.is_supported(70)
 
     assert not trtllm_supported

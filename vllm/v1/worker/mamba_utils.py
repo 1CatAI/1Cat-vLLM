@@ -189,9 +189,7 @@ def postprocess_mamba_fused_kernel(
                 ).to(tl.int64)
                 src_addr = state_base_addr + actual_src_block_id * state_block_stride
                 dst_addr = state_base_addr + dest_block_id * state_block_stride
-                copy_size = (
-                    conv_width.to(tl.int64) * state_inner_size * state_elem_size
-                )
+                copy_size = conv_width.to(tl.int64) * state_inner_size * state_elem_size
             else:
                 src_offset = (
                     accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
@@ -208,7 +206,8 @@ def postprocess_mamba_fused_kernel(
             # Conv state: copy
             #   state[block_table[req_idx, src_block_idx],  accept_token_bias:]
             # to
-            #   state[block_table[req_idx, dest_block_idx], :conv_width - accept_token_bias]
+            #   state[block_table[req_idx, dest_block_idx],
+            #         :conv_width - accept_token_bias]
             src_offset = (
                 accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
             )

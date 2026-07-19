@@ -7,8 +7,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import torch
 
@@ -25,7 +25,7 @@ from vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv import (
 def _bench_ms(fn: Callable[[], object], warmup: int, repeat: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -65,7 +65,7 @@ def main() -> None:
         raise ValueError("FlashQLA SM70 path currently requires dim=128")
 
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
     torch.manual_seed(1234)
     scale = args.dim**-0.5
@@ -140,8 +140,11 @@ def main() -> None:
     has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
     core_out = torch.empty_like(v)
     conv_output = torch.cat(
-        (q.reshape(args.tokens, -1), k.reshape(args.tokens, -1),
-         v.reshape(args.tokens, -1)),
+        (
+            q.reshape(args.tokens, -1),
+            k.reshape(args.tokens, -1),
+            v.reshape(args.tokens, -1),
+        ),
         dim=-1,
     ).contiguous()
     a = torch.randn(
@@ -230,7 +233,7 @@ def main() -> None:
     wrapper_out, wrapper_final = wrapper_like_call()
     prep_q, prep_k, prep_v, prep_g, prep_beta = post_conv_prep_call()
     post_conv_out, post_conv_final = post_conv_plus_vlk_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     public_ms = _bench_ms(public_call, args.warmup, args.repeat)
     vlk_ms = _bench_ms(vlk_call, args.warmup, args.repeat)
@@ -244,7 +247,7 @@ def main() -> None:
 
     state_cache[0].copy_(vlk_state[0])
     wrapper_out, wrapper_final = wrapper_like_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     result = {
         "shape": {

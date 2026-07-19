@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
-from collections.abc import Iterable
-from itertools import islice
 import os
 import time
+from collections.abc import Iterable
+from itertools import islice
 
 import torch
 from torch import nn
@@ -187,9 +187,7 @@ def _sm70_qwen_layer_dump_impl(
             return tensor
 
     enable_file = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE")
-    can_save = bool(dump_dir) and (
-        not enable_file or os.path.exists(enable_file)
-    )
+    can_save = bool(dump_dir) and (not enable_file or os.path.exists(enable_file))
     direct_save = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE", "1") != "0"
     if direct_save and can_save and not torch.cuda.is_current_stream_capturing():
         target_counts = _sm70_parse_int_ranges(
@@ -572,9 +570,7 @@ class Qwen3NextAttention(nn.Module):
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1
-            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         v = _sm70_dump_qwen_layer_tensor(
             "full_attn_v",
             self.layer_idx,

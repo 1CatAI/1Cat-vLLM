@@ -18,7 +18,7 @@ warnings.filterwarnings(
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
-import vllm.env_override  # noqa: F401
+import vllm.env_override  # noqa: E402, F401
 
 MODULE_ATTRS = {
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",

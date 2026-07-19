@@ -6,6 +6,7 @@ pynvml. However, it should not initialize cuda context.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Callable
 from datetime import timedelta
@@ -19,13 +20,11 @@ from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
 import vllm._C  # noqa
-try:
+
+with contextlib.suppress(ImportError):
     import vllm._C_stable_libtorch  # noqa
-except ImportError:
-    # Some local SM70 development environments pin Torch versions older than
-    # the stable-libtorch op target. Keep CUDA platform import usable; missing
-    # stable ops will still fail at their call sites.
-    pass
+# Some local SM70 development environments pin Torch versions older than the
+# stable-libtorch op target. Missing stable ops still fail at their call sites.
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml

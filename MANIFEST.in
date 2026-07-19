@@ -7,3 +7,4 @@ include CMakeLists.txt
 
 recursive-include cmake *
 recursive-include csrc *
+recursive-include flash_qla *.py *.cu LICENSE

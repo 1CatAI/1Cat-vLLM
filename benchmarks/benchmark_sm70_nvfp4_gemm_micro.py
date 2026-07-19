@@ -16,11 +16,11 @@ import json
 import os
 import statistics
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import torch
-
 
 DEFAULT_QWEN35_27B_TP2_CASES = (
     # label, per-rank N, per-rank K, per-rank call count per decode token
@@ -96,18 +96,18 @@ def _time_cuda_call(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     timed_fn = fn
     if use_cuda_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             fn()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         timed_fn = graph.replay
         for _ in range(min(warmup, 10)):
             timed_fn()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
     times_ms: list[float] = []
     for _ in range(iters):
@@ -136,8 +136,7 @@ def _parse_case(raw: str, default_m: int) -> BenchCase:
     parts = raw.split(":")
     if len(parts) not in (4, 5):
         raise ValueError(
-            "--case must be LABEL:N:K:COUNT or LABEL:N:K:COUNT:M, "
-            f"got {raw!r}"
+            f"--case must be LABEL:N:K:COUNT or LABEL:N:K:COUNT:M, got {raw!r}"
         )
     label, n, k, count = parts[:4]
     m = int(parts[4]) if len(parts) == 5 else default_m
@@ -182,17 +181,17 @@ def _run_case(
         k_ld = int(meta[0].item())
         q_ld = int(meta[1].item())
 
-        def run() -> None:
-            ops.nvfp4_gemm_sm70_out(
-                out,
-                x,
-                tm_weight,
-                tm_scales,
-                group_size,
-                k_ld,
-                q_ld,
-                False,
-            )
+        run = partial(
+            ops.nvfp4_gemm_sm70_out,
+            out,
+            x,
+            tm_weight,
+            tm_scales,
+            group_size,
+            k_ld,
+            q_ld,
+            False,
+        )
     elif mode in ("raw-gemv", "raw-gemv-warp", "raw-gemv-h2"):
         if case.m != 1:
             raise ValueError(f"{mode} mode only supports M=1.")
@@ -204,16 +203,16 @@ def _run_case(
                 else torch.empty((0,), dtype=torch.float32, device=device)
             )
 
-            def run() -> None:
-                ops.nvfp4_gemv_sm70_raw_out(
-                    out,
-                    x,
-                    qweight_packed,
-                    scales,
-                    partials,
-                    group_size,
-                    gemv_split_k,
-                )
+            run = partial(
+                ops.nvfp4_gemv_sm70_raw_out,
+                out,
+                x,
+                qweight_packed,
+                scales,
+                partials,
+                group_size,
+                gemv_split_k,
+            )
         elif mode == "raw-gemv-h2":
             partials = (
                 torch.empty((gemv_split_k, case.n), dtype=torch.float16, device=device)
@@ -221,27 +220,27 @@ def _run_case(
                 else torch.empty((0,), dtype=torch.float16, device=device)
             )
 
-            def run() -> None:
-                ops.nvfp4_gemv_sm70_h2_out(
-                    out,
-                    x,
-                    qweight_packed,
-                    scales,
-                    partials,
-                    group_size,
-                    gemv_split_k,
-                )
+            run = partial(
+                ops.nvfp4_gemv_sm70_h2_out,
+                out,
+                x,
+                qweight_packed,
+                scales,
+                partials,
+                group_size,
+                gemv_split_k,
+            )
         else:
             partials = torch.empty((0,), dtype=torch.float32, device=device)
 
-            def run() -> None:
-                ops.nvfp4_gemv_sm70_warp_out(
-                    out,
-                    x,
-                    qweight_packed,
-                    scales,
-                    group_size,
-                )
+            run = partial(
+                ops.nvfp4_gemv_sm70_warp_out,
+                out,
+                x,
+                qweight_packed,
+                scales,
+                group_size,
+            )
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -276,7 +275,7 @@ def _run_case(
         "weighted_mean_ms": weighted_mean_ms,
     }
     del qweight, scales, tm_weight, tm_scales, qweight_packed, partials, x, out
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return row
 
 
@@ -352,9 +351,7 @@ def main() -> int:
         raise RuntimeError("Missing _C::nvfp4_sm70_prepare.")
     if not hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
         raise RuntimeError("Missing _C::nvfp4_gemm_sm70_out.")
-    if args.mode == "raw-gemv" and not hasattr(
-        torch.ops._C, "nvfp4_gemv_sm70_raw_out"
-    ):
+    if args.mode == "raw-gemv" and not hasattr(torch.ops._C, "nvfp4_gemv_sm70_raw_out"):
         raise RuntimeError("Missing _C::nvfp4_gemv_sm70_raw_out.")
     if args.mode == "raw-gemv-warp" and not hasattr(
         torch.ops._C, "nvfp4_gemv_sm70_warp_out"
@@ -396,9 +393,7 @@ def main() -> int:
         "group_size": args.group_size,
         "mode": args.mode,
         "gemv_split_k": (
-            args.gemv_split_k
-            if args.mode in ("raw-gemv", "raw-gemv-h2")
-            else 0
+            args.gemv_split_k if args.mode in ("raw-gemv", "raw-gemv-h2") else 0
         ),
         "warmup": args.warmup,
         "iters": args.iters,

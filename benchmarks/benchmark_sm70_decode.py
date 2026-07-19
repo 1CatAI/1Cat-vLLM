@@ -549,7 +549,8 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "flags are stage-local diagnostic lanes and must be recorded "
             "separately. FP8 legacy single-token compact evidence must show "
             "the exact-layout active source-group route, not the old top-k "
-            "descriptor compact route. MoE evidence additionally records fixed-dispatch "
+            "descriptor compact route. MoE evidence additionally records "
+            "fixed-dispatch "
             "tune policy: either explicit tune0 pins or source-level "
             "unset-env safe-default selector fields."
         ),
@@ -568,6 +569,22 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         True,
     )
     decode_use_xqa = _env_bool("VLLM_FLASH_V100_DECODE_USE_XQA", True)
+    smallq_decode_use_xqa = _env_bool(
+        "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA",
+        True,
+    )
+    smallq_decode_xqa_min_seq_len = _env_int(
+        "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN",
+        4096,
+    )
+    mtp5_xqa_dual_cta = _env_bool(
+        "VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA",
+        True,
+    )
+    mtp5_xqa_partition_size = _env_int(
+        "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE",
+        1024,
+    )
     decode_dynamic_partitions = _env_bool(
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
         True,
@@ -627,6 +644,27 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_DECODE_USE_XQA"
         ),
         "decode_xqa_effective": decode_use_xqa,
+        "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA": os.environ.get(
+            "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA"
+        ),
+        "smallq_decode_xqa_effective": smallq_decode_use_xqa,
+        "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN": os.environ.get(
+            "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN"
+        ),
+        "smallq_decode_xqa_min_seq_len_effective": (smallq_decode_xqa_min_seq_len),
+        "VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA": os.environ.get(
+            "VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA"
+        ),
+        "mtp5_xqa_dual_cta_effective": mtp5_xqa_dual_cta,
+        "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE": os.environ.get(
+            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE"
+        ),
+        "mtp5_xqa_partition_size_effective": mtp5_xqa_partition_size,
+        "exact_mtp5_fp8_p1024_dual_cta_policy": (
+            smallq_decode_use_xqa
+            and mtp5_xqa_dual_cta
+            and mtp5_xqa_partition_size == 1024
+        ),
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS": os.environ.get(
             "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS"
         ),
@@ -1450,10 +1488,10 @@ def _write_results(
             "version": torch.__version__,
             "cuda": torch.version.cuda,
         },
-        "cuda_device_count": torch.cuda.device_count(),
+        "cuda_device_count": torch.accelerator.device_count(),
         "device_capabilities": [
             list(torch.cuda.get_device_capability(i))
-            for i in range(torch.cuda.device_count())
+            for i in range(torch.accelerator.device_count())
         ],
         "env": _tracked_env(),
         "sm70_tune_policy": _sm70_tune_policy(),

@@ -19,7 +19,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DECODE_BENCH = Path(__file__).with_name("benchmark_sm70_decode.py")
 
@@ -27,9 +26,7 @@ DECODE_BENCH = Path(__file__).with_name("benchmark_sm70_decode.py")
 def _parse_case(raw: str) -> dict[str, Any]:
     parts = raw.split(":")
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError(
-            "--case must be NAME:INPUT_LEN:OUTPUT_LEN"
-        )
+        raise argparse.ArgumentTypeError("--case must be NAME:INPUT_LEN:OUTPUT_LEN")
     name, input_len, output_len = parts
     return {
         "name": name,
@@ -221,8 +218,7 @@ def _build_summary(
 ) -> dict[str, Any]:
     awq_rows = _case_rows(awq)
     fp8_rows = {
-        selector: _case_rows(payload)
-        for selector, payload in fp8_payloads.items()
+        selector: _case_rows(payload) for selector, payload in fp8_payloads.items()
     }
     fixed_rows = fp8_rows.get("fixed", {})
 
@@ -255,12 +251,8 @@ def _build_summary(
                     "awq_tpot_seconds_mean": awq_row.get("tpot_seconds_mean"),
                     "fp8_tpot_seconds_mean": fp8_row.get("tpot_seconds_mean"),
                     "tpot_over_awq_pct": tpot_over_awq_pct,
-                    "awq_steady_decode_tps_mean": awq_row.get(
-                        "steady_decode_tps_mean"
-                    ),
-                    "fp8_steady_decode_tps_mean": fp8_row.get(
-                        "steady_decode_tps_mean"
-                    ),
+                    "awq_steady_decode_tps_mean": awq_row.get("steady_decode_tps_mean"),
+                    "fp8_steady_decode_tps_mean": fp8_row.get("steady_decode_tps_mean"),
                     "decode_tps_ratio_fp8_over_awq": tps_ratio,
                     "fp8_token_hash": token_hash,
                     "fp8_hash_equal_to_fixed": hash_equal_to_fixed,
@@ -290,7 +282,8 @@ def _write_markdown(summary: dict[str, Any], out: Path) -> None:
     lines = [
         "# SM70 AWQ vs FP8 Decode Pair",
         "",
-        "| Case | FP8 selector | AWQ tok/s | FP8 tok/s | FP8 TPOT over AWQ | FP8 hash == fixed | Pass |",
+        "| Case | FP8 selector | AWQ tok/s | FP8 tok/s | FP8 TPOT over AWQ | "
+        "FP8 hash == fixed | Pass |",
         "| --- | --- | ---: | ---: | ---: | --- | --- |",
     ]
     for row in summary["comparisons"]:
@@ -300,7 +293,10 @@ def _write_markdown(summary: dict[str, Any], out: Path) -> None:
         fp8_tps = row["fp8_steady_decode_tps_mean"]
         hash_equal = row["fp8_hash_equal_to_fixed"]
         lines.append(
-            "| {case} | {selector} | {awq_tps} | {fp8_tps} | {over} | {hash_equal} | {passed} |".format(
+            (
+                "| {case} | {selector} | {awq_tps} | {fp8_tps} | {over} | "
+                "{hash_equal} | {passed} |"
+            ).format(
                 case=row["case"],
                 selector=row["fp8_selector"],
                 awq_tps="n/a" if awq_tps is None else f"{awq_tps:.3f}",
@@ -457,7 +453,8 @@ def main() -> int:
 
     if args.fail_on_threshold:
         failed = [
-            row for row in payload["summary"]["comparisons"]
+            row
+            for row in payload["summary"]["comparisons"]
             if not row["passes_tpot_threshold"]
         ]
         return 1 if failed else 0

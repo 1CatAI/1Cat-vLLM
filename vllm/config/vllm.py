@@ -1148,12 +1148,6 @@ class VllmConfig:
         sm70_no_compile_decode_graph_requested = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
         )
-        sm70_no_compile_decode_graph_explicit = (
-            os.environ.get("VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE", "")
-            .strip()
-            .lower()
-            in ("1", "true", "yes", "on")
-        )
         sm70_fp8_kv_requested = str(self.cache_config.cache_dtype).startswith("fp8")
 
         if (
@@ -1216,14 +1210,19 @@ class VllmConfig:
             ):
                 from .multimodal import ImageDummyOptions, VideoDummyOptions
 
-                limit_per_prompt = (
-                    self.model_config.multimodal_config.limit_per_prompt
-                )
+                limit_per_prompt = self.model_config.multimodal_config.limit_per_prompt
                 if not limit_per_prompt:
                     limit_per_prompt.update(
                         {
-                            "image": ImageDummyOptions(count=1),
-                            "video": VideoDummyOptions(count=0),
+                            "image": ImageDummyOptions(
+                                count=1, width=None, height=None
+                            ),
+                            "video": VideoDummyOptions(
+                                count=0,
+                                num_frames=None,
+                                width=None,
+                                height=None,
+                            ),
                         }
                     )
                     logger.info_once(
@@ -1231,7 +1230,12 @@ class VllmConfig:
                         "video=0. Set --limit-mm-per-prompt to override."
                     )
                 elif "video" not in limit_per_prompt:
-                    limit_per_prompt["video"] = VideoDummyOptions(count=0)
+                    limit_per_prompt["video"] = VideoDummyOptions(
+                        count=0,
+                        num_frames=None,
+                        width=None,
+                        height=None,
+                    )
                     logger.info_once(
                         "Using SM70 Flash-V100 multimodal default: video=0 "
                         "for partial --limit-mm-per-prompt override."
@@ -1294,9 +1298,7 @@ class VllmConfig:
                         env_value,
                     )
 
-        sm70_flash_0dot3_compile_graph = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-        )
+        sm70_flash_0dot3_compile_graph = envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         sm70_flash_no_compile_graph = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
             and not sm70_flash_0dot3_compile_graph
@@ -1333,8 +1335,7 @@ class VllmConfig:
                             else [1, 2, 4, 8, 9]
                         )
                         decode_query_len = (
-                            self.speculative_config.num_speculative_state_tokens()
-                            + 1
+                            self.speculative_config.num_speculative_state_tokens() + 1
                         )
                         smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
                         if (
@@ -1351,9 +1352,7 @@ class VllmConfig:
                                 decode_query_len,
                             )
                         max_graph_reqs = (
-                            4
-                            if self.parallel_config.tensor_parallel_size >= 4
-                            else 1
+                            4 if self.parallel_config.tensor_parallel_size >= 4 else 1
                         )
                         max_graph_reqs = min(
                             max(int(self.scheduler_config.max_num_seqs), 1),
@@ -1453,9 +1452,7 @@ class VllmConfig:
                         "diagnostic-only configuration: cached AOT artifact "
                         "reload reproduced deterministic greedy token drift."
                     )
-                self.compilation_config.inductor_compile_config[
-                    "combo_kernels"
-                ] = True
+                self.compilation_config.inductor_compile_config["combo_kernels"] = True
                 self.compilation_config.inductor_compile_config[
                     "benchmark_combo_kernel"
                 ] = True
@@ -1491,9 +1488,7 @@ class VllmConfig:
                     envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE,
                 )
                 self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.FULL_DECODE_ONLY
-                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
                 if self.compilation_config.max_cudagraph_capture_size is None:
                     self.compilation_config.max_cudagraph_capture_size = capture_size
                 if self.compilation_config.cudagraph_capture_sizes is None:
@@ -1536,15 +1531,13 @@ class VllmConfig:
         def enable_quant_fp8_custom_op_for_blocked_weights() -> bool:
             if not has_blocked_weights():
                 return False
-            if (
+            return not (
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
                 and current_platform.is_device_capability((7, 0))
                 and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-            ):
-                return False
-            return True
+            )
 
         # Enable quant_fp8 CUDA ops (TODO disable in follow up)
         # On H100 the CUDA kernel is faster than
@@ -2136,9 +2129,7 @@ class VllmConfig:
                     from vllm.platforms import current_platform
 
                     cap = current_platform.get_device_capability()
-                    use_dense_sm70_cudagraph = (
-                        cap is not None and cap.major == 7
-                    )
+                    use_dense_sm70_cudagraph = cap is not None and cap.major == 7
 
                 if use_dense_sm70_cudagraph:
                     # Legacy 0.0.3 SM70 decode-heavy tuning: capture every

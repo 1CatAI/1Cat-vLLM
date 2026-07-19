@@ -222,7 +222,14 @@ def _load_memcpys(
         return []
     return [
         (start, end, device, correlation_id, global_pid, copy_kind)
-        for start, end, device, correlation_id, global_pid, copy_kind in connection.execute(
+        for (
+            start,
+            end,
+            device,
+            correlation_id,
+            global_pid,
+            copy_kind,
+        ) in connection.execute(
             "SELECT start, end, deviceId, correlationId, globalPid, copyKind "
             "FROM CUPTI_ACTIVITY_KIND_MEMCPY ORDER BY start"
         )
@@ -506,9 +513,7 @@ def _analyze(args: argparse.Namespace) -> dict[str, Any]:
             "correlation_count": _stats(
                 [float(row["correlation_count"]) for row in rows]
             ),
-            "activity_wall_ms": _stats(
-                [float(row["scope_wall_ms"]) for row in rows]
-            ),
+            "activity_wall_ms": _stats([float(row["scope_wall_ms"]) for row in rows]),
         }
 
     gpu_wall_ms = _stats([row["gpu_wall_ms"] for row in window_rows])

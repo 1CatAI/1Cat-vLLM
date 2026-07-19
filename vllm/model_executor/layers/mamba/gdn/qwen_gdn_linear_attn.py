@@ -232,11 +232,13 @@ def _ddtree_depth_batches(
         if query_len == num_tree_tokens + 1:
             token_start = int(starts[req_row]) + 1
             prefix_rows.append((token_start - 1, req_row))
+        elif query_len == num_tree_tokens:
+            token_start = int(starts[req_row])
         else:
             raise RuntimeError(
-                "DDTree GDN metadata mismatch: official DDTree verifier "
-                "requires root + tree nodes, so query length must equal tree "
-                "node count + 1 for pure-spec tree replay, "
+                "DDTree GDN metadata mismatch: query length must equal the tree "
+                "node count, with one additional row when the verifier includes "
+                "an explicit root, "
                 f"got {query_len} and {num_tree_tokens} for request row "
                 f"{req_row}."
             )
@@ -278,9 +280,7 @@ def _sm70_gdn_prefill_profile_enabled() -> bool:
         return False
     if torch.compiler.is_compiling():
         return False
-    return not (
-        torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    )
+    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
 
 def _sm70_profile_trace_enabled() -> bool:
@@ -330,7 +330,7 @@ def _sm70_mixed_qkv_decode_layout(mixed_qkv: torch.Tensor) -> str:
 def _sm70_gdn_prefill_profile_start() -> float | None:
     if not _sm70_gdn_prefill_profile_enabled():
         return None
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return time.perf_counter()
 
 
@@ -344,7 +344,7 @@ def _sm70_gdn_prefill_profile_end(
 ) -> None:
     if start is None:
         return
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     total_key = "__total__"
     max_logs = int(os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS", "256"))
@@ -352,17 +352,14 @@ def _sm70_gdn_prefill_profile_end(
     if total >= max_logs:
         return
     key = f"{os.getpid()}:{layer_name}:{stage}"
-    per_stage_max = int(
-        os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE", "2")
-    )
+    per_stage_max = int(os.getenv("VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE", "2"))
     count = _SM70_GDN_PREFILL_PROFILE_COUNTS.get(key, 0)
     if count >= per_stage_max:
         return
     _SM70_GDN_PREFILL_PROFILE_COUNTS[key] = count + 1
     _SM70_GDN_PREFILL_PROFILE_COUNTS[total_key] = total + 1
     logger.info(
-        "SM70 GDN prefill profile: layer=%s stage=%s elapsed_ms=%.3f "
-        "tokens=%s %s",
+        "SM70 GDN prefill profile: layer=%s stage=%s elapsed_ms=%.3f tokens=%s %s",
         layer_name,
         stage,
         elapsed_ms,
@@ -386,10 +383,7 @@ def _sm70_log_flashqla_decode_route(
     if torch.compiler.is_compiling():
         return
     mixed_layout = _sm70_mixed_qkv_decode_layout(mixed_qkv)
-    key = (
-        f"{os.getpid()}:{stage}:{decision}:{reason}:"
-        f"{mixed_layout}:{layer_name}"
-    )
+    key = f"{os.getpid()}:{stage}:{decision}:{reason}:{mixed_layout}:{layer_name}"
     count = _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS.get(key, 0)
     if count >= 1:
         return
@@ -566,6 +560,7 @@ def _sm70_assert_standard_core_not_active_spec(
         return
     if not _sm70_qwen_gdn_metadata_has_active_spec(attn_metadata):
         return
+    assert attn_metadata is not None
     raise RuntimeError(
         "SM70 Qwen GDN active spec decode reached "
         "qwen_gdn_attention_core_standard while "
@@ -784,17 +779,17 @@ def _qwen_gdn_run_recurrent_core(
 def _qwen_gdn_metadata_tensors(
     layer_name: LayerNameType,
     device: torch.device,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     resolved_layer_name = _resolve_layer_name(layer_name)
     try:
         forward_context = get_forward_context()
@@ -988,9 +983,7 @@ def dump_sm70_gdn_graph_buffers(step: int, stage: str) -> None:
     enable_file = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE")
     if enable_file and not os.path.exists(enable_file):
         return
-    target_steps = _sm70_parse_int_ranges(
-        os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STEPS")
-    )
+    target_steps = _sm70_parse_int_ranges(os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STEPS"))
     if target_steps is not None and step not in target_steps:
         return
     if not _SM70_GDN_GRAPH_BUFFERS:
@@ -1002,7 +995,7 @@ def dump_sm70_gdn_graph_buffers(step: int, stage: str) -> None:
         label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
         source = str(meta.get("source", "unknown")).replace("/", "_").replace(".", "_")
         layer_idx = meta.get("layer_idx")
-        layer_text = "none" if layer_idx is None else f"{int(layer_idx):02d}"
+        layer_text = f"{layer_idx:02d}" if isinstance(layer_idx, int) else "none"
         shape = "x".join(str(dim) for dim in tuple(buffer.shape))
         path = os.path.join(
             dump_dir,
@@ -1163,10 +1156,11 @@ def _sm70_gdn_projection_dump_impl(
         return tensor
     dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR")
     enable_file = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE")
-    can_save = bool(dump_dir) and (
-        not enable_file or os.path.exists(enable_file)
-    )
-    if can_save and not torch.cuda.is_current_stream_capturing():
+    if (
+        dump_dir
+        and (not enable_file or os.path.exists(enable_file))
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         try:
             max_dumps = int(os.getenv("VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS", "4"))
         except ValueError:
@@ -1589,8 +1583,7 @@ def _log_gdn_backend_decision(
         "triton": "Triton/FLA",
     }[active_backend]
     logger.info_once(
-        "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s, "
-        "model_dtype=%s).",
+        "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s, model_dtype=%s).",
         chosen,
         requested_backend,
         head_k_dim,
@@ -1675,6 +1668,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
         from flash_qla.ops.gated_delta_rule.chunk import (
             chunk_gated_delta_rule_fwd_sm70_tilelang,
         )
+
         _log_runtime_route_once(
             "Using original FlashQLA-SM70 TileLang GDN prefill path "
             "(indexed_state=%s, direct_output=%s).",
@@ -1697,9 +1691,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
             tokens=q.shape[1],
         )
     if cu_seqlens is None:
-        cu_seqlens = torch.tensor(
-            [0, q.shape[1]], device=q.device, dtype=torch.int32
-        )
+        cu_seqlens = torch.tensor([0, q.shape[1]], device=q.device, dtype=torch.int32)
     if cu_seqlens.dtype != torch.int32:
         cu_seqlens = cu_seqlens.to(torch.int32)
 
@@ -2201,10 +2193,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if vllm_config.speculative_config is not None:
             self._sm70_spec_cache_stride = max(
                 1,
-                1
-                + int(
-                    vllm_config.speculative_config.num_speculative_state_tokens()
-                ),
+                1 + int(vllm_config.speculative_config.num_speculative_state_tokens()),
             )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
@@ -2216,14 +2205,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE
         )
         self.enable_flashqla_decode = envs.VLLM_SM70_GDN_DECODE_FLASHQLA
-        self.force_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_QWEN_GDN_FULL_FORWARD
-        )
-        num_speculative_tokens = _sm70_qwen_gdn_num_speculative_tokens(
+        self.force_sm70_qwen_gdn_full_forward = envs.VLLM_SM70_QWEN_GDN_FULL_FORWARD
+        num_speculative_tokens = _sm70_qwen_gdn_num_speculative_tokens(vllm_config)
+        block_003_deep_mtp = _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
             vllm_config
-        )
-        block_003_deep_mtp = (
-            _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config)
         )
         if block_003_deep_mtp:
             logger.warning_once(
@@ -2237,17 +2222,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_speculative_tokens,
             )
         self.disable_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD
-            and not block_003_deep_mtp
+            envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD and not block_003_deep_mtp
         )
         self.auto_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             and vllm_config.speculative_config is not None
             and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
-            and (
-                not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
-                or block_003_deep_mtp
-            )
+            and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
         )
         self.auto_sm70_qwen_gdn_spec_core = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
@@ -2279,9 +2260,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             logger.info_once(
                 "SM70 Qwen GDN 0.0.3-style spec recurrent-core route armed."
             )
-        self.enable_sm70_legacy_prefill_prep = (
-            envs.VLLM_SM70_GDN_LEGACY_PREFILL_PREP
-        )
+        self.enable_sm70_legacy_prefill_prep = envs.VLLM_SM70_GDN_LEGACY_PREFILL_PREP
         if current_platform.is_device_capability(70) and (
             envs.VLLM_SM70_GDN_KKT_SCHEDULE
             or envs.VLLM_SM70_GDN_DELTA_H_SCHEDULE
@@ -2460,9 +2439,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query = mixed_qkvz.index_select(-1, q_idx).view(
                 *base_shape_qkvz, ng, q_size
             )
-            key = mixed_qkvz.index_select(-1, k_idx).view(
-                *base_shape_qkvz, ng, k_size
-            )
+            key = mixed_qkvz.index_select(-1, k_idx).view(*base_shape_qkvz, ng, k_size)
             value = mixed_qkvz.index_select(-1, v_idx).view(
                 *base_shape_qkvz,
                 self.num_v_heads // self.tp_size,
@@ -2522,9 +2499,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
             z_size = self.value_dim // self.tp_size
             mixed_qkv = mixed_qkvz[..., :qkv_size]
-            z_flat = _sm70_compile_graph_slice_dim(
-                mixed_qkvz, -1, qkv_size, z_size
-            )
+            z_flat = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
             n = mixed_qkvz.shape[0]
             z_out = z_flat.reshape(n, -1, self.head_v_dim)
             ba_size = mixed_ba.shape[-1] // 2
@@ -2578,9 +2553,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query = mixed_qkvz.index_select(-1, q_idx).view(
                 *base_shape_qkvz, ng, q_size
             )
-            key = mixed_qkvz.index_select(-1, k_idx).view(
-                *base_shape_qkvz, ng, k_size
-            )
+            key = mixed_qkvz.index_select(-1, k_idx).view(*base_shape_qkvz, ng, k_size)
             value = mixed_qkvz.index_select(-1, v_idx).view(
                 *base_shape_qkvz,
                 self.num_v_heads // self.tp_size,
@@ -2714,7 +2687,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         global _DFLASH_DDTREE_PATH_PROBE_REPORTS
 
         max_reports = _dflash_ddtree_path_probe_max_reports()
-        if _DFLASH_DDTREE_PATH_PROBE_REPORTS >= max_reports:
+        if max_reports <= _DFLASH_DDTREE_PATH_PROBE_REPORTS:
             return
 
         parent_rows = ddtree_parent_ids[:num_spec_decodes].detach().cpu()
@@ -2773,9 +2746,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     b_spec.index_select(0, path_token_idx),
                     self.dt_bias,
                 )
-                local_ssm_state = initial_ssm_state[
-                    req_row : req_row + 1
-                ].clone()
+                local_ssm_state = initial_ssm_state[req_row : req_row + 1].clone()
                 _, root_final_state = fused_recurrent_gated_delta_rule(
                     q=query_path,
                     k=key_path,
@@ -2787,13 +2758,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=True,
                 )
                 conv_diff = (
-                    conv_state[root_state_idx, :, :conv_state_width].float()
-                    - local_conv_state[1, :, :conv_state_width].float()
-                ).abs().max()
+                    (
+                        conv_state[root_state_idx, :, :conv_state_width].float()
+                        - local_conv_state[1, :, :conv_state_width].float()
+                    )
+                    .abs()
+                    .max()
+                )
                 ssm_diff = (
-                    ssm_state[root_state_idx].float()
-                    - root_final_state[-1].float()
-                ).abs().max()
+                    (ssm_state[root_state_idx].float() - root_final_state[-1].float())
+                    .abs()
+                    .max()
+                )
                 conv_diff_value = float(conv_diff.item())
                 ssm_diff_value = float(ssm_diff.item())
                 if worst is None or max(conv_diff_value, ssm_diff_value) > max(
@@ -2866,9 +2842,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     b_spec.index_select(0, path_token_idx),
                     self.dt_bias,
                 )
-                local_ssm_state = initial_ssm_state[
-                    req_row : req_row + 1
-                ].clone()
+                local_ssm_state = initial_ssm_state[req_row : req_row + 1].clone()
                 _, path_final_state = fused_recurrent_gated_delta_rule(
                     q=query_path,
                     k=key_path,
@@ -2887,17 +2861,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 if actual_state_idx < 0:
                     continue
                 conv_diff = (
-                    conv_state[
-                        actual_state_idx, :, :conv_state_width
-                    ].float()
-                    - local_conv_state[
-                        len(token_rows), :, :conv_state_width
-                    ].float()
-                ).abs().max()
+                    (
+                        conv_state[actual_state_idx, :, :conv_state_width].float()
+                        - local_conv_state[
+                            len(token_rows), :, :conv_state_width
+                        ].float()
+                    )
+                    .abs()
+                    .max()
+                )
                 ssm_diff = (
-                    ssm_state[actual_state_idx].float()
-                    - local_ssm_final.float()
-                ).abs().max()
+                    (ssm_state[actual_state_idx].float() - local_ssm_final.float())
+                    .abs()
+                    .max()
+                )
                 conv_diff_value = float(conv_diff.item())
                 ssm_diff_value = float(ssm_diff.item())
                 if worst is None or max(conv_diff_value, ssm_diff_value) > max(
@@ -2914,7 +2891,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if worst is None:
             return
-        if _DFLASH_DDTREE_PATH_PROBE_REPORTS >= max_reports:
+        if max_reports <= _DFLASH_DDTREE_PATH_PROBE_REPORTS:
             return
         _DFLASH_DDTREE_PATH_PROBE_REPORTS += 1
         conv_diff_value, ssm_diff_value, req_row, node_slot, path_slots, state_idx = (
@@ -2930,7 +2907,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_idx,
             conv_diff_value,
             ssm_diff_value,
-            )
+        )
 
     def _forward_ddtree_gdn_pure_spec_flashqla(
         self,
@@ -3057,18 +3034,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc,
             )
             if _dflash_ddtree_qla_gdn_enabled():
-                core_attn_out_spec = (
-                    self._forward_ddtree_gdn_pure_spec_flashqla(
-                        mixed_qkv_spec=mixed_qkv_spec,
-                        a_spec=a_spec,
-                        b_spec=b_spec,
-                        ssm_state=ssm_state,
-                        spec_query_start_loc=spec_query_start_loc,
-                        spec_state_indices_tensor=spec_state_indices_tensor,
-                        spec_state_slot_selectors=spec_state_slot_selectors,
-                        ddtree_parent_ids=ddtree_parent_ids,
-                        num_spec_decodes=num_spec_decodes,
-                    )
+                core_attn_out_spec = self._forward_ddtree_gdn_pure_spec_flashqla(
+                    mixed_qkv_spec=mixed_qkv_spec,
+                    a_spec=a_spec,
+                    b_spec=b_spec,
+                    ssm_state=ssm_state,
+                    spec_query_start_loc=spec_query_start_loc,
+                    spec_state_indices_tensor=spec_state_indices_tensor,
+                    spec_state_slot_selectors=spec_state_slot_selectors,
+                    ddtree_parent_ids=ddtree_parent_ids,
+                    num_spec_decodes=num_spec_decodes,
                 )
                 if core_attn_out_spec is not None:
                     _sm70_gdn_prefill_profile_end(
@@ -3096,7 +3071,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_v_dim=self.head_v_dim,
                 initial_state=ssm_state,
                 inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[:num_spec_decodes + 1],
+                cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
                 ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=spec_state_slot_selectors,
                 ddtree_parent_ids=ddtree_parent_ids,
@@ -3168,7 +3143,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 beta=beta_linear,
                 initial_state=ssm_state,
                 inplace_final_state=True,
-                cu_seqlens=spec_query_start_loc[:num_spec_decodes + 1],
+                cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
                 ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=spec_state_slot_selectors,
                 use_qk_l2norm_in_kernel=True,
@@ -3320,9 +3295,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 device = mixed_qkv_spec.device
                 token_idx = torch.tensor(token_rows, dtype=torch.long, device=device)
                 req_idx = torch.tensor(req_rows, dtype=torch.long, device=device)
-                parent_idx = torch.tensor(
-                    parent_slots, dtype=torch.long, device=device
-                )
+                parent_idx = torch.tensor(parent_slots, dtype=torch.long, device=device)
                 node_idx = torch.tensor(node_slots, dtype=torch.long, device=device)
 
                 parent_state_indices = spec_state_indices_tensor[req_idx, parent_idx]
@@ -3659,9 +3632,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             profile_start,
             tokens=num_tokens,
         )
-        proj_out = _sm70_dump_gdn_projection_tensor(
-            "proj_out", layer_name, proj_out
-        )
+        proj_out = _sm70_dump_gdn_projection_tensor("proj_out", layer_name, proj_out)
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_total",
@@ -3891,9 +3862,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b = b.contiguous()
             a = a.contiguous()
 
-        if (
-            envs.VLLM_SM70_GDN_Z_CONTIGUOUS
-            and current_platform.is_device_capability(70)
+        if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
+            70
         ):
             z = z.contiguous()
 
@@ -4075,9 +4045,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             int(getattr(self, "_sm70_spec_cache_stride", 1)),
             _sm70_spec_cache_stride_from_config(),
         )
-        cache_indices_variants = [
-            torch.zeros(1, device=device, dtype=torch.int32)
-        ]
+        cache_indices_variants = [torch.zeros(1, device=device, dtype=torch.int32)]
         if spec_cache_stride > 1:
             strided_cache_base = torch.zeros(
                 spec_cache_stride, device=device, dtype=torch.int32
@@ -4101,9 +4069,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         device=device,
                         dtype=dtype,
                     )
-                    dummy_conv_inputs.append(
-                        dummy_qkv[:, :qkv_dim].transpose(0, 1)
-                    )
+                    dummy_conv_inputs.append(dummy_qkv[:, :qkv_dim].transpose(0, 1))
                 query_start_loc = torch.tensor(
                     [0, prefill_tokens], device=device, dtype=torch.int32
                 )
@@ -4111,9 +4077,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     [0, prefill_tokens], dtype=torch.int32
                 )
                 nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                    compute_causal_conv1d_metadata(
-                        query_start_loc_cpu, device=device
-                    )
+                    compute_causal_conv1d_metadata(query_start_loc_cpu, device=device)
                 )
                 conv_metadata = SimpleNamespace(
                     nums_dict=nums_dict,
@@ -4226,9 +4190,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
         qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
-        qkv_row_stride = (
-            qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
-        )
+        qkv_row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
         self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(qkv_row_stride))
         prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
         warmup_key = (
@@ -4515,7 +4477,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         else:
             if trace_prefill_warmup:
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 logger.info(
                     "SM70 profile trace: GDN prefill warmup exit layer=%s "
                     "T=%d elapsed_ms=%.3f",
@@ -4548,9 +4510,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     device=device,
                     dtype=dtype,
                 )
-                indexed_state_indices = torch.zeros(
-                    1, device=device, dtype=torch.long
-                )
+                indexed_state_indices = torch.zeros(1, device=device, dtype=torch.long)
                 indexed_has_initial_state = torch.ones(
                     1, device=device, dtype=torch.bool
                 )
@@ -4708,13 +4668,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                 else:
                     if trace_decode_warmup:
-                        torch.cuda.synchronize()
+                        torch.accelerator.synchronize()
                         logger.info(
                             "SM70 profile trace: GDN mixed-QKV decode warmup "
                             "exit layer=%s elapsed_ms=%.3f",
                             self.prefix,
-                            (time.perf_counter() - mixed_decode_warmup_start)
-                            * 1000.0,
+                            (time.perf_counter() - mixed_decode_warmup_start) * 1000.0,
                         )
                     logger.debug(
                         "GDN mixed-QKV decode warmup completed for layer %s",
@@ -4742,9 +4701,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                                 "warmup enter layer=%s tokens=%d layout=%s",
                                 self.prefix,
                                 decode_tokens,
-                                _sm70_mixed_qkv_decode_layout(
-                                    dummy_decode_mixed_qkv
-                                ),
+                                _sm70_mixed_qkv_decode_layout(dummy_decode_mixed_qkv),
                             )
                         try:
                             self._forward_core_decode_flashqla(
@@ -4766,15 +4723,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                             )
                         else:
                             if trace_decode_warmup:
-                                torch.cuda.synchronize()
+                                torch.accelerator.synchronize()
                                 logger.info(
                                     "SM70 profile trace: GDN FlashQLA decode "
                                     "warmup exit layer=%s elapsed_ms=%.3f",
                                     self.prefix,
-                                    (
-                                        time.perf_counter()
-                                        - flashqla_decode_warmup_start
-                                    )
+                                    (time.perf_counter() - flashqla_decode_warmup_start)
                                     * 1000.0,
                                 )
                             logger.debug(
@@ -4921,9 +4875,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         conv_state = (
-            kv_cache[0]
-            if is_conv_state_dim_first()
-            else kv_cache[0].transpose(-1, -2)
+            kv_cache[0] if is_conv_state_dim_first() else kv_cache[0].transpose(-1, -2)
         )
         ssm_state = kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -5083,6 +5035,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and mixed_qkv_non_spec.dtype == torch.float16
             and mixed_qkv_non_spec.is_contiguous()
         ):
+            assert non_spec_query_start_loc is not None
+            assert non_spec_state_indices_tensor is not None
             if self._can_use_flashqla_decode(
                 mixed_qkv_non_spec,
                 non_spec_state_indices_tensor,
@@ -5228,8 +5182,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b_non_spec = b
 
             if self.enable_sm70_legacy_prefill_prep:
-                query_non_spec, key_non_spec, value_non_spec = (
-                    self.rearrange_mixed_qkv(mixed_qkv_non_spec)
+                query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                    mixed_qkv_non_spec
                 )
                 g_non_spec, beta_non_spec = fused_gdn_gating(
                     self.A_log, a_non_spec, b_non_spec, self.dt_bias
@@ -5332,6 +5286,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 assert spec_state_indices_tensor is not None
                 assert ddtree_parent_ids is not None
                 assert ddtree_num_tree_tokens_cpu is not None
+                assert spec_state_slot_selectors is not None
                 core_attn_out_spec = self._forward_ddtree_gdn_pure_spec(
                     mixed_qkv_spec=mixed_qkv_spec,
                     a_spec=a_spec,
@@ -5457,9 +5412,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                             else None
                         ),
                         "has_initial_state": (
-                            has_initial_state
-                            if use_indexed_original_prefill
-                            else None
+                            has_initial_state if use_indexed_original_prefill else None
                         ),
                         "inplace_final_state": use_indexed_original_prefill,
                     }
@@ -5513,6 +5466,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 int(has_initial_state.shape[0]),
             )
         elif attn_metadata.num_decodes > 0:
+            assert non_spec_state_indices_tensor is not None
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -5584,9 +5538,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         conv_state = (
-            kv_cache[0]
-            if is_conv_state_dim_first()
-            else kv_cache[0].transpose(-1, -2)
+            kv_cache[0] if is_conv_state_dim_first() else kv_cache[0].transpose(-1, -2)
         )
         ssm_state = kv_cache[1]
 
@@ -5656,9 +5608,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             core_attn_out=core_attn_out,
             non_spec_query_start_loc=attn_metadata.non_spec_query_start_loc,
-            non_spec_state_indices_tensor=(
-                attn_metadata.non_spec_state_indices_tensor
-            ),
+            non_spec_state_indices_tensor=(attn_metadata.non_spec_state_indices_tensor),
             num_decode_tokens=attn_metadata.num_decodes,
             kv_cache=kv_cache,
             layer_name=_encode_layer_name(self.prefix),
@@ -5682,9 +5632,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         conv_state = (
-            kv_cache[0]
-            if is_conv_state_dim_first()
-            else kv_cache[0].transpose(-1, -2)
+            kv_cache[0] if is_conv_state_dim_first() else kv_cache[0].transpose(-1, -2)
         )
         ssm_state = kv_cache[1]
 
@@ -5960,9 +5908,7 @@ def qwen_gdn_attention_core(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor(
-        "input_qkv", layer_name, qkv_or_qkvz, "core_generic"
-    )
+    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, qkv_or_qkvz, "core_generic")
     _sm70_dump_gdn_core_tensor("input_b", layer_name, b_or_ba, "core_generic")
     _sm70_dump_gdn_core_tensor("input_a", layer_name, a_or_z_out, "core_generic")
     restore_query_start_loc = False
@@ -5974,12 +5920,8 @@ def qwen_gdn_attention_core(
     else:
         old_non_spec_query_start_loc = None
     if attn_metadata is not None and non_spec_state_indices_tensor.numel() > 0:
-        old_non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )
-        attn_metadata.non_spec_state_indices_tensor = (
-            non_spec_state_indices_tensor
-        )
+        old_non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+        attn_metadata.non_spec_state_indices_tensor = non_spec_state_indices_tensor
         restore_state_indices = True
     else:
         old_non_spec_state_indices_tensor = None
@@ -6007,9 +5949,7 @@ def qwen_gdn_attention_core(
             attn_metadata.non_spec_state_indices_tensor = (
                 old_non_spec_state_indices_tensor
             )
-    _sm70_dump_gdn_core_tensor(
-        "core_out", layer_name, core_attn_out, "core_generic"
-    )
+    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, "core_generic")
 
 
 def qwen_gdn_attention_core_standard_spec(
@@ -6043,9 +5983,7 @@ def qwen_gdn_attention_core_standard_spec(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor(
-        "input_qkv", layer_name, mixed_qkv, "core_standard_spec"
-    )
+    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv, "core_standard_spec")
     _sm70_dump_gdn_core_tensor("input_b", layer_name, b, "core_standard_spec")
     _sm70_dump_gdn_core_tensor("input_a", layer_name, a, "core_standard_spec")
     _sm70_dump_gdn_spec_metadata_graph_buffers(
@@ -6169,12 +6107,12 @@ def qwen_gdn_attention_core_spec_commit(
         or attn_metadata.spec_sequence_masks is None
     )
     if fallback_to_standard:
-        restore_fields: dict[str, object] = {}
+        fallback_restore_fields: dict[str, object] = {}
 
-        def _patch_metadata(name: str, value: object) -> None:
+        def _patch_fallback_metadata(name: str, value: object) -> None:
             if attn_metadata is None:
                 return
-            restore_fields[name] = getattr(attn_metadata, name)
+            fallback_restore_fields[name] = getattr(attn_metadata, name)
             setattr(attn_metadata, name, value)
 
         if (
@@ -6182,12 +6120,12 @@ def qwen_gdn_attention_core_spec_commit(
             and attn_metadata.num_spec_decodes <= 0
             and attn_metadata.spec_sequence_masks is not None
         ):
-            _patch_metadata("spec_sequence_masks", None)
-            _patch_metadata("spec_token_indx", None)
-            _patch_metadata("non_spec_token_indx", None)
-            _patch_metadata("spec_query_start_loc", None)
-            _patch_metadata("spec_state_indices_tensor", None)
-            _patch_metadata("num_accepted_tokens", None)
+            _patch_fallback_metadata("spec_sequence_masks", None)
+            _patch_fallback_metadata("spec_token_indx", None)
+            _patch_fallback_metadata("non_spec_token_indx", None)
+            _patch_fallback_metadata("spec_query_start_loc", None)
+            _patch_fallback_metadata("spec_state_indices_tensor", None)
+            _patch_fallback_metadata("num_accepted_tokens", None)
         try:
             qwen_gdn_attention_core_standard(
                 mixed_qkv,
@@ -6202,10 +6140,13 @@ def qwen_gdn_attention_core_spec_commit(
             )
         finally:
             if attn_metadata is not None:
-                for name, value in restore_fields.items():
+                for name, value in fallback_restore_fields.items():
                     setattr(attn_metadata, name, value)
         return core_attn_out
-    pure_spec_decode = attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
+    assert attn_metadata is not None
+    pure_spec_decode = (
+        attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0
+    )
     metadata_source = "core_spec_commit"
     missing_core_spec_tensors = (
         spec_query_start_loc.numel() == 0
@@ -6213,8 +6154,7 @@ def qwen_gdn_attention_core_spec_commit(
         or num_accepted_tokens.numel() == 0
     )
     missing_mixed_spec_tensors = (not pure_spec_decode) and (
-        spec_token_indx.numel() == 0
-        or spec_sequence_masks.numel() == 0
+        spec_token_indx.numel() == 0 or spec_sequence_masks.numel() == 0
     )
     if missing_core_spec_tensors or missing_mixed_spec_tensors:
         metadata_tensors = gdn_spec_metadata_tensors(attn_metadata, mixed_qkv.device)
@@ -6224,8 +6164,7 @@ def qwen_gdn_attention_core_spec_commit(
             or metadata_tensors[7].numel() == 0
         )
         metadata_missing_mixed_spec_tensors = (not pure_spec_decode) and (
-            metadata_tensors[4].numel() == 0
-            or metadata_tensors[6].numel() == 0
+            metadata_tensors[4].numel() == 0 or metadata_tensors[6].numel() == 0
         )
         if (
             not metadata_missing_core_spec_tensors
@@ -6276,9 +6215,7 @@ def qwen_gdn_attention_core_spec_commit(
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
 
-    _sm70_dump_gdn_core_tensor(
-        "input_qkv", layer_name, mixed_qkv, metadata_source
-    )
+    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv, metadata_source)
     _sm70_dump_gdn_core_tensor("input_b", layer_name, b, metadata_source)
     _sm70_dump_gdn_core_tensor("input_a", layer_name, a, metadata_source)
     _sm70_dump_gdn_spec_metadata_graph_buffers(
@@ -6338,9 +6275,7 @@ def qwen_gdn_attention_core_spec_commit(
                 spec_state_slot_selectors=spec_state_slot_selectors[
                     : attn_metadata.num_spec_decodes
                 ],
-                ddtree_parent_ids=ddtree_parent_ids[
-                    : attn_metadata.num_spec_decodes
-                ],
+                ddtree_parent_ids=ddtree_parent_ids[: attn_metadata.num_spec_decodes],
                 ddtree_num_tree_tokens_cpu=ddtree_num_tree_tokens_cpu[
                     : attn_metadata.num_spec_decodes
                 ],
@@ -6428,9 +6363,7 @@ def qwen_gdn_attention_core_spec_commit(
     finally:
         for name, value in restore_fields.items():
             setattr(attn_metadata, name, value)
-    _sm70_dump_gdn_core_tensor(
-        "core_out", layer_name, core_attn_out, metadata_source
-    )
+    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, metadata_source)
     return core_attn_out
 
 
@@ -6458,9 +6391,7 @@ def qwen_gdn_attention_core_standard(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor(
-        "input_qkv", layer_name, mixed_qkv, "core_standard"
-    )
+    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv, "core_standard")
     _sm70_dump_gdn_core_tensor("input_b", layer_name, b, "core_standard")
     _sm70_dump_gdn_core_tensor("input_a", layer_name, a, "core_standard")
     mixed_qkv_decode_requested = (
@@ -6506,12 +6437,8 @@ def qwen_gdn_attention_core_standard(
     else:
         old_non_spec_query_start_loc = None
     if attn_metadata is not None and non_spec_state_indices_tensor.numel() > 0:
-        old_non_spec_state_indices_tensor = (
-            attn_metadata.non_spec_state_indices_tensor
-        )
-        attn_metadata.non_spec_state_indices_tensor = (
-            non_spec_state_indices_tensor
-        )
+        old_non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+        attn_metadata.non_spec_state_indices_tensor = non_spec_state_indices_tensor
         restore_state_indices = True
     else:
         old_non_spec_state_indices_tensor = None
@@ -6530,9 +6457,7 @@ def qwen_gdn_attention_core_standard(
             attn_metadata.non_spec_state_indices_tensor = (
                 old_non_spec_state_indices_tensor
             )
-    _sm70_dump_gdn_core_tensor(
-        "core_out", layer_name, core_attn_out, "core_standard"
-    )
+    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, "core_standard")
 
 
 def qwen_gdn_attention_core_context(
@@ -6590,9 +6515,7 @@ def qwen_gdn_attention_core_003_spec(
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
             conv_state_cache, ssm_state_cache = kv_cache[0], kv_cache[1]
-    _sm70_dump_gdn_core_tensor(
-        "input_qkv", layer_name, mixed_qkv, "core_003_spec"
-    )
+    _sm70_dump_gdn_core_tensor("input_qkv", layer_name, mixed_qkv, "core_003_spec")
     _sm70_dump_gdn_core_tensor("input_b", layer_name, b, "core_003_spec")
     _sm70_dump_gdn_core_tensor("input_a", layer_name, a, "core_003_spec")
     self._forward_core(
@@ -6602,9 +6525,7 @@ def qwen_gdn_attention_core_003_spec(
         core_attn_out=core_attn_out,
         kv_cache=(conv_state_cache, ssm_state_cache),
     )
-    _sm70_dump_gdn_core_tensor(
-        "core_out", layer_name, core_attn_out, "core_003_spec"
-    )
+    _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, "core_003_spec")
     return core_attn_out
 
 

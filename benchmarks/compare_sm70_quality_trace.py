@@ -11,22 +11,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
-
 
 _LAYER_DUMP_RE = re.compile(
     r"pid(?P<pid>\d+)_step(?P<step>\d+)_layer(?P<layer>-?\d+)_"
     r"(?P<tail>.+?)_shape(?P<shape>[^/]+)\.pt$"
 )
 _PID_RE = re.compile(r"pid(?P<pid>\d+)_")
-_SAMPLE_DUMP_RE = re.compile(
-    r"sample_tensors_pid(?P<pid>\d+)_step(?P<step>\d+)\.pt$"
-)
+_SAMPLE_DUMP_RE = re.compile(r"sample_tensors_pid(?P<pid>\d+)_step(?P<step>\d+)\.pt$")
 
 
 def _json_safe(value: Any) -> Any:
@@ -81,14 +78,16 @@ def _compare_tokens(left: Any | None, right: Any | None) -> dict[str, Any] | Non
     records = []
     for index, (l_ids, r_ids) in enumerate(zip(left_ids, right_ids, strict=False)):
         prefix = _common_prefix(l_ids, r_ids)
-        records.append({
-            "record_index": index,
-            "left_len": len(l_ids),
-            "right_len": len(r_ids),
-            "common_prefix_len": prefix,
-            "first_left": None if prefix >= len(l_ids) else l_ids[prefix],
-            "first_right": None if prefix >= len(r_ids) else r_ids[prefix],
-        })
+        records.append(
+            {
+                "record_index": index,
+                "left_len": len(l_ids),
+                "right_len": len(r_ids),
+                "common_prefix_len": prefix,
+                "first_left": None if prefix >= len(l_ids) else l_ids[prefix],
+                "first_right": None if prefix >= len(r_ids) else r_ids[prefix],
+            }
+        )
     return {
         "left_record_count": len(left_ids),
         "right_record_count": len(right_ids),
@@ -107,11 +106,13 @@ def _load_margin_records(path: Path | None) -> list[dict[str, Any]]:
                 line = line.strip()
                 if line:
                     records.append(json.loads(line))
-    records.sort(key=lambda item: (
-        int(item.get("decode_step", -1)),
-        int(item.get("device", -1) if item.get("device") is not None else -1),
-        int(item.get("pid", -1)),
-    ))
+    records.sort(
+        key=lambda item: (
+            int(item.get("decode_step", -1)),
+            int(item.get("device", -1) if item.get("device") is not None else -1),
+            int(item.get("pid", -1)),
+        )
+    )
     return records
 
 
@@ -129,8 +130,7 @@ def _compare_margin_lists(
     for left, right in zip(left_values, right_values, strict=False):
         if isinstance(left, list) and isinstance(right, list):
             diffs.extend(
-                abs(float(a) - float(b))
-                for a, b in zip(left, right, strict=False)
+                abs(float(a) - float(b)) for a, b in zip(left, right, strict=False)
             )
         else:
             diff = _float_diff(left, right)
@@ -170,7 +170,9 @@ def _compare_margins(
             l_rec.get("top1_top2_margins") or [],
             r_rec.get("top1_top2_margins") or [],
         )
-        max_top_value_diff = max(max_top_value_diff, top_value_diff["max_abs_diff"] or 0)
+        max_top_value_diff = max(
+            max_top_value_diff, top_value_diff["max_abs_diff"] or 0
+        )
         max_selected_value_diff = max(
             max_selected_value_diff, selected_value_diff["max_abs_diff"] or 0
         )
@@ -188,16 +190,18 @@ def _compare_margins(
                 "right_margins": r_rec.get("top1_top2_margins"),
             }
         if index < 8 or not selected_equal or not top_ids_equal:
-            pairs.append({
-                "pair_index": index,
-                "left_step": l_rec.get("decode_step"),
-                "right_step": r_rec.get("decode_step"),
-                "selected_equal": selected_equal,
-                "top_ids_equal": top_ids_equal,
-                "top_value_diff": top_value_diff,
-                "selected_value_diff": selected_value_diff,
-                "margin_diff": margin_diff,
-            })
+            pairs.append(
+                {
+                    "pair_index": index,
+                    "left_step": l_rec.get("decode_step"),
+                    "right_step": r_rec.get("decode_step"),
+                    "selected_equal": selected_equal,
+                    "top_ids_equal": top_ids_equal,
+                    "top_value_diff": top_value_diff,
+                    "selected_value_diff": selected_value_diff,
+                    "margin_diff": margin_diff,
+                }
+            )
     return {
         "left_record_count": len(left),
         "right_record_count": len(right),
@@ -266,9 +270,7 @@ def _index_layer_dumps(
             continue
         pid = int(payload.get("pid", match.group("pid")))
         shape = payload.get("shape")
-        if isinstance(shape, tuple):
-            shape_key = "x".join(str(dim) for dim in shape)
-        elif isinstance(shape, list):
+        if isinstance(shape, (tuple, list)):
             shape_key = "x".join(str(dim) for dim in shape)
         else:
             shape_key = match.group("shape")
@@ -336,13 +338,15 @@ def _compare_layer_dumps(
             group["max_record"] = record
         if len(rows) < max_rows or max_diff > 0:
             rows.append(record)
-    rows.sort(key=lambda item: (
-        item["worker"],
-        item["step"],
-        item["layer"],
-        item["layer_type"],
-        item["label"],
-    ))
+    rows.sort(
+        key=lambda item: (
+            item["worker"],
+            item["step"],
+            item["layer"],
+            item["layer_type"],
+            item["label"],
+        )
+    )
     by_label_out = dict(sorted(by_label.items()))
     first_nonzero = next(
         (row for row in rows if float(row.get("max_abs_diff") or 0.0) > 0),
@@ -399,8 +403,13 @@ def _compare_sample_dumps(
             right_payload["sample_hidden_states"],
         )
         logits_stats = None
-        if left_payload.get("logits") is not None and right_payload.get("logits") is not None:
-            logits_stats = _tensor_stats(left_payload["logits"], right_payload["logits"])
+        if (
+            left_payload.get("logits") is not None
+            and right_payload.get("logits") is not None
+        ):
+            logits_stats = _tensor_stats(
+                left_payload["logits"], right_payload["logits"]
+            )
         hidden_diff = float(hidden_stats.get("max_abs_diff") or 0.0)
         logits_diff = float((logits_stats or {}).get("max_abs_diff") or 0.0)
         max_hidden = max(max_hidden, hidden_diff)

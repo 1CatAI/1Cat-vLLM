@@ -46,10 +46,14 @@ DECODE_VARIANTS = (
     "fp16_b784_xqa",
     "fp16_b784_scalar",
     "fp16_b1568_scalar",
+    "fp16_b1616_xqa",
+    "fp16_b1616_scalar",
     "fp8_b784_xqa",
     "fp8_b784_scalar",
     "fp8_b1568_xqa",
     "fp8_b1568_scalar",
+    "fp8_b1616_xqa",
+    "fp8_b1616_scalar",
 )
 
 
@@ -95,7 +99,7 @@ def _measure(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     if cuda_profiler:
         torch.cuda.cudart().cudaProfilerStart()
@@ -132,6 +136,9 @@ def _bench_variant(
     variant: str,
     context_len: int,
     query_len: int,
+    decode_rows: int,
+    decode_workspace_capacity: int | None,
+    decode_partition_size_hint: int | None,
     heads_q: int,
     heads_kv: int,
     head_dim: int,
@@ -229,32 +236,46 @@ def _bench_variant(
                 )
 
     else:
-        query = torch.randn((1, heads_q, head_dim), device=device, dtype=torch.float16)
-        if route == "xqa":
+        query = torch.randn(
+            (decode_rows, heads_q, head_dim),
+            device=device,
+            dtype=torch.float16,
+        )
+        block_table = block_table.expand(decode_rows, -1).contiguous()
+        seq_lens = torch.arange(
+            context_len - decode_rows + 1,
+            context_len + 1,
+            device=device,
+            dtype=torch.int32,
+        )
 
-            def run() -> torch.Tensor:
-                return flash_attn_decode_paged_xqa(
-                    query,
-                    key,
-                    value,
-                    block_table,
-                    seq_lens,
-                    kv_cache_dtype=cache_dtype,
-                    max_seq_len_hint=context_len,
-                )
+        def run_scalar() -> torch.Tensor:
+            return flash_attn_decode_paged(
+                query,
+                key,
+                value,
+                block_table,
+                seq_lens,
+                kv_cache_dtype=cache_dtype,
+                max_seq_len_hint=context_len,
+                workspace_seq_capacity_hint=decode_workspace_capacity,
+                partition_size_hint=decode_partition_size_hint,
+            )
 
-        else:
+        def run_xqa() -> torch.Tensor:
+            return flash_attn_decode_paged_xqa(
+                query,
+                key,
+                value,
+                block_table,
+                seq_lens,
+                kv_cache_dtype=cache_dtype,
+                max_seq_len_hint=context_len,
+                workspace_seq_capacity_hint=decode_workspace_capacity,
+                partition_size_hint=decode_partition_size_hint,
+            )
 
-            def run() -> torch.Tensor:
-                return flash_attn_decode_paged(
-                    query,
-                    key,
-                    value,
-                    block_table,
-                    seq_lens,
-                    kv_cache_dtype=cache_dtype,
-                    max_seq_len_hint=context_len,
-                )
+        run = run_xqa if route == "xqa" else run_scalar
 
     name = f"{stage}_{variant}_N{context_len}"
     timing = _measure(
@@ -268,7 +289,13 @@ def _bench_variant(
         "stage": stage,
         "variant": variant,
         "context_len": context_len,
-        "query_len": query_len if stage == "prefill" else 1,
+        "query_len": query_len if stage == "prefill" else decode_rows,
+        "decode_workspace_capacity": (
+            decode_workspace_capacity if stage == "decode" else None
+        ),
+        "decode_partition_size_hint": (
+            decode_partition_size_hint if stage == "decode" else None
+        ),
         "heads_q": heads_q,
         "heads_kv": heads_kv,
         "head_dim": head_dim,
@@ -280,6 +307,12 @@ def _bench_variant(
     if stage == "prefill" and bridge_timing is not None:
         result["bridge_median_ms"] = bridge_timing["median_ms"]
         result["bridge_attention_median_ms"] = attention_timing["median_ms"]
+    if stage == "decode":
+        scalar_out = run_scalar()
+        xqa_out = run_xqa()
+        diff = scalar_out.float().sub(xqa_out.float()).abs()
+        result["scalar_xqa_max_abs_diff"] = float(diff.max().item())
+        result["scalar_xqa_mean_abs_diff"] = float(diff.mean().item())
     return result
 
 
@@ -292,6 +325,29 @@ def main() -> None:
         "--contexts", type=int, nargs="+", default=[16384, 65536, 131072]
     )
     parser.add_argument("--query-len", type=int, default=1568)
+    parser.add_argument(
+        "--decode-rows",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent paged-decode rows. Use 5 for an MTP4 "
+            "target verifier; rows share KV pages and use seq_lens N-4..N."
+        ),
+    )
+    parser.add_argument(
+        "--decode-workspace-capacity",
+        type=int,
+        help=(
+            "Optional fixed decode workspace sequence capacity. Use 262144 "
+            "to reproduce the production long-context CUDA graph grid."
+        ),
+    )
+    parser.add_argument(
+        "--decode-partition-size-hint",
+        type=int,
+        choices=(256, 512, 1024),
+        help="Explicit paged-decode partition size for reproducible XQA sweeps.",
+    )
     parser.add_argument("--heads-q", type=int, default=12)
     parser.add_argument("--heads-kv", type=int, default=2)
     parser.add_argument("--head-dim", type=int, default=256)
@@ -306,7 +362,16 @@ def main() -> None:
 
     if args.heads_q % args.heads_kv:
         raise ValueError("--heads-q must be divisible by --heads-kv")
-    torch.cuda.set_device(args.device)
+    if args.decode_rows <= 0:
+        raise ValueError("--decode-rows must be positive")
+    if min(args.contexts) < args.decode_rows:
+        raise ValueError("Every context must be at least --decode-rows")
+    if (
+        args.decode_workspace_capacity is not None
+        and args.decode_workspace_capacity < max(args.contexts)
+    ):
+        raise ValueError("--decode-workspace-capacity must cover the largest context")
+    torch.accelerator.set_device_index(args.device)
     device = torch.device(f"cuda:{args.device}")
     props = torch.cuda.get_device_properties(device)
     if (props.major, props.minor) != (7, 0):
@@ -325,12 +390,15 @@ def main() -> None:
             raise ValueError(f"Invalid {stage} variants: {invalid}; allowed={allowed}")
         for context_len in args.contexts:
             for variant in variants:
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
                 result = _bench_variant(
                     stage=stage,
                     variant=variant,
                     context_len=context_len,
                     query_len=args.query_len,
+                    decode_rows=args.decode_rows,
+                    decode_workspace_capacity=args.decode_workspace_capacity,
+                    decode_partition_size_hint=args.decode_partition_size_hint,
                     heads_q=args.heads_q,
                     heads_kv=args.heads_kv,
                     head_dim=args.head_dim,

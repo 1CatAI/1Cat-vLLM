@@ -9,7 +9,6 @@ import csv
 import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import regex as re
 
 K_REQUIRED_VISIBLE_DEVICES = "2"
 K_REQUIRED_PHYSICAL_GPU = 2
@@ -109,9 +109,7 @@ def _build_binary(verbose: bool) -> tuple[Path, list[str], str]:
     if nvcc is None:
         raise RuntimeError("nvcc is required to build the SM70 BM32 microbenchmark.")
     source = (
-        Path(__file__).resolve().parent
-        / "csrc"
-        / "sm70_native_bm32_qk_panel_micro.cu"
+        Path(__file__).resolve().parent / "csrc" / "sm70_native_bm32_qk_panel_micro.cu"
     )
     build_dir = (
         Path(tempfile.gettempdir())
@@ -170,9 +168,7 @@ def _instruction_count(sass: str, mnemonic: str) -> int:
 
 
 def _ldg_width_count(sass: str, width: int) -> int:
-    return len(
-        re.findall(rf"\bLDG(?:\.[A-Z0-9_]+)*\.{width}(?:\.|\b)", sass)
-    )
+    return len(re.findall(rf"\bLDG(?:\.[A-Z0-9_]+)*\.{width}(?:\.|\b)", sass))
 
 
 def _inspect_sass(binary: Path) -> dict[str, Any]:
@@ -215,7 +211,9 @@ def _inspect_sass(binary: Path) -> dict[str, Any]:
     return {"available": True, "binary": str(binary), "kernels": kernels}
 
 
-def _resource_gate(payload: dict[str, Any], sass: dict[str, Any]) -> tuple[bool, list[str]]:
+def _resource_gate(
+    payload: dict[str, Any], sass: dict[str, Any]
+) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     resources = payload.get("resources", {})
     baseline = resources.get("baseline", {})
@@ -248,13 +246,11 @@ def _resource_gate(payload: dict[str, Any], sass: dict[str, Any]) -> tuple[bool,
         )
     if candidate.get("registers_per_thread", 65) > 64:
         reasons.append(
-            "candidate REG="
-            f"{candidate.get('registers_per_thread')}, requires <=64"
+            f"candidate REG={candidate.get('registers_per_thread')}, requires <=64"
         )
     if candidate.get("local_bytes_per_thread") != 0:
         reasons.append(
-            "candidate LOCAL="
-            f"{candidate.get('local_bytes_per_thread')}, requires 0"
+            f"candidate LOCAL={candidate.get('local_bytes_per_thread')}, requires 0"
         )
     if paths.get("baseline_ctas_per_group") != 2:
         reasons.append(
@@ -372,7 +368,11 @@ def _run_ncu_kernel(
     metrics = _parse_ncu_metrics(result.stdout)
     active = metrics.get("smsp__warps_active.avg.per_cycle_active")
     eligible = metrics.get("smsp__warps_eligible.avg.per_cycle_active")
-    no_eligible = max(active - eligible, 0.0) if active is not None and eligible is not None else None
+    no_eligible = (
+        max(active - eligible, 0.0)
+        if active is not None and eligible is not None
+        else None
+    )
     return {
         "status": "completed" if result.returncode == 0 else "failed",
         "command": command,
@@ -383,9 +383,7 @@ def _run_ncu_kernel(
             "long_scoreboard_per_warp_active": metrics.get(
                 "smsp__warp_issue_stalled_long_scoreboard_per_warp_active"
             ),
-            "tensor_instructions": metrics.get(
-                "smsp__inst_executed_pipe_tensor.sum"
-            ),
+            "tensor_instructions": metrics.get("smsp__inst_executed_pipe_tensor.sum"),
         },
         "stdout_tail": result.stdout[-3000:],
         "stderr_tail": result.stderr[-3000:],
@@ -436,7 +434,9 @@ def main() -> int:
     if exactness.get("word_count") != expected_words or not exactness.get(
         "full_32x128"
     ):
-        raise RuntimeError("Probe did not compare the complete [groups, 32, 128] output.")
+        raise RuntimeError(
+            "Probe did not compare the complete [groups, 32, 128] output."
+        )
     sass = _inspect_sass(binary)
     resource_passed, resource_reasons = _resource_gate(payload, sass)
     candidate_speedup_pct = payload["timing"]["candidate_speedup_vs_baseline_pct"]
@@ -460,11 +460,9 @@ def main() -> int:
     ncu = _ncu_payload(binary, args, eligible_for_ncu)
     clock_after_ncu_mhz = _verify_clock(args)
 
-    baseline_sass = sass.get("kernels", {}).get("baseline", {}).get(
-        "instructions", {}
-    )
-    candidate_sass = sass.get("kernels", {}).get("candidate", {}).get(
-        "instructions", {}
+    baseline_sass = sass.get("kernels", {}).get("baseline", {}).get("instructions", {})
+    candidate_sass = (
+        sass.get("kernels", {}).get("candidate", {}).get("instructions", {})
     )
     payload["build"] = {
         "command": build_command,

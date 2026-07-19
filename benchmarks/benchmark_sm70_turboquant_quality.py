@@ -25,7 +25,8 @@ DEFAULT_PROMPT_BASES = [
     "Explain why deterministic GPU validation needs fixed seeds and stable inputs. ",
     "Summarize the tradeoff between throughput, latency, and output quality. ",
     "Write a Python function that validates a list of token ids without mutation. ",
-    "A model serving stack should preserve numerical stability while changing cache format. ",
+    "A model serving stack should preserve numerical stability while changing "
+    "cache format. ",
 ]
 DEFAULT_CONTEXT_LENS = [128, 512, 1024]
 DEFAULT_CANARY_PROMPTS = [
@@ -78,15 +79,17 @@ def _load_probe_prompts(args: argparse.Namespace) -> list[dict[str, Any]]:
     for input_len in context_lens:
         for base_index, prompt_base in enumerate(bases):
             token_ids = _make_prompt_token_ids(tokenizer, prompt_base, input_len)
-            prompts.append({
-                "prompt_token_ids": token_ids,
-                "meta": {
-                    "base_index": base_index,
-                    "context_len": input_len,
-                    "prompt_hash": _hash_ids(token_ids),
-                },
-            })
-    return prompts[:args.max_probe_prompts]
+            prompts.append(
+                {
+                    "prompt_token_ids": token_ids,
+                    "meta": {
+                        "base_index": base_index,
+                        "context_len": input_len,
+                        "prompt_hash": _hash_ids(token_ids),
+                    },
+                }
+            )
+    return prompts[: args.max_probe_prompts]
 
 
 def _load_canary_prompts(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -98,16 +101,18 @@ def _load_canary_prompts(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
     prompts = args.canary_prompt or DEFAULT_CANARY_PROMPTS
     encoded_prompts = []
-    for index, prompt in enumerate(prompts[:args.max_canary_prompts]):
+    for index, prompt in enumerate(prompts[: args.max_canary_prompts]):
         token_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        encoded_prompts.append({
-            "prompt_token_ids": token_ids,
-            "meta": {
-                "canary_index": index,
-                "context_len": len(token_ids),
-                "prompt_hash": _hash_ids(token_ids),
-            },
-        })
+        encoded_prompts.append(
+            {
+                "prompt_token_ids": token_ids,
+                "meta": {
+                    "canary_index": index,
+                    "context_len": len(token_ids),
+                    "prompt_hash": _hash_ids(token_ids),
+                },
+            }
+        )
     return encoded_prompts
 
 
@@ -151,8 +156,7 @@ def _logsumexp(values: list[float]) -> float:
     max_value = max(values)
     if math.isinf(max_value):
         return max_value
-    return max_value + math.log(sum(math.exp(value - max_value)
-                                    for value in values))
+    return max_value + math.log(sum(math.exp(value - max_value) for value in values))
 
 
 def _prob_vector(
@@ -188,10 +192,11 @@ def _js_divergence(
         return None
     left_probs = _prob_vector(left, keys, missing_floor)
     right_probs = _prob_vector(right, keys, missing_floor)
-    midpoint = [(lprob + rprob) * 0.5
-                for lprob, rprob in zip(left_probs, right_probs, strict=False)]
-    return 0.5 * _kl_div(left_probs, midpoint) + 0.5 * _kl_div(
-        right_probs, midpoint)
+    midpoint = [
+        (lprob + rprob) * 0.5
+        for lprob, rprob in zip(left_probs, right_probs, strict=False)
+    ]
+    return 0.5 * _kl_div(left_probs, midpoint) + 0.5 * _kl_div(right_probs, midpoint)
 
 
 def _sorted_tokens(logprobs: dict[str, float]) -> list[tuple[str, float]]:
@@ -229,8 +234,9 @@ def _longest_run(token_ids: list[int]) -> int:
     return max(longest, current)
 
 
-def _make_sampling_params(args: argparse.Namespace, max_tokens: int,
-                          logprobs: int | None):
+def _make_sampling_params(
+    args: argparse.Namespace, max_tokens: int, logprobs: int | None
+):
     from vllm import SamplingParams
 
     return SamplingParams(
@@ -272,17 +278,20 @@ def _records_from_outputs(
         first_step = None
         if completion.logprobs:
             first_step = completion.logprobs[0]
-        records.append({
-            "meta": prompt_meta["meta"],
-            "prompt_token_hash": _hash_ids(
-                list(request_output.prompt_token_ids or [])),
-            "output_token_ids": token_ids,
-            "finish_reason": completion.finish_reason,
-            "stop_reason": completion.stop_reason,
-            "cumulative_logprob": completion.cumulative_logprob,
-            "first_step_top_logprobs": _serialize_logprob_map(first_step),
-            "first_step_top_logprob_values": _logprob_map(first_step),
-        })
+        records.append(
+            {
+                "meta": prompt_meta["meta"],
+                "prompt_token_hash": _hash_ids(
+                    list(request_output.prompt_token_ids or [])
+                ),
+                "output_token_ids": token_ids,
+                "finish_reason": completion.finish_reason,
+                "stop_reason": completion.stop_reason,
+                "cumulative_logprob": completion.cumulative_logprob,
+                "first_step_top_logprobs": _serialize_logprob_map(first_step),
+                "first_step_top_logprob_values": _logprob_map(first_step),
+            }
+        )
     return records
 
 
@@ -295,13 +304,12 @@ def _generate_records(
 ) -> dict[str, Any]:
     import torch
 
-    prompt_inputs = [{"prompt_token_ids": item["prompt_token_ids"]}
-                     for item in prompts]
+    prompt_inputs = [{"prompt_token_ids": item["prompt_token_ids"]} for item in prompts]
     sampling_params = _make_sampling_params(args, max_tokens, logprobs)
     generate_start = time.perf_counter()
     outputs = llm.generate(prompt_inputs, sampling_params, use_tqdm=False)
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     generate_seconds = time.perf_counter() - generate_start
     return {
         "generate_seconds": generate_seconds,
@@ -317,16 +325,17 @@ def _run_case(
     probe_prompts: list[dict[str, Any]],
     canary_prompts: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    from vllm import LLM
     import torch
+
     import vllm
+    from vllm import LLM
 
     kwargs = _llm_kwargs(args, kv_cache_dtype)
 
     load_start = time.perf_counter()
     llm = LLM(**kwargs)
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
     load_seconds = time.perf_counter() - load_start
 
     probe = _generate_records(
@@ -364,8 +373,8 @@ def _run_case(
     del llm
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
     return result
 
 
@@ -422,23 +431,24 @@ def _compare_probe_records(
             base_top1_delta = base_map[base_token] - cand_logprob
             baseline_top1_deltas.append(base_top1_delta)
 
-        comparisons.append({
-            "meta": base_record["meta"],
-            "same_prompt_hash": (
-                base_record["prompt_token_hash"]
-                == cand_record["prompt_token_hash"]
-            ),
-            "baseline_token_id": base_token,
-            "candidate_token_id": cand_token,
-            "token_match": base_token == cand_token,
-            "top_logprob_overlap": overlap,
-            "top_logprob_jsd": jsd,
-            "baseline_top1_margin": margin,
-            "baseline_top1_nll_delta": base_top1_delta,
-            "baseline_top1_missing_in_candidate_topk": (
-                base_token is not None and base_token not in cand_map
-            ),
-        })
+        comparisons.append(
+            {
+                "meta": base_record["meta"],
+                "same_prompt_hash": (
+                    base_record["prompt_token_hash"] == cand_record["prompt_token_hash"]
+                ),
+                "baseline_token_id": base_token,
+                "candidate_token_id": cand_token,
+                "token_match": base_token == cand_token,
+                "top_logprob_overlap": overlap,
+                "top_logprob_jsd": jsd,
+                "baseline_top1_margin": margin,
+                "baseline_top1_nll_delta": base_top1_delta,
+                "baseline_top1_missing_in_candidate_topk": (
+                    base_token is not None and base_token not in cand_map
+                ),
+            }
+        )
 
     count = len(comparisons)
     return {
@@ -493,27 +503,30 @@ def _compare_canary_records(
         )
         severe = (
             len(cand_ids) == 0
-            or (len(cand_ids) >= 32
+            or (
+                len(cand_ids) >= 32
                 and cand_unique_ratio < args.min_canary_unique_ratio
-                and low_relative_unique)
+                and low_relative_unique
+            )
             or cand_longest_run >= args.max_canary_repeated_run
         )
         severe_count += int(severe)
-        records.append({
-            "meta": base_record["meta"],
-            "same_prompt_hash": (
-                base_record["prompt_token_hash"]
-                == cand_record["prompt_token_hash"]
-            ),
-            "baseline_token_count": len(base_ids),
-            "candidate_token_count": len(cand_ids),
-            "exact_prefix_tokens": prefix,
-            "baseline_unique_ratio": base_unique_ratio,
-            "candidate_unique_ratio": cand_unique_ratio,
-            "candidate_longest_repeated_run": cand_longest_run,
-            "candidate_finish_reason": cand_record["finish_reason"],
-            "severe_candidate_degradation": severe,
-        })
+        records.append(
+            {
+                "meta": base_record["meta"],
+                "same_prompt_hash": (
+                    base_record["prompt_token_hash"] == cand_record["prompt_token_hash"]
+                ),
+                "baseline_token_count": len(base_ids),
+                "candidate_token_count": len(cand_ids),
+                "exact_prefix_tokens": prefix,
+                "baseline_unique_ratio": base_unique_ratio,
+                "candidate_unique_ratio": cand_unique_ratio,
+                "candidate_longest_repeated_run": cand_longest_run,
+                "candidate_finish_reason": cand_record["finish_reason"],
+                "severe_candidate_degradation": severe,
+            }
+        )
     count = len(records)
     return {
         "count": count,
@@ -528,8 +541,7 @@ def _gate(summary: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     probe = summary["probe"]
     canary = summary["canary"]
 
-    def fail_if_metric_gt(name: str, value: float | None,
-                          limit: float) -> None:
+    def fail_if_metric_gt(name: str, value: float | None, limit: float) -> None:
         if value is None:
             failures.append(f"{name} missing")
         elif value > limit:
@@ -537,21 +549,32 @@ def _gate(summary: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
 
     if not summary["candidate"]["kv_cache_dtype"].startswith("turboquant_"):
         failures.append("candidate kv_cache_dtype is not turboquant")
-    fail_if_metric_gt("mean_top_logprob_jsd",
-                      probe["mean_top_logprob_jsd"], args.max_mean_jsd)
-    fail_if_metric_gt("p95_top_logprob_jsd", probe["p95_top_logprob_jsd"],
-                      args.max_p95_jsd)
-    fail_if_metric_gt("mean_baseline_top1_nll_delta",
-                      probe["mean_baseline_top1_nll_delta"],
-                      args.max_mean_baseline_top1_nll_delta)
-    fail_if_metric_gt("baseline_top1_missing_rate",
-                      probe["baseline_top1_missing_rate"],
-                      args.max_baseline_top1_missing_rate)
-    fail_if_metric_gt("high_margin_mismatch_rate",
-                      probe["high_margin_mismatch_rate"],
-                      args.max_high_margin_mismatch_rate)
-    fail_if_metric_gt("severe_candidate_degradation_rate",
-                      canary["severe_candidate_degradation_rate"], 0.0)
+    fail_if_metric_gt(
+        "mean_top_logprob_jsd", probe["mean_top_logprob_jsd"], args.max_mean_jsd
+    )
+    fail_if_metric_gt(
+        "p95_top_logprob_jsd", probe["p95_top_logprob_jsd"], args.max_p95_jsd
+    )
+    fail_if_metric_gt(
+        "mean_baseline_top1_nll_delta",
+        probe["mean_baseline_top1_nll_delta"],
+        args.max_mean_baseline_top1_nll_delta,
+    )
+    fail_if_metric_gt(
+        "baseline_top1_missing_rate",
+        probe["baseline_top1_missing_rate"],
+        args.max_baseline_top1_missing_rate,
+    )
+    fail_if_metric_gt(
+        "high_margin_mismatch_rate",
+        probe["high_margin_mismatch_rate"],
+        args.max_high_margin_mismatch_rate,
+    )
+    fail_if_metric_gt(
+        "severe_candidate_degradation_rate",
+        canary["severe_candidate_degradation_rate"],
+        0.0,
+    )
 
     return {
         "passed": not failures,
@@ -559,20 +582,12 @@ def _gate(summary: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         "thresholds": {
             "max_mean_jsd": args.max_mean_jsd,
             "max_p95_jsd": args.max_p95_jsd,
-            "max_mean_baseline_top1_nll_delta": (
-                args.max_mean_baseline_top1_nll_delta
-            ),
-            "max_baseline_top1_missing_rate": (
-                args.max_baseline_top1_missing_rate
-            ),
-            "max_high_margin_mismatch_rate": (
-                args.max_high_margin_mismatch_rate
-            ),
+            "max_mean_baseline_top1_nll_delta": (args.max_mean_baseline_top1_nll_delta),
+            "max_baseline_top1_missing_rate": (args.max_baseline_top1_missing_rate),
+            "max_high_margin_mismatch_rate": (args.max_high_margin_mismatch_rate),
             "high_margin_threshold": args.high_margin_threshold,
             "min_canary_unique_ratio": args.min_canary_unique_ratio,
-            "min_canary_relative_unique_ratio": (
-                args.min_canary_relative_unique_ratio
-            ),
+            "min_canary_relative_unique_ratio": (args.min_canary_relative_unique_ratio),
             "max_canary_repeated_run": args.max_canary_repeated_run,
         },
     }
@@ -623,9 +638,11 @@ def _build_payload(args: argparse.Namespace) -> dict[str, Any]:
             "run": candidate,
         },
         "probe": _compare_probe_records(
-            baseline["probe"]["records"], candidate["probe"]["records"], args),
+            baseline["probe"]["records"], candidate["probe"]["records"], args
+        ),
         "canary": _compare_canary_records(
-            baseline["canary"]["records"], candidate["canary"]["records"], args),
+            baseline["canary"]["records"], candidate["canary"]["records"], args
+        ),
     }
     payload["gate"] = _gate(payload, args)
     return payload
@@ -633,7 +650,8 @@ def _build_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate SM70 TurboQuant KV-cache output quality.")
+        description="Validate SM70 TurboQuant KV-cache output quality."
+    )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--baseline-json", type=Path)
@@ -663,17 +681,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.20,
     )
-    parser.add_argument("--max-baseline-top1-missing-rate",
-                        type=float,
-                        default=0.10)
+    parser.add_argument("--max-baseline-top1-missing-rate", type=float, default=0.10)
     parser.add_argument("--high-margin-threshold", type=float, default=1.0)
-    parser.add_argument("--max-high-margin-mismatch-rate",
-                        type=float,
-                        default=0.0)
+    parser.add_argument("--max-high-margin-mismatch-rate", type=float, default=0.0)
     parser.add_argument("--min-canary-unique-ratio", type=float, default=0.05)
-    parser.add_argument("--min-canary-relative-unique-ratio",
-                        type=float,
-                        default=0.5)
+    parser.add_argument("--min-canary-relative-unique-ratio", type=float, default=0.5)
     parser.add_argument("--max-canary-repeated-run", type=int, default=32)
     return parser.parse_args()
 
@@ -690,14 +702,10 @@ def main() -> int:
         "model": payload["model"],
         "candidate_kv_cache_dtype": payload["candidate"]["kv_cache_dtype"],
         "probe": {
-            key: value
-            for key, value in payload["probe"].items()
-            if key != "records"
+            key: value for key, value in payload["probe"].items() if key != "records"
         },
         "canary": {
-            key: value
-            for key, value in payload["canary"].items()
-            if key != "records"
+            key: value for key, value in payload["canary"].items() if key != "records"
         },
         "gate": payload["gate"],
         "json_out": str(args.json_out),

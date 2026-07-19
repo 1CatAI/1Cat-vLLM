@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import torch
 import pytest
+import torch
 
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner

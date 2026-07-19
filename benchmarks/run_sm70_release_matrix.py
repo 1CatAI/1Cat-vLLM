@@ -30,7 +30,6 @@ import hashlib
 import json
 import os
 import queue
-import re
 import statistics
 import subprocess
 import sys
@@ -39,6 +38,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
+
+import regex as re
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LONG_BENCH_ROOT = REPO_ROOT / "third_party" / "LongBench" / "LongBench"
@@ -325,9 +326,7 @@ def _make_case_name(
     kv_cache_dtype: str,
     mode: str,
 ) -> str:
-    return (
-        f"{backend}-tp{tp}-{model.key}-kv-{_slug(kv_cache_dtype)}-{mode}"
-    )
+    return f"{backend}-tp{tp}-{model.key}-kv-{_slug(kv_cache_dtype)}-{mode}"
 
 
 def _make_cases(
@@ -351,13 +350,11 @@ def _make_cases(
                         and kv_cache_dtype.startswith("turboquant")
                     )
                     gemma_nvfp4_fp8_kv = (
-                        model.key == "gemma4-31b-nvfp4"
-                        and kv_cache_dtype == "fp8_e5m2"
+                        model.key == "gemma4-31b-nvfp4" and kv_cache_dtype == "fp8_e5m2"
                     )
-                    if (gemma_turboquant and not include_gemma_turboquant):
+                    if gemma_turboquant and not include_gemma_turboquant:
                         continue
-                    if (gemma_nvfp4_fp8_kv
-                            and not include_gemma_nvfp4_fp8_kv):
+                    if gemma_nvfp4_fp8_kv and not include_gemma_nvfp4_fp8_kv:
                         continue
                     cases.append(
                         CaseSpec(
@@ -378,18 +375,10 @@ def _make_cases(
                     # SM70 TurboQuant target KV currently forces the MTP
                     # drafter onto TurboQuant KV too. That route is useful for
                     # diagnostics, but is not release-safe by default.
-                    # FP8-weight Qwen MTP with fp8_e5m2 KV hits an unsupported
-                    # static_scaled_fp8_quant e5m2 kernel during drafter
-                    # warmup; keep that as an explicit diagnostic route too.
-                    fp8_model_fp8_kv_mtp = (
-                        model.quantization == "fp8"
-                        and kv_cache_dtype == "fp8_e5m2"
-                    )
-                    if (model.has_mtp
-                            and (include_turboquant_mtp
-                                 or not kv_cache_dtype.startswith("turboquant"))
-                            and (include_fp8_model_fp8_kv_mtp
-                                 or not fp8_model_fp8_kv_mtp)):
+                    if model.has_mtp and (
+                        include_turboquant_mtp
+                        or not kv_cache_dtype.startswith("turboquant")
+                    ):
                         cases.append(
                             CaseSpec(
                                 name=_make_case_name(
@@ -409,9 +398,10 @@ def _make_cases(
                         )
                     # DFlash draft attention is non-causal; TurboQuant KV
                     # currently has no non-causal attention backend on SM70.
-                    if (model.supports_dflash_35b
-                            and (include_turboquant_dflash
-                                 or not kv_cache_dtype.startswith("turboquant"))):
+                    if model.supports_dflash_35b and (
+                        include_turboquant_dflash
+                        or not kv_cache_dtype.startswith("turboquant")
+                    ):
                         cases.append(
                             CaseSpec(
                                 name=_make_case_name(
@@ -433,8 +423,9 @@ def _make_cases(
     return cases
 
 
-def _parse_tuple_arg(values: list[str] | None,
-                     default: tuple[str, ...]) -> tuple[str, ...]:
+def _parse_tuple_arg(
+    values: list[str] | None, default: tuple[str, ...]
+) -> tuple[str, ...]:
     if not values:
         return default
     out: list[str] = []
@@ -443,8 +434,9 @@ def _parse_tuple_arg(values: list[str] | None,
     return tuple(out)
 
 
-def _parse_int_tuple_arg(values: list[str] | None,
-                         default: tuple[int, ...]) -> tuple[int, ...]:
+def _parse_int_tuple_arg(
+    values: list[str] | None, default: tuple[int, ...]
+) -> tuple[int, ...]:
     return tuple(int(value) for value in _parse_tuple_arg(values, ())) or default
 
 
@@ -472,7 +464,7 @@ def _filter_cases(cases: list[CaseSpec], args: argparse.Namespace) -> list[CaseS
             continue
         filtered.append(case)
     if args.limit_cases is not None:
-        filtered = filtered[:args.limit_cases]
+        filtered = filtered[: args.limit_cases]
     return filtered
 
 
@@ -644,8 +636,7 @@ def _build_longbench_prompt(
     )
 
 
-def _score_longbench_one(dataset: str, prediction: str,
-                         row: dict[str, Any]) -> float:
+def _score_longbench_one(dataset: str, prediction: str, row: dict[str, Any]) -> float:
     sys.path.insert(0, str(LONG_BENCH_ROOT.resolve()))
     from eval import dataset2metric  # type: ignore
 
@@ -780,7 +771,7 @@ def _make_exact_prompt_token_ids_from_parts(
         filler_ids = prefix_ids or suffix_ids
     while len(token_ids) < len(prefix_ids) + remaining:
         token_ids.extend(filler_ids)
-    token_ids = token_ids[:len(prefix_ids) + remaining]
+    token_ids = token_ids[: len(prefix_ids) + remaining]
     token_ids.extend(suffix_ids)
     return token_ids[:target_len]
 
@@ -809,8 +800,7 @@ def _make_coding_prompt_token_ids(tokenizer: Any, target_len: int) -> list[int]:
     )
 
 
-def _make_speed_prompt_token_ids(tokenizer: Any,
-                                 args: argparse.Namespace) -> list[int]:
+def _make_speed_prompt_token_ids(tokenizer: Any, args: argparse.Namespace) -> list[int]:
     if args.speed_prompt == "synthetic":
         return _make_exact_prompt_token_ids(tokenizer, args.speed_input_len)
     if args.speed_prompt == "coding":
@@ -824,8 +814,9 @@ def _safe_delta(end: float | None, start: float | None) -> float | None:
     return end - start
 
 
-def _request_metrics(output: Any, elapsed_s: float | None,
-                     prompt_tokens: int) -> dict[str, Any]:
+def _request_metrics(
+    output: Any, elapsed_s: float | None, prompt_tokens: int
+) -> dict[str, Any]:
     metrics = getattr(output, "metrics", None)
     completion = output.outputs[0]
     output_tokens = len(completion.token_ids)
@@ -851,15 +842,11 @@ def _request_metrics(output: Any, elapsed_s: float | None,
         "prefill_tps": prompt_tokens / prefill_time if prefill_time else None,
         "steady_decode_tokens": steady_tokens,
         "steady_decode_tps": (
-            steady_tokens / decode_time
-            if decode_time and steady_tokens > 0
-            else None
+            steady_tokens / decode_time if decode_time and steady_tokens > 0 else None
         ),
         "first_token_latency_s": getattr(metrics, "first_token_latency", None),
         "ttft_s": ttft_s,
-        "finish_num_generation_tokens": getattr(
-            metrics, "num_generation_tokens", None
-        ),
+        "finish_num_generation_tokens": getattr(metrics, "num_generation_tokens", None),
         "is_corrupted": getattr(metrics, "is_corrupted", None),
     }
 
@@ -910,7 +897,7 @@ def _max_repeated_window(text: str, width: int) -> int:
         return 0
     counts: dict[str, int] = {}
     for idx in range(0, len(normalized) - width + 1):
-        window = normalized[idx:idx + width]
+        window = normalized[idx : idx + width]
         if len(window.strip()) < width // 2:
             continue
         counts[window] = counts.get(window, 0) + 1
@@ -959,6 +946,10 @@ def _quality_metrics(
         "max_digit_run": _longest_char_run(text, str.isdigit),
         "max_same_char_run": _longest_same_char_run(text),
         "repeat20": _max_repeated_window(text, 20),
+        # Short HTML/code fragments legitimately repeat in large generated
+        # applications. Scale this guard with output size; the longer-window
+        # and token-run checks below still catch actual degeneration.
+        "repeat20_limit": max(80, len(text) // 200),
         "repeat50": _max_repeated_window(text, 50),
         "repeat100": _max_repeated_window(text, 100),
         "max_same_line_run": _max_same_line_run(text),
@@ -974,7 +965,7 @@ def _quality_metrics(
         failures.append("digit_run")
     if metrics["max_same_char_run"] > 120:
         failures.append("same_char_run")
-    if metrics["repeat20"] > 80:
+    if metrics["repeat20"] > metrics["repeat20_limit"]:
         failures.append("repeat20")
     if metrics["repeat50"] > 40:
         failures.append("repeat50")
@@ -987,6 +978,43 @@ def _quality_metrics(
     metrics["failures"] = failures
     metrics["passed"] = not failures
     return metrics
+
+
+def _fixed_quality_contract_failures(
+    prompt_id: str,
+    text: str,
+    finish_reason: str,
+) -> list[str]:
+    failures = []
+    if finish_reason != "stop":
+        failures.append("did_not_naturally_stop")
+
+    if prompt_id != "macos_6k_code":
+        return failures
+
+    lowered = text.lower()
+    required_html = (
+        "<!doctype html",
+        "<html",
+        "</html>",
+        "<style",
+        "</style>",
+        "<script",
+        "</script>",
+        "<body",
+        "</body>",
+    )
+    if any(fragment not in lowered for fragment in required_html):
+        failures.append("incomplete_html_document")
+    if text.count("```") % 2:
+        failures.append("unclosed_code_fence")
+    if re.search(
+        r"(?im)^\s*(?:meta|div|span|script|button|input|textarea|section|nav|"
+        r"main|header|footer)(?:>|\s+[A-Za-z_:][\w:.-]*\s*=[^<\n]*>)",
+        text,
+    ):
+        failures.append("malformed_html_tag_line")
+    return failures
 
 
 def _output_record(request_output: Any) -> tuple[str, list[int], str, Any]:
@@ -1004,7 +1032,7 @@ def _sync_cuda() -> None:
         import torch
 
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
     except Exception:
         return
 
@@ -1042,7 +1070,7 @@ def _speculative_config(case: CaseSpec) -> dict[str, Any] | None:
         draft_attention_backend = (
             "TURBOQUANT"
             if case.kv_cache_dtype.startswith("turboquant")
-            else "TRITON_ATTN"
+            else "FLASH_ATTN_V100"
         )
         return {
             "method": "mtp",
@@ -1172,15 +1200,17 @@ def _run_prefix_probe(
         _sync_cuda()
         elapsed_s = time.perf_counter() - start
         text, token_ids, finish_reason, stop_reason = _output_record(outputs[0])
-        records.append({
-            "repeat": idx + 1,
-            "finish_reason": finish_reason,
-            "stop_reason": stop_reason,
-            "metrics": _request_metrics(outputs[0], elapsed_s, len(prompt_ids)),
-            "num_cached_tokens": getattr(outputs[0], "num_cached_tokens", None),
-            "token_hash": _sha256_ids(token_ids),
-            "text_hash": _sha256_text(text),
-        })
+        records.append(
+            {
+                "repeat": idx + 1,
+                "finish_reason": finish_reason,
+                "stop_reason": stop_reason,
+                "metrics": _request_metrics(outputs[0], elapsed_s, len(prompt_ids)),
+                "num_cached_tokens": getattr(outputs[0], "num_cached_tokens", None),
+                "token_hash": _sha256_ids(token_ids),
+                "text_hash": _sha256_text(text),
+            }
+        )
     first_ttft = records[0]["metrics"].get("ttft_s")
     second_ttft = records[1]["metrics"].get("ttft_s")
     ttft_ratio = second_ttft / first_ttft if first_ttft and second_ttft else None
@@ -1196,8 +1226,7 @@ def _run_prefix_probe(
         failure_reasons.append("missing_ttft")
     elif ttft_ratio > args.prefix_probe_max_ttft_ratio:
         failure_reasons.append(
-            f"ttft_ratio {ttft_ratio:.4f} > "
-            f"{args.prefix_probe_max_ttft_ratio:.4f}"
+            f"ttft_ratio {ttft_ratio:.4f} > {args.prefix_probe_max_ttft_ratio:.4f}"
         )
     if not token_hash_match:
         failure_reasons.append("token_hash_mismatch")
@@ -1230,7 +1259,8 @@ def _run_quality_phase(
     generation_config = _load_generation_config(case.model.path)
     selected_prompt_ids = set(_parse_tuple_arg(args.quality_prompt_id, ()))
     quality_prompts = [
-        prompt for prompt in QUALITY_PROMPTS
+        prompt
+        for prompt in QUALITY_PROMPTS
         if not selected_prompt_ids or prompt["id"] in selected_prompt_ids
     ]
     missing = selected_prompt_ids - {prompt["id"] for prompt in quality_prompts}
@@ -1259,6 +1289,15 @@ def _run_quality_phase(
             _sync_cuda()
             elapsed_s = time.perf_counter() - start
             text, token_ids, finish_reason, stop_reason = _output_record(request)
+            metrics = _quality_metrics(text, token_ids)
+            metrics["failures"].extend(
+                _fixed_quality_contract_failures(
+                    prompt["id"],
+                    text,
+                    finish_reason,
+                )
+            )
+            metrics["passed"] = not metrics["failures"]
             record = {
                 "id": prompt["id"],
                 "repeat": repeat_idx + 1,
@@ -1270,7 +1309,7 @@ def _run_quality_phase(
                     elapsed_s,
                     len(request.prompt_token_ids or []),
                 ),
-                "metrics": _quality_metrics(text, token_ids),
+                "metrics": metrics,
                 "preview": text[:1200],
                 "tail": text[-1200:],
             }
@@ -1332,23 +1371,25 @@ def _run_public_quality_phase(
             elapsed_s = time.perf_counter() - start
             text, token_ids, finish_reason, stop_reason = _output_record(request)
             metrics = _quality_metrics(text, token_ids, min_tokens=8)
-            records.append({
-                "dataset": dataset,
-                "ordinal": ordinal,
-                "source_index": row.get("_source_index"),
-                "task_id": row.get("task_id") or row.get("key"),
-                "finish_reason": finish_reason,
-                "stop_reason": stop_reason,
-                "prompt_tokens": len(request.prompt_token_ids or []),
-                "request_metrics": _request_metrics(
-                    request,
-                    elapsed_s,
-                    len(request.prompt_token_ids or []),
-                ),
-                "metrics": metrics,
-                "preview": text[:1200],
-                "tail": text[-1200:],
-            })
+            records.append(
+                {
+                    "dataset": dataset,
+                    "ordinal": ordinal,
+                    "source_index": row.get("_source_index"),
+                    "task_id": row.get("task_id") or row.get("key"),
+                    "finish_reason": finish_reason,
+                    "stop_reason": stop_reason,
+                    "prompt_tokens": len(request.prompt_token_ids or []),
+                    "request_metrics": _request_metrics(
+                        request,
+                        elapsed_s,
+                        len(request.prompt_token_ids or []),
+                    ),
+                    "metrics": metrics,
+                    "preview": text[:1200],
+                    "tail": text[-1200:],
+                }
+            )
             print(
                 f"[public-quality] {dataset} {ordinal + 1}/{len(rows)} "
                 f"passed={metrics['passed']}",
@@ -1416,19 +1457,21 @@ def _run_gsm8k_phase(
         correct += int(is_correct)
         invalid += int(pred == INVALID_GSM8K_ANSWER)
         total_output_tokens += len(token_ids)
-        records.append({
-            "ordinal": idx,
-            "source_index": rows[idx].get("_source_index"),
-            "label": labels[idx],
-            "prediction": pred,
-            "correct": is_correct,
-            "invalid": pred == INVALID_GSM8K_ANSWER,
-            "finish_reason": finish_reason,
-            "stop_reason": stop_reason,
-            "output_tokens": len(token_ids),
-            "quality_metrics": _quality_metrics(text, token_ids, min_tokens=1),
-            "preview": text[:800],
-        })
+        records.append(
+            {
+                "ordinal": idx,
+                "source_index": rows[idx].get("_source_index"),
+                "label": labels[idx],
+                "prediction": pred,
+                "correct": is_correct,
+                "invalid": pred == INVALID_GSM8K_ANSWER,
+                "finish_reason": finish_reason,
+                "stop_reason": stop_reason,
+                "output_tokens": len(token_ids),
+                "quality_metrics": _quality_metrics(text, token_ids, min_tokens=1),
+                "preview": text[:800],
+            }
+        )
     num_questions = len(records)
     accuracy = correct / num_questions if num_questions else None
     invalid_rate = invalid / num_questions if num_questions else None
@@ -1518,31 +1561,33 @@ def _run_longbench_phase(
             prediction = completion.text
             score = _score_longbench_one(dataset, prediction, row)
             token_ids = list(completion.token_ids)
-            records.append({
-                "dataset": dataset,
-                "ordinal": ordinal,
-                "source_index": row["_source_index"],
-                "id": row.get("_id"),
-                "length": row.get("length"),
-                "prompt_tokens": prompt_tokens,
-                "answers": row["answers"],
-                "all_classes": row.get("all_classes", []),
-                "score": score,
-                "output_tokens": len(token_ids),
-                "finish_reason": completion.finish_reason,
-                "request_metrics": _request_metrics(
-                    request_output,
-                    elapsed_s,
-                    prompt_tokens,
-                ),
-                "quality_metrics": _quality_metrics(
-                    prediction,
-                    token_ids,
-                    min_tokens=1,
-                ),
-                "prediction_preview": prediction[:1200],
-                "prediction_tail": prediction[-1200:],
-            })
+            records.append(
+                {
+                    "dataset": dataset,
+                    "ordinal": ordinal,
+                    "source_index": row["_source_index"],
+                    "id": row.get("_id"),
+                    "length": row.get("length"),
+                    "prompt_tokens": prompt_tokens,
+                    "answers": row["answers"],
+                    "all_classes": row.get("all_classes", []),
+                    "score": score,
+                    "output_tokens": len(token_ids),
+                    "finish_reason": completion.finish_reason,
+                    "request_metrics": _request_metrics(
+                        request_output,
+                        elapsed_s,
+                        prompt_tokens,
+                    ),
+                    "quality_metrics": _quality_metrics(
+                        prediction,
+                        token_ids,
+                        min_tokens=1,
+                    ),
+                    "prediction_preview": prediction[:1200],
+                    "prediction_tail": prediction[-1200:],
+                }
+            )
             print(
                 f"[longbench] {dataset} {ordinal + 1}/{len(selected)} "
                 f"score={100.0 * score:.2f} prompt_tokens={prompt_tokens}",
@@ -1567,20 +1612,19 @@ def _run_longbench_phase(
         "average_score": (
             round(statistics.mean(dataset_scores), 4) if dataset_scores else None
         ),
-        "passed_garble": all(
-            record["quality_metrics"]["passed"] for record in records
-        ),
+        "passed_garble": all(record["quality_metrics"]["passed"] for record in records),
     }
 
 
 def _run_worker(args: argparse.Namespace) -> int:
     case = CaseSpec.from_jsonable(json.loads(args.case_json))
     out_path = args.out
-    phases = set(_parse_tuple_arg(
-        args.phase,
-        ("speed", "prefix", "quality", "public_quality", "gsm8k",
-         "longbench"),
-    ))
+    phases = set(
+        _parse_tuple_arg(
+            args.phase,
+            ("speed", "prefix", "quality", "public_quality", "gsm8k", "longbench"),
+        )
+    )
 
     def write_checkpoint() -> None:
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
@@ -1615,13 +1659,15 @@ def _run_worker(args: argparse.Namespace) -> int:
         result["env"] = {
             key: value
             for key, value in sorted(os.environ.items())
-            if key.startswith((
-                "CUDA_",
-                "VLLM_",
-                "TORCHINDUCTOR_",
-                "TRITON_",
-                "PYTHONPATH",
-            ))
+            if key.startswith(
+                (
+                    "CUDA_",
+                    "VLLM_",
+                    "TORCHINDUCTOR_",
+                    "TRITON_",
+                    "PYTHONPATH",
+                )
+            )
         }
         start = time.perf_counter()
         llm = LLM(**llm_kwargs)
@@ -1738,19 +1784,19 @@ def _parse_spec_decode_metrics(log_text: str) -> dict[str, Any]:
     samples = []
     for match in line_re.finditer(log_text):
         per_pos = [
-            float(item.strip())
-            for item in match.group(6).split(",")
-            if item.strip()
+            float(item.strip()) for item in match.group(6).split(",") if item.strip()
         ]
-        samples.append({
-            "acceptance_length": float(match.group(1)),
-            "accepted_throughput": float(match.group(2)),
-            "drafted_throughput": float(match.group(3)),
-            "accepted_tokens": int(match.group(4)),
-            "drafted_tokens": int(match.group(5)),
-            "per_position_acceptance_rate": per_pos,
-            "draft_acceptance_rate_pct": float(match.group(7)),
-        })
+        samples.append(
+            {
+                "acceptance_length": float(match.group(1)),
+                "accepted_throughput": float(match.group(2)),
+                "drafted_throughput": float(match.group(3)),
+                "accepted_tokens": int(match.group(4)),
+                "drafted_tokens": int(match.group(5)),
+                "per_position_acceptance_rate": per_pos,
+                "draft_acceptance_rate_pct": float(match.group(7)),
+            }
+        )
     if not samples:
         return {"samples": [], "found": False}
     total_accepted = sum(sample["accepted_tokens"] for sample in samples)
@@ -1764,7 +1810,8 @@ def _parse_spec_decode_metrics(log_text: str) -> dict[str, Any]:
         1.0 + total_accepted / total_drafts if total_drafts > 0 else None
     )
     all_one_plateau_samples = [
-        sample for sample in samples
+        sample
+        for sample in samples
         if sample["per_position_acceptance_rate"]
         and all(rate >= 0.999 for rate in sample["per_position_acceptance_rate"])
     ]
@@ -1877,9 +1924,7 @@ def _summarize_case(
         "prefill_time_s": speed_metrics.get("prefill_time_s"),
         "decode_tps": speed_metrics.get("steady_decode_tps"),
         "decode_time_s": speed_metrics.get("decode_time_s"),
-        "speed_output_tokens": (
-            data.get("speed") or {}
-        ).get("output_tokens"),
+        "speed_output_tokens": (data.get("speed") or {}).get("output_tokens"),
         "speed_quality_passed": (
             (data.get("speed") or {}).get("quality_metrics") or {}
         ).get("passed"),
@@ -1896,9 +1941,7 @@ def _summarize_case(
             (data.get("prefix_cache_probe") or {}).get("passed")
         ),
         "prefix_ttft_ratio": (
-            (data.get("prefix_cache_probe") or {}).get(
-                "ttft_ratio_second_over_first"
-            )
+            (data.get("prefix_cache_probe") or {}).get("ttft_ratio_second_over_first")
         ),
         "longbench_average_score": longbench.get("average_score"),
         "longbench_garble_passed": longbench.get("passed_garble"),
@@ -1949,14 +1992,17 @@ def _gate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         failures = []
         case = row["case"]
         mode = case["mode"]
-        phases = set(row.get("phases") or (
-            "speed",
-            "prefix",
-            "quality",
-            "public_quality",
-            "gsm8k",
-            "longbench",
-        ))
+        phases = set(
+            row.get("phases")
+            or (
+                "speed",
+                "prefix",
+                "quality",
+                "public_quality",
+                "gsm8k",
+                "longbench",
+            )
+        )
         status = row.get("status")
         decode_tps = row.get("decode_tps")
         prefill_tps = row.get("prefill_tps")
@@ -1971,10 +2017,7 @@ def _gate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 failures.append("speed_output_quality")
         if "quality" in phases and row.get("quality_passed") is not True:
             failures.append("fixed_quality")
-        if (
-            "public_quality" in phases
-            and row.get("public_quality_passed") is not True
-        ):
+        if "public_quality" in phases and row.get("public_quality_passed") is not True:
             failures.append("public_quality")
         if "gsm8k" in phases:
             if row.get("gsm8k_passed") is not True:
@@ -2035,13 +2078,13 @@ def _gate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 failures.append("missing_longbench_score_baseline")
             base_average = (
                 baseline_score.get("longbench_average_score")
-                if baseline_score else None
+                if baseline_score
+                else None
             )
             current_average = row.get("longbench_average_score")
             if (
                 "longbench" in phases
-                and
-                isinstance(base_average, (int, float))
+                and isinstance(base_average, (int, float))
                 and isinstance(current_average, (int, float))
                 and current_average < 0.85 * base_average
             ):
@@ -2052,8 +2095,7 @@ def _gate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             current_gsm8k = row.get("gsm8k_accuracy")
             if (
                 "gsm8k" in phases
-                and
-                isinstance(base_gsm8k, (int, float))
+                and isinstance(base_gsm8k, (int, float))
                 and isinstance(current_gsm8k, (int, float))
                 and current_gsm8k < 0.85 * base_gsm8k
             ):
@@ -2133,31 +2175,32 @@ def _write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
             )
         )
     pass_count = sum(1 for row in rows if row.get("gate_passed"))
-    lines.extend([
-        "",
-        f"Cases: {pass_count}/{len(rows)} passed.",
-        "",
-        "Primary gates: every case must load, report speed, pass fixed "
-        "quality prompts, PublicQuality prompts (HumanEval/MBPP/IFEval), "
-        "GSM8K, and LongBench garble checks. Non-baseline KV modes must keep "
-        "decode >=80% and prefill >=70% of auto no-spec. MTP4 must decode "
-        ">=1.25x no-spec with acceptance length >1.5 and no sustained "
-        "all-position 1.000 plateau. DFlash16 must decode >=1.05x no-spec "
-        "with the same acceptance quality gate. GSM8K and LongBench candidate "
-        "routes must keep at least 85% of the auto/no-spec baseline aggregate.",
-    ])
+    lines.extend(
+        [
+            "",
+            f"Cases: {pass_count}/{len(rows)} passed.",
+            "",
+            "Primary gates: every case must load, report speed, pass fixed "
+            "quality prompts, PublicQuality prompts (HumanEval/MBPP/IFEval), "
+            "GSM8K, and LongBench garble checks. Non-baseline KV modes must keep "
+            "decode >=80% and prefill >=70% of auto no-spec. MTP4 must decode "
+            ">=1.25x no-spec with acceptance length >1.5 and no sustained "
+            "all-position 1.000 plateau. DFlash16 must decode >=1.05x no-spec "
+            "with the same acceptance quality gate. GSM8K and LongBench candidate "
+            "routes must keep at least 85% of the auto/no-spec baseline aggregate.",
+        ]
+    )
     (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _default_env(args: argparse.Namespace, case: CaseSpec,
-                 devices: str) -> dict[str, str]:
+def _default_env(
+    args: argparse.Namespace, case: CaseSpec, devices: str
+) -> dict[str, str]:
     env = os.environ.copy()
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["CUDA_VISIBLE_DEVICES"] = devices
     env["PYTHONPATH"] = (
-        f"{REPO_ROOT}:{env['PYTHONPATH']}"
-        if env.get("PYTHONPATH")
-        else str(REPO_ROOT)
+        f"{REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else str(REPO_ROOT)
     )
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_ymzx")
@@ -2169,8 +2212,10 @@ def _default_env(args: argparse.Namespace, case: CaseSpec,
     env["VLLM_SM70_QUANT_BACKEND"] = case.backend
     if case.kv_cache_dtype.startswith("turboquant"):
         env.setdefault("VLLM_SM70_TURBOQUANT_FLASH_V100_DECODE", "0")
-        env.setdefault("VLLM_SM70_TURBOQUANT_CONTINUATION_WORKSPACE_TOKENS",
-                       str(args.max_model_len + args.max_num_batched_tokens))
+        env.setdefault(
+            "VLLM_SM70_TURBOQUANT_CONTINUATION_WORKSPACE_TOKENS",
+            str(args.max_model_len + args.max_num_batched_tokens),
+        )
     if args.extra_env:
         for value in args.extra_env:
             if "=" not in value:
@@ -2188,8 +2233,7 @@ def _case_artifact_paths(out_dir: Path, case: CaseSpec) -> tuple[Path, Path]:
     return cases_dir / f"{case.name}.json", logs_dir / f"{case.name}.log"
 
 
-def _case_result_reusable(data: dict[str, Any],
-                          phases: tuple[str, ...]) -> bool:
+def _case_result_reusable(data: dict[str, Any], phases: tuple[str, ...]) -> bool:
     if not (data.get("complete") and data.get("status") == "completed"):
         return False
     completed_phases = set(data.get("phases_completed") or [])
@@ -2471,37 +2515,46 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-turboquant-mtp",
         action="store_true",
-        help=("Include turboquant_4bit_nc + mtp4 diagnostic cases. "
-              "They are skipped by default because the MTP drafter currently "
-              "inherits TurboQuant KV on SM70."),
+        help=(
+            "Include turboquant_4bit_nc + mtp4 diagnostic cases. "
+            "They are skipped by default because the MTP drafter currently "
+            "inherits TurboQuant KV on SM70."
+        ),
     )
     parser.add_argument(
         "--include-turboquant-dflash",
         action="store_true",
-        help=("Include turboquant_4bit_nc + dflash16 diagnostic cases. "
-              "They are skipped by default because DFlash draft attention is "
-              "non-causal and TurboQuant KV has no non-causal backend on SM70."),
+        help=(
+            "Include turboquant_4bit_nc + dflash16 diagnostic cases. "
+            "They are skipped by default because DFlash draft attention is "
+            "non-causal and TurboQuant KV has no non-causal backend on SM70."
+        ),
     )
     parser.add_argument(
         "--include-fp8-model-fp8-kv-mtp",
         action="store_true",
-        help=("Include FP8-weight model + fp8_e5m2 KV + mtp4 diagnostic cases. "
-              "They are skipped by default because Qwen MTP drafter warmup "
-              "hits an unsupported static_scaled_fp8_quant e5m2 kernel on SM70."),
+        help=(
+            "Deprecated compatibility option. FP8-weight model + fp8_e5m2 "
+            "KV + MTP4 cases are included by default."
+        ),
     )
     parser.add_argument(
         "--include-gemma-turboquant",
         action="store_true",
-        help=("Include Gemma + turboquant_4bit_nc diagnostic cases. They are "
-              "skipped by default because Gemma4 multimodal/text-only attention "
-              "currently rejects the TurboQuant attention backend on SM70."),
+        help=(
+            "Include Gemma + turboquant_4bit_nc diagnostic cases. They are "
+            "skipped by default because Gemma4 multimodal/text-only attention "
+            "currently rejects the TurboQuant attention backend on SM70."
+        ),
     )
     parser.add_argument(
         "--include-gemma-nvfp4-fp8-kv",
         action="store_true",
-        help=("Include Gemma4 NVFP4 + fp8_e5m2 KV diagnostic cases. They are "
-              "skipped by default because this combination is rejected by "
-              "KV-cache quantization validation on SM70."),
+        help=(
+            "Include Gemma4 NVFP4 + fp8_e5m2 KV diagnostic cases. They are "
+            "skipped by default because this combination is rejected by "
+            "KV-cache quantization validation on SM70."
+        ),
     )
     parser.add_argument("--tp", action="append")
     parser.add_argument("--tp-filter", action="append")
@@ -2524,17 +2577,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-output-len", type=int, default=32)
     parser.add_argument("--speed-input-len", type=int, default=4096)
     parser.add_argument("--speed-output-len", type=int, default=1024)
-    parser.add_argument("--speed-prompt",
-                        choices=("coding", "synthetic"),
-                        default="coding")
+    parser.add_argument(
+        "--speed-prompt", choices=("coding", "synthetic"), default="coding"
+    )
     parser.add_argument("--prefix-probe-input-len", type=int, default=2048)
     parser.add_argument("--prefix-probe-output-len", type=int, default=32)
     parser.add_argument(
         "--prefix-probe-max-ttft-ratio",
         type=float,
         default=0.90,
-        help=("Require the second identical prompt TTFT to be at most this "
-              "fraction of the first prompt TTFT during the prefix phase."),
+        help=(
+            "Require the second identical prompt TTFT to be at most this "
+            "fraction of the first prompt TTFT during the prefix phase."
+        ),
     )
     parser.add_argument("--quality-max-tokens", type=int, default=6000)
     parser.add_argument("--quality-repeat", type=int, default=1)
@@ -2544,22 +2599,23 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Store full quality text and token IDs instead of preview/tail only.",
     )
-    parser.add_argument("--public-dataset-cache-dir",
-                        type=Path,
-                        default=DEFAULT_PUBLIC_DATASET_CACHE_DIR)
+    parser.add_argument(
+        "--public-dataset-cache-dir",
+        type=Path,
+        default=DEFAULT_PUBLIC_DATASET_CACHE_DIR,
+    )
     parser.add_argument("--public-quality-dataset", action="append")
     parser.add_argument("--public-quality-limit", type=int, default=5)
     parser.add_argument("--public-quality-max-tokens", type=int, default=768)
-    parser.add_argument("--gsm8k-cache-dir",
-                        type=Path,
-                        default=DEFAULT_GSM8K_CACHE_DIR)
+    parser.add_argument("--gsm8k-cache-dir", type=Path, default=DEFAULT_GSM8K_CACHE_DIR)
     parser.add_argument("--gsm8k-questions", type=int, default=32)
     parser.add_argument("--gsm8k-num-shots", type=int, default=5)
     parser.add_argument("--gsm8k-max-tokens", type=int, default=256)
     parser.add_argument("--sampling-seed", type=int, default=20260620)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--disable-thinking", action="store_false",
-                        dest="enable_thinking")
+    parser.add_argument(
+        "--disable-thinking", action="store_false", dest="enable_thinking"
+    )
     parser.set_defaults(enable_thinking=True)
     parser.add_argument("--longbench-data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--longbench-dataset", action="append")

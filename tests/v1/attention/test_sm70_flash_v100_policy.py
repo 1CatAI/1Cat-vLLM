@@ -906,6 +906,158 @@ def test_flash_v100_fp8_xqa_graph_capture_marker_forces_xqa(monkeypatch):
     assert mod._decode_fp8_xqa_allowed(metadata, torch.empty(1))
 
 
+def test_flash_v100_mtp5_dual_cta_partition_policy(monkeypatch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", raising=False)
+    assert mod._mtp5_xqa_dual_cta_partition_size_hint() == 1024
+
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "0")
+    assert mod._mtp5_xqa_dual_cta_partition_size_hint() is None
+
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "false")
+    assert mod._mtp5_xqa_dual_cta_partition_size_hint() is None
+
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "256")
+    assert mod._mtp5_xqa_dual_cta_partition_size_hint() == 256
+
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "128")
+    with pytest.raises(ValueError, match="must be one of"):
+        mod._mtp5_xqa_dual_cta_partition_size_hint()
+
+
+@pytest.mark.parametrize(("num_heads", "num_kv_heads"), [(6, 1), (12, 2)])
+def test_flash_v100_mtp_verifier_uses_xqa_in_long_graph(
+    monkeypatch,
+    num_heads,
+    num_kv_heads,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", raising=False)
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
+    impl = FlashAttnV100Impl(
+        num_heads=num_heads,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+
+    calls: list[tuple[str, int | None]] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append(("xqa", kwargs.get("partition_size_hint")))
+        kwargs["out"].fill_(1)
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("long-graph MTP verifier should use XQA")
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
+    smallq_seq_lens = torch.tensor(
+        [65532, 65533, 65534, 65535, 65536], dtype=torch.int32
+    )
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=5,
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([65536], dtype=torch.int32),
+        smallq_decode_block_table=torch.zeros((5, 1), dtype=torch.int32),
+        smallq_decode_seq_lens=smallq_seq_lens,
+        smallq_query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        smallq_decode_max_seq_len_hint=5,
+        smallq_decode_workspace_seq_capacity_hint=262144,
+        smallq_decode_partition_size_hint=None,
+        flash_v100_cudagraph_capture=True,
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((5, num_heads, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((1, 1616, num_kv_heads, 256), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+
+    result = impl._flash_v100_small_query_prefill_as_decode(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        attn_metadata.smallq_query_start_loc,
+        attn_metadata.seq_lens,
+    )
+
+    assert result is output
+    assert calls == [("xqa", 1024)]
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_mtp_context_bucket_keeps_scalar_verifier(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", raising=False)
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+
+    calls: list[str] = []
+
+    def fail_xqa(*args, **kwargs):
+        raise AssertionError("P256 context-bucket verifier must stay scalar")
+
+    def hit_scalar(*args, **kwargs):
+        calls.append("scalar")
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = fail_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=5,
+        query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([768], dtype=torch.int32),
+        smallq_decode_block_table=torch.zeros((5, 1), dtype=torch.int32),
+        smallq_decode_seq_lens=torch.tensor(
+            [764, 765, 766, 767, 768], dtype=torch.int32
+        ),
+        smallq_query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
+        smallq_decode_max_seq_len_hint=5,
+        smallq_decode_workspace_seq_capacity_hint=4096,
+        smallq_decode_partition_size_hint=256,
+        flash_v100_cudagraph_capture=True,
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((5, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((1, 1616, 1, 256), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+
+    result = impl._flash_v100_small_query_prefill_as_decode(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        attn_metadata.smallq_query_start_loc,
+        attn_metadata.seq_lens,
+    )
+
+    assert result is output
+    assert calls == ["scalar"]
+    assert torch.all(output == 1)
+
+
 def test_flash_v100_decode_uses_xqa_for_qwen35_tp4_long_context(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 

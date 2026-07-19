@@ -87,7 +87,7 @@ def _rejection_profile_report(
         ) + start.elapsed_time(end)
     _REJECTION_PROFILE_INTERVAL_CALLS += 1
     interval = _rejection_profile_interval()
-    if _REJECTION_PROFILE_INTERVAL_CALLS < interval:
+    if interval > _REJECTION_PROFILE_INTERVAL_CALLS:
         return
 
     parts = [
@@ -156,12 +156,10 @@ def _token_matching_sampling_enabled(
         for processor in sampling_metadata.logitsprocs.argmax_invariant
     ):
         return False
-    if any(
+    return not any(
         not _token_matching_processor_safe(processor)
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant
-    ):
-        return False
-    return True
+    )
 
 
 def _combined_bonus_sampling_enabled(
@@ -189,12 +187,10 @@ def _combined_bonus_sampling_enabled(
         for processor in sampling_metadata.logitsprocs.argmax_invariant
     ):
         return False
-    if any(
+    return not any(
         not _token_matching_processor_safe(processor)
         for processor in sampling_metadata.logitsprocs.non_argmax_invariant
-    ):
-        return False
-    return True
+    )
 
 
 class RejectionSampler(nn.Module):
@@ -307,7 +303,9 @@ class RejectionSampler(nn.Module):
         ):
             return self._sample_by_token_matching(metadata, logits, sampling_metadata)
 
-        profile_events = [] if _rejection_profile_enabled() else None
+        profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
+            ([]) if _rejection_profile_enabled() else None
+        )
         profile_total_start = _rejection_profile_start(profile_events)
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices

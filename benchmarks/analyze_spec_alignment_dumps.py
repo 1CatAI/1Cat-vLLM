@@ -17,11 +17,11 @@ import argparse
 import glob
 import json
 import math
-import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 
 PLACEHOLDER_TOKEN_ID = -1
@@ -192,9 +192,7 @@ def summarize(pattern: str) -> dict[str, Any]:
         rows = [row for row in token_rows if row["position"] == pos]
         caps = [row["acceptance_cap"] for row in rows if "acceptance_cap" in row]
         overlaps = [
-            row["distribution_overlap"]
-            for row in rows
-            if "distribution_overlap" in row
+            row["distribution_overlap"] for row in rows if "distribution_overlap" in row
         ]
         ranks = [row["target_top10_rank"] for row in rows if "target_top10_rank" in row]
         target_ps = [
@@ -275,12 +273,15 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"- Deduped sampler steps: `{meta['num_deduped_steps']}`",
         f"- PIDs: `{', '.join(meta['pids'])}`",
         f"- Duplicate mismatches: `{meta['num_duplicate_mismatches']}`",
-        f"- Step range: `{meta.get('first_step', '-')}` to `{meta.get('last_step', '-')}`",
+        f"- Step range: `{meta.get('first_step', '-')}` to "
+        f"`{meta.get('last_step', '-')}`",
         "",
         "## Round Summary",
         "",
-        f"- Mean output tokens per round: `{overview['mean_output_tokens_per_round']:.4f}`",
-        f"- Mean accepted draft tokens per round: `{overview['mean_accepted_draft_tokens_per_round']:.4f}`",
+        "- Mean output tokens per round: "
+        f"`{overview['mean_output_tokens_per_round']:.4f}`",
+        "- Mean accepted draft tokens per round: "
+        f"`{overview['mean_accepted_draft_tokens_per_round']:.4f}`",
         f"- Total output tokens: `{overview['total_output_tokens']}`",
         f"- Total accepted draft tokens: `{overview['total_accepted_draft_tokens']}`",
         f"- Accepted-draft histogram: `{overview['accepted_draft_count_histogram']}`",
@@ -288,7 +289,9 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Per-Position Summary",
         "",
-        "| pos | prefix accept | mean overlap | p50 overlap | p10 overlap | mean cap | p50 cap | cap < 0.5 | target top10 miss | q(draft)>p(target) |",
+        "| pos | prefix accept | mean overlap | p50 overlap | p10 overlap | "
+        "mean cap | p50 cap | cap < 0.5 | target top10 miss | "
+        "q(draft)>p(target) |",
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summary["per_position"]:

@@ -17,12 +17,13 @@ import dataclasses
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -125,9 +126,7 @@ def _load_quality_prompts(path: Path | None) -> list[dict[str, str]]:
             prompt_id = str(raw_id)
             content = raw_content
         else:
-            raise TypeError(
-                "--quality-prompts-json entries must be strings or objects"
-            )
+            raise TypeError("--quality-prompts-json entries must be strings or objects")
         prompts.append({"id": prompt_id, "content": content})
 
     ids = [prompt["id"] for prompt in prompts]
@@ -228,8 +227,9 @@ def _safe_delta(end: float, start: float) -> float | None:
     return end - start
 
 
-def _request_metrics(metrics: Any, prompt_tokens: int,
-                     output_tokens: int) -> dict[str, Any] | None:
+def _request_metrics(
+    metrics: Any, prompt_tokens: int, output_tokens: int
+) -> dict[str, Any] | None:
     if metrics is None:
         return None
     prefill_time = _safe_delta(metrics.first_token_ts, metrics.scheduled_ts)
@@ -240,14 +240,10 @@ def _request_metrics(metrics: Any, prompt_tokens: int,
         "output_tokens": output_tokens,
         "prefill_time_s": prefill_time,
         "decode_time_s": decode_time,
-        "prefill_tps": (
-            prompt_tokens / prefill_time if prefill_time else None
-        ),
+        "prefill_tps": (prompt_tokens / prefill_time if prefill_time else None),
         "steady_decode_tokens": steady_tokens,
         "steady_decode_tps": (
-            steady_tokens / decode_time
-            if decode_time and steady_tokens > 0
-            else None
+            steady_tokens / decode_time if decode_time and steady_tokens > 0 else None
         ),
         "first_token_latency_s": metrics.first_token_latency,
         "finish_num_generation_tokens": metrics.num_generation_tokens,
@@ -301,7 +297,7 @@ def _max_repeated_window(text: str, width: int) -> int:
         return 0
     counts: dict[str, int] = {}
     for idx in range(0, len(normalized) - width + 1):
-        window = normalized[idx:idx + width]
+        window = normalized[idx : idx + width]
         if len(window.strip()) < width // 2:
             continue
         counts[window] = counts.get(window, 0) + 1
@@ -345,6 +341,7 @@ def _quality_metrics(text: str, token_ids: list[int]) -> dict[str, Any]:
         "max_digit_run": _longest_char_run(text, str.isdigit),
         "max_same_char_run": _longest_same_char_run(text),
         "repeat20": _max_repeated_window(text, 20),
+        "repeat20_limit": max(80, len(text) // 200),
         "repeat50": _max_repeated_window(text, 50),
         "repeat100": _max_repeated_window(text, 100),
         "max_same_line_run": _max_same_line_run(text),
@@ -360,7 +357,7 @@ def _quality_metrics(text: str, token_ids: list[int]) -> dict[str, Any]:
         failures.append("digit_run")
     if metrics["max_same_char_run"] > 120:
         failures.append("same_char_run")
-    if metrics["repeat20"] > 80:
+    if metrics["repeat20"] > metrics["repeat20_limit"]:
         failures.append("repeat20")
     if metrics["repeat50"] > 40:
         failures.append("repeat50")
@@ -449,7 +446,8 @@ def _run_worker(args: argparse.Namespace) -> int:
     )
     speed_wall_s = time.perf_counter() - start
     speed_text, speed_token_ids, finish_reason, stop_reason = _output_record(
-        speed_outputs[0])
+        speed_outputs[0]
+    )
     speed_metrics = _request_metrics(
         speed_outputs[0].metrics,
         len(speed_prompt_ids),
@@ -487,19 +485,19 @@ def _run_worker(args: argparse.Namespace) -> int:
         )
         for repeat_idx in range(args.quality_repeat):
             request = llm.generate([chat_prompt], official_sampling)[0]
-            text, token_ids, q_finish_reason, q_stop_reason = _output_record(
-                request
+            text, token_ids, q_finish_reason, q_stop_reason = _output_record(request)
+            quality_records.append(
+                {
+                    "id": prompt["id"],
+                    "repeat": repeat_idx + 1,
+                    "finish_reason": q_finish_reason,
+                    "stop_reason": q_stop_reason,
+                    "prompt_tokens": len(request.prompt_token_ids or []),
+                    "metrics": _quality_metrics(text, token_ids),
+                    "preview": text[:1000],
+                    "tail": text[-1000:],
+                }
             )
-            quality_records.append({
-                "id": prompt["id"],
-                "repeat": repeat_idx + 1,
-                "finish_reason": q_finish_reason,
-                "stop_reason": q_stop_reason,
-                "prompt_tokens": len(request.prompt_token_ids or []),
-                "metrics": _quality_metrics(text, token_ids),
-                "preview": text[:1000],
-                "tail": text[-1000:],
-            })
 
     det_prompt = _make_chat_prompt(
         tokenizer,
@@ -517,12 +515,14 @@ def _run_worker(args: argparse.Namespace) -> int:
     det_records = []
     for output in det_outputs:
         text, token_ids, det_finish_reason, det_stop_reason = _output_record(output)
-        det_records.append({
-            "finish_reason": det_finish_reason,
-            "stop_reason": det_stop_reason,
-            "metrics": _quality_metrics(text, token_ids),
-            "preview": text[:800],
-        })
+        det_records.append(
+            {
+                "finish_reason": det_finish_reason,
+                "stop_reason": det_stop_reason,
+                "metrics": _quality_metrics(text, token_ids),
+                "preview": text[:800],
+            }
+        )
     deterministic_exact = (
         det_records[0]["metrics"]["token_hash"]
         == det_records[1]["metrics"]["token_hash"]
@@ -547,13 +547,15 @@ def _run_worker(args: argparse.Namespace) -> int:
         "env": {
             key: value
             for key, value in sorted(os.environ.items())
-            if key.startswith((
-                "CUDA_",
-                "VLLM_",
-                "TORCHINDUCTOR_",
-                "TRITON_",
-                "PYTHONPATH",
-            ))
+            if key.startswith(
+                (
+                    "CUDA_",
+                    "VLLM_",
+                    "TORCHINDUCTOR_",
+                    "TRITON_",
+                    "PYTHONPATH",
+                )
+            )
         },
         "generation_config": generation_config,
         "load_seconds": load_seconds,
@@ -588,17 +590,18 @@ def _run_worker(args: argparse.Namespace) -> int:
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    print(json.dumps({
-        "case": args.case_name,
-        "quality_passed": case_quality_passed,
-        "prefill_tps": (
-            speed_metrics or {}
-        ).get("prefill_tps"),
-        "steady_decode_tps": (
-            speed_metrics or {}
-        ).get("steady_decode_tps"),
-        "out": str(args.out),
-    }, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "case": args.case_name,
+                "quality_passed": case_quality_passed,
+                "prefill_tps": (speed_metrics or {}).get("prefill_tps"),
+                "steady_decode_tps": (speed_metrics or {}).get("steady_decode_tps"),
+                "out": str(args.out),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0 if case_quality_passed and speed_metrics else 2
 
 
@@ -623,8 +626,7 @@ def _spec_tokens_from_case_name(case_name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def _summarize_case(path: Path, log_path: Path,
-                    returncode: int) -> dict[str, Any]:
+def _summarize_case(path: Path, log_path: Path, returncode: int) -> dict[str, Any]:
     if not path.exists():
         return {
             "case": path.stem,
@@ -659,9 +661,9 @@ def _summarize_case(path: Path, log_path: Path,
         "decode_time_s": speed_metrics.get("decode_time_s"),
         "speed_output_tokens": (data.get("speed") or {}).get("output_tokens"),
         "quality_passed": quality.get("passed"),
-        "deterministic_exact": (
-            quality.get("determinism") or {}
-        ).get("exact_token_match"),
+        "deterministic_exact": (quality.get("determinism") or {}).get(
+            "exact_token_match"
+        ),
         "failed_prompts": failed_prompts,
         "kv_capacity": _parse_kv_capacity(log_text),
         "json": str(path),
@@ -709,12 +711,14 @@ def _write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
                 artifact=Path(row.get("json", "")).name,
             )
         )
-    lines.extend([
-        "",
-        "Quality gates: official generation_config sampling, no ignore_eos; "
-        "fatal gates are repeated windows, long digit/same-token runs, bad "
-        "markers, and greedy repeat determinism mismatch.",
-    ])
+    lines.extend(
+        [
+            "",
+            "Quality gates: official generation_config sampling, no ignore_eos; "
+            "fatal gates are repeated windows, long digit/same-token runs, bad "
+            "markers, and greedy repeat determinism mismatch.",
+        ]
+    )
     (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -723,9 +727,7 @@ def _default_env(args: argparse.Namespace) -> dict[str, str]:
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     env["PYTHONPATH"] = (
-        f"{REPO_ROOT}:{env['PYTHONPATH']}"
-        if env.get("PYTHONPATH")
-        else str(REPO_ROOT)
+        f"{REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else str(REPO_ROOT)
     )
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_ymzx")
     env.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
@@ -803,10 +805,12 @@ def _run_matrix(args: argparse.Namespace) -> int:
             for prompt_id in args.quality_prompt_id or []:
                 cmd.extend(["--quality-prompt-id", prompt_id])
             if args.quality_prompts_json is not None:
-                cmd.extend([
-                    "--quality-prompts-json",
-                    str(args.quality_prompts_json),
-                ])
+                cmd.extend(
+                    [
+                        "--quality-prompts-json",
+                        str(args.quality_prompts_json),
+                    ]
+                )
             print(f"[matrix] running {case_name}", flush=True)
             with log_path.open("w", encoding="utf-8") as log_file:
                 proc = subprocess.run(
@@ -862,9 +866,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sampling-seed", type=int, default=20260617)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--speculative-tokens", type=int, default=0)
-    parser.add_argument("--disable-thinking",
-                        action="store_false",
-                        dest="enable_thinking")
+    parser.add_argument(
+        "--disable-thinking", action="store_false", dest="enable_thinking"
+    )
     parser.set_defaults(enable_thinking=True)
     parser.add_argument("--engine-arg", action="append", default=[])
     parser.add_argument("--out", type=Path)

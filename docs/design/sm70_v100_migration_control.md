@@ -59,13 +59,13 @@ Main implementation priority:
   noise only after proof. This includes multi-partition/block online softmax vs
   single-pass reference, or Flash vs Triton comparisons where arithmetic order
   genuinely differs. Acceptance requires all of:
-  - input alignment is proven first: KV source, `cu_seqlens`, block table, mask,
+    - input alignment is proven first: KV source, `cu_seqlens`, block table, mask,
     and raw-vs-cache data are not the source of the diff;
-  - the diff source is proven to be reduction order or different fp16 rounding;
-  - the dtype-specific bound is satisfied: fp32 comparison `<= 1e-5`, fp16
+    - the diff source is proven to be reduction order or different fp16 rounding;
+    - the dtype-specific bound is satisfied: fp32 comparison `<= 1e-5`, fp16
     output around `<= 2e-3`, bf16 output around `<= 1e-2`. The bound is chosen
     from path class plus dtype, never reverse-fit from the observed result;
-  - the diff does not grow monotonically with sequence length.
+    - the diff does not grow monotonically with sequence length.
 - The mechanical classifier is: rerun the reference with the same
   block/partition tiling as the tested path. If the diff goes to zero, classify
   the original nonzero as Type B reduction-order noise. If it remains nonzero,
@@ -195,9 +195,9 @@ Safe XQA decode recovery update, 2026-06-21:
   this route cannot use `active_num_partitions` to truncate attention.
 - Direct V100 operator check, TP2 27B-like shape
   (`B=1`, `H=12`, `Hkv=2`, `D=256`, page size `784`):
-  - 16K scalar `0.239565 ms`, XQA `0.164296 ms`, `1.46x`, `maxdiff=3.05e-5`.
-  - 64K scalar `0.811540 ms`, XQA `0.616806 ms`, `1.32x`, `maxdiff=1.53e-5`.
-  - Stale-active check: `active=1` vs correct active partitions produced
+    - 16K scalar `0.239565 ms`, XQA `0.164296 ms`, `1.46x`, `maxdiff=3.05e-5`.
+    - 64K scalar `0.811540 ms`, XQA `0.616806 ms`, `1.32x`, `maxdiff=1.53e-5`.
+    - Stale-active check: `active=1` vs correct active partitions produced
     `torch.equal=True`, `maxdiff=0.0`.
 - Qwen3.6-27B-AWQ TP2 no-MTP endpoint A/B, output 256, same token hashes:
   `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_scalar_i16k_64k_o256_tp2_20260621.json`
@@ -214,9 +214,9 @@ Follow-up on the old flat-decode target, 2026-06-21:
 
 - Direct 0.0.5 XQA op reproduction with forced stale `active_num_partitions=1`
   reproduces the flat-speed shape but not correctness:
-  - 16K correct active `64`: `0.161162 ms`; stale active `1`: `0.059950 ms`;
+    - 16K correct active `64`: `0.161162 ms`; stale active `1`: `0.059950 ms`;
     `maxdiff=0.43686676025390625`.
-  - 64K correct active `256`: `0.614943 ms`; stale active `1`: `0.059853 ms`;
+    - 64K correct active `256`: `0.614943 ms`; stale active `1`: `0.059853 ms`;
     `maxdiff=0.3969764709472656`.
 - This is the only reproduced mechanism so far that gives the old flat-speed
   shape: the attention work is bounded by a stale active partition count. The
@@ -224,12 +224,12 @@ Follow-up on the old flat-decode target, 2026-06-21:
   not be treated as proof of a safe flat-decode implementation.
 - Tested larger partition experiments under the current correctness-preserving
   path:
-  - Global `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=512` plus XQA improved the
+    - Global `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=512` plus XQA improved the
     27B-AWQ TP2 `o256` probe and kept hashes for both 16K and 64K, but this
     changes scalar and XQA reduction boundaries together and conflicts with
     earlier long-output p512/p1024 token-divergence evidence. It remains a
     diagnostic candidate, not accepted default.
-  - An XQA-only p512 override was tested separately and rejected: 64K hash
+    - An XQA-only p512 override was tested separately and rejected: 64K hash
     matched, but 16K hash changed
     (`0f892ef276684fd8ec89d50877876f2fc7e383ab1914024868e2ca528b0ce0e3`
     vs the accepted
@@ -255,19 +255,19 @@ Dynamic active trace follow-up, 2026-06-21:
   log:
   `bench_results/sm70_migration_20260621/decode_qwen36_27b_awq_flashv100_xqa_trace_active_i16k_64k_o16_tp2_20260621.log`.
 - Trace result:
-  - CUDA graph capture used fixed workspace capacity
+    - CUDA graph capture used fixed workspace capacity
     `workspace_hint=131072`, `workspace_partitions=512`, with dummy
     `seq_len_hint=1`, `active=1`.
-  - Runtime 16K decode logged `seq_len_hint=16385`, `partition=256`,
+    - Runtime 16K decode logged `seq_len_hint=16385`, `partition=256`,
     `active=65`, `expected_active=65`.
-  - Runtime 64K decode logged `seq_len_hint=65537`, `partition=256`,
+    - Runtime 64K decode logged `seq_len_hint=65537`, `partition=256`,
     `active=257`, `expected_active=257`.
-  - Therefore the current dynamic partition path is active and mathematically
+    - Therefore the current dynamic partition path is active and mathematically
     consistent; replay is not stuck at the full 512-partition workspace.
 - Speed in the same trace run:
-  - 16K steady decode `52.00 tok/s`, decode time `0.2884s` for 15 steady
+    - 16K steady decode `52.00 tok/s`, decode time `0.2884s` for 15 steady
     tokens.
-  - 64K steady decode `38.74 tok/s`, decode time `0.3872s` for 15 steady
+    - 64K steady decode `38.74 tok/s`, decode time `0.3872s` for 15 steady
     tokens.
   This keeps the current XQA p256 result consistent with the `o256` probe:
   dynamic active works, but exact full-attention decode still scales with the
@@ -280,39 +280,39 @@ Dynamic active trace follow-up, 2026-06-21:
 - Compared the current XQA port against the 0.0.5 Flash-V100 source under
   `/home/ymzx/桌面/1cat-vllm/1cat-vllm-0.0.5/flash-attention-v100-1cat-0.0.5`.
   Important old-only pieces:
-  - `VALID_DECODE_PARTITION_SIZES=(32,64,128,256,512,1024)`.
-  - The 0.0.5 planner auto-selected coarser D=256 GQA/MQA partitions:
+    - `VALID_DECODE_PARTITION_SIZES=(32,64,128,256,512,1024)`.
+    - The 0.0.5 planner auto-selected coarser D=256 GQA/MQA partitions:
     `512` at >=4K and `1024` at >=12288 tokens for small batches.
-  - The 0.0.5 XQA path allowed FP32 `tmp_out` via
+    - The 0.0.5 XQA path allowed FP32 `tmp_out` via
     `VLLM_FLASH_V100_XQA_FP32_TMP_OUT=1` for `D=256`, `q_per_kv in {4,6,8}`.
-  - Current XQA port intentionally keeps only the narrow safe slice:
+    - Current XQA port intentionally keeps only the narrow safe slice:
     D=256, `q_per_kv in {4,6,8}`, p256/p512/p1024, fp16 `tmp_out`.
 - Old 0.0.5 operator sweep, same synthetic 27B-like shape
   (`B=1`, `H=12`, `Hkv=2`, `D=256`, page size `784`, seq `65536`),
   artifact log:
   `bench_results/sm70_migration_20260621/old005_xqa_fp32_tmp_partition_sweep_64k_20260621.log`.
   Results vs old FP32 p256:
-  - fp16 p256 `0.717ms`, maxdiff `3.81e-6`.
-  - fp16 p512 `0.666ms`, maxdiff `3.81e-6`.
-  - fp16 p1024 `0.642ms`, maxdiff `3.81e-6`.
-  - fp32 p256 `0.699ms`, baseline.
-  - fp32 p512 `0.663ms`, maxdiff `3.81e-6`.
-  - fp32 p1024 `0.638ms`, maxdiff `3.81e-6`.
+    - fp16 p256 `0.717ms`, maxdiff `3.81e-6`.
+    - fp16 p512 `0.666ms`, maxdiff `3.81e-6`.
+    - fp16 p1024 `0.642ms`, maxdiff `3.81e-6`.
+    - fp32 p256 `0.699ms`, baseline.
+    - fp32 p512 `0.663ms`, maxdiff `3.81e-6`.
+    - fp32 p1024 `0.638ms`, maxdiff `3.81e-6`.
   FP32 tmp_out does not make larger partitions bitwise-equivalent to p256; it
   is not enough to justify restoring p512/p1024 as a default.
 - Current operator sweep, same synthetic shape, artifact log:
   `bench_results/sm70_migration_20260621/current_xqa_partition_sweep_64k_20260621.log`.
   Results vs current p256:
-  - p256 `0.694ms`, baseline.
-  - p512 `0.646ms`, maxdiff `3.81e-6`.
-  - p1024 `0.613ms`, maxdiff `3.81e-6`.
+    - p256 `0.694ms`, baseline.
+    - p512 `0.646ms`, maxdiff `3.81e-6`.
+    - p1024 `0.613ms`, maxdiff `3.81e-6`.
   The current XQA port is not slower than the old implementation for this
   shape; larger partitions provide only a modest 64K kernel win and still alter
   reduction order.
 - Current p256 vs p1024 sequence-length sweep, artifact log:
   `bench_results/sm70_migration_20260621/current_xqa_p256_p1024_seq_sweep_20260621.log`.
-  - p256: 16K `0.228ms` active `64`; 64K `0.685ms` active `256`.
-  - p1024: 16K `0.334ms` active `16`; 64K `0.612ms` active `64`.
+    - p256: 16K `0.228ms` active `64`; 64K `0.685ms` active `256`.
+    - p1024: 16K `0.334ms` active `16`; 64K `0.612ms` active `64`.
   Larger partitions reduce the 64K cost but do not make exact decode flat; they
   also remain inconsistent with earlier model-level p512/p1024 token divergence.
 - Decision: do not restore the old auto-p512/p1024 planner as a public default.
@@ -330,19 +330,19 @@ Adaptive XQA decode partition policy, 2026-06-22:
 - Model-level partition sweep on Qwen3.6-27B-AWQ TP2, no-MTP,
   `FLASH_ATTN_V100`, XQA enabled, `max_model_len=262144`,
   `max_num_batched_tokens=8192`:
-  - 4K/o128: p256 `55.92 tok/s`, p512 `53.27`, p1024 `48.65`; all hashes
+    - 4K/o128: p256 `55.92 tok/s`, p512 `53.27`, p1024 `48.65`; all hashes
     matched p256, but p256 is clearly best.
-  - 64K/o128: p256 `36.19 tok/s`, p512 `36.82`, p1024 `36.60`; all hashes
+    - 64K/o128: p256 `36.19 tok/s`, p512 `36.82`, p1024 `36.60`; all hashes
     matched p256, p512 is slightly best.
-  - 128K/o128: p256 `26.88 tok/s`, p512 `26.76`, p1024 `27.51`; all hashes
+    - 128K/o128: p256 `26.88 tok/s`, p512 `26.76`, p1024 `27.51`; all hashes
     matched p256, p1024 is best.
-  - 262080/o64: p256 `18.42 tok/s`, p512 `18.93`, p1024 `18.67`; all hashes
+    - 262080/o64: p256 `18.42 tok/s`, p512 `18.93`, p1024 `18.67`; all hashes
     matched p256, p512 is best.
 - Updated the default adaptive policy when
   `VLLM_FLASH_V100_DECODE_PARTITION_SIZE` is unset after the TP4 long-decode
   sweep:
-  - `<32768`: p256.
-  - `>=32768`: p1024.
+    - `<32768`: p256.
+    - `>=32768`: p1024.
   Explicit `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=256/512/1024` still overrides
   the policy for diagnostics and rollback.
 - Validation artifact:
@@ -366,18 +366,18 @@ Default-on XQA decode update, 2026-06-22:
   profiles can keep scalar paged decode while long-context service graphs use
   the XQA path.
 - TP4 Qwen3.6-27B-AWQ evidence with matching token hashes:
-  - 64K/o64 scalar `50.55 tok/s`; XQA p1024 `58.07 tok/s` (`+14.9%`).
-  - 128K/o64 scalar `37.92 tok/s`; XQA p1024 `46.93 tok/s` (`+23.8%`).
-  - 262K/o64 scalar `22.92 tok/s`; XQA p1024 `34.23 tok/s` (`+49.4%`).
+    - 64K/o64 scalar `50.55 tok/s`; XQA p1024 `58.07 tok/s` (`+14.9%`).
+    - 128K/o64 scalar `37.92 tok/s`; XQA p1024 `46.93 tok/s` (`+23.8%`).
+    - 262K/o64 scalar `22.92 tok/s`; XQA p1024 `34.23 tok/s` (`+49.4%`).
 - TP4 Qwen3.6-35B-A3B-AWQ default-route evidence, no MTP,
   `FLASH_ATTN_V100`, `max_model_len=65536`, `max_num_batched_tokens=8192`,
   output 256:
-  - 4K prefill `0.278s`, steady decode `118.88 tok/s`.
-  - 16K prefill `1.380s`, steady decode `117.21 tok/s`.
-  - 64K prefill `12.069s`, steady decode `92.62 tok/s`.
-  - Runtime active trace: `4097 -> p256 active=17`,
+    - 4K prefill `0.278s`, steady decode `118.88 tok/s`.
+    - 16K prefill `1.380s`, steady decode `117.21 tok/s`.
+    - 64K prefill `12.069s`, steady decode `92.62 tok/s`.
+    - Runtime active trace: `4097 -> p256 active=17`,
     `16385 -> p256 active=65`, `65281 -> p1024 active=64`.
-  - Route summary included both scalar and XQA hits:
+    - Route summary included both scalar and XQA hits:
     `decode_scalar_paged=10`, `decode_xqa_paged=20`.
 - The current default partition policy remains adaptive with dynamic active
   partitions: p256 below 32K and p1024 at 32K or above unless
@@ -385,13 +385,13 @@ Default-on XQA decode update, 2026-06-22:
 - TP4 default-route smoke across 27B quantization variants, no MTP,
   `FLASH_ATTN_V100`, `max_model_len=65536`, `max_num_batched_tokens=8192`,
   output 64:
-  - Qwen3.6-27B-AWQ: 4K `69.74 tok/s`, 64K `54.63 tok/s`;
+    - Qwen3.6-27B-AWQ: 4K `69.74 tok/s`, 64K `54.63 tok/s`;
     route summary `decode_xqa_paged=48`.
-  - Qwen3.6-27B-FP8: 4K `66.22 tok/s`, 64K `53.16 tok/s`;
+    - Qwen3.6-27B-FP8: 4K `66.22 tok/s`, 64K `53.16 tok/s`;
     route summary `decode_xqa_paged=48`.
-  - Qwen3.5-27B-NVFP4/compressed-tensors: 4K `70.50 tok/s`,
+    - Qwen3.5-27B-NVFP4/compressed-tensors: 4K `70.50 tok/s`,
     64K `56.32 tok/s`; route summary `decode_xqa_paged=48`.
-  - Outputs were readable in all three smokes. NVFP4 still logs the known
+    - Outputs were readable in all three smokes. NVFP4 still logs the known
     compressed-tensors global-scale mismatch warning for fused layers, so keep
     it in the quality-watch bucket.
 - SM70 `FLASH_ATTN_V100` multimodal default remains image-enabled:
@@ -482,22 +482,22 @@ Stability follow-up, 2026-06-22:
 - Refreshed the GPUModelRunner draft-probability alignment regression test for
   the current `_sample` signature and token-id alignment guard.
 - Validation:
-  - `tests/v1/spec_decode/test_mtp.py -k 'mtp or draft or probability or cache'`:
+    - `tests/v1/spec_decode/test_mtp.py -k 'mtp or draft or probability or cache'`:
     2 passed with proxy env unset.
-  - `tests/v1/core/test_scheduler.py -k 'mtp or speculative or chunk'`:
+    - `tests/v1/core/test_scheduler.py -k 'mtp or speculative or chunk'`:
     6 passed with proxy env unset.
-  - `tests/v1/sample/test_rejection_sampler.py`: 67 passed on V100.
-  - `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py`,
+    - `tests/v1/sample/test_rejection_sampler.py`: 67 passed on V100.
+    - `tests/v1/spec_decode/test_mtp_draft_prob_alignment.py`,
     `tests/v1/spec_decode/test_sm70_mtp_safety.py`,
     `tests/v1/spec_decode/test_mtp_proposer_step_index.py`: 15 passed.
-  - Qwen3.6-27B-AWQ TP4 short smoke, no MTP, default multimodal image profile:
+    - Qwen3.6-27B-AWQ TP4 short smoke, no MTP, default multimodal image profile:
     prefill `0.739s`, steady decode `26.18 tok/s`, route summary included
     `prefill_no_prefix_dense_flash=16` and `decode_xqa_paged=48`, output text
     was readable.
 - Remaining log-noise candidates from the smoke:
-  - repeated Transformers `use_fast` deprecation lines from every worker;
-  - `Failed to read file <frozen os>` warning during torch compile;
-  - `No available shared memory broadcast block found in 60 seconds` during
+    - repeated Transformers `use_fast` deprecation lines from every worker;
+    - `Failed to read file <frozen os>` warning during torch compile;
+    - `No available shared memory broadcast block found in 60 seconds` during
     expected long compile/capture.
 
 ## Current State Summary
@@ -612,10 +612,10 @@ Target implementation update, 2026-05-30:
 - Pruned obvious non-runtime noise from the copied subset: TurboMind tests,
   CMake fragments, and non-SM70 kernel `.cu` files.
 - Added latest-tree `CMakeLists.txt` hook:
-  - computes `SM70_TURBOMIND_ARCHS` with arch `7.0`;
-  - appends TurboMind sources to `_C` only when that intersection is non-empty;
-  - adds `csrc/sm70_turbomind/lmdeploy` to `_C` include dirs;
-  - defines `ENABLE_SM70_TURBOMIND=1` only for SM70 builds.
+    - computes `SM70_TURBOMIND_ARCHS` with arch `7.0`;
+    - appends TurboMind sources to `_C` only when that intersection is non-empty;
+    - adds `csrc/sm70_turbomind/lmdeploy` to `_C` include dirs;
+    - defines `ENABLE_SM70_TURBOMIND=1` only for SM70 builds.
 - Follow-up build fix: `VLLM_GPU_FLAGS` alone did not make
   `ENABLE_SM70_TURBOMIND` visible to `csrc/torch_bindings.cpp`, so the C++
   binding registration block was compiled out even though the CUDA symbols were
@@ -684,22 +684,22 @@ Target implementation update, 2026-05-30:
 - Added guarded Torch op schemas/impl bindings in `csrc/torch_bindings.cpp`.
 - Added independent Python facade `vllm/_sm70_ops.py`.
 - Registered only base dense/prepare/cache candidates:
-  - `awq_sm70_prepare`
-  - `fp8_sm70_prepare`
-  - `sm70_f16_prepare`
-  - `awq_gemm_sm70`
-  - `awq_gemm_sm70_out`
-  - `fp8_gemm_sm70_out`
-  - `fp8_gemm_sm70_out_auto`
-  - `fp8_gemm_sm70_out_meta`
-  - `sm70_f16_gemm`
-  - `sm70_f16_gemm_out`
-  - `sm70_gemm_import_cache`
-  - `sm70_gemm_export_cache`
+    - `awq_sm70_prepare`
+    - `fp8_sm70_prepare`
+    - `sm70_f16_prepare`
+    - `awq_gemm_sm70`
+    - `awq_gemm_sm70_out`
+    - `fp8_gemm_sm70_out`
+    - `fp8_gemm_sm70_out_auto`
+    - `fp8_gemm_sm70_out_meta`
+    - `sm70_f16_gemm`
+    - `sm70_f16_gemm_out`
+    - `sm70_gemm_import_cache`
+    - `sm70_gemm_export_cache`
 - Deliberately not registered in the main facade yet:
-  - MoE compact/router/single-token ops;
-  - LM-head/top1 ops;
-  - gate-mul and greedy-only shortcuts.
+    - MoE compact/router/single-token ops;
+    - LM-head/top1 ops;
+    - gate-mul and greedy-only shortcuts.
 - Reason: these need separate strict exactness and semantic validation before
   they can be visible to mainline callers.
 - Verified after conda build: all registered dense/prepare/cache op schemas
@@ -751,11 +751,11 @@ Target implementation update, 2026-05-30:
   otherwise latest upstream default remains `75`.
 - `AWQLinearMethod.process_weights_after_loading()` prepares TurboMind weights
   only when all of these are true:
-  - `VLLM_SM70_AWQ_TURBOMIND=1`;
-  - parameter is already on CUDA;
-  - active device capability is exactly `(7, 0)`;
-  - `awq_sm70_prepare` exists in `_C`;
-  - group size is 32, 64, or 128.
+    - `VLLM_SM70_AWQ_TURBOMIND=1`;
+    - parameter is already on CUDA;
+    - active device capability is exactly `(7, 0)`;
+    - `awq_sm70_prepare` exists in `_C`;
+    - group size is 32, 64, or 128.
 - `AWQLinearMethod.apply()` dispatches to `sm70_ops.awq_gemm_sm70` only when
   the layer was prepared successfully.
 - AWQ dense GEMM now uses `select_awq_dense_dispatch_policy()`, whose
@@ -844,11 +844,11 @@ Implementation checkpoint, 2026-05-31:
 - After the skip fix, Qwen3.6-35B-A3B-AWQ TP4 latest-tree smoke passed:
   `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_awq_sm70_tp4_greedy1_smoke_after_awq_moe_skipfix.json`.
   Evidence:
-  - four visible GPUs all reported capability `[7, 0]`;
-  - `VLLM_SM70_AWQ_TURBOMIND=1`;
-  - log confirmed `SM70 AWQ MoE TurboMind batched path enabled (256 experts)`;
-  - model loaded and generated one greedy token (`token_id=271`);
-  - `load_seconds=709.44`, dominated by first-run torch/Triton compile and
+    - four visible GPUs all reported capability `[7, 0]`;
+    - `VLLM_SM70_AWQ_TURBOMIND=1`;
+    - log confirmed `SM70 AWQ MoE TurboMind batched path enabled (256 experts)`;
+    - model loaded and generated one greedy token (`token_id=271`);
+    - `load_seconds=709.44`, dominated by first-run torch/Triton compile and
     CUDA graph capture; `generate_seconds=5.02`.
 - Acceptance status: this is only a load/generate smoke. It does not satisfy
   the quality gate yet. AWQ MoE still needs an op-level strict diff harness and
@@ -864,12 +864,12 @@ Strict AWQ MoE batched-GEMM check, 2026-05-31:
 - Strict command:
   `CUDA_VISIBLE_DEVICES=1 CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0 conda run --live-stream -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_turbomind_exactness.py --mode awq_moe --awq-moe-model /home/ymzx/models/Qwen3.6-35B-A3B-AWQ --awq-moe-layer model.language_model.layers.1.mlp.experts --m 1 2 --group-size 128 --device cuda:0 --json-out bench_results/sm70_migration_20260531/sm70_awq_moe_batched_vs_dense_strict_qwen36_35a3b_tune0_20260531.json`
 - Result failed strict equality:
-  - `m=1 w13_gate_up`: `max_diff=0.000244140625`;
-  - `m=1 silu_and_mul`: `max_diff=6.103515625e-05`;
-  - `m=1 w2_sorted_output`: `max_diff=1.52587890625e-05`;
-  - `m=2 w13_gate_up`: `max_diff=0.000244140625`;
-  - `m=2 silu_and_mul`: `max_diff=0.0001220703125`;
-  - `m=2 w2_sorted_output`: `max_diff=1.52587890625e-05`.
+    - `m=1 w13_gate_up`: `max_diff=0.000244140625`;
+    - `m=1 silu_and_mul`: `max_diff=6.103515625e-05`;
+    - `m=1 w2_sorted_output`: `max_diff=1.52587890625e-05`;
+    - `m=2 w13_gate_up`: `max_diff=0.000244140625`;
+    - `m=2 silu_and_mul`: `max_diff=0.0001220703125`;
+    - `m=2 w2_sorted_output`: `max_diff=1.52587890625e-05`.
 - Setting `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0` did not remove the difference,
   so this is not only the small-shape autotuner choosing a different first
   algorithm.
@@ -894,11 +894,11 @@ Strict AWQ MoE batched-GEMM check, 2026-05-31:
 - Full-model default-bridge eager smoke passed:
   `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_awq_sm70_tp4_greedy1_default_dense_bridge_eager.json`.
   Evidence:
-  - `--enforce-eager`, `VLLM_SM70_AWQ_TURBOMIND=1`, TP4, four SM70 GPUs;
-  - log confirmed
+    - `--enforce-eager`, `VLLM_SM70_AWQ_TURBOMIND=1`, TP4, four SM70 GPUs;
+    - log confirmed
     `SM70 AWQ MoE TurboMind per-expert dense path enabled (256 experts)`;
-  - model loaded and generated one greedy token (`token_id=271`);
-  - `load_seconds=112.81`, `generate_seconds=4.41`.
+    - model loaded and generated one greedy token (`token_id=271`);
+    - `load_seconds=112.81`, `generate_seconds=4.41`.
 - Tried `@eager_break_during_capture` plus
   `VLLM_USE_BREAKABLE_CUDAGRAPH=1` for the same default dense bridge. This did
   not fix non-eager startup because latest vLLM runs this section under
@@ -913,14 +913,14 @@ Strict AWQ MoE batched-GEMM check, 2026-05-31:
   Result passed load/generate:
   `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_awq_sm70_tp4_greedy1_default_dense_bridge_cg_none.json`.
   Evidence:
-  - latest vLLM parsed `cudagraph_mode` as `CUDAGraphMode.NONE` and explicitly
+    - latest vLLM parsed `cudagraph_mode` as `CUDAGraphMode.NONE` and explicitly
     skipped CUDA graph capture;
-  - log again confirmed
+    - log again confirmed
     `SM70 AWQ MoE TurboMind per-expert dense path enabled (256 experts)`;
-  - model generated one greedy token;
-  - `load_seconds=660.18`, with `Initial profiling/warmup run took 470.57 s`;
-  - `generate_seconds=8.86`;
-  - inference still triggered Triton JIT for `_zero_kv_blocks_kernel`,
+    - model generated one greedy token;
+    - `load_seconds=660.18`, with `Initial profiling/warmup run took 470.57 s`;
+    - `generate_seconds=8.86`;
+    - inference still triggered Triton JIT for `_zero_kv_blocks_kernel`,
     `_compute_slot_mapping_kernel`, `_causal_conv1d_fwd_kernel`,
     `_fused_post_conv_kernel`, `fused_moe_kernel`, and
     `kernel_unified_attention`.
@@ -996,10 +996,10 @@ Target implementation update, 2026-05-30:
 - Latest FP8 linear `create_weights()` normally selects a kernel before weight
   processing. On SM70 this can fail before we reach TurboMind preparation, so
   the hook intercepts earlier:
-  - only if `VLLM_SM70_FP8_TURBOMIND=1`;
-  - only on exact SM70;
-  - only for serialized block FP8 with `weight_block_size=[128, 128]`;
-  - otherwise raises a clear error instead of silently falling back to an
+    - only if `VLLM_SM70_FP8_TURBOMIND=1`;
+    - only on exact SM70;
+    - only for serialized block FP8 with `weight_block_size=[128, 128]`;
+    - otherwise raises a clear error instead of silently falling back to an
     unverified path.
 - `process_weights_after_loading()` prepares local TurboMind layout with
   `sm70_ops.fp8_sm70_prepare`.
@@ -1119,25 +1119,25 @@ FP8 MoE route recovery update, 2026-06-13:
   worth repairing for the 35B-FP8 decode target, but it remains default-off
   until the common-prefix logprob/model-quality issue is fixed.
 - Post Flash-V100 shared-memory fix compact retest, 2026-06-14:
-  - Repaired no-compact baseline artifact:
+    - Repaired no-compact baseline artifact:
     `bench_results/fp8_moe_route_recovery_20260613/after_flash_v100_smem_fix_long_20260614/decode_qwen36_35b_fp8_default_long1024_i4096_tp2_r2_20260614.json`.
     Warmup and both repeats produced identical 1024-token hashes; steady decode
     was `108.89`/`108.91 tok/s`.
-  - Compact artifact:
+    - Compact artifact:
     `bench_results/fp8_moe_route_recovery_20260613/compact_after_flash_v100_smem_fix_20260614/decode_qwen36_35b_fp8_compact_long1024_i4096_tp2_r2_20260614.json`.
     Compact was self-stable across warmup/repeats, but disagreed with
     no-compact at token index `46` in that decode-script run. In that repaired
     long run compact did not show a speed win (`~105 tok/s` vs no-compact
     `~109 tok/s`), so keep the older `119.85 tok/s` speed artifact as
     non-current until rerun under the exact same post-fix baseline.
-  - Same-prompt top-token-margin diagnostic using
+    - Same-prompt top-token-margin diagnostic using
     `benchmark_sm70_model_tokens.py` moved the first no-compact vs compact
     divergence to token index `35` (`13` vs `364`), which is expected because
     the harness differs. The compact run at the first divergence had
     top1 `364 = 16.5`, top2 `13 = 16.296875`, margin `0.203125`:
     `bench_results/fp8_moe_route_recovery_20260613/compact_top_margin_after_smem_fix_20260614/compact_firstdiff_margin/`.
     This is a low-margin greedy flip, not a large sampler-logit failure.
-  - Compact internal reference compare was attempted with
+    - Compact internal reference compare was attempted with
     `VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE=1` and printed
     exact reports for the compact-vs-batched-reference MoE layers before CUDA
     graph capture rejected the diagnostic `.item()` call:
@@ -1146,7 +1146,7 @@ FP8 MoE route recovery update, 2026-06-13:
     `bench_results/fp8_moe_route_recovery_20260613/compact_top_margin_after_smem_fix_20260614/compact_firstdiff/run.log`.
     Do not rerun this compare inside CUDA graph capture without first making
     the diagnostic capture-safe.
-  - Current decision: FP8 legacy compact is not proven to be a kernel-correctness
+    - Current decision: FP8 legacy compact is not proven to be a kernel-correctness
     bug. The strict exact-layout runtime can match no-compact greedy tokens for
     a 4K/1024 prompt, but it still has not recovered the old compact speed.
     The useful next implementation work is to recover the faster top-k compact
@@ -1154,7 +1154,7 @@ FP8 MoE route recovery update, 2026-06-13:
     quality behavior or proving the remaining diff is bounded FP16 model-safe
     numeric noise. Do not default the divergent old compact route by speed
     alone.
-  - Same-command post-fix speed rerun, 2026-06-14:
+    - Same-command post-fix speed rerun, 2026-06-14:
     `bench_results/fp8_moe_route_recovery_20260613/compact_speed_recheck_20260614/model_tokens_qwen36_35b_fp8_no_compact_i4096_o1024_tp2_20260614.json`
     measured no-compact steady decode `108.252 tok/s`; compact artifact
     `bench_results/fp8_moe_route_recovery_20260613/compact_speed_recheck_20260614/model_tokens_qwen36_35b_fp8_compact_i4096_o1024_tp2_20260614.json`
@@ -1170,7 +1170,7 @@ FP8 MoE route recovery update, 2026-06-13:
     token-identical for 1024 generated tokens. Treat the old `119.852 tok/s`
     artifact as pre-repair trajectory evidence only, not an accepted current
     speed target.
-  - Superseding fixed-route interpretation for the missing compact speed value:
+    - Superseding fixed-route interpretation for the missing compact speed value:
     the post-fix compact/no-compact runs have matching attention, graph,
     custom all-reduce, FP8 MoE native, scratch-permute, and GDN policy fields
     except for `fp8_moe_legacy_single_token_compact_effective`. The compact
@@ -1186,16 +1186,16 @@ FP8 MoE route recovery update, 2026-06-13:
     The compact kernel-speed question must be answered with a fixed
     hidden/top-k replay or a fixed-route MoE microbenchmark, not by comparing
     two different generated token traces.
-  - Fixed-route FP8 MoE layer-1 microbenchmark on 2026-06-14, GPU0, 35B-FP8
+    - Fixed-route FP8 MoE layer-1 microbenchmark on 2026-06-14, GPU0, 35B-FP8
     `model.language_model.layers.1.mlp.experts`, `m=1`, `top_k=8`,
     `group_size=128`, fixed hidden/top-k:
-    - `single:0`: no-compact `0.1446 ms`, current exact-layout compact
+        - `single:0`: no-compact `0.1446 ms`, current exact-layout compact
       `0.0836 ms`, monolithic old compact family `0.0637 ms`.
-    - `round_robin`: no-compact `0.1352 ms`, current exact-layout compact
+        - `round_robin`: no-compact `0.1352 ms`, current exact-layout compact
       `0.0867 ms`, monolithic old compact family `0.0640 ms`.
-    - `random_unique:0`: no-compact `0.1374 ms`, current exact-layout compact
+        - `random_unique:0`: no-compact `0.1374 ms`, current exact-layout compact
       `0.0982 ms`, monolithic old compact family `0.0646 ms`.
-    - `random_unique:7`: no-compact `0.1370 ms`, current exact-layout compact
+        - `random_unique:7`: no-compact `0.1370 ms`, current exact-layout compact
       `0.0994 ms`, monolithic old compact family `0.0655 ms`.
     This proves the current exact-layout compact path still has real
     fixed-work MoE speed value versus no-compact. The old `119.852 tok/s`
@@ -1205,7 +1205,7 @@ FP8 MoE route recovery update, 2026-06-13:
     because the divergent end-to-end generated-token run showed `104.914` vs
     `108.252 tok/s`; first compare with a common token/router replay or a
     same-token teacher-forced decode path.
-  - Strict-quality exact-layout compact end-to-end speed, 2026-06-14:
+    - Strict-quality exact-layout compact end-to-end speed, 2026-06-14:
     `bench_results/fp8_moe_route_recovery_20260613/strict_compact_e2e_speed_20260614/model_tokens_qwen36_35b_fp8_strict_compact_i4096_o1024_tp2_20260614.json`
     ran Qwen3.6-35B-A3B-FP8, TP2, 4K input, 1024 greedy output, FP8 KV,
     Flash-V100, compile/FULL graph, custom all-reduce, native FP8 MoE
@@ -1215,7 +1215,7 @@ FP8 MoE route recovery update, 2026-06-13:
     Request metrics: prefill `0.451776 s` = `9066.44 tok/s`; decode
     `9.762155 s` for `1023` steady tokens = `104.792 tok/s`; total output
     throughput `100.255 tok/s`.
-  - Strict compact vs the prior no-compact 4K/1024 artifact
+    - Strict compact vs the prior no-compact 4K/1024 artifact
     (`compact_speed_recheck_20260614/model_tokens_qwen36_35b_fp8_no_compact_i4096_o1024_tp2_20260614.json`)
     has equal prompt and all `1024` output token IDs:
     `strict_compact_e2e_speed_20260614/compare_no_compact_vs_strict_compact_i4096_o1024_tp2_20260614.json`.
@@ -1227,14 +1227,14 @@ FP8 MoE route recovery update, 2026-06-13:
     accepted default speed win. The next useful work is to recover more of the
     monolithic compact speed while keeping this token-equal behavior, not to
     rerun more proof that the current exact-layout route is only ~105 tok/s.
-  - No-compact 4K/1024 recheck, 2026-06-14:
+    - No-compact 4K/1024 recheck, 2026-06-14:
     `bench_results/fp8_moe_route_recovery_20260613/no_compact_e2e_recheck_20260614/model_tokens_qwen36_35b_fp8_no_compact_i4096_o1024_tp2_20260614.json`
     measured prefill `0.444015 s` = `9224.92 tok/s`; decode `9.431384 s`
     for `1023` steady tokens = `108.468 tok/s`. This confirms no-compact is
     stable near `108 tok/s`; the current strict exact-layout compact `104.792`
     is a real end-to-end regression on same-token output, not just trajectory
     noise.
-  - 4K/128 Nsight/profile-speed check, 2026-06-14:
+    - 4K/128 Nsight/profile-speed check, 2026-06-14:
     no-compact
     `compact_rootcause_nsys_20260614/no_compact_i4096_o128_tp2.json`
     measured prefill `0.466437 s` = `8781.46 tok/s`, decode `1.249953 s`
@@ -1246,7 +1246,7 @@ FP8 MoE route recovery update, 2026-06-13:
     The exported no-compact nsys kernel summary missed most graph GEMM kernels,
     so do not use that CSV as kernel-count proof; use it only as a speed
     reproduction artifact.
-  - Rejected attempted fix, 2026-06-14: wiring the runtime strict compact branch
+    - Rejected attempted fix, 2026-06-14: wiring the runtime strict compact branch
     to C++ `fp8_moe_single_token_sm70_out(... exact_per_route=True)` produced
     op-level exact output for layer1/single:0
     (`fp8_moe_legacy_compact_runtime_monolithic_exactroute_opdiff_layer1_m1_single0_20260614.json`,
@@ -1259,7 +1259,7 @@ FP8 MoE route recovery update, 2026-06-13:
     graph to many tiny GEMM kernels per MoE layer. It is faster in isolated
     fixed-route layer microbenchmarks but loses badly in end-to-end decode.
     Do not use per-route exact as the production compact fix.
-  - Root-cause direction after the rejected fix: the old fast compact family
+    - Root-cause direction after the rejected fix: the old fast compact family
     likely got its speed from the monolithic top-k compact descriptor path:
     prepare/copy only the active expert pointer rows, run W13 as one
     top_k-expert GEMM, run W2 as one top_k-expert GEMM, then weighted reduce.
@@ -1321,8 +1321,8 @@ Source behavior:
 - The external package is not a normal vLLM `_C` CMake source. It lives under
   source-tree `flash-attention-v100/` and builds two Python/CUDA extension
   modules:
-  - `flash_attn_v100_cuda`;
-  - `paged_kv_utils`.
+    - `flash_attn_v100_cuda`;
+    - `paged_kv_utils`.
 - Decode path reads vLLM paged KV cache directly.
 - Prefill has direct and fallback paths, including paged KV gather fallback.
 
@@ -1347,9 +1347,9 @@ Investigation update, 2026-05-30:
   external CUDA modules, the old backend either cannot import its V100 ops or
   falls back to slower Triton/Python gather behavior.
 - Next attention step must therefore include either:
-  - packaging/installing `flash-attention-v100/` as an explicit optional SM70
+    - packaging/installing `flash-attention-v100/` as an explicit optional SM70
     subpackage; or
-  - migrating those kernels into a latest-tree optional extension target.
+    - migrating those kernels into a latest-tree optional extension target.
 - Quality gate remains unresolved. Attention can only become default on SM70
   after Type A layout paths prove strict `max_diff == 0`, all remaining
   nonzero paths are either fixed or promoted from `B-pending` to `B-accept`,
@@ -1373,13 +1373,13 @@ Flash-V100 dense prefill quality fix, 2026-06-14:
 - Attribution evidence before the fix, with Qwen3.6-35B-A3B-FP8 TP2 4K/6,
   `--enforce-eager`, `--disable-custom-all-reduce`, no compile and no CUDA
   graph:
-  - layer0-2 were exact;
-  - layer3 is the first full-attention layer;
-  - layer3 `input_norm_out`, qkv, rotary, v, and gate were exact;
-  - rank1 `full_attn_core_out` first drifted (`max_diff=6.103515625e-05`);
-  - row-parallel `o_proj`/all-reduce then propagated the drift to both ranks
+    - layer0-2 were exact;
+    - layer3 is the first full-attention layer;
+    - layer3 `input_norm_out`, qkv, rotary, v, and gate were exact;
+    - rank1 `full_attn_core_out` first drifted (`max_diff=6.103515625e-05`);
+    - row-parallel `o_proj`/all-reduce then propagated the drift to both ranks
     (`attn_out max_diff=1.52587890625e-05`);
-  - layer4/GDN received already-different hidden states, so GDN/QLA was a
+    - layer4/GDN received already-different hidden states, so GDN/QLA was a
     downstream amplifier, not the root.
 - Post-fix focused evidence:
   `bench_results/fp8_moe_route_recovery_20260613/qwen_layer3_full_attn_after_smem_fix_20260614/decode_qwen36_35b_fp8_layer3_full_attn_after_smem_fix_float16_i4096_o6_tp2_r1_20260614.json`.
@@ -1412,10 +1412,10 @@ TurboQuant KV-cache update, 2026-06-04:
 - Added `benchmarks/benchmark_sm70_turboquant_quality.py` for lossy KV-cache
   validation. The gate does not require greedy token equality as a hard rule.
   It checks:
-  - identical-context next-token top-logprob distribution drift;
-  - baseline top1 NLL delta and missing rate;
-  - high-margin baseline top1 mismatch rate;
-  - natural-prompt long-output health against baseline.
+    - identical-context next-token top-logprob distribution drift;
+    - baseline top1 NLL delta and missing rate;
+    - high-margin baseline top1 mismatch rate;
+    - natural-prompt long-output health against baseline.
 - Route blocker fixed: on SM70, TurboQuant prefill no longer treats an
   importable FA2 package as sufficient evidence that FA varlen kernels can run.
   V100 now skips FA varlen in TurboQuant prefill and can use either the
@@ -1455,20 +1455,20 @@ TurboQuant KV-cache update, 2026-06-04:
   discarded.
 - 35B-AWQ TP2 long-context speed evidence with all applicable accepted SM70
   routes enabled and first request treated as warmup:
-  - Flash-V100, `kv_cache_dtype=auto`, artifact
+    - Flash-V100, `kv_cache_dtype=auto`, artifact
     `bench_results/sm70_migration_20260604/decode_qwen36_35b_awq_flashv100_i16324_o256_tp2_warm1_r2_fullaccel_20260604.json`:
     prefill `4.43775s` (`3678.44 tok/s`), pure decode `84.5963 tok/s`,
     output throughput `34.3252 tok/s`.
-  - TurboQuant `turboquant_4bit_nc` with Triton prefill fallback, artifact
+    - TurboQuant `turboquant_4bit_nc` with Triton prefill fallback, artifact
     `bench_results/sm70_migration_20260604/decode_qwen36_35b_awq_turboquant4bit_i16324_o256_tp2_warm1_r2_fullaccel_tqprefill_b32_20260604.json`:
     prefill `9.11379s` (`1791.13 tok/s`), pure decode `69.1938 tok/s`,
     output throughput `19.9940 tok/s`.
-  - TurboQuant `turboquant_4bit_nc` with Flash-V100 dense raw-QKV prefill
+    - TurboQuant `turboquant_4bit_nc` with Flash-V100 dense raw-QKV prefill
     bridge, artifact
     `bench_results/sm70_migration_20260604/decode_qwen36_35b_awq_turboquant4bit_i16324_o256_tp2_warm1_r2_flashv100prefill_20260604.json`:
     prefill `4.44126s` (`3675.65 tok/s`), pure decode `69.1680 tok/s`,
     output throughput `31.4771 tok/s`.
-  - TurboQuant `turboquant_4bit_nc` with Flash-V100 dense prefill plus
+    - TurboQuant `turboquant_4bit_nc` with Flash-V100 dense prefill plus
     Flash-V100 TQ packed-cache decode, CUDA graph enabled, artifact
     `bench_results/sm70_migration_20260604/decode_qwen36_35b_awq_turboquant4bit_i16324_o256_tp2_warm1_r2_flashv100_tqdecode_20260604.json`:
     route logs include `TURBOQUANT prefill using Flash-V100 dense raw-QKV
@@ -1478,7 +1478,7 @@ TurboQuant KV-cache update, 2026-06-04:
     different token hashes (`9e574c...` vs `83754b...`, first mismatch at token
     index 76). Treat as speed/route evidence only until CUDA graph quality is
     resolved.
-  - TurboQuant `turboquant_4bit_nc` with Flash-V100 dense prefill plus
+    - TurboQuant `turboquant_4bit_nc` with Flash-V100 dense prefill plus
     Flash-V100 TQ packed-cache decode, CUDA graph disabled via
     `--enforce-eager`, artifact
     `bench_results/sm70_migration_20260604/decode_qwen36_35b_awq_turboquant4bit_i16324_o256_tp2_warm1_r2_flashv100_tqdecode_enforce_eager_20260604.json`:
@@ -1488,19 +1488,19 @@ TurboQuant KV-cache update, 2026-06-04:
     mismatch at token index 123. Decode speed under eager is only
     ~`9.12 tok/s`, so this artifact is quality isolation only, not a speed
     baseline.
-  - Speed interpretation: the Flash-V100 prefill bridge fully recovers the
+    - Speed interpretation: the Flash-V100 prefill bridge fully recovers the
     TurboQuant prefill regression for this shape. The first Flash-V100
     TQ-cache-aware decode op improves packed-cache decode from ~`69.17 tok/s`
     to ~`76.32 tok/s`, but normal Flash-V100 paged-KV still reaches
     ~`84.60 tok/s`; remaining decode work is inside the TQ packed-cache
     Flash-V100 op, not disabling TurboQuant or falling back to slow prefill.
 - Kernel-level TQ decode parity, no model load:
-  - Random D=256/GQA short-cache smoke: Flash-V100 TQ decode vs Triton TQ
+    - Random D=256/GQA short-cache smoke: Flash-V100 TQ decode vs Triton TQ
     decode `max_diff=3.05176e-05`, no NaN.
-  - Random D=256, `seq_len=16324`, `block_size=4096`, Hq=32/Hk=4 smoke:
+    - Random D=256, `seq_len=16324`, `block_size=4096`, Hq=32/Hk=4 smoke:
     Flash-V100 TQ decode vs Triton TQ decode `max_diff=1.90735e-06`,
     mean diff `1.29963e-07`, no NaN.
-  - CUDA graph micro replay of the new op matched eager exactly for changed
+    - CUDA graph micro replay of the new op matched eager exactly for changed
     static query buffers, so the model-level CUDA graph drift is not yet
     attributed to the TQ packed-cache CUDA op itself.
 - Kernel-level smoke on GPU 2:
@@ -1571,26 +1571,26 @@ Target implementation update, 2026-05-30:
   memory stayed around 26-29 GiB and peak sampled CUDA compiler RSS was about
   2 GiB for one process.
 - Import/backend checks passed:
-  - `flash_attn_v100_cuda` imported;
-  - `paged_kv_utils` imported;
-  - `flash_attn_decode_paged` available;
-  - `flash_attn_prefill_paged` available;
-  - `AttentionBackendEnum.FLASH_ATTN_V100.get_class()` resolves;
-  - gated SM70 priority list selects `FLASH_ATTN_V100` first.
+    - `flash_attn_v100_cuda` imported;
+    - `paged_kv_utils` imported;
+    - `flash_attn_decode_paged` available;
+    - `flash_attn_prefill_paged` available;
+    - `AttentionBackendEnum.FLASH_ATTN_V100.get_class()` resolves;
+    - gated SM70 priority list selects `FLASH_ATTN_V100` first.
 - Strict dense-prefill sample against a simple PyTorch softmax reference is not
   bitwise exact:
-  - evidence file:
+    - evidence file:
     `bench_results/sm70_migration_20260530/flash_attn_v100_import_and_prefill_exactness.json`;
-  - shape `[1, 16, 4, 64]`: `equal=false`, `max_diff=0.0009765625`,
+    - shape `[1, 16, 4, 64]`: `equal=false`, `max_diff=0.0009765625`,
     `mean_diff=0.0001001286`.
 - Kernel regression:
-  - first attempt to run old test files directly failed because pytest loaded
+    - first attempt to run old test files directly failed because pytest loaded
     old-tree `tests/conftest.py`, which imported the old `_C.abi3.so` and hit
     a Torch ABI symbol mismatch;
-  - rerun with
+    - rerun with
     `--confcutdir=/home/ymzx/桌面/1cat-vllm/1Cat-vLLM-0.0.3/vllm/tests/kernels/attention`
     isolated the kernel tests from the old vLLM package;
-  - result: `20 passed in 0.63s` for
+    - result: `20 passed in 0.63s` for
     `test_flash_attn_v100_smallq_decode.py` and
     `test_flash_attn_v100_dense_short_prefill.py`.
 - Conclusion: the extension/backend are migrated and usable for explicit
@@ -1611,13 +1611,13 @@ Strict prefill/decode exactness expansion, 2026-05-30:
   `torch.equal`, `max_diff`, `mean_diff`, NaN counts, shape, seed, and kernel
   mode.
 - Result on V100/SM70: `passed=false`.
-  - dense prefill cases: nonzero `max_diff` from `0.00048828125` to
+    - dense prefill cases: nonzero `max_diff` from `0.00048828125` to
     `0.0009765625`;
-  - paged prefill cases: nonzero `max_diff` from `0.00006103515625` to
+    - paged prefill cases: nonzero `max_diff` from `0.00006103515625` to
     `0.001953125`;
-  - paged decode cases: nonzero `max_diff` from `0.0000152587890625` to
+    - paged decode cases: nonzero `max_diff` from `0.0000152587890625` to
     `0.000244140625`;
-  - all cases had zero NaNs.
+    - all cases had zero NaNs.
 - Interpretation: the V100 attention kernels appear numerically close but not
   bitwise identical to the latest strict reference. Under the current
   `max_diff == 0` rule, this confirms `FLASH_ATTN_V100` cannot be selected by
@@ -1642,28 +1642,28 @@ Triangle exactness update, 2026-05-30:
   is therefore an inherited kernel/numeric-order issue, not merely a bad port.
 - Added a stricter triangle comparison to
   `benchmarks/benchmark_sm70_attention_exactness.py`:
-  - `dense_prefill` vs `torch_float32`;
-  - `paged_prefill` vs `torch_float32`;
-  - `paged_prefill` vs `dense_flash_v100`;
-  - `paged_decode` vs `torch_float32`;
-  - `paged_decode` vs `dense_flash_v100`.
+    - `dense_prefill` vs `torch_float32`;
+    - `paged_prefill` vs `torch_float32`;
+    - `paged_prefill` vs `dense_flash_v100`;
+    - `paged_decode` vs `torch_float32`;
+    - `paged_decode` vs `dense_flash_v100`.
 - Evidence file:
   `bench_results/sm70_migration_20260530/sm70_flash_attn_v100_triangle_exactness_20260530.json`.
 - Result:
-  - all `paged_prefill` vs `dense_flash_v100` cases passed strict equality
+    - all `paged_prefill` vs `dense_flash_v100` cases passed strict equality
     with `max_diff=0.0` and `num_different=0`;
-  - all `dense_prefill` vs `torch_float32` cases still had small nonzero
+    - all `dense_prefill` vs `torch_float32` cases still had small nonzero
     diffs (`0.00048828125` to `0.0009765625`);
-  - `paged_decode` vs `dense_flash_v100` still had nonzero diffs
+    - `paged_decode` vs `dense_flash_v100` still had nonzero diffs
     (`0.00006103515625` to `0.0009765625` in the tested cases);
-  - no NaNs were observed.
+    - no NaNs were observed.
 - Interpretation:
-  - the paged prefill kernel is internally aligned with dense Flash-V100 and
+    - the paged prefill kernel is internally aligned with dense Flash-V100 and
     is the closest candidate for future acceptance once the canonical latest
     vLLM attention oracle is selected;
-  - the paged decode kernel is the immediate fix target because it disagrees
+    - the paged decode kernel is the immediate fix target because it disagrees
     even with dense Flash-V100;
-  - dense Flash-V100 itself does not match the simple PyTorch FP32-softmax
+    - dense Flash-V100 itself does not match the simple PyTorch FP32-softmax
     oracle bitwise, so final acceptance must compare against the agreed
     latest-vLLM canonical attention path with strict `max_diff == 0`, not only
     against this diagnostic PyTorch oracle.
@@ -1674,33 +1674,33 @@ Triangle exactness update, 2026-05-30:
   bench_results/sm70_migration_20260530/sm70_flash_attn_v100_decode_as_prefill_exactness_20260530.json
   --allow-nonzero`.
 - Decode-as-prefill result:
-  - `paged_decode_as_prefill` vs `dense_flash_v100_causal` passed strict
+    - `paged_decode_as_prefill` vs `dense_flash_v100_causal` passed strict
     equality on all tested decode shapes, including `query_len=1`, `4`, `8`
     and `seq_len=9`, `69`, `181`, `4096`;
-  - every such case had `max_diff=0.0` and `num_different=0`;
-  - `dense_flash_v100_causal` also matched `dense_flash_v100_decode_steps`
+    - every such case had `max_diff=0.0` and `num_different=0`;
+    - `dense_flash_v100_causal` also matched `dense_flash_v100_decode_steps`
     with `max_diff=0.0`.
 - Interpretation update:
-  - the `max_diff != 0` issue is not caused by paged KV layout, block table,
+    - the `max_diff != 0` issue is not caused by paged KV layout, block table,
     GQA head mapping, or causal offset;
-  - the mismatch is localized to the dedicated scalar/partitioned paged decode
+    - the mismatch is localized to the dedicated scalar/partitioned paged decode
     kernel in `flash-attention-v100/kernel/flash_decode_paged.cu`;
-  - a quality-safe bridge exists: run decode through the WMMA paged prefill
+    - a quality-safe bridge exists: run decode through the WMMA paged prefill
     kernel, then optimize from that exact compute order instead of accepting
     the scalar decode mismatch.
 - Op-level timing probe, `seq_len=4096`, `query_len=1`, `q_heads=6`,
   `kv_heads=1`, `head_dim=256`, `block_size=16`, 200 iterations:
-  - scalar `flash_attn_decode_paged`: `0.0492 ms`, but
+    - scalar `flash_attn_decode_paged`: `0.0492 ms`, but
     `max_diff=6.103515625e-05` vs dense Flash-V100;
-  - `decode-as-paged-prefill`: `0.7976 ms`, with `max_diff=0.0` vs dense
+    - `decode-as-paged-prefill`: `0.7976 ms`, with `max_diff=0.0` vs dense
     Flash-V100;
-  - dense Flash-V100 over contiguous KV: `0.5312 ms`.
+    - dense Flash-V100 over contiguous KV: `0.5312 ms`.
 - Performance interpretation:
-  - the exact decode-as-prefill bridge is too slow to be the final decode
+    - the exact decode-as-prefill bridge is too slow to be the final decode
     fast path;
-  - it is still important because it proves the exactness issue is solvable
+    - it is still important because it proves the exactness issue is solvable
     without changing KV layout or causal semantics;
-  - the final FA2/V100 decode optimization should be a new or rewritten paged
+    - the final FA2/V100 decode optimization should be a new or rewritten paged
     decode kernel that preserves the WMMA/paged-prefill compute order while
     avoiding the full prefill kernel's wasted work for one-token decode.
 - Reproducible timing harness update:
@@ -1715,11 +1715,11 @@ Triangle exactness update, 2026-05-30:
   bench_results/sm70_migration_20260530/sm70_flash_attn_v100_decode_timing_exactness_20260530.json
   --allow-nonzero`.
 - Timing result:
-  - `seq_len=4096`, `query_len=1`, `block_size=16`:
+    - `seq_len=4096`, `query_len=1`, `block_size=16`:
     scalar paged decode `0.04928 ms`, `max_diff=6.103515625e-05`;
     decode-as-paged-prefill `0.79987 ms`, `max_diff=0.0`; dense Flash
     `0.54482 ms`;
-  - `seq_len=4096`, `query_len=8`, `block_size=832`:
+    - `seq_len=4096`, `query_len=8`, `block_size=832`:
     scalar paged decode `0.17274 ms`, `max_diff=6.103515625e-05`;
     decode-as-paged-prefill `0.59288 ms`, `max_diff=0.0`; dense Flash
     `0.49381 ms`.
@@ -1731,12 +1731,12 @@ Triangle exactness update, 2026-05-30:
   preserve WMMA reduction order while specializing away the full prefill
   overhead for decode shapes.
 - Partition-size elimination test:
-  - `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=512` evidence file:
+    - `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=512` evidence file:
     `bench_results/sm70_migration_20260530/sm70_flash_attn_v100_decode_partition512_exactness_20260530.json`;
-  - `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=1024` evidence file:
+    - `VLLM_FLASH_V100_DECODE_PARTITION_SIZE=1024` evidence file:
     `bench_results/sm70_migration_20260530/sm70_flash_attn_v100_decode_partition1024_exactness_20260530.json`;
-  - both runs still failed `paged_decode` vs `dense_flash_v100`;
-  - representative results stayed nonzero:
+    - both runs still failed `paged_decode` vs `dense_flash_v100`;
+    - representative results stayed nonzero:
     `seq_len=9/query_len=1 max_diff=0.0009765625`,
     `seq_len=69/query_len=1 max_diff=0.00048828125`,
     `seq_len=181/query_len=4 max_diff=0.000244140625`,
@@ -1748,32 +1748,32 @@ Triangle exactness update, 2026-05-30:
 - Added default-off dense-cache bridge path
   `VLLM_FLASH_V100_DECODE_DENSE_CACHE=1` in
   `vllm/v1/attention/backends/flash_attn_v100.py`.
-  - Scope: single-sequence no-MTP decode experiments.
-  - Behavior: maintain an incremental contiguous K/V cache after the first
+    - Scope: single-sequence no-MTP decode experiments.
+    - Behavior: maintain an incremental contiguous K/V cache after the first
     step and call dense Flash-V100, preserving the WMMA compute order.
-  - Quality: the op-level simulation is bitwise equal to dense Flash-V100.
-  - Limitation: not CUDA-graph capture safe, not multi-sequence safe, and not
+    - Quality: the op-level simulation is bitwise equal to dense Flash-V100.
+    - Limitation: not CUDA-graph capture safe, not multi-sequence safe, and not
     a final paged decode fast path.
 - Dense-cache timing evidence:
   `bench_results/sm70_migration_20260530/sm70_flash_attn_v100_decode_dense_cache_timing_20260530.json`.
-  - `seq_len=4096`, `query_len=1`, `block_size=16`:
+    - `seq_len=4096`, `query_len=1`, `block_size=16`:
     scalar paged decode `0.04925 ms`, `max_diff=6.103515625e-05`;
     decode-as-paged-prefill `0.78830 ms`, `max_diff=0.0`;
     dense-cache `0.53059 ms`, `max_diff=0.0`; dense Flash `0.52594 ms`.
-  - `seq_len=4096`, `query_len=8`, `block_size=832`:
+    - `seq_len=4096`, `query_len=8`, `block_size=832`:
     scalar paged decode `0.17294 ms`, `max_diff=6.103515625e-05`;
     decode-as-paged-prefill `0.57490 ms`, `max_diff=0.0`;
     dense-cache `0.47237 ms`, `max_diff=0.0`; dense Flash `0.46717 ms`.
 - Dense-cache interpretation:
-  - this is a better strict bridge than decode-as-paged-prefill for
+    - this is a better strict bridge than decode-as-paged-prefill for
     single-concurrency experiments because it avoids full paged prefill
     overhead;
-  - it still does not recover the scalar paged decode speed, so it cannot be
+    - it still does not recover the scalar paged decode speed, so it cannot be
     the final attention performance route;
-  - it gives a useful intermediate acceptance probe for no-MTP single request
+    - it gives a useful intermediate acceptance probe for no-MTP single request
     quality while the real exact paged decode kernel is implemented.
 - Full-model minimal token gate for dense-cache bridge:
-  - baseline command:
+    - baseline command:
     `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID
     VLLM_SM70_FP8_TURBOMIND=1 conda run --live-stream -n vllm-0.0.5-t210
     python benchmarks/benchmark_sm70_model_tokens.py --model
@@ -1784,7 +1784,7 @@ Triangle exactness update, 2026-05-30:
     --ignore-eos --disable-custom-all-reduce --enforce-eager
     --attention-backend TRITON_ATTN --prompt "Write one sentence about
     deterministic validation."`;
-  - dense-cache command:
+    - dense-cache command:
     `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID
     VLLM_SM70_FP8_TURBOMIND=1 VLLM_SM70_FLASH_ATTN_V100=1
     VLLM_FLASH_V100_DECODE_DENSE_CACHE=1 conda run --live-stream -n
@@ -1796,7 +1796,7 @@ Triangle exactness update, 2026-05-30:
     --ignore-eos --disable-custom-all-reduce --enforce-eager
     --attention-backend FLASH_ATTN_V100 --prompt "Write one sentence about
     deterministic validation."`;
-  - compare command:
+    - compare command:
     `conda run --live-stream -n vllm-0.0.5-t210 python
     benchmarks/benchmark_sm70_model_tokens.py --compare
     bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_greedy8_recheck.json
@@ -1804,20 +1804,20 @@ Triangle exactness update, 2026-05-30:
     --json-out
     bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_eager_greedy8.json`.
 - Full-model minimal token result:
-  - `equal=true`;
-  - prompt token IDs matched;
-  - output token IDs matched for the 8-token greedy sample;
-  - logs confirmed `AttentionBackendEnum.FLASH_ATTN_V100`, no-prefix prefill
+    - `equal=true`;
+    - prompt token IDs matched;
+    - output token IDs matched for the 8-token greedy sample;
+    - logs confirmed `AttentionBackendEnum.FLASH_ATTN_V100`, no-prefix prefill
     path, and `FLASH_ATTN_V100 decode dense-cache path active`;
-  - both runs used `--enforce-eager`, so CUDA graph capture was disabled and
+    - both runs used `--enforce-eager`, so CUDA graph capture was disabled and
     the Python debug bridge could actually execute.
 - Interpretation of the full-model token gate:
-  - this is the first full-model evidence that a strict FA2/V100 bridge can
+    - this is the first full-model evidence that a strict FA2/V100 bridge can
     preserve deterministic tokens against the latest TRITON eager baseline for
     Qwen3.6-35B-A3B-FP8;
-  - it is not sufficient for default enablement: coverage is only one prompt,
+    - it is not sufficient for default enablement: coverage is only one prompt,
     8 greedy tokens, `max_model_len=4096`, eager mode, and no speed acceptance;
-  - next required gates are broader prompt/token coverage, official sampling
+    - next required gates are broader prompt/token coverage, official sampling
     semantics, 256k startup, and either an exact graph-safe paged decode kernel
     or an explicitly documented eager-only/debug scope.
 - Added default-off debug path
@@ -1834,20 +1834,20 @@ Triangle exactness update, 2026-05-30:
   experiments, pending backend-level/full-model token checks and speed
   measurement.
 - Broader full-model token gate, batched small-prompt mode:
-  - baseline output:
+    - baseline output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_greedy16.json`;
-  - dense-cache output:
+    - dense-cache output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_eager_small_prompts_greedy16.json`;
-  - compare output:
+    - compare output:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_eager_small_prompts_greedy16.json`.
 - Batched small-prompt result:
-  - `equal=false`;
-  - prompt 0 first output-token mismatch: index `3`, TRITON token `90700`,
+    - `equal=false`;
+    - prompt 0 first output-token mismatch: index `3`, TRITON token `90700`,
     FA2/V100 dense-cache run token `8160`;
-  - prompt 1 first output-token mismatch: index `5`, TRITON token `13955`,
+    - prompt 1 first output-token mismatch: index `5`, TRITON token `13955`,
     FA2/V100 dense-cache run token `1652`;
-  - prompt 2 matched;
-  - console logs showed the backend selected `FLASH_ATTN_V100`, ran the
+    - prompt 2 matched;
+    - console logs showed the backend selected `FLASH_ATTN_V100`, ran the
     prefill path, then activated dense-cache and also dense-reference fallback.
     This is expected from the current bridge because dense-cache only supports
     `num_seqs == 1`; batched decode falls back to the slow dense-reference
@@ -1856,73 +1856,73 @@ Triangle exactness update, 2026-05-30:
   `benchmarks/benchmark_sm70_model_tokens.py` to isolate single-request
   quality from batched scheduling/fallback behavior.
 - Broader full-model token gate, sequential small-prompt mode:
-  - TRITON output:
+    - TRITON output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_seq_greedy16.json`;
-  - FA2/V100 dense-cache output:
+    - FA2/V100 dense-cache output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_eager_small_prompts_seq_greedy16.json`;
-  - compare output:
+    - compare output:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_eager_small_prompts_seq_greedy16.json`.
 - Sequential small-prompt result:
-  - `equal=true`;
-  - all three prompt token ID sequences matched;
-  - all three 16-token greedy output sequences matched exactly;
-  - FA2/V100 logs confirmed the prefill path and
+    - `equal=true`;
+    - all three prompt token ID sequences matched;
+    - all three 16-token greedy output sequences matched exactly;
+    - FA2/V100 logs confirmed the prefill path and
     `FLASH_ATTN_V100 decode dense-cache path active`.
 - Cross-checks:
-  - TRITON batched vs TRITON sequential compare:
+    - TRITON batched vs TRITON sequential compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_batched_vs_seq_small_prompts_greedy16.json`,
     `equal=true`;
-  - old FA2/V100 dense-cache batched vs old FA2/V100 dense-cache sequential
+    - old FA2/V100 dense-cache batched vs old FA2/V100 dense-cache sequential
     compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_flash_v100_dense_cache_batched_vs_seq_small_prompts_greedy16.json`,
     `equal=false`, with the same prompt 0/1 mismatch locations as the TRITON
     comparison.
 - Fix applied:
-  - in `vllm/v1/attention/backends/flash_attn_v100.py`, the
+    - in `vllm/v1/attention/backends/flash_attn_v100.py`, the
     `VLLM_FLASH_V100_DECODE_DENSE_CACHE=1` path now routes unsupported
     dense-cache cases through `_flash_v100_decode_as_paged_prefill` when the
     paged prefill kernel is available;
-  - this covers multi-sequence decode and FP8 KV-cache storage cases, where
+    - this covers multi-sequence decode and FP8 KV-cache storage cases, where
     the previous fallback went to dense-reference and produced batched token
     divergence.
 - Fix validation:
-  - direct `VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=1` batched output:
+    - direct `VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=1` batched output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_decode_as_paged_prefill_eager_small_prompts_greedy16.json`;
-  - direct paged-prefill compare:
+    - direct paged-prefill compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_eager_small_prompts_greedy16.json`,
     `equal=true`;
-  - patched dense-cache fallback output:
+    - patched dense-cache fallback output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_greedy16.json`;
-  - patched dense-cache fallback compare:
+    - patched dense-cache fallback compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_greedy16.json`,
     `equal=true`.
 - Official-sampling token gate, small-prompt mode:
-  - sampling params:
+    - sampling params:
     `temperature=1.0`, `top_p=0.95`, `top_k=20`, `max_tokens=16`,
     `ignore_eos=true`, `seed=0`;
-  - TRITON baseline:
+    - TRITON baseline:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_official_sampling16.json`;
-  - TRITON repeat:
+    - TRITON repeat:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_official_sampling16_repeat.json`;
-  - TRITON self-compare:
+    - TRITON self-compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_official_sampling16_self_repeat.json`,
     `equal=true`;
-  - FA2/V100 patched dense-cache fallback:
+    - FA2/V100 patched dense-cache fallback:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_official_sampling16.json`;
-  - TRITON vs FA2/V100 compare:
+    - TRITON vs FA2/V100 compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_official_sampling16.json`,
     `equal=false`.
 - Official-sampling result:
-  - prompt 0 matched;
-  - prompt 1 first output-token mismatch: index `2`, TRITON token `198`,
+    - prompt 0 matched;
+    - prompt 1 first output-token mismatch: index `2`, TRITON token `198`,
     FA2/V100 token `271`;
-  - prompt 2 matched.
+    - prompt 2 matched.
 - Official-sampling interpretation:
-  - the sampling gate is valid because the TRITON baseline is repeat-stable
+    - the sampling gate is valid because the TRITON baseline is repeat-stable
     under the same seed and sampling params;
-  - the current FA2/V100 strict/debug bridge is not accepted for official
+    - the current FA2/V100 strict/debug bridge is not accepted for official
     sampling semantics even though the greedy small-prompt gate passes;
-  - under the project rule, greedy success cannot be used to approve this path
+    - under the project rule, greedy success cannot be used to approve this path
     for sampling. The next fix needs attention/logit-level strict parity
     against the chosen latest-vLLM canonical path, not a sampling shortcut.
 - Added optional `--logprobs` support to
@@ -1930,147 +1930,147 @@ Triangle exactness update, 2026-05-30:
   can dump selected-token and top-token logprobs without changing the harness
   default behavior.
 - Short logprobs diagnostic:
-  - TRITON output:
+    - TRITON output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_official_sampling4_logprobs20.json`;
-  - FA2/V100 output:
+    - FA2/V100 output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_official_sampling4_logprobs20.json`;
-  - compare:
+    - compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_official_sampling4_logprobs20.json`,
     `equal=true`.
 - Diagnostic limitation:
-  - the 4-token/top-20-logprobs run did not reproduce the 16-token sampling
+    - the 4-token/top-20-logprobs run did not reproduce the 16-token sampling
     mismatch. The first four sampled tokens matched for all prompts;
-  - this means the short logprobs run is useful as a harness check, but it does
+    - this means the short logprobs run is useful as a harness check, but it does
     not explain the 16-token official-sampling failure;
-  - next useful diagnostic is same-length `max_tokens=16` logprobs or a
+    - next useful diagnostic is same-length `max_tokens=16` logprobs or a
     direct logits-level compare at the failing prefix.
 - Same-length logprobs diagnostic:
-  - TRITON 16-token/top-20-logprobs output:
+    - TRITON 16-token/top-20-logprobs output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_official_sampling16_logprobs20.json`;
-  - TRITON no-logprobs vs TRITON logprobs compare:
+    - TRITON no-logprobs vs TRITON logprobs compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_official_sampling16_vs_logprobs20.json`,
     `equal=false`;
-  - first mismatch is again prompt 1 output index `2`, no-logprobs token
+    - first mismatch is again prompt 1 output index `2`, no-logprobs token
     `198`, logprobs token `271`;
-  - TRITON logprobs vs FA2/V100 no-logprobs compare:
+    - TRITON logprobs vs FA2/V100 no-logprobs compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_logprobs20_vs_flash_v100_official_sampling16.json`,
     `equal=false`, first mismatch prompt 1 output index `11`.
 - Same-length logprobs interpretation:
-  - requesting top-20 logprobs changes the TRITON sampling trajectory, so it is
+    - requesting top-20 logprobs changes the TRITON sampling trajectory, so it is
     not a neutral diagnostic for this official-sampling failure;
-  - the logprobs run moves TRITON onto the same early branch as FA2/V100
+    - the logprobs run moves TRITON onto the same early branch as FA2/V100
     through token index `10`, then diverges again at token index `11`;
-  - therefore `--logprobs` should remain a diagnostic tool only. It cannot be
+    - therefore `--logprobs` should remain a diagnostic tool only. It cannot be
     used as quality evidence for accepting FA2/V100 sampling, and the next
     reliable diagnostic should be a direct logits/probability capture at the
     failing prefix without enabling sampling logprobs.
 - Sequential official-sampling isolation:
-  - TRITON sequential output:
+    - TRITON sequential output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_seq_official_sampling16.json`;
-  - FA2/V100 sequential output:
+    - FA2/V100 sequential output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_seq_official_sampling16.json`;
-  - TRITON batched vs TRITON sequential compare:
+    - TRITON batched vs TRITON sequential compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_batched_vs_seq_official_sampling16.json`,
     `equal=false`, with prompt 2 first output-token mismatch at index `0`
     (`271` vs `198`);
-  - TRITON sequential vs FA2/V100 sequential compare:
+    - TRITON sequential vs FA2/V100 sequential compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_seq_official_sampling16.json`,
     `equal=true`.
 - Sequential official-sampling interpretation:
-  - the same official sampling params are token-stable under same-backend
+    - the same official sampling params are token-stable under same-backend
     repeat, but not invariant to batched-vs-sequential request grouping;
-  - under the same sequential request grouping, the current FA2/V100 bridge
+    - under the same sequential request grouping, the current FA2/V100 bridge
     matches TRITON token IDs exactly for the three-prompt, 16-token official
     sampling gate;
-  - the remaining batched official-sampling failure must be debugged as a
+    - the remaining batched official-sampling failure must be debugged as a
     request-grouping/sampling-trajectory/logits interaction, not treated as
     proof that FA2/V100 is inherently unsafe;
-  - acceptance still requires batched-mode parity or an explicit explanation
+    - acceptance still requires batched-mode parity or an explicit explanation
     of upstream sampling semantics, plus a direct logits/probability capture
     at the failing prefix that does not perturb generation.
 - Additional batched/sequential cross-check:
-  - FA2/V100 batched vs FA2/V100 sequential compare:
+    - FA2/V100 batched vs FA2/V100 sequential compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_flash_v100_batched_vs_seq_official_sampling16.json`,
     `equal=false`;
-  - prompt 1 first mismatch was index `2`, batched token `271` vs sequential
+    - prompt 1 first mismatch was index `2`, batched token `271` vs sequential
     token `198`;
-  - prompt 2 first mismatch was index `0`, batched token `271` vs sequential
+    - prompt 2 first mismatch was index `0`, batched token `271` vs sequential
     token `198`;
-  - TRITON sequential vs FA2/V100 batched compare:
+    - TRITON sequential vs FA2/V100 batched compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_seq_vs_flash_v100_batched_official_sampling16.json`,
     `equal=false`, with the same prompt 1/prompt 2 mismatch pattern;
-  - combining this with TRITON batched-vs-sequential shows prompt 2 is a
+    - combining this with TRITON batched-vs-sequential shows prompt 2 is a
     general request-grouping sampling effect, while prompt 1 remains the
     FA2/V100-specific batched official-sampling mismatch to debug.
 - Added default-off sampler logits dump diagnostics:
-  - implementation: `vllm/v1/sample/sampler.py`;
-  - env vars registered in `vllm/envs.py`:
+    - implementation: `vllm/v1/sample/sampler.py`;
+    - env vars registered in `vllm/envs.py`:
     `VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR` and
     `VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS`;
-  - the dump records pre-processor float32 sampler logits and sampling
+    - the dump records pre-processor float32 sampler logits and sampling
     metadata through `torch.save` only when the directory env var is set.
 - Logits dump diagnostic result:
-  - 4-token batched official sampling with dump:
+    - 4-token batched official sampling with dump:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_official_sampling4_logits_dump.json`,
     `equal=true`;
-  - 16-token batched official sampling with dump:
+    - 16-token batched official sampling with dump:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_official_sampling16_logits_dump.json`,
     `equal=true`;
-  - first four dumped sampler-logit steps compared strictly equal:
+    - first four dumped sampler-logit steps compared strictly equal:
     `bench_results/sm70_migration_20260530/sampler_logits_compare_triton_vs_flash_v100_official_sampling16_dump_first4.json`,
     `all_equal=true`, all checked `max_diff=0.0`.
 - Logits dump interpretation:
-  - the dump's device-to-host synchronization and file I/O perturb the
+    - the dump's device-to-host synchronization and file I/O perturb the
     original asynchronous batched sampling trajectory. It cannot be used as
     acceptance evidence for official sampling equality;
-  - it is still useful because, on the perturbed but equal trajectory, the
+    - it is still useful because, on the perturbed but equal trajectory, the
     first four sampler-logit tensors are bitwise identical between TRITON and
     FA2/V100. This points away from a deterministic early-step attention
     max-diff and toward an async scheduling/sampling interaction that needs a
     lower-overhead capture method.
 - Async scheduling isolation:
-  - latest vLLM exposes `async_scheduling` through `SchedulerConfig`; the
+    - latest vLLM exposes `async_scheduling` through `SchedulerConfig`; the
     model-token harness can pass it with
     `--engine-arg async_scheduling=false`;
-  - TRITON async-off output:
+    - TRITON async-off output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_official_sampling16_async_off.json`;
-  - FA2/V100 async-off output:
+    - FA2/V100 async-off output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_dense_cache_paged_prefill_fallback_eager_small_prompts_official_sampling16_async_off.json`;
-  - TRITON async-off vs FA2/V100 async-off compare:
+    - TRITON async-off vs FA2/V100 async-off compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_official_sampling16_async_off.json`,
     `equal=true`;
-  - TRITON async-on vs TRITON async-off compare:
+    - TRITON async-on vs TRITON async-off compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_async_on_vs_off_official_sampling16.json`,
     `equal=false`, with prompt 0 first mismatch at output index `3` and
     prompt 2 first mismatch at output index `2`;
-  - FA2/V100 async-on vs FA2/V100 async-off compare:
+    - FA2/V100 async-on vs FA2/V100 async-off compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_flash_v100_async_on_vs_off_official_sampling16.json`,
     `equal=false`, with prompt 0 first mismatch at output index `3`,
     prompt 1 at output index `2`, and prompt 2 at output index `2`.
 - Async scheduling interpretation:
-  - disabling async scheduling removes the TRITON-vs-FA2/V100 batched
+    - disabling async scheduling removes the TRITON-vs-FA2/V100 batched
     official-sampling mismatch for this three-prompt, 16-token gate;
-  - async scheduling itself changes official-sampling token trajectories even
+    - async scheduling itself changes official-sampling token trajectories even
     for TRITON, so sampling equality must record the async scheduling state as
     part of the benchmark口径;
-  - the FA2/V100-specific async-on mismatch is still a real default-route
+    - the FA2/V100-specific async-on mismatch is still a real default-route
     blocker, but the async-off pass shows the path is not inherently
     quality-breaking. The next fix target is either a deterministic
     async-sampling/request-ordering mechanism for SM70, or a documented
     quality-safe SM70 policy that disables async scheduling for official
     sampling after speed impact is measured.
 - Interpretation:
-  - FA2/V100 is still a required migration path, not a discarded route;
-  - any `max_diff != 0` or token mismatch on the required acceptance path is
+    - FA2/V100 is still a required migration path, not a discarded route;
+    - any `max_diff != 0` or token mismatch on the required acceptance path is
     a fix target. It may temporarily keep FA2/V100 default-off, but it is not
     a reason to remove FlashAttention2/V100 from the migration plan;
-  - the latest evidence says the single-sequence dense-cache bridge and the
+    - the latest evidence says the single-sequence dense-cache bridge and the
     patched multi-sequence paged-prefill fallback both preserve deterministic
     tokens for the tested prompts;
-  - this fixes the immediate batched bridge quality failure and passes the
+    - this fixes the immediate batched bridge quality failure and passes the
     sequential official-sampling gate, but it is still a strict/debug bridge
     and not the final speed path or fully batched sampling-safe path;
-  - the next fix target is an exact, graph-safe paged decode CUDA kernel with
+    - the next fix target is an exact, graph-safe paged decode CUDA kernel with
     the same numerical order as the paged-prefill WMMA path, not removal of
     FlashAttention-V100.
 - Registered the Flash V100 debug/tuning env vars in `vllm/envs.py`:
@@ -2091,42 +2091,42 @@ Triangle exactness update, 2026-05-30:
   `VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS`, and
   `VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE`.
 - Static checks after this patch:
-  - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
+    - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
     benchmarks/benchmark_sm70_attention_exactness.py
     vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py`;
-  - `uv run --no-sync ruff check
+    - `uv run --no-sync ruff check
     benchmarks/benchmark_sm70_attention_exactness.py
     vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py`;
-  - `git diff --check -- benchmarks/benchmark_sm70_attention_exactness.py
+    - `git diff --check -- benchmarks/benchmark_sm70_attention_exactness.py
     vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py
     docs/design/sm70_v100_migration_control.md`.
 - Static checks after the dense-cache paged-prefill fallback fix:
-  - `uv run --no-sync ruff check benchmarks/benchmark_sm70_model_tokens.py
+    - `uv run --no-sync ruff check benchmarks/benchmark_sm70_model_tokens.py
     benchmarks/benchmark_sm70_attention_exactness.py
     vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py`;
-  - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
+    - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
     benchmarks/benchmark_sm70_model_tokens.py
     benchmarks/benchmark_sm70_attention_exactness.py
     vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py`;
-  - `git diff --check -- benchmarks/benchmark_sm70_model_tokens.py
+    - `git diff --check -- benchmarks/benchmark_sm70_model_tokens.py
     benchmarks/benchmark_sm70_attention_exactness.py
     vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py
     docs/design/sm70_v100_migration_control.md`.
 - User clarification, 2026-05-30:
-  - FlashAttention2/V100 is a required migration and optimization track. It
+    - FlashAttention2/V100 is a required migration and optimization track. It
     must not be dropped merely because the current scalar paged decode kernel
     or a current full-model gate produces nonzero diff.
-  - The old `0.0.3` tree already contained a V100-specific modified
+    - The old `0.0.3` tree already contained a V100-specific modified
     FlashAttention path. The latest tree now carries the same external
     `flash-attention-v100/` CUDA extension sources; `diff -qr`, excluding
     build products and caches, only found the old `.claude` metadata
     directory.
-  - Therefore the remaining work is not "skip old FA2" or "discard V100 FA",
+    - Therefore the remaining work is not "skip old FA2" or "discard V100 FA",
     but to make the V100 path satisfy the stricter mainline rule:
     `torch.equal`, `max_diff == 0`, deterministic token equality, and official
     sampling semantics under a clearly recorded scheduler/request-grouping
     criterion.
-  - Current source-level root cause candidate remains
+    - Current source-level root cause candidate remains
     `flash-attention-v100/kernel/flash_decode_paged.cu`: it uses scalar/half2
     QK dot, per-partition softmax, fp16 partial output, and a second reduce
     kernel. The paged prefill kernel
@@ -2136,17 +2136,17 @@ Triangle exactness update, 2026-05-30:
     or specialized paged decode kernel that preserves the WMMA/paged-prefill
     numerical order while removing the wasted prefill overhead.
 - Vectorized strict bridge update, 2026-05-30:
-  - Updated `vllm/v1/attention/backends/flash_attn_v100.py` so
+    - Updated `vllm/v1/attention/backends/flash_attn_v100.py` so
     `_flash_v100_decode_as_paged_prefill` batches uniform-query decode
     requests into one `flash_attn_prefill_paged` call instead of looping over
     sequences one by one.
-  - This does not accept the scalar paged decode kernel. It keeps the current
+    - This does not accept the scalar paged decode kernel. It keeps the current
     exact WMMA/paged-prefill numerical order and only reduces Python/kernel
     launch overhead for the default-off strict bridge.
-  - Also moved the scalar paged-decode log so debug bridge runs no longer print
+    - Also moved the scalar paged-decode log so debug bridge runs no longer print
     the misleading "paged KV kernel, CUDA-graph safe" message before routing to
     decode-as-paged-prefill.
-  - Validation command:
+    - Validation command:
     `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID
     VLLM_SM70_FP8_TURBOMIND=1 VLLM_SM70_FLASH_ATTN_V100=1
     VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=1 conda run --live-stream -n
@@ -2158,51 +2158,51 @@ Triangle exactness update, 2026-05-30:
     --ignore-eos --disable-custom-all-reduce --enforce-eager
     --attention-backend FLASH_ATTN_V100 --prompts-json
     benchmarks/sm70_model_token_prompts_small.json`.
-  - Compare evidence:
+    - Compare evidence:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_vectorized_eager_small_prompts_greedy16.json`,
     `equal=true`.
-  - Scope: three small prompts, greedy 16 tokens, Qwen3.6-35B-A3B-FP8 TP4,
+    - Scope: three small prompts, greedy 16 tokens, Qwen3.6-35B-A3B-FP8 TP4,
     eager mode, latest tree. This is a quality-preserving bridge validation,
     not final speed acceptance and not official-sampling acceptance.
 - BHMD raw-out bridge attempt, 2026-05-30:
-  - Added `flash_attn_prefill_paged_bhmd` to
+    - Added `flash_attn_prefill_paged_bhmd` to
     `flash-attention-v100/flash_attn_v100/flash_attn_interface.py` and
     exported it from `flash_attn_v100/__init__.py`. It calls the existing C++
     `prefill_paged_fwd` directly for tensors already laid out as `[B,H,M,D]`,
     avoiding the normal wrapper's permute/copy path.
-  - Op-level checks passed:
+    - Op-level checks passed:
     `bench_results/sm70_migration_20260530/flash_v100_prefill_paged_bhmd_raw_exactness.json`
     and
     `bench_results/sm70_migration_20260530/flash_v100_prefill_paged_bhmd_raw_exactness_batched.json`
     both reported `equal=true`, `max_diff=0.0`, and `out_alias=true`.
-  - Full-model gate failed:
+    - Full-model gate failed:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_bhmd_out_eager_small_prompts_greedy16.json`
     reported `equal=false`, prompt 0 first mismatch at output index `3`
     (`90700` vs `8160`).
-  - The BHMD raw-out run also diverged from the earlier vectorized strict
+    - The BHMD raw-out run also diverged from the earlier vectorized strict
     bridge:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_flash_v100_vectorized_vs_bhmd_out_eager_small_prompts_greedy16.json`,
     same prompt 0 mismatch.
-  - Conclusion: this sub-route is not quality-safe despite synthetic op
+    - Conclusion: this sub-route is not quality-safe despite synthetic op
     equality. It is now behind a separate default-off gate
     `VLLM_FLASH_V100_DECODE_USE_BHMD_OUT=1` and must not be counted as a main
     route until a real-model tensor-level cause is found and fixed. The
     previously passed vectorized strict bridge remains the default behavior
     for `VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=1`.
-  - Gate-off recovery validation:
+    - Gate-off recovery validation:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_bhmd_gate_off_eager_small_prompts_greedy16.json`
     reported `equal=true` for the same three-prompt greedy16 gate, and logs did
     not show the BHMD out path. This confirms the unsafe raw-out experiment is
     isolated from the default strict bridge.
 - BHMD raw-out real-model tensor diagnostic, 2026-05-30:
-  - Added a separate diagnostic-only compare gate in
+    - Added a separate diagnostic-only compare gate in
     `vllm/v1/attention/backends/flash_attn_v100.py`:
     `VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR` and
     `VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS`. This gate computes the
     safe vectorized `flash_attn_prefill_paged` result, computes the BHMD raw
     `flash_attn_prefill_paged_bhmd` result into scratch memory, writes strict
     JSON reports, and still returns the safe result to the model.
-  - Validation command:
+    - Validation command:
     `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID
     VLLM_SM70_FP8_TURBOMIND=1 VLLM_SM70_FLASH_ATTN_V100=1
     VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=1
@@ -2216,14 +2216,14 @@ Triangle exactness update, 2026-05-30:
     --ignore-eos --disable-custom-all-reduce --enforce-eager
     --attention-backend FLASH_ATTN_V100 --prompts-json
     benchmarks/sm70_model_token_prompts_small.json`.
-  - Tensor report aggregation over
+    - Tensor report aggregation over
     `bench_results/sm70_migration_20260530/bhmd_compare_gate_off/*.json`:
     `count=80`, `all_equal=true`, `max_diff=0.0`, `max_mean_diff=0.0`,
     `max_num_different=0`.
-  - Token compare evidence:
+    - Token compare evidence:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_bhmd_compare_eager_small_prompts_greedy16.json`
     reported `equal=true`.
-  - Interpretation: BHMD raw compute is not inherently numerically unsafe for
+    - Interpretation: BHMD raw compute is not inherently numerically unsafe for
     the real Qwen3.6-35B-A3B-FP8 TP4 tensors tested here. The earlier token
     divergence appears tied to directly writing the model output buffer through
     the raw BHMD view, likely a layout/alias/lifetime/synchronization issue.
@@ -2231,54 +2231,54 @@ Triangle exactness update, 2026-05-30:
     `VLLM_FLASH_V100_DECODE_USE_BHMD_OUT=1` remains default-off and outside
     mainline acceptance until the direct-output path also passes token equality.
 - BHMD raw-out direct-output recovery attempt, 2026-05-30:
-  - Added `_same_storage` guard in
+    - Added `_same_storage` guard in
     `vllm/v1/attention/backends/flash_attn_v100.py`. If the raw BHMD Q view
     and output view share the same storage, the backend clones Q before
     launching `flash_attn_prefill_paged_bhmd` so the kernel cannot overwrite
     Q while reading it. The tested run did not trigger this guard
     (`any_q_out_same_storage=false` below), so aliasing is only a guarded risk,
     not the proven root cause of the earlier failure.
-  - Added direct-output strict compare mode under the existing compare envs:
+    - Added direct-output strict compare mode under the existing compare envs:
     when `VLLM_FLASH_V100_DECODE_USE_BHMD_OUT=1` and
     `VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR` are both set, the backend computes
     a safe `flash_attn_prefill_paged` reference before the raw-out launch,
     writes raw BHMD output into the real model output buffer, then compares the
     final output buffer against the safe reference.
-  - Raw-out token recovery evidence:
+    - Raw-out token recovery evidence:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_bhmd_out_alias_guard_eager_small_prompts_greedy16.json`
     reported `equal=true` for Qwen3.6-35B-A3B-FP8 TP4, three small prompts,
     greedy 16 tokens.
-  - Direct-output max-diff evidence:
+    - Direct-output max-diff evidence:
     `bench_results/sm70_migration_20260530/bhmd_direct_compare_alias_guard/*.json`
     aggregated to `count=40`, `modes=["direct_out_vs_safe"]`,
     `all_equal=true`, `max_diff=0.0`, `max_mean_diff=0.0`,
     `max_num_different=0`, `any_q_out_same_storage=false`.
-  - Direct-output token compare evidence:
+    - Direct-output token compare evidence:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_decode_as_paged_prefill_bhmd_out_direct_compare_eager_small_prompts_greedy16.json`
     reported `equal=true`.
-  - Current conclusion: the FA2/V100 BHMD raw-out route is no longer proven
+    - Current conclusion: the FA2/V100 BHMD raw-out route is no longer proven
     inherently unsafe by the earlier failed run. It still stays default-off
     because coverage is small and the earlier failure has not been fully
     explained, but the correct next step is broader strict validation
     (repeat runs, longer prompts, official sampling, async grouping, and then
     speed) rather than discarding FlashAttention2/V100.
 - BHMD raw-out official-sampling gate, 2026-05-30:
-  - Sampling params were the official Qwen-style test口径:
+    - Sampling params were the official Qwen-style test口径:
     `temperature=1.0`, `top_p=0.95`, `top_k=20`, `max_tokens=16`,
     `ignore_eos=true`, three small prompts, Qwen3.6-35B-A3B-FP8, TP4,
     eager mode, latest tree.
-  - Async-off output:
+    - Async-off output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_bhmd_out_eager_small_prompts_official_sampling16_async_off.json`.
-  - Async-off compare:
+    - Async-off compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_bhmd_out_official_sampling16_async_off.json`
     reported `equal=true` against the existing TRITON async-off baseline.
-  - Default async-on output:
+    - Default async-on output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_bhmd_out_eager_small_prompts_official_sampling16_async_on.json`.
-  - Default async-on compare:
+    - Default async-on compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_bhmd_out_official_sampling16_async_on.json`
     reported `equal=false`; prompt 1 first mismatch remained output token
     index `2`, TRITON token `198`, FA2/V100 token `271`.
-  - Interpretation: BHMD raw-out improves the direct-output path and passes
+    - Interpretation: BHMD raw-out improves the direct-output path and passes
     official sampling under `async_scheduling=false`, but it does not solve
     the default async-on official-sampling blocker. The failure point matches
     the earlier dense-cache/paged-prefill fallback mismatch, so the remaining
@@ -2287,23 +2287,23 @@ Triangle exactness update, 2026-05-30:
     Until that is fixed or a measured SM70 policy disables async scheduling,
     official sampling with async-on is not default-accepted.
 - Async-on per-request seed isolation, 2026-05-30:
-  - Added `--sampling-seed` to
+    - Added `--sampling-seed` to
     `benchmarks/benchmark_sm70_model_tokens.py`, wired to
     `SamplingParams(seed=...)`.
-  - Reason: with `SamplingParams.seed=None`, the vLLM top-k/top-p sampler can
+    - Reason: with `SamplingParams.seed=None`, the vLLM top-k/top-p sampler can
     consume global CUDA RNG in `random_sample`; async scheduling and backend
     latency can therefore change RNG consumption order. An unseeded stochastic
     async-on token mismatch is not, by itself, proof of FA2/V100 attention
     numerical drift.
-  - Seeded TRITON async-on baseline:
+    - Seeded TRITON async-on baseline:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_small_prompts_official_sampling16_async_on_sampling_seed0.json`.
-  - Seeded FA2/V100 BHMD raw-out async-on output:
+    - Seeded FA2/V100 BHMD raw-out async-on output:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_bhmd_out_eager_small_prompts_official_sampling16_async_on_sampling_seed0.json`.
-  - Seeded async-on compare:
+    - Seeded async-on compare:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_bhmd_out_official_sampling16_async_on_sampling_seed0.json`
     reported `equal=true` for all 3 prompts and all 48 output tokens under
     `temperature=1.0`, `top_p=0.95`, `top_k=20`, `max_tokens=16`.
-  - Interpretation: the previous unseeded async-on mismatch is now best
+    - Interpretation: the previous unseeded async-on mismatch is now best
     treated as a sampler/RNG-order semantics issue rather than FA2/V100
     compute corruption. This does not weaken the strict rule: any accepted
     attention kernel path still needs `max_diff == 0`, and any accepted
@@ -2311,7 +2311,7 @@ Triangle exactness update, 2026-05-30:
     a required migration path; nonzero diff is a fix target, not a discard
     reason.
 - Backend default policy change, 2026-05-30:
-  - Problem found in current code: when `FLASH_ATTN_V100` was selected but
+    - Problem found in current code: when `FLASH_ATTN_V100` was selected but
     `VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL` was not manually set, decode
     fell through to the scalar paged decode kernel. Existing exactness files
     show that scalar kernel has nonzero diffs vs the dense/paged-prefill
@@ -2319,53 +2319,53 @@ Triangle exactness update, 2026-05-30:
     `bench_results/sm70_migration_20260530/sm70_flash_attn_v100_decode_timing_exactness_20260530.json`
     reported `decode_paged_equal_dense=false` and
     `decode_paged_max_diff=6.103515625e-05` for the 4096-token timing cases.
-  - Change made: `vllm/v1/attention/backends/flash_attn_v100.py` now defaults
+    - Change made: `vllm/v1/attention/backends/flash_attn_v100.py` now defaults
     decode to the strict paged-prefill bridge and BHMD output path when those
     ops are available. The scalar paged decode kernel is no longer the backend
     default; it requires explicit
     `VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED=1`.
-  - If the strict bridge is unavailable or CUDA graph capture is active, the
+    - If the strict bridge is unavailable or CUDA graph capture is active, the
     backend now falls back to Triton instead of silently using the known
     nonzero-diff scalar kernel.
-  - `vllm/envs.py` now registers this policy:
+    - `vllm/envs.py` now registers this policy:
     `VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=1` by default,
     `VLLM_FLASH_V100_DECODE_USE_BHMD_OUT=1` by default, and
     `VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED=0` by default.
-  - Full-model default-policy greedy gate:
+    - Full-model default-policy greedy gate:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_default_strict_bridge_eager_small_prompts_greedy16.json`
     was generated with only `VLLM_SM70_FLASH_ATTN_V100=1` plus the FP8
     TurboMind gate; the log showed `decode-as-paged-prefill` and `BHMD out`
     without manually setting those decode env vars. Compare file
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_default_strict_bridge_eager_small_prompts_greedy16.json`
     reported `equal=true`.
-  - Full-model default-policy seeded official sampling gate:
+    - Full-model default-policy seeded official sampling gate:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_default_strict_bridge_eager_small_prompts_official_sampling16_async_on_sampling_seed0.json`
     used `temperature=1.0`, `top_p=0.95`, `top_k=20`,
     `SamplingParams.seed=0`, and async-on. Compare file
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_default_strict_bridge_official_sampling16_async_on_sampling_seed0.json`
     reported `equal=true` for all 3 prompts and all 48 output tokens.
-  - Interpretation: this does not finish FA2/V100 acceptance because dense
+    - Interpretation: this does not finish FA2/V100 acceptance because dense
     Flash-V100 vs strict reference and final speed still need work. It does
     prevent a known nonzero-diff decode kernel from being the default route
     once the V100 backend is selected.
 - Real-model Triton-output compare hook, 2026-05-30:
-  - Added diagnostic envs:
+    - Added diagnostic envs:
     `VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR` and
     `VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS`.
-  - When enabled, `FlashAttnV100Impl` first writes the real FA/V100 output,
+    - When enabled, `FlashAttnV100Impl` first writes the real FA/V100 output,
     then runs the inherited `TritonAttentionImpl.forward` on the same
     query/KV/metadata into a temporary buffer and writes a strict report with
     `torch.equal`, `max_diff`, `mean_diff`, `num_different`, stage, shape, and
     token/query metadata. This does not change the returned model output.
-  - Test run:
+    - Test run:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_default_strict_bridge_triton_out_compare_eager_small_prompts_greedy16.json`
     used Qwen3.6-35B-A3B-FP8, TP4, greedy16, three small prompts, default
     strict FA/V100 bridge, and
     `VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS=2`.
-  - Token compare still passed:
+    - Token compare still passed:
     `bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_triton_vs_flash_v100_default_strict_bridge_triton_out_compare_eager_small_prompts_greedy16.json`
     reported `equal=true`.
-  - Attention-output compare reports:
+    - Attention-output compare reports:
     `bench_results/sm70_migration_20260530/flash_v100_triton_out_compare_default_strict/*.json`.
     Aggregate summary:
     `bench_results/sm70_migration_20260530/flash_v100_triton_out_compare_default_strict_summary.json`.
@@ -2373,7 +2373,7 @@ Triangle exactness update, 2026-05-30:
     Breakdown:
     `prefill_no_prefix` had `40/40` non-equal with max diff `0.00390625`;
     `decode_paged_prefill` had `39/40` non-equal with max diff `0.00390625`.
-  - Interpretation: the default strict bridge removes the scalar paged-decode
+    - Interpretation: the default strict bridge removes the scalar paged-decode
     quality hole and preserves tested tokens, but it is not bitwise identical
     to latest Triton attention at the real layer-output level. Therefore
     `FLASH_ATTN_V100` still cannot be auto/default-selected for the main
@@ -2383,19 +2383,19 @@ Triangle exactness update, 2026-05-30:
     bitwise-identical implementation.
 - Op-level Flash-V100 vs latest Triton `unified_attention` compare,
   2026-05-30:
-  - Added `--compare-triton` to
+    - Added `--compare-triton` to
     `benchmarks/benchmark_sm70_attention_exactness.py`. The diagnostic calls
     latest Triton `unified_attention` directly on the same Q, paged K/V cache,
     block table, sequence length, causal mask, and scale, then compares both
     dense Flash-V100 and paged Flash-V100 outputs with strict `torch.equal`.
-  - Result file:
+    - Result file:
     `bench_results/sm70_migration_20260530/attention_exactness_flash_v100_vs_triton_unified_headgroup_20260530.json`.
-  - Result: `passed=false`. Dense Flash-V100 and paged Flash-V100 match each
+    - Result: `passed=false`. Dense Flash-V100 and paged Flash-V100 match each
     other for the tested cases, but both differ from latest Triton. The
     Triton-compare cases reached maximum `max_diff=0.0009765625`; even the
     `q_heads=1, kv_heads=1, seq_len=9, query_len=9, head_dim=256` case had one
     differing element in this seed.
-  - Interpretation: the mismatch is reproduced without model layers, paged-KV
+    - Interpretation: the mismatch is reproduced without model layers, paged-KV
     wrapper policy, BHMD output aliasing, or sampler state. The current
     Flash-V100 kernel is computing the same attention math with a different
     tensor-core/online-softmax schedule than latest Triton. Therefore the safe
@@ -2406,21 +2406,21 @@ Triangle exactness update, 2026-05-30:
     2. if the accepted oracle for V100 is changed to the old `0.0.3`
        FlashAttention route, separately prove old-FA vs latest-FA bitwise
        equality and record that oracle change explicitly.
-  - Until one of those is done, FA2/V100 remains mandatory in scope but
+    - Until one of those is done, FA2/V100 remains mandatory in scope but
     default-off / non-accepted for mainline performance claims.
 - User reaffirmation, 2026-05-31:
-  - FlashAttention2/V100 is a mandatory migration/fix track because the old
+    - FlashAttention2/V100 is a mandatory migration/fix track because the old
     `0.0.3` tree already contains a modified FlashAttention path. A nonzero
     attention `max_diff` is a defect to isolate and fix, not a reason to drop
     FA2/V100 from the migration.
-  - Source diff check on 2026-05-31 found no CUDA kernel differences between
+    - Source diff check on 2026-05-31 found no CUDA kernel differences between
     old `0.0.3` and latest-tree `flash-attention-v100/` for
     `kernel/fused_mha_forward_paged.cu` and `kernel/flash_decode_paged.cu`.
     `diff -qr` only reports Python package interface/export differences:
     `flash_attn_v100/__init__.py` and
     `flash_attn_v100/flash_attn_interface.py`, where the latest tree added
     the BHMD raw-output wrapper for diagnostics/bridge experiments.
-  - Added `benchmarks/benchmark_sm70_attention_exactness.py --mode
+    - Added `benchmarks/benchmark_sm70_attention_exactness.py --mode
     source-parity` so this check is reproducible and recorded in JSON instead
     of being an ad hoc shell diff. Evidence file:
     `bench_results/sm70_migration_20260531/flash_attn_v100_old003_vs_latest_source_parity_20260531.json`.
@@ -2428,13 +2428,13 @@ Triangle exactness update, 2026-05-30:
     interface/export files differ; CUDA `kernel/` and `include/` source parity
     is `kernel_passed=true`, with no kernel mismatches and no kernel-only
     additions/removals.
-  - Old `0.0.3` FA2/V100 tests
+    - Old `0.0.3` FA2/V100 tests
     `tests/kernels/attention/test_flash_attn_v100_smallq_decode.py` and
     `tests/kernels/attention/test_flash_attn_v100_dense_short_prefill.py`
     use `torch.testing.assert_close(..., atol=1e-3, rtol=1e-2)`. They prove
     the old modified FA path was close and usable, but they do not prove the
     new strict requirement `max_diff == 0`.
-  - Therefore the current exactness failure is not evidence that the old V100
+    - Therefore the current exactness failure is not evidence that the old V100
     FA kernels were lost during the port. It is an inherited kernel/arithmetic
     order mismatch against the current chosen latest-vLLM oracle. The next FA
     work must split two gates:
@@ -2443,31 +2443,31 @@ Triangle exactness update, 2026-05-30:
     2. mainline quality gate: the accepted default attention route must also
        satisfy `max_diff == 0` and exact token equality against the chosen
        production oracle.
-  - If the production oracle remains latest Triton/unified attention, then the
+    - If the production oracle remains latest Triton/unified attention, then the
     V100 FA kernel or bridge must be rewritten to match that arithmetic order
     exactly. If the production oracle is changed to old modified FA for SM70,
     that decision must be explicit and backed by old-FA-vs-latest-FA bitwise
     parity plus model-level token/logit validation. In neither case is
     "discard FA2/V100" an acceptable resolution.
-  - Immediate recheck after the policy update:
+    - Immediate recheck after the policy update:
     `CUDA_VISIBLE_DEVICES=1 conda run --live-stream -n vllm-0.0.5-t210 python
     benchmarks/benchmark_sm70_attention_exactness.py --mode paged-decode
     --json-out
     bench_results/sm70_migration_20260531/sm70_flash_attn_v100_decode_strict_recheck_after_source_parity_20260531.json
     --allow-nonzero`.
-  - Result: `passed=false`. The old scalar `flash_attn_decode_paged` path still
+    - Result: `passed=false`. The old scalar `flash_attn_decode_paged` path still
     has nonzero diffs: against dense Flash-V100, the recheck saw
     `max_diff` values up to `0.0009765625`; against the diagnostic
     `torch_float32` oracle, up to `0.000244140625`. In the same run,
     `paged_decode_as_prefill` matched `dense_flash_v100_causal` with
     `max_diff=0.0` for every tested case, and dense Flash-V100 causal matched
     dense Flash-V100 decode-steps with `max_diff=0.0`.
-  - Current source-level conclusion: do not discard FA2/V100. The scalar paged
+    - Current source-level conclusion: do not discard FA2/V100. The scalar paged
     decode kernel/bridge is the non-bitwise subpath; the prefill-based decode
     bridge is the strict candidate. The remaining work is to turn that strict
     bridge into a fast path, or rewrite scalar paged decode to use the same
     arithmetic order.
-  - Source-level cause split:
+    - Source-level cause split:
     `flash-attention-v100/kernel/flash_decode_paged.cu` computes decode with
     half2/scalar QK dot products, stores per-partition fp16 `tmp_out`, then
     merges partitions with a second reduction kernel. In contrast,
@@ -2478,93 +2478,93 @@ Triangle exactness update, 2026-05-30:
     bitwise. The next implementation target is therefore a fast decode kernel
     using the paged-prefill/WMMA arithmetic order, not a Python-only policy
     switch.
-  - Current timing recheck after source-parity instrumentation:
+    - Current timing recheck after source-parity instrumentation:
     `bench_results/sm70_migration_20260531/sm70_flash_attn_v100_decode_timing_current_20260531.json`.
     With `seq_len=4096`, `head_dim=256`, V100:
-    - `query_len=1`, `block_size=16`: scalar paged decode `0.04929 ms`
+        - `query_len=1`, `block_size=16`: scalar paged decode `0.04929 ms`
       with nonzero `max_diff=6.103515625e-05`; strict
       decode-as-prefill `0.80235 ms`; strict dense-cache bridge
       `0.58243 ms`; dense Flash `0.52733 ms`.
-    - `query_len=8`, `block_size=832`: scalar paged decode `0.17248 ms`
+        - `query_len=8`, `block_size=832`: scalar paged decode `0.17248 ms`
       with nonzero `max_diff=6.103515625e-05`; strict
       decode-as-prefill `0.58260 ms`; strict dense-cache bridge
       `0.47205 ms`; dense Flash `0.46571 ms`.
-  - Small-M paged-prefill prototype, 2026-05-31:
-    - Tried a default-off CUDA prototype that specialized the D=256,
+    - Small-M paged-prefill prototype, 2026-05-31:
+        - Tried a default-off CUDA prototype that specialized the D=256,
       causal, `M<=16` paged-prefill path from `BLOCK_M=32/WARPS=16` to
       `BLOCK_M=16/WARPS=8`, preserving `BLOCK_N=64` and the same
       per-row 16-thread softmax width.
-    - Evidence:
+        - Evidence:
       `bench_results/sm70_migration_20260531/sm70_flash_attn_v100_decode_timing_small_m_proto_20260531.json`.
-    - Quality stayed strict for the strict bridge:
+        - Quality stayed strict for the strict bridge:
       decode-as-prefill still had `max_diff=0.0`.
-    - Performance got worse rather than better: `query_len=1`
+        - Performance got worse rather than better: `query_len=1`
       decode-as-prefill moved from `0.80235 ms` to `0.88595 ms`, and
       `query_len=8` moved from `0.58260 ms` to `0.60277 ms`.
-    - Action: the prototype was removed from source and the extension was
+        - Action: the prototype was removed from source and the extension was
       rebuilt. It is recorded as a failed route, not left as dead experimental
       code. The follow-up source parity file
       `bench_results/sm70_migration_20260531/flash_attn_v100_old003_vs_latest_source_parity_after_small_m_removal_20260531.json`
       again reports `kernel_passed=true`; only Python interface/export files
       differ from old `0.0.3`.
-    - Interpretation: the main cost is not just invalid rows from
+        - Interpretation: the main cost is not just invalid rows from
       `BLOCK_M=32`. A useful exact fast path likely needs a true
       single-query paged-decode WMMA kernel that keeps the paged-prefill
       arithmetic order but avoids full prefill shared-memory staging and dense
       output machinery.
-  - C++ WMMA decode wrapper, 2026-05-31:
-    - Added experimental `decode_paged_wmma_fwd` to
+    - C++ WMMA decode wrapper, 2026-05-31:
+        - Added experimental `decode_paged_wmma_fwd` to
       `flash-attention-v100/kernel/fused_mha_api.cpp`, declared it in
       `flash-attention-v100/include/fused_mha.h`, implemented it in
       `flash-attention-v100/kernel/fused_mha_forward_paged.cu`, and exposed it
       as `flash_attn_v100.flash_attn_decode_paged_wmma`.
-    - Scope: non-default experimental op-level path only. It accepts the same
+        - Scope: non-default experimental op-level path only. It accepts the same
       `[B, H, D]` query shape as scalar `flash_attn_decode_paged`, reshapes to
       `M=1`, and launches the existing paged-prefill WMMA kernel with causal
       semantics so each row attends to its own `seq_lens` prefix.
-    - Evidence:
+        - Evidence:
       `bench_results/sm70_migration_20260531/sm70_flash_attn_v100_decode_wmma_wrapper_20260531.json`.
-    - Quality: all `paged_decode_wmma` cases matched dense Flash-V100 with
+        - Quality: all `paged_decode_wmma` cases matched dense Flash-V100 with
       strict `max_diff=0.0`.
-    - Timing, `seq_len=4096`, `head_dim=256`, V100:
-      - `query_len=1`: `decode_wmma=0.77577 ms`,
+        - Timing, `seq_len=4096`, `head_dim=256`, V100:
+            - `query_len=1`: `decode_wmma=0.77577 ms`,
         `decode_as_prefill=0.80177 ms`, scalar paged decode `0.04901 ms`
         with nonzero diff, dense-cache bridge `0.53096 ms`;
-      - `query_len=8`: `decode_wmma=0.60884 ms`,
+            - `query_len=8`: `decode_wmma=0.60884 ms`,
         `decode_as_prefill=0.56491 ms`, scalar paged decode `0.16291 ms`
         with nonzero diff, dense-cache bridge `0.47076 ms`.
-    - Interpretation: this C++ wrapper proves the paged-prefill WMMA order can
+        - Interpretation: this C++ wrapper proves the paged-prefill WMMA order can
       be exposed in scalar-decode shape with exact output, and it slightly
       reduces wrapper overhead for `query_len=1`. It is still far too slow to
       replace scalar paged decode as the final fast path, and worse than the
       Python prefill bridge for `query_len=8`, so it remains experimental.
       The next kernel step must remove the full paged-prefill staging/output
       overhead rather than only changing the host-side entrypoint.
-    - Source parity after this change:
+        - Source parity after this change:
       `bench_results/sm70_migration_20260531/flash_attn_v100_old003_vs_latest_source_parity_decode_wmma_wrapper_20260531.json`.
       This intentionally reports kernel mismatches in
       `include/fused_mha.h`, `kernel/fused_mha_api.cpp`, and
       `kernel/fused_mha_forward_paged.cu` because latest-tree now carries the
       experimental exact WMMA decode wrapper.
-  - Full-model token gate for the C++ WMMA decode wrapper, 2026-05-31:
-    - Baseline:
+    - Full-model token gate for the C++ WMMA decode wrapper, 2026-05-31:
+        - Baseline:
       `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_eager_greedy8_wmma_wrapper_baseline.json`
       ran Qwen3.6-35B-A3B-FP8, TP4, greedy 8-token, eager,
       `attention_backend=TRITON_ATTN`, and `VLLM_SM70_FP8_TURBOMIND=1`.
-    - Candidate:
+        - Candidate:
       `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_wmma_wrapper_eager_greedy8.json`
       used the same model/sampling/TP settings with
       `attention_backend=FLASH_ATTN_V100`,
       `VLLM_SM70_FLASH_ATTN_V100=1`, and
       `VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER=1`.
-    - Logs confirmed the latest-tree backend selected
+        - Logs confirmed the latest-tree backend selected
       `AttentionBackendEnum.FLASH_ATTN_V100`, ran Flash-V100 prefill, ran the
       strict decode-as-paged-prefill policy, and activated the experimental
       `FLASH_ATTN_V100 decode WMMA wrapper path`.
-    - Compare file:
+        - Compare file:
       `bench_results/sm70_migration_20260531/model_tokens_compare_triton_vs_flash_v100_wmma_wrapper_greedy8.json`
       reported `equal=true` for the prompt IDs and all 8 output token IDs.
-    - Interpretation: this keeps FA2/V100 in the migration and repair scope.
+        - Interpretation: this keeps FA2/V100 in the migration and repair scope.
       The wrapper passes the first latest-vLLM full-model token smoke and the
       op-level dense Flash-V100 equality check above has `max_diff=0.0`.
       It is not yet mainline-accepted because the previous real-model
@@ -2573,75 +2573,75 @@ Triangle exactness update, 2026-05-30:
       logits/attention tensors. The remaining task is to make the accepted
       V100 path match the latest vLLM baseline at tensor `max_diff == 0`, not
       to drop the V100 FlashAttention route.
-  - Real-model Triton-output compare for the C++ WMMA wrapper, 2026-05-31:
-    - Run:
+    - Real-model Triton-output compare for the C++ WMMA wrapper, 2026-05-31:
+        - Run:
       `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_wmma_wrapper_triton_out_compare_eager_greedy2.json`
       used the same Qwen3.6-35B-A3B-FP8 TP4 eager route with
       `VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER=1`,
       `VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR=bench_results/sm70_migration_20260531/flash_v100_triton_out_compare_wmma_wrapper_20260531`,
       and `VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS=2`.
-    - Summary:
+        - Summary:
       `bench_results/sm70_migration_20260531/flash_v100_triton_out_compare_wmma_wrapper_summary_20260531.json`.
-    - Result: `80` reports, `80` non-equal, global
+        - Result: `80` reports, `80` non-equal, global
       `max_diff=0.00390625`.
-    - Stage split:
+        - Stage split:
       `prefill_no_prefix` had `40/40` non-equal with
       `max_diff=0.00390625`; `decode_paged_prefill` had `40/40` non-equal
       with `max_diff=0.001953125`.
-    - Interpretation: the WMMA wrapper solves the scalar decode shape inside
+        - Interpretation: the WMMA wrapper solves the scalar decode shape inside
       the Flash-V100 arithmetic family, but it does not make Flash-V100 match
       latest TRITON attention bitwise. The next FA2/V100 task must compare the
       actual per-layer inputs and arithmetic order for prefill first, because
       prefill already has the larger mismatch before decode-specific wrapper
       details can be promoted to the accepted path.
-  - Prefill raw-KV vs paged-cache diagnostic, 2026-05-31:
-    - Added diagnostic-only fields to the existing
+    - Prefill raw-KV vs paged-cache diagnostic, 2026-05-31:
+        - Added diagnostic-only fields to the existing
       `VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR` reports in
       `vllm/v1/attention/backends/flash_attn_v100.py`. For
       `prefill_no_prefix`, each report now compares the raw `key/value`
       tensors consumed by dense Flash-V100 with the contiguous K/V extracted
       from the paged KV cache consumed by latest TRITON attention. This runs
       only when the compare env is enabled.
-    - Run:
+        - Run:
       `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_prefill_kv_diag_eager_greedy1.json`
       with Qwen3.6-35B-A3B-FP8, TP4, eager, greedy 1-token,
       `VLLM_SM70_FP8_TURBOMIND=1`,
       `VLLM_SM70_FLASH_ATTN_V100=1`,
       `VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR=bench_results/sm70_migration_20260531/flash_v100_triton_out_compare_prefill_kv_diag_20260531`,
       and `VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS=1`.
-    - Summary:
+        - Summary:
       `bench_results/sm70_migration_20260531/flash_v100_triton_out_compare_prefill_kv_diag_summary_20260531.json`.
-    - Result: `40` prefill reports, `40` output non-equal,
+        - Result: `40` prefill reports, `40` output non-equal,
       output `max_diff=0.00390625`.
-    - Input split: `33` reports had raw K/V exactly equal to extracted paged
+        - Input split: `33` reports had raw K/V exactly equal to extracted paged
       cache K/V (`max_key_diff=0`, `max_value_diff=0`) but still had output
       mismatch up to `max_out_diff=0.00390625`. `7` reports had raw K/V and
       cache K/V mismatch (`max_key_diff=17.359375`,
       `max_value_diff=16.71875`) and output mismatch up to
       `max_out_diff=0.001953125`.
-    - Interpretation: raw-vs-cache input mismatch is a real secondary issue
+        - Interpretation: raw-vs-cache input mismatch is a real secondary issue
       for part of the prefill path, so the accepted V100 prefill candidate
       should consume the same KV source as the latest baseline. However it is
       not the primary blocker: most reports have identical inputs and still
       differ. The primary fix target remains arithmetic/order parity between
       Flash-V100 prefill and latest TRITON attention.
-  - Flash-V100 vs TRITON launch-meta probe, 2026-05-31:
-    - Ran the model-free `--compare-triton` harness with SM70 TRITON schedule
+    - Flash-V100 vs TRITON launch-meta probe, 2026-05-31:
+        - Ran the model-free `--compare-triton` harness with SM70 TRITON schedule
       overrides to test whether the Flash-V100 mismatch is only a tile/warp
       selection artifact:
       `bench_results/sm70_migration_20260531/flash_v100_vs_triton_warps4_compare_triton_20260531.json`,
       `bench_results/sm70_migration_20260531/flash_v100_vs_triton_tile16_compare_triton_20260531.json`,
       and
       `bench_results/sm70_migration_20260531/flash_v100_vs_triton_tile64_compare_triton_20260531.json`.
-    - All three variants still failed strict equality for dense Flash-V100 and
+        - All three variants still failed strict equality for dense Flash-V100 and
       paged-prefill Flash-V100 against `triton_unified_attention`. Typical
       `max_diff` stayed in the `6.1035e-05` to `9.765625e-04` range. `tile64`
       reduced `num_different` for some shapes (`seq_len=69` dropped from
       `4806` to `379`) but did not make any shape strict-equal.
-    - `VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE=128` failed to launch on V100
+        - `VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE=128` failed to launch on V100
       with shared-memory out-of-resources (`147456` bytes required,
       `98304` limit).
-    - Fast-math probe:
+        - Fast-math probe:
       temporarily removed `--use_fast_math` from
       `flash-attention-v100/setup.py`, rebuilt only the FA2/V100 extension with
       `MAX_JOBS=4`, and reran the same model-free compare:
@@ -2652,7 +2652,7 @@ Triangle exactness update, 2026-05-30:
       `--use_fast_math` flag was restored and the extension was rebuilt, so
       later performance runs are not contaminated by this failed exactness
       experiment.
-    - Explicit `expf` probe:
+        - Explicit `expf` probe:
       temporarily replaced the forward, paged-prefill, and paged-decode
       Flash-V100 softmax exponent calls from `__expf(...)` to `expf(...)`,
       rebuilt only `flash-attention-v100`, and reran:
@@ -2664,7 +2664,7 @@ Triangle exactness update, 2026-05-30:
       `max_diff=6.103515625e-05`. The source was restored to `__expf(...)` and
       the extension was rebuilt. Conclusion: the strict mismatch is not
       explained by the explicit `__expf` intrinsic alone.
-    - No-prefix prefill input-source probe:
+        - No-prefix prefill input-source probe:
       added the default-off env `VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE=1`
       so no-prefix FA2/V100 prefill can read the same paged KV cache source as
       latest TRITON instead of raw K/V tensors. The real-model diagnostic run
@@ -2672,20 +2672,20 @@ Triangle exactness update, 2026-05-30:
       `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_fp8_tp4_flash_v100_prefill_paged_cache_diag_eager_greedy1.json`;
       report summary is
       `bench_results/sm70_migration_20260531/flash_v100_triton_out_compare_prefill_paged_cache_diag_summary_20260531.json`.
-    - Result: the new path ran, but `prefill_no_prefix_paged_cache` still had
+        - Result: the new path ran, but `prefill_no_prefix_paged_cache` still had
       `40/40` non-equal reports against latest TRITON and max output
       `max_diff=0.0078125`. Raw K/V-vs-cache mismatch remains visible in the
       diagnostic fields for 5 reports, but this no longer explains the output
       of the paged-cache path because that path reads from cache. This makes
       cache-source alignment a necessary cleanup, not the primary exactness
       fix.
-    - Interpretation: the FA2/V100 nonzero diff is not solved by launch-meta
+        - Interpretation: the FA2/V100 nonzero diff is not solved by launch-meta
       tuning. The fix path must either make a V100-capable kernel reproduce the
       latest TRITON online softmax/accumulator order exactly, or keep FA2/V100
       behind a strict gate that only selects it for shapes/profiles proven
       `max_diff == 0`. This is a fix target, not a reason to remove FA2/V100
       from the migration.
-    - Flash-side `BLOCK_N_256=32` probe, 2026-05-31:
+        - Flash-side `BLOCK_N_256=32` probe, 2026-05-31:
       temporarily changed both dense and paged Flash-V100 `head_dim=256`
       kernels from `BLOCK_N_256=64` to `BLOCK_N_256=32`, rebuilt only the
       `flash-attention-v100` extension, and reran the model-free
@@ -2701,7 +2701,7 @@ Triangle exactness update, 2026-05-30:
       rebuilt. Conclusion: aligning Flash's `D=256` tile size to latest
       TRITON's default tile size is not sufficient for strict equality; the
       remaining mismatch is in lower-level arithmetic/reduction/rounding order.
-    - Flash-side `BLOCK_M_256=16/BLOCK_N_256=32/WARPS_256=8` probe,
+        - Flash-side `BLOCK_M_256=16/BLOCK_N_256=32/WARPS_256=8` probe,
       2026-05-31:
       temporarily changed both dense and paged Flash-V100 `head_dim=256`
       kernels to match the latest TRITON `BLOCK_M=16/TILE_SIZE=32` shape more
@@ -2716,7 +2716,7 @@ Triangle exactness update, 2026-05-30:
       rebuilt. Conclusion: matching Flash's outer block geometry to TRITON's
       default geometry is not enough; the remaining defect is inside the
       arithmetic/reduction/rounding order rather than only launch geometry.
-    - Arithmetic-order diagnostic, 2026-05-31:
+        - Arithmetic-order diagnostic, 2026-05-31:
       added `benchmarks/benchmark_sm70_attention_exactness.py --mode
       arithmetic-diagnostic` and ran:
       `bench_results/sm70_migration_20260531/flash_v100_triton_arithmetic_diagnostic_20260531.json`.
@@ -2727,7 +2727,7 @@ Triangle exactness update, 2026-05-30:
       online softmax with tile32 FP16 P, online tile64 FP16 P,
       online tile64 FP16 P with Flash-style `exp` clamp at `-80`, and online
       tile32 fp32 PV.
-    - Diagnostic result:
+        - Diagnostic result:
       paged Flash-V100 and dense Flash-V100 remained bitwise identical
       (`max_diff=0.0`) in all diagnostic cases. Flash-V100 vs latest TRITON
       still had small nonzero diffs:
@@ -2738,7 +2738,7 @@ Triangle exactness update, 2026-05-30:
       with `max_diff=0.00048828125`; and
       `seq=4096/query=8/heads=6/head_dim=256` had `1853` differing elements
       with `max_diff=6.103515625e-05`.
-    - The PyTorch diagnostic references were all farther from both Flash and
+        - The PyTorch diagnostic references were all farther from both Flash and
       TRITON than Flash and TRITON were from each other. For the smallest
       case, Flash-vs-TRITON differed in `1` element, while the closest PyTorch
       variants differed from Flash in `519` elements and from TRITON in `520`
@@ -2748,7 +2748,7 @@ Triangle exactness update, 2026-05-30:
       Python-level choices tested here: it is not explained by simply using
       FP16 P before PV, online softmax tiling, tile32 vs tile64, or Flash's
       `exp` clamp.
-    - Next FA2/V100 fix implication:
+        - Next FA2/V100 fix implication:
       shallow schedule/geometry tuning is exhausted for strict equality. To
       accept Flash-V100 against latest TRITON as the production oracle, the
       next source-level route must either instrument/rewrite the CUDA kernel
@@ -2756,7 +2756,7 @@ Triangle exactness update, 2026-05-30:
       implement a V100-capable Triton-family fast path that preserves latest
       TRITON's arithmetic exactly. A nonzero-diff Flash route stays
       experimental and cannot become the default SM70 attention path.
-    - Triton `num_warps=16` diagnostic, 2026-05-31:
+        - Triton `num_warps=16` diagnostic, 2026-05-31:
       temporarily allowed `VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS=16` and
       `VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS=16` to test whether the mismatch
       was only a warp-count mismatch with the 16-warp Flash-V100 WMMA kernel.
@@ -2768,7 +2768,7 @@ Triangle exactness update, 2026-05-30:
       `max_diff=6.103515625e-05`. The validator was restored to the accepted
       `1/2/4/8` warp set. Conclusion: the FA2/V100 mismatch is not solved by
       matching Triton's launch warp count to Flash's 16-warp block geometry.
-    - Flash-V100 final-normalization probe, 2026-05-31:
+        - Flash-V100 final-normalization probe, 2026-05-31:
       temporarily changed dense and paged Flash-V100 forward epilogues from
       `inv_sum = 1.0f / row_sum` plus `acc * inv_sum` to direct `acc / row_sum`,
       matching the apparent latest-TRITON source expression `acc / L`.
@@ -2781,7 +2781,7 @@ Triangle exactness update, 2026-05-30:
       reciprocal-multiply and the extension was rebuilt. Conclusion: the
       remaining FA2/V100 mismatch is earlier than final normalization, most
       likely in QK/PV MMA accumulation or row reduction order.
-    - Dense Flash-V100 serial row-softmax probe, 2026-05-31:
+        - Dense Flash-V100 serial row-softmax probe, 2026-05-31:
       temporarily changed only `fused_mha_forward.cu` dense forward to compute
       each row's softmax max/sum/P values on one lane in column order, leaving
       paged prefill unchanged. Result file:
@@ -2793,13 +2793,13 @@ Triangle exactness update, 2026-05-30:
       the extension was rebuilt. Conclusion: a useful row-reduction repair
       must preserve the tiled online-softmax invariant and target the exact
       Triton reduction tree; a naive serial rewrite is not viable.
-  - Latest-TRITON SM70 schedule gate, 2026-05-31:
-    - Added default-off schedule envs to `vllm/envs.py` and
+    - Latest-TRITON SM70 schedule gate, 2026-05-31:
+        - Added default-off schedule envs to `vllm/envs.py` and
       `vllm/v1/attention/ops/triton_unified_attention.py`:
       `VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE`,
       `VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE`, and
       `VLLM_SM70_TRITON_ATTN_NUM_WARPS`.
-    - Follow-up split-warps gate, 2026-05-31:
+        - Follow-up split-warps gate, 2026-05-31:
       added `VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS` and
       `VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS`, plus matching
       `benchmarks/benchmark_sm70_triton_attention_schedule.py` parser fields
@@ -2807,22 +2807,22 @@ Triangle exactness update, 2026-05-30:
       `VLLM_SM70_TRITON_ATTN_NUM_WARPS` still sets both sides when the split
       envs are unset. Defaults remain `0`, so this change does not alter
       normal attention behavior.
-    - This is a separate safe-candidate branch from Flash-V100. It keeps the
+        - This is a separate safe-candidate branch from Flash-V100. It keeps the
       latest `TRITON_ATTN` backend and only changes Triton launch
       meta-parameters on exact SM70. The envs default to `0`, so current
       behavior is unchanged unless explicitly enabled.
-    - Added model-free strict/timing harness:
+        - Added model-free strict/timing harness:
       `benchmarks/benchmark_sm70_triton_attention_schedule.py`.
-    - Sweep run:
+        - Sweep run:
       `bench_results/sm70_migration_20260531/sm70_triton_attention_schedule_sweep_20260531.json`
       on one V100 with synthetic Qwen-like shape
       `q_heads=4`, `kv_heads=1`, `head_dim=256`, `block_size=528`,
       `seq_len=4096`, `prefill_query_len=128`, and `decode_query_len=1`.
-    - Strict-safe candidates:
+        - Strict-safe candidates:
       `num_warps=4` was `max_diff=0.0` for both prefill and decode. It
       improved the measured prefill case from `2.99827 ms` to `2.57536 ms`
       (`1.164x`) and decode from `2.62758 ms` to `2.59891 ms` (`1.011x`).
-    - Qwen-like `q_heads=6` split-warps rerun:
+        - Qwen-like `q_heads=6` split-warps rerun:
       `bench_results/sm70_migration_20260531/sm70_triton_attention_schedule_split_p4_d8_qheads6_hd256_bs528_20260531.json`
       with `seq_len=4096`, `prefill_query_len=128`, `decode_query_len=1`,
       `q_heads=6`, `kv_heads=1`, `head_dim=256`, and `block_size=528`.
@@ -2834,7 +2834,7 @@ Triangle exactness update, 2026-05-30:
       (`max_diff=7.62939453125e-06`) even though it is fast, so the split gate
       is necessary.
       `num_warps=2` was also strict but much slower.
-    - Split-warps full-model token gate:
+        - Split-warps full-model token gate:
       `bench_results/sm70_migration_20260531/model_tokens_compare_triton_default_vs_split_p4_d8_eager_greedy8.json`
       compared default TRITON against
       `VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS=4` and
@@ -2844,13 +2844,13 @@ Triangle exactness update, 2026-05-30:
       same 8 output tokens. This is token-level quality evidence only; it is
       not speed acceptance because the single tiny run was dominated by JIT and
       startup effects.
-    - Unsafe/paused candidates:
+        - Unsafe/paused candidates:
       `num_warps=8` sped decode (`1.193x`) and prefill (`1.349x`) but failed
       strict prefill equality (`max_diff=1.52587890625e-05`), so it cannot
       enter the main route. `tile16` and `tile64` changed the softmax tiling,
       failed strict equality for both prefill/decode, and are recorded as
       experiment-only.
-    - Full-model token smoke:
+        - Full-model token smoke:
       `bench_results/sm70_migration_20260531/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_sm70_warps4_eager_greedy8.json`
       ran Qwen3.6-35B-A3B-FP8, TP4, greedy 8-token, eager,
       `attention_backend=TRITON_ATTN`, `VLLM_SM70_FP8_TURBOMIND=1`, and
@@ -2858,14 +2858,14 @@ Triangle exactness update, 2026-05-30:
       Compare file
       `bench_results/sm70_migration_20260531/model_tokens_compare_triton_default_vs_sm70_warps4_greedy8.json`
       reported `equal=true`.
-    - Broader greedy token gate:
+        - Broader greedy token gate:
       `bench_results/sm70_migration_20260531/model_tokens_compare_triton_default_vs_sm70_warps4_small_prompts_greedy16.json`
       compared the same model/backend over three prompts and 48 total output
       tokens. It also reported `equal=true`. The measured generate time in
       this tiny eager token test was `4.7038 s` for default TRITON and
       `4.8412 s` for `NUM_WARPS=4`, so this gate is quality evidence only;
       it is not accepted as end-to-end speed evidence.
-    - Seeded official-sampling token gate:
+        - Seeded official-sampling token gate:
       `bench_results/sm70_migration_20260531/model_tokens_compare_triton_default_vs_sm70_warps4_small_prompts3_official_sampling_seed0_16.json`
       compared three prompts, 48 total output tokens,
       `temperature=1.0`, `top_p=0.95`, `top_k=20`, and
@@ -2874,7 +2874,7 @@ Triangle exactness update, 2026-05-30:
       `model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_default_eager_small_prompts_official_sampling_seed0_16.json`
       omitted `--prompts-json`, so it is retained only as a smoke artifact and
       is not counted as the three-prompt gate.
-    - Interpretation: `VLLM_SM70_TRITON_ATTN_NUM_WARPS=4` is the first
+        - Interpretation: `VLLM_SM70_TRITON_ATTN_NUM_WARPS=4` is the first
       attention-side candidate in this latest tree that preserves the latest
       TRITON arithmetic family with op-level `max_diff=0.0` and a model-level
       token pass while showing a measurable prefill microbenchmark speedup.
@@ -2883,7 +2883,7 @@ Triangle exactness update, 2026-05-30:
       decode a faster strict launch shape. Both remain default-off pending
       broader prompt coverage, official sampling, and end-to-end no-MTP decode
       throughput validation.
-    - No-MTP single-request decode A/B, 2026-05-31:
+        - No-MTP single-request decode A/B, 2026-05-31:
       `benchmarks/benchmark_sm70_decode.py` was run with
       Qwen3.6-35B-A3B-FP8, TP4 on V100 GPUs 1-4, `TRITON_ATTN`,
       `VLLM_SM70_FP8_TURBOMIND=1`, `--input-len 1024`,
@@ -2897,7 +2897,7 @@ Triangle exactness update, 2026-05-30:
       averaged `9.2949` output tokens/s (`9.2009`, `9.3498`,
       `9.3340`), about `1.83%` slower than default in this end-to-end
       eager harness.
-    - Quality outcome for this A/B: all measured repeats in both files
+        - Quality outcome for this A/B: all measured repeats in both files
       produced the same output token hash
       `4644e8ac97b04436112b6fb3d288c3952f8726bb3faa9bfae9a3983267e57698`.
       This preserves token-level determinism for the tested prompt but does
@@ -2907,23 +2907,23 @@ Triangle exactness update, 2026-05-30:
       speedup.
 - Static checks after sampler dump diagnostics, vectorized strict bridge, and
   this policy note:
-  - `uv run --no-sync ruff check vllm/v1/sample/sampler.py
+    - `uv run --no-sync ruff check vllm/v1/sample/sampler.py
     benchmarks/benchmark_sm70_model_tokens.py
     benchmarks/benchmark_sm70_decode.py vllm/envs.py
     vllm/v1/attention/backends/flash_attn_v100.py`;
-  - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
+    - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
     vllm/v1/sample/sampler.py benchmarks/benchmark_sm70_model_tokens.py
     benchmarks/benchmark_sm70_decode.py vllm/envs.py
     vllm/v1/attention/backends/flash_attn_v100.py`;
-  - `git diff --check -- vllm/v1/sample/sampler.py vllm/envs.py
+    - `git diff --check -- vllm/v1/sample/sampler.py vllm/envs.py
     benchmarks/benchmark_sm70_model_tokens.py benchmarks/benchmark_sm70_decode.py
     vllm/v1/attention/backends/flash_attn_v100.py
     docs/design/sm70_v100_migration_control.md`;
-  - `rg -n "[ \\t]+$" docs/design/sm70_v100_migration_control.md
+    - `rg -n "[ \\t]+$" docs/design/sm70_v100_migration_control.md
     vllm/v1/sample/sampler.py vllm/envs.py benchmarks/benchmark_sm70_decode.py
     benchmarks/benchmark_sm70_model_tokens.py
     vllm/v1/attention/backends/flash_attn_v100.py` returned no matches.
-  - Latest check after the backend default-policy change:
+    - Latest check after the backend default-policy change:
     `uv run --no-sync ruff check vllm/v1/attention/backends/flash_attn_v100.py
     vllm/envs.py benchmarks/benchmark_sm70_model_tokens.py
     vllm/v1/sample/sampler.py`;
@@ -2932,7 +2932,7 @@ Triangle exactness update, 2026-05-30:
     benchmarks/benchmark_sm70_model_tokens.py vllm/v1/sample/sampler.py`;
     `git diff --check` and trailing-whitespace checks passed for the same
     files plus this document.
-  - Env sanity check in `vllm-0.0.5-t210` reported
+    - Env sanity check in `vllm-0.0.5-t210` reported
     `VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL=True`,
     `VLLM_FLASH_V100_DECODE_USE_BHMD_OUT=True`, and
     `VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED=False` with no env overrides.
@@ -2958,26 +2958,26 @@ Validation required:
 Long-context 256k startup probes, 2026-05-30:
 
 - FP8 offline startup/generation smoke passed:
-  - command shape: Qwen3.6-35B-A3B-FP8, TP4, `TRITON_ATTN`,
+    - command shape: Qwen3.6-35B-A3B-FP8, TP4, `TRITON_ATTN`,
     `VLLM_SM70_FP8_TURBOMIND=1`, `max_model_len=262144`,
     `gpu_memory_utilization=0.88`, eager mode,
     `disable_custom_all_reduce=true`, greedy `max_tokens=1`.
-  - output file:
+    - output file:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_tp4_triton_maxlen256k_greedy1.json`.
-  - result: model loaded, engine used `max_seq_len=262144`, KV cache capacity
+    - result: model loaded, engine used `max_seq_len=262144`, KV cache capacity
     log reported `1,743,257` tokens and maximum concurrency `6.65x` for a
     262,144-token request, then generation completed with
     `total_output_tokens=1`.
-  - measured harness metadata: `load_seconds=117.63520766599686`,
+    - measured harness metadata: `load_seconds=117.63520766599686`,
     `generate_seconds=2.2843230760190636`.
 - AWQ offline 256k first attempt was inconclusive/aborted too early:
-  - command shape: Qwen3.6-27B-AWQ, TP4, `TRITON_ATTN`,
+    - command shape: Qwen3.6-27B-AWQ, TP4, `TRITON_ATTN`,
     `VLLM_SM70_AWQ_TURBOMIND=1`, `max_model_len=262144`,
     `gpu_memory_utilization=0.88`, eager mode,
     `disable_custom_all_reduce=true`, greedy `max_tokens=1`.
-  - failure record:
+    - failure record:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_27b_awq_tp4_triton_maxlen256k_greedy1_aborted.json`.
-  - observed behavior: weights loaded and model memory reached about
+    - observed behavior: weights loaded and model memory reached about
     `7.98 GiB`; the run then stayed in the post-load/profile phase and
     repeatedly logged `No available shared memory broadcast block found in 60
     seconds`. After about six minutes, workers were still consuming CPU and
@@ -2985,74 +2985,74 @@ Long-context 256k startup probes, 2026-05-30:
     The run never reached KV capacity logging or generation and was terminated
     to free GPUs.
 - AWQ 128k bisection smoke passed:
-  - command shape: Qwen3.6-27B-AWQ, TP4, `TRITON_ATTN`,
+    - command shape: Qwen3.6-27B-AWQ, TP4, `TRITON_ATTN`,
     `VLLM_SM70_AWQ_TURBOMIND=1`, `max_model_len=131072`,
     `gpu_memory_utilization=0.88`, eager mode,
     `disable_custom_all_reduce=true`, greedy `max_tokens=1`.
-  - output file:
+    - output file:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_27b_awq_tp4_triton_maxlen128k_greedy1.json`.
-  - result: model loaded, engine used `max_seq_len=131072`, KV cache capacity
+    - result: model loaded, engine used `max_seq_len=131072`, KV cache capacity
     log reported `1,057,774` tokens and maximum concurrency `8.07x` for a
     131,072-token request, then generation completed with
     `total_output_tokens=1`.
-  - measured harness metadata: `load_seconds=209.81592888300656`,
+    - measured harness metadata: `load_seconds=209.81592888300656`,
     `generate_seconds=4.307027061993722`.
 - AWQ 256k retry with a longer timeout passed:
-  - command shape: Qwen3.6-27B-AWQ, TP4, `TRITON_ATTN`,
+    - command shape: Qwen3.6-27B-AWQ, TP4, `TRITON_ATTN`,
     `VLLM_SM70_AWQ_TURBOMIND=1`, `max_model_len=262144`,
     `gpu_memory_utilization=0.88`, eager mode,
     `disable_custom_all_reduce=true`, greedy `max_tokens=1`.
-  - output file:
+    - output file:
     `bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_27b_awq_tp4_triton_maxlen256k_greedy1_retry900s.json`.
-  - result: model loaded, engine used `max_seq_len=262144`, KV cache capacity
+    - result: model loaded, engine used `max_seq_len=262144`, KV cache capacity
     log reported `1,136,991` tokens and maximum concurrency `4.34x` for a
     262,144-token request, then generation completed with
     `total_output_tokens=1`.
-  - measured harness metadata: `load_seconds=73.60401881099096`,
+    - measured harness metadata: `load_seconds=73.60401881099096`,
     `generate_seconds=1.4952264330058824`.
 - API server dependency gate:
-  - First API-server import attempt failed before model loading because the
+    - First API-server import attempt failed before model loading because the
     conda environment had `mistral_common==1.10.0`, while latest vLLM requires
     `mistral_common[image] >= 1.11.2`.
-  - Environment action: upgraded the active `vllm-0.0.5-t210` conda env to
+    - Environment action: upgraded the active `vllm-0.0.5-t210` conda env to
     `mistral_common==1.11.2`.
-  - After the upgrade, `python -m vllm.entrypoints.openai.api_server --help`
+    - After the upgrade, `python -m vllm.entrypoints.openai.api_server --help`
     reached the CLI successfully. This is an environment prerequisite, not an
     SM70 source change.
 - FP8 API server 256k smoke passed:
-  - command shape: Qwen3.6-35B-A3B-FP8, served name `qwen36-fp8`, TP4,
+    - command shape: Qwen3.6-35B-A3B-FP8, served name `qwen36-fp8`, TP4,
     `TRITON_ATTN`, `VLLM_SM70_FP8_TURBOMIND=1`,
     `max_model_len=262144`, `gpu_memory_utilization=0.88`, eager mode,
     `disable_custom_all_reduce=true`, port `18081`.
-  - engine log evidence: `max_seq_len=262144`; KV cache capacity
+    - engine log evidence: `max_seq_len=262144`; KV cache capacity
     `1,744,830` tokens; maximum concurrency `6.66x` for a 262,144-token
     request; `SM70 FP8 MoE TurboMind batched path enabled (256 experts)`.
-  - health/completion result file:
+    - health/completion result file:
     `bench_results/sm70_migration_20260530/api_server_fp8_35b_256k_health_completion_20260530.json`.
-  - result: `/health` 200 in `0.0552508550172206s`, `/v1/models` 200 in
+    - result: `/health` 200 in `0.0552508550172206s`, `/v1/models` 200 in
     `0.0029929259908385575s`, `/v1/completions` 200 in
     `2.4481725829828065s` for a 1-token greedy request.
 - AWQ API server 256k smoke passed:
-  - command shape: Qwen3.6-27B-AWQ, served name `qwen36-awq`, TP4,
+    - command shape: Qwen3.6-27B-AWQ, served name `qwen36-awq`, TP4,
     `TRITON_ATTN`, `VLLM_SM70_AWQ_TURBOMIND=1`,
     `max_model_len=262144`, `gpu_memory_utilization=0.88`, eager mode,
     `disable_custom_all_reduce=true`, port `18082`.
-  - engine log evidence: `max_seq_len=262144`; KV cache capacity
+    - engine log evidence: `max_seq_len=262144`; KV cache capacity
     `1,140,869` tokens; maximum concurrency `4.35x` for a 262,144-token
     request.
-  - health/completion result file:
+    - health/completion result file:
     `bench_results/sm70_migration_20260530/api_server_awq_27b_256k_health_completion_20260530.json`.
-  - result: `/health` 200 in `0.05337747000157833s`, `/v1/models` 200 in
+    - result: `/health` 200 in `0.05337747000157833s`, `/v1/models` 200 in
     `0.0031092260032892227s`, `/v1/completions` 200 in
     `1.6300983719993383s` for a 1-token greedy request.
 - Interpretation:
-  - Latest FP8 now has both offline and API-server 256k startup/generation
+    - Latest FP8 now has both offline and API-server 256k startup/generation
     evidence.
-  - Latest AWQ now has 128k offline evidence plus both offline and API-server
+    - Latest AWQ now has 128k offline evidence plus both offline and API-server
     256k startup/generation evidence.
     The earlier 256k failure should be treated as an aborted/inconclusive run,
     not proof that AWQ 256k is broken.
-  - These are smoke tests, not decode-speed acceptance and not broad quality
+    - These are smoke tests, not decode-speed acceptance and not broad quality
     acceptance. They do satisfy the service-startup/health part of the 256k
     acceptance row for the safe TRITON attention route.
 
@@ -3095,10 +3095,10 @@ Strict exactness update, 2026-05-30:
 - Evidence file:
   `bench_results/sm70_migration_20260530/sm70_f16_gemm_exactness_vs_torch.json`.
 - Results:
-  - shape `[1, 4096, 4096]`: `equal=false`, `max_diff=0.0625`;
-  - shape `[2, 4096, 4096]`: `equal=false`, `max_diff=0.0625`;
-  - shape `[8, 4096, 4096]`: `equal=false`, `max_diff=0.125`;
-  - shape `[1, 151936, 5120]`: `equal=false`, `max_diff=0.25`.
+    - shape `[1, 4096, 4096]`: `equal=false`, `max_diff=0.0625`;
+    - shape `[2, 4096, 4096]`: `equal=false`, `max_diff=0.0625`;
+    - shape `[8, 4096, 4096]`: `equal=false`, `max_diff=0.125`;
+    - shape `[1, 151936, 5120]`: `equal=false`, `max_diff=0.25`.
 - Conclusion: this route is not bitwise-equivalent to the current PyTorch
   linear baseline. Under the user-required `max_diff == 0` rule, old
   SM70 dense/LM-head FP16 fast paths cannot be counted as safe mainline
@@ -3111,13 +3111,13 @@ Implementation update, 2026-05-31:
   `csrc/sm70_turbomind/ops/awq_sm70_gemm.cu`, but they were not exposed
   through latest `_C` bindings or the SM70 Python facade. Added only the
   missing registration/facade layer:
-  - `csrc/ops.h`;
-  - `csrc/torch_bindings.cpp`;
-  - `vllm/_sm70_ops.py`.
+    - `csrc/ops.h`;
+    - `csrc/torch_bindings.cpp`;
+    - `vllm/_sm70_ops.py`.
 - Newly visible ops:
-  - `sm70_f16_lm_head_top1_out`;
-  - `sm70_f16_lm_head_top1_tc_out`;
-  - `sm70_f16_gate_mul_out`.
+    - `sm70_f16_lm_head_top1_out`;
+    - `sm70_f16_lm_head_top1_tc_out`;
+    - `sm70_f16_gate_mul_out`.
 - Added standalone strict/timing harness:
   `benchmarks/benchmark_sm70_lm_head_top1.py`.
 - Rebuilt latest vLLM in `vllm-0.0.5-t210` with
@@ -3167,33 +3167,33 @@ Python hook re-plumb update, 2026-06-01:
 - The latest tree already had the low-level SM70 FP16 dense/LM-head ops in
   `_sm70_ops.py`, but the model-layer hooks from old 0.0.3 were not connected
   in the latest Python path. Added the decoupled, default-off wiring:
-  - `vllm/envs.py`: registered
+    - `vllm/envs.py`: registered
     `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=0`,
     `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=0`,
     `VLLM_SM70_LM_HEAD_TOP1=0`,
     `VLLM_SM70_LM_HEAD_TOP1_TC=0`, and
     `VLLM_SM70_F16_DENSE_ALLOWLIST`;
-  - `vllm/model_executor/layers/utils.py`: added the suffix/allowlist helper;
-  - `vllm/model_executor/layers/linear.py`: added the prepared-weight dense
+    - `vllm/model_executor/layers/utils.py`: added the suffix/allowlist helper;
+    - `vllm/model_executor/layers/linear.py`: added the prepared-weight dense
     forward hook;
-  - `vllm/model_executor/layers/vocab_parallel_embedding.py`: added LM-head
+    - `vllm/model_executor/layers/vocab_parallel_embedding.py`: added LM-head
     prepared-weight and optional top1 hooks;
-  - `vllm/model_executor/layers/logits_processor.py`: added the optional
+    - `vllm/model_executor/layers/logits_processor.py`: added the optional
     top1 call before falling back to normal logits.
 - Verification so far:
-  - `ruff check` passed on the touched Python files;
-  - `python -m py_compile` passed in conda env `vllm-0.0.5-t210`;
-  - a direct CUDA smoke on V100 with both gates enabled printed
+    - `ruff check` passed on the touched Python files;
+    - `python -m py_compile` passed in conda env `vllm-0.0.5-t210`;
+    - a direct CUDA smoke on V100 with both gates enabled printed
     `dense_prepared True`, `dense_max_diff 0.0`,
     `lm_prepared True`, and `lm_max_diff 0.0` for tiny FP16 shapes.
 - Acceptance status:
-  - This only proves that the latest Python hooks are connected and can be
+    - This only proves that the latest Python hooks are connected and can be
     exact on a tiny direct test.
-  - It does **not** override the earlier large-shape V100 op check where
+    - It does **not** override the earlier large-shape V100 op check where
     `sm70_f16_gemm_out` differed from `torch.nn.functional.linear` by up to
     `0.25`. That nonzero path remains unaccepted under the numeric policy
     until classified or repaired.
-  - The old Qwen model-level force-enable for `qkv_proj/out_proj` has not been
+    - The old Qwen model-level force-enable for `qkv_proj/out_proj` has not been
     made default. Use `VLLM_SM70_F16_DENSE_ALLOWLIST=qkv_proj,out_proj` for
     controlled benchmark experiments only.
 
@@ -3210,34 +3210,34 @@ Controlled AWQ decode benchmark after re-plumb, 2026-06-01:
   `bench_results/sm70_migration_20260601/decode_latest_qwen36_27b_awq_flash_v100_graph_i1024_o256_repeat3_max4608_sm70_f16_dense_lmhead_20260601.json`
   and matching `.log`.
 - Route logs confirmed:
-  - `Using AttentionBackendEnum.FLASH_ATTN_V100 backend`;
-  - `SM70 dense fp16 fast path enabled for small decode projections`;
-  - `FLASH_ATTN_V100 decode path active (scalar paged KV kernel,
+    - `Using AttentionBackendEnum.FLASH_ATTN_V100 backend`;
+    - `SM70 dense fp16 fast path enabled for small decode projections`;
+    - `FLASH_ATTN_V100 decode path active (scalar paged KV kernel,
     CUDA-graph safe, classified Type-B for long q=1 decode)`;
-  - `FLASH_ATTN_V100 prefill path active (no prefix/chunked context)`;
-  - `Registering 384 cuda graph addresses`.
+    - `FLASH_ATTN_V100 prefill path active (no prefix/chunked context)`;
+    - `Registering 384 cuda graph addresses`.
 - Result:
-  - pure decode `steady_decode_tps_mean=75.1324222236754 tok/s`;
-  - `steady_decode_tps_values=[75.12228947595021, 75.14020924360965,
+    - pure decode `steady_decode_tps_mean=75.1324222236754 tok/s`;
+    - `steady_decode_tps_values=[75.12228947595021, 75.14020924360965,
     75.13476795146637]`;
-  - end-to-end output `output_tps_mean=66.44675291407248`;
-  - `prefill_time_mean=0.456442811662176 s`;
-  - `load_seconds=620.7923570779967`;
-  - token hash
+    - end-to-end output `output_tps_mean=66.44675291407248`;
+    - `prefill_time_mean=0.456442811662176 s`;
+    - `load_seconds=620.7923570779967`;
+    - token hash
     `498a54a24f7caa632d007d4230ea185365eee764d3e69a6674ed3eafe98b742f`,
     identical to both the old short baseline and the latest no-dense-gate
     short run for this benchmark prompt.
 - Interpretation:
-  - Enabling the re-plumbed dense hook with `qkv_proj,out_proj` did not recover
+    - Enabling the re-plumbed dense hook with `qkv_proj,out_proj` did not recover
     additional speed on this AWQ `1k/256`口径 (`75.132` vs latest baseline
     `75.150 tok/s`, runtime-equivalent) and did not change this prompt's
     greedy tokens.
-  - The LM-head hook did **not** actually hit in this run: the log contains no
+    - The LM-head hook did **not** actually hit in this run: the log contains no
     `SM70 dense fp16 fast path enabled for LM head` line. Direct safetensors
     inspection shows `/home/ymzx/models/Qwen3.6-27B-AWQ/lm_head.weight` is
     `torch.bfloat16` with shape `(248320, 5120)`, while the migrated old
     SM70 LM-head FP16 fast path requires `torch.float16`.
-  - Therefore this run cannot count LM-head fast-path recovery. It only proves
+    - Therefore this run cannot count LM-head fast-path recovery. It only proves
     that the dense hook can be explicitly enabled without changing this short
     prompt's tokens and without hurting decode speed. Broader quality/exactness
     gates are still required before any default enablement.
@@ -3327,10 +3327,10 @@ Investigation update, 2026-05-30:
 
 - Old 0.0.3 Qwen/GDN no-spec decode contains an explicit fast branch in
   `vllm/model_executor/models/qwen3_next.py`:
-  - for decode-only, no speculative tokens, it runs `causal_conv1d_update`
+    - for decode-only, no speculative tokens, it runs `causal_conv1d_update`
     with `validate_data=False`;
-  - then it calls `fused_sigmoid_gating_delta_rule_update`;
-  - optional `VLLM_SM70_FUSED_SIGMOID_MIXED_QKV=1` can avoid q/k/v unpacking,
+    - then it calls `fused_sigmoid_gating_delta_rule_update`;
+    - optional `VLLM_SM70_FUSED_SIGMOID_MIXED_QKV=1` can avoid q/k/v unpacking,
     but that old mixed-qkv path only had tolerance-based compare and is not
     accepted for mainline without strict `max_diff == 0`.
 - Latest upstream moved Qwen3.5/Qwen3Next GDN logic to
@@ -3442,17 +3442,17 @@ Target design:
 
 - Do not migrate the full benchmark package.
 - Add or keep minimal tools for:
-  - op-level max diff
-  - layer-level max diff
-  - deterministic token equality
-  - no-MTP single-concurrency decode speed
+    - op-level max diff
+    - layer-level max diff
+    - deterministic token equality
+    - no-MTP single-concurrency decode speed
 
 Target implementation update, 2026-05-30:
 
 - Added `benchmarks/benchmark_sm70_turbomind_exactness.py`.
 - The script directly checks the migrated dense op facade:
-  - AWQ: `awq_sm70_prepare` + `awq_gemm_sm70`;
-  - FP8: `fp8_sm70_prepare` + `fp8_gemm_sm70_out_meta`.
+    - AWQ: `awq_sm70_prepare` + `awq_gemm_sm70`;
+    - FP8: `fp8_sm70_prepare` + `fp8_gemm_sm70_out_meta`.
 - The script compares against current reference paths and fails by default
   unless `torch.equal(actual, expected)` is true and `max_diff == 0`.
 - It records JSON-friendly fields: op name, shape, dtype, equality,
@@ -3460,37 +3460,37 @@ Target implementation update, 2026-05-30:
 - It is intentionally synthetic/op-level; model-level and token-level
   validators are still required.
 - Added `benchmarks/benchmark_sm70_model_tokens.py`.
-  - It runs latest or old vLLM through the public offline `LLM` API.
-  - It records model path, vLLM/Torch versions, device capability, env gates,
+    - It runs latest or old vLLM through the public offline `LLM` API.
+    - It records model path, vLLM/Torch versions, device capability, env gates,
     engine kwargs, sampling params, prompt token IDs, output token IDs, output
     text, load time, and generation time.
-  - Its `--compare` mode checks deterministic prompt and output token IDs with
+    - Its `--compare` mode checks deterministic prompt and output token IDs with
     exact equality.
-  - It supports `--attention-backend` for forcing a backend through the `LLM`
+    - It supports `--attention-backend` for forcing a backend through the `LLM`
     constructor instead of relying on environment variables.
 - Added `benchmarks/benchmark_sm70_decode.py`.
-  - It runs a single offline `LLM.generate` request with fixed tokenized input
+    - It runs a single offline `LLM.generate` request with fixed tokenized input
     length, fixed output length, explicit sampling params, and explicit engine
     kwargs.
-  - It records model path, vLLM/Torch versions, device capability, env gates,
+    - It records model path, vLLM/Torch versions, device capability, env gates,
     engine kwargs, sampling params, prompt token hash, load time, warmup runs,
     measured repeat runs, output token IDs, output token hashes, and output
     TPS.
-  - It supports `--attention-backend`, which passes the backend enum through
+    - It supports `--attention-backend`, which passes the backend enum through
     the `LLM` constructor. This is required for old 0.0.3 because
     `VLLM_ATTENTION_BACKEND=TRITON_ATTN` does not override the hard-coded
     SM70 priority order.
-  - It supports `--cuda-profile-repeat`, which wraps only measured repeat
+    - It supports `--cuda-profile-repeat`, which wraps only measured repeat
     generation in `cudaProfilerStart/Stop`. This is for Nsight capture without
     loading, compilation, warmup, and cudagraph setup dominating the trace.
-  - It is the minimal no-MTP single-concurrency decode-speed harness. It does
+    - It is the minimal no-MTP single-concurrency decode-speed harness. It does
     not replace the later OpenAI-compatible server benchmark for TTFT and
     streaming latency.
 - Added `benchmarks/benchmark_sm70_attention_exactness.py`.
-  - It exercises the migrated `flash_attn_v100` package directly without
+    - It exercises the migrated `flash_attn_v100` package directly without
     loading a full model.
-  - It covers dense prefill, paged prefill, and paged decode.
-  - It compares each output with a simple PyTorch GQA attention reference using
+    - It covers dense prefill, paged prefill, and paged decode.
+    - It compares each output with a simple PyTorch GQA attention reference using
     strict `torch.equal` and `max_diff == 0`, then records JSON evidence.
 
 Validation required:
@@ -3506,9 +3506,9 @@ Latest strict result, 2026-05-30:
   `CUDA_VISIBLE_DEVICES=1 VLLM_SM70_AWQ_TURBOMIND=1 VLLM_SM70_FP8_TURBOMIND=1 conda run --live-stream -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_turbomind_exactness.py --mode all --json-out bench_results/sm70_migration_20260530/sm70_turbomind_exactness_strict.json`
 - Active device was V100/SM70: `device_capability=[7, 0]`.
 - Result failed strict mode:
-  - AWQ synthetic cases returned non-identical output with `NaN` diff stats;
+    - AWQ synthetic cases returned non-identical output with `NaN` diff stats;
     this needs test/reference investigation before any AWQ acceptance claim.
-  - FP8 returned finite but nonzero diffs:
+    - FP8 returned finite but nonzero diffs:
     `1.52587890625e-05` for `m=1`,
     `0.0001220703125` for `m=2`, and `0.001953125` for `m=8`.
 - Interim conclusion from this oracle: the dense TurboMind AWQ/FP8 hooks were
@@ -3524,10 +3524,10 @@ Follow-up oracle repair, 2026-05-30:
   SM75-only inline PTX (`dequantize_s4_to_fp16x2` asserts for
   `__CUDA_ARCH__ < 750`), so it is not a valid V100 quality oracle.
 - Updated `benchmarks/benchmark_sm70_turbomind_exactness.py`:
-  - AWQ now uses a manual Torch reference that matches the AWQ/TurboMind
+    - AWQ now uses a manual Torch reference that matches the AWQ/TurboMind
     qweight and qzeros unpacking rules instead of calling `awq_dequantize`;
-  - the script records NaN counts and finite diff counts;
-  - the script can load real AWQ and FP8 safetensors layers with
+    - the script records NaN counts and finite diff counts;
+    - the script can load real AWQ and FP8 safetensors layers with
     `--awq-model/--awq-layer` and `--fp8-model/--fp8-layer`.
 - Synthetic strict check with the repaired AWQ oracle:
   `bench_results/sm70_migration_20260530/sm70_turbomind_exactness_strict_manual_awq_ref.json`.
@@ -3564,16 +3564,16 @@ Old-vs-latest TurboMind parity, 2026-05-30:
   the saved tensors with strict `torch.equal` and `max_diff == 0`.
 - FP8 dense parity passed on real Qwen3.6-35B-A3B-FP8
   `model.language_model.layers.1.linear_attn.out_proj`:
-  - `m=1`: `bench_results/sm70_migration_20260530/parity_compare_fp8_qwen36_35a3b_out_proj_m1_source_vs_latest.json`,
+    - `m=1`: `bench_results/sm70_migration_20260530/parity_compare_fp8_qwen36_35a3b_out_proj_m1_source_vs_latest.json`,
     `equal=true`, `max_diff=0.0`;
-  - `m=8`: `bench_results/sm70_migration_20260530/parity_compare_fp8_qwen36_35a3b_out_proj_m8_source_vs_latest.json`,
+    - `m=8`: `bench_results/sm70_migration_20260530/parity_compare_fp8_qwen36_35a3b_out_proj_m8_source_vs_latest.json`,
     `equal=true`, `max_diff=0.0`.
 - AWQ dense parity initially failed on real Qwen3.6-27B-AWQ
   `model.language_model.layers.1.linear_attn.out_proj`:
-  - old 0.0.3 source tree vs latest migration tree:
+    - old 0.0.3 source tree vs latest migration tree:
     `bench_results/sm70_migration_20260530/parity_compare_awq_qwen36_27b_out_proj_m1_source_vs_latest.json`,
     `max_diff=0.00048828125`;
-  - latest tree repeated against itself also failed:
+    - latest tree repeated against itself also failed:
     `bench_results/sm70_migration_20260530/parity_compare_awq_latest_repeat_m1.json`,
     `max_diff=0.00048828125`.
 - Root cause: the SM70 TurboMind dense path defaulted
@@ -3582,10 +3582,10 @@ Old-vs-latest TurboMind parity, 2026-05-30:
   low-order FP16 results. This violates the strict main-route rule even when
   the arithmetic is semantically equivalent.
 - With `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0`, AWQ became bitwise deterministic:
-  - latest repeated against itself:
+    - latest repeated against itself:
     `bench_results/sm70_migration_20260530/parity_compare_awq_latest_notune_repeat_m1.json`,
     `equal=true`, `max_diff=0.0`;
-  - old 0.0.3 source tree vs latest migration tree:
+    - old 0.0.3 source tree vs latest migration tree:
     `bench_results/sm70_migration_20260530/parity_compare_awq_notune_qwen36_27b_out_proj_m1_source_vs_latest.json`,
     `equal=true`, `max_diff=0.0`.
 - Rebuild note: a first source change made the generic
@@ -3598,20 +3598,20 @@ Old-vs-latest TurboMind parity, 2026-05-30:
   selector keeps the old default-enabled behavior so FP8/F16 preserve old
   TurboMind parity.
 - Rebuilt with the AWQ-only dispatch split and re-ran old-vs-latest parity:
-  - AWQ latest default repeated against itself:
+    - AWQ latest default repeated against itself:
     `bench_results/sm70_migration_20260530/parity_compare_awq_latest_awqonly_default_repeat_m1.json`,
     `equal=true`, `max_diff=0.0`;
-  - AWQ old 0.0.3 source tree with
+    - AWQ old 0.0.3 source tree with
     `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0` vs latest default:
     `bench_results/sm70_migration_20260530/parity_compare_awq_old_notune_vs_latest_awqonly_default_m1.json`,
     `equal=true`, `max_diff=0.0`;
-  - AWQ small-batch check `m=8`:
+    - AWQ small-batch check `m=8`:
     `bench_results/sm70_migration_20260530/parity_compare_awq_old_notune_vs_latest_awqonly_default_m8.json`,
     `equal=true`, `max_diff=0.0`;
-  - FP8 old 0.0.3 default vs latest default, `m=1`:
+    - FP8 old 0.0.3 default vs latest default, `m=1`:
     `bench_results/sm70_migration_20260530/parity_compare_fp8_old_default_vs_latest_awqonly_default_m1.json`,
     `equal=true`, `max_diff=0.0`;
-  - FP8 old 0.0.3 default vs latest default, `m=8`:
+    - FP8 old 0.0.3 default vs latest default, `m=8`:
     `bench_results/sm70_migration_20260530/parity_compare_fp8_old_default_vs_latest_awqonly_default_m8.json`,
     `equal=true`, `max_diff=0.0`.
 - Current interpretation: copied dense TurboMind AWQ/FP8 can be migration-safe
@@ -3624,10 +3624,10 @@ Full-model AWQ token equality, 2026-05-30:
 - Latest vLLM target tree command:
   `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_SM70_AWQ_TURBOMIND=1 conda run --live-stream -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_model_tokens.py --model /home/ymzx/models/Qwen3.6-27B-AWQ --out bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_27b_awq_sm70_tp4_greedy8.json --tensor-parallel-size 4 --quantization awq --dtype auto --max-model-len 4096 --gpu-memory-utilization 0.88 --max-tokens 8 --ignore-eos --disable-custom-all-reduce --prompt "Write one sentence about deterministic validation."`
 - Latest result:
-  - loaded and generated successfully on four V100s;
-  - `load_seconds=663.2541071340092`;
-  - `generate_seconds=10.98722099000588`;
-  - output token IDs:
+    - loaded and generated successfully on four V100s;
+    - `load_seconds=663.2541071340092`;
+    - `generate_seconds=10.98722099000588`;
+    - output token IDs:
     `[271, 248068, 198, 8160, 579, 264, 7047, 1817]`.
 - Important latest-tree observation: latest vLLM on V100 logged FA2 as
   unsupported and selected `TRITON_ATTN`, not `FLASH_ATTN_V100`. It also paid
@@ -3643,18 +3643,18 @@ Full-model AWQ token equality, 2026-05-30:
   params. Evidence file:
   `bench_results/sm70_migration_20260530/model_tokens_old003_qwen36_27b_awq_sm70_tp4_notune_greedy8_gmu070.json`.
 - Old 0.0.3 result:
-  - loaded and generated successfully on four V100s;
-  - `load_seconds=131.98629504500423`;
-  - `generate_seconds=4.665383944986388`;
-  - output token IDs:
+    - loaded and generated successfully on four V100s;
+    - `load_seconds=131.98629504500423`;
+    - `generate_seconds=4.665383944986388`;
+    - output token IDs:
     `[271, 248068, 198, 8160, 579, 264, 7047, 1817]`.
 - Old 0.0.3 logs confirmed these safe paths that are still missing or not wired
   in the latest target tree:
-  - `FLASH_ATTN_V100 decode path active`;
-  - `FLASH_ATTN_V100 prefill path active`;
-  - `SM70 dense fp16 fast path enabled for small decode projections`;
-  - `SM70 dense fp16 fast path enabled for LM head`;
-  - `SM70 AWQ warmup finished`.
+    - `FLASH_ATTN_V100 decode path active`;
+    - `FLASH_ATTN_V100 prefill path active`;
+    - `SM70 dense fp16 fast path enabled for small decode projections`;
+    - `SM70 dense fp16 fast path enabled for LM head`;
+    - `SM70 AWQ warmup finished`.
 - Strict token compare:
   `conda run -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_model_tokens.py --compare bench_results/sm70_migration_20260530/model_tokens_old003_qwen36_27b_awq_sm70_tp4_notune_greedy8_gmu070.json bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_27b_awq_sm70_tp4_greedy8.json --json-out bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_27b_awq_old003_notune_gmu070_vs_latest_gmu088_greedy8.json`
   returned `equal=true`, with prompt token IDs and output token IDs identical.
@@ -3671,13 +3671,13 @@ Full-model FP8 token equality, 2026-05-30:
   Root cause: latest upstream FP8 selector had dense FP8 support but no SM70
   FP8 MoE backend.
 - Migration action:
-  - added safe/base `Fp8SM70MoEMethod` into
+    - added safe/base `Fp8SM70MoEMethod` into
     `vllm/model_executor/layers/quantization/fp8_sm70_moe.py`;
-  - wired latest `fp8.py` to select that backend only for serialized block-FP8
+    - wired latest `fp8.py` to select that backend only for serialized block-FP8
     MoE on CUDA SM70 with `VLLM_SM70_FP8_TURBOMIND=1`;
-  - registered only the base MoE support ops
+    - registered only the base MoE support ops
     `awq_moe_build_strided_ptrs` and `fp8_moe_gemm_sm70_out`;
-  - did not register compact/router/gated/broadcast/direct-reduce experimental
+    - did not register compact/router/gated/broadcast/direct-reduce experimental
     ops.
 - First rebuild after opening the old MoE C++ block failed at import time:
   `_C.abi3.so: undefined symbol: silu_and_mul(torch::Tensor&, torch::Tensor&)`.
@@ -3691,10 +3691,10 @@ Full-model FP8 token equality, 2026-05-30:
 - Rebuild command:
   `TORCH_CUDA_ARCH_LIST="7.0" MAX_JOBS=8 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_BUILD_PARALLEL_LEVEL=8 conda run --live-stream -n vllm-0.0.5-t210 python -m pip install -e . --no-build-isolation --no-deps`
 - Rebuild result:
-  - editable latest vLLM installed successfully;
-  - sampled host memory stayed safe; `NVCC_THREADS=1` kept compiler memory
+    - editable latest vLLM installed successfully;
+    - sampled host memory stayed safe; `NVCC_THREADS=1` kept compiler memory
     from multiplying per job;
-  - compile time was dominated by upstream FA2/FA3 sources unrelated to SM70.
+    - compile time was dominated by upstream FA2/FA3 sources unrelated to SM70.
 - Post-build op registration check passed:
   `awq_sm70_prepare`, `fp8_sm70_prepare`, `awq_moe_build_strided_ptrs`,
   `fp8_moe_gemm_sm70_out`, `fp8_gemm_sm70_out_meta`, and
@@ -3703,24 +3703,24 @@ Full-model FP8 token equality, 2026-05-30:
 - Latest vLLM target tree command:
   `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_SM70_FP8_TURBOMIND=1 conda run --live-stream -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_model_tokens.py --model /home/ymzx/models/Qwen3.6-35B-A3B-FP8 --out bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_sm70_tp4_greedy8.json --tensor-parallel-size 4 --quantization fp8 --dtype auto --max-model-len 4096 --gpu-memory-utilization 0.88 --max-tokens 8 --ignore-eos --disable-custom-all-reduce --prompt "Write one sentence about deterministic validation."`
 - Latest result:
-  - loaded and generated successfully on four V100s;
-  - log confirmed `SM70 FP8 MoE TurboMind batched path enabled (256 experts)`;
-  - latest still selected `TRITON_ATTN`, not old `FLASH_ATTN_V100`;
-  - `load_seconds=685.7047191240126`;
-  - `generate_seconds=6.581952182983514`;
-  - output token IDs:
+    - loaded and generated successfully on four V100s;
+    - log confirmed `SM70 FP8 MoE TurboMind batched path enabled (256 experts)`;
+    - latest still selected `TRITON_ATTN`, not old `FLASH_ATTN_V100`;
+    - `load_seconds=685.7047191240126`;
+    - `generate_seconds=6.581952182983514`;
+    - output token IDs:
     `[271, 248068, 198, 90700, 8340, 25, 271, 16]`.
 - Latest startup observation: initial profiling/warmup took `470.96 s` and
   engine init took `598.20 s`, mostly due latest V1 compile/profile/cudagraph
   behavior and Triton JIT. This is not a decode-speed acceptance result.
 - Old 0.0.3 comparison setup:
-  - first attempt accidentally imported the installed site-packages copy and
+    - first attempt accidentally imported the installed site-packages copy and
     failed the FP8 SM70 capability check (`min capability 75`). This path is
     invalid for comparison.
-  - rerun used
+    - rerun used
     `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/1Cat-vLLM-0.0.3/vllm` to force the
     old source tree.
-  - explicit unsafe-route guards:
+    - explicit unsafe-route guards:
     `VLLM_SM70_FP8_MOE_SINGLE_TOKEN_COMPACT=0`,
     `VLLM_SM70_FP8_MOE_SINGLE_TOKEN_CPP=0`, and
     `VLLM_SM70_FP8_MOE_GATED_SILU_EPILOGUE=0`.
@@ -3734,14 +3734,14 @@ Full-model FP8 token equality, 2026-05-30:
   Evidence file:
   `bench_results/sm70_migration_20260530/model_tokens_old003_qwen36_35a3b_fp8_sm70_tp4_greedy8_source_gmu070.json`.
 - Old 0.0.3 result:
-  - loaded and generated successfully on four V100s;
-  - logs confirmed safe old paths:
+    - loaded and generated successfully on four V100s;
+    - logs confirmed safe old paths:
     `FLASH_ATTN_V100`, SM70 FP8 dense W8A16 TurboMind,
     `SM70 FP8 MoE TurboMind path enabled`, and
     `SM70 dense fp16 fast path enabled for LM head`;
-  - `load_seconds=149.40006000598078`;
-  - `generate_seconds=4.972198622010183`;
-  - output token IDs:
+    - `load_seconds=149.40006000598078`;
+    - `generate_seconds=4.972198622010183`;
+    - output token IDs:
     `[271, 248068, 198, 90700, 8340, 25, 271, 16]`.
 - Strict token compare:
   `conda run -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_model_tokens.py --compare bench_results/sm70_migration_20260530/model_tokens_old003_qwen36_35a3b_fp8_sm70_tp4_greedy8_source_gmu070.json bench_results/sm70_migration_20260530/model_tokens_latest_qwen36_35a3b_fp8_sm70_tp4_greedy8.json --json-out bench_results/sm70_migration_20260530/model_tokens_compare_qwen36_35a3b_fp8_old003_gmu070_vs_latest_gmu088_greedy8.json`
@@ -3760,67 +3760,67 @@ Latest FP8 no-MTP single-request decode smoke, 2026-05-30:
 - Command:
   `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_SM70_FP8_TURBOMIND=1 conda run --live-stream -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_decode.py --model /home/ymzx/models/Qwen3.6-35B-A3B-FP8 --out bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_smoke.json --tensor-parallel-size 4 --quantization fp8 --dtype auto --max-model-len 4096 --gpu-memory-utilization 0.88 --input-len 1024 --output-len 32 --warmup 1 --repeat 1 --temperature 0.0 --top-p 1.0 --top-k -1 --ignore-eos --disable-custom-all-reduce`
 - Result:
-  - latest vLLM loaded and generated successfully on four V100s;
-  - log confirmed `SM70 FP8 MoE TurboMind batched path enabled (256 experts)`;
-  - latest selected `TRITON_ATTN`;
-  - `load_seconds=686.5917022899957`;
-  - initial profiling/warmup run took `470.36 s`;
-  - CUDA graph capture took `25 s` and `2.11 GiB`;
-  - warmup generation: 32 output tokens in `7.050269241997739 s`,
+    - latest vLLM loaded and generated successfully on four V100s;
+    - log confirmed `SM70 FP8 MoE TurboMind batched path enabled (256 experts)`;
+    - latest selected `TRITON_ATTN`;
+    - `load_seconds=686.5917022899957`;
+    - initial profiling/warmup run took `470.36 s`;
+    - CUDA graph capture took `25 s` and `2.11 GiB`;
+    - warmup generation: 32 output tokens in `7.050269241997739 s`,
     `4.538833752529513 tok/s`, affected by first-inference Triton JIT;
-  - measured repeat: 32 output tokens in `0.5552385489863809 s`,
+    - measured repeat: 32 output tokens in `0.5552385489863809 s`,
     `57.63288600623605 tok/s`;
-  - repeat token hash:
+    - repeat token hash:
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`.
 - Interpretation:
-  - This is the first latest-tree no-MTP single-concurrency decode-speed smoke
+    - This is the first latest-tree no-MTP single-concurrency decode-speed smoke
     for the migrated FP8 path.
-  - It is not final performance acceptance: output length is only 32 tokens,
+    - It is not final performance acceptance: output length is only 32 tokens,
     there is no same-criterion old 0.0.3 comparison yet, and server TTFT is not
     measured by this offline harness.
-  - It exposes a real latest-upstream startup/perf debt: cold init for this
+    - It exposes a real latest-upstream startup/perf debt: cold init for this
     model/config is about 11.4 minutes, dominated by profiling/warmup and graph
     capture behavior, not by weight loading alone.
 
 Async scheduling speed-policy probes, 2026-05-30:
 
 - Non-eager probe:
-  - command shape: Qwen3.6-35B-A3B-FP8, TP4, `TRITON_ATTN`, 1024 input,
+    - command shape: Qwen3.6-35B-A3B-FP8, TP4, `TRITON_ATTN`, 1024 input,
     64 greedy output, `VLLM_SM70_FP8_TURBOMIND=1`, no `--enforce-eager`;
-  - intended output file:
+    - intended output file:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o64_greedy_triton_async_on.json`;
-  - result: aborted after more than 9 minutes because runtime compile/shared
+    - result: aborted after more than 9 minutes because runtime compile/shared
     memory broadcast did not reach benchmark repeats. The run emitted repeated
     `No available shared memory broadcast block found in 60 seconds` messages;
-  - interpretation: this is not accepted performance evidence. It is a
+    - interpretation: this is not accepted performance evidence. It is a
     latest-tree startup/compile path debt to revisit separately from SM70
     kernel quality.
 - Eager async-on probe:
-  - evidence:
+    - evidence:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o64_greedy_triton_async_on_eager.json`;
-  - command used `--enforce-eager`, `--attention-backend TRITON_ATTN`,
+    - command used `--enforce-eager`, `--attention-backend TRITON_ATTN`,
     `--input-len 1024`, `--output-len 64`, `--repeat 3`, greedy sampling,
     TP4, FP8 TurboMind gate enabled;
-  - log confirmed `Asynchronous scheduling is enabled`;
-  - repeat output TPS: `9.3126`, `9.3179`, `9.2142`; mean `9.2816`;
-  - all repeats had token hash
+    - log confirmed `Asynchronous scheduling is enabled`;
+    - repeat output TPS: `9.3126`, `9.3179`, `9.2142`; mean `9.2816`;
+    - all repeats had token hash
     `46bdaa82f9bdfe02d8c4548c25182c72e2342c589868e6c4417f42643ae09c34`.
 - Eager async-off probe:
-  - evidence:
+    - evidence:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o64_greedy_triton_async_off_eager.json`;
-  - same command plus `--engine-arg async_scheduling=false`;
-  - log confirmed `Asynchronous scheduling is disabled`;
-  - repeat output TPS: `9.4261`, `9.5085`, `9.4775`; mean `9.4707`;
-  - all repeats had token hash
+    - same command plus `--engine-arg async_scheduling=false`;
+    - log confirmed `Asynchronous scheduling is disabled`;
+    - repeat output TPS: `9.4261`, `9.5085`, `9.4775`; mean `9.4707`;
+    - all repeats had token hash
     `669b4703db7f1a26c955a2e389b88ffd50bdb8fe97f70339a5315df0d5a82904`.
 - Interpretation:
-  - under eager mode, disabling async scheduling improved this narrow
+    - under eager mode, disabling async scheduling improved this narrow
     single-request greedy speed probe by about `+2.04%`;
-  - async-on and async-off produced different greedy token hashes, even though
+    - async-on and async-off produced different greedy token hashes, even though
     each setting was internally repeat-stable. This reinforces that
     `async_scheduling` is part of the benchmark and quality口径, not a
     transparent runtime knob;
-  - `async_scheduling=false` remains a possible SM70 quality policy only if the
+    - `async_scheduling=false` remains a possible SM70 quality policy only if the
     canonical acceptance route is explicitly defined around that scheduler
     state and broader token/speed validation passes. It is not yet a default
     change.
@@ -3833,14 +3833,14 @@ Old 0.0.3 FP8 no-MTP decode comparison smoke, 2026-05-30:
   FP8 MoE compact/gated flags were explicitly disabled. Evidence file:
   `bench_results/sm70_migration_20260530/decode_old003_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_gmu070_smoke.json`.
 - Historical old-tree result:
-  - selected old `FLASH_ATTN_V100`;
-  - logged `FLASH_ATTN_V100 decode path active` and
+    - selected old `FLASH_ATTN_V100`;
+    - logged `FLASH_ATTN_V100 decode path active` and
     `FLASH_ATTN_V100 prefill path active`;
-  - logged SM70 FP8 dense/MoE TurboMind paths;
-  - also logged the old SM70 dense FP16 LM-head fast path;
-  - measured repeat: 32 output tokens in `0.42561735899653286 s`,
+    - logged SM70 FP8 dense/MoE TurboMind paths;
+    - also logged the old SM70 dense FP16 LM-head fast path;
+    - measured repeat: 32 output tokens in `0.42561735899653286 s`,
     `75.18490334944416 tok/s`;
-  - repeat token hash:
+    - repeat token hash:
     `45f96c9a20358ae70141b8bcca6d0d2fda659b5ba23940db3d33043ed9484df8`.
 - A follow-up attempted to align the old tree closer to the latest safe route:
   `VLLM_ATTENTION_BACKEND=TRITON_ATTN`,
@@ -3848,54 +3848,54 @@ Old 0.0.3 FP8 no-MTP decode comparison smoke, 2026-05-30:
   MoE flags disabled, same benchmark shape. Evidence file:
   `bench_results/sm70_migration_20260530/decode_old003_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_triton_no_lmhead_gmu070_smoke.json`.
 - Follow-up result:
-  - old tree still selected `FLASH_ATTN_V100` despite
+    - old tree still selected `FLASH_ATTN_V100` despite
     `VLLM_ATTENTION_BACKEND=TRITON_ATTN`;
-  - measured repeat: 32 output tokens in `0.4200822720013093 s`,
+    - measured repeat: 32 output tokens in `0.4200822720013093 s`,
     `76.17555448733685 tok/s`;
-  - repeat token hash stayed
+    - repeat token hash stayed
     `45f96c9a20358ae70141b8bcca6d0d2fda659b5ba23940db3d33043ed9484df8`.
 - Source investigation:
-  - old 0.0.3 `vllm/platforms/cuda.py` hard-codes the SM70 priority list as
+    - old 0.0.3 `vllm/platforms/cuda.py` hard-codes the SM70 priority list as
     `[FLASH_ATTN_V100, TRITON_ATTN]`;
-  - the `VLLM_ATTENTION_BACKEND` environment variable alone did not populate
+    - the `VLLM_ATTENTION_BACKEND` environment variable alone did not populate
     `attention_config.backend` for the offline `LLM` harness;
-  - the correct forcing mechanism for this harness is passing
+    - the correct forcing mechanism for this harness is passing
     `attention_backend="TRITON_ATTN"` into `LLM(...)`, now exposed by
     `benchmarks/benchmark_sm70_decode.py --attention-backend`.
 - Proper forced old-tree safe-attention rerun:
-  - command added `--attention-backend TRITON_ATTN` and kept
+    - command added `--attention-backend TRITON_ATTN` and kept
     `VLLM_SM70_ENABLE_LM_HEAD_FASTPATH=0`;
-  - evidence file:
+    - evidence file:
     `bench_results/sm70_migration_20260530/decode_old003_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_triton_backend_no_lmhead_gmu070_smoke.json`;
-  - logs confirmed `Using AttentionBackendEnum.TRITON_ATTN backend`;
-  - measured repeat: 32 output tokens in `0.4432002370012924 s`,
+    - logs confirmed `Using AttentionBackendEnum.TRITON_ATTN backend`;
+    - measured repeat: 32 output tokens in `0.4432002370012924 s`,
     `72.20212745487923 tok/s`;
-  - repeat token hash:
+    - repeat token hash:
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`.
 - Strict token comparison against the latest safe migration smoke:
-  - latest safe route token hash:
+    - latest safe route token hash:
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`;
-  - old forced-TRITON/no-LM-head route produced the same hash and identical
+    - old forced-TRITON/no-LM-head route produced the same hash and identical
     token IDs;
-  - old historical `FLASH_ATTN_V100` route and the env-only attempted-aligned
+    - old historical `FLASH_ATTN_V100` route and the env-only attempted-aligned
     route both produced hash
     `45f96c9a20358ae70141b8bcca6d0d2fda659b5ba23940db3d33043ed9484df8`;
-  - first output-token mismatch between latest safe route and old
+    - first output-token mismatch between latest safe route and old
     `FLASH_ATTN_V100` route is at 0-based output index `16`: latest safe route
     token `1061`, old V100-FA route token `1919`.
 - Interpretation:
-  - The old 0.0.3 `FLASH_ATTN_V100` short decode is faster but not a safe
+    - The old 0.0.3 `FLASH_ATTN_V100` short decode is faster but not a safe
     migration acceptance baseline because output tokens diverge.
-  - The old forced-TRITON/no-LM-head route is a better short safety baseline:
+    - The old forced-TRITON/no-LM-head route is a better short safety baseline:
     it matches latest safe tokens exactly while still running at
     `72.20212745487923 tok/s`.
-  - Latest safe route reached `57.63288600623605 tok/s` on the same short
+    - Latest safe route reached `57.63288600623605 tok/s` on the same short
     shape, about `79.8%` of this old short safe baseline. That is below the
     95% target and needs further profiling. Because attention and LM-head
     unsafe routes are excluded, the next likely gap is latest-vs-old scheduler,
     compile/cudagraph, Triton attention implementation, GDN/linear-attention
     hooks, or safe TurboMind/MoE integration differences.
-  - The migrated latest route should remain on latest `TRITON_ATTN` by default
+    - The migrated latest route should remain on latest `TRITON_ATTN` by default
     until `FLASH_ATTN_V100` prefill and decode prove strict `max_diff == 0`
     and deterministic token equality.
 
@@ -3906,22 +3906,22 @@ Latest explicit-TRITON rerun, 2026-05-30:
 - Evidence file:
   `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_triton_gmu070_smoke.json`.
 - Result:
-  - logs confirmed latest `AttentionBackendEnum.TRITON_ATTN`;
-  - latest init remained very expensive: `load_seconds=693.4559482740005`,
+    - logs confirmed latest `AttentionBackendEnum.TRITON_ATTN`;
+    - latest init remained very expensive: `load_seconds=693.4559482740005`,
     initial profiling/warmup `463.35 s`, engine init `590.78 s`;
-  - measured repeat: 32 output tokens in `0.5544982289720792 s`,
+    - measured repeat: 32 output tokens in `0.5544982289720792 s`,
     `57.70983265234433 tok/s`;
-  - repeat token hash:
+    - repeat token hash:
     `45f96c9a20358ae70141b8bcca6d0d2fda659b5ba23940db3d33043ed9484df8`.
 - Interpretation:
-  - Speed is essentially unchanged from latest auto-selector smoke
+    - Speed is essentially unchanged from latest auto-selector smoke
     (`57.63 tok/s`), so the short speed gap is not caused by
     `gpu_memory_utilization=0.88` vs `0.70`.
-  - However, explicit `attention_backend=TRITON_ATTN` on latest changes the
+    - However, explicit `attention_backend=TRITON_ATTN` on latest changes the
     deterministic output hash away from the latest auto-selector safe hash
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`.
     It matches the old `FLASH_ATTN_V100` divergent hash instead.
-  - Therefore the latest explicit-backend run is a useful speed probe but not a
+    - Therefore the latest explicit-backend run is a useful speed probe but not a
     quality-safe acceptance run. Latest main-route evidence should continue to
     use the default auto selector until the explicit-backend semantic
     difference is understood.
@@ -3935,27 +3935,27 @@ Latest no-packed GDN decode probe, 2026-05-30:
 - Command:
   `CUDA_VISIBLE_DEVICES=1,2,3,4 CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 VLLM_SM70_FP8_TURBOMIND=1 conda run --live-stream -n vllm-0.0.5-t210 python benchmarks/benchmark_sm70_decode.py --model /home/ymzx/models/Qwen3.6-35B-A3B-FP8 --out bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_no_packed_gdn_smoke.json --tensor-parallel-size 4 --quantization fp8 --dtype auto --max-model-len 4096 --gpu-memory-utilization 0.88 --input-len 1024 --output-len 32 --warmup 1 --repeat 1 --temperature 0.0 --top-p 1.0 --top-k -1 --ignore-eos --disable-custom-all-reduce`.
 - Result:
-  - latest loaded and generated successfully;
-  - auto selector still used latest `TRITON_ATTN`;
-  - `load_seconds=672.7149341000186`;
-  - initial profiling/warmup run took `464.26 s`;
-  - measured repeat: 32 output tokens in `0.5541771060081664 s`,
+    - latest loaded and generated successfully;
+    - auto selector still used latest `TRITON_ATTN`;
+    - `load_seconds=672.7149341000186`;
+    - initial profiling/warmup run took `464.26 s`;
+    - measured repeat: 32 output tokens in `0.5541771060081664 s`,
     `57.745298997492604 tok/s`;
-  - repeat token hash:
+    - repeat token hash:
     `38fa505396e2736409f493605cddcc6439c336ab7548f76c9056a8fc4e53f03e`.
 - Strict token comparison:
-  - latest default safe hash:
+    - latest default safe hash:
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`;
-  - first mismatch is at 0-based output index `16`: latest default safe token
+    - first mismatch is at 0-based output index `16`: latest default safe token
     `1061`, no-packed GDN token `1919`;
-  - therefore this probe is not quality-safe under the deterministic token
+    - therefore this probe is not quality-safe under the deterministic token
     equality rule.
 - Interpretation:
-  - Disabling packed recurrent GDN decode does not recover performance; it is
+    - Disabling packed recurrent GDN decode does not recover performance; it is
     effectively the same speed as latest default (`57.63-57.75 tok/s`).
-  - It also changes deterministic output tokens, so it cannot enter the main
+    - It also changes deterministic output tokens, so it cannot enter the main
     route.
-  - The old forced-TRITON/no-LM-head route still matches latest default tokens
+    - The old forced-TRITON/no-LM-head route still matches latest default tokens
     exactly at `72.20 tok/s`, so the recoverable performance gap is not
     explained by simply choosing latest non-packed GDN decode. The next safe
     direction is source/profiler comparison of latest-vs-old scheduler,
@@ -3965,122 +3965,122 @@ Latest no-packed GDN decode probe, 2026-05-30:
 Nsight repeat-range profile and SM70 GDN schedule probe, 2026-05-30:
 
 - Harness update:
-  - Added `benchmarks/benchmark_sm70_decode.py --cuda-profile-repeat`, which
+    - Added `benchmarks/benchmark_sm70_decode.py --cuda-profile-repeat`, which
     wraps only measured repeats in `cudaProfilerStart/Stop`.
-  - Static checks passed:
+    - Static checks passed:
     `git diff --check`, `ruff check`, and `py_compile`.
 - Latest safe repeat-range profile:
-  - JSON:
+    - JSON:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_nsys_safe.json`;
-  - Nsight report:
+    - Nsight report:
     `bench_results/sm70_migration_20260530/nsys_latest_safe_fp8_tp4_i1024_o32_repeat.nsys-rep`;
-  - repeat token hash stayed on latest safe hash
+    - repeat token hash stayed on latest safe hash
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`;
-  - profiler overhead reduced measured TPS to `54.516 tok/s`, so this run is
+    - profiler overhead reduced measured TPS to `54.516 tok/s`, so this run is
     used for kernel mix, not speed acceptance.
 - Latest kernel mix, CUDA kernel summary:
-  - `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`: `337.384 ms`, `37.2%`;
-  - NCCL all-reduce: `103.655 ms`, `11.4%`;
-  - TurboMind FP8 GEMM, large tile: `97.634 ms`, `10.8%`;
-  - TurboMind FP8 GEMM, 128x128 tile: `79.662 ms`, `8.8%`;
-  - `kernel_unified_attention`: `52.409 ms`, `5.8%`.
+    - `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`: `337.384 ms`, `37.2%`;
+    - NCCL all-reduce: `103.655 ms`, `11.4%`;
+    - TurboMind FP8 GEMM, large tile: `97.634 ms`, `10.8%`;
+    - TurboMind FP8 GEMM, 128x128 tile: `79.662 ms`, `8.8%`;
+    - `kernel_unified_attention`: `52.409 ms`, `5.8%`.
 - Old 0.0.3 profiler caveat:
-  - Starting old 0.0.3 from the latest working directory failed because the
+    - Starting old 0.0.3 from the latest working directory failed because the
     old model-inspection subprocess imported the latest tree's `vllm` package
     and then failed to load the wrong `_C.abi3.so`.
-  - Re-running from the old tree fixed the path issue and produced:
+    - Re-running from the old tree fixed the path issue and produced:
     `bench_results/sm70_migration_20260530/nsys_old003_triton_no_lmhead_fp8_tp4_i1024_o32_repeat.nsys-rep`.
-  - However, the Nsight/cudaProfiler run changed old repeat hash to
+    - However, the Nsight/cudaProfiler run changed old repeat hash to
     `45f96c9a20358ae70141b8bcca6d0d2fda659b5ba23940db3d33043ed9484df8`.
     A no-Nsight rerun from the same old working directory returned to the safe
     hash `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`
     and measured `75.970 tok/s`
     (`decode_old003_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_triton_no_lmhead_oldcwd_rerun.json`).
-  - Therefore old Nsight output is useful for rough hotspot comparison only;
+    - Therefore old Nsight output is useful for rough hotspot comparison only;
     it is not quality evidence.
 - Source finding:
-  - Old 0.0.3 has an SM70-specific Triton autotune search space for
+    - Old 0.0.3 has an SM70-specific Triton autotune search space for
     `chunk_delta_h.py`: `VLLM_SM70_GDN_DELTA_H_BV`, warps, and stages. Latest
     upstream only uses the generic FLA autotune space.
-  - Old 0.0.3 also has SM70 schedule knobs in `fused_recurrent.py` and
+    - Old 0.0.3 also has SM70 schedule knobs in `fused_recurrent.py` and
     `fused_sigmoid_gating.py`, but this experiment intentionally touched only
     `chunk_delta_h.py`.
 - Experiment:
-  - Temporarily transplanted only the old SM70 `chunk_delta_h` autotune config
+    - Temporarily transplanted only the old SM70 `chunk_delta_h` autotune config
     into latest tree. No math formula or model routing was changed.
-  - Result file:
+    - Result file:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_sm70_delta_h_sched.json`.
-  - Speed improved from latest baseline `57.633 tok/s` to `68.756 tok/s`
+    - Speed improved from latest baseline `57.633 tok/s` to `68.756 tok/s`
     (`+19.3%` on this 1024 input / 32 output smoke).
-  - Strict token equality failed: repeat hash became
+    - Strict token equality failed: repeat hash became
     `4bc76cef5fac73dbe79845b02e79a41ea462ebd1e9180316f723f0b4583c47fd`;
     first known divergence is at 0-based output index `16`, where baseline
     token is `1061` and the schedule-probe token is `1919`.
 - Safety action:
-  - The temporary `chunk_delta_h.py`/`utils.py` changes were fully reverted;
+    - The temporary `chunk_delta_h.py`/`utils.py` changes were fully reverted;
     both files now have no diff.
-  - Recheck file:
+    - Recheck file:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_after_delta_h_revert_recheck.json`.
-  - Recheck returned to safe hash
+    - Recheck returned to safe hash
     `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`
     and baseline speed `57.607 tok/s`.
 - Interpretation:
-  - Tile-style scheduling absolutely matters here; this probe found nearly
+    - Tile-style scheduling absolutely matters here; this probe found nearly
     `+19%` on the short smoke without changing high-level routing.
-  - But the current FLA/GDN scheduling route is not acceptable under the
+    - But the current FLA/GDN scheduling route is not acceptable under the
     project rule because it changes generated tokens. It cannot enter the main
     route, even behind a default-on SM70 gate.
-  - Any future GDN schedule work needs a lower-level strict oracle for
+    - Any future GDN schedule work needs a lower-level strict oracle for
     `chunk_gated_delta_rule` output/state equality before a full-model speed
     run, because token-only failure appears after a near-tie in greedy decode.
 
 GDN/FLA op-level strict oracle, 2026-05-30:
 
 - Added `benchmarks/benchmark_sm70_gdn_exactness.py`.
-  - It imports vLLM only inside the `run` subcommand so the same script can run
+    - It imports vLLM only inside the `run` subcommand so the same script can run
     against the latest tree and the old 0.0.3 tree.
-  - It saves the generated inputs with the outputs, then reuses the same input
+    - It saves the generated inputs with the outputs, then reuses the same input
     file for old-vs-latest runs. This avoids false conclusions from different
     RNG behavior between Torch versions.
-  - The strict comparator requires both `torch.equal` and `max_diff == 0` for
+    - The strict comparator requires both `torch.equal` and `max_diff == 0` for
     `out` and `final_state`; it also checks all saved inputs are identical.
-  - Static checks passed:
+    - Static checks passed:
     `uv run --no-sync ruff check`, `python -m py_compile`, and
     `git diff --check`.
 - Test shape:
-  - Qwen3.6-35B-A3B-FP8 TP4 local prefill shape:
+    - Qwen3.6-35B-A3B-FP8 TP4 local prefill shape:
     `q/k=[1, 1024, 4, 128]`, `v=[1, 1024, 8, 128]`,
     `g/beta=[1, 1024, 8]`, `initial_state=[1, 8, 128, 128]`;
-  - dtype: `q/k/v/initial_state=float16`, `g/beta=float32`;
-  - `cu_seqlens=[0, 1024]`, matching the vLLM prefill path.
+    - dtype: `q/k/v/initial_state=float16`, `g/beta=float32`;
+    - `cu_seqlens=[0, 1024]`, matching the vLLM prefill path.
 - Evidence files:
-  - latest run:
+    - latest run:
     `bench_results/sm70_migration_20260530/gdn_delta_h_latest_qwen_shape.pt`;
-  - old 0.0.3 run on the exact same inputs:
+    - old 0.0.3 run on the exact same inputs:
     `bench_results/sm70_migration_20260530/gdn_delta_h_old003_qwen_shape.pt`;
-  - strict old-vs-latest comparison:
+    - strict old-vs-latest comparison:
     `bench_results/sm70_migration_20260530/gdn_delta_h_latest_vs_old003_qwen_shape_strict.json`;
-  - latest self-repeat:
+    - latest self-repeat:
     `bench_results/sm70_migration_20260530/gdn_delta_h_latest_self_repeat_strict.json`;
-  - old 0.0.3 self-repeat:
+    - old 0.0.3 self-repeat:
     `bench_results/sm70_migration_20260530/gdn_delta_h_old003_self_repeat_strict.json`.
 - Result:
-  - Inputs are identical: `inputs_ok=true`.
-  - latest self-repeat is strict-pass: `out max_diff=0`,
+    - Inputs are identical: `inputs_ok=true`.
+    - latest self-repeat is strict-pass: `out max_diff=0`,
     `final_state max_diff=0`.
-  - old 0.0.3 self-repeat is strict-pass: `out max_diff=0`,
+    - old 0.0.3 self-repeat is strict-pass: `out max_diff=0`,
     `final_state max_diff=0`.
-  - old-vs-latest strict comparison fails:
-    - `out`: `torch_equal=false`,
+    - old-vs-latest strict comparison fails:
+        - `out`: `torch_equal=false`,
       `max_diff=1.9073486328125e-06`, `num_different=556390`;
-    - `final_state`: `torch_equal=false`,
+        - `final_state`: `torch_equal=false`,
       `max_diff=1.23586505651474e-05`, `num_different=131061`.
 - Interpretation:
-  - The GDN op is deterministic within each implementation, but old 0.0.3 and
+    - The GDN op is deterministic within each implementation, but old 0.0.3 and
     latest vLLM produce different bit patterns on the same Qwen-like input.
-  - Therefore the old SM70 GDN/FLA schedule cannot be directly copied into the
+    - Therefore the old SM70 GDN/FLA schedule cannot be directly copied into the
     latest main route under the project rule `max_diff == 0`.
-  - This does not prove that a safe GDN schedule optimization is impossible.
+    - This does not prove that a safe GDN schedule optimization is impossible.
     It proves that the current old-vs-latest full-op transplant is not the safe
     answer. The next safe direction is to isolate sub-ops
     (`chunk_local_cumsum`, `chunk_scaled_dot_kkt`, `solve_tril`,
@@ -4091,37 +4091,37 @@ GDN/FLA sub-op strict split, 2026-05-30:
 
 - Extended `benchmarks/benchmark_sm70_gdn_exactness.py` with
   `--save-intermediates`.
-  - It saves `stage_g_cumsum`, `stage_A_kkt`, `stage_A_solved`, `stage_w`,
+    - It saves `stage_g_cumsum`, `stage_A_kkt`, `stage_A_solved`, `stage_w`,
     `stage_u`, `stage_h`, `stage_v_new`, `stage_final_state`, and `stage_out`.
-  - Static checks passed again:
+    - Static checks passed again:
     `uv run --no-sync ruff check`, `python -m py_compile`, and
     `git diff --check`.
 - Evidence files:
-  - latest pipeline:
+    - latest pipeline:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_qwen_shape.pt`;
-  - old 0.0.3 pipeline:
+    - old 0.0.3 pipeline:
     `bench_results/sm70_migration_20260530/gdn_pipeline_old003_qwen_shape.pt`;
-  - strict pipeline comparison:
+    - strict pipeline comparison:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_vs_old003_qwen_shape_strict.json`.
 - Result:
-  - `stage_g_cumsum`: strict-pass, `max_diff=0`.
-  - First divergence is `stage_A_kkt`:
+    - `stage_g_cumsum`: strict-pass, `max_diff=0`.
+    - First divergence is `stage_A_kkt`:
     `max_diff=4.883110523223877e-05`, `num_different=258008`.
-  - Downstream propagation:
-    - `stage_A_solved`: `max_diff=0.0001220703125`;
-    - `stage_w`: `max_diff=0.0001220703125`;
-    - `stage_u`: `max_diff=3.0517578125e-05`;
-    - `stage_h`: `max_diff=3.0517578125e-05`;
-    - `stage_v_new`: `max_diff=6.103515625e-05`;
-    - `stage_final_state`: `max_diff=1.23586505651474e-05`;
-    - `stage_out`: `max_diff=1.9073486328125e-06`.
+    - Downstream propagation:
+        - `stage_A_solved`: `max_diff=0.0001220703125`;
+        - `stage_w`: `max_diff=0.0001220703125`;
+        - `stage_u`: `max_diff=3.0517578125e-05`;
+        - `stage_h`: `max_diff=3.0517578125e-05`;
+        - `stage_v_new`: `max_diff=6.103515625e-05`;
+        - `stage_final_state`: `max_diff=1.23586505651474e-05`;
+        - `stage_out`: `max_diff=1.9073486328125e-06`.
 - Interpretation:
-  - The first unsafe numeric change is not `chunk_delta_h`; it appears in
+    - The first unsafe numeric change is not `chunk_delta_h`; it appears in
     `chunk_scaled_dot_kkt_fwd`.
-  - Old 0.0.3 has SM70-specific KKT autotune restrictions and a slightly
+    - Old 0.0.3 has SM70-specific KKT autotune restrictions and a slightly
     different Triton dot/cast expression from latest upstream. That difference
     is enough to break bitwise equality before the delta-state update.
-  - This makes the direct "copy old SM70 FLA schedules into latest" route
+    - This makes the direct "copy old SM70 FLA schedules into latest" route
     broader and riskier than a single-kernel transplant. Any safe recovery has
     to start from `chunk_scaled_dot_kkt_fwd` with a same-implementation
     strict-equality harness.
@@ -4129,95 +4129,95 @@ GDN/FLA sub-op strict split, 2026-05-30:
 Latest KKT SM70 schedule gate, 2026-05-30:
 
 - Source change:
-  - Added a default-off gate in
+    - Added a default-off gate in
     `vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py`.
-  - Gate: `VLLM_SM70_GDN_KKT_SCHEDULE=1`, active only on CUDA SM70.
-  - Optional tuning envs:
+    - Gate: `VLLM_SM70_GDN_KKT_SCHEDULE=1`, active only on CUDA SM70.
+    - Optional tuning envs:
     `VLLM_SM70_GDN_KKT_BK`, `VLLM_SM70_GDN_KKT_WARPS`,
     `VLLM_SM70_GDN_KKT_STAGES`.
-  - Default-off path keeps latest upstream's original KKT autotune search
+    - Default-off path keeps latest upstream's original KKT autotune search
     space exactly.
-  - The gated SM70 default mirrors only the old reduced search space
+    - The gated SM70 default mirrors only the old reduced search space
     (`BK=[32,64]`, `warps=[4]`, `stages=[2]`) and intentionally does not copy
     old 0.0.3's different `tl.dot` cast expression.
 - Evidence files:
-  - default-off latest pipeline after adding the gate:
+    - default-off latest pipeline after adding the gate:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_kkt_gate_default_qwen_shape.pt`;
-  - gated latest pipeline:
+    - gated latest pipeline:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_kkt_sm70_sched_qwen_shape.pt`;
-  - strict comparison:
+    - strict comparison:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_default_vs_kkt_sm70_sched_strict.json`.
 - Result:
-  - default-off latest hash remains identical to the pre-gate latest baseline.
-  - gated KKT schedule is strict-pass against default-off:
+    - default-off latest hash remains identical to the pre-gate latest baseline.
+    - gated KKT schedule is strict-pass against default-off:
     `stage_A_kkt max_diff=0`, `stage_out max_diff=0`,
     `final_state max_diff=0`.
-  - Repeat timing on the same 1024-token Qwen-like prefill shape:
-    - default-off: average `0.0043428276 s` over 5 repeats;
-    - gated schedule: average `0.0043614434 s` over 5 repeats.
-  - Timing evidence files:
-    - `bench_results/sm70_migration_20260530/gdn_timing_latest_kkt_gate_default_qwen_shape.pt`;
-    - `bench_results/sm70_migration_20260530/gdn_timing_latest_kkt_sm70_sched_qwen_shape.pt`;
-    - `bench_results/sm70_migration_20260530/gdn_timing_latest_default_vs_kkt_sm70_sched_strict.json`.
+    - Repeat timing on the same 1024-token Qwen-like prefill shape:
+        - default-off: average `0.0043428276 s` over 5 repeats;
+        - gated schedule: average `0.0043614434 s` over 5 repeats.
+    - Timing evidence files:
+        - `bench_results/sm70_migration_20260530/gdn_timing_latest_kkt_gate_default_qwen_shape.pt`;
+        - `bench_results/sm70_migration_20260530/gdn_timing_latest_kkt_sm70_sched_qwen_shape.pt`;
+        - `bench_results/sm70_migration_20260530/gdn_timing_latest_default_vs_kkt_sm70_sched_strict.json`.
 - Interpretation:
-  - The safe part of the old KKT optimization is the reduced SM70 autotune
+    - The safe part of the old KKT optimization is the reduced SM70 autotune
     search space, not the old KKT math/cast expression.
-  - The gate is runtime-performance neutral on the measured shape and should
+    - The gate is runtime-performance neutral on the measured shape and should
     not be counted as decode-speed recovery.
-  - It may still be useful as a compile/autotune-memory reduction knob after
+    - It may still be useful as a compile/autotune-memory reduction knob after
     more shapes pass exactness. It should remain default-off for now.
 
 Latest delta_h SM70 schedule gate, 2026-05-30:
 
 - Source change:
-  - Added a default-off gate in
+    - Added a default-off gate in
     `vllm/model_executor/layers/fla/ops/chunk_delta_h.py`.
-  - Registered the GDN SM70 KKT/delta_h env vars in `vllm/envs.py` to avoid
+    - Registered the GDN SM70 KKT/delta_h env vars in `vllm/envs.py` to avoid
     unknown-env warnings.
-  - Gate: `VLLM_SM70_GDN_DELTA_H_SCHEDULE=1`, active only on CUDA SM70.
-  - Optional tuning envs:
+    - Gate: `VLLM_SM70_GDN_DELTA_H_SCHEDULE=1`, active only on CUDA SM70.
+    - Optional tuning envs:
     `VLLM_SM70_GDN_DELTA_H_BV`, `VLLM_SM70_GDN_DELTA_H_WARPS`,
     `VLLM_SM70_GDN_DELTA_H_STAGES`.
-  - Default-off path keeps latest upstream's original delta_h autotune search
+    - Default-off path keeps latest upstream's original delta_h autotune search
     space exactly.
-  - The gated SM70 default mirrors the old reduced search space
+    - The gated SM70 default mirrors the old reduced search space
     (`BV=[16,32,64]`, `warps=[4,8]`, `stages=[1,2]`) while preserving latest
     kernel semantics, including latest's `USE_EXP2` support.
 - Evidence files:
-  - default-off latest pipeline after adding the gate:
+    - default-off latest pipeline after adding the gate:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_delta_h_gate_default_qwen_shape.pt`;
-  - gated latest pipeline:
+    - gated latest pipeline:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_delta_h_sm70_sched_qwen_shape.pt`;
-  - strict comparison:
+    - strict comparison:
     `bench_results/sm70_migration_20260530/gdn_pipeline_latest_default_vs_delta_h_sm70_sched_strict.json`;
-  - timing default-off:
+    - timing default-off:
     `bench_results/sm70_migration_20260530/gdn_timing_latest_delta_h_gate_default_qwen_shape.pt`;
-  - timing gated:
+    - timing gated:
     `bench_results/sm70_migration_20260530/gdn_timing_latest_delta_h_sm70_sched_qwen_shape.pt`;
-  - timing strict comparison:
+    - timing strict comparison:
     `bench_results/sm70_migration_20260530/gdn_timing_latest_default_vs_delta_h_sm70_sched_strict.json`.
-  - full-model short decode:
+    - full-model short decode:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_i1024_o32_greedy_delta_h_sm70_sched.json`.
 - Result:
-  - default-off latest hash remains identical to the pre-gate latest baseline.
-  - gated delta_h schedule is strict-pass against default-off:
+    - default-off latest hash remains identical to the pre-gate latest baseline.
+    - gated delta_h schedule is strict-pass against default-off:
     `stage_h max_diff=0`, `stage_v_new max_diff=0`,
     `stage_final_state max_diff=0`, `stage_out max_diff=0`.
-  - Repeat timing on the same 1024-token Qwen-like prefill shape:
-    - default-off: average `0.0043306174 s` over 5 repeats;
-    - gated schedule: average `0.0013836514 s` over 5 repeats.
-  - Full-model Qwen3.6-35B-A3B-FP8, TP4, 1024 input / 32 output greedy:
-    - latest safe baseline:
+    - Repeat timing on the same 1024-token Qwen-like prefill shape:
+        - default-off: average `0.0043306174 s` over 5 repeats;
+        - gated schedule: average `0.0013836514 s` over 5 repeats.
+    - Full-model Qwen3.6-35B-A3B-FP8, TP4, 1024 input / 32 output greedy:
+        - latest safe baseline:
       `57.606754 tok/s`, repeat hash
       `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`;
-    - gated delta_h schedule:
+        - gated delta_h schedule:
       `69.236809 tok/s`, repeat hash
       `a11e079ddea12fc7c0a48f41a0bfe3a323d03331cfc8da19b175cb6a6e75f645`;
-    - gain: `+20.2%` on this short same-criterion smoke.
+        - gain: `+20.2%` on this short same-criterion smoke.
 - Interpretation:
-  - This is the first GDN/FLA schedule route in latest that is both op-level
+    - This is the first GDN/FLA schedule route in latest that is both op-level
     strict-safe and materially faster on the measured shape.
-  - It has now passed one full-model deterministic token equality smoke, but
+    - It has now passed one full-model deterministic token equality smoke, but
     it is still not accepted as default-on until broader prompt/length shape
     coverage passes, because an earlier full-model schedule transplant changed
     tokens.
@@ -4225,56 +4225,56 @@ Latest delta_h SM70 schedule gate, 2026-05-30:
 Broader delta_h and default determinism check, 2026-05-30:
 
 - Reason for this check:
-  - The one-case delta_h smoke above was not enough for the `max_diff == 0`
+    - The one-case delta_h smoke above was not enough for the `max_diff == 0`
     rule. I reran multiple prompt/length cases and also reran default-off
     itself to separate gate-caused drift from latest-tree runtime
     nondeterminism.
 - Evidence files:
-  - default-off multicase:
+    - default-off multicase:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_multicase_default.json`;
-  - delta_h gated multicase:
+    - delta_h gated multicase:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_multicase_delta_h_sched.json`;
-  - default-off rerun with the same case file:
+    - default-off rerun with the same case file:
     `bench_results/sm70_migration_20260530/decode_latest_qwen36_35a3b_fp8_tp4_multicase_default_rerun_compile6.json`;
-  - op-level delta_h config probe:
+    - op-level delta_h config probe:
     `bench_results/sm70_migration_20260530/delta_h_config_probe/`.
 - Full-model multicase result:
-  - `chat_1024_o32`: default1 `57.660905 tok/s`, default2
+    - `chat_1024_o32`: default1 `57.660905 tok/s`, default2
     `57.804671 tok/s`, delta_h `69.169352 tok/s`. Token equality failed
     for default1 vs default2 at output index 6, and for default1 vs delta_h
     at output index 6.
-  - `writing_1024_o64`: default1 `70.906379 tok/s`, default2
+    - `writing_1024_o64`: default1 `70.906379 tok/s`, default2
     `71.100212 tok/s`, delta_h `79.178841 tok/s`. Token equality failed
     for default1 vs default2 at output index 0, and for default1 vs delta_h
     at output index 40.
-  - `code_2048_o64`: default1 `57.452346 tok/s`, default2
+    - `code_2048_o64`: default1 `57.452346 tok/s`, default2
     `57.485145 tok/s`, delta_h `67.185011 tok/s`. Token equality failed
     for default1 vs default2 at output index 1, and for default1 vs delta_h
     at output index 1.
-  - `long_4096_o32`: default1 `27.250267 tok/s`, default2
+    - `long_4096_o32`: default1 `27.250267 tok/s`, default2
     `27.338811 tok/s`, delta_h `37.472997 tok/s`. All three token
     sequences matched exactly.
 - Op-level delta_h schedule result:
-  - A stress input with `seqlen=1024`, `cu_seqlens=[0,1024]`,
+    - A stress input with `seqlen=1024`, `cu_seqlens=[0,1024]`,
     `input_scale=1.0`, `gate_scale=5.0`, and `beta_scale=1.0` was run
     against each single candidate config:
     `BV in {16,32,64}`, `warps in {4,8}`, `stages in {1,2}`.
-  - All 12 candidate configs were strict-pass against default-off for
+    - All 12 candidate configs were strict-pass against default-off for
     `stage_h`, `stage_v_new`, `stage_final_state`, `stage_out`, `out`, and
     `final_state`: `torch.equal=True`, `max_diff=0`.
-  - Default-off repeated against itself on the same op fixture was also
+    - Default-off repeated against itself on the same op fixture was also
     strict-pass across all saved stages.
-  - Fastest measured candidate on this fixture was `BV=16, warps=8,
+    - Fastest measured candidate on this fixture was `BV=16, warps=8,
     stages=1` at `0.001436636 s` average, versus default-off
     `0.004432690 s`.
 - Interpretation:
-  - The delta_h kernel schedule itself is not proven unsafe by the current
+    - The delta_h kernel schedule itself is not proven unsafe by the current
     evidence. On the op fixture, the schedule choices are bitwise identical
     and materially faster.
-  - The full-model token check is currently polluted by latest default-off
+    - The full-model token check is currently polluted by latest default-off
     cross-process nondeterminism: the default path changes tokens on the same
     prompts before the delta_h gate is considered.
-  - Therefore the gate remains default-off and not accepted for main route.
+    - Therefore the gate remains default-off and not accepted for main route.
     The next safe path is to first freeze the full GDN/FLA autotune schedule
     or capture real model GDN/logit tensors, then require `max_diff == 0`
     against that fixed canonical route before counting the speed gain.
@@ -4524,9 +4524,9 @@ Strict exactness:
   `bench_results/sm70_migration_20260530/sm70_turbomind_exactness_strict.json`.
 - After repairing the AWQ oracle, strict checks still fail but now fail with
   finite diffs rather than AWQ reference NaNs. Evidence files:
-  - `bench_results/sm70_migration_20260530/sm70_turbomind_exactness_strict_manual_awq_ref.json`;
-  - `bench_results/sm70_migration_20260530/sm70_turbomind_awq_real_qwen36_27b_out_proj_strict.json`;
-  - `bench_results/sm70_migration_20260530/sm70_turbomind_fp8_real_qwen36_35a3b_out_proj_strict.json`.
+    - `bench_results/sm70_migration_20260530/sm70_turbomind_exactness_strict_manual_awq_ref.json`;
+    - `bench_results/sm70_migration_20260530/sm70_turbomind_awq_real_qwen36_27b_out_proj_strict.json`;
+    - `bench_results/sm70_migration_20260530/sm70_turbomind_fp8_real_qwen36_35a3b_out_proj_strict.json`.
 
 ## Acceptance Matrix
 
@@ -8628,7 +8628,7 @@ evidence before they can count as accepted/default.
        semantic difference is classified and fixed or accepted under the
        numeric policy.
 
-100. Applied the active continuation update to the current Flash-V100
+104. Applied the active continuation update to the current Flash-V100
      `max_diff != 0` blocker without restarting completed routes.
 
      Scope:
@@ -8711,7 +8711,7 @@ evidence before they can count as accepted/default.
        argmax. FP8 tests that also enable batched FP8 MoE remain confounded
        because that MoE route is itself `B-pending`.
 
-104. User checkpoint: AWQ no-MTP "`80 tok/s`" memory is valid for the short
+105. User checkpoint: AWQ no-MTP "`80 tok/s`" memory is valid for the short
      pure-decode口径, not the long-prefill output-throughput口径.
 
      Reconfirmed on 2026-06-01 after the user pointed out that the old no-MTP
@@ -8756,7 +8756,7 @@ evidence before they can count as accepted/default.
      - Remaining short-AWQ gaps are latest-tree prefill/TTFT and startup/warmup,
        not the pure decode TPOT baseline.
 
-105. Continuation checkpoint after the active goal update: the new classified
+106. Continuation checkpoint after the active goal update: the new classified
      max-diff policy is now the controlling quality rule, and current
      Flash-V100 evidence was re-read from JSON rather than copied from notes.
 
@@ -8829,7 +8829,7 @@ evidence before they can count as accepted/default.
        build/install in `vllm-0.0.5-t210`, then verify `import vllm._C` and the
        new SM70 ops register successfully.
 
-106. FP8 MoE graph-safe dense bridge follow-up, 2026-06-01.
+107. FP8 MoE graph-safe dense bridge follow-up, 2026-06-01.
 
      The first production CUDA-graph retry after the single-token dense fix
      still failed:
@@ -8906,7 +8906,7 @@ evidence before they can count as accepted/default.
        it was repeatedly launching a Qwen3.6-35B-A3B-AWQ backend on port 8000
        and could have polluted the 4-GPU benchmark.
 
-107. Flash-V100 re-review under the classified numeric rule, 2026-06-01.
+108. Flash-V100 re-review under the classified numeric rule, 2026-06-01.
 
      This is a continuation of items 100 and 105, using the current worktree
      JSON as evidence rather than memory. The route under review is the
@@ -8985,7 +8985,7 @@ evidence before they can count as accepted/default.
        and decode timing. Until then, this route stays explicit and cannot be
        counted as accepted/default performance.
 
-108. Flash-V100 clamp80 replay diagnostic follow-up, 2026-06-01.
+109. Flash-V100 clamp80 replay diagnostic follow-up, 2026-06-01.
 
      Source/tool change:
      - Extended
@@ -9032,7 +9032,7 @@ evidence before they can count as accepted/default.
        `B-pending`: keep it, continue diagnosing it, but do not count it as
        default-accepted quality evidence.
 
-109. Flash-V100 QK/PV reconstruction-at-max diagnostic, 2026-06-01.
+110. Flash-V100 QK/PV reconstruction-at-max diagnostic, 2026-06-01.
 
      Source/tool change:
      - Extended
@@ -9085,7 +9085,7 @@ evidence before they can count as accepted/default.
        intermediate that reproduces the actual Flash/Triton QK and PV
        accumulation order, not another high-level PyTorch softmax simulation.
 
-110. Flash-V100 LSE/normalization diagnostic, 2026-06-01.
+111. Flash-V100 LSE/normalization diagnostic, 2026-06-01.
 
      Source/tool change:
      - Extended
@@ -9150,7 +9150,7 @@ evidence before they can count as accepted/default.
        keep diagnosing it, but do not promote this real-model Flash-vs-Triton
        prefill evidence to default-accepted quality yet.
 
-111. Flash-V100 immediate re-review under the active A/B numeric policy,
+112. Flash-V100 immediate re-review under the active A/B numeric policy,
      2026-06-01.
 
      This item implements the current goal continuation request. It does not
@@ -9261,7 +9261,7 @@ evidence before they can count as accepted/default.
        model-level logprob/perplexity acceptance bounds and rerun the AWQ graph
        quality gate over broader prompts and lengths.
 
-112. Flash-V100 PV/final-cast p-half aggregation diagnostic, 2026-06-01.
+113. Flash-V100 PV/final-cast p-half aggregation diagnostic, 2026-06-01.
 
      Source/tool change:
      - Extended
@@ -9328,7 +9328,7 @@ evidence before they can count as accepted/default.
        intermediate from the Flash/Triton path or a reference that matches the
        actual PV accumulation and final cast order.
 
-113. Flash-V100 current edge-case non-divergence recheck, 2026-06-01.
+114. Flash-V100 current edge-case non-divergence recheck, 2026-06-01.
 
      Purpose:
      - Recheck the existing synthetic edge-case suite against the current
@@ -9408,7 +9408,7 @@ evidence before they can count as accepted/default.
        synthetic long decode/prefill non-divergence evidence present; real-model
        Flash-vs-Triton prefill attention output still `B-pending`.
 
-114. AWQ Flash-V100 graph model-level candidate-bound replay, 2026-06-01.
+115. AWQ Flash-V100 graph model-level candidate-bound replay, 2026-06-01.
 
      Purpose:
      - Rejudge the existing Qwen3.6-27B-AWQ TP4 CUDA-graph Flash-V100 model
@@ -9482,7 +9482,7 @@ evidence before they can count as accepted/default.
        mark the full real-model Flash-vs-Triton route `B-accept` until the
        broader op-level and model-level evidence closes.
 
-115. Development pivot: split Flash-V100 decode speed path from B-pending
+116. Development pivot: split Flash-V100 decode speed path from B-pending
      prefill, 2026-06-01.
 
      User correction:
@@ -9550,7 +9550,7 @@ evidence before they can count as accepted/default.
        actually executes `prefill_triton_safe` and `decode_scalar_paged`, then
        compare decode speed against the existing same-口径 baseline.
 
-116. Flash-V100 engineering cleanup after the prefill/decode split,
+117. Flash-V100 engineering cleanup after the prefill/decode split,
      2026-06-01.
 
      Source cleanup:
@@ -9584,7 +9584,7 @@ evidence before they can count as accepted/default.
        decode speed regression. This is a targeted validation step, not another
        broad quality sweep.
 
-117. Flash-V100 route-summary instrumentation, 2026-06-01.
+118. Flash-V100 route-summary instrumentation, 2026-06-01.
 
      Reason:
      - The user explicitly corrected that development should not turn into
@@ -9612,7 +9612,7 @@ evidence before they can count as accepted/default.
        the same口径 baseline. This does not replace the unresolved source-proof
        work for Flash prefill, which remains `B-pending`.
 
-118. Offline classified-summary tool for the current Flash-V100 blocker,
+119. Offline classified-summary tool for the current Flash-V100 blocker,
      2026-06-01.
 
      Reason:
@@ -9692,7 +9692,7 @@ evidence before they can count as accepted/default.
        performance; it also should not be bitwise-forced in a way that destroys
        scalar decode speed unless future evidence relabels it as an `A-bug`.
 
-119. Flash-V100 PV/final-cast split for the real-model replay, 2026-06-01.
+120. Flash-V100 PV/final-cast split for the real-model replay, 2026-06-01.
 
      Reason:
      - Item 118 made the current label auditable but did not expose enough of
@@ -9757,7 +9757,7 @@ evidence before they can count as accepted/default.
        scalar decode speed path while the next source task targets a stronger
        matched-tiling reconstruction, not another broad quality sweep.
 
-120. Flash-V100 precomputed-QK online replay split, 2026-06-01.
+121. Flash-V100 precomputed-QK online replay split, 2026-06-01.
 
      Reason:
      - Item 119 showed the residual is not raw K/V, block-table, or causal-mask
@@ -9823,7 +9823,7 @@ evidence before they can count as accepted/default.
        in latest vLLM and only return to Flash prefill with a concrete source
        hypothesis, not by repeating the same replay/model tests.
 
-121. AWQ dense SM70 runtime cleanup ported from 0.0.3, 2026-06-01.
+122. AWQ dense SM70 runtime cleanup ported from 0.0.3, 2026-06-01.
 
      Reason:
      - The current performance gap is more likely to come from missing or
@@ -9855,7 +9855,7 @@ evidence before they can count as accepted/default.
        harness. It should still be treated as needing the next targeted smoke
        after build, but it is not a new numerical algorithm.
 
-122. FP8 dense SM70 repeated-processing guard, 2026-06-01.
+123. FP8 dense SM70 repeated-processing guard, 2026-06-01.
 
      Reason:
      - The FP8 dense SM70 path replaces original block-FP8 weights with
@@ -9872,7 +9872,7 @@ evidence before they can count as accepted/default.
      - No math path changed. This is a route-stability guard for the existing
        SM70 FP8 TurboMind dense path.
 
-123. Restore 0.0.3 default-hit semantics for SM70 base fast paths, 2026-06-01.
+124. Restore 0.0.3 default-hit semantics for SM70 base fast paths, 2026-06-01.
 
      Reason:
      - The latest tree had the SM70 fast-path code present but three base
@@ -9923,7 +9923,7 @@ evidence before they can count as accepted/default.
      - Next verification should be minimal route-hit evidence plus one
        same-口径 decode speed run, not another broad quality sweep.
 
-124. Flash-V100 classified re-review with bounded model evidence, 2026-06-01.
+125. Flash-V100 classified re-review with bounded model evidence, 2026-06-01.
 
      Reason:
      - The active goal update requires splitting every nonzero max-diff into
@@ -10021,7 +10021,7 @@ evidence before they can count as accepted/default.
      - Continue using the split production route while moving development back
        to speed restoration: Triton prefill plus scalar Flash-V100 decode.
 
-125. Greedy token scheduling fast path re-plumbed into latest tree,
+126. Greedy token scheduling fast path re-plumbed into latest tree,
      2026-06-01.
 
      Reason:
@@ -10174,7 +10174,7 @@ evidence before they can count as accepted/default.
        not log `SM70 dense fp16 fast path enabled for LM head` unless the
        explicitly unsafe full-GEMM gate is enabled.
 
-126. Active-goal numeric-policy audit for Flash-V100 real-model residual,
+127. Active-goal numeric-policy audit for Flash-V100 real-model residual,
      2026-06-01.
 
      Scope:
@@ -10266,7 +10266,7 @@ evidence before they can count as accepted/default.
        diff, promote toward `B-accept`; if it remains after matched tiling,
        relabel as `A-bug` and repair.
 
-127. Greedy LM-head top1 route-hit bug fixed, 2026-06-01.
+128. Greedy LM-head top1 route-hit bug fixed, 2026-06-01.
 
      Root cause:
      - The latest-tree LM-head top1 preparation checked `layer.prefix` to decide
@@ -10343,7 +10343,7 @@ evidence before they can count as accepted/default.
        the LM-head/top1 route-connectivity fix. Do not compare the warmup
        result; it includes first-run compile/capture costs.
 
-128. Old-tree custom top1 allreduce source path ported, 2026-06-01.
+129. Old-tree custom top1 allreduce source path ported, 2026-06-01.
 
      Scope:
      - This is a development port, not a default-enabled performance claim.
@@ -10426,7 +10426,7 @@ evidence before they can count as accepted/default.
        `pending-debug`; the accepted production route remains the normal tiny
        all-gather top1 from item 127.
 
-129. Flash-V100 numeric-gate summary made explicit, 2026-06-01.
+130. Flash-V100 numeric-gate summary made explicit, 2026-06-01.
 
      Reason:
      - The active goal update asks for the current Flash-V100 nonzero residual
@@ -10494,7 +10494,7 @@ evidence before they can count as accepted/default.
      hypothesis that can either make matched replay collapse or explain why
      the dtype bound should be changed by policy, not by this result.
 
-130. AWQ MoE CUDA-graph-safe dense bridge and active-expert decode path,
+131. AWQ MoE CUDA-graph-safe dense bridge and active-expert decode path,
      2026-06-01.
 
      Reason:
@@ -10577,7 +10577,7 @@ evidence before they can count as accepted/default.
        can count. Do not repeat the old eager-only dense bridge tests unless a
        new source change invalidates this evidence.
 
-131. AWQ MoE production route-hit follow-up and compile-safe route logging,
+132. AWQ MoE production route-hit follow-up and compile-safe route logging,
      2026-06-01.
 
      Reason:
@@ -10639,7 +10639,7 @@ evidence before they can count as accepted/default.
        speed work, or reuse a warmed/cached compile path, then run one minimal
        production decode route check.
 
-132. FP8 MoE route observability aligned with the safe single-token path,
+133. FP8 MoE route observability aligned with the safe single-token path,
      2026-06-01.
 
      Reason:
@@ -10671,7 +10671,7 @@ evidence before they can count as accepted/default.
        vllm/model_executor/layers/quantization/fp8_sm70_moe.py
        vllm/model_executor/layers/quantization/awq_sm70_moe.py` passed.
 
-133. Flash-V100 split route demoted from default to explicit diagnostic fallback,
+134. Flash-V100 split route demoted from default to explicit diagnostic fallback,
      2026-06-01.
 
      Reason:
@@ -10713,7 +10713,7 @@ evidence before they can count as accepted/default.
      - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
        vllm/envs.py vllm/v1/attention/backends/flash_attn_v100.py` passed.
 
-134. Flash-V100 CUDA-graph prefill no longer silently falls back to Triton,
+135. Flash-V100 CUDA-graph prefill no longer silently falls back to Triton,
      2026-06-01.
 
      Reason:
@@ -10758,7 +10758,7 @@ evidence before they can count as accepted/default.
      - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
        vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py` passed.
 
-135. Flash-V100 implicit Triton fallback paths are gated behind an explicit env,
+136. Flash-V100 implicit Triton fallback paths are gated behind an explicit env,
      2026-06-01.
 
      Reason:
@@ -10800,7 +10800,7 @@ evidence before they can count as accepted/default.
      - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
        vllm/v1/attention/backends/flash_attn_v100.py vllm/envs.py` passed.
 
-136. Full-Flash AWQ graph route-hit attempt after fallback hardening,
+137. Full-Flash AWQ graph route-hit attempt after fallback hardening,
      2026-06-01.
 
      Purpose:
@@ -10859,7 +10859,7 @@ evidence before they can count as accepted/default.
      - `conda run --live-stream -n vllm-0.0.5-t210 python -m py_compile
        benchmarks/benchmark_sm70_decode.py` passed.
 
-190. Benchmark environment trace now records low-memory compile and MQ knobs,
+138. Benchmark environment trace now records low-memory compile and MQ knobs,
      2026-06-02.
 
      Purpose:
@@ -10911,7 +10911,7 @@ evidence before they can count as accepted/default.
        docs/design/sm70_v100_migration_control.md` found no trailing
        whitespace.
 
-167. DFlash multi-KV-cache-group metadata plumbing migrated to latest tree,
+139. DFlash multi-KV-cache-group metadata plumbing migrated to latest tree,
      2026-06-02.
 
      Purpose:
@@ -10985,7 +10985,7 @@ evidence before they can count as accepted/default.
        KV leakage, and deterministic token/logit quality before any default
        enablement.
 
-138. Spec/MTP diagnostic gate migration, 2026-06-02.
+140. Spec/MTP diagnostic gate migration, 2026-06-02.
 
      Purpose:
      - Continue the 0.0.3 old-only env inventory without repeating earlier
@@ -11063,7 +11063,7 @@ evidence before they can count as accepted/default.
        `VLLM_DEBUG_MTP_LOAD=1`, and `VLLM_DEBUG_MTP_LOAD_VERBOSE=1`
        printed `True True True`.
 
-139. DFlash profile / first-pass dump diagnostic migration, 2026-06-02.
+141. DFlash profile / first-pass dump diagnostic migration, 2026-06-02.
 
      Purpose:
      - Continue the DFlash subset from item 138, but keep this pass limited to
@@ -11121,7 +11121,7 @@ evidence before they can count as accepted/default.
        `VLLM_DFLASH_PROFILE_LOG_INTERVAL=7`, and
        `VLLM_DFLASH_DUMP_FIRST_PASS=1` printed `True 7 True`.
 
-140. DFlash CUDA-graph query-padding safety migration, 2026-06-02.
+142. DFlash CUDA-graph query-padding safety migration, 2026-06-02.
 
      Purpose:
      - Migrate one small functional DFlash safety fix from 0.0.3 after item
@@ -11156,7 +11156,7 @@ evidence before they can count as accepted/default.
      - Low-memory `python -m py_compile vllm/v1/spec_decode/dflash.py
        vllm/envs.py` passed.
 
-141. DFlash auxiliary hidden-state output gate restored, 2026-06-02.
+143. DFlash auxiliary hidden-state output gate restored, 2026-06-02.
 
      Purpose:
      - Close another old-only DFlash compatibility gate from item 139:
@@ -11199,7 +11199,7 @@ evidence before they can count as accepted/default.
        vllm/v1/worker/gpu_model_runner.py` passed.
      - Env smoke with `VLLM_DFLASH_DISABLE_AUX_OUTPUTS=1` printed `True`.
 
-142. DFlash/GDN state-table diagnostic gate restored, 2026-06-02.
+144. DFlash/GDN state-table diagnostic gate restored, 2026-06-02.
 
      Purpose:
      - Continue closing old-only DFlash debug gates from item 139 by restoring
@@ -11241,7 +11241,7 @@ evidence before they can count as accepted/default.
        vllm/v1/attention/backends/gdn_attn.py` passed.
      - Env smoke with `VLLM_DFLASH_DEBUG_STATE_TABLE=1` printed `True`.
 
-143. Spec/DFlash draft-logits and corruption diagnostics restored,
+145. Spec/DFlash draft-logits and corruption diagnostics restored,
      2026-06-02.
 
      Purpose:
@@ -11281,7 +11281,7 @@ evidence before they can count as accepted/default.
        `VLLM_DFLASH_DUMP_DRAFT_LOGITS=1`, and
        `VLLM_DFLASH_DEBUG_CORRUPTION=1` printed `True True True True`.
 
-167. Legacy Qwen3.5 MoE dense allowlist and unquantized MoE inplace gate
+146. Legacy Qwen3.5 MoE dense allowlist and unquantized MoE inplace gate
      closed, 2026-06-02.
 
      Reason:
@@ -11352,7 +11352,7 @@ evidence before they can count as accepted/default.
        `VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE`.
      - No CUDA/C++ build, no model load, and no GPU benchmark were run.
 
-168. Legacy AWQ MoE disable and SM70 debug/runtime gates closed,
+147. Legacy AWQ MoE disable and SM70 debug/runtime gates closed,
      2026-06-02.
 
      Reason:
@@ -11429,7 +11429,7 @@ evidence before they can count as accepted/default.
        `VLLM_SM70_SHARED_GATE_MAX_M=32`.
      - No CUDA/C++ build, no model load, and no GPU benchmark were run.
 
-169. Legacy Qwen3Next SM70 trace and GDN empty-core gates closed,
+148. Legacy Qwen3Next SM70 trace and GDN empty-core gates closed,
      2026-06-02.
 
      Reason:
@@ -11504,7 +11504,7 @@ evidence before they can count as accepted/default.
        `VLLM_SM70_GDN_EMPTY_CORE_OUT=1`.
      - No CUDA/C++ build, no model load, and no GPU benchmark were run.
 
-164. Legacy Qwen3Next shared-MoE overlap gates classified and compat-hooked,
+149. Legacy Qwen3Next shared-MoE overlap gates classified and compat-hooked,
      2026-06-02.
 
      Reason:
@@ -11594,7 +11594,7 @@ evidence before they can count as accepted/default.
        disable-gate stream suppression, but it should not repeat the already
        completed AWQ short no-MTP decode baseline.
 
-165. Legacy SM70 dense CUDA-graph capture-size gate migrated default-off,
+150. Legacy SM70 dense CUDA-graph capture-size gate migrated default-off,
      2026-06-02.
 
      Reason:
@@ -11662,7 +11662,7 @@ evidence before they can count as accepted/default.
        and pure decode speed for the same model/TP/max_model_len/input-output
        criterion before promoting this knob.
 
-166. Legacy TP all-reduce backend trace gate migrated, 2026-06-02.
+151. Legacy TP all-reduce backend trace gate migrated, 2026-06-02.
 
      Reason:
      - Item 147 left `VLLM_TP_ALLREDUCE_TRACE` open in the old
@@ -11722,7 +11722,7 @@ evidence before they can count as accepted/default.
        shape uses `custom`, `custom_sum2`, `pynccl`, `flashinfer`, or a torch
        fallback. The trace itself is not a performance result.
 
-155. Mixed-QKV GDN route log made compile-safe before real model route-hit,
+152. Mixed-QKV GDN route log made compile-safe before real model route-hit,
      2026-06-02.
 
      Reason:
@@ -11762,7 +11762,7 @@ evidence before they can count as accepted/default.
      - `git diff --check` passed for the file; trailing-whitespace search found
        no matches.
 
-156. Mixed-QKV GDN real-model CUDA-graph route-hit smoke, 2026-06-02.
+153. Mixed-QKV GDN real-model CUDA-graph route-hit smoke, 2026-06-02.
 
      Purpose:
      - Move item 154's synthetic model-layer evidence to one real
@@ -11850,7 +11850,7 @@ evidence before they can count as accepted/default.
        no compute processes listed.
      - No C++/CUDA build was run.
 
-157. `benchmark_sm70_model_tokens.py` sampler-logits dump made generation-only,
+154. `benchmark_sm70_model_tokens.py` sampler-logits dump made generation-only,
      2026-06-02.
 
      Reason:
@@ -11883,7 +11883,7 @@ evidence before they can count as accepted/default.
      - It exists to prevent repeating the same quality run with ambiguous
        sampler-logits provenance.
 
-158. Mixed-QKV real-model quality gate against default packed recurrent,
+155. Mixed-QKV real-model quality gate against default packed recurrent,
      2026-06-02.
 
      Purpose:
@@ -12005,7 +12005,7 @@ evidence before they can count as accepted/default.
        (`rg` found no matches), ruff, and low-memory conda `py_compile`
        passed for the touched files.
 
-170. Mixed-QKV compare now checks recurrent state, 2026-06-02.
+156. Mixed-QKV compare now checks recurrent state, 2026-06-02.
 
      Reason:
      - Item 158 left the real-model mixed-QKV GDN route at `B-pending`.
@@ -12077,7 +12077,7 @@ evidence before they can count as accepted/default.
        vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` passed.
      - No CUDA/C++ rebuild and no real-model benchmark were run in this step.
 
-171. Legacy FusedMoE activation chunking restored as default-off latest
+157. Legacy FusedMoE activation chunking restored as default-off latest
      hook, 2026-06-02.
 
      Reason:
@@ -12150,7 +12150,7 @@ evidence before they can count as accepted/default.
        and scalar scale preservation `[1.0]`.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-172. DFlash context-KV debug/sync/skip gates restored, 2026-06-02.
+158. DFlash context-KV debug/sync/skip gates restored, 2026-06-02.
 
      Reason:
      - Refreshed inventory after item 171 still showed old-only DFlash
@@ -12216,7 +12216,7 @@ evidence before they can count as accepted/default.
        parsing and `qwen3_dflash` import.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-173. DFlash forward tensor dump gates restored, 2026-06-02.
+159. DFlash forward tensor dump gates restored, 2026-06-02.
 
      Reason:
      - Continue item 172 and close the remaining old-only DFlash forward dump
@@ -12281,7 +12281,7 @@ evidence before they can count as accepted/default.
      - Tail whitespace scan for the same files returned no matches.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-174. SM70 MoE single-token permute/unpermute fast path restored,
+160. SM70 MoE single-token permute/unpermute fast path restored,
      2026-06-02.
 
      Reason:
@@ -12364,7 +12364,7 @@ evidence before they can count as accepted/default.
      - No model load, full pytest matrix, or decode benchmark was run in this
        item.
 
-175. SM70 MoE single-token fast path checked-in regression added,
+161. SM70 MoE single-token fast path checked-in regression added,
      2026-06-02.
 
      Reason:
@@ -12420,7 +12420,7 @@ evidence before they can count as accepted/default.
        model-level route-hit, greedy token/logit quality, and production CUDA
        graph behavior.
 
-176. Mamba align diagnostics restored and prefix-async env closed,
+162. Mamba align diagnostics restored and prefix-async env closed,
      2026-06-02.
 
      Reason:
@@ -12492,7 +12492,7 @@ evidence before they can count as accepted/default.
        files and this document.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-177. Legacy shared-memory idle-wait env closed, 2026-06-02.
+163. Legacy shared-memory idle-wait env closed, 2026-06-02.
 
      Reason:
      - After item 176, refreshed inventory still listed
@@ -12537,7 +12537,7 @@ evidence before they can count as accepted/default.
        176's `11`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-178. Legacy FP8 compact strict-fail env closed as paused-unsafe no-op,
+164. Legacy FP8 compact strict-fail env closed as paused-unsafe no-op,
      2026-06-02.
 
      Reason:
@@ -12586,7 +12586,7 @@ evidence before they can count as accepted/default.
        177's `10`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-179. Legacy MoE DP all-to-all chunk envs registered as pending,
+165. Legacy MoE DP all-to-all chunk envs registered as pending,
      2026-06-02.
 
      Reason:
@@ -12646,7 +12646,7 @@ evidence before they can count as accepted/default.
        178's `9`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-180. FunAudioChat debug/dump diagnostics restored, 2026-06-02.
+166. FunAudioChat debug/dump diagnostics restored, 2026-06-02.
 
      Reason:
      - After item 179, refreshed inventory still listed
@@ -12694,7 +12694,7 @@ evidence before they can count as accepted/default.
        179's `7`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-181. ROCm custom paged-attention opt-out restored, 2026-06-02.
+167. ROCm custom paged-attention opt-out restored, 2026-06-02.
 
      Reason:
      - After item 180, refreshed inventory still listed
@@ -12737,7 +12737,7 @@ evidence before they can count as accepted/default.
        180's `5`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-182. Legacy decode-tile profile env aliased to SM70 profile trace,
+168. Legacy decode-tile profile env aliased to SM70 profile trace,
      2026-06-02.
 
      Reason:
@@ -12775,7 +12775,7 @@ evidence before they can count as accepted/default.
        181's `4`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-183. Env inventory cleanup and legacy V1 knob closed, 2026-06-02.
+169. Env inventory cleanup and legacy V1 knob closed, 2026-06-02.
 
      Reason:
      - After item 182, inventory still listed:
@@ -12828,7 +12828,7 @@ evidence before they can count as accepted/default.
        migration gates remain active.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-184. Old GDN and attention custom-op schemas classified, 2026-06-02.
+170. Old GDN and attention custom-op schemas classified, 2026-06-02.
 
      Reason:
      - The refreshed inventory still lists old-only torch op/schema names:
@@ -12900,7 +12900,7 @@ evidence before they can count as accepted/default.
        `status=closed-replaced`, `doc_item=188`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-185. Old sparse/Cutlass auxiliary schemas classified as non-SM70 target,
+171. Old sparse/Cutlass auxiliary schemas classified as non-SM70 target,
      2026-06-02.
 
      Reason:
@@ -12958,7 +12958,7 @@ evidence before they can count as accepted/default.
      - Static source comparison only. No CUDA/C++ build, no model load, no GPU
        run, and no benchmark were triggered.
 
-186. Remaining non-SM70/upstream-replaced torch-op schemas classified,
+172. Remaining non-SM70/upstream-replaced torch-op schemas classified,
      2026-06-02.
 
      Reason:
@@ -13025,7 +13025,7 @@ evidence before they can count as accepted/default.
      - Static source comparison only. No CUDA/C++ build, no model load, no GPU
        run, and no benchmark were triggered.
 
-187. Torch-op inventory now reports classified old-only schemas, 2026-06-02.
+173. Torch-op inventory now reports classified old-only schemas, 2026-06-02.
 
      Reason:
      - The raw old-only torch-op count is useful for discovery but too easy to
@@ -13066,7 +13066,7 @@ evidence before they can count as accepted/default.
      - The inventory refresh completed under `vllm-0.0.5-t210`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-188. Old `vllm::sm70_unquantized_gemm` wrapper closed against latest
+174. Old `vllm::sm70_unquantized_gemm` wrapper closed against latest
      `_sm70_ops` dense path, 2026-06-02.
 
      Reason:
@@ -13126,7 +13126,7 @@ evidence before they can count as accepted/default.
        `status=closed-replaced`, `doc_item=188`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-189. Shared-memory message-queue chunk count made tunable for compile bursts,
+175. Shared-memory message-queue chunk count made tunable for compile bursts,
      2026-06-02.
 
      Reason:
@@ -13187,7 +13187,7 @@ evidence before they can count as accepted/default.
        `unclassified=[]`.
      - No CUDA/C++ build, model load, GPU run, or benchmark was triggered.
 
-159. Re-runnable 0.0.3-to-latest SM70 source inventory added, 2026-06-02.
+176. Re-runnable 0.0.3-to-latest SM70 source inventory added, 2026-06-02.
 
      Reason:
      - The updated active goal requires a complete inventory of old 0.0.3
@@ -13324,7 +13324,7 @@ evidence before they can count as accepted/default.
      - The inventory command completed under `vllm-0.0.5-t210`.
      - No CUDA/C++ compile, no model load, and no GPU benchmark were run.
 
-160. AWQ MoE old compact/exact-layout schemas closed against latest
+177. AWQ MoE old compact/exact-layout schemas closed against latest
      active-expert route, 2026-06-02.
 
      Reason:
@@ -13414,7 +13414,7 @@ evidence before they can count as accepted/default.
      - Static source comparison only. No CUDA/C++ build, no model load, and no
        GPU benchmark were run for this closure item.
 
-161. FP8 MoE old monolithic/router schemas classified against latest safe
+178. FP8 MoE old monolithic/router schemas classified against latest safe
      dense-stage route, 2026-06-02.
 
      Reason:
@@ -13528,7 +13528,7 @@ evidence before they can count as accepted/default.
      - Static source comparison only. No CUDA/C++ build, no model load, and no
        GPU benchmark were run for this closure item.
 
-162. Old Triton SM70 q-head split gate classified, 2026-06-02.
+179. Old Triton SM70 q-head split gate classified, 2026-06-02.
 
      Reason:
      - Item 159 surfaced old-only `VLLM_TRITON_ATTN_SM70_QHEAD_SPLIT`.
@@ -13600,7 +13600,7 @@ evidence before they can count as accepted/default.
      - Static source comparison only. No CUDA/C++ build, no model load, and no
        GPU benchmark were run for this closure item.
 
-163. Safe SM70 AWQ warmup/LUT subset migrated to latest tree, 2026-06-02.
+180. Safe SM70 AWQ warmup/LUT subset migrated to latest tree, 2026-06-02.
 
      Reason:
      - Item 159 and item 160 left old AWQ warmup / compact / LUT gates open:
@@ -13686,7 +13686,7 @@ evidence before they can count as accepted/default.
      - `git diff --check` passed for the touched source files.
      - No CUDA/C++ build, no model load, and no GPU benchmark were run.
 
-191. AWQ warmup runtime evidence made less ambiguous, 2026-06-02.
+181. AWQ warmup runtime evidence made less ambiguous, 2026-06-02.
 
      Reason:
      - Item 163 restored the safe AWQ warmup/LUT subset but left runtime
@@ -13729,7 +13729,7 @@ evidence before they can count as accepted/default.
        found no trailing whitespace.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-192. `VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE` source status closed, 2026-06-02.
+182. `VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE` source status closed, 2026-06-02.
 
      Reason:
      - Item 147/159 listed `VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE` as a
@@ -13782,7 +13782,7 @@ evidence before they can count as accepted/default.
        document files.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-193. Model-token quality artifacts now record the packed recurrent GDN switch,
+183. Model-token quality artifacts now record the packed recurrent GDN switch,
      2026-06-02.
 
      Reason:
@@ -13819,7 +13819,7 @@ evidence before they can count as accepted/default.
        document files.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-194. SM70 TurboMind tune-policy defaults are now explicit in benchmark JSON,
+184. SM70 TurboMind tune-policy defaults are now explicit in benchmark JSON,
      2026-06-02.
 
      Reason:
@@ -13862,7 +13862,7 @@ evidence before they can count as accepted/default.
        document files.
      - No CUDA/C++ build, model load, or GPU benchmark was run.
 
-195. Qwen3.5 MTP keep-quant/share-IO old envs are source-closed by latest
+185. Qwen3.5 MTP keep-quant/share-IO old envs are source-closed by latest
      upstream defaults, 2026-06-02.
 
      Purpose:
@@ -13916,7 +13916,7 @@ evidence before they can count as accepted/default.
        `TOKENIZERS_PARALLELISM=false`, and `MALLOC_ARENA_MAX=2` unless the user
        explicitly approves a higher-thread build.
 
-196. Source inventory now separates documentation hits from runtime env
+186. Source inventory now separates documentation hits from runtime env
      migration, 2026-06-02.
 
      Problem:
@@ -13997,7 +13997,7 @@ evidence before they can count as accepted/default.
      - No CUDA/C++ compile, model load, GPU benchmark, or route-hit run was
        executed for this checkpoint.
 
-200. Qwen3.6-27B-FP8 TP2 dense gate-up gated-SiLU uses one runtime layout,
+187. Qwen3.6-27B-FP8 TP2 dense gate-up gated-SiLU uses one runtime layout,
      2026-06-20.
 
      Reason:
@@ -14103,7 +14103,7 @@ evidence before they can count as accepted/default.
        `benchmarks/benchmark_sm70_decode.py:604` E501 and `vllm/envs.py:716`
        SIM103.
 
-198. Old Qwen3.5/Qwen3.6 SM70 server-default profile is not restored as a
+188. Old Qwen3.5/Qwen3.6 SM70 server-default profile is not restored as a
      default policy, 2026-06-02.
 
      Reason:
@@ -14180,7 +14180,7 @@ evidence before they can count as accepted/default.
      - No CUDA/C++ compile, model load, GPU benchmark, or route-hit run was
        executed for this checkpoint.
 
-199. Old-only keyword file inventory is now classified, 2026-06-02.
+189. Old-only keyword file inventory is now classified, 2026-06-02.
 
      Reason:
      - After items 187 and 196, old-only torch-op schemas and runtime envs had
@@ -14245,7 +14245,7 @@ evidence before they can count as accepted/default.
      - No CUDA/C++ compile, model load, GPU benchmark, or route-hit run was
        executed for this checkpoint.
 
-197. Old shared gate-up gated-SiLU envs paused with source evidence,
+190. Old shared gate-up gated-SiLU envs paused with source evidence,
      2026-06-02.
 
      Reason:
@@ -14312,7 +14312,7 @@ evidence before they can count as accepted/default.
      - No CUDA/C++ compile, model load, GPU benchmark, or route-hit run was
        executed for this checkpoint.
 
-142. Generic `all_reduce_sum2` hook for latest `FusedMoE` shared-expert
+191. Generic `all_reduce_sum2` hook for latest `FusedMoE` shared-expert
      output fusion, 2026-06-02.
 
      Purpose:
@@ -14395,7 +14395,7 @@ evidence before they can count as accepted/default.
      - After adding the trace log, the focused ruff/py_compile checks for
        `vllm/model_executor/layers/fused_moe/runner/moe_runner.py` passed.
 
-143. `all_reduce_sum2` MoERunner integration boundary tightened to preserve
+192. `all_reduce_sum2` MoERunner integration boundary tightened to preserve
      custom-AR reduction order, 2026-06-02.
 
      Reason:
@@ -14474,7 +14474,7 @@ evidence before they can count as accepted/default.
        benchmarks/benchmark_sm70_moe_sum2_runner.py` passed.
      - Low-thread conda `py_compile` passed for the same files.
 
-144. `all_reduce_sum2` two-stage kernel added; item 143 threshold restriction
+193. `all_reduce_sum2` two-stage kernel added; item 143 threshold restriction
      removed, 2026-06-02.
 
      Reason:
@@ -14578,7 +14578,7 @@ evidence before they can count as accepted/default.
        benchmarks/benchmark_sm70_moe_sum2_runner.py` passed.
      - Low-thread conda `py_compile` passed for the same Python files.
 
-145. `all_reduce_sum2` route evidence tightened: C++ trace is the actual
+194. `all_reduce_sum2` route evidence tightened: C++ trace is the actual
      graph-hit oracle, 2026-06-02.
 
      Reason:
@@ -14695,7 +14695,7 @@ evidence before they can count as accepted/default.
        benchmarks/benchmark_sm70_moe_sum2_runner.py` passed.
      - Low-thread conda `py_compile` passed for the same Python files.
 
-146. Qwen3.6-35B-A3B-AWQ CUDA-graph `sum2` route-hit clarified: normal
+195. Qwen3.6-35B-A3B-AWQ CUDA-graph `sum2` route-hit clarified: normal
      Inductor graph reaches the C++ op, but cold compile/warmup is still not a
      throughput acceptance result, 2026-06-02.
 
@@ -14801,7 +14801,7 @@ evidence before they can count as accepted/default.
      - Run token/logit/perplexity quality checks before defaulting this
        route.
 
-147. Updated-goal source inventory checkpoint and decode metrics harness fix,
+196. Updated-goal source inventory checkpoint and decode metrics harness fix,
      2026-06-02.
 
      Reason:
@@ -14906,7 +14906,7 @@ evidence before they can count as accepted/default.
        `benchmarks/benchmark_sm70_decode.py`.
      - No CUDA compile and no heavy benchmark were run for this item.
 
-148. Old-tree SM70 FLA recurrent schedule knobs migrated as default-off
+197. Old-tree SM70 FLA recurrent schedule knobs migrated as default-off
      controls, 2026-06-02.
 
      Reason:
@@ -14975,7 +14975,7 @@ evidence before they can count as accepted/default.
        `CMAKE_BUILD_PARALLEL_LEVEL=2`, and `NVCC_THREADS=1`.
      - No CUDA/C++ rebuild and no heavy benchmark were run for this item.
 
-149. FLA packed recurrent decode schedule split: BV-only exact, automatic
+198. FLA packed recurrent decode schedule split: BV-only exact, automatic
      multi-warp route not accepted, 2026-06-02.
 
      Reason:
@@ -15067,7 +15067,7 @@ evidence before they can count as accepted/default.
        `vllm/envs.py`.
      - No CUDA/C++ rebuild was run.
 
-150. FLA non-packed recurrent forward BV-only schedule exactness, 2026-06-02.
+199. FLA non-packed recurrent forward BV-only schedule exactness, 2026-06-02.
 
      Reason:
      - Item 149 only covered `fused_recurrent_gated_delta_rule_packed_decode`,
@@ -15140,7 +15140,7 @@ evidence before they can count as accepted/default.
        `vllm/envs.py`.
      - No CUDA/C++ rebuild and no model benchmark were run.
 
-151. Fused sigmoid gating SM70 schedule migration and strict split,
+200. Fused sigmoid gating SM70 schedule migration and strict split,
      2026-06-02.
 
      Reason:
@@ -15220,7 +15220,7 @@ evidence before they can count as accepted/default.
        `vllm/envs.py`.
      - No CUDA/C++ rebuild was run.
 
-152. Fused sigmoid mixed-QKV low-level route migrated with strict op evidence,
+201. Fused sigmoid mixed-QKV low-level route migrated with strict op evidence,
      2026-06-02.
 
      Reason:
@@ -15308,7 +15308,7 @@ evidence before they can count as accepted/default.
        for the touched files and passed.
      - No CUDA/C++ rebuild and no model benchmark were run.
 
-153. Fused sigmoid mixed-QKV wired into latest GDN decode fallback,
+202. Fused sigmoid mixed-QKV wired into latest GDN decode fallback,
      2026-06-02.
 
      Reason:
@@ -15364,7 +15364,7 @@ evidence before they can count as accepted/default.
        the mixed-QKV function export, and `qwen_gdn_linear_attn` import.
      - No CUDA/C++ rebuild and no model benchmark were run.
 
-154. Mixed-QKV latest model-layer synthetic route smoke, 2026-06-02.
+203. Mixed-QKV latest model-layer synthetic route smoke, 2026-06-02.
 
      Reason:
      - Item 153 wired mixed-QKV into `qwen_gdn_linear_attn.py`, but only static
@@ -15437,7 +15437,7 @@ evidence before they can count as accepted/default.
        `benchmarks/benchmark_sm70_gdn_exactness.py`.
      - No CUDA/C++ rebuild and no model benchmark were run.
 
-139. Old-tree `all_reduce_sum2` source path ported as a non-default
+204. Old-tree `all_reduce_sum2` source path ported as a non-default
      communication capability, 2026-06-02.
 
      Reason:
@@ -15510,7 +15510,7 @@ evidence before they can count as accepted/default.
        should profiling decide whether latest Qwen3Next has a place to use this
        fused helper.
 
-140. `all_reduce_sum2` narrow `_C` rebuild and TP2/TP4 graph correctness,
+205. `all_reduce_sum2` narrow `_C` rebuild and TP2/TP4 graph correctness,
      2026-06-02.
 
      Purpose:
@@ -15597,7 +15597,7 @@ evidence before they can count as accepted/default.
        benchmarks/benchmark_sm70_all_reduce_sum2.py` passed.
      - `git diff --check` over the touched C++/Python files passed.
 
-141. GDN/FLA `chunk_o` SM70 schedule gate exactness/timing, 2026-06-02.
+206. GDN/FLA `chunk_o` SM70 schedule gate exactness/timing, 2026-06-02.
 
      Purpose:
      - Complete item 138A's next step for the default-off
@@ -33591,24 +33591,24 @@ End-to-end evidence:
 - Short CUDA graph smoke, Qwen3.6-27B-AWQ TP2 no-MTP, `input_len=128`,
   `output_len=8`, `CUDA_VISIBLE_DEVICES=0,3`, AWQ, Flash-V100,
   FlashQLA decode, `gpu_memory_utilization=0.5`:
-  - JSON:
+    - JSON:
     `bench_results/awq_qla_strided_20260618/json/27b_awq_tp2_graph_smoke_i128_o8_mem05.json`
-  - Log:
+    - Log:
     `bench_results/awq_qla_strided_20260618/logs/27b_awq_tp2_graph_smoke_i128_o8_mem05.log`
-  - Result: `steady_decode_tps_mean=52.364051`, `tpot_seconds_mean=0.019097`.
-  - Route evidence: `SM70 AWQ TurboMind dense path enabled`,
+    - Result: `steady_decode_tps_mean=52.364051`, `tpot_seconds_mean=0.019097`.
+    - Route evidence: `SM70 AWQ TurboMind dense path enabled`,
     `SM70 FlashQLA GDN decode route enabled`, graph capture finished, and real
     decode hit `mixed_layout=row_strided` with `mixed_stride=(8192, 1)`.
 - Longer decode sample, Qwen3.6-27B-AWQ TP2 no-MTP, `input_len=4096`,
   `output_len=256`, `CUDA_VISIBLE_DEVICES=0,3`,
   `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`, CUDA graph on:
-  - JSON:
+    - JSON:
     `bench_results/awq_qla_strided_20260618/json/27b_awq_tp2_graph_i4096_o256_awqtune.json`
-  - Log:
+    - Log:
     `bench_results/awq_qla_strided_20260618/logs/27b_awq_tp2_graph_i4096_o256_awqtune.log`
-  - Result: `steady_decode_tps_mean=52.837135`, `tpot_seconds_mean=0.018926`,
+    - Result: `steady_decode_tps_mean=52.837135`, `tpot_seconds_mean=0.018926`,
     `prefill_time_mean=2.866176`, `decode_time_mean=4.826151`.
-  - Route evidence: CUDA graph `FULL_AND_PIECEWISE`, graph capture finished in
+    - Route evidence: CUDA graph `FULL_AND_PIECEWISE`, graph capture finished in
     `114 s`, AWQ TurboMind dense path and AWQ warmup hit, FlashQLA decode hit
     `stage=packed_explicit decision=take` with `mixed_layout=row_strided` and
     `row_stride=8192`.
@@ -33726,13 +33726,13 @@ Kernel bucket evidence:
 
 - In this graph-safe split-count-only profile, the visible TurboMind GEMM bucket
   did not materially change:
-  - default TurboMind GEMM: `1.503356 ms/token`;
-  - split-count-only TurboMind GEMM: `1.503001 ms/token`.
+    - default TurboMind GEMM: `1.503356 ms/token`;
+    - split-count-only TurboMind GEMM: `1.503001 ms/token`.
 - Other major buckets were also effectively stable:
-  - CUTLASS GEMM: `2.043427 -> 2.045063 ms/token`;
-  - all-reduce/NCCL bucket: `0.194556 -> 0.178753 ms/token`;
-  - FlashQLA/GDN: `0.079508 -> 0.079459 ms/token`;
-  - Flash-V100 attention: `0.055763 -> 0.055720 ms/token`.
+    - CUTLASS GEMM: `2.043427 -> 2.045063 ms/token`;
+    - all-reduce/NCCL bucket: `0.194556 -> 0.178753 ms/token`;
+    - FlashQLA/GDN: `0.079508 -> 0.079459 ms/token`;
+    - Flash-V100 attention: `0.055763 -> 0.055720 ms/token`.
 - Therefore the earlier large kernel-level AWQ improvement should be treated as
   evidence for the unconstrained/tuned kernel lane, not as evidence that the
   current graph-safe split-count-only full decode path already reduced the
@@ -33741,15 +33741,15 @@ Kernel bucket evidence:
 CUDA API/event evidence:
 
 - Default profiled run:
-  - CUDA API window: `2762.548 ms`;
-  - `cudaEventSynchronize`: `2555.026 ms` total over 388 calls,
+    - CUDA API window: `2762.548 ms`;
+    - `cudaEventSynchronize`: `2555.026 ms` total over 388 calls,
     p95 `19.248 ms`, max `120.284 ms`;
-  - `cudaGraphLaunch`: 254 calls, `190.188 ms` total, median `0.740 ms`.
+    - `cudaGraphLaunch`: 254 calls, `190.188 ms` total, median `0.740 ms`.
 - Split-count-only profiled run:
-  - CUDA API window: `2713.122 ms`;
-  - `cudaEventSynchronize`: `2459.991 ms` total over 388 calls,
+    - CUDA API window: `2713.122 ms`;
+    - `cudaEventSynchronize`: `2459.991 ms` total over 388 calls,
     p95 `18.672 ms`, max `89.561 ms`;
-  - `cudaGraphLaunch`: 254 calls, `215.634 ms` total, median `0.842 ms`.
+    - `cudaGraphLaunch`: 254 calls, `215.634 ms` total, median `0.842 ms`.
 - The long events are not a separate CUDA kernel. They are the host-visible
   wait point where the CPU must observe the previous decode result before it
   can drive the next step.
@@ -33910,10 +33910,10 @@ Expanded graph-node interpretation:
   CUDA graph execution was not expanded to per-node kernels.
 - With node tracing enabled, the TurboMind GEMM bucket does move in the expected
   direction:
-  - default: `1862.789 ms` summed over both ranks, about
+    - default: `1862.789 ms` summed over both ranks, about
     `14.784 ms/token` wall-equivalent;
-  - split-count-only: `1808.205 ms`, about `14.351 ms/token`;
-  - dynamic no-preserve: `1736.569 ms`, about `13.782 ms/token`.
+    - split-count-only: `1808.205 ms`, about `14.351 ms/token`;
+    - dynamic no-preserve: `1736.569 ms`, about `13.782 ms/token`.
 - The total graph node span also improves from `1535.924 ms` default to
   `1478.743 ms` dynamic no-preserve for the profiled o64 request.
 
@@ -33927,13 +33927,13 @@ Full o128 speed validation:
 - Result over repeat 2: steady decode `57.681699 tok/s`, TPOT
   `17.336521 ms`, decode time `2.201738 s`.
 - Same-hash comparison set:
-  - qdepth4 default:
+    - qdepth4 default:
     `bench_results/awq_event_gap_20260618/json/qdepth4_default_i512_o128_tp2_graph_mem05_gpu23.json`,
     TPOT `18.6760 ms`, steady decode `53.5446 tok/s`;
-  - qdepth4 split-count-only:
+    - qdepth4 split-count-only:
     `bench_results/awq_event_gap_20260618/json/qdepth4_splitcount_i512_o128_tp2_graph_mem05_gpu23.json`,
     TPOT `18.1988 ms`, steady decode `54.9486 tok/s`;
-  - dynamic no-preserve:
+    - dynamic no-preserve:
     TPOT `17.3365 ms`, steady decode `57.6817 tok/s`.
 - Dynamic no-preserve is therefore `1.3395 ms/token` faster than default
   (`+7.72%` steady decode throughput) and `0.8623 ms/token` faster than
@@ -34005,11 +34005,11 @@ Source changes:
   `VLLM_SM70_FP8_TUNE_SMALL_SHAPES`, default enabled.
 - MXFP4 and NVFP4 no longer reuse the AWQ dense selector. They now have
   independent TuneKey lanes:
-  - `TuneKeyKind::kMxfp4Dense`,
+    - `TuneKeyKind::kMxfp4Dense`,
     `select_mxfp4_dense_dispatch_policy`,
     `VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES`, and
     `VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M`;
-  - `TuneKeyKind::kNvfp4Dense`,
+    - `TuneKeyKind::kNvfp4Dense`,
     `select_nvfp4_dense_dispatch_policy`,
     `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES`, and
     `VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M`.
@@ -34050,10 +34050,10 @@ Validation completed:
   `benchmarks/benchmark_sm70_model_tokens.py`.
 - `git diff --check` passed for the touched C++/Python files.
 - Static dispatch audit:
-  - AWQ dense calls `select_awq_dense_dispatch_policy`;
-  - FP8 dense calls `select_fp8_dense_dispatch_policy`;
-  - MXFP4 dense calls `select_mxfp4_dense_dispatch_policy`;
-  - NVFP4 dense calls `select_nvfp4_dense_dispatch_policy`.
+    - AWQ dense calls `select_awq_dense_dispatch_policy`;
+    - FP8 dense calls `select_fp8_dense_dispatch_policy`;
+    - MXFP4 dense calls `select_mxfp4_dense_dispatch_policy`;
+    - NVFP4 dense calls `select_nvfp4_dense_dispatch_policy`.
 - FP8 real-weight selector gate:
   `bench_results/quant_tuning_20260619/fp8_fixed_vs_dynamic_qwen36_27b_after_multi_quant_20260619_004456.json`
   loaded Qwen3.6-27B-FP8 weights, ran `159` cases across `53` layer prefixes
@@ -34064,9 +34064,9 @@ Validation completed:
   ran `72` real NVFP4 cases plus `36` finite synthetic MXFP4 cases and reported
   `failures=0`, `max_fixed_vs_dynamic_diff_nan_to_num=0.0`, `nan_cases=0`.
 - FP8 CUDA graph end-to-end gate:
-  - fixed selector:
+    - fixed selector:
     `bench_results/quant_tuning_20260619/json/fp8_27b_tp2_graph_i128_o64_fixed.json`;
-  - dynamic selector:
+    - dynamic selector:
     `bench_results/quant_tuning_20260619/json/fp8_27b_tp2_graph_i128_o64_dynamic.json`.
   Both used Qwen3.6-27B-FP8, TP2 on V100 GPUs 0/1, Flash-V100 CUDA graph,
   `input_len=128`, `output_len=64`, no MTP, greedy ignore-EOS, and both
@@ -34145,15 +34145,15 @@ NSYS per-token root-cause pass, 2026-06-19:
   Qwen3.6-27B-AWQ, TP2, no-MTP, CUDA graph, Flash-V100, FlashQLA decode,
   custom all-reduce, queue depth `4`, `i512/o64`, repeat `1`.
 - End-to-end decode:
-  - AWQ dynamic no-preserve: TPOT `18.6672 ms`, steady decode
+    - AWQ dynamic no-preserve: TPOT `18.6672 ms`, steady decode
     `53.5698 tok/s`.
-  - FP8 dynamic no-preserve: TPOT `23.5850 ms`, steady decode
+    - FP8 dynamic no-preserve: TPOT `23.5850 ms`, steady decode
     `42.3998 tok/s`.
-  - FP8 is therefore `+4.9178 ms/token` slower on this shape.
+    - FP8 is therefore `+4.9178 ms/token` slower on this shape.
 - NSYS graph-node span:
-  - AWQ kernel span `1478.546 ms`.
-  - FP8 kernel span `1808.926 ms`.
-  - Span delta is `330.380 ms` over `63` steady decode tokens, or
+    - AWQ kernel span `1478.546 ms`.
+    - FP8 kernel span `1808.926 ms`.
+    - Span delta is `330.380 ms` over `63` steady decode tokens, or
     `5.244 ms/token`, close to the measured TPOT delta.
 - Kernel-sum wall-equivalent buckets use
   `sum(kernel_duration over both TP ranks) / 2 / 63`.
@@ -34181,11 +34181,11 @@ Interpretation:
   this shows up as more expensive graph-node GEMMs rather than scheduler/event
   gap.
 - Representative grid costs:
-  - AWQ `grid(8,9,2)` totals `3.883 ms/token`, average `60.1 us/kernel`.
-  - FP8 `grid(8,9,2)` totals `3.459 ms/token`, average `106.4 us/kernel`.
-  - FP8 adds another large peer shape, `grid(4,17,2)`, at
+    - AWQ `grid(8,9,2)` totals `3.883 ms/token`, average `60.1 us/kernel`.
+    - FP8 `grid(8,9,2)` totals `3.459 ms/token`, average `106.4 us/kernel`.
+    - FP8 adds another large peer shape, `grid(4,17,2)`, at
     `3.483 ms/token`, average `107.1 us/kernel`.
-  - AWQ `grid(2,10,7)` averages `28.3 us/kernel`; FP8 `grid(2,10,7)`
+    - AWQ `grid(2,10,7)` averages `28.3 us/kernel`; FP8 `grid(2,10,7)`
     averages `43.4 us/kernel`.
 - The load-time memory picture matches the kernel diagnosis: AWQ model loading
   reported `11.13 GiB` on this TP2 lane, while FP8 reported `19.73 GiB` and
@@ -34593,8 +34593,8 @@ Common prompt and sampling:
 4060 Ti / SM89 result:
 
 - Artifacts:
-  - `bench_results/qwen35_2b_mtp_path_probe_20260619/rtx4060_qwen35_2b_awq_mtp4_lmonly_triton_o512.log`
-  - `bench_results/qwen35_2b_mtp_path_probe_20260619/rtx4060_qwen35_2b_awq_mtp4_lmonly_triton_isolated_o512.log`
+    - `bench_results/qwen35_2b_mtp_path_probe_20260619/rtx4060_qwen35_2b_awq_mtp4_lmonly_triton_o512.log`
+    - `bench_results/qwen35_2b_mtp_path_probe_20260619/rtx4060_qwen35_2b_awq_mtp4_lmonly_triton_isolated_o512.log`
 - The first text/MM run failed before generation because the current
   FlashAttention wheel is built for the SM70 lane and the model's visual
   encoder dummy path attempted FA2 on SM89.
@@ -34615,20 +34615,20 @@ V100 / SM70 MTP4 result:
 - Artifact:
   `bench_results/qwen35_2b_mtp_path_probe_20260619/v100_qwen35_2b_awq_mtp4_lmonly_o512.json`.
 - Route facts:
-  - FlashInfer top-k/top-p sampler is unsupported on CC 7.0 and falls back to
+    - FlashInfer top-k/top-p sampler is unsupported on CC 7.0 and falls back to
     PyTorch-native sampler.
-  - Target attention uses `FLASH_ATTN_V100`.
-  - Qwen GDN uses the active-MTP full-forward quality guard
+    - Target attention uses `FLASH_ATTN_V100`.
+    - Qwen GDN uses the active-MTP full-forward quality guard
     (`VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`).
-  - AWQ target and MTP drafter hit SM70 TurboMind dense routes.
-  - Drafter attention is `TRITON_ATTN`; local argmax reduction is enabled.
+    - AWQ target and MTP drafter hit SM70 TurboMind dense routes.
+    - Drafter attention is `TRITON_ATTN`; local argmax reduction is enabled.
 - Request metrics: `generate_seconds=8.598`, `prefill_time=5.108`,
   `decode_time=3.455`, `steady_decode_tps=147.885`.
 - Hot-window profile from `calls=128 -> 144`, incremental per spec step:
-  - Runner: `target_forward=5.772 ms`, `target_logits=1.048 ms`,
+    - Runner: `target_forward=5.772 ms`, `target_logits=1.048 ms`,
     `target_rejection_sample=1.394 ms`, `draft_total=7.003 ms`,
     `bookkeeping=0.093 ms`.
-  - Proposer: `total_gpu=6.755 ms`, `first_forward=0.538 ms`,
+    - Proposer: `total_gpu=6.755 ms`, `first_forward=0.538 ms`,
     four sample points at about `1.33 ms` each, later loop forwards about
     `0.26 ms` each, and loop metadata about `0.85 ms` total.
 
@@ -34729,21 +34729,21 @@ Initial validation:
 
 - Built `flash-attention-v100` in place for `TORCH_CUDA_ARCH_LIST=7.0`.
 - Kernel all-keep exactness passed on GPU0:
-  - `block_size=16, M=256, N=768, Hq=4, Hkv=1`: dense vs BFLA `maxdiff=0`,
+    - `block_size=16, M=256, N=768, Hq=4, Hkv=1`: dense vs BFLA `maxdiff=0`,
     `torch.equal=True`.
-  - `block_size=528, M=256, N=2112, Hq=16, Hkv=4`: dense vs BFLA `maxdiff=0`,
+    - `block_size=528, M=256, N=2112, Hq=16, Hkv=4`: dense vs BFLA `maxdiff=0`,
     `torch.equal=True`.
 - Sparse-mask kernel semantics matched a PyTorch tile-mask reference at fp16
   roundoff level: both synthetic shapes above had `maxdiff_ref=1.5259e-05`.
 - 9B-AWQ TP1 CUDA-graph smoke, `max_num_batched_tokens=8192`,
   `max_model_len=65536`, prompt `32768`, output `1`, `logprobs=5`:
-  - Dense `low_smem`: `ttft=14.859s`, `prefill_tps=2205.2`,
+    - Dense `low_smem`: `ttft=14.859s`, `prefill_tps=2205.2`,
     routes `prefill_prefix_flash=24`.
-  - `bfla_allkeep`: route hit `prefill_prefix_bfla=8`, `ttft=15.070s`,
+    - `bfla_allkeep`: route hit `prefill_prefix_bfla=8`, `ttft=15.070s`,
     output token/hash equal, top-5 token ids equal, but top-5 logprob max drift
     was `0.00727`; treat this as E2E numeric drift to investigate, not a
     bitwise quality pass.
-  - `bfla_sparse` default knobs: route hit `prefill_prefix_bfla=8`,
+    - `bfla_sparse` default knobs: route hit `prefill_prefix_bfla=8`,
     `ttft=12.222s`, `prefill_tps=2681.0`, about `+21.6%` TTFT throughput
     versus dense for this smoke. Output token/hash stayed equal, but top-5
     tokens changed at rank 5 and top-5 logprob max drift was `0.858`; this is
@@ -34822,22 +34822,22 @@ logprobs and task quality while retaining enough speed.
 Quality-speed sweep after the official-parameter reproduction:
 
 - Kernel Pareto, qwen9-tp1 `8192x65536`:
-  - official: density `0.208`, total `4.31x`, maxdiff `0.1152`.
-  - `KEEP_MASS=0.995`: density `0.262`, total `3.47x`, maxdiff `0.0966`.
-  - `LOCAL_BLOCKS=32`: density `0.290`, total `3.14x`, maxdiff `0.0731`.
-  - `KEEP_RATIO=0.05`: density `0.263`, total `3.49x`, maxdiff `0.0889`.
-  - `KEEP_RATIO=0.10`: density `0.387`, total `2.39x`, maxdiff `0.0509`.
+    - official: density `0.208`, total `4.31x`, maxdiff `0.1152`.
+    - `KEEP_MASS=0.995`: density `0.262`, total `3.47x`, maxdiff `0.0966`.
+    - `LOCAL_BLOCKS=32`: density `0.290`, total `3.14x`, maxdiff `0.0731`.
+    - `KEEP_RATIO=0.05`: density `0.263`, total `3.49x`, maxdiff `0.0889`.
+    - `KEEP_RATIO=0.10`: density `0.387`, total `2.39x`, maxdiff `0.0509`.
 - Kernel Pareto, qwen9-tp1 `8192x131072`:
-  - official: density `0.136`, total `6.26x`, maxdiff `0.1204`.
-  - `LOCAL_BLOCKS=32`: density `0.179`, total `4.88x`, maxdiff `0.0813`.
-  - `KEEP_RATIO=0.05`: density `0.221`, total `4.04x`, maxdiff `0.0536`.
-  - `KEEP_RATIO=0.10`: density `0.366`, total `2.53x`, maxdiff `0.0359`.
-  - `MASK_BLOCK_N=512`: density `0.278`, total `3.29x`, maxdiff `0.0814`.
+    - official: density `0.136`, total `6.26x`, maxdiff `0.1204`.
+    - `LOCAL_BLOCKS=32`: density `0.179`, total `4.88x`, maxdiff `0.0813`.
+    - `KEEP_RATIO=0.05`: density `0.221`, total `4.04x`, maxdiff `0.0536`.
+    - `KEEP_RATIO=0.10`: density `0.366`, total `2.53x`, maxdiff `0.0359`.
+    - `MASK_BLOCK_N=512`: density `0.278`, total `3.29x`, maxdiff `0.0814`.
 - Kernel Pareto, qwen9-tp1 `8192x262144`:
-  - official: density `0.080`, total `9.74x`, maxdiff `0.1180`.
-  - `LOCAL_BLOCKS=32`: density `0.102`, total `7.90x`, maxdiff `0.0818`.
-  - `KEEP_RATIO=0.05`: density `0.197`, total `4.49x`, maxdiff `0.0384`.
-  - `MASK_BLOCK_N=512`: density `0.173`, total `5.08x`, maxdiff `0.0864`.
+    - official: density `0.080`, total `9.74x`, maxdiff `0.1180`.
+    - `LOCAL_BLOCKS=32`: density `0.102`, total `7.90x`, maxdiff `0.0818`.
+    - `KEEP_RATIO=0.05`: density `0.197`, total `4.49x`, maxdiff `0.0384`.
+    - `MASK_BLOCK_N=512`: density `0.173`, total `5.08x`, maxdiff `0.0864`.
 
 9B-AWQ TP1 E2E smoke, CUDA graph, `max_num_batched_tokens=8192`,
 prompt `32768`, output `1`, `logprobs=5`:
@@ -34892,25 +34892,25 @@ LongBench quality gate, 2026-06-19:
   metrics while keeping dense Flash-V100 and BFLA on the same model, seed,
   prompt set, decoding parameters, and tokenizer.
 - Official BFLA paper quality references:
-  - LongBench Table 3 reports Full `0.4022`, BFLA `0.3975`, XAttention
+    - LongBench Table 3 reports Full `0.4022`, BFLA `0.3975`, XAttention
     `0.3976`, i.e. average BFLA gap `-0.0047` (`-0.47` points on a 0-100
     scale). The largest listed drops are retrieval/counting-sensitive:
     PassageCount `0.0883 -> 0.0663`, PassageRetrieval-en
     `0.9534 -> 0.9272`, PassageRetrieval-zh `0.9293 -> 0.9131`.
-  - General benchmark Table 4 uses MMLU Pro, AIME 2026 no-tools,
+    - General benchmark Table 4 uses MMLU Pro, AIME 2026 no-tools,
     GPQA Diamond, and LiveCodeBench v6 across Qwen 3.5-9B, Qwen 3.6-27B,
     Gemma 4-E4B, and Gemma 4-31B. The often-quoted `-0.1` is the Qwen
     3.6-27B MMLU Pro change `83.3% -> 83.2%`, not the LongBench average.
 - Local controlled LongBench subset:
-  - Model: `/home/ymzx/models/Qwen3.5-9B-AWQ`, TP1, AWQ, CUDA graph,
+    - Model: `/home/ymzx/models/Qwen3.5-9B-AWQ`, TP1, AWQ, CUDA graph,
     Flash-V100 backend, `max_num_batched_tokens=8192`, `max_model_len=65536`.
-  - Sample set: longest 10 examples each from `passage_count` and
+    - Sample set: longest 10 examples each from `passage_count` and
     `passage_retrieval_en`, all `>8K` prompt tokens after Qwen formatting.
-  - Dense artifact:
+    - Dense artifact:
     `benchmark-results/longbench_bfla_quality/low_smem_longest10_rerun`.
-  - BFLA official-speed artifact:
+    - BFLA official-speed artifact:
     `benchmark-results/longbench_bfla_quality/bfla_sparse_official_longest10`.
-  - BFLA `KEEP_RATIO=0.10` artifact:
+    - BFLA `KEEP_RATIO=0.10` artifact:
     `benchmark-results/longbench_bfla_quality/bfla_ratio10_longest10`.
 
 | task | dense score | official-speed BFLA | `KEEP_RATIO=0.10` | dense median TTFT | official median TTFT | ratio10 median TTFT |
@@ -34938,19 +34938,19 @@ LongBench quality gate, 2026-06-19:
   probe, not the full LongBench all-example score. Compare this separately from
   the longest-example stress subset above.
 - Interim speed/quality search:
-  - `benchmark-results/longbench_bfla_quality/sensitivity_strided8_*` covers
+    - `benchmark-results/longbench_bfla_quality/sensitivity_strided8_*` covers
     `passage_count`, `passage_retrieval_en`, and `passage_retrieval_zh` with
     8 strided samples each. Dense baseline scores are `0.0`, `83.33`, and
     `100.0`.
-  - Unconditional official BFLA (`MIN_KV=256`, `KEEP_RATIO=0`) is rejected for
+    - Unconditional official BFLA (`MIN_KV=256`, `KEEP_RATIO=0`) is rejected for
     medium-length retrieval: `passage_retrieval_en` falls `83.33 -> 12.50`
     while median TTFT is only `1.02x` faster. This is not a useful
     speed/quality tradeoff.
-  - `KEEP_RATIO=0.10` still fails retrieval (`83.33 -> 37.50`) and is not
+    - `KEEP_RATIO=0.10` still fails retrieval (`83.33 -> 37.50`) and is not
     faster. `KEEP_RATIO=0.20` improves retrieval (`83.33 -> 70.83`) but is
     slightly slower than dense on this 12K-token median task. `SPEC_STRIDE=16`
     does not recover retrieval quality.
-  - New active candidates are length-gated: full strided20 runs are queued for
+    - New active candidates are length-gated: full strided20 runs are queued for
     `MIN_KV=32768, KEEP_RATIO=0` at
     `benchmark-results/longbench_bfla_quality/official_strided20_bfla_minkv32768`
     and `MIN_KV=32768, KEEP_RATIO=0.20` at
@@ -34959,11 +34959,11 @@ LongBench quality gate, 2026-06-19:
     sub-32K prompts, about `1.34x` TTFT speedup on active >32K prompts, and no
     current task-average quality regression (`31.67 -> 35.22` on the first
     completed narrativeqa task).
-  - Early `MIN_KV=32768, KEEP_RATIO=0.20` evidence is weaker: on the first 18
+    - Early `MIN_KV=32768, KEEP_RATIO=0.20` evidence is weaker: on the first 18
     narrativeqa samples it changes score `33.05 -> 32.16` and active >32K
     speed is only about `1.13x`. Unless later tasks contradict this, the best
     current candidate is `MIN_KV=32768, KEEP_RATIO=0`, not ratio-based rescue.
-  - Direct 9B-AWQ E2E long-context TTFT for `MIN_KV=32768, KEEP_RATIO=0.20`
+    - Direct 9B-AWQ E2E long-context TTFT for `MIN_KV=32768, KEEP_RATIO=0.20`
     was collected at
     `benchmark-results/flash_v100_bfla_9b_ratio20_long_64k_256k_8192_gmem086_gpu3.json`.
     It is faster than dense but much slower than official-density BFLA:
@@ -35055,25 +35055,25 @@ Interpretation:
   and synchronized `num_accepted_tokens_cpu` /
   `spec_num_accepted_tokens_cpu` reset after rollover.
 - Speed evidence in that branch should be read by route:
-  - LongGen3 Qwen3.6-27B GPTQ-INT4 MTP sweep: noMTP `43.59 tok/s`, MTP3
+    - LongGen3 Qwen3.6-27B GPTQ-INT4 MTP sweep: noMTP `43.59 tok/s`, MTP3
     `60.62 tok/s`, MTP4 `60.77 tok/s`, MTP5 `59.55 tok/s`; weighted
     acceptance falls from `67.9%` at MTP3 to `57.7%` at MTP4.
-  - Profile tables also show selected dual-2080Ti Qwen3.6-27B GPTQ-INT4
+    - Profile tables also show selected dual-2080Ti Qwen3.6-27B GPTQ-INT4
     routes around `85-100 tok/s`, but those mix SM75 hardware, GPTQ-INT4,
     FP16KV/TurboQuant profiles, and branch-specific launch policy.
 - Actionable carryover for this SM70 tree:
-  - Keep the current full-Qwen-GDN quality guard as the default quality-safe
+    - Keep the current full-Qwen-GDN quality guard as the default quality-safe
     route. The already measured V100 whole-verifier `PIECEWISE` experiment
     avoids the bad FULL split but decodes at only about `35 tok/s`, so it is
     not a replacement for the full-GDN guard.
-  - Keep `spec_commit` and other split-Qwen-GDN FULL paths experimental until
+    - Keep `spec_commit` and other split-Qwen-GDN FULL paths experimental until
     their recurrent state/spec metadata contract is proven by kernel-level and
     6k real-output tests.
-  - Borrow the branch's deployment discipline: separate safe/normal/fast
+    - Borrow the branch's deployment discipline: separate safe/normal/fast
     profiles, validate MTP with real prompts, and treat MTP3 as the safer
     mixed-workload starting point while using MTP4 only as a workload-specific
     speed candidate.
-  - Do not port the generic 2080Ti GDN metadata code into the Qwen3.6 SM70
+    - Do not port the generic 2080Ti GDN metadata code into the Qwen3.6 SM70
     path; it would drop the accepted-state rollover protections already added
     here.
 
@@ -35086,57 +35086,57 @@ Interpretation:
   not a replacement for dynamic mass.
 - Missing official knobs were added to the Flash-V100 path so future
   experiments do not silently diverge from the reference:
-  - `VLLM_FLASH_V100_BFLA_SPEC_PROB`
-  - `VLLM_FLASH_V100_BFLA_SPEC_SEED`
-  - `maxabs` pooling mode
-  - `SPEC_STRIDE` now uses the official seed term instead of a hard-coded
+    - `VLLM_FLASH_V100_BFLA_SPEC_PROB`
+    - `VLLM_FLASH_V100_BFLA_SPEC_SEED`
+    - `maxabs` pooling mode
+    - `SPEC_STRIDE` now uses the official seed term instead of a hard-coded
     `+1`.
 - Runner maintenance:
-  - `benchmarks/benchmark_flash_v100_bfla_longbench.py` now accepts and records
+    - `benchmarks/benchmark_flash_v100_bfla_longbench.py` now accepts and records
     `--bfla-spec-prob` and `--bfla-spec-seed`.
-  - `benchmarks/benchmark_flash_v100_9b_awq_e2e.py` now records/overrides those
+    - `benchmarks/benchmark_flash_v100_9b_awq_e2e.py` now records/overrides those
     envs.
-  - `benchmarks/kernels/benchmark_flash_v100_bfla_prefill.py` now supports
+    - `benchmarks/kernels/benchmark_flash_v100_bfla_prefill.py` now supports
     both `--spec-stride` and `--spec-prob` in its independent torch mask
     builder.
 - Full strided20 LongBench artifacts are complete:
-  - Dense:
+    - Dense:
     `benchmark-results/longbench_bfla_quality/official_strided20_dense`
     average score `50.299`, median TTFT `4.788s`, sum TTFT `2295.506s`.
-  - Aggressive README-style `MIN_KV=256`:
+    - Aggressive README-style `MIN_KV=256`:
     `benchmark-results/longbench_bfla_quality/official_strided20_bfla_official`
     average score `42.1893`, median TTFT `4.504s`, sum TTFT `2007.796s`.
     This is rejected: it saves only about `12.5%` total TTFT on this mixed
     LongBench slice but loses `8.11` average points.
-  - Length-gated `MIN_KV=32768`:
+    - Length-gated `MIN_KV=32768`:
     `benchmark-results/longbench_bfla_quality/official_strided20_bfla_minkv32768`
     average score `50.4694`, median TTFT `4.759s`, sum TTFT `2198.449s`.
     This preserves quality on the strided20 slice and speeds only the true
     long-prefix rows.
 - Quality loss concentration:
-  - `MIN_KV=256` loses most quality on 8K-32K prompts while gaining little
+    - `MIN_KV=256` loses most quality on 8K-32K prompts while gaining little
     speed: `passage_retrieval_en` drops `80.83 -> 15.00`, `musique`
     `42.01 -> 12.72`, `lsht` `60.00 -> 40.00`, `2wikimqa`
     `64.74 -> 48.70`.
-  - Prompt-token buckets for `MIN_KV=256`: `<8K` roughly flat; `8K-16K`
+    - Prompt-token buckets for `MIN_KV=256`: `<8K` roughly flat; `8K-16K`
     average delta `-14.79` points at only `1.07x` mean TTFT speed; `16K-32K`
     delta `-15.97` points at `1.25x`; `>=32K` showed no regression on this
     small slice and averaged `1.78x`.
 - Interpretation:
-  - The official code's function default `bfla_min_prefill_tokens=32768`
+    - The official code's function default `bfla_min_prefill_tokens=32768`
     matters. The README `256` setting is useful for broad/aggressive testing,
     but it is not quality-safe on our Qwen3.5-9B-AWQ LongBench slice.
-  - The current best default-off candidate remains `MIN_KV=32768`,
+    - The current best default-off candidate remains `MIN_KV=32768`,
     `KEEP_MASS=0.99`, `KEEP_RATIO=0`, `LOCAL_BLOCKS=8`, `POOL=flat64`.
     Lowering the gate toward 256 should be treated as an experimental speed
     mode until retrieval/multihop quality is recovered.
 - Verification:
-  - `python -m py_compile` passed for `vllm/envs.py`,
+    - `python -m py_compile` passed for `vllm/envs.py`,
     `vllm/v1/attention/backends/flash_attn_v100.py`,
     `benchmarks/benchmark_flash_v100_bfla_longbench.py`,
     `benchmarks/benchmark_flash_v100_9b_awq_e2e.py`, and
     `benchmarks/kernels/benchmark_flash_v100_bfla_prefill.py`.
-  - `git diff --check` passed for the same files.
+    - `git diff --check` passed for the same files.
 
 2026-06-19 Flash-V100 BFLA speed/quality operating point:
 
@@ -35159,14 +35159,14 @@ Interpretation:
   | selected-six average | `52.79` | `32.09` | `-20.69` | `48.06` | `-4.73` | `53.42` | `+0.63` |
 
 - Quality interpretation:
-  - `MIN_KV=256` is rejected: it is the fastest broad setting but loses
+    - `MIN_KV=256` is rejected: it is the fastest broad setting but loses
     `20.69` points on the stress slice and `8.11` points on the full
     strided20 LongBench slice.
-  - `MIN_KV=16384` is also rejected for default use. It protects the
+    - `MIN_KV=16384` is also rejected for default use. It protects the
     11K-15K retrieval samples but still destroys 16K-18K `musique`
     multihop quality (`42.01 -> 17.72`), with only `1.04x` selected-slice
     total-TTFT speedup.
-  - `MIN_KV=32768` is the current operating point: no measured quality drop on
+    - `MIN_KV=32768` is the current operating point: no measured quality drop on
     the selected slice or full strided20 slice, while still accelerating true
     long-prefix rows.
 - New speed artifact:
@@ -35183,7 +35183,7 @@ Interpretation:
   | 261,120 | `499.099s` | `79.077s` | `6.31x` | `81.742s` | `6.11x` | `229.734s` | `2.17x` |
 
 - Decision:
-  - Recommended default-off experimental preset for further model/data testing:
+    - Recommended default-off experimental preset for further model/data testing:
     `VLLM_FLASH_V100_BFLA_PREFILL=1`,
     `VLLM_FLASH_V100_BFLA_MIN_Q=256`,
     `VLLM_FLASH_V100_BFLA_MIN_KV=32768`,
@@ -35192,7 +35192,7 @@ Interpretation:
     `VLLM_FLASH_V100_BFLA_KEEP_RATIO=0`,
     `VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS=8`,
     `VLLM_FLASH_V100_BFLA_POOL=flat64`.
-  - Do not default-enable `MIN_KV=256` or `MIN_KV=16384` until a better
+    - Do not default-enable `MIN_KV=256` or `MIN_KV=16384` until a better
     selector recovers retrieval/multihop quality in the 16K-32K band.
 
 2026-06-19 Qwen3.6-27B-AWQ TP2 BFLA experiment:
@@ -35203,11 +35203,11 @@ Interpretation:
   the experimental preset with `MIN_Q=256`, `MIN_KV=32768`,
   `KEEP_MASS=0.99`, `KEEP_RATIO=0`, `LOCAL_BLOCKS=8`, and `POOL=flat64`.
 - Speed artifacts:
-  - Dense:
+    - Dense:
     `benchmark-results/flash_v100_bfla_27b_awq_dense_64k_256k_tp2_8192_gmem088.json`
-  - BFLA:
+    - BFLA:
     `benchmark-results/flash_v100_bfla_27b_awq_sparse_minkv32768_64k_256k_tp2_8192_gmem088.json`
-  - Model `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, CUDA graph,
+    - Model `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, CUDA graph,
     `max_num_batched_tokens=8192`, `max_model_len=262144`,
     `max_tokens=1`, V100, Flash-V100.
 
@@ -35218,11 +35218,11 @@ Interpretation:
   | 261,120 | `855.071s` | `170.168s` | `5.03x` | `80.1%` | `305.4` | `1534.5` | different |
 
 - Quality artifacts:
-  - Dense 0.86:
+    - Dense 0.86:
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_selected3_dense`
-  - BFLA 0.80:
+    - BFLA 0.80:
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_selected3_bfla_minkv32768_gmem080`
-  - Isolation checks:
+    - Isolation checks:
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_musique_dense_gmem080_isolation`
     and
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_dense_gmem080_isolation`.
@@ -35235,9 +35235,9 @@ Interpretation:
   | average | `68.26` | `60.39` | `-7.86` | `64.09` | `-3.70` |
 
 - Interpretation:
-  - Speed is strong and improves with context length, so the sparse lane is a
+    - Speed is strong and improves with context length, so the sparse lane is a
     real long-prefill solution candidate for 27B-AWQ.
-  - Quality is not accepted. The matched 0.80 isolation shows `musique` loss is
+    - Quality is not accepted. The matched 0.80 isolation shows `musique` loss is
     not caused by BFLA, but `narrativeqa` sample `source_index=142`
     (`59,744` prompt tokens) changes from `Bill`/100 to `Benson`/0 only when
     BFLA is enabled. Keep the route default-off and treat future work as
@@ -35264,18 +35264,18 @@ Interpretation:
   | all-keep `mass=1.0` | `1.000` | `0.97x` | `0.00000` | `1.000` | `0.97x` | `0.00000` |
 
 - Bug triage:
-  - All-keep produces exact dense parity (`maxdiff=0`) on both 64K and 128K,
+    - All-keep produces exact dense parity (`maxdiff=0`) on both 64K and 128K,
     so the BFLA paged kernel itself is not the source of the quality failure.
-  - The regression is selector/approximation driven: increasing keep density
+    - The regression is selector/approximation driven: increasing keep density
     monotonically lowers maxdiff, but speed drops quickly.
 - Real 27B quality check:
-  - Artifact:
+    - Artifact:
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_bfla_ratio20_minkv32768_gmem080`.
-  - `ratio=.10` artifacts:
+    - `ratio=.10` artifacts:
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_bfla_ratio10_minkv32768_lazy_gmem080`
     plus the graph-mode source-199 repair run
     `benchmark-results/longbench_bfla_quality/27b_awq_tp2_narrativeqa_bfla_ratio10_minkv32768_lazy_gmem080_src199_graph`.
-  - Dataset: `narrativeqa`, strided 8, same samples as dense isolation.
+    - Dataset: `narrativeqa`, strided 8, same samples as dense isolation.
 
   | variant | score | source `142` / 59,744 tokens | source `199` / 33,873 tokens |
   | --- | ---: | --- | --- |
@@ -35291,9 +35291,9 @@ Interpretation:
 - Standalone speed artifacts, 27B-AWQ TP2, CUDA graph, `max_num_batched_tokens=8192`,
   `gpu_memory_utilization=0.88`, `safetensors_load_strategy=lazy` for fixed-ratio
   runs:
-  - `ratio=.10`:
+    - `ratio=.10`:
     `benchmark-results/flash_v100_bfla_27b_awq_sparse_ratio10_minkv32768_64k_128k_tp2_8192_gmem088_lazy.json`.
-  - `ratio=.20`:
+    - `ratio=.20`:
     `benchmark-results/flash_v100_bfla_27b_awq_sparse_ratio20_minkv32768_64k_128k_tp2_8192_gmem088_lazy.json`.
 
   | input tokens | dense TTFT | official `ratio=0` | `ratio=.10` | `ratio=.20` | `ratio=.10` vs dense | `ratio=.10` vs `ratio=.20` |
@@ -35302,16 +35302,16 @@ Interpretation:
   | 131,072 | `244.007s` | `83.024s` | `111.996s` | `144.504s` | `2.18x` | `1.29x` |
 
 - Interpretation:
-  - `ratio=.20` fixes the main long-sample failure and improves the small
+    - `ratio=.20` fixes the main long-sample failure and improves the small
     `narrativeqa` slice over dense, but it introduces a different sample-level
     regression and only has about `1.25x` kernel speed at 128K.
-  - `ratio=.10` now runs with `safetensors_load_strategy=lazy` and is the
+    - `ratio=.10` now runs with `safetensors_load_strategy=lazy` and is the
     better 27B quality point on this `narrativeqa` slice: it keeps the source
     `142` repair and restores source `199` to the dense answer. One 8-sample
     CUDA-graph run segfaulted after 7 samples; the missing source `199` then
     passed as an isolated CUDA-graph run, so treat this as a lifecycle
     stability issue to reproduce separately, not a source-199 quality failure.
-  - Current best known fixed-ratio 27B point is `ratio=.10`: it is faster than
+    - Current best known fixed-ratio 27B point is `ratio=.10`: it is faster than
     `ratio=.20` at both 64K and 128K and better on the `narrativeqa` slice.
     The route remains default-off because it is approximate and still needs
     broader LongBench validation plus a clean 256K speed run. A 262K one-shot
@@ -35321,32 +35321,32 @@ Interpretation:
 2026-06-19 Qwen3.6-27B BFLA ratio default:
 
 - Route change:
-  - `VLLM_FLASH_V100_BFLA_PREFILL` remains globally default-off.
-  - When BFLA is explicitly enabled and
+    - `VLLM_FLASH_V100_BFLA_PREFILL` remains globally default-off.
+    - When BFLA is explicitly enabled and
     `VLLM_FLASH_V100_BFLA_KEEP_RATIO` is not set, the SM70 Flash-V100 baseline
     now auto-sets `VLLM_FLASH_V100_BFLA_KEEP_RATIO=0.10` for the 27B
     attention shape `num_attention_heads=24`, `num_key_value_heads=4`,
     `head_dim=256`.
-  - This default follows model architecture, not quantization. Qwen3.6-27B-AWQ
+    - This default follows model architecture, not quantization. Qwen3.6-27B-AWQ
     and Qwen3.6-27B-FP8 have the same text config and both use runtime
     attention block size `784` on this hybrid layout.
 - Benchmark harness change:
-  - `benchmark_flash_v100_bfla_longbench.py` no longer passes an implicit
+    - `benchmark_flash_v100_bfla_longbench.py` no longer passes an implicit
     `--bfla-keep-ratio 0.0`; unset means the runtime architecture default can
     apply. Passing `--bfla-keep-ratio` still overrides it.
-  - The 9B/27B E2E Flash-V100 harness now accepts `--quantization` and
+    - The 9B/27B E2E Flash-V100 harness now accepts `--quantization` and
     `--kv-cache-dtype`, so AWQ/FP8 can share the same long-prefill test path.
 - FP8 route-hit and quality evidence:
-  - Model `/home/ymzx/models/Qwen3.6-27B-FP8`, TP2, CUDA graph,
+    - Model `/home/ymzx/models/Qwen3.6-27B-FP8`, TP2, CUDA graph,
     `quantization=fp8`, `max_model_len=65536`, `max_num_batched_tokens=8192`,
     `gpu_memory_utilization=0.80`, `safetensors_load_strategy=lazy`.
-  - Ratio10-auto artifact:
+    - Ratio10-auto artifact:
     `benchmark-results/longbench_bfla_quality/27b_fp8_tp2_narrativeqa_bfla_ratio10_auto_minkv32768_gmem080_src142_199`.
     Logs confirmed auto-setting `VLLM_FLASH_V100_BFLA_KEEP_RATIO=0.10` and
     BFLA sparse prefix prefill route hit.
-  - Ratio20 artifact:
+    - Ratio20 artifact:
     `benchmark-results/longbench_bfla_quality/27b_fp8_tp2_narrativeqa_bfla_ratio20_minkv32768_gmem080_src142_199`.
-  - Dense baseline artifact:
+    - Dense baseline artifact:
     `benchmark-results/longbench_bfla_quality/27b_fp8_tp2_narrativeqa_dense_gmem080_src142_199`.
 
   | variant | source `142` / 59,744 tokens | source `199` / 33,873 tokens |
@@ -35356,65 +35356,65 @@ Interpretation:
   | `ratio=.20` FP8 | `100.00`, TTFT `50.571s` | `15.38`, TTFT `27.273s` |
 
 - Interpretation:
-  - FP8 does not show a reason to prefer `ratio=.20` on the two AWQ-sensitive
+    - FP8 does not show a reason to prefer `ratio=.20` on the two AWQ-sensitive
     `narrativeqa` samples. `ratio=.10` preserves the dense answers and is
     faster than `ratio=.20`.
-  - The current default for explicitly enabled 27B BFLA should therefore be
+    - The current default for explicitly enabled 27B BFLA should therefore be
     architecture-driven `ratio=.10` for both AWQ and FP8. This is still an
     experimental approximate path, not a global default-enable decision.
 
 2026-06-19 AWQ Marlin backend sharing SM70 TurboMind MoE:
 
 - Route change:
-  - Explicit AWQ Marlin still keeps dense linear layers on Marlin.
-  - On exact SM70, AWQ Marlin `RoutedExperts` now selects
+    - Explicit AWQ Marlin still keeps dense linear layers on Marlin.
+    - On exact SM70, AWQ Marlin `RoutedExperts` now selects
     `AWQSM70MoEMethod` when `VLLM_SM70_AWQ_TURBOMIND=1`,
     `VLLM_SM70_AWQ_MOE_DISABLE=0`, 4-bit AWQ zero-points are present,
     `group_size` is 32/64/128, and the MoE has no bias.
-  - This lets `VLLM_SM70_QUANT_BACKEND=marlin` reuse the accepted
+    - This lets `VLLM_SM70_QUANT_BACKEND=marlin` reuse the accepted
     TurboMind AWQ MoE batched and legacy single-token compact routes without
     moving dense AWQ linear layers to TurboMind.
 - Route-hit evidence:
-  - Lightweight dispatch check under
+    - Lightweight dispatch check under
     `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3
     VLLM_SM70_QUANT_BACKEND=marlin` returned `AWQSM70MoEMethod`.
-  - Full Qwen3.6-35B-A3B-AWQ TP2 run logged all MoE layers selecting
+    - Full Qwen3.6-35B-A3B-AWQ TP2 run logged all MoE layers selecting
     `SM70 AWQ TurboMind MoE route under AWQ Marlin`, then
     `SM70 AWQ MoE TurboMind batched path enabled (256 experts)`.
-  - SM70 warmup logged `0 AWQ dense calls` and `8 MoE stage calls`,
+    - SM70 warmup logged `0 AWQ dense calls` and `8 MoE stage calls`,
     confirming this is dense Marlin plus TurboMind MoE, not a full TurboMind
     dense route.
 - Speed evidence, diagnostic non-AOT CUDA-graph lane:
-  - Artifact:
+    - Artifact:
     `benchmark-results/backend_compare/qwen36_35b_a3b_awq_tp2_1k256_marlin_sm70_moe_noaot.json`.
-  - Model `/home/ymzx/models/Qwen3.6-35B-A3B-AWQ`, TP2,
+    - Model `/home/ymzx/models/Qwen3.6-35B-A3B-AWQ`, TP2,
     `CUDA_VISIBLE_DEVICES=2,3`, input 1024, output 256, warmup 1,
     repeat 3, `enforce_eager=False`, CUDA graph capture completed,
     `VLLM_USE_AOT_COMPILE=0`.
-  - Results: prefill mean `0.16744185999656716s`, pure decode mean
+    - Results: prefill mean `0.16744185999656716s`, pure decode mean
     `2.455101999997472s`, steady decode `103.86533844031753 tok/s`,
     output TPS `97.54255688686705`.
-  - Previous explicit Marlin artifact
+    - Previous explicit Marlin artifact
     `qwen36_35b_a3b_awq_tp2_1k256_marlin.json`: pure decode
     `4.860214932016485s`, steady decode `52.466815985039126 tok/s`.
-  - Same-run TurboMind artifact
+    - Same-run TurboMind artifact
     `qwen36_35b_a3b_awq_tp2_1k256_turbomind.json`: pure decode
     `2.4804601893314007s`, steady decode `102.80353182983112 tok/s`.
-  - The new Marlin+SM70-MoE path therefore recovers the old Marlin decode
+    - The new Marlin+SM70-MoE path therefore recovers the old Marlin decode
     gap to TurboMind-level speed on this diagnostic lane.
 - Quality/hash note:
-  - The new Marlin+SM70-MoE token hash
+    - The new Marlin+SM70-MoE token hash
     `782d4576cb63874bdba78d84d46e278e549ac366c6d2fd3b3bc47567bd9b9694`
     matches the previous explicit Marlin artifact, as expected because dense
     Marlin remains unchanged.
-  - It differs from the full TurboMind artifact hash
+    - It differs from the full TurboMind artifact hash
     `8bb2d07e7551200c4c0107722dc4f333c34c8972df13343203b824d86820295f`,
     which uses the TurboMind dense AWQ route.
 - AOT status:
-  - The AOT benchmark variant failed during CUDA graph capture with the
+    - The AOT benchmark variant failed during CUDA graph capture with the
     existing Torch Dynamo guard serialization error:
     `pybind11_detail_function_record... is not pickleable`.
-  - This is the same AOT failure reproduced before and after the MoE route
+    - This is the same AOT failure reproduced before and after the MoE route
     change; do not count it as a Marlin+SM70-MoE route failure.
 
 2026-06-19 Qwen3.6-27B-AWQ TP2 backend speed check:
@@ -35443,47 +35443,47 @@ Interpretation:
 2026-06-19 Qwen3.6-27B-AWQ explicit Marlin dense speed recovery:
 
 - Route change:
-  - Exact-SM70 AWQ Marlin dense Linear now prepares the original AWQ packed
+    - Exact-SM70 AWQ Marlin dense Linear now prepares the original AWQ packed
     weights with the same SM70 TurboMind AWQ dense layout used by the `awq`
     route, then calls `awq_gemm_sm70_out` directly at runtime.
-  - The branch is limited to 4-bit AWQ with zero-points, group size 32/64/128,
+    - The branch is limited to 4-bit AWQ with zero-points, group size 32/64/128,
     default A16 activations, CUDA capability exactly 7.0, and
     `VLLM_SM70_AWQ_TURBOMIND=1`.
-  - Unsupported cases still fall through to the existing AWQ-to-Marlin
+    - Unsupported cases still fall through to the existing AWQ-to-Marlin
     conversion plus `MarlinLinearKernel`.
 - Route-hit evidence:
-  - Run command used TP2 on physical GPUs `2,3` with
+    - Run command used TP2 on physical GPUs `2,3` with
     `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2,3`,
     `VLLM_SM70_QUANT_BACKEND=marlin`, `VLLM_USE_AOT_COMPILE=0`,
     input 1024, output 256, warmup 1, repeat 3, greedy ignore-EOS,
     `enforce_eager=False`, and CUDA graph capture completed.
-  - Logs include `Using MarlinLinearKernel for AWQMarlinLinearMethod`,
+    - Logs include `Using MarlinLinearKernel for AWQMarlinLinearMethod`,
     `SM70 AWQ TurboMind dense path enabled under AWQ Marlin`, and
     `SM70 TurboMind warmup finished (20 AWQ dense calls, 0 FP8 dense calls,
     0 FP4 dense calls, 0 MoE stage calls, 0 single-token active-expert calls)`.
-  - An attempted generic `sm70_turbomind.apply_prepared_linear` reuse was
+    - An attempted generic `sm70_turbomind.apply_prepared_linear` reuse was
     rejected because CUDA graph capture could hang; the accepted implementation
     mirrors the direct field/apply structure of `AWQLinearMethod`.
 - Speed evidence:
-  - Artifact:
+    - Artifact:
     `benchmark-results/backend_compare/qwen36_27b_awq_tp2_1k256_marlin_sm70_dense_noaot.json`.
-  - New explicit Marlin+SM70-dense results: prefill mean
+    - New explicit Marlin+SM70-dense results: prefill mean
     `0.49903542932588607s`, pure decode mean `4.928026396334947s`,
     steady decode `51.74485292546152 tok/s`, output TPS
     `47.15263017971813`.
-  - Previous explicit Marlin artifact
+    - Previous explicit Marlin artifact
     `qwen36_27b_awq_tp2_1k256_marlin_noaot.json`: pure decode
     `13.662682776659494s`, steady decode `18.663977274249053 tok/s`,
     output TPS `17.82150392717129`.
-  - Previous TurboMind artifact
+    - Previous TurboMind artifact
     `qwen36_27b_awq_tp2_1k256_turbomind_noaot.json`: pure decode
     `4.778137704677647s`, steady decode `53.3680728780179 tok/s`,
     output TPS `48.00268552503858`.
-  - The recovered Marlin path is `2.77x` faster than old explicit Marlin on
+    - The recovered Marlin path is `2.77x` faster than old explicit Marlin on
     pure decode and is within about `3.0%` of the recorded TurboMind steady
     decode artifact on the same diagnostic lane.
 - Quality/hash note:
-  - New Marlin+SM70-dense token hash
+    - New Marlin+SM70-dense token hash
     `498a54a24f7caa632d007d4230ea185365eee764d3e69a6674ed3eafe98b742f`
     matches the TurboMind artifact hash and differs from the old explicit
     Marlin hash
@@ -35493,133 +35493,133 @@ Interpretation:
 2026-06-19 Qwen3.5-27B-NVFP4 explicit Marlin dense speed recovery:
 
 - Build/route fix:
-  - The active `_C` extension was replaced with the SM70-Marlin build from
+    - The active `_C` extension was replaced with the SM70-Marlin build from
     `build/temp.linux-x86_64-cpython-312-sm70-marlin-v100/_C.abi3.so`.
     Its hash is
     `a40e35ee98a93786fcdb9b0c1476dc79e0e9aeb63376679106f69dc7af9f1624`,
     matching the active `vllm/_C.abi3.so`.
-  - `CMakeLists.txt` now defines `ENABLE_SM70_MARLIN=1` only for the pure
+    - `CMakeLists.txt` now defines `ENABLE_SM70_MARLIN=1` only for the pure
     SM70 Marlin build, and `_C::sm70_marlin_available()` exposes that marker
     to Python. `is_fp4_marlin_supported()` accepts exact SM70 only when this
     marker is present, preventing a mixed/non-SM70 extension from silently
     advertising V100 Marlin FP4 support.
 - Route change:
-  - Explicit compressed-tensors NVFP4 Marlin on exact SM70 now follows the AWQ
+    - Explicit compressed-tensors NVFP4 Marlin on exact SM70 now follows the AWQ
     dense recovery precedent: the public backend remains `marlin`, but W4A4
     and W4A16 NVFP4 layers prepare their packed FP4 weights into the SM70
     TurboMind dense layout and call the existing SM70 FP4 dense op at runtime.
-  - The helper gate is `should_prepare_turbomind_or_marlin(...)`, so `auto` /
+    - The helper gate is `should_prepare_turbomind_or_marlin(...)`, so `auto` /
     `turbomind` still use the TurboMind route and explicit `marlin` gets the
     same V100-optimized dense kernel instead of the slow generic Marlin FP4
     GEMM.
-  - Generic explicit Marlin NVFP4 is kept as a fallback for unsupported
+    - Generic explicit Marlin NVFP4 is kept as a fallback for unsupported
     devices/builds. It remains too slow on this V100 target and should not be
     used as the accepted performance path.
 - Route-hit evidence:
-  - Import check after rebuild returned `sm70_marlin_available=True` and
+    - Import check after rebuild returned `sm70_marlin_available=True` and
     `is_fp4_marlin_supported=True`.
-  - Dummy V100 W4A16 route check under
+    - Dummy V100 W4A16 route check under
     `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0
     VLLM_SM70_QUANT_BACKEND=marlin` produced
     `prepared=True`, `op_kind=nvfp4`, `tm_weight_shape=(5120, 32)`,
     `tm_scales_shape=(320, 256)`, and a finite `fp16` output.
-  - Full speed run logs include `linear_backend='marlin'`,
+    - Full speed run logs include `linear_backend='marlin'`,
     `SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled`,
     SM70 FP4 dense warmup, Flash-V100 attention, and CUDA graph capture
     completion. This is not eager mode.
 - Speed evidence:
-  - Model:
+    - Model:
     `/home/ymzx/.cache/huggingface/hub/models--apolo13x--Qwen3.5-27B-NVFP4/snapshots/f48cfc832696cccd195ac305ff7d2ffaeeab4d28`.
-  - Shared benchmark shape: TP2, input 1024, output 256, warmup 1, repeat 3,
+    - Shared benchmark shape: TP2, input 1024, output 256, warmup 1, repeat 3,
     greedy ignore-EOS, `max_model_len=2048`, `max_num_batched_tokens=1024`,
     `max_num_seqs=1`, CUDA graph enabled, `VLLM_USE_AOT_COMPILE=0`.
-  - Previous explicit Marlin artifact
+    - Previous explicit Marlin artifact
     `benchmark-results/backend_compare/qwen35_27b_nvfp4_tp2_1k256_marlin_sm70_noaot.json`:
     prefill mean `0.6863738586544059s`, pure decode mean
     `14.440067318995716s`, steady decode `17.659334377029335 tok/s`,
     output TPS `16.922189925405288`.
-  - TurboMind baseline artifact
+    - TurboMind baseline artifact
     `benchmark-results/backend_compare/qwen35_27b_nvfp4_tp2_1k256_turbomind_noaot.json`:
     prefill mean `0.566358134325128s`, pure decode mean
     `4.882517051330069s`, steady decode `52.236148206072734 tok/s`,
     output TPS `46.968546554682085`.
-  - Recovered explicit Marlin+SM70-FP4-dense artifact
+    - Recovered explicit Marlin+SM70-FP4-dense artifact
     `benchmark-results/backend_compare/qwen35_27b_nvfp4_tp2_1k256_marlin_sm70_tmfast_noaot.json`:
     prefill mean `0.5595701336569618s`, pure decode mean
     `4.818029662012123s`, steady decode `52.926199764454076 tok/s`,
     output TPS `47.58765693562373`.
-  - The recovered Marlin path is about `3.0x` faster than old explicit Marlin
+    - The recovered Marlin path is about `3.0x` faster than old explicit Marlin
     on pure decode and is within measurement noise of the TurboMind baseline
     on the same TP2 1k/256 lane.
 - Quality/hash note:
-  - Recovered Marlin, old explicit Marlin, and TurboMind baseline all produced
+    - Recovered Marlin, old explicit Marlin, and TurboMind baseline all produced
     the same token hash:
     `26514f49d19f5ba1cca5fc71c8ae28834263c50054b6db43f6e95a282b5a221a`.
-  - This verifies the speed recovery did not change the deterministic greedy
+    - This verifies the speed recovery did not change the deterministic greedy
     output for this benchmark prompt.
 
 2026-06-20 Qwen3.6-27B-AWQ TP2 Nsight Systems decode profile:
 
 - GPU-use rule recorded for follow-up work:
-  - Use TP2 unless the target changes.
-  - Use any suitable free V100 pair directly, but never stop, kill, reset, or
+    - Use TP2 unless the target changes.
+    - Use any suitable free V100 pair directly, but never stop, kill, reset, or
     otherwise interfere with another user's GPU process. If a needed GPU is
     busy, wait or choose a different free pair.
-  - During this profile, GPU3 had another `VLLM::EngineCore` process, so all
+    - During this profile, GPU3 had another `VLLM::EngineCore` process, so all
     runs avoided GPU3. The successful profile used
     `CUDA_VISIBLE_DEVICES=1,2`.
 - Failed startup paths that should not be repeated blindly:
-  - The first compile-graph profile attempt with nsys on GPUs 0/1 failed before
+    - The first compile-graph profile attempt with nsys on GPUs 0/1 failed before
     measured repeat; the worker exited during engine initialization.
-  - A non-nsys compile-graph smoke with `gpu_memory_utilization=0.6` failed
+    - A non-nsys compile-graph smoke with `gpu_memory_utilization=0.6` failed
     with `Available KV cache memory: -7.0 GiB`. Raising gmem to `0.88`
     fixed KV sizing, but both GPUs 0/1 and 1/2 still exited during mixed
     prefill-decode CUDA graph capture after AWQ warmup. No valid speed/profile
     artifact was produced for this compile-graph lane.
-  - The no-compile decode-graph lane initially triggered the Qwen3-VL dummy
+    - The no-compile decode-graph lane initially triggered the Qwen3-VL dummy
     multimodal profile and failed because this `1cat-vllm-1.2.0-releasecheck`
     environment does not provide `_vllm_fa2_C`. Passing
     `--engine-arg 'limit_mm_per_prompt={"image":0,"video":0}'` forced the
     intended text-only route and fixed startup.
 - Successful profile artifact:
-  - Command shape: Qwen3.6-27B-AWQ, TP2, GPUs 1/2, input 4096, output 32,
+    - Command shape: Qwen3.6-27B-AWQ, TP2, GPUs 1/2, input 4096, output 32,
     warmup 1, repeat 1, greedy ignore-EOS, `max_model_len=8192`,
     `max_num_batched_tokens=4096`, `max_num_seqs=1`,
     `gpu_memory_utilization=0.88`, Flash-V100 attention, no-compile decode
     CUDA graph (`VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1`,
     `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=0`), text-only multimodal
     limit, and nsys `--cuda-graph-trace=node`.
-  - Files:
+    - Files:
     `bench_results/nsys_27b_awq_tp2_20260620/27b_awq_tp2_i4096_o32_decodegraph_textonly_nsys.json`,
     `.nsys-rep`, and `.sqlite`.
-  - Route logs confirmed Flash-V100 prefill/decode, GDN FlashQLA decode,
+    - Route logs confirmed Flash-V100 prefill/decode, GDN FlashQLA decode,
     AWQ TurboMind dense, SM70 fused LM-head top1, and TP custom all-reduce.
-  - The nsys run recorded steady decode `42.6708 tok/s` and TPOT
+    - The nsys run recorded steady decode `42.6708 tok/s` and TPOT
     `23.435 ms`. This is slower than normal non-profile 256-token decodegraph
     evidence (`46.5455 tok/s`) because node-level nsys tracing adds overhead,
     so use this artifact for bottleneck distribution rather than accepted
     speed.
 - Per-token decode breakdown from the sqlite:
-  - Stable decode windows: 30 windows after skipping the first graph launch
+    - Stable decode windows: 30 windows after skipping the first graph launch
     that was tied to the prefill dependency tail. Mean `24.08 ms`, median
     `23.40 ms`, min `21.65 ms`, max `42.58 ms`.
-  - Per-device aggregate kernel-time split in those stable windows:
+    - Per-device aggregate kernel-time split in those stable windows:
     dense GEMM `54.0-54.6%`; elementwise/cache/misc small kernels
     `18.6-20.6%`; TP all-reduce `6.4-8.0%`; LM-head top1/sampler
     `5.7-5.8%`; Flash-V100 decode attention `5.5-5.6%`;
     GDN/linear-attention small ops `2.8-3.0%`; RMSNorm `2.5-2.7%`.
-  - The largest individual steady-decode kernels were TurboMind dense GEMM
+    - The largest individual steady-decode kernels were TurboMind dense GEMM
     variants, followed by `vllm::cross_device_reduce_1stage`, LM-head top1
     stage1, and Flash-V100 decode partition kernels.
 - Interpretation:
-  - For 27B-AWQ TP2 decode, the main bottleneck is dense GEMM, not
+    - For 27B-AWQ TP2 decode, the main bottleneck is dense GEMM, not
     Flash-V100 attention or GDN FlashQLA. Attention and GDN together are a
     small minority of stable decode GPU time on this profile.
-  - The next narrow optimization target should be AWQ/F16 dense GEMM dispatch
+    - The next narrow optimization target should be AWQ/F16 dense GEMM dispatch
     and the surrounding small-kernel launch/copy pattern. TP all-reduce and
     LM-head top1 are secondary. Do not spend the next iteration on attention
     unless a compile-graph same-criterion profile contradicts this split.
-  - Re-run the same nsys method on the accepted compile-graph speed lane when
+    - Re-run the same nsys method on the accepted compile-graph speed lane when
     the usual GPUs 2/3 are both free, because the current profile is a
     no-compile decode-graph diagnostic lane.
 
@@ -35627,34 +35627,34 @@ Interpretation:
 
 - Scope: TurboMind AWQ dense path only; Marlin is intentionally unchanged.
 - Code path:
-  - `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu`
+    - `csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu`
     now has a default-on `VLLM_SM70_AWQ_TP2_FAST_SELECTOR` cache-miss selector.
-  - `vllm/envs.py` exposes the same environment gate, defaulting to enabled.
+    - `vllm/envs.py` exposes the same environment gate, defaulting to enabled.
 - Exact descriptors promoted after today's source-path micro and TP2 route
   trace:
-  - `sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1` ->
+    - `sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1` ->
     `8x256x64`, `splits=3`, `swizzle=3`.
-  - `sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1` ->
+    - `sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1` ->
     `8x256x64`, `splits=7`, `swizzle=0`.
 - End-to-end evidence:
-  - Baseline artifact
+    - Baseline artifact
     `bench_results/nsys_27b_awq_tp2_20260620/27b_awq_tp2_i512_o128_currentgraph_turbomind_fixed_r3.json`:
     TPOT `18.796 ms`, steady decode `53.201 tok/s`.
-  - Source selector artifact
+    - Source selector artifact
     `bench_results/nsys_27b_awq_tp2_20260620/27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_r3.json`:
     TPOT `17.759 ms`, steady decode `56.309 tok/s`, `+5.84%` vs fixed.
-  - Token hash stayed identical:
+    - Token hash stayed identical:
     `25acc1257b65019cd7398d36105134378675d9de82bc7d30c6b49d78b1f7b755`.
 - Rejected descriptors:
-  - Do not hard-enable the dynamic choices for `1x5120x8704` or
+    - Do not hard-enable the dynamic choices for `1x5120x8704` or
     `1x8192x5120`: today's source-path microbench measured default faster
     (`0.04221 ms` vs `0.05949 ms`, and `0.04379 ms` vs `0.06072 ms`).
 - Follow-up:
-  - The external no-preserve LUT experiment reached `57.285 tok/s`
+    - The external no-preserve LUT experiment reached `57.285 tok/s`
     (`+7.68%`), so there is still about `1.7%` absolute steady-TPS gap between
     the source selector and that best diagnostic lane. Closing it needs deeper
     exact-selector/kernel work, not broad dynamic measurement.
-  - Direct script validation must pass
+    - Direct script validation must pass
     `PYTHONPATH=/home/ymzx/桌面/1cat-vllm/vllm`; otherwise the releasecheck
     conda environment can import its installed vLLM instead of this source
     tree.
@@ -35666,26 +35666,26 @@ Interpretation:
 - Post-selector NCU artifact:
   `bench_results/nsys_27b_awq_tp2_20260620/ncu/awq_m1_k8704_n5120_postselector_warpstats.ncu-rep`.
 - NCU result for the default `8x256x64, splits=7, swizzle=0` launch:
-  - Duration `48.256 us`, grid `140 CTAs`, waves/SM `0.65`.
-  - Registers/thread `160`, dynamic shared memory/block `20.512 KiB`.
-  - Achieved occupancy `11.47%`, active warps/SM `7.34`.
-  - SM throughput `33.49%`, Tensor pipe `15.82%`, DRAM throughput `45.87%`,
+    - Duration `48.256 us`, grid `140 CTAs`, waves/SM `0.65`.
+    - Registers/thread `160`, dynamic shared memory/block `20.512 KiB`.
+    - Achieved occupancy `11.47%`, active warps/SM `7.34`.
+    - SM throughput `33.49%`, Tensor pipe `15.82%`, DRAM throughput `45.87%`,
     L1/TEX throughput `56.43%`.
-  - Scheduler no-eligible cycles `62.63%`.
+    - Scheduler no-eligible cycles `62.63%`.
 - Tile probes:
-  - Default `8x256x64,s7,w0`: `0.04036 ms` CUDA event avg.
-  - Existing `8x128x32,s7,w0`: `0.04376 ms`, slower.
-  - Existing `8x128x64,s7,w0`: `0.05080 ms`, slower.
-  - Temporary new `8x256x32,s10,w0`: `0.04387 ms`, slower.
-  - Temporary new `8x64x32,s14,w3`: `0.05052 ms`, slower.
-  - Temporary new `8x64x64,s7,w0`: `0.05089 ms`, slower.
+    - Default `8x256x64,s7,w0`: `0.04036 ms` CUDA event avg.
+    - Existing `8x128x32,s7,w0`: `0.04376 ms`, slower.
+    - Existing `8x128x64,s7,w0`: `0.05080 ms`, slower.
+    - Temporary new `8x256x32,s10,w0`: `0.04387 ms`, slower.
+    - Temporary new `8x64x32,s14,w3`: `0.05052 ms`, slower.
+    - Temporary new `8x64x64,s7,w0`: `0.05089 ms`, slower.
 - Code hygiene:
-  - The temporary probe selector and rejected `8x256x32`/`8x64` registry
+    - The temporary probe selector and rejected `8x256x32`/`8x64` registry
     instantiations were removed after measurement.
-  - Do not re-add these generic GEMM-template variants unless a new same-source
+    - Do not re-add these generic GEMM-template variants unless a new same-source
     microbench shows a win.
 - Next implementation direction:
-  - Existing generic GEMM tile scaling does not fix the low Tensor pipe/low
+    - Existing generic GEMM tile scaling does not fix the low Tensor pipe/low
     occupancy issue for this M=1 AWQ decode shape. A useful M=1-specific AWQ
     dense path must still preserve HMMA/tile-level dataflow; do not assume a
     scalar per-column GEMV replacement will be faster.
@@ -35693,41 +35693,41 @@ Interpretation:
 2026-06-20 Qwen3.6-27B-AWQ TP2 TurboMind M=1 GEMV rejection and 17408 NCU:
 
 - Transient scalar GEMV probe:
-  - I added, built, and measured a temporary source-local experimental op that
+    - I added, built, and measured a temporary source-local experimental op that
     used a pre-transposed raw AWQ qweight layout `[N/8, K]`, one warp per
     8 output columns, and group-level scale/zero reuse.
-  - The probe was numerically aligned with TurboMind on the target
+    - The probe was numerically aligned with TurboMind on the target
     `M=1,K=8704,N=5120,group=128` microbench (`max_abs=0.001953`,
     `mean_abs=0.000276`), but it was much slower:
-    - Current TurboMind `8x256x64,s7,w0`: `0.03980 ms`.
-    - Transposed scalar GEMV probe: `0.13601 ms` (`3.42x` slower).
-  - Artifact:
+        - Current TurboMind `8x256x64,s7,w0`: `0.03980 ms`.
+        - Transposed scalar GEMV probe: `0.13601 ms` (`3.42x` slower).
+    - Artifact:
     `bench_results/nsys_27b_awq_tp2_20260620/awq_gemv_transposed_k8704_n5120_probe.json`.
-  - The temporary op and bindings were removed after measurement. Do not
+    - The temporary op and bindings were removed after measurement. Do not
     reintroduce this scalar-GEMV direction unless the kernel design changes
     materially; the performance issue is not qweight nibble-order correctness.
 - Post-selector `1x17408x5120` NCU:
-  - Artifacts:
+    - Artifacts:
     `bench_results/nsys_27b_awq_tp2_20260620/ncu/awq_m1_n17408_k5120_postselector_warpstats.ncu-rep`,
     `_details.txt`, `_raw.csv`,
     `awq_m1_n17408_k5120_postselector_compute.ncu-rep`, and compute exports.
-  - Fast selector launch: `8x256x64,splits=3,swizzle=3`.
-  - Stable repeat200 CUDA event avg:
+    - Fast selector launch: `8x256x64,splits=3,swizzle=3`.
+    - Stable repeat200 CUDA event avg:
     `bench_results/nsys_27b_awq_tp2_20260620/awq_m1_n17408_k5120_postselector_repeat200.json`
     -> `0.06184 ms`; post-cleanup repeat50
     `awq_m1_n17408_k5120_postcleanup_repeat50.json` -> `0.06248 ms`.
-  - NCU counters for the selected launch:
+    - NCU counters for the selected launch:
     duration `70.624 us`, grid `216 CTAs`, waves/SM `1.00`,
     registers/thread `160`, dynamic shared memory/block `20.512 KiB`,
     achieved occupancy `18.13%`, active warps/SM `11.60`, SM throughput
     `43.88%`, Tensor pipe `23.60%`, DRAM throughput `61.29%`, L1/TEX
     throughput `75.96%`, scheduler no-eligible cycles `50.59%`.
-  - TurboMind's own measure path with fast selector disabled selected
+    - TurboMind's own measure path with fast selector disabled selected
     `8x128x32,splits=10,swizzle=3` and measured `0.06567 ms`
     (`awq_m1_n17408_k5120_tune_repeat200.json`), slower than the source fast
     selector. Keep the promoted selector spec for this descriptor.
 - Updated implication:
-  - The next useful work is not more generic tile variants and not scalar
+    - The next useful work is not more generic tile variants and not scalar
     GEMV. Focus on an HMMA-preserving M=1/small-M variant that lowers
     register/shared pressure or split/tail overhead, or on reducing/fusing the
     number of AWQ GEMM launches around the TurboMind backend.
@@ -35735,44 +35735,44 @@ Interpretation:
 2026-06-20 Qwen3.6-27B-AWQ TP2 custom all-reduce small-message tuning:
 
 - Scope:
-  - This was the first communication-side step after the nsys TileRT-style
+    - This was the first communication-side step after the nsys TileRT-style
     overlap analysis. It targets the hidden-state custom all-reduce latency
     visible after row-parallel AWQ/F16 projections; it is not a replacement for
     GEMM/activation/reduce tile fusion.
 - Code path:
-  - `csrc/custom_all_reduce.cuh` now chooses `block_limit=1` automatically only
+    - `csrc/custom_all_reduce.cuh` now chooses `block_limit=1` automatically only
     for SM70, `world_size=2`, and payloads `<= 40 KiB`.
-  - Larger messages keep the previous default block limit. The explicit
+    - Larger messages keep the previous default block limit. The explicit
     override `VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT=<1..36>` remains available.
-  - `vllm/envs.py` registers the override variable to avoid unknown-env
+    - `vllm/envs.py` registers the override variable to avoid unknown-env
     warnings.
 - Microbench evidence:
-  - `bench_results/nsys_27b_awq_tp2_20260620/custom_ar_block_limit_sizes_fp16_tp2.json`
+    - `bench_results/nsys_27b_awq_tp2_20260620/custom_ar_block_limit_sizes_fp16_tp2.json`
     measured TP2 fp16 graph-replay latency:
-    - `5120` elements: `block_limit=1` `10.59 us` vs `36` `12.96 us`.
-    - `10240` elements: `11.47 us` vs `13.03 us`.
-    - `20480` elements: `12.59 us` vs `13.45 us`.
-    - `40960` elements: `block_limit=1` is slower (`15.67 us` vs `14.45 us`).
-    - `81920` elements: `block_limit=1` is much slower (`21.70 us` vs
+        - `5120` elements: `block_limit=1` `10.59 us` vs `36` `12.96 us`.
+        - `10240` elements: `11.47 us` vs `13.03 us`.
+        - `20480` elements: `12.59 us` vs `13.45 us`.
+        - `40960` elements: `block_limit=1` is slower (`15.67 us` vs `14.45 us`).
+        - `81920` elements: `block_limit=1` is much slower (`21.70 us` vs
       about `16.05-16.35 us`).
-  - `custom_ar_block_limit_autoheuristic_check.json` confirmed the default
+    - `custom_ar_block_limit_autoheuristic_check.json` confirmed the default
     heuristic follows the small-message path for `5120` elements and keeps the
     old route for `40960`.
 - End-to-end evidence, same GPU0/1, 27B-AWQ TP2, `i512/o128`, CUDA graph,
   TurboMind fast selector:
-  - Pre-heuristic default AR
+    - Pre-heuristic default AR
     `27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_defaultar_gpu01_r3.json`:
     steady decode `56.168 tok/s`, TPOT `17.804 ms`.
-  - Explicit `VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT=1`
+    - Explicit `VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT=1`
     `27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_arblk1_r3.json`:
     steady decode `56.612 tok/s`, TPOT `17.664 ms`.
-  - Source auto heuristic
+    - Source auto heuristic
     `27b_awq_tp2_i512_o128_currentgraph_turbomind_fast_selector2_autoar_gpu01_r3.json`:
     steady decode `56.450 tok/s`, TPOT `17.715 ms`.
-  - Token hash stayed identical:
+    - Token hash stayed identical:
     `25acc1257b65019cd7398d36105134378675d9de82bc7d30c6b49d78b1f7b755`.
 - Implication:
-  - This is a real but small default win, around `+0.5%` end-to-end on the
+    - This is a real but small default win, around `+0.5%` end-to-end on the
     same-GPU comparison. Do not keep spending time on multi-kernel AR chunking:
     previous chunk tests showed multiple chunk AR launches scale badly. The next
     larger step remains a fused/chunk-aware single engine: preferably AWQ
@@ -35782,17 +35782,17 @@ Interpretation:
 2026-06-20 Qwen3.6-35B-A3B-AWQ TP2 Nsight Systems decode profile:
 
 - Scope correction:
-  - The profiling target for this task is 35B-AWQ, not 27B-AWQ. The preceding
+    - The profiling target for this task is 35B-AWQ, not 27B-AWQ. The preceding
     27B nsys profile is retained only as a diagnostic-method reference and must
     not be used to infer the 35B bottleneck.
-  - GPU policy for all follow-up runs: use suitable free V100s directly, but
+    - GPU policy for all follow-up runs: use suitable free V100s directly, but
     never stop, kill, reset, or otherwise interfere with a GPU process unless
     it was started by the current agent run or the operator explicitly
     authorizes the exact process. A parent `codex` process is not sufficient
     ownership evidence, because another Codex agent may be working in the same
     machine.
 - Successful profile artifact:
-  - Command shape: Qwen3.6-35B-A3B-AWQ, TP2, GPUs 0/1, input 4096, output 32,
+    - Command shape: Qwen3.6-35B-A3B-AWQ, TP2, GPUs 0/1, input 4096, output 32,
     warmup 1, repeat 1, greedy ignore-EOS, `max_model_len=8192`,
     `max_num_batched_tokens=4096`, `max_num_seqs=1`,
     `gpu_memory_utilization=0.6`, Flash-V100 attention, 0.0.3 compile-graph
@@ -35801,14 +35801,14 @@ Interpretation:
     (`VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=0`), packed recurrent decode enabled,
     `VLLM_SM70_LM_HEAD_TOP1=0`, text-only multimodal limit, and nsys
     `--cuda-graph-trace=node`.
-  - Files:
+    - Files:
     `bench_results/nsys_35b_awq_tp2_20260620/35b_awq_tp2_i4096_o32_compilegraph_awqtune0_nsys.json`,
     `.nsys-rep`, and `.sqlite`.
-  - Route logs confirmed text-only mode, Flash-V100 prefill/decode, GDN
+    - Route logs confirmed text-only mode, Flash-V100 prefill/decode, GDN
     FlashQLA decode, SM70 GDN schedule gates, SM70 AWQ MoE TurboMind batched
     path, legacy single-token AWQ MoE compact path, TP custom all-reduce, and
     CUDA graph capture completion.
-  - The nsys diagnostic run recorded steady decode `85.4383 tok/s`, TPOT
+    - The nsys diagnostic run recorded steady decode `85.4383 tok/s`, TPOT
     `11.704 ms`, prefill `0.5446 s`, and pure decode `0.3628 s` for 32
     output tokens. This is slower than the non-profile 4K/256 compile-graph
     reference
@@ -35817,66 +35817,66 @@ Interpretation:
     overhead. Use this artifact for bottleneck distribution, not accepted
     speed.
 - Per-token decode breakdown from the sqlite:
-  - The profile contained 62 `cudaGraphLaunch_v10000` runtime calls, i.e. 31
+    - The profile contained 62 `cudaGraphLaunch_v10000` runtime calls, i.e. 31
     replay pairs across the two TP workers. The first replay pair was skipped
     because it was tied to the prefill/first-token tail. The 29 complete
     steady intervals between the remaining replay pairs had mean `11.696 ms`,
     median `11.701 ms`, min `10.913 ms`, and max `11.917 ms`, matching the
     benchmark JSON TPOT.
-  - Aggregate GPU kernel-time split across both devices in those steady
+    - Aggregate GPU kernel-time split across both devices in those steady
     windows:
-    - F16 dense GEMV/GEMM: `234.561 ms`, `36.86%`, `8.088 ms` aggregate per
+        - F16 dense GEMV/GEMM: `234.561 ms`, `36.86%`, `8.088 ms` aggregate per
       token.
-    - AWQ MoE expert path: `131.876 ms`, `20.72%`, `4.547 ms` aggregate per
+        - AWQ MoE expert path: `131.876 ms`, `20.72%`, `4.547 ms` aggregate per
       token.
-    - TP custom all-reduce: `55.456 ms`, `8.71%`, `1.912 ms` aggregate per
+        - TP custom all-reduce: `55.456 ms`, `8.71%`, `1.912 ms` aggregate per
       token.
-    - GDN/linear-attention decode: `54.302 ms`, `8.53%`, `1.872 ms` aggregate
+        - GDN/linear-attention decode: `54.302 ms`, `8.53%`, `1.872 ms` aggregate
       per token.
-    - Elementwise/cache/misc: `44.928 ms`, `7.06%`, `1.549 ms` aggregate per
+        - Elementwise/cache/misc: `44.928 ms`, `7.06%`, `1.549 ms` aggregate per
       token.
-    - Flash-V100 decode attention: `37.756 ms`, `5.93%`, `1.302 ms` aggregate
+        - Flash-V100 decode attention: `37.756 ms`, `5.93%`, `1.302 ms` aggregate
       per token.
-    - MoE router top-k: `27.801 ms`, `4.37%`, `0.959 ms` aggregate per token.
-    - RMSNorm: `21.994 ms`, `3.46%`, `0.758 ms` aggregate per token.
-    - MoE activation: `9.562 ms`, `1.50%`, `0.330 ms` aggregate per token.
-    - memcpy/memset: `7.957 ms`, `1.25%`, `0.274 ms` aggregate per token.
-    - NCCL collective tail: `1.091 ms`, `0.17%`.
-  - Per-device split was balanced:
-    - Device 0 total aggregate kernel time `317.052 ms` (`10.933 ms` per
+        - MoE router top-k: `27.801 ms`, `4.37%`, `0.959 ms` aggregate per token.
+        - RMSNorm: `21.994 ms`, `3.46%`, `0.758 ms` aggregate per token.
+        - MoE activation: `9.562 ms`, `1.50%`, `0.330 ms` aggregate per token.
+        - memcpy/memset: `7.957 ms`, `1.25%`, `0.274 ms` aggregate per token.
+        - NCCL collective tail: `1.091 ms`, `0.17%`.
+    - Per-device split was balanced:
+        - Device 0 total aggregate kernel time `317.052 ms` (`10.933 ms` per
       token): F16 dense `36.68%`, AWQ MoE expert `20.78%`, TP custom
       all-reduce `9.17%`, GDN `8.39%`, elementwise/cache `6.90%`,
       Flash-V100 decode attention `5.95%`.
-    - Device 1 total aggregate kernel time `319.277 ms` (`11.010 ms` per
+        - Device 1 total aggregate kernel time `319.277 ms` (`11.010 ms` per
       token): F16 dense `37.04%`, AWQ MoE expert `20.67%`, GDN `8.68%`, TP
       custom all-reduce `8.26%`, elementwise/cache `7.22%`, Flash-V100 decode
       attention `5.92%`.
-  - Largest individual steady-decode kernels:
-    - `turbomind::gemm::gemm_kernel` for AWQ MoE expert GEMM:
+    - Largest individual steady-decode kernels:
+        - `turbomind::gemm::gemm_kernel` for AWQ MoE expert GEMM:
       `81.317 ms` aggregate, `2.804 ms` per token.
-    - `gemv2T_kernel_val` F16 GEMV variants:
+        - `gemv2T_kernel_val` F16 GEMV variants:
       `81.146 ms`, `39.229 ms`, `27.738 ms`, and `12.277 ms` aggregate
       buckets.
-    - `vllm::cross_device_reduce_1stage<half, 2>`:
+        - `vllm::cross_device_reduce_1stage<half, 2>`:
       `50.594 ms`, `1.745 ms` per token.
-    - Flash-V100 decode partition/reduce:
+        - Flash-V100 decode partition/reduce:
       `33.714 ms` and `4.042 ms`.
-    - `awq_moe_single_token_prepare_kernel`: `31.601 ms`.
-    - `vllm::moe::topkGating`: `27.801 ms`.
-    - GDN decode kernels such as `triton_per_fused_1`,
+        - `awq_moe_single_token_prepare_kernel`: `31.601 ms`.
+        - `vllm::moe::topkGating`: `27.801 ms`.
+        - GDN decode kernels such as `triton_per_fused_1`,
       `fused_sigmoid_gating_delta_rule_update_kernel`, and
       `_causal_conv1d_update_kernel`: together a meaningful but secondary
       bucket.
 - Interpretation:
-  - For 35B-A3B-AWQ TP2 decode, the main bottleneck is the combined model
+    - For 35B-A3B-AWQ TP2 decode, the main bottleneck is the combined model
     compute path: F16 dense GEMV/GEMM plus AWQ MoE expert execution is about
     `57.6%` of stable decode GPU kernel time. This is the primary optimization
     target.
-  - TP custom all-reduce (`~8.7%`), GDN/linear-attention decode (`~8.5%`),
+    - TP custom all-reduce (`~8.7%`), GDN/linear-attention decode (`~8.5%`),
     elementwise/cache small kernels (`~7.1%`), and Flash-V100 decode attention
     (`~5.9%`) are secondary. Attention alone is not the dominant 35B-AWQ
     bottleneck on this same-criterion compile-graph profile.
-  - The next implementation pass should focus on reducing F16 GEMV/GEMM count
+    - The next implementation pass should focus on reducing F16 GEMV/GEMM count
     and AWQ MoE single-token expert overhead, especially TurboMind expert GEMM,
     `awq_moe_single_token_prepare`, F16 GEMV dispatch, and the surrounding
     per-layer small-kernel pattern. All-reduce and GDN are follow-up targets
@@ -35885,71 +35885,71 @@ Interpretation:
 2026-06-20 Qwen3.6-35B-A3B-AWQ TP2 Nsight Compute resource utilization:
 
 - Tool and safety constraints:
-  - Nsight Systems GPU metrics are not available for the V100/Tesla PG503-216
+    - Nsight Systems GPU metrics are not available for the V100/Tesla PG503-216
     devices in this workstation, so SM/DRAM utilization must come from Nsight
     Compute counters.
-  - Nsight Compute requires privileged performance-counter access on this host
+    - Nsight Compute requires privileged performance-counter access on this host
     (`RmProfilingAdminOnly=1`). The valid NCU reports below were collected as
     root against isolated microbenchmarks on otherwise-free V100s.
-  - Root CUDA device ordering must be pinned with
+    - Root CUDA device ordering must be pinned with
     `CUDA_DEVICE_ORDER=PCI_BUS_ID`. Earlier dense GEMV trial reports without
     that env selected the RTX 4060 Ti (`CC 8.9`) as CUDA device 0 and are not
     valid V100 evidence. Only reports with `CC 7.0` are used below.
-  - Full-model NCU worker profiling of the 35B TP2 decode path failed during
+    - Full-model NCU worker profiling of the 35B TP2 decode path failed during
     NCU kernel replay. TP custom all-reduce microbench profiling also hung in
     kernel/application replay for
     `vllm::cross_device_reduce_1stage<half, 2>`. Keep using the nsys time
     split for all-reduce until an NCU `range`/`app-range` method is proven.
 - V100 Nsight Compute artifacts:
-  - Summary:
+    - Summary:
     `bench_results/nsight_35b_awq_tp2_20260620/ncu/sol_summary_v100.json`.
-  - AWQ MoE production GEMM:
+    - AWQ MoE production GEMM:
     `micro_v100_35b_awq_moe_layer1_legacy_single_token_gemm_rawdram.ncu-rep`
     and `_details.csv`; SpeedOfLight report
     `micro_35b_awq_moe_layer1_legacy_single_token_gemm_sol.ncu-rep`.
-  - F16 hidden projection GEMV:
+    - F16 hidden projection GEMV:
     `micro_v100_f16_gemv_hidden2048_out2048_sol.ncu-rep`,
     `micro_v100_f16_gemv_hidden2048_out2048_rawdram.ncu-rep`, and CSV
     exports.
-  - F16 large vocab/lm-head GEMM:
+    - F16 large vocab/lm-head GEMM:
     `micro_v100_f16_gemm_hidden2048_out151936_sol.ncu-rep`,
     `micro_v100_f16_gemm_hidden2048_out151936_rawdram.ncu-rep`, and CSV
     exports.
 - Resource utilization results:
-  - F16 hidden GEMV, shape `1x2048 @ 2048x2048`, V100 `gemv2T_kernel_val`:
+    - F16 hidden GEMV, shape `1x2048 @ 2048x2048`, V100 `gemv2T_kernel_val`:
     mean SpeedOfLight duration `19.2 us`, SM throughput `22.5%`, DRAM
     throughput `38.8%`. Raw DRAM pass measured `9.77 MB`, `509.8 GB/s`,
     `50.9%` of sustained peak, SM throughput `23.1%`. NCU flagged the grid
     as small: `(256, 1, 1)` blocks, about `0.4` full waves across SMs.
-  - F16 large vocab/lm-head GEMM, shape `1x2048 @ 2048x151936`, V100 CUTLASS
+    - F16 large vocab/lm-head GEMM, shape `1x2048 @ 2048x151936`, V100 CUTLASS
     `cutlass_70_wmma_tensorop_f16...gemm`: mean duration `635.7 us`, SM
     throughput `25.8%`, DRAM throughput `86.4%`. Raw DRAM pass measured
     `624.0 MB`, `981.0 GB/s`, `87.0%` of sustained peak. This is already a
     high-bandwidth kernel; kernel micro-tuning has limited headroom compared
     with avoiding or reducing the call/output work.
-  - AWQ MoE production `legacy_single_token_compact` TurboMind GEMM for layer
+    - AWQ MoE production `legacy_single_token_compact` TurboMind GEMM for layer
     1, `top_k=8`, `experts=256`, `hidden=2048`, `moe_intermediate=512`:
-    - W13/gate-up launch grid `(9, 8, 8)`: duration `33.57 us`, `9.41 MB`
+        - W13/gate-up launch grid `(9, 8, 8)`: duration `33.57 us`, `9.41 MB`
       DRAM, `280.2 GB/s`, DRAM `23.9%`, SM `28.6%`.
-    - W2/down launch grid `(9, 16, 4)`: duration `23.04 us`, `4.54 MB` DRAM,
+        - W2/down launch grid `(9, 16, 4)`: duration `23.04 us`, `4.54 MB` DRAM,
       `196.9 GB/s`, DRAM `17.5%`, SM `27.9%`.
-    - The later 64-block GEMMs in the exactness microbench are reference-check
+        - The later 64-block GEMMs in the exactness microbench are reference-check
       kernels, not the production compact path, and must not be used to infer
       end-to-end decode utilization.
 - Interpretation:
-  - The F16 dense bucket is bandwidth-oriented. The large vocab/lm-head GEMM
+    - The F16 dense bucket is bandwidth-oriented. The large vocab/lm-head GEMM
     is already at about `87%` sustained DRAM peak on V100, while smaller
     hidden GEMVs are partly small-grid limited and still consume hundreds of
     GB/s. The best speed lever is reducing dense calls or the amount of dense
     output work, especially logits/lm-head work, not expecting a large gain
     from retuning the existing cuBLAS/CUTLASS kernels.
-  - The AWQ MoE expert GEMM bucket is not bandwidth saturated and not close to
+    - The AWQ MoE expert GEMM bucket is not bandwidth saturated and not close to
     peak SM throughput. It is dominated by small single-token expert shapes and
     surrounding metadata/launch work. There is still optimization room, but it
     is more likely in packing/fusion/launch reduction and
     `awq_moe_single_token_prepare`/router metadata flow than in pure GEMM math
     micro-tuning alone.
-  - Combining the nsys time split with NCU counters: 35B-AWQ TP2 decode is
+    - Combining the nsys time split with NCU counters: 35B-AWQ TP2 decode is
     mainly split between a high-bandwidth F16 dense path (`36.9%` of stable
     decode GPU time) and an under-occupied AWQ MoE path (`20.7%`). TP
     all-reduce remains a secondary `8.7%` time bucket, but its hardware
@@ -35963,9 +35963,9 @@ Interpretation:
   check and should not be treated as part of the vLLM runtime.
 - Temporary SM70-enablement patches were needed before Mirage would import or
   attempt JIT on V100:
-  - add CUDA architecture `70` to `CMakeLists.txt`;
-  - add V100 shared-memory capacity (`96 KiB`) in `python/mirage/utils.py`;
-  - relax the generic transpiler guard in `src/transpiler/transpile.cc` from
+    - add CUDA architecture `70` to `CMakeLists.txt`;
+    - add V100 shared-memory capacity (`96 KiB`) in `python/mirage/utils.py`;
+    - relax the generic transpiler guard in `src/transpiler/transpile.cc` from
     A100+ to V100+.
 - After rebuilding, `python/mirage/core.cpython-312-x86_64-linux-gnu.so`
   contains `sm_70` cubins and `import mirage` succeeds on V100
@@ -35977,27 +35977,27 @@ Interpretation:
   not yet a production-quality SM70 route.
 - Follow-up SM70 threadblock patches unblocked the generic customized matmul
   path on V100:
-  - `src/transpiler/transpiler_tb.cc` now selects the CuTe Volta atom
+    - `src/transpiler/transpiler_tb.cc` now selects the CuTe Volta atom
     `SM70_8x8x4_F16F16F16F16_TN` for fp16 customized matmul and throws a
     runtime error instead of relying on release-dead `assert(0)` for unsupported
     architectures.
-  - `include/mirage/transpiler/runtime/threadblock/matmul.h` now has an
+    - `include/mirage/transpiler/runtime/threadblock/matmul.h` now has an
     `IS_LDMATRIX_AVAIL=false` selector path and bypasses the SM75+
     `ldmatrix`/all-zero-fragment branch for SM70 universal shared-to-register
     copies.
 - V100 GPU0 evidence with `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0`:
-  - Small customized matmul `(8,64) @ (64,64)`, generated `file_id=7003`:
+    - Small customized matmul `(8,64) @ (64,64)`, generated `file_id=7003`:
     `compile done True`, `valid True`, output shape `(8,64)`, `max_abs
     0.001953125`, `bad 0 / 512` under the existing `1e-1` mismatch rule.
-  - Gated-MLP shape from `tests/python/test_tensor_program.py::test_gated_mlp`
+    - Gated-MLP shape from `tests/python/test_tensor_program.py::test_gated_mlp`
     (`8x4096`, two `4096x4096` weights, grid `(64,1,1)`, block `(128,1,1)`,
     forloop `64`) generated `file_id=7004` and compiled/ran. The original test
     input scale overflows fp16 outputs to `inf`, so that run is only route
     evidence, not numeric quality evidence.
-  - Same gated-MLP shape with scaled weights, generated `file_id=7005`: finite
+    - Same gated-MLP shape with scaled weights, generated `file_id=7005`: finite
     outputs, output shape `(8,4096)`, `max_abs 1.15625`, `max_rel 0.0198`,
     `bad 0 / 32768` under the existing Mirage test criterion.
-  - The official `pytest` wrapper was not run because the local overlay venv
+    - The official `pytest` wrapper was not run because the local overlay venv
     does not include `pytest`; the test body above was run directly.
 - Updated status: Mirage generic customized fp16 matmul/gated-MLP is no longer
   blocked by the SIGFPE/SM75 `ldmatrix` issue on V100. This is still not MPK or
@@ -36044,28 +36044,28 @@ Interpretation:
   tiles. Searches over the generated CUDA found no `ldmatrix`, `.bf16`,
   `m16n8k16`, `cp.async`, or `mma.sync` instructions in the SM70 linear path.
 - Two V100 MPK runtime blockers were fixed:
-  - `include/mirage/persistent_kernel/runtime_header.h` now caps SM70 dynamic
+    - `include/mirage/persistent_kernel/runtime_header.h` now caps SM70 dynamic
     shared memory at `96 KiB - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE`.
     Before this, the worker kernel requested `163840` bytes dynamic shared
     memory and never actually entered on V100. After the fix the launcher
     prints `smem size: 95232`.
-  - `include/mirage/persistent_kernel/tasks/common/copy_sm80.cuh` now has a
+    - `include/mirage/persistent_kernel/tasks/common/copy_sm80.cuh` now has a
     non-`cp.async` fallback for `load_smem()` and
     `load_smem_with_predict()`. Before this, SM70 compiled the functions as
     empty bodies, so workers fetched task ids but copied no `TaskDesc` data
     into shared memory.
 - Runtime correctness evidence on V100 GPU2:
-  - Minimal verbose smoke `B=1,K=8,N=64`, `num_workers=1`,
+    - Minimal verbose smoke `B=1,K=8,N=64`, `num_workers=1`,
     `num_local_schedulers=1`: worker fetched begin task, triggered the launch
     event, executed `TASK_LINEAR`, triggered end-of-graph, and returned.
-  - `B=8,K=128,N=128`, `num_workers=1`, `num_local_schedulers=1`:
+    - `B=8,K=128,N=128`, `num_workers=1`, `num_local_schedulers=1`:
     `max_abs=0.0`, `max_rel=0.0`, `bad 0 / 1024`,
     `SM70_MPK_LINEAR_SMOKE_PASS`.
-  - Same `B=8,K=128,N=128` with default V100
+    - Same `B=8,K=128,N=128` with default V100
     `mirage.get_configurations_from_gpu(0)` output
     `64` workers and `32` schedulers: `max_abs=3.814697265625e-06`,
     `bad 0 / 1024`, `SM70_MPK_LINEAR_DEFAULT_CFG_PASS`.
-  - Qwen hidden-size smoke `B=8,K=4096,N=4096`, default `64/32`
+    - Qwen hidden-size smoke `B=8,K=4096,N=4096`, default `64/32`
     worker/scheduler config: `max_abs=7.62939453125e-06`,
     `max_rel=0.0009661835501901805`, `bad 0 / 32768`,
     `SM70_MPK_LINEAR_QWEN_SHAPE_PASS`.
@@ -36089,22 +36089,22 @@ Interpretation:
   total shared-memory limit and test-mode hung after scheduler launch. After
   the fix, launch prints `smem size: 81920`.
 - V100 GPU2 correctness and route evidence:
-  - `B=8,K=128,N=128`, `num_workers=1`, `num_local_schedulers=1`:
+    - `B=8,K=128,N=128`, `num_workers=1`, `num_local_schedulers=1`:
     `max_abs=9.5367431640625e-07`, `max_rel=0.0006802721181884408`,
     `bad 0 / 1024`, `SM70_MPK_LINEAR_WMMA_SMOKE_PASS`.
-  - `B=8,K=4096,N=4096`, default V100 `64/32` worker/scheduler config:
+    - `B=8,K=4096,N=4096`, default V100 `64/32` worker/scheduler config:
     `max_abs=1.52587890625e-05`, `max_rel=0.0009643201483413577`,
     `bad 0 / 32768`, `SM70_MPK_LINEAR_WMMA_QWEN_SHAPE_PASS`.
-  - `cuobjdump --dump-sass` on
+    - `cuobjdump --dump-sass` on
     `generated_mpk_sm70_linear_wmma_qwen_shape/mpk_launcher_rank0...so`
     shows `HMMA.884.F32.F32.STEP*` instructions. The scalar-forced B=1 build
     shows `FFMA.FTZ` and no HMMA in the sampled lines, so the default path is
     genuinely using Volta tensor cores.
 - Rough test-mode timing, measured with CUDA events around `pk.run_test_mode()`
   and therefore including worker/scheduler launch overhead:
-  - `B=8,K=4096,N=4096`, default config: WMMA median
+    - `B=8,K=4096,N=4096`, default config: WMMA median
     `0.06144 ms`; scalar-forced median `0.06554 ms`.
-  - `B=1,K=4096,N=4096`, default config: WMMA median
+    - `B=1,K=4096,N=4096`, default config: WMMA median
     `0.06042 ms`; scalar-forced median `0.07066 ms`.
   These timings are useful only as route sanity checks. They are not steady-state
   persistent-kernel decode latency and should not be compared directly to vLLM
@@ -36220,29 +36220,29 @@ Interpretation:
   186 output tokens. Since DFlash16 is the target route, do not spend the next
   pass stabilizing DFlash4 before the K16 verifier bottleneck is addressed.
 - Interpretation:
-  - K16 is active and exact under greedy with the full-GDN verifier, but it is
+    - K16 is active and exact under greedy with the full-GDN verifier, but it is
     not accelerating yet: `34.50 tok/s` greedy and `27.73 tok/s` official are
     both well below the matched no-DFlash references (`55.86` and `54.52
     tok/s` steady decode).
-  - The immediate blocker is not whether DFlash can be enabled at K16. The
+    - The immediate blocker is not whether DFlash can be enabled at K16. The
     blocker is the combination of low long-position acceptance and expensive
     quality-safe full-GDN verification.
-  - The existing GDN spec-core route remains a failed K16 candidate: it changes
+    - The existing GDN spec-core route remains a failed K16 candidate: it changes
     the greedy token hash and is slower than full-GDN at K16 in this benchmark.
     DFlash should not inherit that route as a default until the spec-core state
     snapshot/commit semantics match the full-GDN reference and a same-K16 speed
     run shows an actual win.
-  - The next DFlash speed pass should focus on a quality-safe narrow GDN spec
+    - The next DFlash speed pass should focus on a quality-safe narrow GDN spec
     verifier boundary and full-GDN verifier overhead reduction on K16. Also
     inspect draft/target distribution mismatch for official sampling, where
     acceptance falls to `0.1685` overall.
-  - External DDTree/Diffusion Draft Tree work exists and targets this exact
+    - External DDTree/Diffusion Draft Tree work exists and targets this exact
     vanilla-DFlash limitation by constructing a draft tree from the DFlash
     block distribution and verifying the tree with an ancestor-only attention
     mask. This repository currently has no DDTree/DTree implementation or flag;
     treating it as a local switch would be wrong. A local DDTree port would be
     a new verifier/tree-attention implementation, not a config tweak.
-  - Do not spend another pass sweeping smaller DFlash K values or treating
+    - Do not spend another pass sweeping smaller DFlash K values or treating
     DDTree/DTree as a local drop-in flag; this repository does not currently
     contain a local DDTree/DTree DFlash implementation.
 
@@ -36261,14 +36261,14 @@ Interpretation:
   `27b_awq_tp2_i512_o128_currentgraph_nsys.sqlite` produced:
   `tile_runtime_candidate_ranking_i512_o128_currentgraph.json` and `.md`.
 - Highest-value candidates:
-  - device 0, AWQ GEMM `grid=1x20x7`: `62.896` calls/token,
+    - device 0, AWQ GEMM `grid=1x20x7`: `62.896` calls/token,
     `775.813 us/token` all-reduce after the GEMM, `2406.688 us/token` in the
     preceding GEMM, `140` CTAs, eligible for an 80-SM V100 tile-overlap
     experiment.
-  - device 0, AWQ GEMM `grid=1x40x12`: `62.968` calls/token,
+    - device 0, AWQ GEMM `grid=1x40x12`: `62.968` calls/token,
     `755.913 us/token` all-reduce after the GEMM, `1742.154 us/token` in the
     preceding GEMM, `480` CTAs, also eligible.
-  - device 1 shows the same ordering with `732.124 us/token` and
+    - device 1 shows the same ordering with `732.124 us/token` and
     `710.721 us/token` all-reduce after those two GEMM grids.
 - Interpretation: the first TileRT-style implementation should not split
   all-reduce into many launched chunk kernels. The chunk diagnostic already
@@ -36286,9 +36286,9 @@ Interpretation:
 
 - Implemented a standalone TP2 tile-runtime prototype that does not affect the
   decode path:
-  - `_C_custom_ar.tile_runtime_all_reduce`
-  - `CustomAllreduce.tile_runtime_all_reduce`
-  - `benchmarks/benchmark_sm70_tile_runtime.py`
+    - `_C_custom_ar.tile_runtime_all_reduce`
+    - `CustomAllreduce.tile_runtime_all_reduce`
+    - `benchmarks/benchmark_sm70_tile_runtime.py`
 - The kernel is a single-launch persistent CTA pool. Each tile task copies the
   local tile to a peer-visible staging buffer, publishes a tile-ready flag via
   the existing custom-AR signal memory, waits for peer tile flags, and reduces
@@ -36300,12 +36300,12 @@ Interpretation:
 - TP2 GPU0/1 engine-block sweep:
   `bench_results/nsys_27b_awq_tp2_20260620/tile_runtime_proto_5120_fp16_tp2_engineblocks.json`
   showed:
-  - `tile_numel=5120`: about `10.7-10.8 us`, `max_abs=0`.
-  - `tile_numel=2560`: about `12.35-12.45 us` with enough worker blocks,
+    - `tile_numel=5120`: about `10.7-10.8 us`, `max_abs=0`.
+    - `tile_numel=2560`: about `12.35-12.45 us` with enough worker blocks,
     `max_abs=0`.
-  - `tile_numel=1024`: about `12.07-12.13 us` with enough worker blocks,
+    - `tile_numel=1024`: about `12.07-12.13 us` with enough worker blocks,
     `max_abs=0`.
-  - `tile_numel=512`: about `12.22 us` with `engine_blocks=0`, but about
+    - `tile_numel=512`: about `12.22 us` with `engine_blocks=0`, but about
     `65.5 us` with only one worker block.
 - Interpretation: the substrate works and remains in the same latency class as
   optimized custom AR for coarse tiles. Fine tiles need enough resident worker
@@ -36317,9 +36317,9 @@ Interpretation:
 
 - Added a second experimental custom-AR op that follows the public TileRT
   block-specialization direction more closely:
-  - `_C_custom_ar.tile_runtime_all_reduce_engine`
-  - `CustomAllreduce.tile_runtime_all_reduce_engine`
-  - `benchmarks/benchmark_sm70_tile_runtime.py --modes engine`
+    - `_C_custom_ar.tile_runtime_all_reduce_engine`
+    - `CustomAllreduce.tile_runtime_all_reduce_engine`
+    - `benchmarks/benchmark_sm70_tile_runtime.py --modes engine`
 - The new kernel separates producer CTAs from reducer CTAs in one CUDA
   graph-compatible launch. Producer CTAs write local tiles into the registered
   peer-visible staging buffer and publish tile-ready flags. Reducer CTAs wait
@@ -36327,14 +36327,14 @@ Interpretation:
 - Build/install completed for `_C.abi3.so`; Python schema check confirmed
   `torch.ops._C_custom_ar.tile_runtime_all_reduce_engine`.
 - TP2 GPU0/1 validation artifacts:
-  - `tile_runtime_engine_phase1_5120_fp16_tp2_smoke.json`
-  - `tile_runtime_engine_phase1_5120_fp16_tp2_rolesweep.json`
-  - `tile_runtime_engine_phase1_5120_fp16_tp2_inline_baseline_1000.json`
+    - `tile_runtime_engine_phase1_5120_fp16_tp2_smoke.json`
+    - `tile_runtime_engine_phase1_5120_fp16_tp2_rolesweep.json`
+    - `tile_runtime_engine_phase1_5120_fp16_tp2_inline_baseline_1000.json`
 - Correctness: all tested modes reported `max_abs=0`.
 - Same-replay 5120-fp16 TP2 baseline:
-  - inline prototype, `tile_numel=5120`: about `11.41 us`.
-  - role engine, `tile_numel=5120`: best observed about `12.27 us`.
-  - role engine, `tile_numel=2560`: best observed about `12.82 us`.
+    - inline prototype, `tile_numel=5120`: about `11.41 us`.
+    - role engine, `tile_numel=5120`: best observed about `12.27 us`.
+    - role engine, `tile_numel=2560`: best observed about `12.82 us`.
 - Interpretation: this is not a standalone AR-speed win. It pays extra CTA and
   flag overhead when the producer is only a synthetic copy. Its value is that
   the local code now has the official-style role-separated producer/reducer
@@ -36345,9 +36345,9 @@ Interpretation:
 
 - New design note: `docs/design/sm70_dflash_ddtree_27b_awq_plan.md`.
 - Cloned two public DDTree references under `third_party/ddtree_refs/`:
-  - `official_ddtree` at `c96427a185677bf4133ed865dd1626a5041aef9b`,
+    - `official_ddtree` at `c96427a185677bf4133ed865dd1626a5041aef9b`,
     MIT license.
-  - `aeon_qwen36_ddtree` at `d2610ae5e42ddcbccbf8cd800c67644d3c7843f6`,
+    - `aeon_qwen36_ddtree` at `d2610ae5e42ddcbccbf8cd800c67644d3c7843f6`,
     Apache-2.0 license.
 - Decision: use both repositories as references, not drop-in dependencies.
   The official implementation gives the algorithmic tree builder/verifier walk;
@@ -36357,14 +36357,14 @@ Interpretation:
   `dflash_ddtree` flat-fallback alias before touching scheduler, sampler,
   Flash-V100 verifier, or Qwen GDN state commit code.
 - M1 is now present locally:
-  - `vllm/v1/spec_decode/ddtree_tree.py`
-  - `vllm/v1/spec_decode/ddtree_metadata.py`
-  - `tests/v1/spec_decode/test_ddtree_tree.py`
-  - `tests/v1/spec_decode/test_ddtree_metadata.py`
+    - `vllm/v1/spec_decode/ddtree_tree.py`
+    - `vllm/v1/spec_decode/ddtree_metadata.py`
+    - `tests/v1/spec_decode/test_ddtree_tree.py`
+    - `tests/v1/spec_decode/test_ddtree_metadata.py`
 - M2 flat-fallback entry is also present:
-  - `method="dflash_ddtree"` is accepted by `SpeculativeConfig`.
-  - `DFlashProposer` accepts both `dflash` and `dflash_ddtree`.
-  - `ddtree_budget`, `ddtree_top_k`, `ddtree_chain_seed`, and
+    - `method="dflash_ddtree"` is accepted by `SpeculativeConfig`.
+    - `DFlashProposer` accepts both `dflash` and `dflash_ddtree`.
+    - `ddtree_budget`, `ddtree_top_k`, `ddtree_chain_seed`, and
     `ddtree_disable_tree_verify` are recorded, with tree verification disabled
     by default.
 - Validation completed in the `1cat-vllm-1.2.0-releasecheck` conda env by
@@ -36372,26 +36372,26 @@ Interpretation:
   have `pytest` installed. Targeted `ruff check` and `py_compile` also passed
   for the touched DDTree/DFlash/config files.
 - M3 payload-only path is now present:
-  - `vllm/v1/spec_decode/ddtree_payload.py` builds per-request
+    - `vllm/v1/spec_decode/ddtree_payload.py` builds per-request
     `DDTreeDraftPayload` objects from the DFlash first-pass logits and reuses
     the local `build_ddtree()` helper.
-  - `DFlashProposer` overrides `_sample_draft_tokens()` for
+    - `DFlashProposer` overrides `_sample_draft_tokens()` for
     `method="dflash_ddtree"` so the same logits block feeds both current flat
     draft sampling and DDTree payload construction.
-  - `GPUModelRunner` caches the latest payload out-of-band via
+    - `GPUModelRunner` caches the latest payload out-of-band via
     `take_dflash_ddtree_payloads()`. Scheduler output, `DraftTokenIds`, and
     rejection sampling remain unchanged.
-  - Validation covered `top_k=1` flat-chain parity and `top_k=2` sibling branch
+    - Validation covered `top_k=1` flat-chain parity and `top_k=2` sibling branch
     construction with direct assert tests, plus targeted ruff/py_compile.
 - Next step is M4/M5 correctness: consume this payload in a verifier prototype
   without committing rejected Qwen3.6 GDN state. The current payload path
   materializes top-k/logprob data to CPU and is not yet a performance path.
 - M4 helper path has started:
-  - `tree_from_payload()` reconstructs `DDTree` from a `DDTreeDraftPayload`.
-  - `vllm/v1/spec_decode/ddtree_verify.py` provides metadata construction,
+    - `tree_from_payload()` reconstructs `DDTree` from a `DDTreeDraftPayload`.
+    - `vllm/v1/spec_decode/ddtree_verify.py` provides metadata construction,
     prompt-plus-tree attention verifier inputs, and greedy verification from
     compact root-plus-node logits.
-  - Tests cover full-chain accept, sibling-branch accept, payload metadata
+    - Tests cover full-chain accept, sibling-branch accept, payload metadata
     rebuild, and sibling hiding in the dense attention mask.
 - Remaining M4 work is the actual target-model oracle: run a small
   attention-only model with the prompt-plus-tree inputs and compare one-pass
@@ -36400,10 +36400,10 @@ Interpretation:
 ## 2026-06-21 DDTree Scheduler/GDN Metadata Bridge
 
 - Implemented the first end-to-end data bridge for DDTree payloads:
-  - `DraftTokenIds.ddtree_payloads`
-  - `SchedulerOutput.scheduled_ddtree_payloads`
-  - scheduler-side per-request payload caching and strict token/payload matching
-  - worker-side payload return from `GPUModelRunner.take_draft_token_ids()`
+    - `DraftTokenIds.ddtree_payloads`
+    - `SchedulerOutput.scheduled_ddtree_payloads`
+    - scheduler-side per-request payload caching and strict token/payload matching
+    - worker-side payload return from `GPUModelRunner.take_draft_token_ids()`
 - Added `vllm/v1/spec_decode/ddtree_parent_metadata.py`, which converts
   `DDTreeDraftPayload.parent_indices` into padded root-plus-tree parent-id rows
   aligned with the active request batch.
@@ -36416,9 +36416,9 @@ Interpretation:
   `ddtree_num_tree_tokens_cpu`, and existing GDN diagnostic dumps include those
   fields.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - direct DDTree assert tests passed for config, tree, metadata, parent
+    - direct DDTree assert tests passed for config, tree, metadata, parent
     metadata, payload, verifier helpers, and scheduler bridge.
-  - `py_compile` passed for all touched DDTree/config/scheduler/runner/GDN
+    - `py_compile` passed for all touched DDTree/config/scheduler/runner/GDN
     files.
 - Environment caveat: this conda env currently lacks both `pytest` and `ruff`;
   direct test invocation and `py_compile` were used instead.
@@ -36430,33 +36430,33 @@ Interpretation:
 
 - Added greedy DDTree sampling from compact root-plus-node target logits:
   `vllm/v1/spec_decode/ddtree_sampler.py`.
-  - It returns normal `SamplerOutput.sampled_token_ids` plus
+    - It returns normal `SamplerOutput.sampled_token_ids` plus
     `SamplerOutput.ddtree_accepted_node_indices`.
-  - `GPUModelRunner._sample()` uses it only for `dflash_ddtree` tree verify,
+    - `GPUModelRunner._sample()` uses it only for `dflash_ddtree` tree verify,
     all-greedy sampling, no logprobs, no penalties, no token masks, and no
     logits processors. Other cases fall back to the existing rejection sampler.
 - Added experimental FlexAttention DDTree logical masking:
-  - `FlexAttentionMetadata` can carry `ddtree_parent_ids` and
+    - `FlexAttentionMetadata` can carry `ddtree_parent_ids` and
     `ddtree_num_tree_tokens`.
-  - The paged mask wrapper permits history/root/self/ancestor visibility and
+    - The paged mask wrapper permits history/root/self/ancestor visibility and
     hides sibling branches.
 - Added DDTree position handling in `GPUModelRunner`:
-  - slot mapping and token-id lookup stay linear;
-  - after slot mapping, tree-node `positions` are rewritten to
+    - slot mapping and token-id lookup stay linear;
+    - after slot mapping, tree-node `positions` are rewritten to
     `root_position + node_depth`.
 - Added attention-only accepted-path KV compaction:
-  - non-hybrid models copy accepted DDTree KV rows from their tree slots back
+    - non-hybrid models copy accepted DDTree KV rows from their tree slots back
     into the contiguous prefix slots before the next step reads cache;
-  - hybrid Qwen3.6 models remain guarded because GDN/Mamba recurrent state
+    - hybrid Qwen3.6 models remain guarded because GDN/Mamba recurrent state
     compaction is not implemented yet.
 - Scheduler tree-row expansion now avoids partial trees and only emits a DDTree
   payload when the scheduled rows exactly match the payload. Branched DDTree
   scheduling is allowed only for non-hybrid models; hybrid models accept only
   flat-chain-equivalent payloads until parent-aware GDN state commit exists.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - `py_compile` passed for scheduler, runner, outputs, DDTree sampler, and
+    - `py_compile` passed for scheduler, runner, outputs, DDTree sampler, and
     FlexAttention.
-  - Direct DDTree assert tests passed for config, tree, metadata, parent
+    - Direct DDTree assert tests passed for config, tree, metadata, parent
     metadata, payload, verifier helpers, sampler, scheduler bridge,
     FlexAttention mask, DDTree position override, and accepted KV compaction.
 - Remaining blocker for the requested 27B-AWQ route:
@@ -36469,21 +36469,21 @@ Interpretation:
 ## 2026-06-21 DDTree Hybrid State Guard
 
 - Tightened flat-chain detection:
-  - `DDTreeDraftPayload.is_flat_chain()` now requires verifier token ids,
+    - `DDTreeDraftPayload.is_flat_chain()` now requires verifier token ids,
     parent ids, and node depths to be the exact linear draft chain.
-  - Scheduler fallback checking uses the same stricter semantics, so a payload
+    - Scheduler fallback checking uses the same stricter semantics, so a payload
     with matching token order but branched parent ids is rejected for hybrid
     scheduling.
 - Added runner-side hybrid protection:
-  - `GPUModelRunner._ddtree_accepted_nodes_are_flat_prefix()` identifies
+    - `GPUModelRunner._ddtree_accepted_nodes_are_flat_prefix()` identifies
     accepted DDTree paths that are still a normal linear prefix.
-  - `GPUModelRunner._validate_ddtree_hybrid_state_path()` runs before
+    - `GPUModelRunner._validate_ddtree_hybrid_state_path()` runs before
     recurrent-state postprocess and raises if a branched DDTree payload reaches
     a hybrid model without tree-aware GDN/Mamba state support.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - `py_compile` passed for DDTree payload, scheduler, GPU runner, and the
+    - `py_compile` passed for DDTree payload, scheduler, GPU runner, and the
     focused tests.
-  - Direct assert tests passed for payload, scheduler, and GPU runner
+    - Direct assert tests passed for payload, scheduler, and GPU runner
     DDTree position/KV/state-guard helpers.
 - This is a correctness guard, not a speed milestone. The next implementation
   slice is still the real hybrid state path: compute each GDN/Mamba tree node
@@ -36494,13 +36494,13 @@ Interpretation:
 
 - Added the first runner-side split between generated-token count and
   recurrent-state slot selection for DDTree:
-  - `GPUModelRunner._ddtree_state_slot_selectors_from_accepted_nodes()` maps
+    - `GPUModelRunner._ddtree_state_slot_selectors_from_accepted_nodes()` maps
     accepted compact node indices to the selector value consumed by existing
     hybrid state code (`selected_slot + 1`).
-  - Flat accepted paths preserve old MTP semantics: accepted nodes `[1, 2]`
+    - Flat accepted paths preserve old MTP semantics: accepted nodes `[1, 2]`
     produce selector `3`, matching the three generated output rows
     `accepted draft 1`, `accepted draft 2`, and bonus.
-  - Branched accepted paths no longer collapse to generated-token count:
+    - Branched accepted paths no longer collapse to generated-token count:
     accepted nodes `[4, 5]` produce selector `6`, identifying compact tree
     state slot 5.
 - `_update_states_after_model_execute()` now accepts optional
@@ -36508,9 +36508,9 @@ Interpretation:
   DDTree payload is present. The existing hybrid branched-payload guard still
   runs first, so this does not yet enable unsafe Qwen3.6 branched execution.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - `py_compile` passed for `gpu_model_runner.py` and the focused DDTree GPU
+    - `py_compile` passed for `gpu_model_runner.py` and the focused DDTree GPU
     runner test.
-  - Direct focused tests passed for DDTree position override, accepted KV
+    - Direct focused tests passed for DDTree position override, accepted KV
     compaction mapping, state-slot selector, state-update selector wiring, and
     hybrid branch guard.
 - Remaining required work is unchanged: GDN/Mamba forward kernels must compute
@@ -36522,24 +36522,24 @@ Interpretation:
 
 - Added `GDNAttentionMetadata.spec_state_slot_selectors` and
   `GDNSpecDecodeStateContract.spec_state_slot_selectors`.
-  - The default is still `num_accepted_tokens`, preserving the existing MTP
+    - The default is still `num_accepted_tokens`, preserving the existing MTP
     contract where accepted count and selected speculative state slot are the
     same value.
-  - Callers may now pass `spec_state_slot_selectors` separately to
+    - Callers may now pass `spec_state_slot_selectors` separately to
     `build_gdn_spec_decode_state_contract()` and
     `GDNAttentionMetadataBuilder.build()`, allowing DDTree to represent
     generated-token count and selected compact tree state slot independently.
-  - This field is intentionally not added to `GDN_SPEC_METADATA_TENSORS` or
+    - This field is intentionally not added to `GDN_SPEC_METADATA_TENSORS` or
     the `qwen_gdn_attention_core_spec_commit` graph-op signature yet; that
     remains the next kernel-facing integration step.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - `py_compile` passed for `vllm/v1/attention/backends/gdn_attn.py` and the
+    - `py_compile` passed for `vllm/v1/attention/backends/gdn_attn.py` and the
     focused GDN metadata test file.
-  - Direct contract checks passed for both default selector semantics and the
+    - Direct contract checks passed for both default selector semantics and the
     split selector case (`num_accepted_tokens=[2]`,
     `spec_state_slot_selectors=[4]` selects state slot 13 from
     `[10,11,12,13,14]`).
-  - Full pytest execution was not run because this releasecheck environment
+    - Full pytest execution was not run because this releasecheck environment
     does not currently provide `pytest`.
 - Next required step: make Qwen GDN tree-aware kernels consume both
   `ddtree_parent_ids` and `spec_state_slot_selectors`, then split Mamba
@@ -36549,9 +36549,9 @@ Interpretation:
 ## 2026-06-21 Runner-to-GDN Selector Plumbing
 
 - Split the runner-side GPU buffers that feed hybrid GDN metadata:
-  - `GPUModelRunner.num_accepted_tokens` now remains the actual contiguous
+    - `GPUModelRunner.num_accepted_tokens` now remains the actual contiguous
     generated-token count from `SamplerOutput.sampled_token_ids`.
-  - `GPUModelRunner.spec_state_slot_selectors` carries the state selector,
+    - `GPUModelRunner.spec_state_slot_selectors` carries the state selector,
     defaulting to the generated-token count and switching to the DDTree
     selected compact node slot when `ddtree_accepted_node_indices` is present.
 - `_build_attention_metadata()` now passes both tensors to
@@ -36561,20 +36561,20 @@ Interpretation:
   this plumbing is inert for unsafe Qwen3.6 branches until the GDN core consumes
   DDTree parent/state metadata.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - `py_compile` passed for GPU runner, GDN metadata, and focused tests.
-  - Direct DDTree runner tests passed, including the case where generated count
+    - `py_compile` passed for GPU runner, GDN metadata, and focused tests.
+    - Direct DDTree runner tests passed, including the case where generated count
     is `2` while the DDTree state selector is `4`.
-  - Direct GDN contract checks passed for default and split selector cases.
+    - Direct GDN contract checks passed for default and split selector cases.
 
 ## 2026-06-21 Qwen GDN Selector Consumption
 
 - Qwen GDN core now consumes `GDNAttentionMetadata.spec_state_slot_selectors`
   for speculative conv/recurrent state selection:
-  - `_forward_core()` passes the selector tensor to `causal_conv1d_update()`
+    - `_forward_core()` passes the selector tensor to `causal_conv1d_update()`
     and `fused_recurrent_gated_delta_rule()` when present.
-  - `qwen_gdn_attention_core_spec_commit()` does the same for the explicit
+    - `qwen_gdn_attention_core_spec_commit()` does the same for the explicit
     spec-core graph boundary and patches metadata fallback with the selector.
-  - FULL-graph GDN metadata padding now pads `spec_state_slot_selectors`
+    - FULL-graph GDN metadata padding now pads `spec_state_slot_selectors`
     alongside `num_accepted_tokens`, so live rows and graph-visible state rows
     stay aligned.
 - This still does not implement DDTree parent-state compute. The GDN kernels
@@ -36582,47 +36582,47 @@ Interpretation:
   still processed as a linear spec sequence until `ddtree_parent_ids` is
   consumed by the conv/GDN recurrence itself.
 - Validation in `1cat-vllm-1.2.0-releasecheck`:
-  - `py_compile` passed for GDN metadata, Qwen GDN core, GPU runner, and
+    - `py_compile` passed for GDN metadata, Qwen GDN core, GPU runner, and
     focused test files.
-  - A direct fake-kernel `qwen_gdn_attention_core_spec_commit()` smoke verified
+    - A direct fake-kernel `qwen_gdn_attention_core_spec_commit()` smoke verified
     that conv/recurrent calls receive `spec_state_slot_selectors` rather than
     `num_accepted_tokens`.
-  - Full DDTree direct tests still passed.
+    - Full DDTree direct tests still passed.
 
 ## 2026-06-21 TurboMind AWQ MoE Weighted-Reduce Epilogue
 
 - Implemented the first TurboMind-based AWQ MoE single-token decode
   optimization for the legacy compact route:
-  - `awq_moe_single_token_sm70_out()` now asks the prepare kernel to materialize
+    - `awq_moe_single_token_sm70_out()` now asks the prepare kernel to materialize
     `sorted_weights` in sorted expert-row order.
-  - The W2 TurboMind dispatch uses the existing
+    - The W2 TurboMind dispatch uses the existing
     `kMoeWeightedReduce` epilogue when the logical hidden output is aligned, so
     the common Qwen3.6-35B-A3B-AWQ decode path skips the separate
     `awq_moe_single_token_weighted_reduce_out` kernel and avoids treating
     `sorted_output` as a required final product.
-  - If the logical hidden output is not aligned with the W2 output shape, the
+    - If the logical hidden output is not aligned with the W2 output shape, the
     old W2 plus standalone reduce fallback remains in place.
 - Python/runtime plumbing now carries a persistent `sorted_weights` scratch
   buffer through the AWQ MoE layer, warmup path, and exactness harness. Callers
   still zero the final output before invoking the fused epilogue because the
   TurboMind reduce path accumulates into the destination.
 - Validation in `1cat-vllm-1.2.0-wheelcheck`:
-  - editable SM70 build succeeded with
+    - editable SM70 build succeeded with
     `CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=7.0 MAX_JOBS=8`;
-  - op schema check confirmed the new `sorted_weights` argument is registered;
-  - `py_compile` passed for `_sm70_ops.py`, `awq_sm70_moe.py`,
+    - op schema check confirmed the new `sorted_weights` argument is registered;
+    - `py_compile` passed for `_sm70_ops.py`, `awq_sm70_moe.py`,
     `awq_sm70_warmup.py`, and `benchmark_sm70_turbomind_exactness.py`;
-  - Qwen3.6-35B-A3B-AWQ layer-1 exactness on V100 passed the op-level fp16
+    - Qwen3.6-35B-A3B-AWQ layer-1 exactness on V100 passed the op-level fp16
     gate for both `round_robin` and `random_unique:1` expert patterns:
     final weighted output `max_diff=7.62939453125e-06`, no sign mismatches,
     and fused W13+SiLU bitwise exact.
 - Decode smoke caveat:
-  - A short 35B-AWQ TP2 compile-graph smoke reached model load, TurboMind MoE
+    - A short 35B-AWQ TP2 compile-graph smoke reached model load, TurboMind MoE
     warmup, and CUDA graph capture, then failed engine initialization during
     graph capture without an operator stack.
-  - The same short eager smoke was terminated during checkpoint loading with
+    - The same short eager smoke was terminated during checkpoint loading with
     EngineCore `-15`.
-  - These runs are not accepted speed evidence. The next speed step must rerun
+    - These runs are not accepted speed evidence. The next speed step must rerun
     the matching 35B-AWQ TP2 decode case under Nsight Systems/Compute once the
     environment can keep the engine alive, and must report pure decode
     separately from load, TTFT, and prefill.
@@ -36633,9 +36633,9 @@ Interpretation:
   `VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1`, `--disable-custom-all-reduce`,
   `--gpu-memory-utilization 0.70`, `--max-model-len 2048`,
   `input_len=32`, `output_len=4`, and `warmup=0`.
-  - The run hit `SM70 AWQ MoE TurboMind batched path enabled`, TurboMind
+    - The run hit `SM70 AWQ MoE TurboMind batched path enabled`, TurboMind
     warmup, and `legacy single-token monolithic compact path enabled`.
-  - It is route-hit evidence only, not speed evidence, because the accepted
+    - It is route-hit evidence only, not speed evidence, because the accepted
     baseline must not use this conservative/eager/no-custom-AR setup.
 - Nsight Systems on the same conservative route with `output_len=8` confirmed
   that the standalone `awq_moe_single_token_weighted_reduce` kernel is gone.
@@ -36646,7 +36646,7 @@ Interpretation:
   unsupported architecture. Whole-run resource estimates therefore need the
   safer two-step method: Nsys for kernel time buckets plus NCU for selected
   representative kernels.
-  - Rechecked with sudo on the active `/usr/local/cuda/bin/nsys` 2024.6.2
+    - Rechecked with sudo on the active `/usr/local/cuda/bin/nsys` 2024.6.2
     binary after operator feedback. The result is the same for V100:
     `Tesla PG503-216 ... Unsupported architecture`; only the RTX 4060 Ti is
     listed as a supported GPU metrics device. Earlier project Nsys captures
@@ -36659,28 +36659,28 @@ Interpretation:
   layer-1 AWQ MoE exactness harness, capturing the first two TurboMind
   `gemm_kernel` launches on a V100. Stage labels are inferred from call order:
   W13 fused SiLU/mul first, W2 fused weighted-reduce second.
-  - W13 fused SiLU/mul: `34.016 us`, SM throughput `29.73% avg`
+    - W13 fused SiLU/mul: `34.016 us`, SM throughput `29.73% avg`
     (`34.13% max`), DRAM throughput `23.31% avg`, compute-memory throughput
     `52.06% avg`, L1TEX throughput `59.34% avg`, L2 throughput `11.61% avg`,
     tensor-pipe active `8.39% avg`.
-  - W2 fused weighted-reduce: `29.184 us`, SM throughput `21.45% avg`
+    - W2 fused weighted-reduce: `29.184 us`, SM throughput `21.45% avg`
     (`24.46% max`), DRAM throughput `13.58% avg`, compute-memory throughput
     `34.32% avg`, L1TEX throughput `41.33% avg`, L2 throughput `7.76% avg`,
     tensor-pipe active `4.72% avg`.
-  - Interpretation: the TurboMind AWQ MoE decode GEMMs are not DRAM-bandwidth
+    - Interpretation: the TurboMind AWQ MoE decode GEMMs are not DRAM-bandwidth
     saturated in the single-token/top-k shape. The remaining headroom is mostly
     from low small-GEMM occupancy/parallelism and launch granularity, not from
     the removed standalone weighted-reduce kernel.
 - Nsight Compute SpeedOfLight was also collected for the full-model F16 dense
   `gemv2T_kernel_val` kernel by profiling only the benchmark
   `cudaProfilerStart/Stop` region (`--profile-from-start off`).
-  - Two matched `grid=768x1x1` launches measured `44.512 us` and `43.744 us`.
-  - SM throughput was `36.42%` and `37.39%` avg; DRAM throughput was `49.98%`
+    - Two matched `grid=768x1x1` launches measured `44.512 us` and `43.744 us`.
+    - SM throughput was `36.42%` and `37.39%` avg; DRAM throughput was `49.98%`
     and `50.80%` avg; L1TEX throughput was `52.73%` and `52.04%` avg; L2
     throughput was `25.88%` and `26.37%` avg.
-  - Tensor-pipe active was `0.0%` for these kernels because the cuBLAS path is
+    - Tensor-pipe active was `0.0%` for these kernels because the cuBLAS path is
     GEMV, not tensor-core GEMM.
-  - Interpretation: the main F16 dense GEMV bucket still has optimization
+    - Interpretation: the main F16 dense GEMV bucket still has optimization
     room. It is partially bandwidth-limited but not near peak DRAM; it is also
     not using tensor cores, so improvements should focus on batching/fusing
     GEMV work, replacing GEMV with grouped/batched GEMM where shape permits, or
@@ -36692,34 +36692,34 @@ Interpretation:
   `gemv2T` decode kernels above are only around half of peak DRAM.
 - F16 dense allowlist route-hit experiments on the same short
   35B-AWQ TP2 eager/fallback/custom-AR smoke:
-  - Baseline with no F16 dense fast path:
+    - Baseline with no F16 dense fast path:
     `steady_decode_tps=8.3039`, `tpot=0.120425 s`.
-  - `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` plus
+    - `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` plus
     `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj` prepared and used
     `language_model.model.layers.*.linear_attn.out_proj` (`2048x2048`) and
     improved the short smoke to `steady_decode_tps=8.5354`,
     `tpot=0.117159 s` (`~2.8%` vs baseline).
-  - Expanding the allowlist to `in_proj_qkvz,in_proj_ba,out_proj` was a
+    - Expanding the allowlist to `in_proj_qkvz,in_proj_ba,out_proj` was a
     regression on the same short smoke: `steady_decode_tps=8.1371`,
     `tpot=0.122894 s`. Do not default the GDN input projections to the current
     SM70 F16 dense path without a different implementation or longer accepted
     evidence.
 - Nsys timeline for the `out_proj`-only F16 dense fast path:
-  - The first attempt ended during checkpoint loading before producing a
+    - The first attempt ended during checkpoint loading before producing a
     decode JSON or `.nsys-rep`; it is discarded as invalid evidence.
-  - Retry1 completed with
+    - Retry1 completed with
     `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1`,
     `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj`, custom all-reduce enabled,
     `input_len=32`, `output_len=8`, `warmup=1`, `repeat=1`, eager/fallback.
     Under Nsys overhead it measured `tpot=0.147911 s` and
     `steady_decode_tps=6.7608`; this is only a timeline sample, not a speed
     baseline.
-  - The timeline confirms the route is real: per V100, CUBLAS/CUTLASS dense
+    - The timeline confirms the route is real: per V100, CUBLAS/CUTLASS dense
     launches dropped from `3360` to `3120`, and `240` TurboMind F16 dense
     launches appeared (`Operand_B_Pack<__half>`). AWQ MoE TurboMind launches
     stayed at `624` per V100 and no standalone AWQ weighted-reduce kernel
     appeared.
-  - Using the same classifier and excluding only the custom all-reduce
+    - Using the same classifier and excluding only the custom all-reduce
     wait/spin kernel from active kernel time, CUBLAS/CUTLASS dense went from
     `25.692/25.609 ms` per V100 to `22.185/22.067 ms`; the new TurboMind F16
     dense bucket was `4.651/4.659 ms` per V100, or about `4.7/5.0%` of active
@@ -36728,13 +36728,13 @@ Interpretation:
     uplift alone.
 - NCU SpeedOfLight for the real 35B-AWQ `linear_attn.out_proj` TurboMind F16
   decode kernel (`layer0`, weight `[2048,4096]`, input `[1,4096]`) measured:
-  - Duration `31.648 us`, grid `(16,1,4)`, block `(128,1,1)`, `0.44`
+    - Duration `31.648 us`, grid `(16,1,4)`, block `(128,1,1)`, `0.44`
     waves/SM.
-  - SM throughput `8.35% avg` (`9.86% max`), DRAM throughput `46.94% avg`
+    - SM throughput `8.35% avg` (`9.86% max`), DRAM throughput `46.94% avg`
     (`47.19% max`), compute-memory throughput `46.94% avg`, L1TEX throughput
     `50.11% avg`, L2 throughput `21.46% avg`, tensor-pipe active
     `4.62% avg`.
-  - Interpretation: this fast path is a narrow memory-oriented improvement for
+    - Interpretation: this fast path is a narrow memory-oriented improvement for
     one projection, not a high-utilization tensor-core regime. The larger
     optimization target remains regrouping/fusing more decode work so that the
     model exposes larger effective M or fewer launches.
@@ -36742,33 +36742,33 @@ Interpretation:
   Qwen3.5 MoE projection to the F16 dense path. `out_proj` remains available
   only through the explicit experimental
   `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj` gate.
-  - The earlier short eager/fallback smoke with `out_proj` showed a local
+    - The earlier short eager/fallback smoke with `out_proj` showed a local
     operator-level gain (`steady_decode_tps=8.5354` vs `8.3039`, about
     `+2.8%`), but that was not accepted 35B speed evidence.
-  - Same-card 35B-AWQ TP2 formal decode lane, `input_len=4096`,
+    - Same-card 35B-AWQ TP2 formal decode lane, `input_len=4096`,
     `output_len=1024`, `--ignore-eos`, no-compile FULL decode graph, custom
     all-reduce, GPU 2/3:
-    - no F16 dense:
+        - no F16 dense:
       `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_no_f16dense.json`,
       `steady_decode_tps_mean=74.1842`, `tpot_seconds_mean=0.013480`.
-    - F16 `out_proj`:
+        - F16 `out_proj`:
       `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_f16outproj_gpu23_rerun.json`,
       `steady_decode_tps_mean=73.0648`, `tpot_seconds_mean=0.013686`.
-    - Delta: F16 `out_proj` is `-1.51%` on the same GPU pair for the formal
+        - Delta: F16 `out_proj` is `-1.51%` on the same GPU pair for the formal
       4K/1K graph lane. The default allowlist was reverted; keep this route
       explicit unless a new implementation changes the long-run result.
 - F16 dense split follow-up:
-  - `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj,in_proj_qkvz` passed a short
+    - `VLLM_SM70_MOE_DENSE_ALLOWLIST=out_proj,in_proj_qkvz` passed a short
     35B-AWQ TP2 eager/fallback/custom-AR smoke with `input_len=32`,
     `output_len=8`, `warmup=1`, `repeat=1`.
-  - Result: `steady_decode_tps=8.3369`, `tpot=0.119949 s`. This is slightly
+    - Result: `steady_decode_tps=8.3369`, `tpot=0.119949 s`. This is slightly
     above the no-F16 eager smoke but below `out_proj`-only, so `in_proj_qkvz`
     must not be added to the default allowlist.
-  - `out_proj,in_proj_ba` did not produce valid speed evidence: one attempt
+    - `out_proj,in_proj_ba` did not produce valid speed evidence: one attempt
     failed startup due low free memory in the local CUDA view, and a retry
     terminated during checkpoint loading.
 - Graph route recovery:
-  - The old 0.0.3 compile graph route
+    - The old 0.0.3 compile graph route
     (`VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`,
     `mode=VLLM_COMPILE`, `cudagraph_mode=FULL_AND_PIECEWISE`) still fails on
     the 35B-AWQ TP2 short run during the first PIECEWISE CUDA graph capture.
@@ -36776,7 +36776,7 @@ Interpretation:
     before worker exit; a no-custom-all-reduce rerun reproduced the same
     worker termination after Dynamo bytecode transform. This rules out custom
     all-reduce as the primary blocker.
-  - Explicit no-compile decode graph recovered the large lost speed component:
+    - Explicit no-compile decode graph recovered the large lost speed component:
     `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=0`,
     `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1`,
     `mode=NONE`, `cudagraph_mode=FULL_DECODE_ONLY`, capture size `1`, custom
@@ -36784,24 +36784,24 @@ Interpretation:
     `repeat=3` short sample completed graph capture in about `1 s`, registered
     `80` custom-all-reduce graph addresses per rank, and measured
     `steady_decode_tps_mean=87.5845`, `tpot_mean=0.011418 s`.
-  - Source policy update: SM70 Flash-V100 now honors the default
+    - Source policy update: SM70 Flash-V100 now honors the default
     `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=1` when deciding whether to
     auto-set `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`. The quality/speed
     and release matrix helpers now default to no-compile decode graph as well.
     The compile graph route remains available by explicitly setting
     `VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE=0` and
     `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1`.
-  - Verification without either graph env explicitly set:
+    - Verification without either graph env explicitly set:
     35B-AWQ TP2 `input_len=128`, `output_len=16`, `warmup=1`, `repeat=2`
     logged `Using SM70 Flash-V100 no-compile decode CUDA graph policy:
     mode=NONE, cudagraph_mode=FULL_DECODE_ONLY, capture_size=1`, completed
     FULL decode graph capture, and measured `steady_decode_tps_mean=86.6214`,
     `tpot_mean=0.011545 s`.
-  - A 35B-AWQ TP2 4K/1K speed run without `ignore_eos` is not accepted
+    - A 35B-AWQ TP2 4K/1K speed run without `ignore_eos` is not accepted
     because one measured repeat naturally stopped at token `66`. Its pure
     decode TPS (`72.51` for the full-length repeat and `73.62` for the short
     repeat) was useful as route evidence only.
-  - Accepted 4K/1K speed baseline for this lane:
+    - Accepted 4K/1K speed baseline for this lane:
     Qwen3.6-35B-A3B-AWQ, TP2, GPUs `0,1`, `input_len=4096`,
     `output_len=1024`, `ignore_eos=true`, `warmup=1`, `repeat=2`,
     `max_model_len=262144`, `max_num_batched_tokens=8096`,
@@ -36809,19 +36809,19 @@ Interpretation:
     Flash-V100 attention, no MTP, default no-compile decode CUDA graph,
     and `VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=1` with the default MoE
     `out_proj` allowlist.
-    - Route logs: `mode=NONE`, `cudagraph_mode=FULL_DECODE_ONLY`,
+        - Route logs: `mode=NONE`, `cudagraph_mode=FULL_DECODE_ONLY`,
       capture size `1`; FULL decode graph capture completed in about `1 s`;
       custom all-reduce registered `80` CUDA graph addresses per rank;
       `SM70 AWQ MoE TurboMind batched path enabled`; legacy single-token
       compact path enabled; Flash-V100 backend selected; fused LM-head top1
       path enabled during inference.
-    - Capacity: GPU KV cache size `1,433,469` tokens; maximum concurrency
+        - Capacity: GPU KV cache size `1,433,469` tokens; maximum concurrency
       `5.47x` for `262,144` tokens per request.
-    - Both measured repeats produced `1024` tokens with `finish_reason=length`.
+        - Both measured repeats produced `1024` tokens with `finish_reason=length`.
       Pure steady decode TPS values were `72.5456` and `72.5576`;
       mean `72.5516 tok/s`. Mean TPOT was `13.7833 ms`; mean prefill time was
       `0.7997 s`; mean end-to-end output throughput was `68.7105 tok/s`.
-  - Interpretation: the no-compile FULL_DECODE_ONLY lane restores the missing
+    - Interpretation: the no-compile FULL_DECODE_ONLY lane restores the missing
     graph-replay speed and gives a valid 4K/1K baseline, but it is still below
     the earlier 35B-AWQ TP2 long-context Flash-V100 pure decode evidence
     (`84.5963 tok/s` on `input_len=16324`, `output_len=256`) and below the
@@ -36829,27 +36829,27 @@ Interpretation:
     next optimization step should profile this accepted 4K/1K lane with Nsys
     timeline plus targeted NCU kernels to locate the remaining gap.
 - Relevant artifacts:
-  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_turbomind_weighted_reduce_i32_o4_eager_fallback_gmem070_nocar.json`
-  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_nocar_i32_o8.nsys-rep`
-  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_nocar_i32_o8_kernel_summary.json`
-  - `bench_results/sm70_migration_20260621/ncu_awq_moe_legacy_weighted_reduce_35a3b_layer1_random_unique1_turbomind_w13_w2_sol_gpu0_summary.json`
-  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_customar_i32_o8_kernel_summary.json`
-  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_customar_i32_o8_kernel_summary_v2.json`
-  - `bench_results/sm70_migration_20260621/ncu_dense_gemv2t_35a3b_awq_tp2_i32_o4_profile_startstop_sol_summary.json`
-  - `bench_results/sm70_migration_20260621/ncu_micro_dense_cutlass_fp16_m1_k2048_n49152_sol_summary.json`
-  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_outproj_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
-  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_gdn_inout_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
-  - `bench_results/sm70_migration_20260621/decode_nsys_35a3b_awq_tp2_f16_outproj_fastpath_i32_o8_eager_fallback_gmem070_customar_retry1.json`
-  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_f16_outproj_fastpath_eager_fallback_customar_i32_o8_retry1.nsys-rep`
-  - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_f16_outproj_fastpath_eager_fallback_customar_i32_o8_retry1_kernel_summary.json`
-  - `bench_results/sm70_migration_20260621/ncu_f16_outproj_sm70_qwen36_35a3b_layer0_m1_sol_summary.json`
-  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_outproj_defaultallow_i32_o4_eager_fallback_gmem070_customar.json`
-  - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_out_qkvz_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
-  - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o32_gmem070_nocar_retry1.log`
-  - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o32_nocompile_full_decode_gmem070_customar.json`
-  - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o16_default_nocompile_route_gmem070_customar.json`
-  - `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_nocompile_fulldecode_gmem088_customar_f16outproj.json`
-  - `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_f16outproj.json`
+    - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_turbomind_weighted_reduce_i32_o4_eager_fallback_gmem070_nocar.json`
+    - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_nocar_i32_o8.nsys-rep`
+    - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_nocar_i32_o8_kernel_summary.json`
+    - `bench_results/sm70_migration_20260621/ncu_awq_moe_legacy_weighted_reduce_35a3b_layer1_random_unique1_turbomind_w13_w2_sol_gpu0_summary.json`
+    - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_customar_i32_o8_kernel_summary.json`
+    - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_eager_fallback_customar_i32_o8_kernel_summary_v2.json`
+    - `bench_results/sm70_migration_20260621/ncu_dense_gemv2t_35a3b_awq_tp2_i32_o4_profile_startstop_sol_summary.json`
+    - `bench_results/sm70_migration_20260621/ncu_micro_dense_cutlass_fp16_m1_k2048_n49152_sol_summary.json`
+    - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_outproj_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
+    - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_gdn_inout_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
+    - `bench_results/sm70_migration_20260621/decode_nsys_35a3b_awq_tp2_f16_outproj_fastpath_i32_o8_eager_fallback_gmem070_customar_retry1.json`
+    - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_f16_outproj_fastpath_eager_fallback_customar_i32_o8_retry1.nsys-rep`
+    - `bench_results/sm70_migration_20260621/nsys_35a3b_awq_tp2_f16_outproj_fastpath_eager_fallback_customar_i32_o8_retry1_kernel_summary.json`
+    - `bench_results/sm70_migration_20260621/ncu_f16_outproj_sm70_qwen36_35a3b_layer0_m1_sol_summary.json`
+    - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_outproj_defaultallow_i32_o4_eager_fallback_gmem070_customar.json`
+    - `bench_results/sm70_migration_20260621/decode_smoke_35a3b_awq_tp2_f16_out_qkvz_fastpath_i32_o8_eager_fallback_gmem070_customar.json`
+    - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o32_gmem070_nocar_retry1.log`
+    - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o32_nocompile_full_decode_gmem070_customar.json`
+    - `bench_results/sm70_migration_20260621/decode_graph_35a3b_awq_tp2_f16_outproj_default_i128_o16_default_nocompile_route_gmem070_customar.json`
+    - `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_nocompile_fulldecode_gmem088_customar_f16outproj.json`
+    - `bench_results/sm70_migration_20260621/decode_35a3b_awq_tp2_i4096_o1024_ignoreeos_nocompile_fulldecode_gmem088_customar_f16outproj.json`
 
 ## 2026-06-21 DDTree 27B-AWQ Bring-Up Status
 
@@ -36859,65 +36859,65 @@ Interpretation:
   acceleration evidence.
 - Implemented the first graph-safe DDTree verifier stack for
   Qwen3.6-27B-AWQ:
-  - fused DDTree GDN verifier state path in causal conv and sigmoid-gating
+    - fused DDTree GDN verifier state path in causal conv and sigmoid-gating
     delta-rule update;
-  - Flash-V100 paged-KV Triton ancestor-mask branch attention in
+    - Flash-V100 paged-KV Triton ancestor-mask branch attention in
     `vllm/v1/attention/backends/ddtree_branch_triton.py`;
-  - Flash-V100 DDTree route now prefers `prefill_ddtree_triton` and keeps the
+    - Flash-V100 DDTree route now prefers `prefill_ddtree_triton` and keeps the
     old dense mask as an eager correctness fallback only;
-  - DDTree env switches are registered in `envs.py`.
+    - DDTree env switches are registered in `envs.py`.
 - Correctness checks:
-  - Python compile passed for `envs.py`, `flash_attn_v100.py`, and
+    - Python compile passed for `envs.py`, `flash_attn_v100.py`, and
     `ddtree_branch_triton.py`.
-  - Synthetic CUDA attention checks matched the dense DDTree visibility mask
+    - Synthetic CUDA attention checks matched the dense DDTree visibility mask
     exactly, including padded parent slots and sliding-window masking.
-  - Real 27B-AWQ DDTree runs matched the no-spec hash
+    - Real 27B-AWQ DDTree runs matched the no-spec hash
     `d7e8a039cc9363c9d968bb2b1c0deea9cf6a53fecca39a7fdfdc853a869eaf7f`.
 - Valid speed evidence on `input_len=32`, `output_len=16`, TP2, AWQ,
   Flash-V100, `mamba_cache_mode=align`, spec tokens `16`:
-  - Normal no-spec graph baseline:
+    - Normal no-spec graph baseline:
     `bench_results/ddtree_smoke_20260621/27b_awq_nospec_flashv100_graph_i32_o16_w2r3.json`,
     mean steady decode `48.6173 tok/s`.
-  - Old DDTree tree verify with dense attention fallback:
+    - Old DDTree tree verify with dense attention fallback:
     `27b_awq_dflash_ddtree32_topk4_nochain_flashv100_i32_o16.json`,
     eager, mean steady decode `4.8949 tok/s`.
-  - Fused GDN plus dense attention fallback:
+    - Fused GDN plus dense attention fallback:
     `27b_awq_dflash_ddtree32_topk4_nochain_fusedgdn_tree_eager_i32_o16.json`,
     eager, mean steady decode `8.8475 tok/s`.
-  - Fused GDN plus Triton branch attention:
+    - Fused GDN plus Triton branch attention:
     `27b_awq_dflash_ddtree32_topk4_nochain_tritonattn_fusedgdn_tree_eager_i32_o16.json`,
     eager, route `prefill_ddtree_triton=160`, mean steady decode
     `11.4074 tok/s`.
-  - Fused GDN plus Triton branch attention with no-compile FULL_DECODE_ONLY
+    - Fused GDN plus Triton branch attention with no-compile FULL_DECODE_ONLY
     graph:
     `27b_awq_dflash_ddtree32_topk4_nochain_tritonattn_fusedgdn_tree_graph_i32_o16_w2r3.json`,
     capture size `33`, route `prefill_ddtree_triton=400`, mean steady decode
     `12.0542 tok/s`.
 - Invalid or non-best DDTree evidence:
-  - Runs without `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE=1` can silently
+    - Runs without `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE=1` can silently
     reject branched payloads and schedule flat speculative rows. Treat those as
     invalid DDTree tree-verify speed numbers.
-  - AEON-style `ddtree_budget=22`, `top_k=8`, `chain_seed=true`, adapted to
+    - AEON-style `ddtree_budget=22`, `top_k=8`, `chain_seed=true`, adapted to
     spec tokens `16`, completed but was slower: `9.5538 tok/s`, acceptance
     length `2.8333`, `num_drafts=6`.
-  - `ddtree_budget=32`, `top_k=8`, `chain_seed=true` exited during engine
+    - `ddtree_budget=32`, `top_k=8`, `chain_seed=true` exited during engine
     startup with process status `139`; no route or sampler metrics were
     produced, so it is not evidence.
 - Interpretation:
-  - The DDTree verifier kernel and CUDA graph path are now functional, but
+    - The DDTree verifier kernel and CUDA graph path are now functional, but
     DDTree is still far below the normal no-spec graph baseline.
-  - Current best DDTree accepts only `11` target tokens across `5` drafts for
+    - Current best DDTree accepts only `11` target tokens across `5` drafts for
     16 output tokens (`acceptance_length=3.2`, `draft_tokens_per_step=32`).
     This acceptance/proposal quality is the main speed limiter now.
-  - `build_ddtree_payloads_from_logits()` still does GPU-to-CPU top-k/logprob
+    - `build_ddtree_payloads_from_logits()` still does GPU-to-CPU top-k/logprob
     materialization and Python heap tree construction on the hot path. Profile
     and replace that before claiming recovered DDTree speed.
 - Next DDTree work:
-  - Add per-step DDTree timing for tree build, drafter forward, target verify,
+    - Add per-step DDTree timing for tree build, drafter forward, target verify,
     sampler, and state/KV commit.
-  - Move the DDTree payload builder off the synchronized Python CPU path or
+    - Move the DDTree payload builder off the synchronized Python CPU path or
     prove its cost is negligible on long-output runs.
-  - Continue only DDTree tree-verify parameter sweeps motivated by the
+    - Continue only DDTree tree-verify parameter sweeps motivated by the
     reference plan (`budget=32/40/48`, `top_k=4/8`, chain seed on/off), with
     hash parity and `prefill_ddtree_triton` route required.
 
@@ -36981,104 +36981,104 @@ Interpretation:
 
 - Implemented a default-off TurboMind-only TP2 experiment for the dense MLP
   `down_proj` boundary:
-  - GEMM epilogue publishes tile-ready flags for complete output N tiles.
-  - Custom all-reduce rank-data/IPC registration is reused by the AWQ GEMM op.
-  - `RowParallelLinear.down_proj` can dispatch a single graph-capturable custom
+    - GEMM epilogue publishes tile-ready flags for complete output N tiles.
+    - Custom all-reduce rank-data/IPC registration is reused by the AWQ GEMM op.
+    - `RowParallelLinear.down_proj` can dispatch a single graph-capturable custom
     op under `VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP=1`.
-  - Supported scope is M=1 decode, TP2, fp16 output, Qwen3.6-27B-AWQ dense MLP.
+    - Supported scope is M=1 decode, TP2, fp16 output, Qwen3.6-27B-AWQ dense MLP.
 - Correctness state:
-  - Same-stream wait-reduce and epilogue-fused reduce both reached exact token
+    - Same-stream wait-reduce and epilogue-fused reduce both reached exact token
     hash parity after fixing logical tile publication and per-tile epoch
     advancement.
-  - Stable 32-token comparison hash for both baseline and fused path:
+    - Stable 32-token comparison hash for both baseline and fused path:
     `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
 - Performance state:
-  - Accepted comparison shape: Qwen3.6-27B-AWQ, TP2, GPU0/1,
+    - Accepted comparison shape: Qwen3.6-27B-AWQ, TP2, GPU0/1,
     `input_len=512`, `output_len=32`, `warmup=1`, `repeat=2`, Flash-V100
     compile graph, AWQ TurboMind dense path enabled.
-  - Baseline normal custom all-reduce:
+    - Baseline normal custom all-reduce:
     `17.7176 ms` mean TPOT, `56.4411 tok/s` steady decode.
-  - Epilogue-fused tile reduce:
+    - Epilogue-fused tile reduce:
     `18.0920 ms` mean TPOT, `55.2730 tok/s` steady decode.
-  - Result: fused epilogue reduce is about `2.1%` slower and must not be
+    - Result: fused epilogue reduce is about `2.1%` slower and must not be
     promoted.
-  - Tail-worker reduce, same-day current-binary A/B; the benchmark command
+    - Tail-worker reduce, same-day current-binary A/B; the benchmark command
     recorded `VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS=1`:
-    - baseline normal custom all-reduce:
+        - baseline normal custom all-reduce:
       `17.5106 ms` mean TPOT, `57.1084 tok/s` steady decode;
-    - tail-worker reduce:
+        - tail-worker reduce:
       `17.9204 ms` mean TPOT, `55.8023 tok/s` steady decode;
-    - stable token hash matched baseline:
+        - stable token hash matched baseline:
       `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
-    - Result: tail-worker improves the earlier per-tile fused variant but is
+        - Result: tail-worker improves the earlier per-tile fused variant but is
       still about `2.34%` slower than the current normal path.
 - Interpretation:
-  - This is a useful negative result. Waiting for peer tiles inside the
+    - This is a useful negative result. Waiting for peer tiles inside the
     Tensor Core GEMM CTA makes the GEMM critical path longer. The next
     TileRT-style route must use a lightweight tile scheduler/worker that does
     not block producer CTAs and does not serialize the final row reduce into a
     single tail CTA.
-  - The earlier side-stream reducer-worker prototype hung in actual decode,
+    - The earlier side-stream reducer-worker prototype hung in actual decode,
     so it should be redesigned rather than scaled by more reducer CTAs.
-  - A post-benchmark attempt to turn `reducer_blocks == 1` into an explicit
+    - A post-benchmark attempt to turn `reducer_blocks == 1` into an explicit
     tail-worker switch caused graph-capture startup failure
     (`Registering 0 cuda graph addresses`, then worker exit) and was reverted.
 - Artifacts:
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/baseline_i512_o32_r2.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/fused_localfrag_i512_o32_r2.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/baseline_current_i512_o32_r2.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_i512_o32_r2.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_i512_o4.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/epilogue_fused_epochfix_i512_o4.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/samestream_publishfix_i512_o4.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/baseline_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/fused_localfrag_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/baseline_current_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_i512_o4.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/epilogue_fused_epochfix_i512_o4.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/samestream_publishfix_i512_o4.json`
 
 ### Single-kernel reducer CTA follow-up
 
 - Implemented a narrower default-off single-kernel prototype:
-  - Env gate:
+    - Env gate:
     `VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS`, default `0`.
-  - TurboMind producer CTAs store rank-local staging output and publish
+    - TurboMind producer CTAs store rank-local staging output and publish
     tile-ready flags without waiting.
-  - A second z-plane of reducer CTAs is appended to the same `gemm_kernel`
+    - A second z-plane of reducer CTAs is appended to the same `gemm_kernel`
     launch. Active reducer CTAs wait for both TP2 ranks' tile flags and write
     final `half2` sums.
-  - Scope remains M=1 decode, TP2, fp16 output, dense 27B-AWQ MLP
+    - Scope remains M=1 decode, TP2, fp16 output, dense 27B-AWQ MLP
     `down_proj`.
 - Build and correctness:
-  - Direct `_C` build succeeded with
+    - Direct `_C` build succeeded with
     `cmake --build build/temp.linux-x86_64-cpython-312 --target _C -j 8`.
     Full `setup.py build_ext --inplace` still trips the unrelated
     `_deep_gemm_C` target in this worktree.
-  - Import/schema check passed with the new op argument.
-  - Short smoke hash matched the previous short route:
+    - Import/schema check passed with the new op argument.
+    - Short smoke hash matched the previous short route:
     `e3b3ebc930b09ed8921c4e20f0c8dd6fb93f0bd51c382cdc33a485050ef60939`.
-  - Stable 32-token hash matched the normal-path steady hash:
+    - Stable 32-token hash matched the normal-path steady hash:
     `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
 - Performance under the same compile/fallback setup on GPU0/1,
   Qwen3.6-27B-AWQ TP2, `input_len=512`, `output_len=32`, `warmup=1`,
   `repeat=2`:
-  - tail-worker control:
+    - tail-worker control:
     `17.8614 ms` mean TPOT, `55.9866 tok/s` steady decode;
-  - `kernel_reducer_blocks=1`:
+    - `kernel_reducer_blocks=1`:
     `23.7277 ms` mean TPOT, `42.1449 tok/s` steady decode;
-  - `kernel_reducer_blocks=4`:
+    - `kernel_reducer_blocks=4`:
     `19.5130 ms` mean TPOT, `51.2478 tok/s` steady decode;
-  - result: the appended reducer CTA path is about `9.25%` slower than the
+    - result: the appended reducer CTA path is about `9.25%` slower than the
     same-run tail-worker control with four active reducers; one active reducer
     is about `32.84%` slower and clearly serializes the reduce tail.
 - Decision:
-  - Do not scale this by adding reducer CTAs. The negative result shows that
+    - Do not scale this by adding reducer CTAs. The negative result shows that
     "one kernel" without real tile scheduling is not enough: the appended
     reducer CTAs contend with GEMM CTAs and can delay Tensor Core work.
-  - The next TileRT-style implementation must move to a persistent/flattened
+    - The next TileRT-style implementation must move to a persistent/flattened
     scheduler shape with explicit CTA roles or a device-side tile queue. The
     scheduler must keep compute CTAs dominant and let reduce/communication CTAs
     consume ready tiles only when doing so does not starve the producer GEMM.
 - Additional artifacts:
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o4.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer1_compile_fallback_i512_o32_r2.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o32_r2.json`
-  - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_compile_fallback_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o4.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer1_compile_fallback_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/kernel_reducer4_compile_fallback_i512_o32_r2.json`
+    - `bench_results/sm70_awq_mlp_down_tile_overlap_20260621/tailworker_compile_fallback_i512_o32_r2.json`
 
 ### DDTree 27B-AWQ budget acceptance sweep
 
@@ -37123,16 +37123,16 @@ Interpretation:
   `bench_results/ddtree_humaneval_sweep_20260625/`; the summary is
   `humaneval32_qwen_chat_solution_nothink_t1p0_o256_safe_default_budget_sweep_summary.tsv`.
 - Results:
-  - `budget=16`: mean acceptance length `11.5361`, no-bonus `10.5361`,
+    - `budget=16`: mean acceptance length `11.5361`, no-bonus `10.5361`,
     draft acceptance `0.6585`, steady decode `122.11 tok/s`,
     `bang_repeat_outputs=0`.
-  - `budget=22`: mean acceptance length `10.4905`, draft acceptance `0.4325`,
+    - `budget=22`: mean acceptance length `10.4905`, draft acceptance `0.4325`,
     steady decode `98.67 tok/s`.
-  - `budget=32`: mean acceptance length `10.1213`, draft acceptance `0.2870`,
+    - `budget=32`: mean acceptance length `10.1213`, draft acceptance `0.2870`,
     steady decode `73.64 tok/s`.
-  - `budget=48`: mean acceptance length `9.0323`, draft acceptance `0.1673`,
+    - `budget=48`: mean acceptance length `9.0323`, draft acceptance `0.1673`,
     steady decode `53.79 tok/s`.
-  - `budget=64`: mean acceptance length `8.0851`, draft acceptance `0.1116`,
+    - `budget=64`: mean acceptance length `8.0851`, draft acceptance `0.1116`,
     steady decode `46.58 tok/s`.
 - Decision: use `ddtree_budget=16` as the current HumanEval-calibrated default
   for Qwen3.6-27B-AWQ. Larger budgets are worse on both acceptance and speed;
@@ -37147,39 +37147,39 @@ Interpretation:
   style, tree verify enabled, graph enabled, `num_speculative_tokens=16`,
   `ddtree_budget=16`, and `max_num_batched_tokens=4096`.
 - Artifacts:
-  - `bench_results/ddtree_realcode_20260625/realcode_prompts_6_qwen_chat_nothink.json`
-  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.json`
-  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.log`
-  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_noprofile.json`
-  - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_noprofile.log`
+    - `bench_results/ddtree_realcode_20260625/realcode_prompts_6_qwen_chat_nothink.json`
+    - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.json`
+    - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_profile2.log`
+    - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_noprofile.json`
+    - `bench_results/ddtree_realcode_20260625/realcode6_ddtree_budget16_t1p0_o256_noprofile.log`
 - The run also fixed a profile-only instrumentation bug in
   `vllm/v1/spec_decode/dflash.py`: the payload-stage log referenced stale
   `payload_logits`; it now logs `logits.shape`. This does not change sampling.
 - Results:
-  - Profile run: mean acceptance length `7.3160`, no-bonus `6.3160`, draft
+    - Profile run: mean acceptance length `7.3160`, no-bonus `6.3160`, draft
     acceptance `0.3948`, total generation `57.91 tok/s`, per-request steady
     mean `64.06 tok/s`.
-  - No-profile run: mean acceptance length `7.3602`, no-bonus `6.3602`, draft
+    - No-profile run: mean acceptance length `7.3602`, no-bonus `6.3602`, draft
     acceptance `0.3975`. Per-request steady decode was `18.31`, `65.64`,
     `90.61`, `87.45`, `50.03`, and `77.17 tok/s`; the first request was
     contaminated by inference-time Triton JIT, so the warmed mean excluding the
     first request is `74.18 tok/s`.
-  - The no-profile run logged first-request JIT for
+    - The no-profile run logged first-request JIT for
     `copy_and_expand_dflash_inputs_kernel`, `_topk_topp_kernel`,
     `eagle_prepare_next_token_padded_kernel`, and `expand_kernel`. Treat the
     all-request `45.09 tok/s` total generation number as cold/JIT-contaminated,
     not steady serving speed.
-  - Last profile summary line:
+    - Last profile summary line:
     `target_forward=40.540 ms`, `target_logits=2.848 ms`,
     `target_rejection_sample=2.394 ms`, `state_update_wall_cpu=6.082 ms`,
     `draft_wall_cpu=17.450 ms`. Therefore target verifier cost is about
     `45.78 ms`, or `51.86 ms` including state update; approximate full
     speculative iteration cost is `69.51 ms` including drafter/bookkeeping.
 - Interpretation:
-  - The HumanEval `budget=16` result (`AL 11.54`, `122.11 tok/s`) is a valid
+    - The HumanEval `budget=16` result (`AL 11.54`, `122.11 tok/s`) is a valid
     community-calibration artifact but does not generalize to open-ended
     repo-style coding prompts.
-  - Realistic code repair currently lands around `AL 7.3` and warmed
+    - Realistic code repair currently lands around `AL 7.3` and warmed
     `~74 tok/s`; both acceptance and verifier cost still need work before
     claiming recovered DDTree speed for normal coding workloads.
 
@@ -37198,15 +37198,15 @@ Interpretation:
   `bench_results/sm70_serving_concurrency_20260628/35b_awq_tp2_ab32/` and
   `bench_results/sm70_serving_concurrency_20260628/README.md`.
 - Results:
-  - c4: output `223.56 tok/s`, mean TPOT `14.83 ms`, pure decode estimate
+    - c4: output `223.56 tok/s`, mean TPOT `14.83 ms`, pure decode estimate
     `269.7 tok/s`;
-  - c8: `335.79`, `18.33 ms`, `436.4`;
-  - c12: `384.11`, `22.87 ms`, `524.7`;
-  - c16: `475.15`, `23.86 ms`, `670.6`;
-  - c20: `509.01`, `27.40 ms`, `729.9`;
-  - c24: `564.56`, `28.13 ms`, `853.2`;
-  - c28: `567.33`, `33.25 ms`, `842.1`;
-  - c32: `638.93`, `32.96 ms`, `970.9`.
+    - c8: `335.79`, `18.33 ms`, `436.4`;
+    - c12: `384.11`, `22.87 ms`, `524.7`;
+    - c16: `475.15`, `23.86 ms`, `670.6`;
+    - c20: `509.01`, `27.40 ms`, `729.9`;
+    - c24: `564.56`, `28.13 ms`, `853.2`;
+    - c28: `567.33`, `33.25 ms`, `842.1`;
+    - c32: `638.93`, `32.96 ms`, `970.9`.
 - Decision: no stable aggregate decode throughput knee was reached through
   concurrency 32. c28 showed a plateau and tail-latency spike, but c32 recovered
   to the best aggregate throughput in the sweep. Treat this as a concurrency
@@ -37222,29 +37222,29 @@ Interpretation:
 - Raw logs and full tables are in
   `bench_results/sm70_serving_concurrency_20260628/README.md`.
 - 35B-AWQ TP4:
-  - graph64 service used `--max-num-seqs 64`,
+    - graph64 service used `--max-num-seqs 64`,
     `--max-num-batched-tokens 65536`, capture sizes through `64`.
-  - graph96 probe used `--max-num-seqs 96`,
+    - graph96 probe used `--max-num-seqs 96`,
     `--max-num-batched-tokens 98304`, capture sizes through `96`.
-  - Pure decode estimate peaked at c64: output `1029.79 tok/s`, mean TPOT
+    - Pure decode estimate peaked at c64: output `1029.79 tok/s`, mean TPOT
     `37.61 ms`, pure decode estimate `1701.7 tok/s`.
-  - c80/c96 had worse TPOT/tail latency (`54.27/57.40 ms`) and lower pure
+    - c80/c96 had worse TPOT/tail latency (`54.27/57.40 ms`) and lower pure
     decode estimate than c64, even though c96 end-to-end output throughput rose
     to `1076.19 tok/s`; decode knee remains c64.
 - 27B-AWQ TP2:
-  - Capacity-preserving service used `--max-num-seqs 64`,
+    - Capacity-preserving service used `--max-num-seqs 64`,
     `--max-num-batched-tokens 16384`, capture sizes through `64`.
-  - End-to-end output throughput peaked at c8: `178.20 tok/s`.
-  - Pure decode estimate peaked at c20: mean TPOT `52.69 ms`, pure decode
+    - End-to-end output throughput peaked at c8: `178.20 tok/s`.
+    - Pure decode estimate peaked at c20: mean TPOT `52.69 ms`, pure decode
     estimate `379.6 tok/s`, then fell at c24 to `336.7 tok/s`.
-  - This TP2 route is constrained by the 256K-preserving 16K batch-token budget;
+    - This TP2 route is constrained by the 256K-preserving 16K batch-token budget;
     it is not a best-case 1K-input concurrency route.
 - 27B-AWQ TP4:
-  - graph96 service used `--max-num-seqs 96`,
+    - graph96 service used `--max-num-seqs 96`,
     `--max-num-batched-tokens 98304`, capture sizes through `96`; it passed KV
     validation with about `2.41x` full 256K concurrency.
-  - End-to-end output throughput peaked at c12: `339.69 tok/s`.
-  - Pure decode estimate peaked at c28: mean TPOT `28.50 ms`, pure decode
+    - End-to-end output throughput peaked at c12: `339.69 tok/s`.
+    - Pure decode estimate peaked at c28: mean TPOT `28.50 ms`, pure decode
     estimate `982.5 tok/s`, then fell at c32/c40 (`721.2` and `665.1 tok/s`).
 
 ## 2026-06-30 DDTree 27B-AWQ verifier control point
@@ -37276,53 +37276,53 @@ Interpretation:
   for per-shape ranking and candidate comparison rather than as an absolute
   target-forward replacement.
 - Current best microbench breakdown:
-  - MLP gate/up `17x17408x5120`: `132.20 us`, weighted `8.33 ms`.
-  - MLP down `17x5120x17408`: `129.22 us`, weighted `8.14 ms`.
-  - linear-attention qkv `17x10240x5120`: `88.28 us`, weighted `4.15 ms`.
-  - linear-attention z `17x6144x5120`: `65.32 us`, weighted `3.07 ms`.
-  - full-attention o-proj `17x5120x6144`: `69.25 us`, weighted `1.11 ms`.
+    - MLP gate/up `17x17408x5120`: `132.20 us`, weighted `8.33 ms`.
+    - MLP down `17x5120x17408`: `129.22 us`, weighted `8.14 ms`.
+    - linear-attention qkv `17x10240x5120`: `88.28 us`, weighted `4.15 ms`.
+    - linear-attention z `17x6144x5120`: `65.32 us`, weighted `3.07 ms`.
+    - full-attention o-proj `17x5120x6144`: `69.25 us`, weighted `1.11 ms`.
 - Nsight Compute gate/up attribution:
-  - Default non-mgroup route: `167.168 us`, `68` CTAs, waves/SM `0.47`,
+    - Default non-mgroup route: `167.168 us`, `68` CTAs, waves/SM `0.47`,
     `192` registers/thread, SM throughput `44.31%`, DRAM `25.10%`.
-  - Existing mgroup `c32x256`: `126.240 us`, `136` CTAs, waves/SM `0.94`,
+    - Existing mgroup `c32x256`: `126.240 us`, `136` CTAs, waves/SM `0.94`,
     `187` registers/thread allocated as `192`, shared memory `32.8 KiB`,
     SM throughput `58.42%`, DRAM `33.27%`.
-  - Tested-and-reverted mgroup `c32x128`: `126.464 us`, same register cap and
+    - Tested-and-reverted mgroup `c32x128`: `126.464 us`, same register cap and
     utilization but shared memory drops to `16.4 KiB`. This proves shared
     memory alone is not the remaining limiter; the hot route is
     register/occupancy plus small-GEMM parallelism constrained, not pure DRAM
     bandwidth.
 - Negative control results:
-  - Smaller CTA-M/N candidates did not beat the existing `32x256x32` mgroup
+    - Smaller CTA-M/N candidates did not beat the existing `32x256x32` mgroup
     family. The best `16x256x32` gate/up candidate was about `166 us`, slower
     than the current `~131 us`.
-  - A `24x256x32` verifier-focused CTA-M experiment and temporary `12B` helper
+    - A `24x256x32` verifier-focused CTA-M experiment and temporary `12B` helper
     support were slower (`~183 us` gate/up for `24x256x32`) and were reverted.
-  - Temporary `TG_N=2` and `TG_N=8` registry variants did not improve the
+    - Temporary `TG_N=2` and `TG_N=8` registry variants did not improve the
     dynamic gate/up result and were reverted.
-  - Ordinary AWQ Marlin is not a replacement for the verifier dense path on
+    - Ordinary AWQ Marlin is not a replacement for the verifier dense path on
     V100. A direct comparison on 27B-like synthetic inputs was much slower:
     about `284 us` for gate/up and `674 us` for down.
-  - A direct verifier launch/epilogue branch was slower:
+    - A direct verifier launch/epilogue branch was slower:
     `m17_direct_dense_verifier_probe.json` measured `40.09 ms` weighted and
     regressed MLP down to `293.79 us`; it was reverted.
-  - Forcing `__launch_bounds__(..., 3)` was slower:
+    - Forcing `__launch_bounds__(..., 3)` was slower:
     `gate_up_m17_mgroup_c32x128_launchbounds3.json` measured `187.48 us`;
     it was reverted.
-  - A no-prefetch low-live-range mainloop probe was slower:
+    - A no-prefetch low-live-range mainloop probe was slower:
     `gate_up_m17_mgroup_c32x128_noprefetch_probe.json` measured `189.07 us`;
     it was reverted. The next low-register mainloop must preserve most of the
     current prefetch/transform overlap.
-  - A dense-fp16-output epilogue diagnostic did not materially help:
+    - A dense-fp16-output epilogue diagnostic did not materially help:
     `gate_up_m17_mgroup_denseout_probe.json` measured `140.65 us` for gate/up.
     NCU report
     `gate_up_m17_mgroup_denseout_gemm_full_sudo.ncu-rep` showed `124.99 us`,
     `190` registers/thread, SM `59.12%`, and DRAM `33.91%`; the branch was
     reverted because it did not lower the register/occupancy limiter.
-  - A two-slot K-buffer `lowreg2` mainloop was bitwise exact but slower:
+    - A two-slot K-buffer `lowreg2` mainloop was bitwise exact but slower:
     `gate_up_m17_mgroup_lowreg2_200.json` measured `143.64 us` and NCU showed
     registers/thread only dropped to `184`; it was reverted.
-  - Stream-store epilogues were also reverted. The mgroup variant had no stable
+    - Stream-store epilogues were also reverted. The mgroup variant had no stable
     win, and the active best-family `fff c32x128` variant was bitwise exact but
     slower (`183.10 us` versus same fast-selector default `166.46 us`).
 - Added a default-off exact candidate override in
@@ -37359,65 +37359,65 @@ Interpretation:
   `max_num_seqs=1`, greedy sampling, and
   `speculative_config={"method":"mtp","num_speculative_tokens":4,"use_local_argmax_reduction":true}`.
 - Route evidence:
-  - Target model resolved to `Qwen3_5ForConditionalGeneration`.
-  - Draft model resolved to `Qwen3_5MTP`.
-  - Both ranks logged `Qwen3_5MultiTokenPredictor loaded 0 tensors into 33 params`.
-  - The runner shared target embedding and LM head with the draft model, but
+    - Target model resolved to `Qwen3_5ForConditionalGeneration`.
+    - Draft model resolved to `Qwen3_5MTP`.
+    - Both ranks logged `Qwen3_5MultiTokenPredictor loaded 0 tensors into 33 params`.
+    - The runner shared target embedding and LM head with the draft model, but
     the MTP body itself had no loaded checkpoint tensors.
 - Output result:
-  - Generated `512` output tokens and stopped by `finish_reason=length`, not
+    - Generated `512` output tokens and stopped by `finish_reason=length`, not
     EOS (`contains_eos=False`).
-  - `generate_seconds=27.0357`, equivalent to about `52.8 ms/output token`
+    - `generate_seconds=27.0357`, equivalent to about `52.8 ms/output token`
     for this MTP run.
-  - The text was readable at the beginning but repeated earlier sections near
+    - The text was readable at the beginning but repeated earlier sections near
     the cap, so this run is not evidence that MTP improves generation quality
     or stopping behavior.
 - Speculative decoding metrics:
-  - `num_drafts=511`.
-  - `num_draft_tokens=2044`.
-  - `num_accepted_tokens=0`.
-  - `draft_acceptance_rate=0.0`.
-  - `accepted_tokens_per_pos=[0, 0, 0, 0]`.
-  - `mean_acceptance_length=1.0`, meaning every step fell back to target-only
+    - `num_drafts=511`.
+    - `num_draft_tokens=2044`.
+    - `num_accepted_tokens=0`.
+    - `draft_acceptance_rate=0.0`.
+    - `accepted_tokens_per_pos=[0, 0, 0, 0]`.
+    - `mean_acceptance_length=1.0`, meaning every step fell back to target-only
     acceptance of the normal next token.
 - Final steady profiler line at `calls=512`:
-  - `target_forward=22.584 ms`.
-  - `target_logits=2.040 ms`.
-  - `target_rejection_sample=0.085 ms`.
-  - `draft_total=17.420 ms`, `draft_wall_cpu=38.764 ms`.
-  - MTP proposer `total_gpu=16.905 ms`, `first_forward=4.449 ms`,
+    - `target_forward=22.584 ms`.
+    - `target_logits=2.040 ms`.
+    - `target_rejection_sample=0.085 ms`.
+    - `draft_total=17.420 ms`, `draft_wall_cpu=38.764 ms`.
+    - MTP proposer `total_gpu=16.905 ms`, `first_forward=4.449 ms`,
     `loop0_forward=3.310 ms`, `loop1_forward=0.373 ms`,
     `loop2_forward=0.372 ms`, and each sample stage about `2.0 ms`.
 - Interpretation:
-  - This MTP path is mechanically wired, graph-captured, and able to run, but
+    - This MTP path is mechanically wired, graph-captured, and able to run, but
     it is not a valid acceleration path for this checkpoint. The draft model is
     effectively untrained or unloaded for the MTP body, and measured acceptance
     is exactly zero.
-  - With zero accepted draft tokens, MTP only adds drafter/proposer overhead on
+    - With zero accepted draft tokens, MTP only adds drafter/proposer overhead on
     top of the target forward. It cannot improve TPOT until a real MTP
     checkpoint or correct MTP tensor-loading/remapping path is available.
-  - Do not count this artifact as a positive MTP speed baseline. Treat it as a
+    - Do not count this artifact as a positive MTP speed baseline. Treat it as a
     failed health check for `Qwen3.5-27B-NVFP4` MTP4.
 - Matched no-MTP baseline attempts:
-  - `current_27b_nvfp4_baseline_natural_o512.log` failed during
+    - `current_27b_nvfp4_baseline_natural_o512.log` failed during
     `determine_available_memory()` after worker termination.
-  - `current_27b_nvfp4_baseline_textonly_natural_o512.log` failed during
+    - `current_27b_nvfp4_baseline_textonly_natural_o512.log` failed during
     graph capture / engine startup with `RuntimeError: cancelled`.
-  - `current_27b_nvfp4_baseline_textonly_gmem070_natural_o512.log` completed
+    - `current_27b_nvfp4_baseline_textonly_gmem070_natural_o512.log` completed
     graph capture with reduced `gpu_memory_utilization=0.70`, then failed in
     `LLMEngine.__init__ -> reset_mm_cache()` after worker termination.
-  - These failures are no-MTP engine lifecycle issues and should be debugged
+    - These failures are no-MTP engine lifecycle issues and should be debugged
     separately if an exact matched no-MTP baseline is needed. They do not
     change the MTP conclusion because the MTP run itself directly reports zero
     accepted draft tokens.
 - Next MTP work:
-  - First verify whether the target checkpoint contains any real MTP weights or
+    - First verify whether the target checkpoint contains any real MTP weights or
     whether `qwen3_5_mtp.py::load_weights()` is dropping/remapping expected
     names.
-  - Add a hard warning or guard for `method="mtp"` when the MTP body loads zero
+    - Add a hard warning or guard for `method="mtp"` when the MTP body loads zero
     tensors, unless a model explicitly declares that all required draft weights
     are shared.
-  - Re-test only after the MTP body has nonzero loaded tensors, then require
+    - Re-test only after the MTP body has nonzero loaded tensors, then require
     acceptance-rate, output-quality, and matched no-MTP speed evidence before
     optimizing MTP kernels.
 
@@ -37441,10 +37441,10 @@ Interpretation:
 - Model:
   `/home/ymzx/models/Qwen3.6-27B-FP8`.
 - Weight availability:
-  - `config.json` resolves to `Qwen3_5ForConditionalGeneration` with
+    - `config.json` resolves to `Qwen3_5ForConditionalGeneration` with
     `mtp_num_hidden_layers=1`.
-  - The checkpoint includes `mtp.safetensors` with real `mtp.*` keys.
-  - Debug MTP load run logged `Qwen3_5MultiTokenPredictor loaded 16 tensors
+    - The checkpoint includes `mtp.safetensors` with real `mtp.*` keys.
+    - Debug MTP load run logged `Qwen3_5MultiTokenPredictor loaded 16 tensors
     into 20 params` on both TP ranks, with the remaining missing params being
     attention scale buffers:
     `layers.0.self_attn.attn.{q,k,v,prob}_scale`.
@@ -37454,54 +37454,54 @@ Interpretation:
   `max_model_len=2048`, `max_num_batched_tokens=1024`, `max_num_seqs=1`,
   greedy sampling, output cap `512`.
 - Matched artifacts:
-  - no-MTP:
+    - no-MTP:
     `bench_results/mtp_27b_fp8_20260630/qwen36_27b_fp8_nomtp_natural_o512.json`
     and `.log`.
-  - MTP4 profiled with per-step MTP profile logging:
+    - MTP4 profiled with per-step MTP profile logging:
     `bench_results/mtp_27b_fp8_20260630/qwen36_27b_fp8_mtp4_natural_o512.json`
     and `.log`.
-  - MTP4 clean speed run, no MTP profile logging:
+    - MTP4 clean speed run, no MTP profile logging:
     `bench_results/mtp_27b_fp8_20260630/qwen36_27b_fp8_mtp4_clean_natural_o512.json`
     and `.log`.
 - Decode speed result for this prompt:
-  - no-MTP: `generate_seconds=11.9445`, `512` output tokens,
+    - no-MTP: `generate_seconds=11.9445`, `512` output tokens,
     `23.329 ms/token`, `42.865 tok/s`.
-  - MTP4 profiled: `generate_seconds=8.7273`, `512` output tokens,
+    - MTP4 profiled: `generate_seconds=8.7273`, `512` output tokens,
     `17.046 ms/token`, `58.666 tok/s`. This run is useful for profile
     breakdown but includes heavy `VLLM_SM70_MTP_PROFILE_INTERVAL=1` logging.
-  - MTP4 clean: `generate_seconds=7.7291`, `512` output tokens,
+    - MTP4 clean: `generate_seconds=7.7291`, `512` output tokens,
     `15.096 ms/token`, `66.244 tok/s`.
-  - Clean MTP4 versus matched no-MTP: TPOT reduced by about `35.3%`
+    - Clean MTP4 versus matched no-MTP: TPOT reduced by about `35.3%`
     (`23.329 -> 15.096 ms/token`), throughput improved by about `54.5%`
     (`42.865 -> 66.244 tok/s`).
 - Speculative decoding metrics for both MTP4 runs:
-  - `num_drafts=161`.
-  - `num_draft_tokens=644`.
-  - `num_accepted_tokens=353`.
-  - `draft_acceptance_rate=0.5481`.
-  - `accepted_tokens_per_pos=[124, 97, 75, 57]`.
-  - `per_position_acceptance_rate=[0.7702, 0.6025, 0.4658, 0.3540]`.
-  - `avg_accepted_tokens_no_bonus=2.1925`.
-  - `mean_acceptance_length=3.1925`.
+    - `num_drafts=161`.
+    - `num_draft_tokens=644`.
+    - `num_accepted_tokens=353`.
+    - `draft_acceptance_rate=0.5481`.
+    - `accepted_tokens_per_pos=[124, 97, 75, 57]`.
+    - `per_position_acceptance_rate=[0.7702, 0.6025, 0.4658, 0.3540]`.
+    - `avg_accepted_tokens_no_bonus=2.1925`.
+    - `mean_acceptance_length=3.1925`.
 - Route evidence:
-  - Target dense route hit `SM70 FP8 TurboMind W8A16 dense path enabled`.
-  - Target fused gate-up route hit `SM70 FP8 dense gated-SiLU single-layout
+    - Target dense route hit `SM70 FP8 TurboMind W8A16 dense path enabled`.
+    - Target fused gate-up route hit `SM70 FP8 dense gated-SiLU single-layout
     path enabled`.
-  - Drafter used `AttentionBackendEnum.TRITON_ATTN`.
-  - Runner shared target embedding and LM head with the MTP draft model.
-  - Local argmax reduction was enabled for draft token generation.
-  - MTP clean run used graph capture sizes `[1, 2, 4, 5, 8, 9]`.
+    - Drafter used `AttentionBackendEnum.TRITON_ATTN`.
+    - Runner shared target embedding and LM head with the MTP draft model.
+    - Local argmax reduction was enabled for draft token generation.
+    - MTP clean run used graph capture sizes `[1, 2, 4, 5, 8, 9]`.
 - Caution:
-  - This FP8 entry used greedy sampling before the official-sampling rule above
+    - This FP8 entry used greedy sampling before the official-sampling rule above
     was established. Keep it as positive route/load evidence and a diagnostic
     speed reference; rerun with official sampling before using it as a formal
     user-facing MTP speed conclusion.
-  - Both no-MTP and MTP4 runs stopped by `finish_reason=length`, not EOS; this
+    - Both no-MTP and MTP4 runs stopped by `finish_reason=length`, not EOS; this
     is a speed and route check, not a long-form quality acceptance gate.
-  - Do not compare these numbers directly to older synthetic input-length FP8
+    - Do not compare these numbers directly to older synthetic input-length FP8
     baselines unless the prompt/output length, sampling, MTP state, graph state,
     and profile logging state all match.
-  - The next useful MTP step is not another "does it load" smoke. Start from
+    - The next useful MTP step is not another "does it load" smoke. Start from
     FP8 MTP4 clean as the positive baseline, then test MTP3/MTP2 or adaptive-K
     against this same prompt family and record both TPOT and acceptance.
 
@@ -37512,13 +37512,13 @@ Interpretation:
 - Model:
   `/home/ymzx/models/Qwen3.6-27B-AWQ`.
 - Weight availability:
-  - `config.json` resolves to `Qwen3_5ForConditionalGeneration` with
+    - `config.json` resolves to `Qwen3_5ForConditionalGeneration` with
     `mtp_num_hidden_layers=1`.
-  - The checkpoint includes real `mtp.*` weights across the shard set:
+    - The checkpoint includes real `mtp.*` weights across the shard set:
     `mtp.fc.weight`, MTP layernorms, MTP MLP projections, MTP attention
     projections, `mtp.norm.weight`, `mtp.pre_fc_norm_embedding.weight`, and
     `mtp.pre_fc_norm_hidden.weight`.
-  - `quantization_config.modules_to_not_convert` includes `mtp`, and runtime
+    - `quantization_config.modules_to_not_convert` includes `mtp`, and runtime
     logs show `Qwen3_5MTP: disabling quantization for MTP branch based on
     config.quantization_config.modules_to_not_convert`.
 - Common command shape: TP2 on GPUs `0,1`, `quantization=awq`,
@@ -37527,40 +37527,40 @@ Interpretation:
   `max_model_len=2048`, `max_num_batched_tokens=1024`, `max_num_seqs=1`,
   official sampling `temperature=1.0/top_p=0.95/top_k=20`, output cap `512`.
 - Matched formal artifacts:
-  - no-MTP:
+    - no-MTP:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_nomtp_official_o512.json`
     and `.log`.
-  - MTP4 clean official-sampling speed run:
+    - MTP4 clean official-sampling speed run:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_o512.json`
     and `.log`.
 - Decode speed result for this prompt:
-  - no-MTP: `generate_seconds=9.7550`, `512` output tokens,
+    - no-MTP: `generate_seconds=9.7550`, `512` output tokens,
     `19.053 ms/token`, `52.486 tok/s`.
-  - MTP4 clean: `generate_seconds=8.4169`, `512` output tokens,
+    - MTP4 clean: `generate_seconds=8.4169`, `512` output tokens,
     `16.439 ms/token`, `60.830 tok/s`.
-  - MTP4 versus matched no-MTP: TPOT reduced by about `13.7%`
+    - MTP4 versus matched no-MTP: TPOT reduced by about `13.7%`
     (`19.053 -> 16.439 ms/token`), throughput improved by about `15.9%`
     (`52.486 -> 60.830 tok/s`).
 - Speculative decoding metrics for the MTP4 run:
-  - `num_drafts=184`.
-  - `num_draft_tokens=736`.
-  - `num_accepted_tokens=329`.
-  - `draft_acceptance_rate=0.4470`.
-  - `accepted_tokens_per_pos=[132, 95, 57, 45]`.
-  - `per_position_acceptance_rate=[0.7174, 0.5163, 0.3098, 0.2446]`.
-  - `avg_accepted_tokens_no_bonus=1.7880`.
-  - `mean_acceptance_length=2.7880`.
+    - `num_drafts=184`.
+    - `num_draft_tokens=736`.
+    - `num_accepted_tokens=329`.
+    - `draft_acceptance_rate=0.4470`.
+    - `accepted_tokens_per_pos=[132, 95, 57, 45]`.
+    - `per_position_acceptance_rate=[0.7174, 0.5163, 0.3098, 0.2446]`.
+    - `avg_accepted_tokens_no_bonus=1.7880`.
+    - `mean_acceptance_length=2.7880`.
 - Route evidence:
-  - Target route hit `SM70 AWQ TurboMind dense path enabled`.
-  - MTP draft route hit `SM70 MTP draft dense fp16 TurboMind fast path
+    - Target route hit `SM70 AWQ TurboMind dense path enabled`.
+    - MTP draft route hit `SM70 MTP draft dense fp16 TurboMind fast path
     requested`.
-  - Local argmax reduction was enabled.
-  - MTP run used graph capture sizes `[1, 2, 4, 5, 8, 9]`; no-MTP used
+    - Local argmax reduction was enabled.
+    - MTP run used graph capture sizes `[1, 2, 4, 5, 8, 9]`; no-MTP used
     `[1, 2]`.
 - Caution:
-  - Both no-MTP and MTP4 runs stopped by `finish_reason=length`, not EOS; this
+    - Both no-MTP and MTP4 runs stopped by `finish_reason=length`, not EOS; this
     is a controlled speed comparison, not a natural-stop quality gate.
-  - A prior AWQ MTP4 greedy run exists at
+    - A prior AWQ MTP4 greedy run exists at
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_clean_natural_o512.*`.
     Treat it as diagnostic only. It reported higher acceptance
     (`draft_acceptance_rate=0.5850`, `mean_acceptance_length=3.3399`) and
@@ -37574,95 +37574,95 @@ Interpretation:
   long-term target remains `>=100 tok/s` decode with official
   `temperature=1.0/top_p=0.95/top_k=20`.
 - Candidate tested:
-  - `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`;
-  - `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`;
-  - `VLLM_SM70_AWQ_WARMUP_MAX_M=17`;
-  - `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`;
-  - `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`.
+    - `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`;
+    - `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`;
+    - `VLLM_SM70_AWQ_WARMUP_MAX_M=17`;
+    - `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`;
+    - `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`.
   This is an explicit diagnostic/optimization lane only. It changes AWQ dense
   dispatch selection and does not preserve the default split policy.
 - Invalid or weak attempts:
-  - `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_o512.log` failed during
+    - `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_o512.log` failed during
     `determine_available_memory()` after a worker died. No json was produced;
     do not treat it as speed data.
-  - `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_mm0_u072_gpu23_o512.log`
+    - `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_mm0_u072_gpu23_o512.log`
     was accidentally run without `speculative_config`; it is not an MTP
     result and must not be used.
-  - Unseeded official-sampling paired runs completed but produced different
+    - Unseeded official-sampling paired runs completed but produced different
     acceptance lengths. They are useful startup evidence only, not a clean
     verifier-cost comparison.
 - Matched official-sampling speed evidence with `--sampling-seed 0`,
   GPUs `2,3`, `limit_mm_per_prompt={"image":0,"video":0}`,
   `gpu_memory_utilization=0.72`, TP2, MTP4, CUDA graph, no eager:
-  - Default AWQ selector:
+    - Default AWQ selector:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_baseline_mm0_u072_seed0_gpu23_o512.json`.
     Result: `steady_decode_tps=65.9416`, `tpot=15.1649 ms/token`,
     `num_drafts=184`, `num_accepted_tokens=329`,
     `draft_acceptance_rate=0.4470`, `mean_acceptance_length=2.7880`.
-  - Dynamic/no-preserve selector:
+    - Dynamic/no-preserve selector:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_awqtune_nopreserve_mtp_mm0_u072_seed0_gpu23_o512.json`.
     Result: `steady_decode_tps=69.6142`, `tpot=14.3649 ms/token`,
     with the same `num_drafts=184`, `num_accepted_tokens=329`,
     `draft_acceptance_rate=0.4470`, and
     `mean_acceptance_length=2.7880`.
-  - The output token-id hash matched between the two seeded runs:
+    - The output token-id hash matched between the two seeded runs:
     `62bc393d73d1b22bc2a5819f5d029b9e7079b9129fe0e6b0b6fe882bac9937ff`.
-  - Interpretation: with acceptance path and output held fixed, the candidate
+    - Interpretation: with acceptance path and output held fixed, the candidate
     improves TPOT by `0.800 ms/token` (`15.1649 -> 14.3649`) and throughput by
     about `5.6%` (`65.94 -> 69.61 tok/s`). This is real progress, but it is
     still far from the `100 tok/s` target.
 - Profile evidence:
-  - Baseline profile:
+    - Baseline profile:
     `qwen36_27b_awq_mtp4_official_profile_i20_mm0_u072_gpu23_o512.log`.
     Last stable interval at `calls=180`: `target_forward=22.987 ms`,
     `target_logits=2.039 ms`, `target_rejection_sample=1.354 ms`,
     `state_update_wall_cpu=0.273 ms`, `bookkeeping=0.085 ms`,
     `draft_total=11.176 ms`.
-  - Dynamic/no-preserve profile:
+    - Dynamic/no-preserve profile:
     `qwen36_27b_awq_mtp4_official_awqtune_nopreserve_profile_i20_mm0_u072_seed0_gpu23_o512.log`.
     Last stable interval at `calls=180`: `target_forward=20.824 ms`,
     `target_logits=2.037 ms`, `target_rejection_sample=1.364 ms`,
     `state_update_wall_cpu=0.283 ms`, `bookkeeping=0.094 ms`,
     `draft_total=11.186 ms`.
-  - The reduction is almost entirely target verifier forward:
+    - The reduction is almost entirely target verifier forward:
     `target_forward` drops by `2.163 ms/spec-step`. With the current
     `mean_acceptance_length=2.788`, that is about `0.776 ms/token`, matching
     the measured speed-run TPOT reduction.
 - AWQ verifier micro timing:
-  - Default:
+    - Default:
     `bench_results/mtp_27b_awq_20260630/awq_verifier_micro_m5_default_gpu2.json`,
     `total_weighted_mean_ms=18.6364`.
-  - Dynamic/no-preserve:
+    - Dynamic/no-preserve:
     `bench_results/mtp_27b_awq_20260630/awq_verifier_micro_m5_dynamic_nopreserve_gpu3.json`,
     `total_weighted_mean_ms=15.7226`.
-  - The modeled AWQ verifier GEMM bucket improves by `2.914 ms` (`15.6%`).
+    - The modeled AWQ verifier GEMM bucket improves by `2.914 ms` (`15.6%`).
     Largest contributors: `mlp_gate_up` `6.861 -> 4.771 ms`,
     `linear_attn_in_proj_z` `2.503 -> 2.170 ms`, and `mlp_down`
     `5.563 -> 5.251 ms`.
-  - Dynamic selector trace
+    - Dynamic selector trace
     `awq_verifier_micro_m5_trace_dynamic_all.log` shows all five m=5
     verifier descriptors selecting the same `8x256x64` kernel family, with
     descriptor-specific splits/swizzles: gate/up `3/3`, down `7/1`,
     linear-qkv `5/2`, linear-z `6/1`, and attention-o `7/2`.
     Do not repeat blind CTA/epilogue sweeps without a new kernel idea.
 - Numeric and quality status:
-  - Real-layer m=5 AWQ checks were run for representative verifier shapes:
+    - Real-layer m=5 AWQ checks were run for representative verifier shapes:
     `mlp_gate`, `mlp_down`, `linear_qkv`, `linear_z`, and `attn_o`, both on
     default and dynamic/no-preserve. Artifacts are
     `awq_m5_exact_default_*_gpu2.json` and
     `awq_m5_exact_dynamic_nopreserve_*_gpu3.json`.
-  - These checks are not strict-equal against the Torch AWQ reference on either
+    - These checks are not strict-equal against the Torch AWQ reference on either
     selector, consistent with earlier TurboMind AWQ notes. The candidate did
     not materially enlarge `max_diff`: e.g. `attn_o` stayed at `0.01953125`,
     `linear_qkv` stayed at `0.00390625`, `mlp_down` stayed at `0.0078125`,
     and `mlp_gate` stayed at `0.0023193359375`.
-  - One seeded official-sampling full-model output hash matched, so this is a
+    - One seeded official-sampling full-model output hash matched, so this is a
     viable optimization candidate, but not a default-enable route. It still
     needs a broader model-quality gate before being accepted as production.
 - Next decision:
-  - Keep this lane as an explicit verifier-cost candidate. Do not repeat the
+    - Keep this lane as an explicit verifier-cost candidate. Do not repeat the
     failed startup or unseeded comparison paths.
-  - To continue toward `100 tok/s`, this `~5.6%` gain is insufficient by
+    - To continue toward `100 tok/s`, this `~5.6%` gain is insufficient by
     itself. Remaining work must combine more verifier reduction with either
     lower drafter/proposer overhead or higher acceptance length. At the current
     `mean_acceptance_length=2.788`, even a `~24.6 ms/spec-step` target-side
@@ -37673,23 +37673,23 @@ Interpretation:
 - Goal: see whether the dynamic/no-preserve m=5 AWQ verifier win can be turned
   into a fixed, reproducible selector without relying on runtime measurement.
 - Fixed fast-target experiment:
-  - Injected these exact `VLLM_SM70_AWQ_TP2_FAST_TARGETS` entries:
+    - Injected these exact `VLLM_SM70_AWQ_TP2_FAST_TARGETS` entries:
     `5x17408x5120 -> 8x256x64:3:3:0`,
     `5x5120x17408 -> 8x256x64:7:1:0`,
     `5x10240x5120 -> 8x256x64:5:2:0`,
     `5x6144x5120 -> 8x256x64:6:1:0`,
     `5x5120x6144 -> 8x256x64:7:2:0`.
-  - Trace artifact:
+    - Trace artifact:
     `bench_results/mtp_27b_awq_20260630/awq_verifier_micro_m5_fixed_fasttargets_trace_gpu2.log`.
     It confirms the fixed selector chooses the same `8x256x64` kernel family
     and the requested split/swizzle values.
-  - Micro artifacts:
+    - Micro artifacts:
     `awq_verifier_micro_m5_fixed_fasttargets_gpu2.json` and
     `awq_verifier_micro_m5_fixed_fasttargets_rerun2_gpu2.json`.
     The modeled verifier AWQ bucket measured `16.96 ms` then `16.67 ms`,
     versus same-GPU default rerun `19.07 ms` and same-GPU
     dynamic/no-preserve rerun `15.73 ms`.
-  - Full official-sampling MTP4 speed artifacts:
+    - Full official-sampling MTP4 speed artifacts:
     `qwen36_27b_awq_mtp4_official_fixed_fasttargets_mm0_u072_seed0_gpu23_o512.txt`
     and
     `qwen36_27b_awq_mtp4_official_fixed_fasttargets_unset_tune_mm0_u072_seed0_gpu23_o512.json`.
@@ -37697,14 +37697,14 @@ Interpretation:
     dynamic tuning stayed aligned with the baseline. It measured
     `steady_decode_tps=73.9961`, `tpot=13.5142 ms/token`, and
     `mean_acceptance_length=3.0476`.
-  - Quality gate result: fixed fast-target output token hash was
+    - Quality gate result: fixed fast-target output token hash was
     `32d9c0c4284219a1df0f81b4f98a8847906e31bb67551740784f4b702b22d693`,
     while the matched seeded baseline and dynamic/no-preserve runs both had
     `62bc393d73d1b22bc2a5819f5d029b9e7079b9129fe0e6b0b6fe882bac9937ff`.
     Therefore the `~74 tok/s` result is not accepted as a quality-equivalent
     speed win. Do not hard-code these fixed fast targets until the hash drift is
     explained or a broader quality gate accepts the numerical change.
-  - Follow-up op-level numeric artifacts:
+    - Follow-up op-level numeric artifacts:
     `awq_m5_exact_fixed_fasttargets_*_gpu2.json`. On the five representative
     real layers, fixed fast-target did not increase the recorded `max_diff`
     relative to default/dynamic-no-preserve: `attn_o=0.01953125`,
@@ -37713,20 +37713,20 @@ Interpretation:
     drift investigation, but it does not clear the full-model quality gate; the
     observed official-sampling hash mismatch still wins over op-level similarity.
 - Conservative preserve-default split experiment:
-  - Artifact:
+    - Artifact:
     `awq_verifier_micro_m5_dynamic_preserve_rerun_gpu2.json`.
-  - Result: `total_weighted_mean_ms=21.20`, worse than default. Trace
+    - Result: `total_weighted_mean_ms=21.20`, worse than default. Trace
     `awq_verifier_micro_m5_dynamic_preserve_trace_gpu2.log` shows gate/up was
     constrained to `splits=1`, losing the main verifier-forward benefit.
-  - Do not continue the `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=1` verifier
+    - Do not continue the `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=1` verifier
     lane for this shape unless there is a new kernel idea.
 - Current decision:
-  - The only currently quality-equivalent verifier-cost speed evidence remains
+    - The only currently quality-equivalent verifier-cost speed evidence remains
     the dynamic/no-preserve seeded run: `69.614 tok/s`,
     `14.365 ms/token`, with hash matching the baseline on this prompt.
-  - Fixed m=5 selector is useful diagnostic evidence that split/swizzle choices
+    - Fixed m=5 selector is useful diagnostic evidence that split/swizzle choices
     can cut verifier forward cost, but it is not safe to land as a default.
-  - Next verifier work should either explain the fixed-selector hash drift with
+    - Next verifier work should either explain the fixed-selector hash drift with
     per-layer numeric comparisons or move below the selector level to a kernel
     change that preserves the accepted full-model output gate.
 
@@ -37760,33 +37760,33 @@ Interpretation:
   calls. The existing SM70 Tensor Core LM-head top1 op is disabled by default
   on the compile-graph lane but supports small `M<=17`.
 - Benchmark support:
-  - `benchmarks/benchmark_sm70_lm_head_top1.py` was extended so `m>1` can test
+    - `benchmarks/benchmark_sm70_lm_head_top1.py` was extended so `m>1` can test
     the Tensor Core top1 path against `torch.mm(...).max(...)`; the scalar
     top1 check remains `m=1` only.
-  - Synthetic local LM-head shape for Qwen3.6-27B TP2:
+    - Synthetic local LM-head shape for Qwen3.6-27B TP2:
     `N=124160`, `K=5120`.
-  - Artifacts:
+    - Artifacts:
     `bench_results/mtp_27b_awq_20260630/lm_head_top1_m1_n124160_gpu2.json`
     and `lm_head_top1_m5_n124160_gpu3.json`.
-  - Result: TC top1 matched the reference argmax/value on the synthetic test.
+    - Result: TC top1 matched the reference argmax/value on the synthetic test.
     For `m=5`, `tensor_core=1.327 ms`, `torch_mm_max=2.031 ms`,
     and `sm70_gemm_then_max=1.268 ms`.
 - Full official-sampling MTP4 candidate:
-  - Artifact:
+    - Artifact:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_official_dynamic_nopreserve_top1tc_mm0_u072_seed0_gpu23_o512.json`.
-  - Env combined dynamic/no-preserve verifier selector with
+    - Env combined dynamic/no-preserve verifier selector with
     `VLLM_SM70_LM_HEAD_TOP1_TC=1`.
-  - Result: `steady_decode_tps=81.7641`, `tpot=12.2303 ms/token`,
+    - Result: `steady_decode_tps=81.7641`, `tpot=12.2303 ms/token`,
     `mean_acceptance_length=3.0476`, `draft_acceptance_rate=0.5119`.
     Runtime log shows `SM70 Tensor Core LM head top1 epilogue path enabled`.
-  - Quality gate status: output token hash was
+    - Quality gate status: output token hash was
     `32d9c0c4284219a1df0f81b4f98a8847906e31bb67551740784f4b702b22d693`,
     not the baseline/dynamic-no-preserve hash
     `62bc393d73d1b22bc2a5819f5d029b9e7079b9129fe0e6b0b6fe882bac9937ff`.
     Therefore the `81.8 tok/s` result is a promising candidate, not an accepted
     quality-equivalent speed result.
 - Reproducibility follow-up:
-  - A short O64 margin audit with TOP1_TC
+    - A short O64 margin audit with TOP1_TC
     `qwen36_27b_awq_mtp4_top1tc_margin_o64.*` recorded 48 real drafter
     `get_top_tokens()` rows across TP ranks. All selected tokens were true
     full-logits rank0 (`selected_top_ranks` histogram `{0: 48}`), with minimum
@@ -37794,7 +37794,7 @@ Interpretation:
     `qwen36_27b_awq_mtp4_dynamic_nopreserve_notc_o64_seed0_gpu23.json`
     produced the same O64 token hash and acceptance metrics, so early TOP1_TC
     drift was not observed.
-  - A current O512 rerun of dynamic/no-preserve without TOP1_TC,
+    - A current O512 rerun of dynamic/no-preserve without TOP1_TC,
     `qwen36_27b_awq_mtp4_official_dynamic_nopreserve_notc_rerun_mm0_u072_seed0_gpu23_o512.json`,
     did not reproduce the earlier dynamic/no-preserve seeded hash. It measured
     `steady_decode_tps=76.5702`, `tpot=13.0599 ms/token`,
@@ -37803,12 +37803,12 @@ Interpretation:
     This means the dynamic/no-preserve lane has runtime-measure or sampling
     nondeterminism under the current benchmark conditions. Do not claim a
     production-safe selector from a single seeded hash match.
-  - Compared with that current no-TC rerun, TOP1_TC still improves throughput
+    - Compared with that current no-TC rerun, TOP1_TC still improves throughput
     (`76.57 -> 81.76 tok/s`) and TPOT (`13.06 -> 12.23 ms/token`), but their
     token streams first differ at output index `115`. Treat TOP1_TC as a
     speed/acceptance candidate that requires quality-matrix validation, not as
     an equivalence-preserving micro-optimization.
-  - TOP1_TC profile artifact:
+    - TOP1_TC profile artifact:
     `qwen36_27b_awq_mtp4_official_dynamic_nopreserve_top1tc_profile_i20_mm0_u072_seed0_gpu23_o512.log`.
     The proposer profile at `calls=160` reported `total_gpu=8.544 ms`,
     `first_sample=1.300 ms`, `loop0_sample=1.286 ms`,
@@ -37819,8 +37819,8 @@ Interpretation:
     `loop2_sample=2.004 ms`. This confirms TOP1_TC removes about
     `2.85 ms/spec-step` from drafter sampling/top1 work.
 - Decision:
-  - Do not default-enable `VLLM_SM70_LM_HEAD_TOP1_TC` for official MTP4 yet.
-  - The initial O64 real-hidden-state margin audit did not show TC argmax drift.
+    - Do not default-enable `VLLM_SM70_LM_HEAD_TOP1_TC` for official MTP4 yet.
+    - The initial O64 real-hidden-state margin audit did not show TC argmax drift.
     The remaining gate is longer-step replay plus a broader output-quality
     matrix. Until that passes, treat TOP1_TC as a speed/acceptance candidate
     rather than a hash-equivalent micro-optimization.
@@ -37835,37 +37835,37 @@ Interpretation:
   dynamic/no-preserve AWQ selector, `VLLM_SM70_LM_HEAD_TOP1_TC=1`,
   `limit_mm_per_prompt={"image":0,"video":0}`.
 - O256 sweep:
-  - MTP4:
+    - MTP4:
     `qwen36_27b_awq_mtp4_top1tc_dynamic_nopreserve_o256_seed0_gpu23.json`.
     `steady_decode_tps=80.5773`, `tpot=12.4104 ms/token`,
     `mean_acceptance_length=3.0595`, per-position acceptance
     `[0.8214, 0.5357, 0.3929, 0.3095]`.
-  - MTP5:
+    - MTP5:
     `qwen36_27b_awq_mtp5_top1tc_dynamic_nopreserve_o256_seed0_gpu23.json`.
     `steady_decode_tps=95.8381`, `tpot=10.4343 ms/token`,
     `mean_acceptance_length=3.9231`, per-position acceptance
     `[0.8000, 0.6769, 0.5692, 0.4769, 0.4000]`.
     This is the first short-output run close to the `100 tok/s` target.
-  - MTP6:
+    - MTP6:
     `qwen36_27b_awq_mtp6_top1tc_dynamic_nopreserve_o256_seed0_gpu23.json`.
     `steady_decode_tps=87.1022`, `tpot=11.4808 ms/token`,
     `mean_acceptance_length=3.7647`, per-position acceptance
     `[0.8382, 0.6618, 0.4853, 0.3382, 0.2353, 0.2059]`.
     The sixth draft position is too weak to offset the extra cost.
 - O512 confirmation for the best short-output candidate:
-  - MTP5:
+    - MTP5:
     `qwen36_27b_awq_mtp5_top1tc_dynamic_nopreserve_o512_seed0_gpu23.json`.
     `steady_decode_tps=83.2694`, `tpot=12.0092 ms/token`,
     `mean_acceptance_length=3.3377`, per-position acceptance
     `[0.7468, 0.5519, 0.4416, 0.3442, 0.2532]`.
-  - Interpretation: MTP5 is better than MTP4 on O512, but the O256 acceptance
+    - Interpretation: MTP5 is better than MTP4 on O512, but the O256 acceptance
     spike does not generalize. Do not use O256 alone as the target-speed
     acceptance evidence.
 - Decision:
-  - MTP5+TOP1_TC is the best current acceptance/cost candidate, but it is still
+    - MTP5+TOP1_TC is the best current acceptance/cost candidate, but it is still
     only `83.3 tok/s` on O512 and remains quality-gated.
-  - MTP6 should not be pursued further unchanged.
-  - Next acceptance work should target draft quality or sampling policy, not
+    - MTP6 should not be pursued further unchanged.
+    - Next acceptance work should target draft quality or sampling policy, not
     simply increasing the number of repeated MTP steps.
 
 ### 2026-07-01 MTP validation-cost gate
@@ -37891,31 +37891,31 @@ Interpretation:
   --md-out bench_results/mtp_27b_awq_20260630/mtp_fast_gate_o512_core.md
   ...artifacts...`.
 - Generated gate artifacts:
-  - `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_o512_core.{json,md}`.
-  - `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_top1tc_sweep.{json,md}`.
+    - `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_o512_core.{json,md}`.
+    - `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_top1tc_sweep.{json,md}`.
 - O512 core gate result:
-  - Current MTP4 dynamic/no-TC control:
+    - Current MTP4 dynamic/no-TC control:
     `76.570 tok/s`, `13.060 ms/token`, `mean_acceptance_length=3.096`,
     exact token match to itself.
-  - MTP4 TOP1_TC:
+    - MTP4 TOP1_TC:
     `81.764 tok/s`, `12.230 ms/token`, `mean_acceptance_length=3.048`,
     first token mismatch vs no-TC control at output index `115`.
-  - MTP5 TOP1_TC:
+    - MTP5 TOP1_TC:
     `83.269 tok/s`, `12.009 ms/token`, `mean_acceptance_length=3.338`,
     first token mismatch vs no-TC control at output index `23`.
 - O256/O512 sweep gate result:
-  - MTP4 TOP1_TC O256 is prefix-equal to the no-TC O512 control for the first
+    - MTP4 TOP1_TC O256 is prefix-equal to the no-TC O512 control for the first
     `256` tokens, but only reaches `80.577 tok/s`.
-  - MTP5 TOP1_TC O256 reaches `95.838 tok/s`, but drifts at output index `23`
+    - MTP5 TOP1_TC O256 reaches `95.838 tok/s`, but drifts at output index `23`
     and its O512 confirmation is only `83.269 tok/s`.
-  - MTP6 TOP1_TC O256 reaches `87.102 tok/s` and drifts at output index `26`.
+    - MTP6 TOP1_TC O256 reaches `87.102 tok/s` and drifts at output index `26`.
 - Promotion rule from this gate:
-  - `target-speed-candidate` requires official sampling, TP2, non-eager graph
+    - `target-speed-candidate` requires official sampling, TP2, non-eager graph
     path, at least O512 output, and `steady_decode_tps >= 100`.
-  - `exact` or `prefix` only proves a cheap deterministic screen; it is not a
+    - `exact` or `prefix` only proves a cheap deterministic screen; it is not a
     full model-quality gate. Any `drift` result must pass a broader quality
     matrix before default enablement.
-  - Current TOP1_TC/MTP5 results remain speed candidates, not accepted quality
+    - Current TOP1_TC/MTP5 results remain speed candidates, not accepted quality
     or target-speed results.
 
 ### 2026-07-01 MTP verifier-cost staged-verification check
@@ -37932,12 +37932,12 @@ Interpretation:
   `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS=0`), real AWQ weights through
   `benchmarks/benchmark_sm70_awq_verifier_micro.py`, `warmup=30`, `iters=200`.
 - Artifacts:
-  - `awq_verifier_micro_m1_dynamic_nopreserve_gpu2.json`
-  - `awq_verifier_micro_m2_dynamic_nopreserve_gpu2.json`
-  - `awq_verifier_micro_m3_dynamic_nopreserve_gpu2.json`
-  - `awq_verifier_micro_m4_dynamic_nopreserve_gpu2.json`
-  - `awq_verifier_micro_m5_dynamic_nopreserve_rerun3_gpu2.json`
-  - `awq_verifier_micro_m6_dynamic_nopreserve_gpu2.json`
+    - `awq_verifier_micro_m1_dynamic_nopreserve_gpu2.json`
+    - `awq_verifier_micro_m2_dynamic_nopreserve_gpu2.json`
+    - `awq_verifier_micro_m3_dynamic_nopreserve_gpu2.json`
+    - `awq_verifier_micro_m4_dynamic_nopreserve_gpu2.json`
+    - `awq_verifier_micro_m5_dynamic_nopreserve_rerun3_gpu2.json`
+    - `awq_verifier_micro_m6_dynamic_nopreserve_gpu2.json`
 - Weighted AWQ GEMM curve:
 
   | verifier rows M | weighted mean |
@@ -37954,12 +37954,12 @@ Interpretation:
   than row count. Therefore splitting one `M=5` verifier pass into two smaller
   verifier passes does not reduce AWQ cost.
 - Staged two-pass model using current O512 per-position acceptance:
-  - MTP4 no-TC control has `P(first two drafts accepted)=0.5663`.
+    - MTP4 no-TC control has `P(first two drafts accepted)=0.5663`.
     Cost model `M2 + P2*M3 = 23.610 ms`, versus one-pass `M5=15.762 ms`;
     this is `+49.8%` worse.
-  - MTP4 TOP1_TC has `P2=0.5417`.
+    - MTP4 TOP1_TC has `P2=0.5417`.
     `M2 + P2*M3 = 23.237 ms`, `+47.4%` worse than one-pass `M5`.
-  - MTP5 TOP1_TC O512 has `P2=0.5519`.
+    - MTP5 TOP1_TC O512 has `P2=0.5519`.
     `M2 + P2*M3 = 23.393 ms`, `+48.4%` worse than one-pass `M5`.
 - Decision: do not implement staged target verification for the current AWQ
   MTP4 path. It adds graph/rejection complexity and is already negative before
@@ -37977,63 +37977,63 @@ Interpretation:
   `draft_probs`, so `draft_sample_method="probabilistic"` is the lowest-risk
   acceptance-length lever.
 - Code changes:
-  - `compute_probs_and_sample_next_token()` now has a default-off SM70
+    - `compute_probs_and_sample_next_token()` now has a default-off SM70
     experiment switch
     `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1`, which applies draft top-p even
     when top-k is configured.
-  - It also accepts
+    - It also accepts
     `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE=<float in (0,1]>` for proposal
     sweeps such as `0.98`.
-  - The probabilistic draft sampler now uses `sampling_metadata.generators`
+    - The probabilistic draft sampler now uses `sampling_metadata.generators`
     for seeded Gumbel/exponential sampling when available, matching the target
     sampler/recovered-token sampler pattern. This only affects the
     probabilistic draft path; the default greedy MTP path is unchanged.
 - Strong positive single-seed result:
-  - Artifact:
+    - Artifact:
     `qwen36_27b_awq_mtp5_prob_draft_dynamic_nopreserve_o512_seed0_gpu23.json`.
-  - Setup: Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, official sampling seed `0`,
+    - Setup: Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, official sampling seed `0`,
     `num_speculative_tokens=5`, `draft_sample_method="probabilistic"`,
     TurboMind AWQ dynamic/no-preserve selector, CUDA graph, `limit_mm=0`.
-  - Result: `steady_decode_tps=121.170`, `tpot=8.253 ms/token`,
+    - Result: `steady_decode_tps=121.170`, `tpot=8.253 ms/token`,
     `mean_acceptance_length=5.495`, `draft_acceptance_rate=0.899`.
-  - This is the first O512 target-speed artifact above `100 tok/s`.
+    - This is the first O512 target-speed artifact above `100 tok/s`.
 - Multi-seed stability check:
-  - Same config with seed `1`:
+    - Same config with seed `1`:
     `qwen36_27b_awq_mtp5_prob_draft_dynamic_nopreserve_o512_seed1_gpu23.json`
     fell to `78.405 tok/s`, `mean_acceptance_length=3.556`.
-  - With the generator-aware draft sampling change:
+    - With the generator-aware draft sampling change:
     `qwen36_27b_awq_mtp5_prob_draft_genfix_dynamic_nopreserve_o512_seed0_gpu23.json`
     measured `75.774 tok/s`, `AL=3.436`, while
     `qwen36_27b_awq_mtp5_prob_draft_genfix_dynamic_nopreserve_o512_seed1_gpu23.json`
     measured `127.465 tok/s`, `AL=5.864`.
-  - Interpretation: probabilistic MTP5 can exceed the speed target, but the
+    - Interpretation: probabilistic MTP5 can exceed the speed target, but the
     sampled sequence/proposal path is still highly variable. Seeded generator
     use is a correctness improvement for reproducibility, not by itself a
     robust speed fix.
 - Static draft top-p proposal sweep:
-  - `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1` with seed `1` improved
+    - `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1` with seed `1` improved
     `78.405 -> 106.692 tok/s` and `AL 3.556 -> 4.933`, but with seed `0`
     measured only `80.056 tok/s`, `AL=3.664`.
-  - `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE=0.98` with seed `1` measured
+    - `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE=0.98` with seed `1` measured
     `103.359 tok/s`, `AL=4.794`, but seed `0` measured only `80.435 tok/s`,
     `AL=3.703`.
-  - `genfix + top_p=0.95` with seed `0` measured `74.194 tok/s`, `AL=3.497`.
-  - Decision: do not default-enable static draft top-p truncation. It can
+    - `genfix + top_p=0.95` with seed `0` measured `74.194 tok/s`, `AL=3.497`.
+    - Decision: do not default-enable static draft top-p truncation. It can
     rescue one sampled sequence while hurting another.
 - Gate artifacts:
-  - `mtp_fast_gate_prob_draft.json`
-  - `mtp_fast_gate_prob_draft_o512.json`
-  - `mtp_fast_gate_prob_draft_topp_o512_final.json`
-  - `mtp_fast_gate_prob_draft_proposal_sweep_o512.json`
-  - `mtp_fast_gate_prob_draft_genfix_o512.json`
-  - `mtp_fast_gate_prob_draft_all_o512.{json,md}`
+    - `mtp_fast_gate_prob_draft.json`
+    - `mtp_fast_gate_prob_draft_o512.json`
+    - `mtp_fast_gate_prob_draft_topp_o512_final.json`
+    - `mtp_fast_gate_prob_draft_proposal_sweep_o512.json`
+    - `mtp_fast_gate_prob_draft_genfix_o512.json`
+    - `mtp_fast_gate_prob_draft_all_o512.{json,md}`
 - Current status:
-  - Speed target is now reachable on a real O512 artifact, but not yet robust
+    - Speed target is now reachable on a real O512 artifact, but not yet robust
     enough to declare the goal complete.
-  - Quality is not yet accepted: all probabilistic runs are token-stream drift
+    - Quality is not yet accepted: all probabilistic runs are token-stream drift
     relative to the greedy control, which is expected for non-greedy proposal
     sampling but still requires a broader quality matrix.
-  - Next work should either build an adaptive proposal policy that avoids
+    - Next work should either build an adaptive proposal policy that avoids
     seed-sensitive static top-p tradeoffs, or run a small quality/speed matrix
     on the best probabilistic MTP5 candidate to decide whether distributional
     output quality is acceptable before deeper optimization.
@@ -38041,49 +38041,49 @@ Interpretation:
 ### 2026-07-01 Strict MTP4 probabilistic verifier-cost and validation cost
 
 - Runtime verifier-cost result:
-  - Current MTP4 verifies `4` draft positions plus the bonus row in one target
+    - Current MTP4 verifies `4` draft positions plus the bonus row in one target
     pass (`M=5`). On the real AWQ verifier microbench, the dynamic/no-preserve
     TurboMind AWQ bucket is nearly flat from `M=1` to `M=6`:
     `15.318`, `15.031`, `15.151`, `15.537`, `15.762`, and `15.623 ms`.
-  - Therefore verifier cost is mostly fixed per target pass, not proportional
+    - Therefore verifier cost is mostly fixed per target pass, not proportional
     to the number of verified rows in this small-M range. The practical speed
     lever is amortization: raise accepted tokens per verifier pass, or reduce
     the fixed verifier kernel cost.
-  - Staged/two-pass verification is negative for this path. Using the current
+    - Staged/two-pass verification is negative for this path. Using the current
     O512 acceptance probabilities, `M2 + P(first2 accepted)*M3` is about
     `23.2-23.6 ms` of AWQ verifier work versus one-pass `M5=15.762 ms`,
     before counting the extra CUDA graph replay, rejection sampler, and state
     update overhead. Do not implement staged verifier unless a future fused
     verifier changes this flat-M cost curve.
 - Strict MTP4 probabilistic O512 speed gate:
-  - `qwen36_27b_awq_mtp4_prob_draft_dynamic_nopreserve_o512_seed0_gpu23.json`:
+    - `qwen36_27b_awq_mtp4_prob_draft_dynamic_nopreserve_o512_seed0_gpu23.json`:
     `steady_decode_tps=106.740`, `tpot=9.369 ms/token`,
     `mean_acceptance_length=4.580`, `draft_acceptance_rate=89.5%`.
-  - `qwen36_27b_awq_mtp4_prob_draft_dynamic_nopreserve_o512_seed1_gpu23.json`:
+    - `qwen36_27b_awq_mtp4_prob_draft_dynamic_nopreserve_o512_seed1_gpu23.json`:
     `steady_decode_tps=115.763`, `tpot=8.638 ms/token`,
     `mean_acceptance_length=4.913`, `draft_acceptance_rate=97.8%`.
-  - Gate summary:
+    - Gate summary:
     `bench_results/mtp_27b_awq_20260630/mtp_fast_gate_mtp4_prob_o512_2seed.{json,md}`.
-  - Interpretation: this is the first strict MTP4, official-sampling, O512,
+    - Interpretation: this is the first strict MTP4, official-sampling, O512,
     non-eager CUDA-graph evidence above `100 tok/s` on two seeds. The gain
     comes from amortizing the fixed verifier pass with high acceptance, not from
     making the verifier itself cheaper.
 - Validation-cost gate result:
-  - Minimal two-prompt quality smokes passed for both seeds:
+    - Minimal two-prompt quality smokes passed for both seeds:
     `qwen36_27b_awq_mtp4_prob_quality2_seed0_gpu23.json` and
     `qwen36_27b_awq_mtp4_prob_quality2_seed1_gpu23.json`.
     Each used official sampling, natural EOS behavior (`ignore_eos=false`),
     `max_tokens=512`, and checked `code_snake` plus `structured_design`.
-  - The embedded short speed probes in those quality runs stayed above target:
+    - The embedded short speed probes in those quality runs stayed above target:
     `101.076 tok/s` for seed `0` and `101.235 tok/s` for seed `1` at O128.
-  - This clears only the fast validation gate. It is not a production/default
+    - This clears only the fast validation gate. It is not a production/default
     gate because probabilistic MTP intentionally drifts from the greedy control
     token stream, and the current smoke covers only two prompts.
 - Promotion rule:
-  - Cheap candidate screen: O512 official-sampling speed gate on at least two
+    - Cheap candidate screen: O512 official-sampling speed gate on at least two
     seeds plus the two-prompt quality smoke. The strict MTP4 probabilistic
     route now passes this screen.
-  - Before default enablement: run the broader quality matrix with more prompt
+    - Before default enablement: run the broader quality matrix with more prompt
     families and longer natural-stop outputs, then repeat one O512 speed check.
     Do not spend Nsight/NCU time on this route until that broader quality gate
     passes, because the current bottleneck decision is semantic acceptance
@@ -38100,36 +38100,36 @@ Interpretation:
   dynamic/no-preserve AWQ selector, `VLLM_SM70_LM_HEAD_TOP1_TC=0`,
   `draft_sample_method="probabilistic"`, and MTP4.
 - Artifacts:
-  - Seed `0`:
+    - Seed `0`:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_prob_quality4_o1024_seed0_gpu23.json`.
-  - Seed `1`:
+    - Seed `1`:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_prob_quality4_o1024_seed1_gpu23.json`.
 - Result:
-  - Both seeds passed all four prompt families: `code_macos`, `code_snake`,
+    - Both seeds passed all four prompt families: `code_macos`, `code_snake`,
     `long_story_review`, and `structured_design`.
-  - Every quality prompt produced `1024` tokens and finished by length, with no
+    - Every quality prompt produced `1024` tokens and finished by length, with no
     quality failures. Worst observed metrics stayed low: max same-token run
     `3`, max digit run `6`, `repeat20<=5`, `repeat50<=2`, `repeat100=1`, and
     max same-line run `1`.
-  - Greedy determinism checks were exact on both seeds.
-  - The embedded O128 speed probes reported `100.154 tok/s` for seed `0` and
+    - Greedy determinism checks were exact on both seeds.
+    - The embedded O128 speed probes reported `100.154 tok/s` for seed `0` and
     `99.588 tok/s` for seed `1`. Treat these as quality-run diagnostics only;
     the accepted speed evidence for this route remains the O512 gate above
     (`106.740` and `115.763 tok/s`).
 - Fresh O512 speed rerun after the broader quality gate:
-  - Artifact:
+    - Artifact:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_prob_fresh_o512_seed0_gpu23.txt`.
-  - Result: `steady_decode_tps=108.703`, `tpot=9.199 ms/token`,
+    - Result: `steady_decode_tps=108.703`, `tpot=9.199 ms/token`,
     `mean_acceptance_length=4.580`, `draft_acceptance_rate=89.5%`,
     `total_output_tokens=512`.
-  - This confirms the current worktree still clears the `100 tok/s` target
+    - This confirms the current worktree still clears the `100 tok/s` target
     after the broader quality gate. The run used official sampling, no
     `ignore_eos`, TP2, CUDA graph, TurboMind AWQ, and MTP4 probabilistic draft
     sampling.
 - Decision:
-  - The strict MTP4 probabilistic route now clears the current local quality
+    - The strict MTP4 probabilistic route now clears the current local quality
     gate and the O512 speed target on two seeds.
-  - Remaining risk before default enablement is distributional quality outside
+    - Remaining risk before default enablement is distributional quality outside
     these four prompts, not obvious repetition/corruption. If this route is to
     become the recommended 27B-AWQ MTP4 path, the next verification step should
     be a small external/task-quality eval or wider prompt suite. No kernel
@@ -38139,70 +38139,70 @@ Interpretation:
 ### 2026-07-01 SM70 MTP default-probabilistic promotion check
 
 - Code change:
-  - SM70 MTP default filling in `vllm/engine/arg_utils.py` now sets
+    - SM70 MTP default filling in `vllm/engine/arg_utils.py` now sets
     `speculative_config.draft_sample_method="probabilistic"` when the user did
     not explicitly set a draft sample method.
-  - Explicit user configuration still wins. Greedy requests still use the
+    - Explicit user configuration still wins. Greedy requests still use the
     proposer's argmax fast path when `sampling_metadata.all_greedy` is true, so
     this default is aimed at official non-greedy Qwen sampling without changing
     deterministic request behavior.
-  - `benchmarks/run_sm70_quality_speed_matrix.py` now accepts
+    - `benchmarks/run_sm70_quality_speed_matrix.py` now accepts
     `--quality-prompts-json`, so future quality gates can extend prompt
     coverage without editing the script.
 - Unit test:
-  - `python -m pytest -q tests/engine/test_arg_utils.py -k 'sm70_mtp_defaults or sm70_explicit_mtp'`
+    - `python -m pytest -q tests/engine/test_arg_utils.py -k 'sm70_mtp_defaults or sm70_explicit_mtp'`
     passed (`4 passed`).
-  - Full file after clearing invalid local proxy env:
+    - Full file after clearing invalid local proxy env:
     `ALL_PROXY= all_proxy= HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= python -m pytest -q tests/engine/test_arg_utils.py`
     passed (`81 passed`).
 - Default-filled O512 speed artifact:
-  - `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_o512_seed0_gpu23.txt`.
-  - The run omitted `draft_sample_method` from `speculative_config`; the log
+    - `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_o512_seed0_gpu23.txt`.
+    - The run omitted `draft_sample_method` from `speculative_config`; the log
     confirms `speculative_config.draft_sample_method=probabilistic`.
-  - Result: `steady_decode_tps=107.914`, `tpot=9.267 ms/token`,
+    - Result: `steady_decode_tps=107.914`, `tpot=9.267 ms/token`,
     `mean_acceptance_length=4.580`, `draft_acceptance_rate=89.5%`,
     `total_output_tokens=512`, official sampling, no `ignore_eos`.
 - Wider prompt-json quality artifact:
-  - `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_quality8_o512_seed0_gpu23.json`.
-  - Prompt source: `benchmarks/sm70_quality_prompts_qwen36.json` (`8` prompts).
-  - The run also omitted `draft_sample_method`; the log confirms the same
+    - `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_quality8_o512_seed0_gpu23.json`.
+    - Prompt source: `benchmarks/sm70_quality_prompts_qwen36.json` (`8` prompts).
+    - The run also omitted `draft_sample_method`; the log confirms the same
     probabilistic default. The JSON `engine_kwargs` field records pre-default
     kwargs, so use the log line as the authoritative default-fill evidence.
-  - Result: all `8` prompts passed at `512` output tokens with official
+    - Result: all `8` prompts passed at `512` output tokens with official
     sampling and `ignore_eos=false`; greedy determinism was exact. Worst
     observed quality metrics: max same-token run `2`, max digit run `4`,
     `repeat20<=6`, `repeat50=1`, `repeat100=1`, and max same-line run `1`.
-  - Embedded O128 speed probe was `99.877 tok/s`; treat this as a quality-run
+    - Embedded O128 speed probe was `99.877 tok/s`; treat this as a quality-run
     diagnostic only. The accepted speed evidence remains the O512 speed gate.
 - Serving-path quality artifact:
-  - `benchmarks/benchmark_sm70_serving_quality.py` dump mode now accepts prompt
+    - `benchmarks/benchmark_sm70_serving_quality.py` dump mode now accepts prompt
     JSON files, records the seed, computes the same lightweight repetition /
     corruption metrics used by the offline quality matrix, and can fail the
     process with `--require-quality-gate`.
-  - Server artifact:
+    - Server artifact:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_server_gpu23.log`.
     The OpenAI-compatible server used
     `VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS=1`, omitted manual
     `draft_sample_method`, and logged
     `speculative_config.draft_sample_method=probabilistic`.
-  - Serving quality result:
+    - Serving quality result:
     `bench_results/mtp_27b_awq_20260630/qwen36_27b_awq_mtp4_defaultprob_serving_quality8_o512_seed0_gpu23.json`.
     Setup used Qwen3.6-27B-AWQ, TP2 GPUs `2,3`, TurboMind AWQ, CUDA graph,
     official sampling (`temperature=1.0`, `top_p=0.95`, `top_k=20`),
     `seed=0`, `max_tokens=512`, and `ignore_eos=false`.
-  - Result: all `8` serving requests passed the quality gate. Seven requests
+    - Result: all `8` serving requests passed the quality gate. Seven requests
     finished by length at `512` output tokens, one stopped naturally at `227`
     tokens. Worst observed serving metrics were max same-token run `2`, max
     digit run `4`, and max same-line run `1`; no prompt failed.
-  - Do not use the serving quality run as the accepted speed baseline because
+    - Do not use the serving quality run as the accepted speed baseline because
     it intentionally mixes heterogeneous prompts and OpenAI serving overhead.
     This note was later superseded by the 256k API serving correction below:
     the offline O512 artifact is only a low-overhead speed screen, not the
     accepted user-facing speed baseline.
 - Decision:
-  - The recommended SM70 Qwen3.6-27B-AWQ MTP4 route is now the default-filled
+    - The recommended SM70 Qwen3.6-27B-AWQ MTP4 route is now the default-filled
     probabilistic MTP path, not manual `draft_sample_method` plumbing.
-  - The route has same-criterion offline speed evidence above `100 tok/s`,
+    - The route has same-criterion offline speed evidence above `100 tok/s`,
     offline prompt-matrix quality evidence, and serving-path quality evidence
     using the same default-filled configuration. This is useful route evidence
     but not final speed acceptance under the later 256k API real-prompt target.
@@ -38210,48 +38210,48 @@ Interpretation:
 ### 2026-07-01 256k API serving real-prompt baseline correction
 
 - Correction to the previous speed interpretation:
-  - The `107.914 tok/s` artifact above is a valid low-overhead offline
+    - The `107.914 tok/s` artifact above is a valid low-overhead offline
     `steady_decode_tps` screen for the MTP4 path, but it is not a production
     acceptance result for the new user-facing target.
-  - That run used `max_model_len=2048` and a synthetic repeated tokenized input
+    - That run used `max_model_len=2048` and a synthetic repeated tokenized input
     generated from:
     `This fixed benchmark prompt is used to create a deterministic tokenized input for single-request decode measurement.`
     The prompt was repeated/truncated to `512` prompt tokens. This raises MTP
     acceptance (`mean_acceptance_length=4.580`) and should not be compared to
     natural chat prompts.
-  - New acceptance target for Qwen3.6-27B-AWQ MTP4 is therefore:
+    - New acceptance target for Qwen3.6-27B-AWQ MTP4 is therefore:
     real prompt collection, `max_model_len=262144`, OpenAI API serving path,
     TP2, official sampling (`temperature=1.0`, `top_p=0.95`, `top_k=20`),
     CUDA graph / non-eager, TurboMind AWQ, and no output-quality regression.
 - Benchmark harness update:
-  - `benchmarks/benchmark_sm70_serving_quality.py` dump mode now supports
+    - `benchmarks/benchmark_sm70_serving_quality.py` dump mode now supports
     `--endpoint chat|completions` and records per-request wall time,
     prompt/completion token counts, completion tokens/s, aggregate tokens/s,
     and request-level throughput statistics.
-  - For chat endpoint dumps, quality metrics use OpenAI `usage` completion
+    - For chat endpoint dumps, quality metrics use OpenAI `usage` completion
     token counts when the server does not return token ids.
-  - The same dump mode can now record Prometheus counter deltas with
+    - The same dump mode can now record Prometheus counter deltas with
     `--record-metrics-delta`, which captures per-request MTP drafts, draft
     tokens, accepted tokens, per-position acceptance, prompt tokens, and
     generation tokens. Use this only with one serial benchmark process and no
     concurrent traffic.
 - 256k API server baseline:
-  - Server log:
+    - Server log:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_port8000.log`.
     The server reported `max_model_len=262144`, default MTP4 probabilistic
     filling, TurboMind AWQ, CUDA graph, TP2, and `/v1/models` returned
     `max_model_len=262144`.
-  - Real prompt artifact:
+    - Real prompt artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_chat_quality8_o512_seed0.json`.
     Prompt source was `benchmarks/sm70_quality_prompts_qwen36.json` (`8`
     natural short task prompts) via `/v1/chat/completions`, `max_tokens=512`,
     official sampling, `seed=0`, and `ignore_eos=false`.
-  - Result: quality gate passed on all `8` prompts, but speed missed the
+    - Result: quality gate passed on all `8` prompts, but speed missed the
     `100 tok/s` goal. Aggregate completion throughput was `62.142 tok/s`;
     per-request completion tok/s min/mean/median/p90/max was
     `54.996 / 64.263 / 61.426 / 86.090 / 86.090`.
     Total completion tokens were `2959`.
-  - Per-prompt summary:
+    - Per-prompt summary:
 
     | prompt | completion tokens | finish | tok/s |
     | --- | ---: | --- | ---: |
@@ -38264,21 +38264,21 @@ Interpretation:
     | external_07 | 305 | stop | 54.996 |
     | external_08 | 512 | length | 58.215 |
 
-  - Server-side metric windows during this run showed generation throughput in
+    - Server-side metric windows during this run showed generation throughput in
     the `~39-69 tok/s` range and MTP mean acceptance length around `2.6-3.2`,
     far below the synthetic speed screen's `4.580`.
 - Metrics-delta rerun:
-  - Artifact:
+    - Artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_chat_quality8_o512_seed0_metrics.json`.
-  - Result remained stable: aggregate completion throughput `62.338 tok/s`,
+    - Result remained stable: aggregate completion throughput `62.338 tok/s`,
     per-request min/mean/median/p90/max `55.466 / 64.859 / 61.622 / 87.643 /
     87.643 tok/s`, total completion tokens `2959`, and all `8` quality gates
     passed.
-  - Prometheus spec-decode deltas over the run:
+    - Prometheus spec-decode deltas over the run:
     `num_drafts=1050`, `num_draft_tokens=4200`, `num_accepted_tokens=1915`,
     mean acceptance length `2.824`, draft acceptance rate `45.6%`, and
     per-position acceptance `[0.768, 0.504, 0.340, 0.212]`.
-  - Per-prompt speed/acceptance split:
+    - Per-prompt speed/acceptance split:
 
     | prompt | tok/s | mean acceptance length | draft acceptance |
     | --- | ---: | ---: | ---: |
@@ -38291,7 +38291,7 @@ Interpretation:
     | external_07 | 55.466 | 2.488 | 37.2% |
     | external_08 | 59.571 | 2.648 | 41.2% |
 
-  - Simple throughput model from the corrected serving run:
+    - Simple throughput model from the corrected serving run:
     `1050` verifier/draft rounds over `47.467 s` is about `22.1 rounds/s`.
     At the current mean acceptance length `2.824`, this predicts the observed
     `~62 tok/s`. With the same round rate, the `100 tok/s` goal would require
@@ -38299,43 +38299,43 @@ Interpretation:
     run's `4.580`. If mean acceptance stays at `2.824`, round rate must rise to
     about `35.4 rounds/s` (`~60%` faster) to reach `100 tok/s`.
 - Decision:
-  - The active optimization goal remains open under the corrected 256k API
+    - The active optimization goal remains open under the corrected 256k API
     serving / real-prompt criterion.
-  - Immediate next optimization should target real-prompt MTP acceptance first,
+    - Immediate next optimization should target real-prompt MTP acceptance first,
     because the fixed verifier pass cannot amortize to `100 tok/s` while mean
     acceptance remains near `2.8`. Verifier-cost reduction remains useful but
     is no longer sufficient by itself unless it delivers roughly `60%` more
     verifier/draft rounds per second.
-  - Do not use `VLLM_MTP_STOCHASTIC_TOKEN_MATCHING=1` as an official accepted
+    - Do not use `VLLM_MTP_STOCHASTIC_TOKEN_MATCHING=1` as an official accepted
     result without a separate semantic/quality gate: the existing audit notes
     that it changes exact stochastic rejection sampling into token matching.
     It can be measured only as a diagnostic acceptance-speed upper bound.
 - Token-matching diagnostic:
-  - Diagnostic server artifact:
+    - Diagnostic server artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_tokenmatch_port8001.log`.
     It used the same 256k TP2 TurboMind AWQ / CUDA graph configuration on
     GPUs `0,1`, with `VLLM_MTP_STOCHASTIC_TOKEN_MATCHING=1`.
-  - Diagnostic result:
+    - Diagnostic result:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_tokenmatch_chat_quality8_o512_seed0_metrics.json`.
-  - Result: quality gate passed but speed did not materially improve.
+    - Result: quality gate passed but speed did not materially improve.
     Aggregate throughput was `63.089 tok/s`, mean acceptance length `2.837`,
     draft acceptance rate `45.9%`, and per-position acceptance
     `[0.769, 0.504, 0.344, 0.220]`. This is within noise of the standard
     rejection run (`62.338 tok/s`, mean acceptance `2.824`).
-  - Decision: token matching is not the missing speed lever for the corrected
+    - Decision: token matching is not the missing speed lever for the corrected
     real-prompt 256k serving target. Do not repeat this diagnostic unless the
     sampler implementation changes.
 - Matched no-MTP control under the corrected serving criterion:
-  - Artifact:
+    - Artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_nomtp_256k_chat_quality8_o512_seed0.json`.
-  - Same prompt source, `/v1/chat/completions`, `max_model_len=262144`,
+    - Same prompt source, `/v1/chat/completions`, `max_model_len=262144`,
     TurboMind AWQ, TP2, CUDA graph / non-eager, official sampling, and
     `seed=0`; only speculative decoding was disabled.
-  - Result: quality gate passed on all `8` prompts. Aggregate completion
+    - Result: quality gate passed on all `8` prompts. Aggregate completion
     throughput was `55.187 tok/s`, per-request min/mean/median/p90/max was
     `52.170 / 54.926 / 55.316 / 55.526 / 55.526 tok/s`, and total completion
     tokens were `2729`.
-  - Per-prompt no-MTP summary:
+    - Per-prompt no-MTP summary:
 
     | prompt | completion tokens | finish | tok/s |
     | --- | ---: | --- | ---: |
@@ -38348,23 +38348,23 @@ Interpretation:
     | external_07 | 285 | stop | 55.258 |
     | external_08 | 380 | stop | 55.374 |
 
-  - Corrected MTP4 speedup is therefore only `62.338 / 55.187 = 1.13x`;
+    - Corrected MTP4 speedup is therefore only `62.338 / 55.187 = 1.13x`;
     token-matching diagnostic is `63.089 / 55.187 = 1.14x`. MTP is helping,
     but the real-prompt API serving gain is much smaller than the synthetic
     offline `107.914 tok/s` screen suggested.
-  - Root implication: the current blocker is not that no-MTP is already slow
+    - Root implication: the current blocker is not that no-MTP is already slow
     enough to make any MTP gain look large. The corrected no-MTP floor is
     `~55 tok/s`, and the accepted target is `>100 tok/s`, so the next phase
     must lift real-prompt acceptance and/or reduce verifier/draft round cost
     under the same 256k API serving path.
 - Rejection-sampler internal profile, same MTP4/default-probabilistic route:
-  - Added a default-off sampler profiler:
+    - Added a default-off sampler profiler:
     `VLLM_SM70_REJECTION_PROFILE=1` with
     `VLLM_SM70_REJECTION_PROFILE_INTERVAL=<N>`. It only records CUDA-event
     timing when enabled; the default sampling path remains unchanged.
-  - Added model-free microbenchmark:
+    - Added model-free microbenchmark:
     `benchmarks/benchmark_sm70_rejection_sampler_micro.py`.
-  - Validation:
+    - Validation:
     `python -m py_compile vllm/v1/sample/rejection_sampler.py
     vllm/envs.py benchmarks/benchmark_sm70_rejection_sampler_micro.py` passed.
     `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python -m pytest -q
@@ -38372,13 +38372,13 @@ Interpretation:
     unconstrained mixed-GPU run failed with `cudaErrorNoKernelImageForDevice`
     after selecting the RTX 4060 Ti; that failure is environmental, not a
     sampler regression.
-  - V100 micro artifact:
+    - V100 micro artifact:
     `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp4_vocab248320_topk20_v100_gpu0.json`.
     For vocab `248320`, MTP4, `top_k=20/top_p=0.95`, means were:
     `constraints_only=0.889 ms`, `dense_softmax_only=0.197 ms`,
     `dense_recovered_only=0.240 ms`, `sparse_recovered_prototype=0.390 ms`,
     and `full_current_rejection=0.421 ms`.
-  - Real serving profile summary:
+    - Real serving profile summary:
     `bench_results/api_server_27b_awq_20260701/rejection_sampler_profile_summary_20260701.md`.
     Hot intervals showed runner `target_rejection_sample` around
     `1.56 ms/spec-step`, while sampler internals were approximately
@@ -38386,14 +38386,14 @@ Interpretation:
     `bonus_sample=0.49 ms`, `rejection_sample_total=0.34 ms`,
     `rs_target_softmax=0.152 ms`, `rs_recovered_tokens=0.157 ms`, and
     `rs_random_kernel=0.007 ms`.
-  - Decision: the simple QUICK-style idea of only replacing recovered-token
+    - Decision: the simple QUICK-style idea of only replacing recovered-token
     sampling with a `top_k` sparse prototype is not worthwhile on this route;
     it is slower than the current dense recovered kernel. The useful
     sampler-side targets are top-k/top-p constraint work and bonus sampling.
     Even eliminating the entire `target_rejection_sample` bucket would not
     close the `63 -> 100 tok/s` gap by itself.
 - AWQ verifier dynamic-selector API candidate:
-  - Candidate env on the 256k OpenAI API serving path:
+    - Candidate env on the 256k OpenAI API serving path:
     `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1`,
     `VLLM_SM70_AWQ_DENSE_TUNE_MAX_M=17`,
     `VLLM_SM70_AWQ_WARMUP_MAX_M=17`,
@@ -38401,65 +38401,65 @@ Interpretation:
     `VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY=0`, with the same TP2,
     TurboMind AWQ, Flash-V100, CUDA graph, MTP4 default-probabilistic,
     `max_model_len=262144`, real prompt set, and official sampling.
-  - Warmup artifact:
+    - Warmup artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_chat_quality8_o128_seed0_warmup.json`.
-  - O512 metrics artifact:
+    - O512 metrics artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_chat_quality8_o512_seed0_metrics.json`.
     Result: all `8` prompts passed quality; aggregate completion throughput
     `66.629 tok/s`, total completion tokens `2959`, mean acceptance length
     `2.834`, draft acceptance `45.85%`, and per-position acceptance
     `[0.773, 0.507, 0.339, 0.215]`.
-  - Matched warmed default-code serving comparison:
+    - Matched warmed default-code serving comparison:
     `qwen36_27b_awq_mtp4_256k_fix_chat_quality8_o512_seed0_metrics_r2.json`
     was `63.027 tok/s`, `2959` completion tokens, mean acceptance length
     `2.824`, and draft acceptance `45.60%`.
-  - Interpretation: this candidate improves the corrected serving criterion by
+    - Interpretation: this candidate improves the corrected serving criterion by
     about `+5.7%` (`63.027 -> 66.629 tok/s`) with essentially unchanged
     acceptance. It is a verifier/round-cost win, not an acceptance-length win.
     Keep it as an explicit candidate; do not make it the default until the
     dynamic/no-preserve numerical and broader quality risk is closed. It still
     leaves the route far below the `>100 tok/s` real-prompt 256k API target.
 - MTP drafter LM-head TOP1_TC on the corrected API route:
-  - Candidate env added `VLLM_SM70_LM_HEAD_TOP1_TC=1` on top of the
+    - Candidate env added `VLLM_SM70_LM_HEAD_TOP1_TC=1` on top of the
     dynamic/no-preserve AWQ verifier settings, with the same 256k OpenAI API
     serving path, TP2, TurboMind AWQ, Flash-V100, CUDA graph,
     MTP4 default-probabilistic draft, real prompt set, and official sampling.
-  - Server log:
+    - Server log:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_top1tc_port8002.log`.
     It logged `SM70 LM head top1 layout prepared` and local argmax reduction,
     but did not log `SM70 Tensor Core LM head top1 epilogue path enabled`.
-  - O512 metrics artifact:
+    - O512 metrics artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_top1tc_chat_quality8_o512_seed0_metrics.json`.
     Result: all `8` prompts passed quality; aggregate completion throughput
     `66.557 tok/s`, total completion tokens `2959`, mean acceptance length
     `2.837`, draft acceptance `45.93%`, and per-position acceptance
     `[0.769, 0.504, 0.344, 0.220]`.
-  - Interpretation: TOP1_TC has no measurable win over the dynamic/no-TC
+    - Interpretation: TOP1_TC has no measurable win over the dynamic/no-TC
     candidate (`66.629 tok/s`). The official probabilistic draft path requires
     full logits/probabilities and bypasses the greedy/top1 epilogue, so this is
     not the next lever for the corrected route. Do not repeat TOP1_TC under
     official probabilistic MTP4 unless the drafter sampling path is redesigned.
 - Rejection-sampler combined-bonus fast path:
-  - Candidate added `VLLM_SM70_REJECTION_COMBINE_BONUS=1` (default-on,
+    - Candidate added `VLLM_SM70_REJECTION_COMBINE_BONUS=1` (default-on,
     `=0` kill switch). The fast path is limited to the no-output-logprobs
     official random sampling route with no penalties/allowed-token/bad-word
     processors. It runs target constraints once over the compact sampled rows
     and samples bonus from the compact bonus row instead of invoking the full
     bonus sampler over full-vocab logits.
-  - Validation:
+    - Validation:
     `python -m py_compile vllm/v1/sample/rejection_sampler.py vllm/envs.py
     benchmarks/benchmark_sm70_rejection_sampler_micro.py` passed.
     `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python -m pytest -q
     tests/v1/sample/test_rejection_sampler.py` passed (`69 passed`). The
     regression test compares legacy and combined paths with the same RNG state.
-  - V100 micro artifact:
+    - V100 micro artifact:
     `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp4_vocab248320_topk20_v100_gpu0_combined_bonus_20260701.json`.
     For vocab `248320`, MTP4, `top_k=20/top_p=0.95`, full sampler forward
     dropped from `2.014 ms/spec-step` to `1.377 ms/spec-step` (`-0.637 ms`).
     Component means included `bonus_sample_old_full_logits=0.718 ms`,
     `bonus_sample_no_logprobs=0.702 ms`, `target_prepare_with_clone=0.106 ms`,
     and `target_prepare_no_clone=0.081 ms`.
-  - 256k API serving artifacts, same dynamic/no-preserve AWQ verifier route:
+    - 256k API serving artifacts, same dynamic/no-preserve AWQ verifier route:
     warmup
     `qwen36_27b_awq_mtp4_256k_awqdyn_combinedbonus_chat_quality8_o128_seed0_warmup.json`,
     O512
@@ -38470,7 +38470,7 @@ Interpretation:
     `66.200 tok/s`, total completion tokens `2959`, mean acceptance length
     `2.817`, draft acceptance `45.41%`, and per-position acceptance
     `[0.753, 0.496, 0.343, 0.224]`.
-  - Interpretation: this is a real microbenchmark reduction in sampler/verifier
+    - Interpretation: this is a real microbenchmark reduction in sampler/verifier
     overhead, but it does not produce a measurable end-to-end serving win over
     the current dynamic/no-preserve AWQ corrected API baseline (`66.629 tok/s`).
     Keep the guarded implementation as a low-risk cleanup, but do not count it
@@ -38478,25 +38478,25 @@ Interpretation:
     micro-optimization unless a fresh per-token profile shows it has grown into
     a dominant bucket.
 - Probabilistic draft sparse top-k proposal candidate:
-  - Candidate added `VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK=1` (default-off).
+    - Candidate added `VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK=1` (default-off).
     It only applies to the official-probabilistic MTP draft path when the
     proposal is top-k-only (`top_k` present and draft top-p disabled). It
     samples from the `top_k` logits and scatters an exact dense `draft_probs`
     row for the existing rejection sampler, so the proposal distribution
     matches the previous top-k-only proposal and the target sampler still uses
     the official `temperature=1.0/top_p=0.95/top_k=20` parameters.
-  - Validation:
+    - Validation:
     `python -m py_compile vllm/v1/spec_decode/llm_base_proposer.py vllm/envs.py
     tests/v1/spec_decode/test_tp_draft_sampling_sync.py` passed.
     `python -m pytest -q tests/v1/spec_decode/test_tp_draft_sampling_sync.py`
     passed (`5 passed`). The new test checks that sparse top-k draft
     probabilities match the dense top-k proposal and that the sparse path
     bypasses the dense full-vocab mask.
-  - V100 operation microbench, vocab `248320`, top-k `20`, batch `1`:
+    - V100 operation microbench, vocab `248320`, top-k `20`, batch `1`:
     old proposal p50 `0.530 ms/sample`, sparse top-k p50 `0.376 ms/sample`.
     This is at most a small per-draft-step saving because it does not remove
     the drafter LM-head/full-logits cost and still scatters dense `draft_probs`.
-  - 256k API serving artifacts, same dynamic/no-preserve AWQ verifier route:
+    - 256k API serving artifacts, same dynamic/no-preserve AWQ verifier route:
     warmup
     `qwen36_27b_awq_mtp4_256k_awqdyn_sparsetopk_chat_quality8_o128_seed0_warmup.json`,
     O512
@@ -38507,7 +38507,7 @@ Interpretation:
     `66.807 tok/s`, total completion tokens `2858`, mean acceptance length
     `2.802`, draft acceptance `45.04%`, and per-position acceptance
     `[0.741, 0.506, 0.339, 0.215]`.
-  - Interpretation: this is statistically-equivalent proposal plumbing and a
+    - Interpretation: this is statistically-equivalent proposal plumbing and a
     small sampler-operation win, but it does not materially improve the
     corrected 256k API serving target versus the current `awqdyn` baseline
     (`66.629 tok/s`, mean acceptance `2.834`). Keep it default-off. The next
@@ -38516,33 +38516,33 @@ Interpretation:
     dense `draft_probs` scatter; do not count this candidate toward the
     `>100 tok/s` target.
 - Static draft top-p proposal under corrected 256k API serving:
-  - Candidate env:
+    - Candidate env:
     `VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P=1` on top of the same
     dynamic/no-preserve AWQ verifier route. The knob was already present for
     offline proposal sweeps; `vllm/envs.py` now registers it, along with
     `VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE`, so API-server env validation
     records the route cleanly.
-  - Screen rule before the run: stop after O256 unless the candidate reaches
+    - Screen rule before the run: stop after O256 unless the candidate reaches
     mean acceptance length `>=3.5` and throughput `>=75 tok/s` on the real
     256k API prompt set.
-  - Artifacts:
+    - Artifacts:
     server log
     `qwen36_27b_awq_mtp4_256k_awqdyn_drafttopp_port8002.log`, warmup
     `qwen36_27b_awq_mtp4_256k_awqdyn_drafttopp_chat_quality8_o128_seed0_warmup.json`,
     and O256
     `qwen36_27b_awq_mtp4_256k_awqdyn_drafttopp_chat_quality8_o256_seed0_metrics.json`.
-  - Result: quality passed, but O256 aggregate throughput was only
+    - Result: quality passed, but O256 aggregate throughput was only
     `66.187 tok/s`, total completion tokens `1859`, mean acceptance length
     `2.922`, draft acceptance `48.04%`, and per-position acceptance
     `[0.777, 0.529, 0.372, 0.243]`.
-  - Decision: do not continue to O512 and do not repeat static draft-top-p
+    - Decision: do not continue to O512 and do not repeat static draft-top-p
     sweeps for the corrected 256k API target. It slightly improves AL versus
     the `awqdyn` O512 baseline shape, but nowhere near the `~4.2` AL required
     to reach `100 tok/s` at the current round rate, and O256 throughput remains
     around the existing `66 tok/s` plateau.
 
 - MTP alignment dump and draft-temperature scalar diagnostic:
-  - Context correction: the earlier `107.914 tok/s` result used the fixed
+    - Context correction: the earlier `107.914 tok/s` result used the fixed
     synthetic prompt
     `This fixed benchmark prompt is used to create a deterministic tokenized input for single-request decode measurement.`
     and `max_model_len=2048`. Treat it only as a low-overhead route screen,
@@ -38550,22 +38550,22 @@ Interpretation:
     workstream must use the real prompt collection, `max_model_len=262144`,
     OpenAI API serving, official sampling, CUDA graph / non-eager, TurboMind
     AWQ, and must report completion/decode throughput separately from TTFT.
-  - Added `benchmarks/analyze_spec_alignment_dumps.py` to summarize
+    - Added `benchmarks/analyze_spec_alignment_dumps.py` to summarize
     `VLLM_SPEC_DUMP_ALIGNMENT=1` payloads. It deduplicates TP rank dumps by
     sampler step, checks rank mismatch, and reports per-position prefix
     acceptance, proposal/target overlap, acceptance caps, target top-10 misses,
     and `q(draft)>p(target)` rates.
-  - Alignment artifact:
+    - Alignment artifact:
     `bench_results/api_server_27b_awq_20260701/qwen36_27b_awq_mtp4_256k_awqdyn_alignment_o128_seed0_summary.{json,md}`.
     The input had `160` raw files from two TP ranks, `80` deduped sampler
     steps, step range `3..82`, and `0` duplicate mismatches. Therefore the low
     acceptance is not explained by TP ranks sampling divergent draft tokens.
-  - Alignment round summary: mean output tokens per round `2.7375`, mean
+    - Alignment round summary: mean output tokens per round `2.7375`, mean
     accepted draft tokens per round `1.7375`, total output tokens `219`, total
     accepted draft tokens `139`, accepted-draft histogram
     `{0:16, 1:27, 2:12, 3:12, 4:13}`, and finish histogram
     `{all_accept_bonus:13, reject_or_recover:67}`.
-  - Per-position alignment summary:
+    - Per-position alignment summary:
 
     | pos | prefix accept | mean overlap | cap < 0.5 | target top10 miss | q(draft)>p(target) |
     | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -38578,11 +38578,11 @@ Interpretation:
     distribution mismatch in later draft slots. The deeper slots increasingly
     pick tokens outside the target top-10 and overestimate the selected token
     probability relative to the target distribution.
-  - Added guarded diagnostic env
+    - Added guarded diagnostic env
     `VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE` (default `1.0`) in the
     probabilistic draft proposal path. It scales only non-greedy draft proposal
     temperature; the target sampler stays on official sampling.
-  - Validation:
+    - Validation:
     `/home/ymzx/miniconda3/envs/vllm-0.0.5-t210/bin/python -m py_compile
     vllm/envs.py vllm/v1/spec_decode/llm_base_proposer.py
     benchmarks/analyze_spec_alignment_dumps.py
@@ -38592,7 +38592,7 @@ Interpretation:
     tests/v1/spec_decode/test_tp_draft_sampling_sync.py` passed
     (`6 passed`). A default `python -m pytest` attempt failed before tests due
     to the local `_C.abi3.so` Torch/CUDA ABI mismatch and is not a code failure.
-  - Draft-temperature A/B, same dynamic/no-preserve AWQ verifier route and
+    - Draft-temperature A/B, same dynamic/no-preserve AWQ verifier route and
     real 256k API prompt set:
     `VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE=1.25` produced O128
     `61.256 tok/s` and O256 `63.343 tok/s`, quality passed, total completion
@@ -38602,7 +38602,7 @@ Interpretation:
     `64.503 tok/s` and O256 `67.673 tok/s`, quality passed, total completion
     tokens `1840`, mean acceptance length `2.918`, draft acceptance `47.94%`,
     per-position `[0.783, 0.541, 0.354, 0.239]`.
-  - Decision: keep the scalar default-off as a diagnostic only. Scale `0.85`
+    - Decision: keep the scalar default-off as a diagnostic only. Scale `0.85`
     is a small positive A/B but still fails the O256 screen for a target-worthy
     candidate (`>=3.5` mean acceptance length and `>=75 tok/s`) and remains on
     the same `~66-68 tok/s` plateau. Do not spend more time on scalar/top-p
@@ -38612,7 +38612,7 @@ Interpretation:
     increases real-prompt effective acceptance length beyond native linear MTP4.
 
 - Native MTP verifier/sampler sparse-representation audit:
-  - Subagent read-only audit agreed with the corrected bottleneck model: at
+    - Subagent read-only audit agreed with the corrected bottleneck model: at
     real 256k API AL `~2.8`, reaching `100 tok/s` requires either AL near
     `4.5` at the current round rate or roughly `60%` more rounds/s. It
     recommended checking true sparse `draft_probs`/rejection representation
@@ -38620,19 +38620,19 @@ Interpretation:
     repeat staged verifier, token matching, TOP1_TC, combined-bonus,
     current sparse-top-k dense scatter, static top-p, or scalar-temperature
     sweeps unchanged.
-  - Extended `benchmarks/benchmark_sm70_rejection_sampler_micro.py` with
+    - Extended `benchmarks/benchmark_sm70_rejection_sampler_micro.py` with
     model-free timings for:
     `sparse_bonus_topk_topp_prototype`,
     `dense_draft_topk_proposal`,
     `sparse_draft_topk_with_scatter`, and
     `sparse_draft_topk_no_scatter`.
-  - Artifacts:
+    - Artifacts:
     `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp4_sparse_draft_gpu0_20260701.json`
     and
     `bench_results/api_server_27b_awq_20260701/rejection_sampler_micro_mtp5_sparse_draft_gpu1_20260701.json`.
     Both used V100, vocab `248320`, official `top_k=20/top_p=0.95`, warmup
     `20`, and `100` timing iterations.
-  - MTP4 micro result:
+    - MTP4 micro result:
 
     | bucket | mean |
     | --- | ---: |
@@ -38646,7 +38646,7 @@ Interpretation:
     | full current rejection | `0.413 ms` |
     | combined-bonus rejection sampler forward | `1.414 ms` |
 
-  - MTP5 micro result:
+    - MTP5 micro result:
 
     | bucket | mean |
     | --- | ---: |
@@ -38660,14 +38660,14 @@ Interpretation:
     | full current rejection | `0.418 ms` |
     | combined-bonus rejection sampler forward | `1.449 ms` |
 
-  - Interpretation: the current sparse-top-k proposal already captures most of
+    - Interpretation: the current sparse-top-k proposal already captures most of
     the proposal-side savings even though it scatters back to dense
     `draft_probs`; removing only the scatter is worth just `~0.05 ms` in this
     microbench. Sparse recovered-token sampling is slower than the current
     dense recovered kernel. Sparse bonus sampling is positive but only saves
     `~0.23 ms/round`. These are below the threshold for a target-worthy API
     candidate and do not explain the `66-68 tok/s` plateau.
-  - Decision: do not implement a large sparse `draft_probs`/rejection data
+    - Decision: do not implement a large sparse `draft_probs`/rejection data
     structure change yet. A production implementation would add sampler data
     plumbing and seeded-distribution validation but has too little additional
     upside over the already-tested sparse-top-k API route. Keep this as a
@@ -38677,11 +38677,11 @@ Interpretation:
     warmed DDTree/branched proposal validation.
 
 - AWQ M=5 verifier fast-target split/swizzle sweep:
-  - Purpose: after the dynamic/no-preserve selector remained the only
+    - Purpose: after the dynamic/no-preserve selector remained the only
     quality-equivalent verifier-cost win, test whether a narrow fixed
     `8x256x64` split/swizzle sweep could beat it for the two dominant M=5
     verifier GEMMs (`mlp_gate_up` and `mlp_down`).
-  - Baseline reruns on free V100 GPUs:
+    - Baseline reruns on free V100 GPUs:
     `bench_results/api_server_27b_awq_20260701/awq_verifier_micro_m5_default_gpu1_20260701_cont.json`
     and
     `bench_results/api_server_27b_awq_20260701/awq_verifier_micro_m5_dynamic_nopreserve_gpu0_20260701_cont.json`.
@@ -38689,11 +38689,11 @@ Interpretation:
     was `15.985 ms`. The dynamic/no-preserve top buckets were
     `mlp_gate_up=4.776 ms`, `mlp_down=5.259 ms`,
     `linear_qkv=2.722 ms`, `linear_z=2.418 ms`, and `attn_o=0.810 ms`.
-  - Narrow sweep artifacts:
+    - Narrow sweep artifacts:
     `bench_results/api_server_27b_awq_20260701/fasttarget_sweep_m5/`.
     It swept the same `8x256x64` family with split `2..8` and swizzle `0..3`
     for `mlp_gate_up` and `mlp_down`, one shape at a time.
-  - Best fixed sweep points:
+    - Best fixed sweep points:
 
     | shape | best fixed point | weighted mean | dynamic/no-preserve |
     | --- | --- | ---: | ---: |
@@ -38702,7 +38702,7 @@ Interpretation:
 
     The combined best fixed gate+down subtotal is `10.864 ms`, worse than the
     dynamic/no-preserve gate+down subtotal `10.035 ms`.
-  - Decision: do not continue fixed split/swizzle tuning for these M=5 verifier
+    - Decision: do not continue fixed split/swizzle tuning for these M=5 verifier
     shapes without a new kernel-level idea. The failure mode is not a missing
     obvious split/swizzle point inside the current `8x256x64` family; the next
     verifier-cost work must change the kernel/data path itself or move to a
@@ -38791,20 +38791,20 @@ Interpretation:
   It ran on GPUs `0,1` and was stopped after measurement; the user-facing
   port `8000` service was not touched.
 - Setup:
-  - target model `/home/ymzx/models/Qwen3.6-27B-AWQ`;
-  - drafter `/home/ymzx/models/Qwen3.6-27B-DFlash-FP16`;
-  - `speculative_config={"method":"dflash_ddtree","num_speculative_tokens":16,
+    - target model `/home/ymzx/models/Qwen3.6-27B-AWQ`;
+    - drafter `/home/ymzx/models/Qwen3.6-27B-DFlash-FP16`;
+    - `speculative_config={"method":"dflash_ddtree","num_speculative_tokens":16,
     "ddtree_budget":16,"ddtree_top_k":20,"ddtree_disable_tree_verify":false}`;
-  - `max_num_batched_tokens=16384`, `max_num_seqs=1`,
+    - `max_num_batched_tokens=16384`, `max_num_seqs=1`,
     `gpu_memory_utilization=0.90`, `mamba_cache_mode=align`,
     prefix caching enabled, Flash-V100 attention, no eager;
-  - same dynamic/no-preserve AWQ verifier candidate env as the corrected MTP4
+    - same dynamic/no-preserve AWQ verifier candidate env as the corrected MTP4
     API baseline.
 - Startup/route evidence:
-  - 256k capacity was valid: log reported GPU KV cache size `290,053` tokens
+    - 256k capacity was valid: log reported GPU KV cache size `290,053` tokens
     and max concurrency `1.11x` for `262,144` tokens.
-  - CUDA graph capture completed with `capture_sizes=(1, 2, 4, 8, 9, 17)`.
-  - Route logs showed `Using fused DDTree Qwen GDN pure-spec verifier path` and
+    - CUDA graph capture completed with `capture_sizes=(1, 2, 4, 8, 9, 17)`.
+    - Route logs showed `Using fused DDTree Qwen GDN pure-spec verifier path` and
     `FLASH_ATTN_V100 DDTree branched verifier path active`.
 - Real 256k API artifacts:
 
@@ -38816,23 +38816,23 @@ Interpretation:
   Both runs used `benchmarks/sm70_quality_prompts_qwen36.json`, official
   `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`, and no `ignore_eos`.
 - Hot profile evidence from the same 256k server:
-  - Representative steady intervals reported target verifier forward in the
+    - Representative steady intervals reported target verifier forward in the
     `~33-36 ms` range, e.g. `calls=1200` had
     `target_forward=32.916 ms`, `target_logits=2.251 ms`,
     `target_rejection_sample=1.556 ms`, `state_update_wall_cpu=0.573 ms`,
     and `draft_total=7.949 ms`.
-  - Other intervals still hit `~40-41 ms` target-forward when the interval
+    - Other intervals still hit `~40-41 ms` target-forward when the interval
     contained `15` spec steps rather than `16`, for example `calls=1280`
     reported `target_forward=40.405 ms`.
-  - Runtime log metrics showed DDTree16 later positions rarely contribute on
+    - Runtime log metrics showed DDTree16 later positions rarely contribute on
     this real prompt set. Most intervals stayed around mean acceptance length
     `2.3-2.9`; one interval reached `4.33`, but it did not generalize.
 - Decision:
-  - DDTree16/branched verification is valid and graph-captured at 256k, but it
+    - DDTree16/branched verification is valid and graph-captured at 256k, but it
     is not a speed candidate for the current target. It regresses far below the
     corrected native MTP4 API baseline (`~66-68 tok/s`) and the `>100 tok/s`
     goal.
-  - Do not repeat DDTree16 256k serving runs unchanged. Future DDTree work
+    - Do not repeat DDTree16 256k serving runs unchanged. Future DDTree work
     needs a fundamentally lower target verifier cost or a draft/tree policy
     that raises real-prompt mean acceptance well above the current `~2.7`; the
     existing warmed 4k/16k hot-profile success is not sufficient acceptance
@@ -38846,11 +38846,11 @@ Interpretation:
   single-token inputs, so the MTP4 verifier fell back to `gate_up GEMM` plus a
   separate `SiluAndMul` activation.
 - Code change:
-  - `vllm/model_executor/layers/quantization/awq.py` no longer rejects
+    - `vllm/model_executor/layers/quantization/awq.py` no longer rejects
     `x_2d.shape[0] != 1` in `apply_fused_silu_and_mul`.
-  - The route remains gated by `VLLM_SM70_AWQ_MLP_ENGINE=1`, prepared
+    - The route remains gated by `VLLM_SM70_AWQ_MLP_ENGINE=1`, prepared
     interleaved AWQ weights, and TP2. It is not default-enabled.
-  - `benchmarks/benchmark_sm70_awq_verifier_micro.py` now has an optional
+    - `benchmarks/benchmark_sm70_awq_verifier_micro.py` now has an optional
     `--gated-silu-candidate` mode that builds a TP-rank-equivalent merged
     `gate_up_proj` from raw checkpoint `gate_proj/up_proj` AWQ tensors, checks
     fused-vs-baseline numerical diff, and times `AWQ GEMM + silu_and_mul`
@@ -38867,32 +38867,32 @@ Interpretation:
   removes about `5-6 us` from each MLP `gate_up` block, but its total
   modeled-token gain is only about `0.3-0.4 ms`.
 - Corrected 256k API serving validation:
-  - Temporary 8002 server artifact:
+    - Temporary 8002 server artifact:
     `bench_results/api_server_27b_awq_20260701/gated_silu/qwen36_27b_awq_mtp4_256k_awqdyn_gatedsilu_port8002.log`.
-  - Startup route evidence: log showed `Applied 1Cat SM70 MTP defaults`,
+    - Startup route evidence: log showed `Applied 1Cat SM70 MTP defaults`,
     `SM70 AWQ dense MLP gated-SiLU single-layout path enabled`, AWQ warmup
     with `dense_m=[1, 2, 4, 5, 8, 16]`, and CUDA graph capture completed.
-  - Setup matched the corrected native MTP4 API criterion: real prompt
+    - Setup matched the corrected native MTP4 API criterion: real prompt
     collection, OpenAI chat serving, `max_model_len=262144`, TP2,
     Flash-V100, CUDA graph / non-eager, official
     `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`, dynamic/no-preserve AWQ
     selector env, plus `VLLM_SM70_AWQ_MLP_ENGINE=1`.
-  - O128 warmup artifact:
+    - O128 warmup artifact:
     `gated_silu/qwen36_27b_awq_mtp4_256k_awqdyn_gatedsilu_chat_quality8_o128_seed0_warmup.json`.
     Quality passed; aggregate completion throughput was `48.658 tok/s`.
     This was treated as warmup/capture evidence only.
-  - O512 formal artifact:
+    - O512 formal artifact:
     `gated_silu/qwen36_27b_awq_mtp4_256k_awqdyn_gatedsilu_chat_quality8_o512_seed0_metrics.json`.
     Quality passed on all `8` prompts, total completion tokens remained
     `2959`, aggregate completion throughput was `66.636 tok/s`, mean
     acceptance length was `2.824`, draft acceptance was `45.60%`, and
     per-position acceptance was `[0.767, 0.504, 0.341, 0.212]`.
 - Decision:
-  - Keep the M>1 AWQ gated-SiLU hook as a small, exact, env-gated verifier-cost
+    - Keep the M>1 AWQ gated-SiLU hook as a small, exact, env-gated verifier-cost
     improvement candidate, but do not count it as a material 256k API speed
     win. The formal result is effectively tied with the current dynamic AWQ
     baseline (`66.629 tok/s`, mean AL `2.834`).
-  - Do not spend more time on this route unless a future profile shows
+    - Do not spend more time on this route unless a future profile shows
     `SiluAndMul`/MLP activation is again a top service-level bucket. It cannot
     bridge the remaining gap to `>100 tok/s`; the next material work should
     target either much larger verifier-forward cost reduction or real-prompt
@@ -38916,12 +38916,12 @@ Interpretation:
   dynamic/no-preserve AWQ selector env, and official
   `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`.
 - Startup evidence:
-  - log reported `Chunked prefill is enabled with max_num_batched_tokens=16384`;
-  - no repeated low `max_num_scheduled_tokens=1024` warning was present after
+    - log reported `Chunked prefill is enabled with max_num_batched_tokens=16384`;
+    - no repeated low `max_num_scheduled_tokens=1024` warning was present after
     this configuration;
-  - KV cache capacity was valid for 256k: `392,444` tokens and max concurrency
+    - KV cache capacity was valid for 256k: `392,444` tokens and max concurrency
     `1.50x`;
-  - AWQ warmup finished and CUDA graph capture completed.
+    - AWQ warmup finished and CUDA graph capture completed.
 - Real 256k API artifacts:
 
   | run | artifact | quality | completion tok/s | tokens | mean AL | draft accept | per-position accept |
@@ -38930,11 +38930,11 @@ Interpretation:
   | O256 screen | `batchtokens_16k/qwen36_27b_awq_mtp4_256k_awqdyn_bt16k_chat_quality8_o256_seed0_metrics.json` | pass | `65.909` | `1857` | `2.831` | `45.78%` | `[0.760, 0.499, 0.347, 0.225]` |
 
 - Decision:
-  - This is a negative A/B for the current target. Raising
+    - This is a negative A/B for the current target. Raising
     `max_num_batched_tokens` to `16384` did not improve acceptance length or
     service throughput versus the corrected `1024` baseline
     (`66.629 tok/s`, mean AL `2.834`, draft accept `45.85%`).
-  - Do not run the O512 formal pass and do not repeat larger batch-token
+    - Do not run the O512 formal pass and do not repeat larger batch-token
     screens unchanged. The remaining `>100 tok/s` gap is not explained by this
     scheduler-capacity knob; continue with verifier-forward cost reduction or
     proposal/target acceptance-length work.
@@ -38949,25 +38949,25 @@ Interpretation:
   official-sampling evidence already showed this split boundary is not
   quality-safe over 6k outputs.
 - Temporary server:
-  - Ran on GPUs `0,1`, port `8002`, and was stopped after measurement.
-  - The user-facing port `8000` service was not touched.
-  - Setup matched the corrected 256k API screen except for
+    - Ran on GPUs `0,1`, port `8002`, and was stopped after measurement.
+    - The user-facing port `8000` service was not touched.
+    - Setup matched the corrected 256k API screen except for
     `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1`:
     `/home/ymzx/models/Qwen3.6-27B-AWQ`, TP2, TurboMind AWQ,
     `max_model_len=262144`, `max_num_batched_tokens=1024`,
     `max_num_seqs=1`, Flash-V100, CUDA graph / non-eager,
     dynamic/no-preserve AWQ selector env, and official
     `temperature=1.0/top_p=0.95/top_k=20`, `seed=0`.
-  - Startup/capture reached `Application startup complete`; CUDA graph capture
+    - Startup/capture reached `Application startup complete`; CUDA graph capture
     completed. The run did not log the default
     `SM70 Qwen GDN full-forward guard armed ... spec_core=False` route from
     the quality-safe baseline.
 - Artifacts:
-  - Summary and profile excerpts:
+    - Summary and profile excerpts:
     `bench_results/api_server_27b_awq_20260701/gdn_spec_core_mtp4_probe/qwen36_27b_awq_mtp4_256k_awqdyn_gdnspec_profile_screen_summary.md`.
-  - O128 first screen:
+    - O128 first screen:
     `gdn_spec_core_mtp4_probe/qwen36_27b_awq_mtp4_256k_awqdyn_gdnspec_chat_quality8_o128_seed0_metrics.json`.
-  - O256 warmed screen:
+    - O256 warmed screen:
     `gdn_spec_core_mtp4_probe/qwen36_27b_awq_mtp4_256k_awqdyn_gdnspec_chat_quality8_o256_seed0_metrics.json`.
 - Real 256k API screen results:
 
@@ -38977,20 +38977,20 @@ Interpretation:
   | O256 warmed screen | pass | `62.138` | `1848` | `2.830` | `45.75%` | `[0.761, 0.528, 0.334, 0.207]` |
 
 - Profile result:
-  - The profile hypothesis is real: clean 20-spec-step intervals repeatedly
+    - The profile hypothesis is real: clean 20-spec-step intervals repeatedly
     showed `target_forward` around `18.0-18.6 ms`, versus the corrected
     quality-safe profile baseline's usual `~22.4-22.8 ms`.
-  - Representative lines from the console profile:
+    - Representative lines from the console profile:
     `target_forward=18.013`, `17.970`, `17.980`, `18.550`, and `17.987 ms`
     with `target_logits ~=2.05 ms`, `target_rejection_sample ~=1.11 ms`, and
     `draft_total ~=12.2 ms`.
 - Decision:
-  - Do not continue to O512 and do not treat
+    - Do not continue to O512 and do not treat
     `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=1` as an accepted speed route. The O256
     service result is below the corrected native MTP4 baseline
     (`66.629 tok/s`), and the route is already known long-output
     quality-unsafe.
-  - Keep the result as directional evidence: a repaired, quality-safe narrower
+    - Keep the result as directional evidence: a repaired, quality-safe narrower
     Qwen GDN verifier boundary has enough `target_forward` headroom to be
     worth future work, but the next useful step must be an exactness/quality
     repair against the full-Qwen-GDN guard, not another short speed screen.
@@ -39005,13 +39005,13 @@ Interpretation:
   `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
   `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
   `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`:
-  - Artifact:
+    - Artifact:
     `bench_results/verifier20_20260701/qwen36_27b_awq_mtp4_inputcore003_macos512_profile.json`
     and `.log`.
-  - Short offline MTP4 screen: `512` output tokens, official
+    - Short offline MTP4 screen: `512` output tokens, official
     `temperature=1.0/top_p=0.95/top_k=20`, mean acceptance length `2.988`,
     draft acceptance `49.71%`, steady decode `67.462 tok/s`.
-  - Hot profile intervals:
+    - Hot profile intervals:
 
     | interval | target_forward | target_logits | target_rejection_sample | verifier subtotal |
     | ---: | ---: | ---: | ---: | ---: |
@@ -39026,59 +39026,59 @@ Interpretation:
     This is close, but it is not below `20 ms` and is not long-output quality
     evidence.
 - Sparse target top-k/top-p rejection sampler prototype:
-  - Added a model-free timing row to
+    - Added a model-free timing row to
     `benchmarks/benchmark_sm70_rejection_sampler_micro.py`.
-  - Artifact:
+    - Artifact:
     `bench_results/verifier20_20260701/rejection_sampler_micro_sparse_target_topk_topp_mtp4_gpu0_20260701.json`.
-  - Result: current combined-bonus sampler `1.376 ms`; sparse target
+    - Result: current combined-bonus sampler `1.376 ms`; sparse target
     top-k/top-p prototype `1.275 ms`; full current rejection core
     `0.409 ms`.
-  - Decision: this saves only about `0.10 ms`, so do not spend the next
+    - Decision: this saves only about `0.10 ms`, so do not spend the next
     implementation pass rewriting the rejection sampler alone. It cannot close
     the `~0.9 ms` gap to `20 ms`.
 - Pure-spec GDN mixed-QKV fused recurrent candidate:
-  - Added a model-free command to
+    - Added a model-free command to
     `benchmarks/benchmark_sm70_gdn_exactness.py`:
     `run-spec-mixed-qkv-candidate`.
-  - Artifact:
+    - Artifact:
     `bench_results/verifier20_20260701/gdn_pure_spec_mixed_qkv_candidate_steps256.pt`.
-  - Shape: `num_spec=4`, `graph_rows=5`, `k_heads=4`, `v_heads=8`,
+    - Shape: `num_spec=4`, `graph_rows=5`, `k_heads=4`, `v_heads=8`,
     `head_k_dim=128`, `head_v_dim=128`, random initial state.
-  - Result: graph mean was `93.592 us` for the current split
+    - Result: graph mean was `93.592 us` for the current split
     `conv + gating + recurrent` path and `92.840 us` for the fused mixed-QKV
     path, only `0.753 us/layer` faster.
-  - Correctness result: not strict. Live output max diff was
+    - Correctness result: not strict. Live output max diff was
     `1.907e-06`, and SSM state max diff was `7.629e-06`.
-  - Decision: reject this as a verifier-cost fix. It is not bitwise-equivalent
+    - Decision: reject this as a verifier-cost fix. It is not bitwise-equivalent
     and the measured win is far too small to justify quality risk.
 - LM-head/top1 route:
-  - The existing top1 path is a greedy-only optimization. It cannot replace the
+    - The existing top1 path is a greedy-only optimization. It cannot replace the
     official stochastic verifier logits path because native MTP4 must preserve
     `temperature=1.0/top_p=0.95/top_k=20` sampling semantics.
-  - Do not use `VLLM_SM70_LM_HEAD_TOP1=1` for this acceptance target.
+    - Do not use `VLLM_SM70_LM_HEAD_TOP1=1` for this acceptance target.
 - Cost model after this triage:
-  - `20.925 ms` current verifier subtotal.
-  - Already-measured AWQ gated-SiLU M>1 epilogue can save only about
+    - `20.925 ms` current verifier subtotal.
+    - Already-measured AWQ gated-SiLU M>1 epilogue can save only about
     `0.33-0.36 ms` in the modeled verifier MLP gate/up bucket and was
     service-level neutral in the 256k API formal run.
-  - Sparse sampler saves only about `0.10 ms`.
-  - Combined known safe-ish micro gains still leave roughly `20.5 ms`, so the
+    - Sparse sampler saves only about `0.10 ms`.
+    - Combined known safe-ish micro gains still leave roughly `20.5 ms`, so the
     next material candidate must be either:
     1. a quality-safe larger reduction inside `target_forward`, especially AWQ
        dense/logit projection work, or
     2. a compact verifier-logits/rejection representation that avoids
        full-vocab TP gather while keeping exact official top-k/top-p semantics.
 - Next microbench target:
-  - Prototype compact verifier logits for native MTP4: each TP rank computes
+    - Prototype compact verifier logits for native MTP4: each TP rank computes
     local full logits only locally, local top-k, local logsumexp, and
     draft-token logits; communication gathers only small top-k/logsumexp/draft
     tensors. The verifier then samples bonus/recovered tokens from the exact
     global top-k/top-p distribution and computes draft acceptance from exact
     target probabilities at draft token ids.
-  - Continue only if a model-free TP2 microbench predicts at least `0.5 ms`
+    - Continue only if a model-free TP2 microbench predicts at least `0.5 ms`
     end-to-end verifier subtotal reduction and preserves exact official
     top-k/top-p probabilities for the no-penalty serving path.
-  - First single-GPU TP2-shard simulation was added to
+    - First single-GPU TP2-shard simulation was added to
     `benchmarks/benchmark_sm70_rejection_sampler_micro.py` and run as:
     `bench_results/verifier20_20260701/rejection_sampler_micro_compact_tp2_logits_mtp4_gpu0_20260701.json`.
     It measured full-vocab top-k/top-p probability reference at `1.033 ms`
@@ -39100,84 +39100,84 @@ Interpretation:
   `mamba_cache_mode=align`, prefix caching, and official sampling
   `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`.
 - Repro failure for the previous candidate:
-  - Route:
+    - Route:
     `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
     `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
     `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
     `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
-  - Full fixed-quality artifact:
+    - Full fixed-quality artifact:
     `bench_results/verifier20_quality_20260701/inputcore003_release_quality_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
-  - The failing `macos_6k_code` record had `repeat20=326`,
+    - The failing `macos_6k_code` record had `repeat20=326`,
     `repeat50=324`, `repeat100=320`, `max_same_line_run=327`, and tailed
     into repeated `font-size: 0;`. This was route-specific: the full-GDN
     control below passed the same prompt, seed, model, and sampling.
 - Full-GDN positive control:
-  - Route: all split/spec-core knobs off, allowing the MTP full-Qwen-GDN guard
+    - Route: all split/spec-core knobs off, allowing the MTP full-Qwen-GDN guard
     to arm:
     `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=0`,
     `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
     `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=0`,
     `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
-  - Artifact:
+    - Artifact:
     `bench_results/verifier20_quality_20260701/fullgdn_release_macos_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
-  - `macos_6k_code` passed with `steady_decode_tps=85.015`,
+    - `macos_6k_code` passed with `steady_decode_tps=85.015`,
     `repeat20=18`, `repeat50=5`, `repeat100=2`, and
     `max_same_line_run=1`.
 - Input-core dependency repair attempt:
-  - `qwen_gdn_input_projection_core` now returns `(z_out, core_attn_out)`,
+    - `qwen_gdn_input_projection_core` now returns `(z_out, core_attn_out)`,
     and `forward_cuda()` consumes those values before output projection. This
     makes the compiled output projection depend on the opaque input/core op
     value instead of only on a None-returning mutation side effect.
-  - It improved but did not fix the route. Artifact:
+    - It improved but did not fix the route. Artifact:
     `bench_results/verifier20_quality_20260701/inputcore003_valuereturn_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
-  - `macos_6k_code` still failed: `steady_decode_tps=92.509`,
+    - `macos_6k_code` still failed: `steady_decode_tps=92.509`,
     `repeat20=36`, `repeat50=18`, `repeat100=13`,
     `max_same_line_run=20`, tail repeated `padding: 0;`.
-  - Decision: keep this only as a diagnostic improvement for the rejected
+    - Decision: keep this only as a diagnostic improvement for the rejected
     input-core route. It is not a quality acceptance.
 - Output-projection custom-op attempt:
-  - A value-returning `qwen_gdn_output_projection` plus explicit final
+    - A value-returning `qwen_gdn_output_projection` plus explicit final
     `output.copy_()` passed a 512-token smoke but failed at 6000 tokens with a
     worse all-zero tail.
-  - Artifact:
+    - Artifact:
     `bench_results/verifier20_quality_20260701/inputcore003_outputop_valuereturn_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
-  - Failure metrics: `steady_decode_tps=97.055`, `repeat20=2379`,
+    - Failure metrics: `steady_decode_tps=97.055`, `repeat20=2379`,
     `repeat50=2349`, `repeat100=2299`, `max_same_token_run=2398`,
     `bad_marker_hits={'00000000000000000000': 119}`.
-  - Decision: reverted this code path. Do not use
+    - Decision: reverted this code path. Do not use
     `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=1` for quality or speed.
 - Input-core isolation:
-  - Route with input-core enabled but both spec-core knobs disabled, while
+    - Route with input-core enabled but both spec-core knobs disabled, while
     forcing no full-GDN guard:
     `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1`,
     `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1`,
     `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=0`,
     `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
-  - Artifact:
+    - Artifact:
     `bench_results/verifier20_quality_20260701/inputcore_standardcore_valuereturn_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
-  - This also failed, with `steady_decode_tps=100.745`, `repeat20=4557`,
+    - This also failed, with `steady_decode_tps=100.745`, `repeat20=4557`,
     `repeat50=4527`, `repeat100=4477`, `max_same_token_run=4576`, and a
     repeated `2` tail. The log entered all-position acceptance
     `1.000, 1.000, 1.000, 1.000`.
-  - Decision: `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1` is the long-output quality
+    - Decision: `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=1` is the long-output quality
     trigger and remains rejected for 27B-AWQ native MTP4.
 - Accepted 27B-AWQ fixed-quality route:
-  - Route:
+    - Route:
     `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD=1`,
     `VLLM_SM70_QWEN_GDN_INPUT_CORE_OP=0`,
     `VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP=0`,
     `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1`,
     `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0`.
-  - Single `macos_6k_code` artifact:
+    - Single `macos_6k_code` artifact:
     `bench_results/verifier20_quality_20260701/noinputcore_003_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
     It passed with `steady_decode_tps=91.350`, `repeat20=20`,
     `repeat50=10`, `repeat100=2`, `max_same_line_run=3`, and mean
     acceptance length about `4.08`.
-  - Full fixed-quality four-prompt artifact:
+    - Full fixed-quality four-prompt artifact:
     `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`;
     summary:
     `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_seed20260620/summary.md`.
-  - Four-prompt gate result: PASS, mean acceptance length `3.55`, KV tokens
+    - Four-prompt gate result: PASS, mean acceptance length `3.55`, KV tokens
     `144913`. Per-prompt steady decode:
 
     | prompt | tokens | steady decode | repeat20 | repeat50 | repeat100 | max same line |
@@ -39188,15 +39188,15 @@ Interpretation:
     | `long_chinese_report` | `2048` | `76.960 tok/s` | `10` | `4` | `1` | `5` |
 
 - Current decision:
-  - For Qwen3.6-27B-AWQ native MTP4 quality runs, use the accepted
+    - For Qwen3.6-27B-AWQ native MTP4 quality runs, use the accepted
     no-input-core 003 route above. It is about `7.5%` faster than the
     full-GDN control on the `macos_6k_code` quality run (`91.35` vs
     `85.02 tok/s`) and only about `1.3%` slower than the rejected
     input-core candidate (`91.35` vs `92.51 tok/s`) on that same prompt.
-  - Do not promote this to a global default until 35B-AWQ, FP8, and the
+    - Do not promote this to a global default until 35B-AWQ, FP8, and the
     broader release quality matrix are checked. The existing full-GDN guard
     remains the cross-route safety fallback.
-  - The next speed work should not revisit input-core without a strict
+    - The next speed work should not revisit input-core without a strict
     split-vs-full-GDN tensor exactness proof across late decode. To continue
     toward verifier subtotal `<20 ms`, use this quality-safe no-input-core
     003 route as the baseline and optimize logits/sampler or AWQ dense cost.
@@ -39239,8 +39239,8 @@ Interpretation:
   | `draft_total` | `13.699 ms` | `13.404` | `15.479` | `12.568` | `16.293` |
 
 - Decision update:
-  - The output quality is confirmed again on the same accepted route.
-  - The quality-safe route does **not** meet the `<20 ms` verifier-cost target.
+    - The output quality is confirmed again on the same accepted route.
+    - The quality-safe route does **not** meet the `<20 ms` verifier-cost target.
     The remaining gap is mostly `target_forward` (`~20.94 ms`) plus logits
     (`~2.05 ms`) and rejection sampling (`~1.12 ms`). The next optimization
     should treat `24.1 ms` target verifier core, or `24.8 ms` including
@@ -39285,14 +39285,14 @@ Interpretation:
   | runner verifier subtotal without draft | `22.836 ms` | `22.391` | `24.460` | `21.859` | `25.464` |
 
 - Interpretation:
-  - The AWQ dynamic/no-preserve selector gives a real forward-cost reduction
+    - The AWQ dynamic/no-preserve selector gives a real forward-cost reduction
     versus the accepted baseline (`target_forward` mean `20.936 -> 18.951 ms`),
     but it still does not reach the `<20 ms` verifier-core target once logits
     and rejection sampling are included.
-  - More importantly, it is not quality-safe on the long macOS/code prompt.
+    - More importantly, it is not quality-safe on the long macOS/code prompt.
     Do not use this route as the quality baseline and do not repeat it without
     a numerical/root-cause fix for the AWQ selector output drift.
-  - The remaining quality-safe route remains the no-input-core 003 baseline
+    - The remaining quality-safe route remains the no-input-core 003 baseline
     above: `24.106 ms` target verifier core / `24.814 ms` subtotal. The next
     material path must either repair the faster input-core/GDN boundary with
     strict late-decode tensor exactness, or introduce a larger exact verifier
@@ -39306,24 +39306,24 @@ Interpretation:
   `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`, TP2 on GPUs `0,1`,
   Flash-V100, CUDA graph, and `mamba_cache_mode=align`.
 - Rechecked the fixed gate/up fast-target lane:
-  - `5x17408x5120 -> 8x256x64:3:3:0` looked fast in a single profiled
+    - `5x17408x5120 -> 8x256x64:3:3:0` looked fast in a single profiled
     `macos_6k_code` run (`target_forward` around `20.05 ms`) but failed the
     four-prompt gate:
     `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_gateup_quality4_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
     The `macos_6k_code` record had `repeat20=151`, `repeat50=150`,
     `repeat100=148`, `max_same_line_run=79`; reject.
-  - A more conservative `8x256x64:2:3:0` gate/up point passed one no-profile
+    - A more conservative `8x256x64:2:3:0` gate/up point passed one no-profile
     four-prompt run, but failed the same `macos_6k_code` route when profiled:
     `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_gateup_s2w3_macos6000_profile_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
     Failure metrics were `repeat20=719`, `repeat50=715`,
     `repeat100=711`, `max_same_line_run=717`, with tail repeating
     `content: '';`. Reject as unstable.
-  - The `s2w3` profile still showed real speed:
+    - The `s2w3` profile still showed real speed:
     `target_forward=20.172 ms`, target verifier core `23.330 ms`, subtotal
     `23.956 ms` across `9` steady intervals. This is not acceptable evidence
     because the same run failed quality.
 - Micro checks:
-  - Gate/up split sweep on `M=5,N=17408,K=5120,count=63`:
+    - Gate/up split sweep on `M=5,N=17408,K=5120,count=63`:
 
     | point | weighted mean |
     | --- | ---: |
@@ -39335,41 +39335,41 @@ Interpretation:
     The speed gain starts at split `2`, exactly where the long-output quality
     instability appears. Split `1` is quality-conservative but has negligible
     speed value.
-  - Removing gate/up from the fixed fast-target set and keeping only the other
+    - Removing gate/up from the fixed fast-target set and keeping only the other
     four M=5 verifier descriptors was too small to matter:
     `bench_results/verifier20_quality_20260701/awq_m5_nogate_fasttargets_micro_gpu0.json`
     measured `18.459 ms` total modeled AWQ bucket vs same-GPU default
     `18.661 ms`.
 - MLP gated-SiLU epilogue lane:
-  - `VLLM_SM70_AWQ_MLP_ENGINE=1` is exact in isolated real-weight checks. A
+    - `VLLM_SM70_AWQ_MLP_ENGINE=1` is exact in isolated real-weight checks. A
     random-input probe over layers `1,2,32,62,63`, TP ranks `0,1`, and input
     scales `0.25..16.0` found `max_abs_diff=0.0` between
     `gate_up GEMM + torch.ops._C.silu_and_mul` and the fused AWQ gated-SiLU
     epilogue.
-  - The isolated microbench remains only a small win:
+    - The isolated microbench remains only a small win:
     `bench_results/verifier20_quality_20260701/awq_m5_gated_silu_candidate_micro_gpu0.json`
     measured about `0.336 ms` weighted delta for `63` MLP calls.
-  - Combined with AWQ dynamic/no-preserve it still failed the macOS long-output
+    - Combined with AWQ dynamic/no-preserve it still failed the macOS long-output
     gate:
     `bench_results/verifier20_quality_20260701/noinputcore_003_awqdyn_mlpengine_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`,
     `repeat20=357`, `repeat50=355`, `repeat100=353`, tail repeating
     `:has(.traffic-light)`.
-  - MLP-engine only passed a single `macos_6k_code` run:
+    - MLP-engine only passed a single `macos_6k_code` run:
     `bench_results/verifier20_quality_20260701/noinputcore_003_mlpengine_macos6000_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`,
     `steady_decode_tps=92.372`, `repeat20=17`, `repeat50=5`,
     `repeat100=2`.
-  - MLP-engine only failed the full four-prompt quality gate:
+    - MLP-engine only failed the full four-prompt quality gate:
     `bench_results/verifier20_quality_20260701/noinputcore_003_mlpengine_quality4_seed20260620/cases/turbomind-tp2-qwen36-27b-awq-kv-auto-mtp4.json`.
     The `macos_6k_code` record had `repeat20=90`, `repeat50=30`,
     `repeat100=1`, and `bad_marker_hits={'rgba(rgba': 1}`; reject.
 - Decision:
-  - Current accepted quality baseline is still the no-input-core 003 route
+    - Current accepted quality baseline is still the no-input-core 003 route
     without AWQ dynamic/no-preserve, without fixed M=5 gate/up splitK fast
     targets, and without `VLLM_SM70_AWQ_MLP_ENGINE=1`.
-  - The faster AWQ verifier lanes are real speed candidates, but none is
+    - The faster AWQ verifier lanes are real speed candidates, but none is
     quality-safe under the current four-prompt gate. Do not count their
     `22-23 ms` verifier-core numbers as accepted speed.
-  - The next useful repair is not another split/swizzle sweep. The failing
+    - The next useful repair is not another split/swizzle sweep. The failing
     speed comes from changing the M=5 gate/up numerical/sampling path enough to
     alter official-sampling long-output behavior. Continue only with a
     root-cause harness that compares late-decode logits/distributions for the
@@ -39423,13 +39423,13 @@ Interpretation:
   degenerates. Full-Qwen-GDN verifier guard keeps the target verifier state
   coherent and passes the same long prompt.
 - Decision:
-  - Restore the automatic 1Cat SM70 native-MTP serving default to MTP4, but
+    - Restore the automatic 1Cat SM70 native-MTP serving default to MTP4, but
     route deep native MTP through the full-Qwen-GDN verifier guard when
     `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1` is present.
-  - Block `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1` for native MTP3/MTP4 by
+    - Block `VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP=1` for native MTP3/MTP4 by
     default. `VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP=1` exists only for
     diagnostic reruns of the unsafe route.
-  - Do not hard-truncate accepted tokens in the rejection sampler; that would
+    - Do not hard-truncate accepted tokens in the rejection sampler; that would
     break the target distribution unless it resamples from the correct target
     distribution. The correct fix is preserving target verifier semantics at
     the GDN boundary.
@@ -39441,29 +39441,29 @@ Interpretation:
   produces a real decode win over a no-spec control. This is deliberately a
   serving-path check, not a short synthetic route screen.
 - MTP service under test:
-  - Existing port `8000` service on physical GPUs `2,3`, TP2,
+    - Existing port `8000` service on physical GPUs `2,3`, TP2,
     `qwen36-27b-awq-mtp4-256k`, `max_model_len=262144`, TurboMind AWQ,
     Flash-V100, CUDA graph/non-eager, prefix caching with
     `mamba_cache_mode=align`, and official sampling
     `temperature=1.0/top_p=0.95/top_k=20`, seed `20260620`.
-  - Its process environment has MTP defaults enabled and leaves all Qwen GDN
+    - Its process environment has MTP defaults enabled and leaves all Qwen GDN
     split-core knobs unset, so it uses the full-Qwen-GDN verifier guard rather
     than the rejected 003 split-core path. It also enables the current AWQ
     small-shape dynamic/no-preserve selector.
 - Matched no-MTP control:
-  - A temporary port `8002` service ran on otherwise idle physical GPUs `0,1`
+    - A temporary port `8002` service ran on otherwise idle physical GPUs `0,1`
     so the user-facing `8000` service was not restarted. It matched model,
     TP2, 256k max length, TurboMind AWQ, Flash-V100, CUDA graph/non-eager,
     prefix caching, `mamba_cache_mode=align`, scheduler capacity, and all
     observed AWQ tuning environment values. It explicitly set
     `VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS=1`; engine startup recorded
     `speculative_config=None`.
-  - The V100 pairs are the same host/SKU but not the same physical device IDs,
+    - The V100 pairs are the same host/SKU but not the same physical device IDs,
     so this is a close serving A/B rather than a same-process toggle.
 - Artifacts:
-  - MTP4 live record:
+    - MTP4 live record:
     `bench_results/mtp_live_audit_20260710/mtp4_256k_awqdyn_live_macos6000_seed20260620.json`.
-  - No-MTP control directory:
+    - No-MTP control directory:
     `bench_results/mtp_live_audit_20260710/nomtp_control/`. The accepted
     fully warmed record is
     `nomtp_256k_fully_warm_macos6000_seed20260620.json`; the preceding
@@ -39483,33 +39483,33 @@ Interpretation:
   live and useful on the current service; it is not a model-name-only
   configuration.
 - Baseline stability handling:
-  - The first no-MTP long request JIT-compiled `batch_memcpy_kernel` during
+    - The first no-MTP long request JIT-compiled `batch_memcpy_kernel` during
     inference. A short 128-token warmup did not cover that long-sequence
     helper, so a second long request compiled it and a third long request ran
     with no new inference-time JIT warning.
-  - The fully warm run measured `53.505 tok/s`; the three long no-MTP results
+    - The fully warm run measured `53.505 tok/s`; the three long no-MTP results
     span `53.505-54.624 tok/s`. GPU0/1 were only `42/45 C` after the run,
     versus `38/42 C` for the idle MTP pair, but the pairs cannot be treated as
     perfectly identical thermal states. The reported A/B range keeps that
     small uncertainty explicit.
 - Scope and residual risks:
-  - This is one long coding prompt. The earlier real 256k eight-prompt API
+    - This is one long coding prompt. The earlier real 256k eight-prompt API
     aggregate remained much lower: no-MTP `55.187 tok/s`, standard MTP4
     `63.027 tok/s` with mean acceptance length `2.824`, and the faster AWQ
     dynamic candidate `66.629 tok/s` with mean acceptance length `2.834`.
     Do not generalize the `4.016` acceptance length or `1.467x` gain to all
     production prompts.
-  - The direct MTP long output passed and naturally stopped, but the current
+    - The direct MTP long output passed and naturally stopped, but the current
     full-GDN plus AWQ dynamic/no-preserve combination has not yet completed a
     four-prompt, 256k serving quality gate. The historical dynamic-selector
     quality failure was coupled with the rejected 003 GDN route, so it does
     not prove this live route bad, but it prevents a release-wide safety claim.
-  - The live environment explicitly has `VLLM_USE_AOT_COMPILE=0`; current
+    - The live environment explicitly has `VLLM_USE_AOT_COMPILE=0`; current
     startup logs classify that Flash-V100 compile configuration as diagnostic
     because regular torch.compile previously showed deterministic greedy token
     drift. The stochastic serving gate above is positive evidence, not a
     replacement for a greedy determinism gate.
-  - Seeded-repeat determinism is also pending for this server configuration.
+    - Seeded-repeat determinism is also pending for this server configuration.
     Three serialized no-MTP requests used the identical prompt, request seed,
     sampling parameters, and system fingerprint. The first two texts matched
     through byte `21674` apart from a terminal-length difference, but the
@@ -39519,10 +39519,10 @@ Interpretation:
     sensitivity in the current graph/AWQ configuration until a token-ID greedy
     repeat and a seeded official-sampling repeat isolate the source.
 - Decision:
-  - Keep native MTP4 enabled with the full-Qwen-GDN verifier guard. Do not
+    - Keep native MTP4 enabled with the full-Qwen-GDN verifier guard. Do not
     revert to MTP2 or disable MTP based on the earlier MTP3/MTP4 split-core
     failure.
-  - Before treating the current service configuration as a release-quality
+    - Before treating the current service configuration as a release-quality
     default, run the existing four-prompt long-output gate and a token-ID
     greedy repeat against the actual 256k API configuration. The next speed
     investigation should then profile the quality-safe full-GDN verifier
@@ -40083,6 +40083,7 @@ Interpretation:
   difference `0.00048828125`). It is rejected before timing. Do not use a
   smaller split count as a performance shortcut; a valid successor must retain
   all seven original K=128 partial groups and the baseline FP32 addition order.
+
 ## 2026-07-12 TP4 MLP-down scheduling and TG_N screens
 
 - Forcing `split=1` on the unchanged `8x256x64` target is numerically
@@ -40845,3 +40846,264 @@ Interpretation:
   `splitkv3_fast_visible_ab100_m8096_n80960_clock1200.json` and
   `model_splitkv3_endpoint/`, plus
   `model_splitkv3_quality/compare_sampler_only_baseline_vs_candidate.json`.
+
+### 2026-07-19 Pre-Release Acceptance And 256K Quality Blocker
+
+- The production-default TP4 no-MTP matrix passed route and speed checks for
+  Qwen3.6-27B AWQ with FP8 E5M2 KV at 16K/64K/128K/261888-token input:
+  TPOT was `14.280/17.507/22.009/30.434 ms`. Matched FP16 KV was
+  `13.773/17.299/21.838/30.582 ms`, so FP8 KV did not introduce material
+  long-context decode regression at those accepted points.
+- Qwen3.6-35B-A3B passed the matched 16K/64K no-MTP checks for both FP8 weights
+  (`9.204/11.320 ms`) and AWQ (`9.290/11.418 ms`). Qwen3.5-27B NVFP4 passed
+  route and speed checks at `14.466/18.022 ms`.
+- The current-source Qwen3.5-27B-NVFP4 quality smoke reproduces the checkpoint's
+  fused Q/K/V global-scale warning but passes the production output-health
+  gate. With TP4, FP8 E5M2 KV, `max_model_len=262144`, TurboMind NVFP4,
+  Flash-V100, non-eager CUDA graphs, the checkpoint's official
+  `temperature=0.6/top_p=0.95/top_k=20`, and official
+  `enable_thinking=false`, it naturally stops after 74 tokens and returns the
+  requested three coherent Chinese sentences. It has no replacement character
+  and a maximum same-token run of one. This clears catastrophic output
+  corruption for the supported route; it is not a dataset-level quantization
+  accuracy comparison, so the fused-scale warning remains a documented
+  checkpoint risk. Artifact:
+  `bench_results/release_acceptance_20260719/quality_27b_nvfp4_latest/`.
+- TP4 MTP4 initially crashed near the drafter context limit in two independent
+  async paths. The scheduler now stops creating draft placeholders that exceed
+  the drafter limit, and the worker skips stale async acceptance correction
+  when the previous row had no drafts. Same-shape 8K, 64K, and 128K boundary
+  runs complete; the 128K run retained acceptance length `4.6` over its short
+  measured tail.
+- A separate 256K crash came from the fused dynamic-vocabulary top-20 chain:
+  all non-finite candidates left an invalid token sentinel, which later caused
+  `dense_probs.scatter_` to assert. The TurboMind top-20 reduce/merge/sample
+  stages now rank non-finite values last and emit a valid normalized proposal.
+  SM70 tests cover all-NaN/Inf candidates and unchanged finite top-20 order.
+  This is a stability fix, not a 256K quality fix.
+- The initial exact `input_len=262120,max_model_len=262144` gate failed. MTP4
+  no longer crashed, but emitted 24 token-zero outputs, acceptance
+  length `1.0`, acceptance rate `0%`, and TPOT `295.46 ms`. The matched no-MTP
+  run also emitted only token zero, proving the root quality failure is not MTP
+  state pollution. In contrast, `input_len=261888` produced coherent nonzero
+  tokens. This was the final 24-token model-length boundary blocker described
+  and resolved below.
+- The blocker above was localized and fixed on July 19. `262120 mod 128 = 104`,
+  so the FP16 page-784 BM32 prefill kernel loads one final 16-row V tile with
+  eight masked rows. The FP8-to-FP16 bridge previously left those workspace
+  rows uninitialized. A zero softmax probability multiplied by a stale NaN/Inf
+  V value inside HMMA still produced a non-finite target hidden state. The
+  bridge now zero-fills only from `seq_len` to the next 16-token WMMA boundary,
+  at most 15 tokens per layer/chunk; valid-token conversion and the rest of the
+  workspace are unchanged.
+- The focused bridge regression pre-fills the unused workspace with NaNs and
+  passed all seven page/shape cases. The exact production-shaped operator check
+  (`input page=1568`, `bridge page=784`, `seq=262120`, `q=3048`, local
+  `Hq/Hkv=6/1`) zeroed exactly eight tail rows and returned an entirely finite
+  BM32 output. The rebuilt extension changed only `fp8_kv_bridge.cu`.
+- The default TP4 no-MTP full-model rerun at `input_len=262120` emitted coherent
+  nonzero text and matched the slow bridge-disabled reference token hash. The
+  default bridge took `252.49 s` prefill versus `800.61 s` for direct FP8 paged
+  prefill, so the repair preserves the required fast route. Artifact:
+  `bench_results/release_acceptance_20260719/fixed_256k_bridge_nospec/`.
+- The matched TP4/MTP4 official-sampling rerun (`temperature=1`, `top_p=0.95`,
+  `top_k=20`) emitted 24 coherent nonzero tokens, reached acceptance length
+  `4.6` with `18/18` drafts accepted, and completed at `62.20 ms` TPOT. The
+  scheduler correctly stopped drafting at the model-length boundary. This
+  short boundary tail is quality evidence, not a steady MTP speed baseline.
+  Artifact:
+  `bench_results/release_acceptance_20260719/fixed_256k_bridge_mtp4_official.json`.
+- The July 15 macOS artifact previously labelled natural-quality PASS is not
+  valid evidence: it ended with `finish_reason=length` at exactly 16,384 tokens
+  and had an incomplete HTML/code tail. The release matrix now requires natural
+  `finish_reason=stop`; the macOS contract additionally requires complete
+  HTML/style/script/body closures and balanced code fences.
+- A fresh current-source TP4 MTP4/FP8-KV macOS run naturally stopped at 21,331
+  output tokens. It produced a complete closed HTML document, steady decode
+  `94.54 tok/s`, and aggregate acceptance length `3.83`. The first gate result
+  was a false positive: `input.addEventListener(... =>` matched the missing-tag
+  regex. The matcher now requires either an immediate `>` or an HTML
+  `name=value` attribute after the tag name; the saved output passes the
+  corrected contract. This proves normal-prompt long-output quality; the
+  separate near-262144-token boundary evidence is recorded in the fixed bridge
+  runs above.
+- The source tree is now self-contained for the accepted GDN route. The exact
+  tested FlashQLA Python and SM70 CUDA sources are vendored as the top-level
+  `flash_qla` package, retaining the upstream MIT license. `setup.py` includes
+  all `flash_qla*` packages plus the JIT-required `gdn_forward.cu`, while the
+  CUDA requirements already pin the tested TileLang and TVM FFI versions. The
+  package-data and sdist-manifest checks both contain the CUDA source and MIT
+  license; importing from the main repository and running the two SM70
+  row-strided decode exactness cases also pass. The old 1.2.1 wheel still
+  predates these sources and must not be reused; the
+  release requires a newly built wheel from the current commit.
+
+### 2026-07-19 Qwen3.6-27B-FP8 TP4 Final Long-Context Matrix
+
+- This closes the missing 27B-FP8 entry in the current-source release matrix.
+  The matched configuration used TP4 on V100 GPUs `0,1,2,3`, FP8 model
+  weights, FP8 E5M2 KV, TurboMind dense kernels, target `FLASH_ATTN_V100`,
+  `max_model_len=262144`, chunk size `8096`, prefix caching, Mamba `align`,
+  custom all-reduce, CUDA graphs, and official sampling
+  (`temperature=1`, `top_p=0.95`, `top_k=20`). MTP4 used probabilistic draft
+  sampling, TP4 dynamic vocabulary, local argmax, fused proposal, and
+  `TRITON_ATTN` for the drafter; neither target nor drafter used eager mode.
+- Matched steady decode results are:
+
+  | Input | No MTP TPOT / TPS | MTP4 TPOT / TPS | MTP acceptance length / rate | MTP speed change |
+  | --- | --- | --- | --- | --- |
+  | 16K | `16.018 ms / 62.432` | `12.010 ms / 83.265` | `4.047 / 76.17%` | `+33.37%` |
+  | 64K | `19.318 ms / 51.769` | `20.132 ms / 49.671` | `4.981 / 99.52%` | `-4.05%` |
+  | 128K | `23.603 ms / 42.368` | `33.860 ms / 29.533` | `4.942 / 98.56%` | `-30.29%` |
+  | 261888 | `32.177 ms / 31.078` | `60.835 ms / 16.438` | `4.904 / 98.07%` | `-47.11%` |
+
+- Cold prefill time for no-MTP versus MTP4 was
+  `5.846/11.605 s` at 16K, `28.442/38.336 s` at 64K,
+  `78.609/116.453 s` at 128K, and `245.734/390.463 s` at 261888 tokens.
+  FP8 E5M2 bridge prefill remained active. MTP adds substantial prefill cost
+  as context grows.
+- The long-context MTP regression is not caused by acceptance collapse. At
+  64K through 261888 tokens, acceptance remained `98.07%-99.52%`, while MTP
+  moved from neutral to `47.11%` slower than no-MTP. The dominant problem is
+  the context-dependent target verifier and serial drafter attention/KV cost.
+  Default MTP4 is therefore not a release speed win for 27B-FP8 beyond the
+  short-context region, despite near-perfect acceptance on these prompts.
+- All measured requests completed without device assert, token zero, or
+  `is_corrupted`; the two repeats at each length were deterministic. The
+  128K/261888 synthetic prompts deliberately repeat filler and their outputs
+  echo that filler, so this is route/stability evidence, not a natural
+  long-form semantic-quality claim.
+- The exact boundary `input_len=262120,max_model_len=262144,output_len=24`
+  also passed for FP8 weights plus FP8 KV. No-MTP produced 24 valid nonzero
+  tokens with `is_corrupted=false`, prefill `245.508 s`, and boundary TPOT
+  `34.861 ms`. MTP4 produced the identical token sequence with prefill
+  `393.404 s`, boundary TPOT `63.669 ms`, acceptance length `4.6`, and all
+  `18/18` draft tokens accepted. The scheduler stopped drafting at the model
+  limit instead of creating invalid placeholders.
+- A current-source official-chat-template `python_service` quality probe was
+  also run with natural EOS and the prompt's fixed 2,048-token cap. Both
+  no-MTP and MTP4 produced structured FastAPI/SQLite implementation text with
+  no replacement characters, bad markers, token runs, repeated lines, or
+  `is_corrupted`, but both reached `finish_reason=length` and were incomplete.
+  The strict quality result is therefore **FAIL** for
+  `did_not_naturally_stop`, not PASS. No-MTP decoded at `65.117 tok/s`; MTP4
+  decoded at `102.143 tok/s` (`+56.86%`) with aggregate acceptance length
+  `3.220` and draft acceptance `55.40%`. This short-prompt speed signal does
+  not override the long-context regressions above, and the truncated outputs
+  cannot be used as release-quality evidence.
+- Artifacts:
+  `bench_results/release_acceptance_20260719/tp4_27b_fp8weights_fp8kv_long_latest.json`,
+  `bench_results/release_acceptance_20260719/tp4_27b_fp8weights_fp8kv_mtp4_long_latest.json`,
+  `bench_results/release_acceptance_20260719/tp4_27b_fp8weights_fp8kv_nospec_boundary256k_exact_latest.json`,
+  and
+  `bench_results/release_acceptance_20260719/tp4_27b_fp8weights_fp8kv_mtp4_boundary256k_exact_latest.json`.
+  The natural-output probe is under
+  `bench_results/release_acceptance_20260719/quality_27b_fp8_latest/`.
+
+### 2026-07-19 Qwen3.6-27B-AWQ TP4 MTP4 Long-Context Recheck
+
+- This recheck uses the same current source, four V100s, FP8 E5M2 KV,
+  `max_model_len=262144`, chunk size `8096`, prefix caching, Mamba `align`,
+  target `FLASH_ATTN_V100`, drafter `TRITON_ATTN`, CUDA graphs, TP4 dynamic
+  vocabulary, fused proposal, local argmax, and official sampling as the FP8
+  matrix above. The only intended model-route change is FP8 weights to AWQ
+  weights with the TurboMind W4A16 path.
+- Matched AWQ steady decode results are:
+
+  | Input | No MTP TPOT / TPS | MTP4 TPOT / TPS | MTP acceptance length / rate | MTP speed change | AWQ MTP4 vs FP8 MTP4 |
+  | --- | --- | --- | --- | --- | --- |
+  | 16K | `14.280 ms / 70.034` | `10.768 ms / 92.865` | `4.322 / 83.05%` | `+32.60%` | `+11.53%` |
+  | 64K | `17.507 ms / 57.121` | `19.941 ms / 50.149` | `4.981 / 99.52%` | `-12.21%` | `+0.96%` |
+  | 128K | `22.009 ms / 45.438` | `33.676 ms / 29.695` | `4.981 / 99.52%` | `-34.65%` | `+0.55%` |
+  | 261888 | `30.434 ms / 32.858` | `59.324 ms / 16.857` | `5.000 / 100.00%` | `-48.70%` | `+2.55%` |
+
+- AWQ does not materially mitigate the long-context MTP decay. Its MTP4 lead
+  over FP8 falls from `11.53%` at 16K to `0.55%-2.55%` at 64K-261888, while
+  the AWQ no-MTP lead over FP8 no-MTP is still `5.73%-10.34%` in that range.
+  At 128K and 261888, acceptance is effectively perfect but MTP4 is
+  `34.65%` and `48.70%` slower than AWQ no-MTP. This directly excludes low
+  acceptance as the long-context root cause for AWQ as well.
+- The AWQ exact-M5/small-N TurboMind work improves the fixed target-verifier
+  GEMM portion and explains the short-context gain. It does not reduce the
+  context-linear target verifier attention or the four serial drafter
+  attention/KV traversals. Once those dominate, AWQ and FP8 converge to nearly
+  the same MTP4 throughput.
+- Cold prefill time for AWQ no-MTP versus MTP4 was `5.841/6.178 s` at 16K,
+  `29.468/37.399 s` at 64K, `81.335/115.357 s` at 128K, and
+  `256.240/386.647 s` at 261888. All two measured repeats per length were
+  deterministic and reported `is_corrupted=false`.
+- Artifact:
+  `bench_results/release_acceptance_20260719/tp4_27b_awq_fp8kv_mtp4_long_latest.json`.
+
+### 2026-07-19 TP4 MTP4 Full-Flash Long-Context Repair
+
+- The AWQ long-context recheck above pinned the drafter to `TRITON_ATTN` and
+  therefore did not exercise the already repaired Flash-V100 drafter. The
+  target M=5 verifier also converted its five rows to paged decode but stayed
+  on scalar instead of inheriting G6 XQA.
+- The target-only M=5 XQA repair improved 128K from
+  `33.676 ms / 29.695 tok/s` to `30.598 ms / 32.682 tok/s`; this was real but
+  still slower than no-MTP. Switching the four serial draft attentions to the
+  graph-safe Flash-V100 path produced the required first-order gain.
+- Matched full-Flash MTP4 results are `9.944 ms / 100.564 tok/s` at 64K,
+  `13.281 ms / 75.298 tok/s` at 128K, and
+  `20.092 ms / 49.772 tok/s` at 261888. These lead the matched no-MTP route by
+  `76.05%`, `65.72%`, and `51.47%`, respectively. Acceptance remains
+  `4.981/99.52%`, `4.981/99.52%`, and `5.000/100%`; repeated token hashes are
+  unchanged and all requests report `is_corrupted=false`.
+- The default-generated natural `macos_6k_code` quality run selected
+  Flash-V100 for both target and drafter, naturally stopped after 22,053
+  tokens, passed the complete HTML/code health gate, and decoded at
+  `114.167 tok/s`. The previous Triton-drafter natural run was
+  `94.539 tok/s`.
+- SM70 MTP defaults and the release matrix now select `FLASH_ATTN_V100` for the
+  drafter unless the user explicitly overrides it. Verifier XQA can be rolled
+  back with `VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA=0`; explicit P256/P512
+  context-bucket graphs retain scalar and do not reopen the rejected compact
+  XQA route.
+- Detailed method, microbenchmarks, quality evidence, and artifacts are in
+  `docs/design/sm70_qwen36_27b_awq_mtp4_optimization.md`.
+
+### 2026-07-19 Exact-M5 P1024 Dual-CTA Verifier Default
+
+- NCU localized the remaining long-context verifier growth to the TP4 exact
+  `M=5,G6,D256`, page-1616 FP8-E5M2 XQA partition kernel. The old 256-thread
+  P1024 kernel used 186 registers/thread, reached 12.49% occupancy, and had
+  72.33% cycles with no eligible warp; DRAM throughput was only 3.05%.
+- The accepted specialization keeps P1024 and its reduction order, but uses
+  192 threads and a two-CTA launch bound. Registers fall to 168/thread,
+  occupancy rises to 18.67%, eligible warps/scheduler rise `0.34 -> 0.58`, and
+  NCU partition duration falls `2.30 -> 1.85 ms`. Direct output is bitwise
+  equal to P1024 from 72 through 261888 tokens.
+- Matched TP4 128K endpoint TPOT falls `13.2808 -> 11.7291 ms` and steady
+  decode rises `75.298 -> 85.258 tok/s` (`+13.23%`) with identical fixed-run
+  token hashes and `A=4.98077`. Natural output stops after 26,708 tokens,
+  remains complete, reaches `118.674 tok/s`, and has `A=3.92` versus the old
+  `114.167 tok/s`, `A=3.7896` baseline.
+- The route is weight-quantization agnostic. A matched Qwen3.6-27B-FP8 plus
+  FP8-E5M2-KV run hits the same kernel on all four ranks and improves 128K
+  TPOT `13.4579 -> 11.9242 ms` and decode `74.306 -> 83.864 tok/s`
+  (`+12.86%`). Acceptance remains `4.94231`, both token hashes are identical,
+  and the log records `0 AWQ / 35 FP8` TurboMind warmup calls. This is not an
+  AWQ-only optimization. FP16 KV remains outside the current exact gate.
+- TP2 is covered by the same G6 gate rather than a TP4-only head-count check.
+  Its per-rank `Hq=12,Hkv=2` microbenchmark improves P1024 exact-M5 attention
+  by `29.88%/31.20%/28.77%` at 64K/128K/261888, and direct baseline-versus-dual
+  outputs are bitwise equal at all three contexts. The matched TP2 128K
+  FP8-weight/FP8-KV/MTP4 endpoint improves TPOT `22.7660 -> 18.6244 ms` and
+  decode `43.925 -> 53.693 tok/s` (`+22.24%`). Acceptance remains
+  `4.94231/98.56%`; both measured repeats retain the same token hash and report
+  no corruption. Route tests cover both TP2 and TP4.
+- Qwen3.6-35B-A3B has global `Hq/Hkv=16/2` for both AWQ and FP8 checkpoints.
+  Its runtime shape is G8 on TP2 and replicated-KV G4 on TP4, with a different
+  MTP page shape; neither matches the exact G6/page-1616 specialization. Its
+  previously accepted 35B routes and performance are unchanged.
+- Global P256 dual CTA is rejected despite its faster microbenchmark: its
+  changed reduction order produced a 19,930-token repetition and no EOS. Do
+  not default it. The production partition remains P1024; rollback is
+  `VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA=0`.
+- The fixed-quality short-window repetition guard now scales with output
+  length so repeated HTML component markup is not confused with degeneration.
+  Long-window, token-run, malformed-tag, closure, and natural-stop guards are
+  unchanged and still reject the P256 failure. Full evidence is in
+  `docs/design/sm70_qwen36_27b_awq_mtp4_optimization.md`.

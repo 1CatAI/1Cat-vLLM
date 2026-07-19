@@ -15,7 +15,9 @@ from torch.utils.cpp_extension import load
 
 
 def _load_extension() -> object:
-    source = Path(__file__).resolve().parent / "csrc" / "sm70_awq_splitk_reducer_micro.cu"
+    source = (
+        Path(__file__).resolve().parent / "csrc" / "sm70_awq_splitk_reducer_micro.cu"
+    )
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
     return load(
         name="sm70_awq_splitk_reducer_micro_v1",
@@ -26,10 +28,12 @@ def _load_extension() -> object:
     )
 
 
-def _time(fn: object, device: torch.device, warmup: int, iters: int, repeats: int) -> dict[str, float]:
+def _time(
+    fn: object, device: torch.device, warmup: int, iters: int, repeats: int
+) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     values: list[float] = []
     for _ in range(iters):
@@ -70,7 +74,10 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     device = torch.device(args.device)
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (7, 0):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (
+        7,
+        0,
+    ):
         raise RuntimeError("This benchmark requires an SM70 CUDA device.")
     if args.splits < 2 or args.tiles < 1 or args.elements < 1 or args.batch_repeats < 1:
         raise ValueError("splits, tiles, elements, and batch-repeats must be positive.")
@@ -84,7 +91,9 @@ def main() -> int:
     last_staged = torch.empty_like(partials)
     serial_locks = torch.zeros(args.tiles, device=device, dtype=torch.int32)
     last_counters = torch.zeros(args.tiles, device=device, dtype=torch.int32)
-    serial_output = torch.empty((args.tiles, args.elements), device=device, dtype=torch.float32)
+    serial_output = torch.empty(
+        (args.tiles, args.elements), device=device, dtype=torch.float32
+    )
     last_output = torch.empty_like(serial_output)
 
     def serial() -> None:
@@ -95,19 +104,31 @@ def main() -> int:
 
     serial()
     last_arrival()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     exact = bool(torch.equal(serial_output, last_output))
     if not exact:
         raise RuntimeError("Last-arrival reduction changed FP32 output bits.")
-    if bool(torch.count_nonzero(serial_locks).item()) or bool(torch.count_nonzero(last_counters).item()):
-        raise RuntimeError("Reducer did not restore its per-tile synchronization state.")
+    if bool(torch.count_nonzero(serial_locks).item()) or bool(
+        torch.count_nonzero(last_counters).item()
+    ):
+        raise RuntimeError(
+            "Reducer did not restore its per-tile synchronization state."
+        )
 
     if args.candidate_first:
-        last_timing = _time(last_arrival, device, args.warmup, args.iters, args.batch_repeats)
-        serial_timing = _time(serial, device, args.warmup, args.iters, args.batch_repeats)
+        last_timing = _time(
+            last_arrival, device, args.warmup, args.iters, args.batch_repeats
+        )
+        serial_timing = _time(
+            serial, device, args.warmup, args.iters, args.batch_repeats
+        )
     else:
-        serial_timing = _time(serial, device, args.warmup, args.iters, args.batch_repeats)
-        last_timing = _time(last_arrival, device, args.warmup, args.iters, args.batch_repeats)
+        serial_timing = _time(
+            serial, device, args.warmup, args.iters, args.batch_repeats
+        )
+        last_timing = _time(
+            last_arrival, device, args.warmup, args.iters, args.batch_repeats
+        )
     delta_us = last_timing["mean_us"] - serial_timing["mean_us"]
     payload = {
         "device": str(device),
@@ -117,7 +138,10 @@ def main() -> int:
             "splits": args.splits,
             "tiles": args.tiles,
             "elements": args.elements,
-            "note": "TP4 MLP-down has 20 N256 tiles and split 7; only M=1 output rows are modeled.",
+            "note": (
+                "TP4 MLP-down has 20 N256 tiles and split 7; only M=1 output "
+                "rows are modeled."
+            ),
         },
         "warmup": args.warmup,
         "iters": args.iters,

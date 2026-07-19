@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, TypedDict, cast
 
 import numpy as np
 import torch
@@ -137,9 +137,9 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100MetadataBuilder
 from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -275,7 +275,8 @@ def _dflash_ddtree_debug_enabled() -> bool:
 
 def _dflash_ddtree_debug_log(message: str, *args: object) -> None:
     if _dflash_ddtree_debug_enabled():
-        logger.info("DFlash DDTree runner debug: " + message, *args)
+        formatted = message % args if args else message
+        logger.info("DFlash DDTree runner debug: %s", formatted)
 
 
 def _dflash_ddtree_trace_path() -> str | None:
@@ -335,6 +336,21 @@ def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tenso
         .values
     )
     return first_invalid.to(torch.int32)
+
+
+def _async_spec_decode_participating_prev_positions(
+    prev_positions: np.ndarray,
+    prev_num_draft_tokens: np.ndarray,
+) -> np.ndarray:
+    valid_positions = prev_positions[prev_positions >= 0]
+    if valid_positions.size == 0:
+        return valid_positions
+    if int(valid_positions.max()) >= len(prev_num_draft_tokens):
+        raise RuntimeError(
+            "Async speculative decode previous-request index exceeds the "
+            "draft-count buffer."
+        )
+    return valid_positions[prev_num_draft_tokens[valid_positions] > 0]
 
 
 def _sm70_cuda_graph_capture_active() -> bool:
@@ -496,7 +512,7 @@ def _maybe_sync_sm70_sample_tensors(sample_hidden_states: torch.Tensor) -> None:
     if mode == "d2h":
         _ = sample_hidden_states.detach().cpu()
     elif mode == "device" and sample_hidden_states.is_cuda:
-        torch.cuda.synchronize(sample_hidden_states.device)
+        torch.accelerator.synchronize(sample_hidden_states.device)
     elif sample_hidden_states.is_cuda:
         torch.cuda.current_stream(sample_hidden_states.device).synchronize()
 
@@ -637,7 +653,7 @@ def _sync_sm70_before_compile_graph_forward(
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         and current_platform.is_device_capability(70)
     ):
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
 
 def _sync_sm70_before_compile_graph_capture(
@@ -1030,6 +1046,20 @@ class DDTreeAcceptedCopyPlan:
     flat_prefix: bool
 
 
+class DDTreeMambaCopyRecord(TypedDict):
+    kv_cache_gid: int
+    req_idx: int
+    req_id: str
+    req_state: CachedRequestState
+    src_slot: int
+    dst_slot: int
+    state_window_start: int
+    src_block_idx: int
+    dst_block_idx: int
+    src_block_id: int
+    dst_block_id: int
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -1109,13 +1139,13 @@ class GPUModelRunner(
             if profile_this_step:
                 # Make the cudaProfilerApi capture range contain only this
                 # target forward's graph replay/kernels, not earlier queued work.
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 torch.cuda.cudart().cudaProfilerStart()
                 started_profiler = True
             yield
         finally:
             if started_profiler:
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 torch.cuda.cudart().cudaProfilerStop()
             if pushed_nvtx:
                 torch.cuda.nvtx.range_pop()
@@ -1311,7 +1341,7 @@ class GPUModelRunner(
             self.max_encoder_len = 0
 
         # Async scheduling
-        self.use_async_scheduling = self.scheduler_config.async_scheduling
+        self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
         self._sm70_async_worker_execute_trace_step = 0
         self._sm70_async_worker_sample_trace_step = 0
         self._sm70_async_worker_input_prep_trace_step = 0
@@ -1326,7 +1356,7 @@ class GPUModelRunner(
         )
         self._sm70_greedy_token_fastpath_trace_seen: set[str] = set()
         draft_vocab_config = resolve_mtp_draft_vocab_config(
-            self.speculative_config.method if self.speculative_config else "",
+            (self.speculative_config.method or "") if self.speculative_config else "",
             self.parallel_config.tensor_parallel_size,
         )
         self.dynamic_draft_vocab_prefill_topk = draft_vocab_config.prefill_topk
@@ -1900,9 +1930,7 @@ class GPUModelRunner(
             return False
         if self.input_batch.prev_sampled_token_ids is None:
             return False
-        if self.num_accepted_tokens_event is not None:
-            return False
-        return True
+        return self.num_accepted_tokens_event is None
 
     def _copy_buffer_to_gpu(
         self, buffer: CpuGpuBuffer, n: int | None = None
@@ -2314,13 +2342,13 @@ class GPUModelRunner(
                         (req_id, optimistic_num_accepted, req_state)
                     )
 
-                    prev_req_index = (
+                    async_prev_req_index = (
                         self.input_batch.prev_req_id_to_index.get(req_id)
                         if self.input_batch.prev_req_id_to_index
                         else None
                     )
-                    if prev_req_index is not None:
-                        self.prev_num_draft_tokens.np[prev_req_index] = (
+                    if async_prev_req_index is not None:
+                        self.prev_num_draft_tokens.np[async_prev_req_index] = (
                             optimistic_num_accepted
                         )
 
@@ -2663,6 +2691,7 @@ class GPUModelRunner(
                         self.spec_state_slot_selectors.gpu[:num_reqs],
                         non_blocking=True,
                     )
+                assert mamba_bufs.postprocess_align is not None
                 mamba_utils.stage_postprocess_inputs_to_gpu(
                     mamba_bufs.postprocess_align,
                     scheduler_output,
@@ -2982,14 +3011,12 @@ class GPUModelRunner(
         accepted_rows: Sequence[Sequence[int]],
     ) -> bool:
         for row in accepted_rows:
-            expected_node_idx = 0
-            for raw_node_idx in row:
+            for expected_node_idx, raw_node_idx in enumerate(row):
                 node_idx = int(raw_node_idx)
                 if node_idx < 0:
                     break
                 if node_idx != expected_node_idx:
                     return False
-                expected_node_idx += 1
         return True
 
     @staticmethod
@@ -3182,21 +3209,15 @@ class GPUModelRunner(
             return
 
         if hasattr(attn_metadata, "ddtree_parent_ids"):
-            setattr(attn_metadata, "ddtree_parent_ids", parent_ids)
+            attn_metadata.ddtree_parent_ids = parent_ids
         if hasattr(attn_metadata, "ddtree_num_tree_tokens_cpu"):
-            setattr(
-                attn_metadata,
-                "ddtree_num_tree_tokens_cpu",
-                num_tree_tokens_cpu,
-            )
+            attn_metadata.ddtree_num_tree_tokens_cpu = num_tree_tokens_cpu
         if (
             hasattr(attn_metadata, "ddtree_num_tree_tokens")
             and num_tree_tokens_cpu is not None
         ):
-            setattr(
-                attn_metadata,
-                "ddtree_num_tree_tokens",
-                num_tree_tokens_cpu.to(parent_ids.device, non_blocking=True),
+            attn_metadata.ddtree_num_tree_tokens = num_tree_tokens_cpu.to(
+                parent_ids.device, non_blocking=True
             )
 
         # FlexAttention pre-builds its block mask during metadata build. If
@@ -3205,17 +3226,13 @@ class GPUModelRunner(
         if hasattr(attn_metadata, "block_mask") and hasattr(
             attn_metadata, "build_block_mask"
         ):
-            setattr(attn_metadata, "block_mask", None)
+            attn_metadata.block_mask = None
             if getattr(attn_metadata, "direct_build", False) and hasattr(
                 attn_metadata, "_build_block_mask_direct"
             ):
-                setattr(
-                    attn_metadata,
-                    "block_mask",
-                    attn_metadata._build_block_mask_direct(),
-                )
+                attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
             else:
-                setattr(attn_metadata, "block_mask", attn_metadata.build_block_mask())
+                attn_metadata.block_mask = attn_metadata.build_block_mask()
 
     @staticmethod
     def _ddtree_slot_from_cpu_position(
@@ -3317,9 +3334,12 @@ class GPUModelRunner(
         cls,
         scheduler_output: "SchedulerOutput",
     ) -> bool:
+        payloads = scheduler_output.scheduled_ddtree_payloads
+        if not payloads:
+            return False
         return any(
             not cls._ddtree_payload_is_flat_chain(payload)
-            for payload in scheduler_output.scheduled_ddtree_payloads.values()
+            for payload in payloads.values()
         )
 
     def _validate_ddtree_hybrid_state_path(
@@ -3661,7 +3681,7 @@ class GPUModelRunner(
             return
 
         forward_context = self.compilation_config.static_forward_context
-        trace_records: list[dict[str, int]] = []
+        trace_records: list[dict[str, object]] = []
         for kv_cache_gid, kv_cache_group in enumerate(
             self.kv_cache_config.kv_cache_groups
         ):
@@ -3711,36 +3731,35 @@ class GPUModelRunner(
             batch_src_ptrs: list[int] = []
             batch_dst_ptrs: list[int] = []
             batch_sizes: list[int] = []
-            if len(slot_copy_pairs) > 1:
-                if not (set(src_slots) & set(dst_slots)):
-                    src_blocks_offsets = [
-                        divmod(src_slot, block_size) for src_slot in src_slots
-                    ]
-                    dst_blocks_offsets = [
-                        divmod(dst_slot, block_size) for dst_slot in dst_slots
-                    ]
-                    slot_copy_tensors = (
-                        torch.tensor(
-                            [block for block, _ in src_blocks_offsets],
-                            dtype=torch.long,
-                            device=index_device,
-                        ),
-                        torch.tensor(
-                            [offset for _, offset in src_blocks_offsets],
-                            dtype=torch.long,
-                            device=index_device,
-                        ),
-                        torch.tensor(
-                            [block for block, _ in dst_blocks_offsets],
-                            dtype=torch.long,
-                            device=index_device,
-                        ),
-                        torch.tensor(
-                            [offset for _, offset in dst_blocks_offsets],
-                            dtype=torch.long,
-                            device=index_device,
-                        ),
-                    )
+            if len(slot_copy_pairs) > 1 and not (set(src_slots) & set(dst_slots)):
+                src_blocks_offsets = [
+                    divmod(src_slot, block_size) for src_slot in src_slots
+                ]
+                dst_blocks_offsets = [
+                    divmod(dst_slot, block_size) for dst_slot in dst_slots
+                ]
+                slot_copy_tensors = (
+                    torch.tensor(
+                        [block for block, _ in src_blocks_offsets],
+                        dtype=torch.long,
+                        device=index_device,
+                    ),
+                    torch.tensor(
+                        [offset for _, offset in src_blocks_offsets],
+                        dtype=torch.long,
+                        device=index_device,
+                    ),
+                    torch.tensor(
+                        [block for block, _ in dst_blocks_offsets],
+                        dtype=torch.long,
+                        device=index_device,
+                    ),
+                    torch.tensor(
+                        [offset for _, offset in dst_blocks_offsets],
+                        dtype=torch.long,
+                        device=index_device,
+                    ),
+                )
             for layer_name in kv_cache_group.layer_names:
                 attention = forward_context.get(layer_name)
                 kv_cache = None if attention is None else attention.kv_cache
@@ -3909,7 +3928,7 @@ class GPUModelRunner(
             block_table = self.input_batch.block_table.block_tables[
                 kv_cache_gid
             ].get_numpy_array()
-            group_records: list[dict[str, object]] = []
+            group_records: list[DDTreeMambaCopyRecord] = []
             for req_idx, src_slot, dst_slot in copies:
                 if req_idx >= len(self.input_batch.req_ids):
                     continue
@@ -4008,6 +4027,7 @@ class GPUModelRunner(
                 and not (src_block_ids & dst_block_ids)
             )
             if use_batch_copy:
+                assert batch_copy_bufs is not None
                 for record in group_records:
                     before_offset = batch_copy_bufs.offset
                     mamba_utils.collect_mamba_copy_meta(
@@ -4865,11 +4885,28 @@ class GPUModelRunner(
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
         profile_stage_t0 = time.perf_counter() if profile_inputs else 0.0
         profile_inner_t0 = profile_stage_t0
+        participating_prev_positions = (
+            _async_spec_decode_participating_prev_positions(
+                self.prev_positions.np[:num_reqs],
+                self.prev_num_draft_tokens.np,
+            )
+            if self.use_async_spec_decode and prev_req_id_to_index
+            else np.empty(0, dtype=np.int32)
+        )
         if (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
+            and participating_prev_positions.size > 0
         ):
+            max_prev_position = int(participating_prev_positions.max())
+            if max_prev_position >= self.valid_sampled_token_count_gpu.shape[0]:
+                raise RuntimeError(
+                    "Async speculative decode draft-count state is inconsistent: "
+                    f"required previous row {max_prev_position}, but valid sampled "
+                    "token counts contain only "
+                    f"{self.valid_sampled_token_count_gpu.shape[0]} rows."
+                )
             self._copy_buffer_to_gpu(self.prev_positions, num_reqs)
             self._copy_buffer_to_gpu(self.prev_num_draft_tokens)
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
@@ -6647,9 +6684,7 @@ class GPUModelRunner(
         logitsprocs = sampling_metadata.logitsprocs
         if not GPUModelRunner._ddtree_non_argmax_processors_safe(logitsprocs):
             return False
-        if logitsprocs.argmax_invariant:
-            return False
-        return True
+        return not logitsprocs.argmax_invariant
 
     def _can_use_ddtree_greedy_top_tokens(
         self,
@@ -6832,11 +6867,12 @@ class GPUModelRunner(
             )
 
         spec_config = self.speculative_config
+        ddtree_payloads = scheduler_output.scheduled_ddtree_payloads or {}
         ddtree_tree_candidate = (
             spec_config is not None
             and spec_config.use_dflash_ddtree()
             and not spec_config.ddtree_disable_tree_verify
-            and bool(scheduler_output.scheduled_ddtree_payloads)
+            and bool(ddtree_payloads)
         )
         ddtree_greedy_candidate = (
             ddtree_tree_candidate
@@ -6894,7 +6930,7 @@ class GPUModelRunner(
             if ddtree_sampler_output is None:
                 ddtree_result = greedy_sample_ddtree_payloads_from_top_tokens(
                     req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
-                    payload_by_req_id=scheduler_output.scheduled_ddtree_payloads,
+                    payload_by_req_id=ddtree_payloads,
                     compact_top_tokens=top_tokens,
                     num_draft_tokens=spec_decode_metadata.num_draft_tokens,
                 )
@@ -6936,7 +6972,7 @@ class GPUModelRunner(
                 self.input_batch.num_reqs,
                 top_tokens.shape[0],
                 list(spec_decode_metadata.num_draft_tokens),
-                len(scheduler_output.scheduled_ddtree_payloads),
+                len(ddtree_payloads),
             )
 
         if (
@@ -6964,7 +7000,7 @@ class GPUModelRunner(
             sampler_t0 = time.perf_counter() if ddtree_profile_enabled else 0.0
             ddtree_result = stochastic_sample_ddtree_payloads_from_topk(
                 req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
-                payload_by_req_id=scheduler_output.scheduled_ddtree_payloads,
+                payload_by_req_id=ddtree_payloads,
                 target_topk_token_ids=topk_token_ids,
                 target_topk_logits=topk_logits,
                 num_draft_tokens=spec_decode_metadata.num_draft_tokens,
@@ -7012,7 +7048,7 @@ class GPUModelRunner(
                 topk_logits.shape[0],
                 top_k_width,
                 list(spec_decode_metadata.num_draft_tokens),
-                len(scheduler_output.scheduled_ddtree_payloads),
+                len(ddtree_payloads),
             )
 
         if logits is None:
@@ -7139,7 +7175,7 @@ class GPUModelRunner(
                 _dflash_ddtree_trace_event("ddtree_sample_inputs", trace_payload)
             ddtree_result = greedy_sample_ddtree_payloads(
                 req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
-                payload_by_req_id=scheduler_output.scheduled_ddtree_payloads,
+                payload_by_req_id=ddtree_payloads,
                 compact_logits=logits,
                 num_draft_tokens=spec_decode_metadata.num_draft_tokens,
             )
@@ -7166,7 +7202,7 @@ class GPUModelRunner(
                 self.input_batch.num_reqs,
                 logits.shape[0],
                 list(spec_decode_metadata.num_draft_tokens),
-                len(scheduler_output.scheduled_ddtree_payloads),
+                len(ddtree_payloads),
             )
             raise RuntimeError(
                 "DDTree greedy sampler could not match scheduled tree "
@@ -7175,7 +7211,7 @@ class GPUModelRunner(
         elif ddtree_stochastic_candidate and spec_decode_metadata is not None:
             ddtree_result = stochastic_sample_ddtree_payloads(
                 req_ids=self.input_batch.req_ids[: self.input_batch.num_reqs],
-                payload_by_req_id=scheduler_output.scheduled_ddtree_payloads,
+                payload_by_req_id=ddtree_payloads,
                 compact_logits=logits,
                 num_draft_tokens=spec_decode_metadata.num_draft_tokens,
                 temperature=sampling_metadata.temperature,
@@ -7208,7 +7244,7 @@ class GPUModelRunner(
                 self.input_batch.num_reqs,
                 logits.shape[0],
                 list(spec_decode_metadata.num_draft_tokens),
-                len(scheduler_output.scheduled_ddtree_payloads),
+                len(ddtree_payloads),
             )
             raise RuntimeError(
                 "DDTree stochastic sampler could not match scheduled tree "
@@ -8290,7 +8326,9 @@ class GPUModelRunner(
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
         _sync_sm70_before_compile_graph_forward(cudagraph_mode)
-        mtp_profile_events = [] if self._sm70_mtp_profile_enabled() else None
+        mtp_profile_events: (
+            list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None
+        ) = ([]) if self._sm70_mtp_profile_enabled() else None
         mtp_forward_start = self._sm70_mtp_profile_start(mtp_profile_events)
         trace_forward_t0 = time.perf_counter() if trace_log else 0.0
         with (

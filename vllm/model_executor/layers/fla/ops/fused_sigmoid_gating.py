@@ -51,8 +51,7 @@ def _use_sm70_fused_sigmoid_schedule(device: torch.device) -> bool:
     from .fused_recurrent import _is_sm70_device
 
     return _is_sm70_device(device) and (
-        _SM70_FUSED_SIGMOID_SCHEDULE
-        or _SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE
+        _SM70_FUSED_SIGMOID_SCHEDULE or _SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE
     )
 
 
@@ -220,7 +219,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             parent_t = tl.where(parent_t < 0, 0, parent_t)
             reload_t = tl.where(i_t == 0, -1, parent_t)
             reload_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + reload_t * stride_indices_tok,
+                ssm_state_indices
+                + i_n * stride_indices_seq
+                + reload_t * stride_indices_tok,
                 mask=reload_t >= 0,
                 other=-1,
             ).to(tl.int64)

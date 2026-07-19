@@ -16,8 +16,8 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
     from vllm.v1.request import Request
+    from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object

@@ -1,12 +1,15 @@
-import torch
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import os
+
+import torch
+
 try:
     from . import flash_attn_v100_cuda
 except ImportError:
     import flash_attn_v100_cuda
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
 
 try:
     from torch._subclasses.fake_tensor import FakeTensor
@@ -21,6 +24,7 @@ _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
 logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class _DecodePlan:
@@ -54,7 +58,7 @@ def maybe_contiguous(x):
 
 def _copy_bhmd_to_bmhd_out(
     out_bhmd: torch.Tensor,
-    out_bmhd: Optional[torch.Tensor],
+    out_bmhd: torch.Tensor | None,
 ) -> torch.Tensor:
     out = out_bhmd.permute(0, 2, 1, 3).contiguous()
     if out_bmhd is not None:
@@ -69,9 +73,7 @@ def _is_fake_tensor(x: torch.Tensor) -> bool:
 
 def _can_cache_workspace(x: torch.Tensor) -> bool:
     return (
-        not torch.compiler.is_compiling()
-        and not x.is_meta
-        and not _is_fake_tensor(x)
+        not torch.compiler.is_compiling() and not x.is_meta and not _is_fake_tensor(x)
     )
 
 
@@ -145,11 +147,11 @@ def _get_decode_plan(
     k_cache: torch.Tensor,
     block_table: torch.Tensor,
     *,
-    max_seq_len_hint: Optional[int] = None,
-    batch_size_hint: Optional[int] = None,
-    workspace_seq_capacity_hint: Optional[int] = None,
-    active_num_partitions: Optional[torch.Tensor] = None,
-    partition_size_hint: Optional[int] = None,
+    max_seq_len_hint: int | None = None,
+    batch_size_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+    active_num_partitions: torch.Tensor | None = None,
+    partition_size_hint: int | None = None,
 ) -> _DecodePlan:
     batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
@@ -238,7 +240,7 @@ def _get_decode_workspace_for_plan(
     num_heads: int,
     head_dim: int,
     plan: _DecodePlan,
-    active_num_partitions: Optional[torch.Tensor] = None,
+    active_num_partitions: torch.Tensor | None = None,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
@@ -272,9 +274,9 @@ def _get_decode_workspace_for_plan(
         workspace.active_num_partitions.fill_(plan.actual_num_partitions)
         active_num_partitions = workspace.active_num_partitions
     return (
-        workspace.tmp_out[:, :, :workspace.max_num_partitions, :],
-        workspace.max_logits[:, :, :workspace.max_num_partitions],
-        workspace.exp_sums[:, :, :workspace.max_num_partitions],
+        workspace.tmp_out[:, :, : workspace.max_num_partitions, :],
+        workspace.max_logits[:, :, : workspace.max_num_partitions],
+        workspace.exp_sums[:, :, : workspace.max_num_partitions],
         active_num_partitions,
     )
 
@@ -326,8 +328,7 @@ def _get_turboquant_decode_workspace(
     max_seq_capacity = block_table.shape[1] * kv_cache.shape[1]
     per_split_capacity = (max_seq_capacity + num_kv_splits - 1) // num_kv_splits
     partition_size = next(
-        (size for size in VALID_DECODE_PARTITION_SIZES
-         if per_split_capacity <= size),
+        (size for size in VALID_DECODE_PARTITION_SIZES if per_split_capacity <= size),
         None,
     )
     if partition_size is None:
@@ -435,8 +436,8 @@ def _get_decode_partition_size(
     head_dim: int,
     num_q_heads: int,
     num_kv_heads: int,
-    max_seq_len_hint: Optional[int] = None,
-    batch_size_hint: Optional[int] = None,
+    max_seq_len_hint: int | None = None,
+    batch_size_hint: int | None = None,
 ) -> int:
     raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     if raw is None:
@@ -455,7 +456,7 @@ def _get_decode_partition_size(
 
 
 def _select_default_decode_partition_size(
-    max_seq_len_hint: Optional[int],
+    max_seq_len_hint: int | None,
 ) -> int:
     if max_seq_len_hint is None:
         return DEFAULT_DECODE_PARTITION_SIZE
@@ -478,7 +479,7 @@ def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: Optional[torch.Tensor],
+    out: torch.Tensor | None,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -492,15 +493,23 @@ def _flash_attn_forward(
     out = maybe_contiguous(out)
     if out is None:
         out = torch.zeros_like(q)
-    lse = torch.zeros(q.shape[0] * q.shape[1] * q.shape[2], dtype=torch.float32, device=q.device)
     outputs = flash_attn_v100_cuda.fwd(
-        q, k, v,
-        out, alibi_slopes,
-        dropout_p, softmax_scale, causal,
-        window_size_left, window_size_right,
-        softcap, return_softmax, None
+        q,
+        k,
+        v,
+        out,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        return_softmax,
+        None,
     )
     return outputs[0], outputs[1], None, None
+
 
 def _flash_attn_backward(
     dout: torch.Tensor,
@@ -524,14 +533,28 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     dout, q, k, v, out = map(maybe_contiguous, (dout, q, k, v, out))
     grads = flash_attn_v100_cuda.bwd(
-        dout, q, k, v, out, softmax_lse,
-        dq, dk, dv,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
         alibi_slopes,
-        dropout_p, softmax_scale, causal,
-        window_size_left, window_size_right,
-        softcap, deterministic, None, rng_state
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        None,
+        rng_state,
     )
     return grads[0], grads[1], grads[2]
+
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -549,9 +572,8 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic: bool,
         return_softmax: bool,
         is_grad_enabled: bool,
-        out: Optional[torch.Tensor],
+        out: torch.Tensor | None,
     ):
-
         q_ = q.permute(0, 2, 1, 3).contiguous()
         k_ = k.permute(0, 2, 1, 3).contiguous()
         v_ = v.permute(0, 2, 1, 3).contiguous()
@@ -586,11 +608,18 @@ class FlashAttnFunc(torch.autograd.Function):
             raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
 
         out_, lse_, _, rng_state = _flash_attn_forward(
-            q_, k_, v_,
+            q_,
+            k_,
+            v_,
             out.permute(0, 2, 1, 3).contiguous() if out is not None else None,
-            dropout_p, softmax_scale, causal,
-            window_size_left, window_size_right,
-            softcap, alibi_slopes, return_softmax
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            softcap,
+            alibi_slopes,
+            return_softmax,
         )
 
         out = _copy_bhmd_to_bmhd_out(out_, out)
@@ -618,8 +647,15 @@ class FlashAttnFunc(torch.autograd.Function):
         dv_ = torch.empty_like(v_)
 
         _flash_attn_backward(
-            dout_, q_, k_, v_, out_, lse_,
-            dq_, dk_, dv_,
+            dout_,
+            q_,
+            k_,
+            v_,
+            out_,
+            lse_,
+            dq_,
+            dk_,
+            dv_,
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
@@ -637,6 +673,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
+
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -649,14 +686,16 @@ def flash_attn_func(
     alibi_slopes: torch.Tensor = None,
     deterministic: bool = False,
     return_attn_probs: bool = False,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
     try:
         return FlashAttnFunc.apply(
-            q, k, v,
+            q,
+            k,
+            v,
             dropout_p,
             softmax_scale,
             causal,
@@ -701,7 +740,7 @@ def flash_attn_bhmd_func(
     softcap: float = 0.0,
     alibi_slopes: torch.Tensor = None,
     return_attn_probs: bool = False,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """Forward-only Flash-V100 dense attention for [B, H, T, D] tensors."""
     if softmax_scale is None:
@@ -786,16 +825,16 @@ def flash_attn_decode_paged(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     window_size: tuple = (-1, -1),
-    max_seq_len_hint: Optional[int] = None,
-    workspace_seq_capacity_hint: Optional[int] = None,
-    active_num_partitions: Optional[torch.Tensor] = None,
-    partition_size_hint: Optional[int] = None,
+    max_seq_len_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+    active_num_partitions: torch.Tensor | None = None,
+    partition_size_hint: int | None = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -871,15 +910,16 @@ def flash_attn_decode_paged_xqa(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     window_size: tuple = (-1, -1),
-    max_seq_len_hint: Optional[int] = None,
-    workspace_seq_capacity_hint: Optional[int] = None,
-    active_num_partitions: Optional[torch.Tensor] = None,
+    max_seq_len_hint: int | None = None,
+    workspace_seq_capacity_hint: int | None = None,
+    active_num_partitions: torch.Tensor | None = None,
+    partition_size_hint: int | None = None,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -908,6 +948,7 @@ def flash_attn_decode_paged_xqa(
         batch_size_hint=batch_capacity,
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
+        partition_size_hint=partition_size_hint,
     )
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
@@ -989,8 +1030,8 @@ def flash_attn_decode_paged_wmma(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
@@ -1026,7 +1067,7 @@ def flash_attn_decode_qk_scores(
     k_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
 ):
@@ -1066,8 +1107,8 @@ def flash_attn_turboquant_decode_paged(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     centroids: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     mse_bits: int = 4,
     value_quant_bits: int = 4,
     norm_correction: bool = True,
@@ -1084,10 +1125,8 @@ def flash_attn_turboquant_decode_paged(
     seq_lens = maybe_contiguous(seq_lens)
     centroids = maybe_contiguous(centroids)
     out = maybe_contiguous(out)
-    (tmp_out, max_logits, exp_sums), partition_size = (
-        _get_turboquant_decode_workspace(
-            q_rot, kv_cache, block_table, int(num_kv_splits)
-        )
+    (tmp_out, max_logits, exp_sums), partition_size = _get_turboquant_decode_workspace(
+        q_rot, kv_cache, block_table, int(num_kv_splits)
     )
 
     return flash_attn_v100_cuda.decode_turboquant_paged_fwd(
@@ -1114,8 +1153,8 @@ def flash_attn_prefill_paged(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
@@ -1187,8 +1226,8 @@ def flash_attn_prefill_paged_bfla(
     seq_lens: torch.Tensor,
     bfla_block_mask: torch.Tensor,
     bfla_mask_block_n: int,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
@@ -1237,8 +1276,8 @@ def flash_attn_prefill_paged_splitkv(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
@@ -1288,8 +1327,8 @@ def flash_attn_prefill_paged_bhmd(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
@@ -1331,9 +1370,9 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    out: Optional[torch.Tensor] = None,
-    softmax_lse: Optional[torch.Tensor] = None,
+    softmax_scale: float | None = None,
+    out: torch.Tensor | None = None,
+    softmax_lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the fixed causal SM70 D256 BM32 ALL_P pair-scratch entry.
 

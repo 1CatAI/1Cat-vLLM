@@ -10,11 +10,11 @@ the selected reference (`torch.equal` and `max_diff == 0`).
 import argparse
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import regex as re
 import torch
 
 import vllm._custom_ops as ops
@@ -49,8 +49,7 @@ SINGLE_TOKEN_STAGE_ACTUALS = (
     "single_token_indexed",
     "single_token_compact_w13",
 )
-AWQ_SINGLE_TOKEN_ACTUALS = (*SINGLE_TOKEN_STAGE_ACTUALS,
-                            "legacy_single_token_compact")
+AWQ_SINGLE_TOKEN_ACTUALS = (*SINGLE_TOKEN_STAGE_ACTUALS, "legacy_single_token_compact")
 
 
 def _require_cuda(device: torch.device) -> None:
@@ -103,12 +102,7 @@ def _unpack_awq_gemm_qweight(qweight: torch.Tensor) -> torch.Tensor:
         raise ValueError("AWQ qweight K must be divisible by 8.")
     vals = [((qweight >> (4 * i)) & 0xF).to(torch.float16) for i in range(8)]
     flat = torch.stack(vals, dim=-1).reshape(-1)
-    return (
-        flat.reshape(n, k // 8, 2, 4)
-        .permute(0, 1, 3, 2)
-        .contiguous()
-        .reshape(k, n)
-    )
+    return flat.reshape(n, k // 8, 2, 4).permute(0, 1, 3, 2).contiguous().reshape(k, n)
 
 
 def _awq_reference_weight(
@@ -123,8 +117,9 @@ def _awq_reference_weight(
     zero_order = [0, 4, 1, 5, 2, 6, 3, 7]
     w = _unpack_awq_gemm_qweight(qweight)
     zeros = _unpack_int4_cols(qzeros, zero_order)
-    row_groups = (torch.arange(qweight.shape[0], device=qweight.device)
-                  // group_size).long()
+    row_groups = (
+        torch.arange(qweight.shape[0], device=qweight.device) // group_size
+    ).long()
     return ((w - zeros[row_groups]) * scales[row_groups]).to(torch.float16)
 
 
@@ -313,17 +308,18 @@ def _make_moe_input(
     if pattern == "random":
         return torch.randn((m, k), device=device, dtype=torch.float16)
     if pattern == "random_scaled":
-        return (torch.randn((m, k), device=device, dtype=torch.float16) * 3.0)
+        return torch.randn((m, k), device=device, dtype=torch.float16) * 3.0
     raise ValueError(f"Unsupported MoE input pattern: {pattern}")
 
 
 def _stats(name: str, actual: torch.Tensor, expected: torch.Tensor) -> dict[str, Any]:
-    torch.cuda.synchronize(actual.device)
+    torch.accelerator.synchronize(actual.device)
     diff = (actual - expected).abs()
     finite_diff = diff[torch.isfinite(diff)]
     max_diff = float(finite_diff.max().item()) if finite_diff.numel() else float("nan")
     mean_diff = (
-        float(finite_diff.float().mean().item()) if finite_diff.numel()
+        float(finite_diff.float().mean().item())
+        if finite_diff.numel()
         else float("nan")
     )
     rms_diff = (
@@ -353,9 +349,7 @@ def _stats(name: str, actual: torch.Tensor, expected: torch.Tensor) -> dict[str,
         if finite_mask.any():
             actual_bits = actual_np.view(np.uint16).astype(np.int32)
             expected_bits = expected_np.view(np.uint16).astype(np.int32)
-            sign_mismatch = (
-                (actual_bits ^ expected_bits) & 0x8000
-            )[finite_mask] != 0
+            sign_mismatch = ((actual_bits ^ expected_bits) & 0x8000)[finite_mask] != 0
 
             def _ordered_float16_bits(bits: np.ndarray) -> np.ndarray:
                 sign = bits & 0x8000
@@ -381,14 +375,11 @@ def _stats(name: str, actual: torch.Tensor, expected: torch.Tensor) -> dict[str,
             result.update(
                 {
                     "max_ulp_diff": int(ulp_diff.max()) if ulp_diff.size else 0,
-                    "mean_ulp_diff": float(ulp_diff.mean())
-                    if ulp_diff.size
-                    else 0.0,
+                    "mean_ulp_diff": float(ulp_diff.mean()) if ulp_diff.size else 0.0,
                     "max_nonzero_ulp_diff": int(nonzero_ulp.max())
                     if nonzero_ulp.size
                     else 0,
-                    "max_abs_diff_at_max_nonzero_ulp":
-                    max_abs_diff_at_max_nonzero_ulp,
+                    "max_abs_diff_at_max_nonzero_ulp": max_abs_diff_at_max_nonzero_ulp,
                     "mean_nonzero_ulp_diff": float(nonzero_ulp.mean())
                     if nonzero_ulp.size
                     else 0.0,
@@ -414,15 +405,17 @@ def _with_moe_metadata(
     stage: str,
     layer: str | None = None,
 ) -> dict[str, Any]:
-    result.update({
-        "m": m,
-        "top_k": top_k,
-        "total_slots": m * top_k,
-        "num_experts": num_experts,
-        "actual_impl": actual_impl,
-        "expert_pattern": expert_pattern,
-        "stage": stage,
-    })
+    result.update(
+        {
+            "m": m,
+            "top_k": top_k,
+            "total_slots": m * top_k,
+            "num_experts": num_experts,
+            "actual_impl": actual_impl,
+            "expert_pattern": expert_pattern,
+            "stage": stage,
+        }
+    )
     if layer is not None:
         result["layer"] = layer
     return result
@@ -443,48 +436,51 @@ def _classify_moe_results(
 
     nonzero = [r for r in results if not r["equal"] or r["max_diff"] != 0.0]
     nan_reports = [
-        r for r in results
-        if r["actual_nan_count"] != 0 or r["expected_nan_count"] != 0
+        r for r in results if r["actual_nan_count"] != 0 or r["expected_nan_count"] != 0
     ]
     max_diff = max((float(r["max_diff"]) for r in results), default=0.0)
     max_mean_diff = max((float(r["mean_diff"]) for r in results), default=0.0)
-    above_bound = [
-        r for r in results if float(r["max_diff"]) > max_diff_bound
-    ]
+    above_bound = [r for r in results if float(r["max_diff"]) > max_diff_bound]
     raw_above_ulp_bound = [
-        r for r in results
+        r
+        for r in results
         if int(r.get("max_nonzero_ulp_diff", 0)) > max_nonzero_ulp_diff
     ]
     above_ulp_bound = [
-        r for r in raw_above_ulp_bound
+        r
+        for r in raw_above_ulp_bound
         if float(r.get("max_abs_diff_at_max_nonzero_ulp", float("inf")))
         > sign_mismatch_abs_bound
     ]
     near_zero_ulp_bound = [
-        r for r in raw_above_ulp_bound
+        r
+        for r in raw_above_ulp_bound
         if float(r.get("max_abs_diff_at_max_nonzero_ulp", float("inf")))
         <= sign_mismatch_abs_bound
     ]
     bad_sign_mismatch = [
-        r for r in results
+        r
+        for r in results
         if int(r.get("sign_mismatch_count", 0)) > 0
-        and float(r.get("max_abs_diff_on_sign_mismatch", 0.0))
-        > sign_mismatch_abs_bound
+        and float(r.get("max_abs_diff_on_sign_mismatch", 0.0)) > sign_mismatch_abs_bound
     ]
     stages: dict[str, dict[str, Any]] = {}
     for result in results:
         stage = str(result.get("stage") or _stage_from_name(result["name"]))
-        current = stages.setdefault(stage, {
-            "max_diff": 0.0,
-            "max_mean_diff": 0.0,
-            "max_rms_diff": 0.0,
-            "max_nonzero_ulp_diff": 0,
-            "max_abs_diff_at_max_nonzero_ulp": 0.0,
-            "sign_mismatch_count": 0,
-            "max_abs_diff_on_sign_mismatch": 0.0,
-            "num_reports": 0,
-            "num_nonzero": 0,
-        })
+        current = stages.setdefault(
+            stage,
+            {
+                "max_diff": 0.0,
+                "max_mean_diff": 0.0,
+                "max_rms_diff": 0.0,
+                "max_nonzero_ulp_diff": 0,
+                "max_abs_diff_at_max_nonzero_ulp": 0.0,
+                "sign_mismatch_count": 0,
+                "max_abs_diff_on_sign_mismatch": 0.0,
+                "num_reports": 0,
+                "num_nonzero": 0,
+            },
+        )
         current["num_reports"] += 1
         current["max_diff"] = max(current["max_diff"], float(result["max_diff"]))
         current["max_mean_diff"] = max(
@@ -501,9 +497,7 @@ def _classify_moe_results(
             current["max_abs_diff_at_max_nonzero_ulp"],
             float(result.get("max_abs_diff_at_max_nonzero_ulp", 0.0)),
         )
-        current["sign_mismatch_count"] += int(
-            result.get("sign_mismatch_count", 0)
-        )
+        current["sign_mismatch_count"] += int(result.get("sign_mismatch_count", 0))
         current["max_abs_diff_on_sign_mismatch"] = max(
             current["max_abs_diff_on_sign_mismatch"],
             float(result.get("max_abs_diff_on_sign_mismatch", 0.0)),
@@ -530,9 +524,7 @@ def _classify_moe_results(
         if nonzero:
             label = "A-bug"
             failed.append("per-expert dense bridge is expected to be Type-A exact")
-            default_acceptance = (
-                "blocked until dense bridge exactness is repaired"
-            )
+            default_acceptance = "blocked until dense bridge exactness is repaired"
         else:
             label = "A-pass"
             cleared.append("per-expert dense bridge matches the oracle exactly")
@@ -546,8 +538,7 @@ def _classify_moe_results(
         default_acceptance = "blocked: fp16-diff acceptance gate failed"
         if above_bound:
             failed.append(
-                f"{len(above_bound)} reports exceed fp16 output bound "
-                f"{max_diff_bound}"
+                f"{len(above_bound)} reports exceed fp16 output bound {max_diff_bound}"
             )
         if above_ulp_bound:
             failed.append(
@@ -581,9 +572,7 @@ def _classify_moe_results(
                 f"{len(near_zero_ulp_bound)} raw ULP outlier reports are "
                 "near-zero cases under the configured abs gate"
             )
-        pending.append(
-            "grouped TurboMind schedule/reduction source is not yet proven"
-        )
+        pending.append("grouped TurboMind schedule/reduction source is not yet proven")
         pending.append(
             "model-level greedy/logprob/perplexity quality gate has not been "
             "marked passed"
@@ -625,9 +614,15 @@ def _stage_from_name(name: str) -> str:
     return match.group(1) if match else "unknown"
 
 
-def _check_awq(m: int, k: int, n: int, group_size: int,
-               device: torch.device, awq_model: Path | None,
-               awq_layer: str | None) -> dict[str, Any]:
+def _check_awq(
+    m: int,
+    k: int,
+    n: int,
+    group_size: int,
+    device: torch.device,
+    awq_model: Path | None,
+    awq_layer: str | None,
+) -> dict[str, Any]:
     _require_torch_op("awq_sm70_prepare")
     _require_torch_op("awq_gemm_sm70")
 
@@ -652,8 +647,7 @@ def _check_awq(m: int, k: int, n: int, group_size: int,
         qweight = _pack_int4(unpacked_qweight)
         qzeros = _pack_int4(unpacked_qzeros)
         scales = (
-            torch.rand((k // group_size, n), device=device, dtype=torch.float16)
-            * 0.25
+            torch.rand((k // group_size, n), device=device, dtype=torch.float16) * 0.25
             + 0.01
         )
 
@@ -795,10 +789,7 @@ def _make_logical_expert_ids(
         else:
             repeats = (total_slots + num_experts - 1) // num_experts
             expert_ids = torch.cat(
-                [
-                    torch.randperm(num_experts, generator=gen)
-                    for _ in range(repeats)
-                ]
+                [torch.randperm(num_experts, generator=gen) for _ in range(repeats)]
             )[:total_slots]
         return expert_ids.to(device=device, dtype=torch.int64)
     if pattern.startswith("random"):
@@ -965,18 +956,14 @@ def _check_awq_moe(
         _require_torch_op("awq_moe_single_token_dense_stage_sm70_out")
         if actual_impl == "single_token_indexed":
             _require_torch_op("awq_moe_single_token_indexed_dense_w13_sm70_out")
-            _require_torch_op(
-                "awq_moe_single_token_indexed_dense_stage_sm70_out"
-            )
+            _require_torch_op("awq_moe_single_token_indexed_dense_stage_sm70_out")
         if actual_impl == "single_token_compact_w13":
             _require_torch_op("awq_moe_single_token_compact_dense_w13_sm70_out")
         if actual_impl == "legacy_single_token_compact":
             _require_torch_op("awq_moe_single_token_sm70_out")
             _require_torch_op("awq_moe_single_token_weighted_reduce_out")
         if m != 1:
-            raise ValueError(
-                f"{actual_impl} AWQ MoE check requires --m 1."
-            )
+            raise ValueError(f"{actual_impl} AWQ MoE check requires --m 1.")
 
     (
         w13_qweight,
@@ -995,7 +982,7 @@ def _check_awq_moe(
     )
     if actual_impl == "legacy_single_token_compact":
         (
-            w13_legacy_tm_weight,
+            _w13_legacy_tm_weight,
             _w13_legacy_tm_scales,
             w13_legacy_ptrs_w,
             w13_legacy_ptrs_s,
@@ -1009,7 +996,7 @@ def _check_awq_moe(
             interleave_gated_silu=True,
         )
     else:
-        w13_legacy_tm_weight = w13_tm_weight
+        _w13_legacy_tm_weight = w13_tm_weight
         w13_legacy_ptrs_w = w13_ptrs_w
         w13_legacy_ptrs_s = w13_ptrs_s
 
@@ -1064,20 +1051,10 @@ def _check_awq_moe(
             w13_n,
             group_size,
         )
-    elif actual_impl == "batched_w2_per_expert_dispatch":
-        sm70_ops.awq_moe_dense_stage_sm70_out(
-            gate_up_actual,
-            sorted_input,
-            expert_offsets,
-            dense_expert_ids,
-            w13_ptrs_w,
-            w13_ptrs_s,
-            num_experts,
-            int(w13_tm_weight.shape[1]),
-            w13_n,
-            group_size,
-        )
-    elif actual_impl in ("dense_graphsafe", "active_dense_stage"):
+    elif actual_impl == "batched_w2_per_expert_dispatch" or actual_impl in (
+        "dense_graphsafe",
+        "active_dense_stage",
+    ):
         sm70_ops.awq_moe_dense_stage_sm70_out(
             gate_up_actual,
             sorted_input,
@@ -1091,9 +1068,7 @@ def _check_awq_moe(
             group_size,
         )
     elif actual_impl in AWQ_SINGLE_TOKEN_ACTUALS:
-        single_token_offsets = torch.empty(
-            top_k + 1, dtype=torch.int32, device=device
-        )
+        single_token_offsets = torch.empty(top_k + 1, dtype=torch.int32, device=device)
         single_token_offsets64 = torch.empty(
             top_k + 1, dtype=torch.int64, device=device
         )
@@ -1230,8 +1205,8 @@ def _check_awq_moe(
         group_size,
         w13_k_ld,
         w13_q_ld,
-            w13_n,
-        )
+        w13_n,
+    )
 
     if intermediate_actual is None:
         intermediate_actual = torch.empty(
@@ -1292,9 +1267,7 @@ def _check_awq_moe(
         active_expert_offsets = torch.empty(
             total_slots + 1, dtype=torch.int32, device=device
         )
-        active_expert_ids = torch.empty(
-            total_slots, dtype=torch.int32, device=device
-        )
+        active_expert_ids = torch.empty(total_slots, dtype=torch.int32, device=device)
         sm70_ops.awq_moe_active_dense_stage_sm70_out(
             sorted_output_actual,
             intermediate_actual,
@@ -1631,7 +1604,7 @@ def _check_awq_moe_single_token_indexed_graph_replay(
         for _ in range(3):
             _run_indexed_graph_path()
     torch.cuda.current_stream(device).wait_stream(warmup_stream)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1641,7 +1614,7 @@ def _check_awq_moe_single_token_indexed_graph_replay(
     for replay_index, pattern in enumerate(expert_patterns):
         topk_ids = _copy_pattern(pattern)
         graph.replay()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         (
             ref_offsets,
             ref_inv_idx,
@@ -1943,7 +1916,7 @@ def _check_awq_moe_single_token_indexed_compile(
     _copy_pattern(expert_patterns[0])
     compiled_chain = torch.compile(_indexed_chain, backend=_backend, fullgraph=True)
     compiled_chain()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         compiled_chain()
@@ -1952,7 +1925,7 @@ def _check_awq_moe_single_token_indexed_compile(
     for pattern in expert_patterns:
         topk_ids = _copy_pattern(pattern)
         graph.replay()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         (
             ref_offsets,
             ref_inv_idx,
@@ -2023,17 +1996,13 @@ def _check_fp8_moe(
         _require_torch_op("fp8_moe_single_token_dense_stage_sm70_out")
         if actual_impl == "single_token_indexed":
             _require_torch_op("fp8_moe_single_token_indexed_dense_w13_sm70_out")
-            _require_torch_op(
-                "fp8_moe_single_token_indexed_dense_stage_sm70_out"
-            )
+            _require_torch_op("fp8_moe_single_token_indexed_dense_stage_sm70_out")
         if actual_impl == "single_token_compact_w13":
             _require_torch_op("fp8_moe_single_token_compact_dense_w13_sm70_out")
         if actual_impl == "legacy_single_token_compact":
             _require_torch_op("fp8_moe_single_token_sm70_out")
         if m != 1:
-            raise ValueError(
-                f"{actual_impl} FP8 MoE check requires --m 1."
-            )
+            raise ValueError(f"{actual_impl} FP8 MoE check requires --m 1.")
 
     if group_size != 128:
         raise ValueError("FP8 SM70 MoE path currently supports group_size=128 only.")
@@ -2138,9 +2107,7 @@ def _check_fp8_moe(
         "single_token_compact_w13",
         "legacy_single_token_compact",
     ):
-        single_token_offsets = torch.empty(
-            top_k + 1, dtype=torch.int32, device=device
-        )
+        single_token_offsets = torch.empty(top_k + 1, dtype=torch.int32, device=device)
         single_token_offsets64 = torch.empty(
             top_k + 1, dtype=torch.int64, device=device
         )
@@ -2474,9 +2441,15 @@ def _check_fp8_moe(
     return results
 
 
-def _check_fp8(m: int, k: int, n: int, group_size: int,
-               device: torch.device, fp8_model: Path | None,
-               fp8_layer: str | None) -> dict[str, Any]:
+def _check_fp8(
+    m: int,
+    k: int,
+    n: int,
+    group_size: int,
+    device: torch.device,
+    fp8_model: Path | None,
+    fp8_layer: str | None,
+) -> dict[str, Any]:
     _require_torch_op("fp8_sm70_prepare")
     _require_torch_op("fp8_gemm_sm70_out_meta")
 
@@ -2492,9 +2465,7 @@ def _check_fp8(m: int, k: int, n: int, group_size: int,
     else:
         if k % group_size != 0 or n % group_size != 0:
             raise ValueError("FP8 K and N must be divisible by group_size.")
-        weight_f16 = (
-            torch.randn((n, k), device=device, dtype=torch.float16) * 0.25
-        )
+        weight_f16 = torch.randn((n, k), device=device, dtype=torch.float16) * 0.25
         qweight = weight_f16.to(torch.float8_e4m3fn)
         scales = (
             torch.rand(
@@ -2511,9 +2482,7 @@ def _check_fp8(m: int, k: int, n: int, group_size: int,
 
     x = torch.randn((m, k), device=device, dtype=torch.float16)
 
-    tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
-        qweight, scales, group_size
-    )
+    tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(qweight, scales, group_size)
     actual = torch.empty((m, n), device=device, dtype=torch.float16)
     sm70_ops.fp8_gemm_sm70_out_meta(actual, x, tm_weight, tm_scales, meta)
 
@@ -2704,7 +2673,7 @@ def main() -> int:
     _require_sm70(device, args.require_sm70)
 
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(args.seed)
 
     results: list[dict[str, Any]] = []
     moe_expert_patterns = args.moe_expert_patterns or [args.moe_expert_pattern]
@@ -2755,7 +2724,7 @@ def main() -> int:
                             awq_moe_actual,
                             moe_expert_pattern,
                         )
-                )
+                    )
         if mode == "awq_moe_graph_replay":
             model = args.awq_moe_model or args.awq_model
             if model is None:
@@ -2809,7 +2778,7 @@ def main() -> int:
                             fp8_moe_actual,
                             moe_expert_pattern,
                         )
-                )
+                    )
 
     report = {
         "strict": not args.allow_nonzero_diff,
@@ -2821,9 +2790,7 @@ def main() -> int:
         "awq_moe_num_experts": args.awq_moe_num_experts,
         "awq_moe_top_k": args.awq_moe_top_k,
         "awq_moe_actual": awq_moe_actual,
-        "awq_moe_dispatch_policy_env": os.getenv(
-            "VLLM_SM70_AWQ_MOE_DISPATCH_POLICY"
-        ),
+        "awq_moe_dispatch_policy_env": os.getenv("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY"),
         "fp8_model": str(args.fp8_model) if args.fp8_model else None,
         "fp8_layer": args.fp8_layer,
         "fp8_moe_model": str(args.fp8_moe_model) if args.fp8_moe_model else None,

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Small SM70 prefix-cache end-to-end probe."""
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from typing import Any
 import torch
 
 from vllm import LLM, SamplingParams
-
 
 BASE = (
     "请阅读下面的技术说明并保持上下文一致。"
@@ -94,14 +94,14 @@ def main() -> None:
 
     records: list[dict[str, Any]] = []
     for repeat in (1, 2):
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         outputs = llm.generate(
             [{"prompt_token_ids": prompt_ids}],
             sampling,
             use_tqdm=False,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         elapsed = time.perf_counter() - start
         output = outputs[0]
         completion = output.outputs[0]

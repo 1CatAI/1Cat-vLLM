@@ -138,7 +138,7 @@ def test_sm70_flash_v100_fp8_e5m2_paged_kv_read_exact():
         causal=True,
     )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(decode_out[0], expected_decode)
     assert torch.equal(prefill_out[0, 0], expected_decode)
 
@@ -197,7 +197,7 @@ def test_sm70_flash_v100_bm32_phase_multi_kv_stride_exact(monkeypatch):
         causal=True,
     )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(actual, expected)
 
 
@@ -281,7 +281,7 @@ def test_sm70_flash_v100_fp8_e5m2_bridge_prefill_exact(
     )
 
     output_blocks = math.ceil(block_table.shape[1] * input_page_size / output_page_size)
-    sentinel = -123.0
+    sentinel = float("nan")
     output_shape = (
         output_blocks,
         output_page_size,
@@ -317,8 +317,11 @@ def test_sm70_flash_v100_fp8_e5m2_bridge_prefill_exact(
     torch.testing.assert_close(
         flat_value_out[:seq_len], expected_value[:seq_len], rtol=0, atol=0
     )
-    assert torch.all(flat_key_out[seq_len:] == sentinel)
-    assert torch.all(flat_value_out[seq_len:] == sentinel)
+    padded_seq_len = min(flat_key_out.shape[0], math.ceil(seq_len / 16) * 16)
+    assert torch.count_nonzero(flat_key_out[seq_len:padded_seq_len]) == 0
+    assert torch.count_nonzero(flat_value_out[seq_len:padded_seq_len]) == 0
+    assert torch.all(torch.isnan(flat_key_out[padded_seq_len:]))
+    assert torch.all(torch.isnan(flat_value_out[padded_seq_len:]))
 
     output_block_table = torch.arange(
         output_blocks, dtype=torch.int32, device="cuda"
@@ -333,7 +336,7 @@ def test_sm70_flash_v100_fp8_e5m2_bridge_prefill_exact(
         causal=True,
     )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(bridged, direct)
 
 
@@ -407,7 +410,7 @@ def test_sm70_flash_v100_fp8_e5m2_xqa_decode_matches_scalar(
         **kwargs,
     )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     delta = (actual.float() - expected.float()).abs()
     assert float(delta.max()) <= 1e-4
     assert float(delta.mean()) <= 1e-5

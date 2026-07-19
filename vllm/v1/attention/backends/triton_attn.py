@@ -256,14 +256,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         if self._draft_buffer_shape is not None:
             old_reqs, old_block_cols, old_tokens = self._draft_buffer_shape
-            if (
+            return (
                 required_reqs <= old_reqs
                 and block_cols == old_block_cols
                 and required_tokens <= old_tokens
                 and self._draft_slot_mapping_dtype == slot_dtype
-            ):
-                return True
-            return False
+            )
 
         self._draft_block_table = torch.empty(
             (req_capacity, block_cols),
@@ -344,9 +342,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
         attn_metadata.block_table = self._draft_block_table[:num_reqs]
         attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
-        attn_metadata.query_start_loc = self._draft_query_start_loc[
-            : num_reqs + 1
-        ]
+        attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
         attn_metadata.slot_mapping = self._draft_slot_mapping[:num_tokens]
 
     def build_for_cudagraph_capture(

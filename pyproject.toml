@@ -51,9 +51,10 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vllm*"]
+include = ["vllm*", "flash_qla*"]
 
 [tool.ruff.lint.per-file-ignores]
+"flash_qla/**" = ["ALL"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
@@ -120,7 +121,7 @@ python = "./.venv"
 
 [tool.typos.files]
 # these files may be written in non english words
-extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",
+extend-exclude = ["flash_qla/*", "tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",
     "benchmarks/sonnet.txt", "tests/lora/data/*", "build/*",
     "examples/pooling/token_embed/*", "tests/models/language/pooling/*",
     "vllm/third_party/*", "vllm/entrypoints/serve/instrumentator/static/*",
@@ -162,6 +163,8 @@ Pn = "Pn"
 arange = "arange"
 thw = "thw"
 subtile = "subtile"
+subtiles = "subtiles"
+nothink = "nothink"
 HSA = "HSA"
 setp = "setp"
 CPY = "CPY"

@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.v1.sample.rejection_sampler as rejection_sampler_module
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
 from vllm.v1.sample.logits_processor import LogitsProcessors
@@ -17,7 +18,6 @@ from vllm.v1.sample.rejection_sampler import (
     RejectionSampler,
     sample_recovered_tokens,
 )
-import vllm.v1.sample.rejection_sampler as rejection_sampler_module
 from vllm.v1.sample.sampler import Sampler, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
@@ -389,7 +389,9 @@ def test_token_matching_path_is_used_for_safe_mtp_stochastic_sampling(
         return expected
 
     monkeypatch.setattr(rejection_sampler_module, "expand_batch_to_tokens", fake_expand)
-    monkeypatch.setattr(rejection_sampler_module, "token_match_sample", fake_token_match)
+    monkeypatch.setattr(
+        rejection_sampler_module, "token_match_sample", fake_token_match
+    )
 
     logits = torch.zeros((3, 32), device=DEVICE_TYPE)
     spec_decode_metadata = SpecDecodeMetadata(

@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from itertools import count
 from typing import Literal
 
-
 DDTreeBuildMode = Literal["best_first", "root_leaf", "spine_leaf"]
 
 
@@ -166,8 +165,7 @@ def _normalize_candidates(
 
         if not candidates:
             raise ValueError(f"depth {depth} has no draft candidates")
-        candidates.sort(key=lambda item: (item.logprob, -item.token_id),
-                        reverse=True)
+        candidates.sort(key=lambda item: (item.logprob, -item.token_id), reverse=True)
         normalized.append(candidates[:top_k])
 
     if not normalized:
@@ -265,8 +263,7 @@ def build_ddtree(
         while len(nodes) - 1 < budget and nodes[cursor].depth < len(candidates):
             cursor = add_child(cursor, candidates[nodes[cursor].depth][0]).index
     elif min_root_branches > 0:
-        for candidate in candidates[0][:min(min_root_branches,
-                                            len(candidates[0]))]:
+        for candidate in candidates[0][: min(min_root_branches, len(candidates[0]))]:
             if len(nodes) - 1 >= budget:
                 break
             add_child(0, candidate)
@@ -286,7 +283,8 @@ def build_ddtree(
                     continue
                 score = parent.score + candidate.logprob
                 heapq.heappush(
-                    seeded_heap, (-score, next(order), parent_index, candidate))
+                    seeded_heap, (-score, next(order), parent_index, candidate)
+                )
 
         for node in tuple(nodes):
             push_children(node.index)
@@ -303,16 +301,15 @@ def build_ddtree(
         return DDTree(nodes=tuple(nodes))
 
     order = count()
-    heap: list[tuple[float, int, int, int, int, float]] = []
+    best_first_heap: list[tuple[float, int, int, int, int, float]] = []
     first_candidate = candidates[0][0]
     heapq.heappush(
-        heap,
-        (-first_candidate.logprob, next(order), 0, 0, 0,
-         first_candidate.logprob),
+        best_first_heap,
+        (-first_candidate.logprob, next(order), 0, 0, 0, first_candidate.logprob),
     )
 
-    while len(nodes) - 1 < budget and heap:
-        _, _, parent_index, depth_index, rank, _ = heapq.heappop(heap)
+    while len(nodes) - 1 < budget and best_first_heap:
+        _, _, parent_index, depth_index, rank, _ = heapq.heappop(best_first_heap)
         if rank >= len(candidates[depth_index]):
             continue
         candidate = candidates[depth_index][rank]
@@ -328,9 +325,15 @@ def build_ddtree(
             sibling = candidates[depth_index][next_rank]
             sibling_score = parent.score + sibling.logprob
             heapq.heappush(
-                heap,
-                (-sibling_score, next(order), parent_index, depth_index,
-                 next_rank, sibling_score),
+                best_first_heap,
+                (
+                    -sibling_score,
+                    next(order),
+                    parent_index,
+                    depth_index,
+                    next_rank,
+                    sibling_score,
+                ),
             )
 
         next_depth_index = depth_index + 1
@@ -338,9 +341,15 @@ def build_ddtree(
             child = candidates[next_depth_index][0]
             child_score = node.score + child.logprob
             heapq.heappush(
-                heap,
-                (-child_score, next(order), node.index, next_depth_index, 0,
-                 child_score),
+                best_first_heap,
+                (
+                    -child_score,
+                    next(order),
+                    node.index,
+                    next_depth_index,
+                    0,
+                    child_score,
+                ),
             )
 
     return DDTree(nodes=tuple(nodes))

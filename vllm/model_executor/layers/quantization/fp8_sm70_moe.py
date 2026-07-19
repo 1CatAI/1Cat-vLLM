@@ -18,13 +18,13 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    process_fp8_input_tensor_strategy_moe,
-    process_fp8_weight_tensor_strategy_moe,
-)
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute,
     select_sm70_quantized_moe_route,
+)
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    process_fp8_input_tensor_strategy_moe,
+    process_fp8_weight_tensor_strategy_moe,
 )
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -119,28 +119,35 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         )
         self.use_permute_with_scratch = _permute_with_scratch_enabled()
         self.compact_compare_reference = bool(
-            int(os.getenv(
-                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE", "0"))
+            int(os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE", "0"))
         )
         self.compact_exact_layout = bool(
-            int(os.getenv(
-                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT",
-                "1"))
+            int(
+                os.getenv(
+                    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT", "1"
+                )
+            )
         )
         self.compact_native_unpermute = bool(
-            int(os.getenv(
-                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE",
-                "0"))
+            int(
+                os.getenv(
+                    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE",
+                    "0",
+                )
+            )
         )
         self.compact_decomposed = bool(
-            int(os.getenv(
-                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED",
-                "0"))
+            int(
+                os.getenv(
+                    "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED", "0"
+                )
+            )
         )
         self.compact_compare_max_reports = int(
             os.getenv(
-                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS",
-                "16"))
+                "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS", "16"
+            )
+        )
         self._compact_compare_reports = 0
         if envs.VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL:
             logger.warning_once(
@@ -264,9 +271,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         layer.w13_tm_weight = Parameter(
             torch.stack(w13_tm_weights), requires_grad=False
         )
-        layer.w13_tm_scales = Parameter(
-            torch.stack(w13_tm_scales), requires_grad=False
-        )
+        layer.w13_tm_scales = Parameter(torch.stack(w13_tm_scales), requires_grad=False)
         layer.w13_tm_meta = Parameter(torch.stack(w13_meta), requires_grad=False)
         layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
         layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
@@ -520,9 +525,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             w13_per_expert_dispatch=(
                 layer.sm70_fp8_moe_batched_w13_per_expert_dispatch
             ),
-            w2_per_expert_dispatch=(
-                layer.sm70_fp8_moe_batched_w2_per_expert_dispatch
-            ),
+            w2_per_expert_dispatch=(layer.sm70_fp8_moe_batched_w2_per_expert_dispatch),
         )
         if route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
@@ -759,17 +762,11 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
                     :num_tokens
                 ],
                 "permuted_idx": layer._fp8_buf_permuted_idx[:total_slots],
-                "sorted_expert_ids": layer._fp8_buf_sorted_expert_ids[
-                    :total_slots
-                ],
+                "sorted_expert_ids": layer._fp8_buf_sorted_expert_ids[:total_slots],
                 "sort_workspace": layer._fp8_buf_sort_workspace,
-                "permuted_experts_id": layer._fp8_buf_permuted_experts_id[
-                    :total_slots
-                ],
+                "permuted_experts_id": layer._fp8_buf_permuted_experts_id[:total_slots],
                 "sorted_row_idx": layer._fp8_buf_sorted_row_idx[:total_slots],
-                "topk_ids_for_sort": layer._fp8_buf_topk_ids_for_sort[
-                    :total_slots
-                ],
+                "topk_ids_for_sort": layer._fp8_buf_topk_ids_for_sort[:total_slots],
                 "active_expert_offsets": (
                     layer._fp8_buf_active_expert_offsets[: total_slots + 1]
                 ),
@@ -840,9 +837,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             "token_expert_indices": torch.arange(
                 total_slots, dtype=torch.int32, device=device
             ).view(num_tokens, top_k),
-            "permuted_idx": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
+            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
             "sorted_expert_ids": torch.empty(
                 total_slots, dtype=torch.int32, device=device
             ),
@@ -1225,9 +1220,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             w13_per_expert_dispatch=(
                 layer.sm70_fp8_moe_batched_w13_per_expert_dispatch
             ),
-            w2_per_expert_dispatch=(
-                layer.sm70_fp8_moe_batched_w2_per_expert_dispatch
-            ),
+            w2_per_expert_dispatch=(layer.sm70_fp8_moe_batched_w2_per_expert_dispatch),
         )
 
         if route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
@@ -1263,8 +1256,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             )
         else:
             _log_runtime_route_once(
-                "SM70 FP8 MoE CUDA-graph-safe dense-stage path enabled "
-                "(experts=%d).",
+                "SM70 FP8 MoE CUDA-graph-safe dense-stage path enabled (experts=%d).",
                 layer.sm70_num_experts,
             )
             sm70_ops.fp8_moe_dense_stage_sm70_out(

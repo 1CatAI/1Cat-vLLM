@@ -13,13 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from pathlib import Path
 import statistics
 import sys
+from pathlib import Path
 from typing import Any
 
 import torch
-
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 FLASH_V100_ROOT = SOURCE_ROOT / "flash-attention-v100"
@@ -30,7 +29,6 @@ from flash_attn_v100 import (  # noqa: E402
     flash_attn_prefill_paged_bfla,
 )
 
-
 PROFILES = {
     "qwen9-tp1": {"heads_q": 16, "heads_kv": 4, "head_dim": 256, "block_size": 528},
     "qwen27-tp2": {"heads_q": 12, "heads_kv": 2, "head_dim": 256, "block_size": 784},
@@ -39,7 +37,7 @@ PROFILES = {
 
 
 def _sync() -> None:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
 
 def _time_cuda(fn, *, warmup: int, reps: int) -> dict[str, float | int]:
@@ -146,9 +144,7 @@ def _build_bfla_mask(
 
     context_len = seq_len - q_len
     q_block_end = (
-        context_len
-        + (torch.arange(q_blocks, device=q.device) + 1) * mask_block_n
-        - 1
+        context_len + (torch.arange(q_blocks, device=q.device) + 1) * mask_block_n - 1
     ).clamp(max=seq_len - 1)
     k_block_start = torch.arange(kv_tiles, device=q.device) * mask_block_n
     causal = k_block_start[None, :] <= q_block_end[:, None]
@@ -168,7 +164,9 @@ def _build_bfla_mask(
         if keep_mass >= 1.0:
             keep |= causal
         elif keep_mass > 0:
-            sorted_probs, sorted_idx = torch.sort(probs.float(), dim=-1, descending=True)
+            sorted_probs, sorted_idx = torch.sort(
+                probs.float(), dim=-1, descending=True
+            )
             cumsum = torch.cumsum(sorted_probs, dim=-1)
             mass_keep_sorted = cumsum <= keep_mass
             mass_keep_sorted[..., 0] = True
@@ -202,10 +200,10 @@ def _build_bfla_mask(
     if spec_stride > 0:
         dropped = causal[None, :, :] & ~keep_per_kv
         q_idx = torch.arange(q_blocks, device=q.device, dtype=torch.int64)[:, None]
-        k_idx_i64 = torch.arange(kv_tiles, device=q.device, dtype=torch.int64)[
-            None, :
-        ]
-        stride_keep = ((q_idx * 131 + k_idx_i64 * 17 + int(spec_seed)) % spec_stride) == 0
+        k_idx_i64 = torch.arange(kv_tiles, device=q.device, dtype=torch.int64)[None, :]
+        stride_keep = (
+            (q_idx * 131 + k_idx_i64 * 17 + int(spec_seed)) % spec_stride
+        ) == 0
         keep_per_kv |= dropped & stride_keep[None, :, :]
     if spec_prob > 0:
         prob = max(0.0, min(float(spec_prob), 1.0))
@@ -355,7 +353,7 @@ def bench_case(args: argparse.Namespace, q_len: int, kv_len: int) -> dict[str, A
         "dense_vs_sparse_maxdiff": float(diff.max().item()),
         "dense_vs_sparse_meandiff": float(diff.mean().item()),
     }
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     return result
 
 

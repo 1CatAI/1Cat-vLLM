@@ -9,13 +9,12 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import statistics
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
-
 
 _FLASH_V100_ENV_KEYS = (
     "VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16",
@@ -132,10 +131,10 @@ def _run_once(
     token_ids = _make_prompt_token_ids(input_len, seed=seed)
     prompt = {"prompt_token_ids": token_ids}
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = time.perf_counter()
     outputs = llm.generate([prompt], sampling_params, use_tqdm=False)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     elapsed_s = time.perf_counter() - start
 
     request_output = outputs[0]
@@ -232,8 +231,12 @@ def _write_result(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=Path("/home/ymzx/models/Qwen3.5-9B-AWQ"))
-    parser.add_argument("--lengths", type=int, nargs="+", default=[8192, 32768, 65536, 131072, 261120])
+    parser.add_argument(
+        "--model", type=Path, default=Path("/home/ymzx/models/Qwen3.5-9B-AWQ")
+    )
+    parser.add_argument(
+        "--lengths", type=int, nargs="+", default=[8192, 32768, 65536, 131072, 261120]
+    )
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--long-repeat", type=int, default=1)
     parser.add_argument("--long-threshold", type=int, default=200000)
@@ -359,7 +362,9 @@ def main() -> None:
     if args.bfla_keep_ratio is not None:
         os.environ["VLLM_FLASH_V100_BFLA_KEEP_RATIO"] = str(args.bfla_keep_ratio)
     if args.bfla_min_keep_blocks is not None:
-        os.environ["VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS"] = str(args.bfla_min_keep_blocks)
+        os.environ["VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS"] = str(
+            args.bfla_min_keep_blocks
+        )
     if args.bfla_threshold is not None:
         os.environ["VLLM_FLASH_V100_BFLA_THRESHOLD"] = str(args.bfla_threshold)
     if args.bfla_local_blocks is not None:
@@ -435,13 +440,17 @@ def main() -> None:
             records.append(record)
             ttft = record["metrics"].get("ttft_s")
             tps = record["metrics"].get("prefill_tps")
-            print(
-                f"{args.variant} len={input_len} rep={rep} "
-                f"ttft={ttft:.6f}s prefill_tps={tps:.1f}"
-                if ttft and tps
-                else f"{args.variant} len={input_len} rep={rep} metrics={record['metrics']}",
-                flush=True,
-            )
+            if ttft and tps:
+                message = (
+                    f"{args.variant} len={input_len} rep={rep} "
+                    f"ttft={ttft:.6f}s prefill_tps={tps:.1f}"
+                )
+            else:
+                message = (
+                    f"{args.variant} len={input_len} rep={rep} "
+                    f"metrics={record['metrics']}"
+                )
+            print(message, flush=True)
             _write_result(args, load_s, records)
 
     _write_result(args, load_s, records)

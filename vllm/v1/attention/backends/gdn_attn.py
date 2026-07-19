@@ -65,12 +65,9 @@ _GDN_DDTREE_FAST_COMMON_BUFFERS: dict[
 
 
 def _dflash_ddtree_gdn_shared_common_enabled() -> bool:
-    return (
-        os.getenv("VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON", "1")
-        .strip()
-        .lower()
-        not in ("0", "false", "no", "off", "")
-    )
+    return os.getenv(
+        "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON", "1"
+    ).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def _get_ddtree_gdn_fast_common_buffers(
@@ -147,12 +144,9 @@ def _dflash_ddtree_gdn_fast_build_cache_enabled() -> bool:
 
 
 def _dflash_ddtree_gdn_fast_build_triton_enabled() -> bool:
-    return (
-        os.getenv("VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON", "1")
-        .strip()
-        .lower()
-        not in ("0", "false", "no", "off", "")
-    )
+    return os.getenv(
+        "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON", "1"
+    ).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 @triton.jit
@@ -544,9 +538,7 @@ def build_gdn_spec_decode_state_contract(
             1,
         ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[
-            block_mask, : num_spec + 1
-        ]
+        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
             block_table_tensor[~block_mask],
             num_accepted_tokens[~accepted_mask],
@@ -590,14 +582,15 @@ def build_gdn_spec_decode_state_contract(
                 device=spec_state_indices_tensor.device,
                 dtype=torch.long,
             )
-            accepted_offsets = spec_state_slot_selectors.to(
-                device=spec_state_indices_tensor.device,
-                dtype=torch.long,
-                non_blocking=True,
-            ) - 1
-            selected_state_slots = spec_state_indices_tensor[
-                rows, accepted_offsets
-            ]
+            accepted_offsets = (
+                spec_state_slot_selectors.to(
+                    device=spec_state_indices_tensor.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+                - 1
+            )
+            selected_state_slots = spec_state_indices_tensor[rows, accepted_offsets]
             if torch.any(selected_state_slots == PAD_SLOT_ID).item():
                 raise AssertionError(
                     "GDN spec state contract mismatch: accepted slot points "
@@ -605,9 +598,7 @@ def build_gdn_spec_decode_state_contract(
                 )
         if current_state_block_ids is not None:
             current_mask = _mask_for(current_state_block_ids)
-            active_state_ids = current_state_block_ids[
-                current_mask, : num_spec + 1
-            ]
+            active_state_ids = current_state_block_ids[current_mask, : num_spec + 1]
             if torch.any(active_state_ids == PAD_SLOT_ID).item():
                 raise AssertionError(
                     "GDN spec state contract mismatch: active align-mode "
@@ -722,17 +713,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device=device,
         )
         self._ddtree_fast_common_buffers: _GDNDdTreeFastCommonBuffers | None = None
+        self._ddtree_fast_tail_key: tuple[int, int, int] | None = None
         if (
             self.use_spec_decode
             and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
             and _dflash_ddtree_gdn_shared_common_enabled()
         ):
-            self._ddtree_fast_common_buffers = (
-                _get_ddtree_gdn_fast_common_buffers(
-                    device,
-                    self.decode_cudagraph_max_bs,
-                    self.num_spec_state_tokens + 1,
-                )
+            self._ddtree_fast_common_buffers = _get_ddtree_gdn_fast_common_buffers(
+                device,
+                self.decode_cudagraph_max_bs,
+                self.num_spec_state_tokens + 1,
             )
         if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
             placeholder_rows = max(
@@ -821,13 +811,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         metadata_profile: bool,
         metadata_profile_t0: float,
     ) -> GDNAttentionMetadata | None:
-        def _miss(reason: str) -> None:
+        def _miss(reason: str) -> GDNAttentionMetadata | None:
             if os.getenv("VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG", "0") != "1":
-                return
+                return None
             count = getattr(self, "_ddtree_fast_build_miss_count", 0)
             if count >= 8:
-                return
-            setattr(self, "_ddtree_fast_build_miss_count", count + 1)
+                return None
+            self._ddtree_fast_build_miss_count = count + 1
             logger.info(
                 "DFLASH_DDTREE_METADATA_PROFILE gdn_build_fast_miss "
                 "reason=%s full_graph=%s spec=%s core_op=%s "
@@ -843,6 +833,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_draft_tokens_cpu is not None,
                 current_state_block_ids is not None,
             )
+            return None
 
         if (
             for_cudagraph_capture
@@ -937,9 +928,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         common_buffers = self._ddtree_fast_common_buffers
         if common_buffers is not None:
             spec_token_capacity = common_buffers.spec_token_indx.numel()
-            token_index_initialized_size = (
-                common_buffers.token_index_initialized_size
-            )
+            token_index_initialized_size = common_buffers.token_index_initialized_size
         else:
             spec_token_capacity = self.spec_token_indx.numel()
             token_index_initialized_size = self._spec_token_indx_initialized_size
@@ -1033,7 +1022,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and fast_path_state_block_ids.stride(-1) == 1
         )
         if use_triton_update:
-            state_block = 1 << max(batch_size * width, batch_size + 1, width).bit_length()
+            state_block = (
+                1 << max(batch_size * width, batch_size + 1, width).bit_length()
+            )
             _ddtree_gdn_fast_metadata_kernel[(1,)](
                 fast_path_state_block_ids,
                 spec_state_indices_tensor,
@@ -1048,7 +1039,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 query_len,
                 tail_initialized,
                 update_common,
-                common_tail_initialized if common_buffers is not None else tail_initialized,
+                common_tail_initialized
+                if common_buffers is not None
+                else tail_initialized,
                 state_block,
             )
         else:
@@ -1366,9 +1359,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.spec_sequence_masks[:placeholder_rows].fill_(False)
                 spec_sequence_masks = self.spec_sequence_masks[:placeholder_rows]
                 self.spec_query_start_loc[: placeholder_rows + 1].fill_(0)
-                spec_query_start_loc = self.spec_query_start_loc[
-                    : placeholder_rows + 1
-                ]
+                spec_query_start_loc = self.spec_query_start_loc[: placeholder_rows + 1]
                 self.spec_token_indx[:placeholder_rows].copy_(
                     torch.arange(
                         placeholder_rows,
@@ -1401,10 +1392,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     fast_path_width = self.num_spec_state_tokens + 1
                     if is_mamba_cache_all:
                         seq_lens_cpu_for_state = m._seq_lens_cpu
-                        if (
-                            seq_lens_cpu_for_state is not None
-                            and num_spec_decodes == 1
-                        ):
+                        if seq_lens_cpu_for_state is not None and num_spec_decodes == 1:
                             seq_len = int(seq_lens_cpu_for_state[0].item())
                             start_idx = max(
                                 (seq_len - 1) // self.kv_cache_spec.block_size,
@@ -1458,8 +1446,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 else:
                     spec_token_indx = torch.arange(
                         spec_token_size,
-                            dtype=torch.int32,
-                            device=query_start_loc.device,
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
                     )
                 non_spec_token_indx = self.non_spec_token_indx[:0]
                 spec_state_indices_tensor = fast_path_state_block_ids
@@ -1513,9 +1501,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     # is an A/B guard for MTP-only recurrent-state corruption.
                     num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
                     num_prefills = (
-                        non_spec_query_lens_cpu.size(0)
-                        - num_decodes
-                        - num_zero_len
+                        non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
                     )
                     num_decode_tokens = num_decodes
                     num_prefill_tokens = (
@@ -1530,9 +1516,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     num_decode_tokens = 0
                     num_prefill_tokens = non_spec_query_lens_cpu.sum().item()
                 num_spec_decode_tokens = (
-                    query_lens_cpu.sum().item()
-                    - num_prefill_tokens
-                    - num_decode_tokens
+                    query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
                 )
 
                 if num_prefills == 0 and num_decodes == 0:
@@ -1548,9 +1532,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     non_spec_token_indx = torch.empty(
                         0, dtype=torch.int32, device=query_start_loc.device
                     )
-                    spec_state_indices_tensor = (
-                        state_contract.spec_state_indices_tensor
-                    )
+                    spec_state_indices_tensor = state_contract.spec_state_indices_tensor
                     if for_cudagraph_capture:
                         spec_state_indices_tensor = torch.full_like(
                             spec_state_indices_tensor, PAD_SLOT_ID
@@ -1573,9 +1555,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     non_spec_token_indx = index[:num_non_spec_tokens]
                     spec_token_indx = index[num_non_spec_tokens:]
 
-                    spec_state_indices_tensor = (
-                        state_contract.spec_state_indices_tensor
-                    )
+                    spec_state_indices_tensor = state_contract.spec_state_indices_tensor
                     non_spec_state_indices_tensor = (
                         state_contract.non_spec_state_indices_tensor
                     )
@@ -1621,7 +1601,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_accepted_tokens = state_contract.num_accepted_tokens
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
-            assert query_start_loc_cpu[num_spec_decodes].item() == num_spec_decode_tokens
+            assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             assert spec_state_indices_tensor is not None
             assert spec_state_indices_tensor.shape[0] == num_spec_decodes
 
@@ -1692,9 +1672,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes <= self.decode_cudagraph_max_bs
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
-            profile_graph_buffers_t0 = (
-                time.perf_counter() if metadata_profile else 0.0
-            )
+            profile_graph_buffers_t0 = time.perf_counter() if metadata_profile else 0.0
             common_buffers = self._ddtree_fast_common_buffers
             spec_sequence_masks_buffer = (
                 common_buffers.spec_sequence_masks
@@ -1859,9 +1837,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     "spec_state_indices_tensor": _trace_tensor(
                         spec_state_indices_tensor
                     ),
-                    "current_state_block_ids": _trace_tensor(
-                        current_state_block_ids
-                    ),
+                    "current_state_block_ids": _trace_tensor(current_state_block_ids),
                     "ddtree_parent_ids": _trace_tensor(ddtree_parent_ids),
                     "ddtree_num_tree_tokens_cpu": _trace_tensor(
                         ddtree_num_tree_tokens_cpu
@@ -1935,9 +1911,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         non_spec_state_indices_tensor
                     ),
                     "ddtree_parent_ids": _cpu(ddtree_parent_ids),
-                    "ddtree_num_tree_tokens_cpu": _cpu(
-                        ddtree_num_tree_tokens_cpu
-                    ),
+                    "ddtree_num_tree_tokens_cpu": _cpu(ddtree_num_tree_tokens_cpu),
                 },
                 m.seq_lens,
                 num_prefills,
@@ -1983,9 +1957,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         non_spec_state_indices_tensor
                     ),
                     "ddtree_parent_ids": _cpu(ddtree_parent_ids),
-                    "ddtree_num_tree_tokens_cpu": _cpu(
-                        ddtree_num_tree_tokens_cpu
-                    ),
+                    "ddtree_num_tree_tokens_cpu": _cpu(ddtree_num_tree_tokens_cpu),
                 }
             )
             logger.warning("Saved DFlash/GDN state table diagnostics to %s", dump_path)

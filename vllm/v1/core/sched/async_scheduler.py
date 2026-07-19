@@ -16,6 +16,18 @@ class AsyncScheduler(Scheduler):
         # its own list instance because scheduler outputs and worker feedback
         # mutate spec-token rows in later phases.
         self._spec_token_placeholders: tuple[int, ...] = (-1,) * self.num_spec_tokens
+        speculative_config = self.vllm_config.speculative_config
+        draft_model_config = (
+            speculative_config.draft_model_config
+            if speculative_config is not None
+            else None
+        )
+        self._drafter_max_model_len = (
+            draft_model_config.max_model_len
+            if draft_model_config is not None
+            and draft_model_config.max_model_len is not None
+            else self.max_model_len
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -34,7 +46,13 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = list(self._spec_token_placeholders)
+            if (
+                request.num_computed_tokens + self.num_spec_tokens
+                <= self._drafter_max_model_len
+            ):
+                request.spec_token_ids = list(self._spec_token_placeholders)
+            else:
+                request.spec_token_ids = []
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int]

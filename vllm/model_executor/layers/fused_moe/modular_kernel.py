@@ -1053,9 +1053,7 @@ class FusedMoEKernelModularImpl:
     def _chunk_info(M: int, can_chunk: bool) -> tuple[int, int]:
         chunk_size = max(
             1,
-            M
-            if not can_chunk
-            else min(M, envs.VLLM_FUSED_MOE_CHUNK_SIZE),
+            M if not can_chunk else min(M, envs.VLLM_FUSED_MOE_CHUNK_SIZE),
         )
         num_chunks = cdiv(M, chunk_size)
         assert M > 0 or num_chunks == 0
@@ -1202,18 +1200,12 @@ class FusedMoEKernelModularImpl:
         if not current_platform.is_cuda():
             return False
         capability = current_platform.get_device_capability()
-        if (
-            capability is None
-            or capability.major != 7
-            or capability.minor != 0
-        ):
+        if capability is None or capability.major != 7 or capability.minor != 0:
             return False
         quant_config = self.fused_experts.quant_config
         if quant_config.quant_dtype is not None:
             return False
-        if quant_config.weight_quant_dtype is not None:
-            return False
-        return True
+        return quant_config.weight_quant_dtype is None
 
     def _can_use_sm70_0dot3_functional_experts(
         self,
@@ -1234,18 +1226,12 @@ class FusedMoEKernelModularImpl:
         if not current_platform.is_cuda():
             return False
         capability = current_platform.get_device_capability()
-        if (
-            capability is None
-            or capability.major != 7
-            or capability.minor != 0
-        ):
+        if capability is None or capability.major != 7 or capability.minor != 0:
             return False
         quant_config = self.fused_experts.quant_config
         if quant_config.quant_dtype is not None:
             return False
-        if quant_config.weight_quant_dtype is not None:
-            return False
-        return True
+        return quant_config.weight_quant_dtype is None
 
     def _prepare(
         self,

@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BatchFeature
+
 try:
     from transformers.models.qwen2_vl import Qwen2VLImageProcessor
 

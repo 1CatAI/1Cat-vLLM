@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark the SM70 TP2 tile-runtime all-reduce prototype."""
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ def _measure(
     replays: int,
     warmup_replays: int,
 ) -> dict[str, Any]:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
@@ -50,11 +52,11 @@ def _measure(
         else:
             raise ValueError(f"unknown mode: {mode}")
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     ref = tensor.clone()
     dist.all_reduce(ref)
     max_abs = (output - ref).abs().max().item()
@@ -67,7 +69,7 @@ def _measure(
 
     for _ in range(warmup_replays):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -76,7 +78,7 @@ def _measure(
     for _ in range(replays):
         graph.replay()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     return {
@@ -112,12 +114,14 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     gloo_group = dist.new_group(backend="gloo")
 
     dtype = torch.float16 if args.dtype == "float16" else torch.float32
-    ca = CustomAllreduce(group=gloo_group, device=local_rank, max_size=args.max_size_bytes)
+    ca = CustomAllreduce(
+        group=gloo_group, device=local_rank, max_size=args.max_size_bytes
+    )
 
     try:
         if world_size != 2:

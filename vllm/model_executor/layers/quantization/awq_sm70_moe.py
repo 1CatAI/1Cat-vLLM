@@ -37,12 +37,10 @@ def _log_runtime_route_once(message: str, *args) -> None:
 
 
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
-    if is_forward_context_available() and get_forward_context().is_dummy_run:
-        return True
     # CUDA graph replay is address-fixed. Use the per-layer persistent buffers
     # during capture too, so the captured indexed MoE scratch/output lifetimes
     # do not depend on graph-pool temporary allocation analysis.
-    return False
+    return is_forward_context_available() and get_forward_context().is_dummy_run
 
 
 def _single_token_weighted_reduce_enabled() -> bool:
@@ -279,7 +277,9 @@ def _write_compare_dense_record(record: dict[str, object]) -> None:
     if not out_dir:
         return
     os.makedirs(out_dir, exist_ok=True)
-    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    device = (
+        torch.accelerator.current_device_index() if torch.cuda.is_available() else "cpu"
+    )
     path = os.path.join(
         out_dir,
         f"awq_moe_dense_compare_pid{os.getpid()}_cuda{device}.jsonl",
@@ -398,8 +398,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
         if group_size not in (32, 64, 128):
             raise ValueError(
-                "AWQSM70MoEMethod supports group_size=32/64/128, "
-                f"got {group_size}."
+                f"AWQSM70MoEMethod supports group_size=32/64/128, got {group_size}."
             )
         if not zero_point:
             raise ValueError("AWQSM70MoEMethod currently requires AWQ zero points.")
@@ -510,14 +509,12 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         intermediate_logical_size = w13_logical_out // 2
         batched_gemm = _batched_gemm_enabled_for_layer(layer, self.use_batched_gemm)
 
-        w13_qweight, w13_scales, w13_qzeros, w13_aligned_out = (
-            _align_awq_output_dim(
-                layer.w13_qweight,
-                layer.w13_scales,
-                layer.w13_qzeros,
-                self.pack_factor,
-                align * 2,
-            )
+        w13_qweight, w13_scales, w13_qzeros, w13_aligned_out = _align_awq_output_dim(
+            layer.w13_qweight,
+            layer.w13_scales,
+            layer.w13_qzeros,
+            self.pack_factor,
+            align * 2,
         )
         _set_parameter(layer, "w13_qweight", w13_qweight)
         _set_parameter(layer, "w13_scales", w13_scales)
@@ -531,14 +528,12 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             self.group_size,
             align,
         )
-        w2_qweight, w2_scales, w2_qzeros, hidden_aligned_size = (
-            _align_awq_output_dim(
-                w2_qweight,
-                w2_scales,
-                w2_qzeros,
-                self.pack_factor,
-                align,
-            )
+        w2_qweight, w2_scales, w2_qzeros, hidden_aligned_size = _align_awq_output_dim(
+            w2_qweight,
+            w2_scales,
+            w2_qzeros,
+            self.pack_factor,
+            align,
         )
         _set_parameter(layer, "w2_qweight", w2_qweight)
         _set_parameter(layer, "w2_scales", w2_scales)
@@ -598,9 +593,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.w13_tm_weight = Parameter(
             torch.stack(w13_tm_weights), requires_grad=False
         )
-        layer.w13_tm_scales = Parameter(
-            torch.stack(w13_tm_scales), requires_grad=False
-        )
+        layer.w13_tm_scales = Parameter(torch.stack(w13_tm_scales), requires_grad=False)
         layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
         layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
 
@@ -793,8 +786,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         use_temporary_buffers = _use_temporary_buffers_for_dummy_or_capture()
         if (
             not use_temporary_buffers
-            and
-            total_slots <= layer._awq_moe_buf_max_slots
+            and total_slots <= layer._awq_moe_buf_max_slots
             and num_tokens <= layer._awq_moe_buf_max_tokens
         ):
             return {
@@ -812,24 +804,18 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     :num_tokens
                 ],
                 "permuted_idx": layer._awq_moe_buf_permuted_idx[:total_slots],
-                "sorted_expert_ids": layer._awq_moe_buf_sorted_expert_ids[
-                    :total_slots
-                ],
+                "sorted_expert_ids": layer._awq_moe_buf_sorted_expert_ids[:total_slots],
                 "sort_workspace": layer._awq_moe_buf_sort_workspace,
                 "permuted_experts_id": layer._awq_moe_buf_permuted_experts_id[
                     :total_slots
                 ],
                 "sorted_row_idx": layer._awq_moe_buf_sorted_row_idx[:total_slots],
-                "topk_ids_for_sort": layer._awq_moe_buf_topk_ids_for_sort[
-                    :total_slots
-                ],
+                "topk_ids_for_sort": layer._awq_moe_buf_topk_ids_for_sort[:total_slots],
                 "active_expert_offsets": (
                     layer._awq_moe_buf_active_expert_offsets[: total_slots + 1]
                 ),
                 "strict_expert_offsets": layer._awq_moe_buf_strict_expert_offsets,
-                "strict_expert_offsets64": (
-                    layer._awq_moe_buf_strict_expert_offsets64
-                ),
+                "strict_expert_offsets64": (layer._awq_moe_buf_strict_expert_offsets64),
                 "strict_inv_permuted_idx": (
                     layer._awq_moe_buf_strict_inv_permuted_idx[:num_tokens]
                 ),
@@ -924,9 +910,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             "token_expert_indices": torch.arange(
                 total_slots, dtype=torch.int32, device=device
             ).view(num_tokens, top_k),
-            "permuted_idx": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
+            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
             "sorted_expert_ids": torch.empty(
                 total_slots, dtype=torch.int32, device=device
             ),
@@ -1273,9 +1257,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             batched_decode_max_tokens=(
                 envs.VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS
             ),
-            strict_dense_w13=(
-                envs.VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13
-            ),
+            strict_dense_w13=(envs.VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13),
             exact_w2=envs.VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2,
             active_exact_w2=envs.VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2,
             w13_per_expert_dispatch=True,
@@ -1352,9 +1334,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w13_n_dim,
                     self.group_size,
                 )
-                compare_dense_w13_stats = _diff_stats(
-                    buffers["gate_up"], dense_gate_up
-                )
+                compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
         else:
             if use_batched_strict_moe:
                 _log_runtime_route_once(
@@ -1363,8 +1343,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_num_experts,
                 )
             _log_runtime_route_once(
-                "SM70 AWQ MoE CUDA-graph-safe dense-stage path enabled "
-                "(experts=%d).",
+                "SM70 AWQ MoE CUDA-graph-safe dense-stage path enabled (experts=%d).",
                 layer.sm70_num_experts,
             )
             sm70_ops.awq_moe_dense_stage_sm70_out(
@@ -1401,8 +1380,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
         elif use_batched_active_exact_w2:
             _log_runtime_route_once(
-                "SM70 AWQ MoE batched path using grouped-active exact W2 "
-                "(routes=%d).",
+                "SM70 AWQ MoE batched path using grouped-active exact W2 (routes=%d).",
                 total_slots,
             )
             sm70_ops.awq_moe_active_dense_stage_sm70_out(
@@ -1471,9 +1449,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     compare_dense_full_output,
                 )
                 compare_route_state = {
-                    "expert_ranges": _expert_offset_ranges(
-                        buffers["expert_offsets"]
-                    ),
+                    "expert_ranges": _expert_offset_ranges(buffers["expert_offsets"]),
                     "active_expert_offsets": buffers["active_expert_offsets"]
                     .detach()
                     .cpu()
@@ -1684,7 +1660,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if compare_dense_step is not None:
             record = {
                 "decode_step": compare_dense_step,
-                "device": int(torch.cuda.current_device())
+                "device": int(torch.accelerator.current_device_index())
                 if torch.cuda.is_available()
                 else None,
                 "layer_id": getattr(layer, "sm70_awq_moe_layer_id", None),

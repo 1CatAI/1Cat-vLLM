@@ -6,7 +6,6 @@ import copy
 import dataclasses
 import functools
 import json
-import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -713,9 +712,9 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal[
-        "flashinfer", "triton", "cutedsl", "flashqla_sm70"
-    ] | None = None
+    gdn_prefill_backend: (
+        Literal["flashinfer", "triton", "cutedsl", "flashqla_sm70"] | None
+    ) = None
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -1809,13 +1808,13 @@ class EngineArgs:
 
         if "use_local_argmax_reduction" not in self.speculative_config:
             self.speculative_config["use_local_argmax_reduction"] = True
-            profile_updates.append(
-                "speculative_config.use_local_argmax_reduction=True"
-            )
+            profile_updates.append("speculative_config.use_local_argmax_reduction=True")
 
         if "attention_backend" not in self.speculative_config:
-            self.speculative_config["attention_backend"] = "TRITON_ATTN"
-            profile_updates.append("speculative_config.attention_backend=TRITON_ATTN")
+            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
+            profile_updates.append(
+                "speculative_config.attention_backend=FLASH_ATTN_V100"
+            )
 
         if self.max_num_seqs is None:
             self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1
@@ -1842,11 +1841,10 @@ class EngineArgs:
                 self.speculative_config.get("num_speculative_tokens") or 0
             )
             num_speculative_state_tokens = num_speculative_tokens
-            if (
-                self.speculative_config.get("method") == "dflash_ddtree"
-                and not self.speculative_config.get(
-                    "ddtree_disable_tree_verify", False
-                )
+            if self.speculative_config.get(
+                "method"
+            ) == "dflash_ddtree" and not self.speculative_config.get(
+                "ddtree_disable_tree_verify", False
             ):
                 ddtree_budget = int(
                     self.speculative_config.get("ddtree_budget")
@@ -1869,9 +1867,7 @@ class EngineArgs:
                     "mtp_verifier_cudagraph_shapes="
                     f"{decode_query_len}x1..{max_num_seqs}"
                 )
-            self.compilation_config.cudagraph_capture_sizes = (
-                cudagraph_capture_sizes
-            )
+            self.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
             self.compilation_config.max_cudagraph_capture_size = max(
                 cudagraph_capture_sizes
             )
