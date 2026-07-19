@@ -739,7 +739,7 @@ pytest==8.3.5
     #   pytest-subtests
     #   pytest-timeout
     #   schemathesis
-pytest-asyncio==0.24.0
+pytest-asyncio==1.4.0
     # via -r requirements/test/cuda.in
 pytest-cov==6.3.0
     # via -r requirements/test/cuda.in
