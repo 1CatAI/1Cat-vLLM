@@ -792,7 +792,7 @@ rapidfuzz==3.12.1
     # via jiwer
 ray==2.48.0
     # via -r requirements/test/cuda.in
-redis==5.2.0
+redis==8.0.0
     # via tensorizer
 referencing==0.35.1
     # via
