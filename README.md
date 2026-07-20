@@ -349,7 +349,7 @@ python -m pip install -e . --no-build-isolation
 
 请使用微信扫描下方二维码加入群组：
 
-![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr.png)
+![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr-4.png)
 
 > 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
 
