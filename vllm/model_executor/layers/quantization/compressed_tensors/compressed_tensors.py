@@ -180,6 +180,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return CompressedTensorsLinearMethod(self)
 
         if isinstance(layer, Attention):
+            # P7: compressed-tensors W4A16 ships no KV scales (kv_cache_scheme=None).
+            # 1.2.1's SM70 fp8_e5m2 unit-scale override requires the base KV method's
+            # process_weights_after_loading, but CompressedTensorsKVCacheMethod overrides it,
+            # so attention.py rejects --kv-cache-dtype fp8_e5m2. When no KV scheme ships,
+            # skip the CT KV method so e5m2 takes the unit-scale path.
+            if self.kv_cache_scheme is None:
+                return None
             return CompressedTensorsKVCacheMethod(self)
         if isinstance(layer, RoutedExperts):
             return CompressedTensorsMoEMethod.get_moe_method(
