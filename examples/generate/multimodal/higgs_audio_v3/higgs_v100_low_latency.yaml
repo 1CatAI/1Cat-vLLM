@@ -1,0 +1,47 @@
+# Higgs-Audio-v3 low-latency (CUDA graph) deploy profile for Tesla V100 / SM70.
+#
+# Requires:
+#   * 1Cat-vLLM SM70 decode CUDA graph kernel >= e64d39aa7
+#   * vllm-omni talker CUDA-graph-capture fix (vllm-project/vllm-omni#4563)
+#
+# For an eager baseline (no CUDA graph, no fixes needed) set Stage-0
+# `enforce_eager: true` and remove the `compilation_config` block.
+
+async_chunk: true
+
+stages:
+  - stage_id: 0                      # talker (Qwen3-based) — real-time decode
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.6
+    enforce_eager: false
+    dtype: float16
+    attention_backend: FLASH_ATTN_V100
+    trust_remote_code: true
+    enable_prefix_caching: true
+    compilation_config:
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [1]
+      cudagraph_num_of_warmups: 1
+    max_num_batched_tokens: 4096
+    max_model_len: 8192
+    devices: "0"
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 2048
+      seed: 42
+
+  - stage_id: 1                      # code2wav (codec -> 24 kHz PCM)
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.25
+    enforce_eager: true
+    dtype: float32
+    trust_remote_code: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
