@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
+from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -82,6 +83,10 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         if (
             sm70_tm.use_turbomind(envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND)
             or sm70_tm.forces_marlin()
+            # Dedicated sm_70 builds (TORCH_CUDA_ARCH_LIST=7.0) ship Volta
+            # Marlin kernels for all WNA16 types (u4, u4b8, u8, u8b128), so
+            # capability 7.0 is supported out of the box -- no env flag needed.
+            or ops.sm70_marlin_available()
         ):
             return 70
         # Turing and up

@@ -467,7 +467,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       COMPILE_DEFINITIONS ENABLE_SM70_MARLIN=1)
     message(STATUS "Building SM70 Marlin kernels for archs: ${MARLIN_SM70_ARCHS}")
   elseif(MARLIN_SM70_ARCHS)
-    message(STATUS "Skipping SM70 Marlin kernels in mixed Marlin arch build")
+    message(WARNING
+      "Skipping SM70 Marlin kernels: they register the same torch ops as the "
+      "sm_75+ Marlin kernels and can only be built in a dedicated sm_70 build "
+      "(TORCH_CUDA_ARCH_LIST=7.0). This wheel will NOT support Marlin-format "
+      "quantization (GPTQ/AWQ/compressed-tensors WNA16 repack+gemm) on V100.")
   endif()
 
   if (MARLIN_OTHER_ARCHS)

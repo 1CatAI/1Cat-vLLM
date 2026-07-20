@@ -325,6 +325,20 @@ torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,
 
   // Get dev info
   int dev = b_q_weight.get_device();
+
+  // This translation unit is only compiled for sm_75 and newer (see
+  // MARLIN_OTHER_ARCHS in CMakeLists.txt). Volta (sm_70) Marlin kernels are
+  // provided by the dedicated sm_70 build (TORCH_CUDA_ARCH_LIST=7.0), which
+  // replaces this implementation. Fail with an actionable error instead of a
+  // cryptic "no kernel image is available" at kernel-launch time (issue #87).
+  int cc_major = 0, cc_minor = 0;
+  cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev);
+  TORCH_CHECK(cc_major * 10 + cc_minor >= 75,
+              "gptq_marlin_repack: this build has no sm_70 (Volta) Marlin kernels. "
+              "They are only included in a dedicated sm_70 build; rebuild "
+              "with TORCH_CUDA_ARCH_LIST=7.0 to serve on V100. Current "
+              "device compute capability: ", cc_major, ".", cc_minor);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev);
   int blocks;
   cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, dev);
