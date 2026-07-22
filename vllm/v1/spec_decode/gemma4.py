@@ -46,6 +46,9 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         # advance between steps.
         self.constant_draft_positions = True
 
+        # Gemma4MTP.get_top_tokens does not accept spec_step_idx.
+        self.use_local_argmax_reduction = False
+
         # Per-group block tables for multi-group KV cache models.
         # Populated by gpu_model_runner during _prepare_inputs.
         self._per_group_block_tables: dict[int, torch.Tensor] = {}
@@ -96,7 +99,9 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _greedy_sample(
+        self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+    ) -> torch.Tensor:
         if self._centroids_sizes:
             T = hidden_states.shape[0]
             for size in self._centroids_sizes:
@@ -105,7 +110,7 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                     self._centroids_graphs[size].replay()
                     return self._centroids_outputs[size][:T].clone()
             return self.model.get_top_tokens(hidden_states)
-        return super()._greedy_sample(hidden_states)
+        return super()._greedy_sample(hidden_states, spec_step_idx)
 
     def _setup_centroids_cuda_graphs(self) -> None:
         """Capture CUDA graphs for centroids get_top_tokens at key sizes."""
