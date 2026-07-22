@@ -1395,11 +1395,18 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     ) -> None:
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
-        attn_metadata.seq_lens_cpu = (
-            seq_lens_cpu
-            if seq_lens_cpu is not None
-            else common_attn_metadata.seq_lens_cpu
-        )
+        if seq_lens_cpu is None:
+            # The deprecated seq_lens_cpu property performs a blocking D2H
+            # copy when the shadow is unset (the spec-decode draft loop
+            # invalidates it every step). That stalls the CPU behind the
+            # in-flight target forward (~12ms per draft step). The optimistic
+            # upper bound is maintained on CPU by the runner and is
+            # sufficient for every consumer on the draft decode path
+            # (decode shape hints and prefix-context detection only).
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+        if seq_lens_cpu is None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        attn_metadata.seq_lens_cpu = seq_lens_cpu
         attn_metadata.causal = common_attn_metadata.causal
         attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
 
