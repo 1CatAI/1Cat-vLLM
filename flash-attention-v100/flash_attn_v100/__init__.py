@@ -3,6 +3,8 @@ __version__ = "1.2.0"
 from flash_attn_v100.flash_attn_interface import (
     flash_attn_decode_qk_scores,
     flash_attn_decode_paged,
+    flash_attn_decode_paged_mq,
+    flash_attn_decode_paged_mq_available,
     flash_attn_decode_paged_xqa,
     flash_attn_decode_paged_xqa_available,
     flash_attn_decode_paged_wmma,
@@ -21,6 +23,8 @@ from flash_attn_v100.flash_attn_interface import (
 __all__ = [
     "flash_attn_decode_qk_scores",
     "flash_attn_decode_paged",
+    "flash_attn_decode_paged_mq",
+    "flash_attn_decode_paged_mq_available",
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_decode_paged_wmma",

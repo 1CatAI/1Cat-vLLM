@@ -174,6 +174,417 @@ __device__ __forceinline__ float dot_qk_cache(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-query (small-q) paged decode: one CTA processes all q_len query
+// tokens of a request against each K/V tile, so the KV cache is read once per
+// request instead of once per query token. query_start_loc gives per-request
+// token offsets into q/out; seq_lens holds per-request total lengths
+// (including the new tokens). Query token j of a request attends to KV
+// positions [0, seq_len - q_len + j] inclusive (causal within the verify
+// block); the sliding window applies relative to each query token's own
+// position. The partition kernel is instantiated for MQ_QLEN in {1,2,4,8}
+// (MTP1..MTP7 verify shapes); callers pick the smallest MQ_QLEN covering the
+// batch's max q_len, and requests with smaller q_len take zero-filled tail
+// rows. kDecodeMqQMax caps q_len_max at 8 (smem budget at head_dim=256).
+// ---------------------------------------------------------------------------
+
+constexpr int kDecodeMqQMax = 8;
+
+__device__ __forceinline__ int decode_mq_query_limit(
+    const int seq_len, const int q_len, const int j) {
+  return max(0, min(seq_len, seq_len - q_len + j + 1));
+}
+
+template<int D, int KV_DTYPE, int MQ_QLEN>
+__device__ __forceinline__ void dot_qk_cache_mq(
+    const __half* __restrict__ q_shared,
+    const void* __restrict__ k_cache,
+    const int64_t k_index_base,
+    const int lane,
+    float* __restrict__ acc) {
+  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+    static_assert(D % 2 == 0, "Head dim must be even for half2 dot");
+    const __half2* q_ptr2 = reinterpret_cast<const __half2*>(q_shared);
+    const __half2* k_ptr2 = reinterpret_cast<const __half2*>(
+        reinterpret_cast<const __half*>(k_cache) + k_index_base);
+    #pragma unroll
+    for (int i = lane; i < D / 2; i += kWarpSize) {
+      const float2 kv = __half22float2(k_ptr2[i]);
+      #pragma unroll
+      for (int j = 0; j < MQ_QLEN; ++j) {
+        const float2 qv = __half22float2(q_ptr2[j * (D / 2) + i]);
+        acc[j] = fmaf(qv.x, kv.x, acc[j]);
+        acc[j] = fmaf(qv.y, kv.y, acc[j]);
+      }
+    }
+  } else if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2) {
+    static_assert(D % 2 == 0, "Head dim must be even for e5m2 half2 dot");
+    const __half2* q_ptr2 = reinterpret_cast<const __half2*>(q_shared);
+    #pragma unroll
+    for (int i = lane; i < D / 2; i += kWarpSize) {
+      const __half2 k_h2 = flash_v100::load_fp8_e5m2_half2_unscaled(
+          k_cache, k_index_base + static_cast<int64_t>(i) * 2);
+      const float2 kv = __half22float2(k_h2);
+      #pragma unroll
+      for (int j = 0; j < MQ_QLEN; ++j) {
+        const float2 qv = __half22float2(q_ptr2[j * (D / 2) + i]);
+        acc[j] = fmaf(qv.x, kv.x, acc[j]);
+        acc[j] = fmaf(qv.y, kv.y, acc[j]);
+      }
+    }
+  } else {
+    #pragma unroll
+    for (int d = lane; d < D; d += kWarpSize) {
+      const float kv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
+          k_cache, k_index_base + d);
+      #pragma unroll
+      for (int j = 0; j < MQ_QLEN; ++j) {
+        const float qv = __half2float(q_shared[j * D + d]);
+        acc[j] = fmaf(qv, kv, acc[j]);
+      }
+    }
+  }
+}
+
+template<int NUM_WARPS, int COUNT>
+__device__ __forceinline__ void block_reduce_max_mq(
+    float* __restrict__ vals) {
+  __shared__ float shared[NUM_WARPS][COUNT];
+  __shared__ float result[COUNT];
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+
+  #pragma unroll
+  for (int j = 0; j < COUNT; ++j) {
+    vals[j] = warp_reduce_max(vals[j]);
+  }
+  if (lane == 0) {
+    #pragma unroll
+    for (int j = 0; j < COUNT; ++j) {
+      shared[warp][j] = vals[j];
+    }
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    #pragma unroll
+    for (int j = 0; j < COUNT; ++j) {
+      float val = lane < NUM_WARPS ? shared[lane][j] : -1.0e20f;
+      val = warp_reduce_max(val);
+      if (lane == 0) {
+        result[j] = val;
+      }
+    }
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int j = 0; j < COUNT; ++j) {
+    vals[j] = result[j];
+  }
+  __syncthreads();
+}
+
+template<int NUM_WARPS, int COUNT>
+__device__ __forceinline__ void block_reduce_sum_mq(
+    float* __restrict__ vals) {
+  __shared__ float shared[NUM_WARPS][COUNT];
+  __shared__ float result[COUNT];
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+
+  #pragma unroll
+  for (int j = 0; j < COUNT; ++j) {
+    vals[j] = warp_reduce_sum(vals[j]);
+  }
+  if (lane == 0) {
+    #pragma unroll
+    for (int j = 0; j < COUNT; ++j) {
+      shared[warp][j] = vals[j];
+    }
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    #pragma unroll
+    for (int j = 0; j < COUNT; ++j) {
+      float val = lane < NUM_WARPS ? shared[lane][j] : 0.f;
+      val = warp_reduce_sum(val);
+      if (lane == 0) {
+        result[j] = val;
+      }
+    }
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int j = 0; j < COUNT; ++j) {
+    vals[j] = result[j];
+  }
+  __syncthreads();
+}
+
+template<int D, int PARTITION_SIZE, int KV_DTYPE, int MQ_QLEN>
+__global__ void flash_attention_decode_partition_mq_kernel(
+    const __half* __restrict__ q,
+    const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache,
+    __half* __restrict__ tmp_out,
+    float* __restrict__ max_logits,
+    float* __restrict__ exp_sums,
+    const int* __restrict__ block_table,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ active_num_partitions,
+    const int num_reqs,
+    const int max_num_blocks,
+    const int max_num_partitions,
+    const int num_heads_q,
+    const int num_heads_kv,
+    const int block_size,
+    const int64_t q_stride0,
+    const int64_t q_stride1,
+    const int64_t tmp_out_stride0,
+    const int64_t tmp_out_stride1,
+    const int64_t tmp_out_stride2,
+    const int64_t tmp_out_stride3,
+    const int64_t stats_stride0,
+    const int64_t stats_stride1,
+    const int64_t stats_stride2,
+    const int64_t k_block_stride,
+    const int64_t k_token_stride,
+    const int64_t k_head_stride,
+    const int64_t v_block_stride,
+    const int64_t v_token_stride,
+    const int64_t v_head_stride,
+    const float softmax_scale,
+    const float k_scale,
+    const float v_scale,
+    const int window_size_left,
+    const int window_size_right) {
+  const int req_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int partition_idx = blockIdx.z;
+
+  if (req_idx >= num_reqs || head_idx >= num_heads_q ||
+      partition_idx >= max_num_partitions) {
+    return;
+  }
+
+  const int seq_len = seq_lens[req_idx];
+  const int q_start = query_start_loc[req_idx];
+  const int q_len = min(query_start_loc[req_idx + 1] - q_start, MQ_QLEN);
+  const int start_token_idx = partition_idx * PARTITION_SIZE;
+  if (seq_len <= 0 || q_len <= 0 || start_token_idx >= seq_len) {
+    return;
+  }
+  const int runtime_num_partitions = active_num_partitions[0];
+  const int seq_num_partitions =
+      (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  const int effective_num_partitions =
+      min(max_num_partitions, max(runtime_num_partitions, seq_num_partitions));
+  if (partition_idx >= effective_num_partitions) {
+    return;
+  }
+
+  // Token range shared by all queries of this request: the first query owns
+  // the leftmost window edge, the last query the rightmost causal edge.
+  const int query_pos_first = seq_len - q_len;
+  const int query_pos_last = seq_len - 1;
+  const int min_token_idx = window_size_left >= 0
+                                ? max(0, query_pos_first - window_size_left)
+                                : 0;
+  const int max_token_idx = window_size_right >= 0
+                                ? min(seq_len - 1,
+                                      query_pos_last + window_size_right)
+                                : seq_len - 1;
+  const int part_start = max(start_token_idx, min_token_idx);
+  const int part_end = min(start_token_idx + PARTITION_SIZE, max_token_idx + 1);
+  const int q_per_kv = num_heads_q / num_heads_kv;
+  const int kv_head_idx = head_idx / q_per_kv;
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp_idx = threadIdx.x / kWarpSize;
+  const float score_scale =
+      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16 ? softmax_scale
+                                                  : softmax_scale * k_scale;
+
+  const int64_t tmp_out_base =
+      static_cast<int64_t>(req_idx) * tmp_out_stride0 +
+      static_cast<int64_t>(head_idx) * tmp_out_stride1 +
+      static_cast<int64_t>(partition_idx) * tmp_out_stride3;
+  const int64_t stats_base =
+      static_cast<int64_t>(req_idx) * stats_stride0 +
+      static_cast<int64_t>(head_idx) * stats_stride1;
+  if (part_start >= part_end) {
+    for (int j = 0; j < q_len; ++j) {
+      for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        tmp_out[tmp_out_base + static_cast<int64_t>(j) * tmp_out_stride2 + d] =
+            __float2half(0.f);
+      }
+      if (threadIdx.x == 0) {
+        const int64_t stats_index =
+            stats_base + static_cast<int64_t>(j) * stats_stride2 +
+            partition_idx;
+        max_logits[stats_index] = -1.0e20f;
+        exp_sums[stats_index] = 0.f;
+      }
+    }
+    return;
+  }
+
+  const int part_tokens = part_end - part_start;
+
+  __shared__ __half q_shared[MQ_QLEN * D];
+  __shared__ float scores_shared[MQ_QLEN * PARTITION_SIZE];
+  // Per-token KV slot in units of tokens: physical_block * tokens_per_block
+  // (block_stride / token_stride) + block_offset. Works both for contiguous
+  // [block, token, head, dim] caches (tokens_per_block == block_size) and the
+  // interleaved [block, 2, token, head, dim] vLLM layout (== 2 * block_size);
+  // the launcher requires K and V to share the same ratio, so the flat K/V
+  // index is slot * token_stride + head * head_stride (+ d).
+  __shared__ int slot_shared[PARTITION_SIZE];
+  const int64_t tokens_per_block = k_block_stride / k_token_stride;
+
+  const __half* q_ptr = q + static_cast<int64_t>(q_start) * q_stride0 +
+                        static_cast<int64_t>(head_idx) * q_stride1;
+  for (int j = 0; j < q_len; ++j) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+      q_shared[j * D + d] = q_ptr[static_cast<int64_t>(j) * q_stride0 + d];
+    }
+  }
+  // Queries beyond this request's q_len get zeroed Q rows and empty windows
+  // so their dots/scores are defined values that never become valid.
+  #pragma unroll
+  for (int j = q_len; j < MQ_QLEN; ++j) {
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+      q_shared[j * D + d] = __float2half(0.f);
+    }
+  }
+  for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
+    const int token_idx = part_start + i;
+    const int logical_block = token_idx / block_size;
+    slot_shared[i] =
+        block_table[req_idx * max_num_blocks + logical_block] *
+            tokens_per_block +
+        (token_idx - logical_block * block_size);
+  }
+  __syncthreads();
+
+  int qlimit[MQ_QLEN];
+  int qmin[MQ_QLEN];
+  int qmax[MQ_QLEN];
+  #pragma unroll
+  for (int j = 0; j < MQ_QLEN; ++j) {
+    if (j < q_len) {
+      qlimit[j] = decode_mq_query_limit(seq_len, q_len, j);
+      const int query_pos_j = qlimit[j] - 1;
+      qmin[j] = window_size_left >= 0
+                    ? max(0, query_pos_j - window_size_left)
+                    : 0;
+      qmax[j] = window_size_right >= 0
+                    ? min(seq_len - 1, query_pos_j + window_size_right)
+                    : seq_len - 1;
+    } else {
+      qlimit[j] = 0;
+      qmin[j] = 0;
+      qmax[j] = -1;
+    }
+  }
+
+  float part_max[MQ_QLEN];
+  #pragma unroll
+  for (int j = 0; j < MQ_QLEN; ++j) {
+    part_max[j] = -1.0e20f;
+  }
+  for (int token_local = warp_idx; token_local < part_tokens;
+       token_local += kWarpsPerBlock) {
+    const int token_abs = part_start + token_local;
+    const int64_t k_index =
+        static_cast<int64_t>(slot_shared[token_local]) * k_token_stride +
+        static_cast<int64_t>(kv_head_idx) * k_head_stride;
+
+    float acc[MQ_QLEN];
+    #pragma unroll
+    for (int j = 0; j < MQ_QLEN; ++j) {
+      acc[j] = 0.f;
+    }
+    dot_qk_cache_mq<D, KV_DTYPE, MQ_QLEN>(q_shared, k_cache, k_index, lane,
+                                          acc);
+    #pragma unroll
+    for (int j = 0; j < MQ_QLEN; ++j) {
+      acc[j] = warp_reduce_sum(acc[j]);
+      if (lane == 0) {
+        const float score = acc[j] * score_scale;
+        scores_shared[j * PARTITION_SIZE + token_local] = score;
+        if (token_abs < qlimit[j] && token_abs >= qmin[j] &&
+            token_abs <= qmax[j]) {
+          part_max[j] = fmaxf(part_max[j], score);
+        }
+      }
+    }
+  }
+  block_reduce_max_mq<kWarpsPerBlock, MQ_QLEN>(part_max);
+
+  float part_sum[MQ_QLEN];
+  #pragma unroll
+  for (int j = 0; j < MQ_QLEN; ++j) {
+    part_sum[j] = 0.f;
+  }
+  for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
+    const int token_abs = part_start + i;
+    #pragma unroll
+    for (int j = 0; j < MQ_QLEN; ++j) {
+      const bool valid =
+          token_abs < qlimit[j] && token_abs >= qmin[j] &&
+          token_abs <= qmax[j];
+      const float p =
+          valid ? __expf(scores_shared[j * PARTITION_SIZE + i] - part_max[j])
+                : 0.f;
+      scores_shared[j * PARTITION_SIZE + i] = p;
+      part_sum[j] += p;
+    }
+  }
+  block_reduce_sum_mq<kWarpsPerBlock, MQ_QLEN>(part_sum);
+
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    float out_acc[MQ_QLEN];
+    #pragma unroll
+    for (int j = 0; j < MQ_QLEN; ++j) {
+      out_acc[j] = 0.f;
+    }
+    for (int i = 0; i < part_tokens; ++i) {
+      const int64_t v_index =
+          static_cast<int64_t>(slot_shared[i]) * v_token_stride +
+          static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
+      const float vv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
+          v_cache, v_index);
+      #pragma unroll
+      for (int j = 0; j < MQ_QLEN; ++j) {
+        out_acc[j] =
+            fmaf(scores_shared[j * PARTITION_SIZE + i], vv, out_acc[j]);
+      }
+    }
+    #pragma unroll
+    for (int j = 0; j < MQ_QLEN; ++j) {
+      const float inv_part_sum = part_sum[j] > 0.f ? 1.f / part_sum[j] : 0.f;
+      const float out_scale =
+          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
+              ? inv_part_sum
+              : inv_part_sum * v_scale;
+      tmp_out[tmp_out_base + static_cast<int64_t>(j) * tmp_out_stride2 + d] =
+          __float2half(out_acc[j] * out_scale);
+    }
+  }
+
+  if (threadIdx.x == 0) {
+    #pragma unroll
+    for (int j = 0; j < MQ_QLEN; ++j) {
+      const int64_t stats_index =
+          stats_base + static_cast<int64_t>(j) * stats_stride2 + partition_idx;
+      max_logits[stats_index] = part_max[j];
+      exp_sums[stats_index] = part_sum[j];
+    }
+  }
+}
+
 template<int D, int PARTITION_SIZE, int KV_DTYPE>
 __global__ void flash_attention_decode_partition_kernel(
     const __half* __restrict__ q,
@@ -792,6 +1203,109 @@ __global__ void flash_attention_decode_reduce_kernel(
   }
 }
 
+template<int D, int PARTITION_SIZE>
+__global__ void flash_attention_decode_reduce_mq_kernel(
+    const __half* __restrict__ tmp_out,
+    const float* __restrict__ max_logits,
+    const float* __restrict__ exp_sums,
+    const int* __restrict__ seq_lens,
+    const int* __restrict__ query_start_loc,
+    const int* __restrict__ active_num_partitions,
+    __half* __restrict__ out,
+    const int num_reqs,
+    const int max_num_partitions,
+    const int num_heads_q,
+    const int64_t tmp_out_stride0,
+    const int64_t tmp_out_stride1,
+    const int64_t tmp_out_stride2,
+    const int64_t tmp_out_stride3,
+    const int64_t stats_stride0,
+    const int64_t stats_stride1,
+    const int64_t stats_stride2,
+    const int64_t out_stride0,
+    const int64_t out_stride1) {
+  const int req_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+
+  if (req_idx >= num_reqs || head_idx >= num_heads_q) {
+    return;
+  }
+
+  const int seq_len = seq_lens[req_idx];
+  const int q_start = query_start_loc[req_idx];
+  const int q_len =
+      min(query_start_loc[req_idx + 1] - q_start, kDecodeMqQMax);
+  if (q_len <= 0) {
+    return;
+  }
+  __half* out_ptr = out + static_cast<int64_t>(q_start) * out_stride0 +
+                    static_cast<int64_t>(head_idx) * out_stride1;
+  if (seq_len <= 0) {
+    for (int j = 0; j < q_len; ++j) {
+      for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        out_ptr[static_cast<int64_t>(j) * out_stride0 + d] =
+            __float2half(0.f);
+      }
+    }
+    return;
+  }
+  const int num_partitions =
+      min(max_num_partitions,
+          (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE);
+  (void)active_num_partitions;
+
+  extern __shared__ float shared_mem[];
+  float* max_shared = shared_mem;
+  float* weight_shared = shared_mem + max_num_partitions;
+
+  const int64_t tmp_base_bh =
+      static_cast<int64_t>(req_idx) * tmp_out_stride0 +
+      static_cast<int64_t>(head_idx) * tmp_out_stride1;
+  const int64_t stats_base_bh =
+      static_cast<int64_t>(req_idx) * stats_stride0 +
+      static_cast<int64_t>(head_idx) * stats_stride1;
+
+  for (int j = 0; j < q_len; ++j) {
+    const int64_t stats_base =
+        stats_base_bh + static_cast<int64_t>(j) * stats_stride2;
+    float local_max = -1.0e20f;
+    for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
+      const float m = max_logits[stats_base + i];
+      max_shared[i] = m;
+      local_max = fmaxf(local_max, m);
+    }
+    const float global_max = block_reduce_max<kWarpsPerBlock>(local_max);
+
+    float local_sum = 0.f;
+    for (int i = threadIdx.x; i < num_partitions; i += blockDim.x) {
+      const float weight =
+          exp_sums[stats_base + i] * __expf(max_shared[i] - global_max);
+      weight_shared[i] = weight;
+      local_sum += weight;
+    }
+    const float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
+    const float inv_global_sum = global_sum > 0.f ? 1.f / global_sum : 0.f;
+    __syncthreads();
+
+    const int64_t tmp_base =
+        tmp_base_bh + static_cast<int64_t>(j) * tmp_out_stride2;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+      float acc = 0.f;
+      for (int i = 0; i < num_partitions; ++i) {
+        acc = fmaf(
+            weight_shared[i],
+            __half2float(tmp_out[tmp_base +
+                                 static_cast<int64_t>(i) * tmp_out_stride3 +
+                                 d]),
+            acc);
+      }
+      out_ptr[static_cast<int64_t>(j) * out_stride0 + d] =
+          __float2half(acc * inv_global_sum);
+    }
+    __syncthreads();
+  }
+}
+
 template<int D, int PARTITION_SIZE, int KV_DTYPE>
 __global__ void flash_attention_decode_qk_scores_kernel(
     const __half* __restrict__ q,
@@ -961,6 +1475,102 @@ void launch_flash_attention_decode_paged(
       tmp_out.stride(2),
       max_logits.stride(0),
       max_logits.stride(1),
+      out.stride(0),
+      out.stride(1));
+}
+
+template<int D, int PARTITION_SIZE, int KV_DTYPE, int MQ_QLEN>
+void launch_flash_attention_decode_paged_mq(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    at::Tensor& out,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const at::Tensor& query_start_loc,
+    at::Tensor& tmp_out,
+    at::Tensor& max_logits,
+    at::Tensor& exp_sums,
+    const at::Tensor& active_num_partitions,
+    const float softmax_scale,
+    const int launch_num_partitions,
+    const float k_scale,
+    const float v_scale,
+    const int window_size_left,
+    const int window_size_right,
+    cudaStream_t stream) {
+  const int num_reqs = query_start_loc.size(0) - 1;
+  const int num_heads_q = q.size(1);
+  const int num_heads_kv = k_cache.size(2);
+  const int block_size = k_cache.size(1);
+  const int max_num_blocks = block_table.size(1);
+  const int max_num_partitions = launch_num_partitions;
+
+  const dim3 partition_grid(num_reqs, num_heads_q, max_num_partitions);
+  const dim3 reduce_grid(num_reqs, num_heads_q, 1);
+  const dim3 block(kThreadsPerBlock);
+  const size_t reduce_shared_mem =
+      static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
+
+  flash_attention_decode_partition_mq_kernel<D, PARTITION_SIZE, KV_DTYPE,
+                                             MQ_QLEN>
+      <<<partition_grid, block, 0, stream>>>(
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      k_cache.data_ptr(),
+      v_cache.data_ptr(),
+      reinterpret_cast<__half*>(tmp_out.data_ptr<at::Half>()),
+      max_logits.data_ptr<float>(),
+      exp_sums.data_ptr<float>(),
+      block_table.data_ptr<int>(),
+      seq_lens.data_ptr<int>(),
+      query_start_loc.data_ptr<int>(),
+      active_num_partitions.data_ptr<int>(),
+      num_reqs,
+      max_num_blocks,
+      max_num_partitions,
+      num_heads_q,
+      num_heads_kv,
+      block_size,
+      q.stride(0),
+      q.stride(1),
+      tmp_out.stride(0),
+      tmp_out.stride(1),
+      tmp_out.stride(2),
+      tmp_out.stride(3),
+      max_logits.stride(0),
+      max_logits.stride(1),
+      max_logits.stride(2),
+      k_cache.stride(0),
+      k_cache.stride(1),
+      k_cache.stride(2),
+      v_cache.stride(0),
+      v_cache.stride(1),
+      v_cache.stride(2),
+      softmax_scale,
+      k_scale,
+      v_scale,
+      window_size_left,
+      window_size_right);
+
+  flash_attention_decode_reduce_mq_kernel<D, PARTITION_SIZE>
+      <<<reduce_grid, block, reduce_shared_mem, stream>>>(
+      reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),
+      max_logits.data_ptr<float>(),
+      exp_sums.data_ptr<float>(),
+      seq_lens.data_ptr<int>(),
+      query_start_loc.data_ptr<int>(),
+      active_num_partitions.data_ptr<int>(),
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      num_reqs,
+      max_num_partitions,
+      num_heads_q,
+      tmp_out.stride(0),
+      tmp_out.stride(1),
+      tmp_out.stride(2),
+      tmp_out.stride(3),
+      max_logits.stride(0),
+      max_logits.stride(1),
+      max_logits.stride(2),
       out.stride(0),
       out.stride(1));
 }
@@ -1266,6 +1876,239 @@ at::Tensor flash_attention_decode_paged(
   #undef LAUNCH_BY_PARTITION
   #undef LAUNCH_BY_KV_DTYPE
   #undef LAUNCH_TYPED
+
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+at::Tensor flash_attention_decode_paged_mq(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    const at::Tensor& query_start_loc,
+    at::Tensor& tmp_out,
+    at::Tensor& max_logits,
+    at::Tensor& exp_sums,
+    const at::Tensor& active_num_partitions,
+    const float softmax_scale,
+    const int partition_size,
+    const int launch_num_partitions,
+    const int q_len_max,
+    const std::string& kv_cache_dtype,
+    const float k_scale,
+    const float v_scale,
+    const int window_size_left,
+    const int window_size_right) {
+  TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
+  TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(), "k/v cache must be on CUDA");
+  TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
+              "block_table and seq_lens must be on CUDA");
+  TORCH_CHECK(query_start_loc.is_cuda(), "query_start_loc must be on CUDA");
+  TORCH_CHECK(tmp_out.is_cuda() && max_logits.is_cuda() && exp_sums.is_cuda(),
+              "workspace tensors must be on CUDA");
+  TORCH_CHECK(active_num_partitions.is_cuda(),
+              "active_num_partitions must be on CUDA");
+  TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
+  const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
+  TORCH_CHECK(kv_dtype_code >= 0, "Unsupported kv_cache_dtype: ", kv_cache_dtype);
+  if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
+    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
+    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+  } else {
+    TORCH_CHECK(k_cache.dtype() == torch::kUInt8,
+                "fp8 k_cache must be stored as uint8");
+    TORCH_CHECK(v_cache.dtype() == torch::kUInt8,
+                "fp8 v_cache must be stored as uint8");
+    TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
+                "fp8 k/v scales must be positive");
+  }
+  TORCH_CHECK(tmp_out.dtype() == torch::kFloat16, "tmp_out must be fp16");
+  TORCH_CHECK(max_logits.dtype() == torch::kFloat32, "max_logits must be fp32");
+  TORCH_CHECK(exp_sums.dtype() == torch::kFloat32, "exp_sums must be fp32");
+  TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must be int32");
+  TORCH_CHECK(seq_lens.dtype() == torch::kInt32, "seq_lens must be int32");
+  TORCH_CHECK(query_start_loc.dtype() == torch::kInt32,
+              "query_start_loc must be int32");
+  TORCH_CHECK(active_num_partitions.dtype() == torch::kInt32,
+              "active_num_partitions must be int32");
+  TORCH_CHECK(q.dim() == 3, "q must have shape [total_tokens, H, D]");
+  TORCH_CHECK(k_cache.dim() == 4, "k_cache must have shape [num_blocks, block_size, H_kv, D]");
+  TORCH_CHECK(v_cache.dim() == 4, "v_cache must have shape [num_blocks, block_size, H_kv, D]");
+  TORCH_CHECK(block_table.dim() == 2, "block_table must have shape [B, max_num_blocks]");
+  TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must have shape [B]");
+  TORCH_CHECK(query_start_loc.dim() == 1 && query_start_loc.size(0) >= 2,
+              "query_start_loc must have shape [B+1]");
+  TORCH_CHECK(tmp_out.dim() == 5,
+              "tmp_out must have shape [B, H, q_len_max, P, D]");
+  TORCH_CHECK(max_logits.dim() == 4,
+              "max_logits must have shape [B, H, q_len_max, P]");
+  TORCH_CHECK(exp_sums.dim() == 4,
+              "exp_sums must have shape [B, H, q_len_max, P]");
+  TORCH_CHECK(active_num_partitions.dim() == 1 &&
+                  active_num_partitions.numel() == 1,
+              "active_num_partitions must have shape [1]");
+  TORCH_CHECK(q.stride(-1) == 1, "q last dim must be contiguous");
+  TORCH_CHECK(k_cache.stride(-1) == 1, "k_cache last dim must be contiguous");
+  TORCH_CHECK(v_cache.stride(-1) == 1, "v_cache last dim must be contiguous");
+  TORCH_CHECK(tmp_out.stride(-1) == 1, "tmp_out last dim must be contiguous");
+  TORCH_CHECK(k_cache.stride(1) > 0 &&
+                  k_cache.stride(0) % k_cache.stride(1) == 0,
+              "multi-query decode requires the K block stride to be a "
+              "multiple of the token stride");
+  TORCH_CHECK(v_cache.stride(1) > 0 &&
+                  v_cache.stride(0) % v_cache.stride(1) == 0,
+              "multi-query decode requires the V block stride to be a "
+              "multiple of the token stride");
+  TORCH_CHECK(k_cache.stride(0) / k_cache.stride(1) ==
+                  v_cache.stride(0) / v_cache.stride(1),
+              "multi-query decode requires matching K/V block-to-token "
+              "stride ratios");
+  TORCH_CHECK(
+      k_cache.size(0) * (k_cache.stride(0) / k_cache.stride(1)) < (1LL << 31),
+      "multi-query decode KV slot overflow");
+
+  const int num_reqs = query_start_loc.size(0) - 1;
+  const int num_heads_q = q.size(1);
+  const int head_dim = q.size(2);
+  const int num_heads_kv = k_cache.size(2);
+
+  TORCH_CHECK(num_reqs <= block_table.size(0),
+              "block_table batch size must cover num_reqs");
+  TORCH_CHECK(num_reqs <= seq_lens.size(0),
+              "seq_lens batch size must cover num_reqs");
+  TORCH_CHECK(num_reqs <= tmp_out.size(0),
+              "tmp_out batch size must cover num_reqs");
+  TORCH_CHECK(num_heads_q == tmp_out.size(1), "tmp_out head dimension mismatch");
+  TORCH_CHECK(q_len_max >= 1 && q_len_max <= kDecodeMqQMax,
+              "q_len_max must be in [1, ", kDecodeMqQMax, "], got ", q_len_max);
+  TORCH_CHECK(tmp_out.size(2) >= q_len_max,
+              "tmp_out q_len dimension must cover q_len_max");
+  TORCH_CHECK(head_dim == tmp_out.size(4), "tmp_out head_dim mismatch");
+  TORCH_CHECK(max_logits.size(0) == tmp_out.size(0) &&
+                  max_logits.size(1) == tmp_out.size(1) &&
+                  max_logits.size(2) == tmp_out.size(2) &&
+                  max_logits.size(3) == tmp_out.size(3),
+              "max_logits shape mismatch");
+  TORCH_CHECK(exp_sums.sizes() == max_logits.sizes(),
+              "exp_sums shape mismatch");
+  TORCH_CHECK(num_heads_q % num_heads_kv == 0,
+              "num_heads_q must be divisible by num_heads_kv");
+  TORCH_CHECK(k_cache.size(3) == head_dim, "k_cache head_dim mismatch");
+  TORCH_CHECK(v_cache.size(3) == head_dim, "v_cache head_dim mismatch");
+  TORCH_CHECK(partition_size == 256 || partition_size == 512 || partition_size == 1024,
+              "Unsupported decode partition_size: ", partition_size);
+  TORCH_CHECK(launch_num_partitions > 0 &&
+                  launch_num_partitions <= tmp_out.size(3),
+              "launch_num_partitions must be in (0, tmp_out.size(3)]");
+  TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
+              "window sizes must be >= -1");
+
+  at::Tensor out = out_.has_value() ? out_.value() : torch::empty_like(q);
+  TORCH_CHECK(out.is_cuda(), "out must be on CUDA");
+  TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
+  TORCH_CHECK(out.sizes() == q.sizes(), "out must have same shape as q");
+  TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  c10::cuda::CUDAGuard device_guard(q.device());
+
+  #define LAUNCH_MQ_TYPED(HDIM, PARTITION, KV_DTYPE_CODE, QLEN)                 \
+    launch_flash_attention_decode_paged_mq<HDIM, PARTITION, KV_DTYPE_CODE,      \
+                                           QLEN>(                               \
+        q, k_cache, v_cache, out, block_table, seq_lens, query_start_loc,       \
+        tmp_out, max_logits, exp_sums, active_num_partitions, softmax_scale,    \
+        launch_num_partitions, k_scale, v_scale, window_size_left,              \
+        window_size_right, stream)
+
+  #define LAUNCH_MQ_BY_KV_DTYPE(HDIM, PARTITION, QLEN)                          \
+    do {                                                                        \
+      switch (kv_dtype_code) {                                                  \
+        case flash_v100::KV_CACHE_DTYPE_FP16:                                   \
+          LAUNCH_MQ_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP16,     \
+                          QLEN);                                                \
+          break;                                                                \
+        case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                               \
+          LAUNCH_MQ_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, \
+                          QLEN);                                                \
+          break;                                                                \
+        case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                               \
+          LAUNCH_MQ_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E5M2, \
+                          QLEN);                                                \
+          break;                                                                \
+        default:                                                                \
+          TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype);  \
+      }                                                                         \
+    } while (0)
+
+  #define LAUNCH_MQ_BY_PARTITION(HDIM, QLEN)                                    \
+    do {                                                                        \
+      switch (partition_size) {                                                 \
+        case 256:                                                               \
+          LAUNCH_MQ_BY_KV_DTYPE(HDIM, 256, QLEN);                               \
+          break;                                                                \
+        case 512:                                                               \
+          LAUNCH_MQ_BY_KV_DTYPE(HDIM, 512, QLEN);                               \
+          break;                                                                \
+        case 1024:                                                              \
+          LAUNCH_MQ_BY_KV_DTYPE(HDIM, 1024, QLEN);                              \
+          break;                                                                \
+        default:                                                                \
+          TORCH_CHECK(false, "Unsupported decode partition_size: ",             \
+                      partition_size);                                          \
+      }                                                                         \
+    } while (0)
+
+  #define LAUNCH_MQ_BY_PARTITION_FP16_ONLY(HDIM, QLEN)                          \
+    do {                                                                        \
+      switch (partition_size) {                                                 \
+        case 256:                                                               \
+          LAUNCH_MQ_TYPED(HDIM, 256, flash_v100::KV_CACHE_DTYPE_FP16, QLEN);   \
+          break;                                                                \
+        case 512:                                                               \
+          LAUNCH_MQ_TYPED(HDIM, 512, flash_v100::KV_CACHE_DTYPE_FP16, QLEN);   \
+          break;                                                                \
+        case 1024:                                                              \
+          LAUNCH_MQ_TYPED(HDIM, 1024, flash_v100::KV_CACHE_DTYPE_FP16, QLEN);  \
+          break;                                                                \
+        default:                                                                \
+          TORCH_CHECK(false, "Unsupported decode partition_size: ",             \
+                      partition_size);                                          \
+      }                                                                         \
+    } while (0)
+
+  TORCH_CHECK(head_dim == 256 || head_dim == 512,
+              "multi-query paged decode supports head_dim in {256, 512}, got ",
+              head_dim);
+  if (head_dim == 512) {
+    TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
+                "multi-query paged decode supports fp16 KV only at "
+                "head_dim=512");
+    if (q_len_max <= 1) {
+      LAUNCH_MQ_BY_PARTITION_FP16_ONLY(512, 1);
+    } else if (q_len_max <= 2) {
+      LAUNCH_MQ_BY_PARTITION_FP16_ONLY(512, 2);
+    } else if (q_len_max <= 4) {
+      LAUNCH_MQ_BY_PARTITION_FP16_ONLY(512, 4);
+    } else {
+      LAUNCH_MQ_BY_PARTITION_FP16_ONLY(512, 8);
+    }
+  } else if (q_len_max <= 1) {
+    LAUNCH_MQ_BY_PARTITION(256, 1);
+  } else if (q_len_max <= 2) {
+    LAUNCH_MQ_BY_PARTITION(256, 2);
+  } else if (q_len_max <= 4) {
+    LAUNCH_MQ_BY_PARTITION(256, 4);
+  } else {
+    LAUNCH_MQ_BY_PARTITION(256, 8);
+  }
+
+  #undef LAUNCH_MQ_BY_PARTITION_FP16_ONLY
+  #undef LAUNCH_MQ_BY_PARTITION
+  #undef LAUNCH_MQ_BY_KV_DTYPE
+  #undef LAUNCH_MQ_TYPED
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;

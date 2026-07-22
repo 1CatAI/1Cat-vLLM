@@ -62,6 +62,8 @@ _logged_prefill_prefix_bfla = False
 _logged_prefill_prefix_splitkv = False
 _logged_prefill_paged_cache = False
 _logged_prefill_smallq_decode = False
+_logged_smallq_mq = False
+_logged_smallq_mq_fallback = False
 _logged_prefill_triton_safe = False
 _logged_decode_flash = False
 _logged_decode_dense_reference = False
@@ -498,6 +500,7 @@ def _get_flash_ops():
     global _flash_attn_prefill_paged
     global _flash_attn_decode_paged_wmma, _flash_attn_prefill_paged_bhmd
     global _flash_attn_prefill_paged_bfla, _flash_attn_prefill_paged_splitkv
+    global _flash_attn_decode_paged_mq
     if (
         _flash_attn_func is None
         or _flash_attn_decode_paged is None
@@ -521,6 +524,12 @@ def _get_flash_ops():
                 _flash_attn_decode_paged_xqa = flash_attn_decode_paged_xqa
             except ImportError:
                 _flash_attn_decode_paged_xqa = None
+            try:
+                from flash_attn_v100 import flash_attn_decode_paged_mq
+
+                _flash_attn_decode_paged_mq = flash_attn_decode_paged_mq
+            except ImportError:
+                _flash_attn_decode_paged_mq = None
             try:
                 from flash_attn_v100 import flash_attn_decode_paged_wmma
 
@@ -550,6 +559,7 @@ def _get_flash_ops():
             _flash_attn_bhmd_func = None
             _flash_attn_decode_paged = None
             _flash_attn_decode_paged_xqa = None
+            _flash_attn_decode_paged_mq = None
             _flash_attn_decode_paged_wmma = None
             _flash_attn_prefill_paged = None
             _flash_attn_prefill_paged_bhmd = None
@@ -565,11 +575,12 @@ def _get_flash_ops():
         _flash_attn_prefill_paged_bhmd,
         _flash_attn_prefill_paged_bfla,
         _flash_attn_prefill_paged_splitkv,
+        _flash_attn_decode_paged_mq,
     )
 
 
 def flash_v100_dense_prefill_available() -> bool:
-    flash_attn_func, _, _, _, _, _, _, _, _ = _get_flash_ops()
+    flash_attn_func, _, _, _, _, _, _, _, _, _ = _get_flash_ops()
     return flash_attn_func is not None
 
 
@@ -585,7 +596,7 @@ def flash_v100_dense_prefill(
     window_size: tuple[int, int] = (-1, -1),
 ) -> torch.Tensor:
     """Run Flash-V100 dense raw-QKV prefill without backend metadata coupling."""
-    flash_attn_func, _, _, _, _, _, _, _, _ = _get_flash_ops()
+    flash_attn_func, _, _, _, _, _, _, _, _, _ = _get_flash_ops()
     if flash_attn_func is None:
         raise RuntimeError("flash_attn_v100 dense prefill op is unavailable")
 
@@ -1386,6 +1397,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._smallq_query_start_loc: torch.Tensor | None = None
         self._smallq_token_indices: torch.Tensor | None = None
         self._smallq_buffer_shape: tuple[int, int, int] | None = None
+        self._smallq_mq_block_table: torch.Tensor | None = None
+        self._smallq_mq_seq_lens: torch.Tensor | None = None
         self._decode_active_num_partitions: torch.Tensor | None = None
 
     def _attach_common_flash_metadata(
@@ -1695,6 +1708,12 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     def _configured_smallq_max_model_len(self) -> int:
         return int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0"))
 
+    def _configured_smallq_mq_enabled(self) -> bool:
+        return os.getenv("VLLM_FLASH_V100_SMALLQ_FOLD", "0") != "1"
+
+    def _configured_smallq_mq_max_query_len(self) -> int:
+        return int(os.getenv("VLLM_FLASH_V100_SMALLQ_MQ_MAX_Q", "8"))
+
     def _smallq_buffer_token_capacity(self, required_tokens: int) -> int:
         compilation_config = self.vllm_config.compilation_config
         graph_tokens = compilation_config.max_cudagraph_capture_size
@@ -1762,6 +1781,16 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self._smallq_mq_block_table = torch.empty(
+            (req_capacity, block_cols),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._smallq_mq_seq_lens = torch.empty(
+            (req_capacity,),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self._smallq_token_indices = torch.arange(
             token_capacity,
             dtype=torch.int32,
@@ -1779,6 +1808,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata.smallq_query_start_loc = None
         attn_metadata.smallq_decode_max_seq_len_hint = None
         attn_metadata.smallq_decode_workspace_seq_capacity_hint = None
+        attn_metadata.smallq_mq_block_table = None
+        attn_metadata.smallq_mq_seq_lens = None
+        attn_metadata.smallq_mq_query_start_loc = None
 
     def _update_smallq_decode_metadata(
         self,
@@ -1923,6 +1955,59 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata.smallq_query_start_loc = (
             self._smallq_query_start_loc[: num_reqs + 1]
         )
+
+        # Multi-query (unfolded) metadata: one batch row per request so the
+        # decode kernel reads each KV tile once per request instead of once
+        # per query token. The decode grid is baked into the CUDA graph as
+        # (num_reqs, heads, partitions); capture has no padding, so at replay
+        # the launch width must be num_query_tokens // max_query_len (uniform
+        # verify shapes), with tail requests padded as empty (q_len=0).
+        num_reqs_launch = num_reqs
+        mq_eligible = (
+            self._configured_smallq_mq_enabled()
+            and max_query_len <= self._configured_smallq_mq_max_query_len()
+        )
+        if mq_eligible and padding_tokens > 0:
+            if max_query_len <= 0 or num_query_tokens % max_query_len != 0:
+                mq_eligible = False
+            else:
+                num_reqs_launch = num_query_tokens // max_query_len
+        if num_reqs_launch < num_reqs:
+            # Defensive: mixed query lengths under graph replay would leave
+            # some requests uncovered by the launch grid; keep the folded
+            # path for those (uniform verify shapes never hit this).
+            mq_eligible = False
+        if mq_eligible:
+            assert self._smallq_buffer_shape is not None
+            _, req_capacity, _ = self._smallq_buffer_shape
+            if num_reqs_launch > req_capacity:
+                mq_eligible = False
+        if mq_eligible:
+            assert self._smallq_mq_block_table is not None
+            assert self._smallq_mq_seq_lens is not None
+            self._smallq_mq_block_table[:num_reqs].copy_(
+                block_table,
+                non_blocking=True,
+            )
+            self._smallq_mq_seq_lens[:num_reqs].copy_(
+                effective_seq_lens,
+                non_blocking=True,
+            )
+            if num_reqs_launch > num_reqs:
+                self._smallq_mq_seq_lens[num_reqs:num_reqs_launch].zero_()
+                self._smallq_query_start_loc[
+                    num_reqs + 1 : num_reqs_launch + 1
+                ].fill_(real_num_query_tokens)
+            attn_metadata.smallq_mq_block_table = (
+                self._smallq_mq_block_table[:num_reqs_launch]
+            )
+            attn_metadata.smallq_mq_seq_lens = (
+                self._smallq_mq_seq_lens[:num_reqs_launch]
+            )
+            attn_metadata.smallq_mq_query_start_loc = (
+                self._smallq_query_start_loc[: num_reqs_launch + 1]
+            )
+
         raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
         max_seq_len_hint = int(seq_lens_cpu.max().item())
         if max_seq_len_hint > 0 and raw_seq_capacity > 0:
@@ -2085,6 +2170,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_bhmd,
             self.flash_attn_prefill_paged_bfla,
             self.flash_attn_prefill_paged_splitkv,
+            self.flash_attn_decode_paged_mq,
         ) = _get_flash_ops()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -2159,6 +2245,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         self.smallq_decode_max_model_len = int(
             os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
+        )
+        # Multi-query smallq decode: the decode kernel reads KV once per
+        # request for the whole verify block instead of once per query token.
+        # VLLM_FLASH_V100_SMALLQ_FOLD=1 forces the legacy folded path.
+        self.use_smallq_mq = (
+            self.flash_attn_decode_paged_mq is not None
+            and os.getenv("VLLM_FLASH_V100_SMALLQ_FOLD", "0") != "1"
+        )
+        self.smallq_mq_max_query_len = int(
+            os.getenv("VLLM_FLASH_V100_SMALLQ_MQ_MAX_Q", "8")
         )
         self.use_decode_dense_reference = (
             os.getenv("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0") == "1"
@@ -4204,6 +4300,89 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     ),
                     _format_tensor_debug(persistent_query_start_loc, "smallq_qsl"),
                 )
+            mq_block_table = getattr(
+                attn_metadata,
+                "smallq_mq_block_table",
+                None,
+            )
+            mq_seq_lens = getattr(
+                attn_metadata,
+                "smallq_mq_seq_lens",
+                None,
+            )
+            mq_query_start_loc = getattr(
+                attn_metadata,
+                "smallq_mq_query_start_loc",
+                None,
+            )
+            if (
+                self.use_smallq_mq
+                and query.shape[2] in (256, 512)
+                and self._flash_v100_window_size(causal=True) == (-1, -1)
+                and mq_block_table is not None
+                and mq_seq_lens is not None
+                and mq_query_start_loc is not None
+                and int(mq_query_start_loc.shape[0]) >= 2
+            ):
+                # Multi-query decode: one kernel batch row per request reads
+                # each KV tile once for the whole verify block.
+                global _logged_smallq_mq, _logged_smallq_mq_fallback
+                if not _logged_smallq_mq:
+                    logger.info(
+                        "FLASH_ATTN_V100 smallq multi-query decode ACTIVE "
+                        "(num_reqs_launch=%d q_len_max=%d)",
+                        int(mq_query_start_loc.shape[0]) - 1,
+                        min(
+                            int(getattr(attn_metadata, "max_query_len", 1)),
+                            self.smallq_mq_max_query_len,
+                        ),
+                    )
+                    _logged_smallq_mq = True
+                self.flash_attn_decode_paged_mq(
+                    query,
+                    key_cache,
+                    value_cache,
+                    mq_block_table,
+                    mq_seq_lens,
+                    mq_query_start_loc,
+                    softmax_scale=self.scale,
+                    out=out_view,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    window_size=self._flash_v100_window_size(causal=True),
+                    max_seq_len_hint=getattr(
+                        attn_metadata,
+                        "smallq_decode_max_seq_len_hint",
+                        None,
+                    ),
+                    workspace_seq_capacity_hint=getattr(
+                        attn_metadata,
+                        "smallq_decode_workspace_seq_capacity_hint",
+                        None,
+                    ),
+                    q_len_max=min(
+                        int(getattr(attn_metadata, "max_query_len", 1)),
+                        self.smallq_mq_max_query_len,
+                    ),
+                )
+                _record_route("decode_scalar_paged_mq")
+                return output
+            if not _logged_smallq_mq_fallback:
+                logger.info(
+                    "FLASH_ATTN_V100 smallq multi-query decode INACTIVE, "
+                    "folded path: use_smallq_mq=%s query_shape=%s "
+                    "mq_meta=(bt=%s sl=%s qsl=%s) mq_qsl_len=%s",
+                    self.use_smallq_mq,
+                    tuple(query.shape),
+                    mq_block_table is not None,
+                    mq_seq_lens is not None,
+                    mq_query_start_loc is not None,
+                    int(mq_query_start_loc.shape[0])
+                    if mq_query_start_loc is not None
+                    else -1,
+                )
+                _logged_smallq_mq_fallback = True
             self._call_flash_attn_decode_paged(
                 query,
                 key_cache,
@@ -4274,6 +4453,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             real_query_lens_gpu.to(dtype=attn_metadata.seq_lens.dtype),
         )
         block_table = attn_metadata.block_table[:num_seqs].clamp_min(0)
+        if (
+            self.use_smallq_mq
+            and query.shape[2] in (256, 512)
+            and self._flash_v100_window_size(causal=True) == (-1, -1)
+            and num_seqs > 0
+            and int(getattr(attn_metadata, "max_query_len", 1))
+            <= self.smallq_mq_max_query_len
+        ):
+            # Multi-query decode: one kernel batch row per request reads each
+            # KV tile once for the whole verify block. Padding tokens (beyond
+            # query_start_loc[-1]) belong to no request and are ignored.
+            self.flash_attn_decode_paged_mq(
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                effective_seq_lens.to(dtype=torch.int32),
+                query_start_loc_gpu.to(dtype=torch.int32),
+                softmax_scale=self.scale,
+                out=out_view,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                window_size=self._flash_v100_window_size(causal=True),
+                max_seq_len_hint=int(seq_lens.max().item()),
+                workspace_seq_capacity_hint=(
+                    int(block_table.shape[1]) * int(key_cache.shape[1])
+                ),
+                q_len_max=min(
+                    int(getattr(attn_metadata, "max_query_len", 1)),
+                    self.smallq_mq_max_query_len,
+                ),
+            )
+            _record_route("decode_scalar_paged_mq")
+            return output
         decode_block_table = torch.repeat_interleave(
             block_table,
             query_lens_gpu,
