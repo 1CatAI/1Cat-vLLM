@@ -66,7 +66,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput, RequestOutput, STREAM_KEEPALIVE
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
@@ -412,6 +412,7 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        last_server_send_time = time.time()
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -497,6 +498,14 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                # opt22: ignore engine keepalive (15s), handle server keepalive (120s)
+                if res is STREAM_KEEPALIVE:
+                    now = time.time()
+                    if now - last_server_send_time >= 120:
+                        yield ": keepalive\n\n"
+                        last_server_send_time = now
+                    continue
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -874,6 +883,15 @@ class OpenAIServingChat(OpenAIServing):
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(actual_call, "", 1)
+                            import os as _os
+                            if _os.environ.get("VLLM_OPT23_DEBUG_LOG"):
+                                with open("/tmp/log/vllm-tool-log.txt", "a") as _tf:
+                                    _tf.write(
+                                        "opt23 serving remaining_delta: "
+                                        "expected_call=%s actual_call=%s "
+                                        "remaining=%s index=%s\n" % (
+                                            expected_call[:200], actual_call[:200],
+                                            remaining_call[:200], index))
                             # set that as a delta message
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index
@@ -939,6 +957,7 @@ class OpenAIServingChat(OpenAIServing):
 
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
+                    last_server_send_time = time.time()
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage

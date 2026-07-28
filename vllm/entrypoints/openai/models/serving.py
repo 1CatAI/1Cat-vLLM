@@ -43,6 +43,22 @@ class OpenAIModelRegistry:
         self.model_config = model_config
         self.base_model_paths = base_model_paths
 
+    def _compute_context_window(self) -> tuple[int | None, int | None]:
+        """Compute context_window and max_output_tokens from max_model_len."""
+        max_model_len = self.model_config.max_model_len
+        if max_model_len is None:
+            return None, None
+        if max_model_len < 50000:
+            context_window = int(max_model_len * 0.9)
+            max_output_tokens = int(max_model_len * 0.1)
+        elif max_model_len < 100000:
+            context_window = int(max_model_len * 0.85)
+            max_output_tokens = int(max_model_len * 0.15)
+        else:
+            context_window = int(max_model_len * 0.8)
+            max_output_tokens = int(max_model_len * 0.2)
+        return context_window, max_output_tokens
+
     def is_base_model(self, model_name: str) -> bool:
         return any(model.name == model_name for model in self.base_model_paths)
 
@@ -60,11 +76,14 @@ class OpenAIModelRegistry:
     async def show_available_models(self) -> ModelList:
         """Show available models (base models only)."""
         max_model_len = self.model_config.max_model_len
+        context_window, max_output_tokens = self._compute_context_window()
         return ModelList(
             data=[
                 ModelCard(
                     id=base_model.name,
                     max_model_len=max_model_len,
+                    context_window=context_window,
+                    max_output_tokens=max_output_tokens,
                     root=base_model.model_path,
                     permission=[ModelPermission()],
                 )

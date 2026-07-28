@@ -2112,7 +2112,7 @@ __global__ void sm70_sample_packed_top20_kernel(
   }
 }
 
-constexpr int kDynamicDraftVocabMaxTailCapacity = 512;
+constexpr int kDynamicDraftVocabMaxTailCapacity = 1536;
 
 __global__ void sm70_dynamic_draft_vocab_update_tail_kernel(
     int64_t* lru_token_ids, int64_t* local_tail_token_ids,

@@ -824,11 +824,24 @@ def initialize_dynamic_draft_vocab(
             raise ValueError(
                 "Dynamic GPU LRU is validated only with fused TP2/TP4 proposal."
             )
-        if base_size != 98_304 or tail_size != 512:
+        if base_size != 98_304:
             raise ValueError(
-                "Dynamic GPU LRU requires the validated 98,304 base plus "
-                "512 shard-local tail rows per rank."
+                "Dynamic GPU LRU requires the validated 98,304 base."
             )
+        if tail_size != 512:
+            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
+                if tail_size > 512:
+                    raise ValueError(
+                        "GPU LRU multi-concurrent tail_size exceeds "
+                        "compiled kernel limit (512 per rank)."
+                    )
+            else:
+                raise ValueError(
+                    "Dynamic GPU LRU requires the validated 512 "
+                    "shard-local tail rows per rank (got %d). "
+                    "Set VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT=1 "
+                    "for dynamic tail sizing." % tail_size
+                )
         if target_lm_head.weight.dtype != torch.float16:
             raise ValueError("Dynamic GPU LRU currently requires an FP16 LM-head.")
         if full_refresh_interval != 0:

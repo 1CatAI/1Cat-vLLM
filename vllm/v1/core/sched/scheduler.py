@@ -318,6 +318,22 @@ class Scheduler(SchedulerInterface):
             # schedule() frees the blocks (async scheduling race).
             self._re_block_ids: dict[str, list[int]] = {}
 
+        max_seqs = self.scheduler_config.max_num_seqs
+        max_batched_tokens = self.scheduler_config.max_num_batched_tokens
+        safe_threshold = int(max_batched_tokens * 0.25)
+        current_threshold = self.scheduler_config.long_prefill_token_threshold
+        if max_seqs >= 4:
+            if current_threshold == 0:
+                self.scheduler_config.long_prefill_token_threshold = safe_threshold
+                logger.info("Auto-adjusted long_prefill_token_threshold from 0 to %d",
+                            safe_threshold)
+            elif current_threshold < safe_threshold:
+                logger.warning(
+                    "long_prefill_token_threshold (%d) is below safe minimum (%d). Forcing to %d.",
+                    current_threshold, safe_threshold, safe_threshold,
+                )
+                self.scheduler_config.long_prefill_token_threshold = safe_threshold
+
         self._pause_state: PauseState = PauseState.UNPAUSED
 
     @staticmethod
@@ -491,6 +507,14 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
+        running_count = len(self.running)
+        if running_count > 0:
+            decode_per_request = self.scheduler_config.max_num_batched_tokens // running_count
+            prefill_cap = int(self.scheduler_config.max_num_batched_tokens * 0.65)
+        else:
+            decode_per_request = self.scheduler_config.max_num_batched_tokens
+            prefill_cap = self.scheduler_config.max_num_batched_tokens
+
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -553,11 +577,13 @@ class Scheduler(SchedulerInterface):
                 if (
                     tree_len > flat_len
                     and ddtree_payload_fits_output_budget
-                    and (threshold <= 0 or tree_num_new_tokens <= threshold)
-                    and tree_num_new_tokens <= token_budget
                     and tree_num_new_tokens <= max_len_tokens
                 ):
-                    num_new_tokens = tree_num_new_tokens
+                    capped = max(num_new_tokens, decode_per_request)
+                    if tree_num_new_tokens > capped:
+                        num_new_tokens = capped
+                    else:
+                        num_new_tokens = tree_num_new_tokens
                     _ddtree_debug_log(
                         "schedule expanded req=%s num_new=%d",
                         request.request_id,
@@ -887,6 +913,8 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                    if running_count > 0:
+                        num_new_tokens = min(num_new_tokens, prefill_cap)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

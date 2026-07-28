@@ -28,6 +28,14 @@ logger = init_logger(__name__)
 
 router = APIRouter()
 
+from fastapi.responses import Response
+
+
+@router.head("/v1/messages")
+@router.head("/v1/messages/count_tokens")
+async def handle_anthropic_head():
+    return Response(status_code=200)
+
 
 def messages(request: Request) -> AnthropicServingMessages:
     return request.app.state.anthropic_serving_messages

@@ -148,7 +148,7 @@ class SchedulerConfig:
     avoid gaps in GPU utilization, leading to better latency and throughput.
     """
 
-    stream_interval: int = Field(default=1, ge=1)
+    stream_interval: int = Field(default=3, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,
     while a larger value (e.g., 10) reduces host overhead and may increase throughput

@@ -25,7 +25,7 @@ from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
+from vllm.outputs import STREAM_FINISHED, STREAM_KEEPALIVE, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
@@ -573,10 +573,21 @@ class AsyncLLM(EngineClient):
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
             finished = False
+            last_send_time = time.time()
+            _KEEPALIVE_INTERVAL = 15.0
             while not finished:
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
-                out = q.get_nowait() or await q.get()
+                out = q.get_nowait()
+                if out is None:
+                    try:
+                        out = await asyncio.wait_for(
+                            q.get(), timeout=_KEEPALIVE_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        yield STREAM_KEEPALIVE
+                        last_send_time = time.time()
+                        continue
 
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
@@ -584,6 +595,7 @@ class AsyncLLM(EngineClient):
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     yield out
+                last_send_time = time.time()
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,

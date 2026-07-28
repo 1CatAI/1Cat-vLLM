@@ -582,6 +582,25 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        # MTP safety detection: if the model has no MTP layers, disable speculation
+        if self.method == "mtp" and self.target_model_config is not None:
+            hf_config = self.target_model_config.hf_text_config
+            n_predict = getattr(hf_config, "n_predict", 0) or 0
+            mtp_layers = getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
+            nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+            if n_predict <= 0 and mtp_layers <= 0 and nextn_layers <= 0:
+                logger.warning(
+                    "Model does not have MTP layers "
+                    "(n_predict=%s, mtp_num_hidden_layers=%s, "
+                    "num_nextn_predict_layers=%s). "
+                    "Disabling speculative decoding.",
+                    n_predict, mtp_layers, nextn_layers,
+                )
+                self.method = None
+                self.model = None
+                self.num_speculative_tokens = None
+                return self
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -834,6 +853,24 @@ class SpeculativeConfig:
                     )
                 )
 
+                # opt26: Auto-extend drafter max_position_embeddings
+                # to match target model max_model_len.
+                hf_config = self.draft_model_config.hf_config
+                if hf_config is not None:
+                    for pos_attr in ("max_position_embeddings", "max_position"):
+                        current_pos = getattr(hf_config, pos_attr, None)
+                        if (current_pos is not None
+                                and current_pos < self.max_model_len):
+                            setattr(hf_config, pos_attr, self.max_model_len)
+                            logger.info_once(
+                                "Extended Drafter %s from %d to %d "
+                                "to match target model max_model_len=%d.",
+                                pos_attr,
+                                current_pos,
+                                self.max_model_len,
+                                self.max_model_len,
+                            )
+
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config, self.draft_tensor_parallel_size
@@ -1007,6 +1044,8 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.method is None and self.model is None:
+            return self
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "

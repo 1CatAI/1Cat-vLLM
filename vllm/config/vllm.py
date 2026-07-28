@@ -1323,61 +1323,39 @@ class VllmConfig:
                 self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL_AND_PIECEWISE
                 )
-                if self.compilation_config.cudagraph_capture_sizes is None:
-                    cudagraph_capture_sizes = [1, 2]
-                    if (
-                        self.speculative_config is not None
-                        and self.speculative_config.num_speculative_tokens
-                    ):
-                        cudagraph_capture_sizes = (
-                            [1, 2, 4, 8, 9, 18]
-                            if self.parallel_config.tensor_parallel_size >= 4
-                            else [1, 2, 4, 8, 9]
-                        )
-                        decode_query_len = (
-                            self.speculative_config.num_speculative_state_tokens() + 1
-                        )
-                        smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
-                        if (
-                            smallq_env not in os.environ
-                            and decode_query_len
-                            > envs.VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q
-                        ):
-                            os.environ[smallq_env] = str(decode_query_len)
-                            logger.info_once(
-                                "Auto-setting %s=%s so SM70 Flash-V100 "
-                                "speculative verifier graph capture uses the "
-                                "graph-safe small-query decode branch.",
-                                smallq_env,
-                                decode_query_len,
-                            )
-                        max_graph_reqs = (
-                            4 if self.parallel_config.tensor_parallel_size >= 4 else 1
-                        )
-                        max_graph_reqs = min(
-                            max(int(self.scheduler_config.max_num_seqs), 1),
-                            max_graph_reqs,
-                        )
-                        cudagraph_capture_sizes = sorted(
-                            set(cudagraph_capture_sizes)
-                            | {
-                                decode_query_len * num_reqs
-                                for num_reqs in range(1, max_graph_reqs + 1)
-                            }
-                        )
+                # MTP 专用 cudagraph 尺寸
+                # MTP=0 时不设置，留给通用逻辑
+                if (
+                    self.compilation_config.cudagraph_capture_sizes is None
+                    and self.speculative_config is not None
+                    and self.speculative_config.num_speculative_tokens
+                ):
+                    decode_query_len = (
+                        self.speculative_config.num_speculative_state_tokens() + 1
+                    )
+                    smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
+                    if smallq_env not in os.environ and decode_query_len > envs.VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q:
+                        os.environ[smallq_env] = str(decode_query_len)
                         logger.info_once(
-                            "Using SM70 speculative verifier cudagraph shapes "
-                            "%sx1..%s for Flash-V100 compile graph.",
-                            decode_query_len,
-                            max_graph_reqs,
+                            "Auto-setting %s=%s so SM70 Flash-V100 "
+                            "speculative verifier graph capture uses the "
+                            "graph-safe small-query decode branch.",
+                            smallq_env, decode_query_len,
                         )
-                    self.compilation_config.cudagraph_capture_sizes = (
-                        cudagraph_capture_sizes
+                    max_graph_reqs = (
+                        10 if self.parallel_config.tensor_parallel_size >= 4 else 1
                     )
-                if self.compilation_config.max_cudagraph_capture_size is None:
-                    self.compilation_config.max_cudagraph_capture_size = max(
-                        self.compilation_config.cudagraph_capture_sizes
+                    max_graph_reqs = min(max(int(self.scheduler_config.max_num_seqs), 1), max_graph_reqs)
+                    cudagraph_capture_sizes = sorted(
+                        set([1, 2, 4, 8, 9, 18] if self.parallel_config.tensor_parallel_size >= 4 else [1, 2, 4, 8, 9])
+                        | {decode_query_len * num_reqs for num_reqs in range(1, max_graph_reqs + 1)}
                     )
+                    logger.info_once(
+                        "MTP cudagraph shapes %sx1..%s for Flash-V100 compile graph (decode_query_len=%s).",
+                        decode_query_len, max_graph_reqs, decode_query_len,
+                    )
+                    self.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
+                    # 不设置 max_cudagraph_capture_size，交给底包通用逻辑
                 if self.compilation_config.use_inductor_graph_partition is None:
                     self.compilation_config.use_inductor_graph_partition = False
                 self.kernel_config.ir_op_priority.rms_norm = [

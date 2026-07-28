@@ -6774,28 +6774,39 @@ class GPUModelRunner(
         if self.dynamic_draft_vocab_prefill_topk == 0:
             return None
         if self.input_batch.num_reqs != 1:
-            return None
-
-        request_id = self.input_batch.req_ids[0]
-        request_index = self.input_batch.req_id_to_index[request_id]
-        candidate_ids = (
-            self._dynamic_draft_vocab_prefill_bootstrap.maybe_prepare_candidates(
-                request_id,
-                logits,
-                topk=self.dynamic_draft_vocab_prefill_topk,
-                num_computed_tokens=int(
-                    self.input_batch.num_computed_tokens_cpu[request_index]
-                ),
-                num_scheduled_tokens=scheduler_output.num_scheduled_tokens[request_id],
-                num_prompt_tokens=int(
-                    self.input_batch.num_prompt_tokens[request_index]
-                ),
-                spec_decode_active=spec_decode_metadata is not None,
-            )
-        )
-        if candidate_ids is None:
-            return None
-        return request_id, candidate_ids
+            if not envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
+                return None
+            # opt24: multi-concurrent GPU-LRU — traverse all prefilling
+            # requests, union their top-k candidates into shared tail
+            all_candidate_ids = []
+            consumed_ids = []
+            for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                num_computed = int(
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                )
+                num_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
+                if num_computed >= num_prompt:
+                    continue  # not prefilling
+                candidate_ids = self._dynamic_draft_vocab_prefill_bootstrap.maybe_prepare_candidates(
+                    req_id,
+                    logits,
+                    topk=self.dynamic_draft_vocab_prefill_topk,
+                    num_computed_tokens=num_computed,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens.get(
+                        req_id, 0
+                    ),
+                    num_prompt_tokens=num_prompt,
+                    spec_decode_active=spec_decode_metadata is not None,
+                )
+                if candidate_ids is not None:
+                    all_candidate_ids.append(candidate_ids)
+                    consumed_ids.append(req_id)
+            if not all_candidate_ids:
+                return None
+            if len(all_candidate_ids) == 1:
+                return consumed_ids[0], all_candidate_ids[0]
+            union = torch.unique(torch.cat(all_candidate_ids))
+            return ",".join(consumed_ids), union
 
     def _commit_dynamic_draft_vocab_prefill_bootstrap(
         self,
@@ -6821,10 +6832,15 @@ class GPUModelRunner(
 
         request_id, candidate_ids = bootstrap
         update_dynamic_draft_vocab(candidate_ids, sampled_token_ids)
-        self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(request_id)
+        # opt24: handle multi-concurrent (comma-separated request IDs)
+        for rid in request_id.split(","):
+            self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(rid)
+        num_reqs = request_id.count(",") + 1
         logger.info(
-            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: topk=%d.",
+            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: "
+            "topk=%d reqs=%d.",
             self.dynamic_draft_vocab_prefill_topk,
+            num_reqs,
         )
 
     def _sample(

@@ -236,7 +236,11 @@ class SpecDecodeBaseProposer:
         )
         if draft_vocab_config.gpu_lru_enabled:
             if self.max_batch_size != 1:
-                raise ValueError("Dynamic GPU LRU requires scheduler max_num_seqs=1.")
+                logger.warning(
+                    "Dynamic GPU LRU requires scheduler max_num_seqs=1, "
+                    "but max_num_seqs=%d. Falling back to CPU LRU.",
+                    self.max_batch_size,
+                )
             if draft_vocab_config.full_refresh_interval != 0:
                 raise ValueError("Dynamic GPU LRU requires full_refresh_interval=0.")
         self.token_arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
@@ -2249,6 +2253,28 @@ class SpecDecodeBaseProposer:
         full_refresh_interval = vocab_config.full_refresh_interval
         fused_proposal_enabled = vocab_config.fused_proposal_enabled
         gpu_lru_enabled = vocab_config.gpu_lru_enabled
+        if gpu_lru_enabled and self.max_batch_size > 1:
+            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
+                # opt24: true multi-concurrent GPU-LRU
+                # total tail pool = 1536, per-rank = 1536 // tp_size
+                # shared LRU pool across all concurrent requests
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                per_rank_tail = min(512, 1536 // tp_size)
+                if vocab_config.using_defaults:
+                    dynamic_tail_size = per_rank_tail
+                logger.info(
+                    "GPU LRU multi-concurrent enabled: max_num_seqs=%d "
+                    "per_rank_tail=%d total_pool=%d",
+                    self.max_batch_size, per_rank_tail,
+                    per_rank_tail * tp_size,
+                )
+            else:
+                logger.warning(
+                    "Dynamic GPU LRU requires max_num_seqs=1, "
+                    "but max_num_seqs=%d. Disabling GPU LRU, falling back to CPU LRU.",
+                    self.max_batch_size,
+                )
+                gpu_lru_enabled = False
         if vocab_config.using_defaults:
             logger.info(
                 "Using default MTP dynamic draft vocabulary: base=%d tail=%d "

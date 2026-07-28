@@ -487,6 +487,8 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> AnthropicMessagesResponse:
         result = AnthropicMessagesResponse(
             id=generator.id,
+            type="message",
+            role="assistant",
             content=[],
             model=generator.model,
             usage=AnthropicUsage(
@@ -639,6 +641,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
                                     id=origin_chunk.id,
+                                    type="message",
+                                    role="assistant",
                                     content=[],
                                     model=origin_chunk.model,
                                     stop_reason=None,
