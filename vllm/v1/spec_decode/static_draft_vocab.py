@@ -49,6 +49,7 @@ class MTPDraftVocabConfig:
 def resolve_mtp_draft_vocab_config(
     method: str,
     tensor_parallel_size: int = 2,
+    num_speculative_tokens: int = 4,
 ) -> MTPDraftVocabConfig:
     """Resolve explicit vocabulary controls or the default MTP GPU-LRU route."""
     config = MTPDraftVocabConfig(
@@ -89,6 +90,9 @@ def resolve_mtp_draft_vocab_config(
         raise FileNotFoundError(
             f"Default MTP dynamic-vocabulary ranking asset is missing: {ranking_path}"
         )
+    # Fused proposal / GPU-LRU kernels are parameterized by num_speculative_tokens
+    # (buffers are allocated dynamically, kernels operate per-spec-step).
+    # MTP1/2/3/4 all share the same fast fused path.
     return MTPDraftVocabConfig(
         ranking_path=str(ranking_path),
         shortlist_size=98_304,
@@ -960,8 +964,10 @@ def initialize_dynamic_draft_vocab(
         sm70_ops = _get_sm70_ops()
         if tp_size not in (2, 4):
             raise ValueError("Dynamic fused proposal currently requires TP2 or TP4.")
-        if num_speculative_tokens != 4:
-            raise ValueError("Dynamic fused proposal currently requires MTP4.")
+        # num_speculative_tokens is parameterized end-to-end (buffers below
+        # are allocated by num_speculative_tokens; the fused kernels operate
+        # per-spec-step and do not hard-code the draft count).  MTP1/2/3/4
+        # are all supported.
         if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
             raise RuntimeError("Dynamic fused proposal SM70 ops are not built.")
         if gpu_lru_enabled and (
