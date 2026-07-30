@@ -58,3 +58,20 @@ def test_compressed_tensors_w4a16_fp4_min_capability_sm70():
     )
 
     assert CompressedTensorsW4A16Fp4.get_min_capability() <= 70
+
+
+def test_modelopt_w4a16_sm70_branch_imports():
+    """W4A16 SM70 TurboMind branch must resolve envs + sm70_tm at import time.
+
+    Guards against NameError on envs.VLLM_SM70_NVFP4_TURBOMIND when process_weights
+    runs on Volta (regression: branch landed without importing envs).
+    """
+    import inspect
+    from vllm.model_executor.layers.quantization import modelopt as mo
+
+    assert hasattr(mo, "envs"), "modelopt must import envs for SM70 TurboMind flag"
+    assert hasattr(mo.envs, "VLLM_SM70_NVFP4_TURBOMIND")
+    assert hasattr(mo, "sm70_tm")
+    src = inspect.getsource(mo.ModelOptNvFp4W4A16LinearMethod.process_weights_after_loading)
+    assert "sm70_tm.should_prepare_turbomind" in src
+    assert "envs.VLLM_SM70_NVFP4_TURBOMIND" in src

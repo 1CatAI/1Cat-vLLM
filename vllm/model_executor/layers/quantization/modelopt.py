@@ -69,6 +69,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_VALUE_DTYPE,
 )
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
+from vllm import envs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     create_fp8_quant_key,
