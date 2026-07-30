@@ -68,6 +68,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     MXFP8_SCALE_DTYPE,
     MXFP8_VALUE_DTYPE,
 )
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     create_fp8_quant_key,
@@ -1050,7 +1051,10 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        # SM70 (Volta): software NVFP4 via Marlin/emulation or TurboMind.
+        # Native FP4 tensor cores remain Blackwell-only; this only admits
+        # the dequant-to-half path already used on older GPUs.
+        return 70
 
     @classmethod
     def override_quantization_method(
@@ -1367,6 +1371,13 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
+        if sm70_tm.should_prepare_turbomind(
+            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
+        ):
+            # Match compressed-tensors W4A16 NVFP4: TurboMind SM70 path.
+            sm70_tm.prepare_nvfp4_linear(layer)
+            return
+
         self.kernel.process_weights_after_loading(layer)
 
     def apply(
@@ -1375,6 +1386,8 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if sm70_tm.has_prepared_linear(layer):
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
