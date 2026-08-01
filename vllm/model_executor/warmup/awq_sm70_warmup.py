@@ -641,7 +641,7 @@ def sm70_awq_warmup(worker: Worker) -> None:
             moe_layers, moe_token_counts
         )
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     logger.info(
         "SM70 TurboMind warmup finished (%d AWQ dense calls, %d FP8 dense "
         "calls, %d FP4 dense calls, %d MoE stage calls, "
