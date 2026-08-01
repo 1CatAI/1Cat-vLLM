@@ -78,9 +78,7 @@ class FixFunctionalizationPass(VllmInductorPass):
         fused_add_rms_norm_static_fp8_quant = _get_c_op(
             "fused_add_rms_norm_static_fp8_quant"
         )
-        rms_norm_dynamic_per_token_quant = _get_c_op(
-            "rms_norm_dynamic_per_token_quant"
-        )
+        rms_norm_dynamic_per_token_quant = _get_c_op("rms_norm_dynamic_per_token_quant")
         rms_norm_targets = [
             op
             for op in (

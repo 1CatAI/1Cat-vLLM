@@ -155,8 +155,7 @@ class KVBlockZeroer:
                         page_size_el = cur_page_el
                     else:
                         assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs "
-                            f"{cur_page_el}"
+                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
                         )
 
                     block_stride_bytes = cur_bytes
@@ -187,8 +186,7 @@ class KVBlockZeroer:
                         page_size_el = cur_page_el
                     else:
                         assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs "
-                            f"{cur_page_el}"
+                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
                         )
                     seg_addrs.append(dp)
 

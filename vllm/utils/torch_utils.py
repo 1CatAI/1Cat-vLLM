@@ -592,9 +592,7 @@ def create_kv_caches_with_random(
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             key_cache.uniform_(-scale, scale)
         elif cache_dtype in fp8_cache_dtypes:
-            _generate_random_fp8(
-                key_cache, -scale, scale, kv_dtype=str(cache_dtype)
-            )
+            _generate_random_fp8(key_cache, -scale, scale, kv_dtype=str(cache_dtype))
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_cache)
@@ -606,9 +604,7 @@ def create_kv_caches_with_random(
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
             value_cache.uniform_(-scale, scale)
         elif cache_dtype in fp8_cache_dtypes:
-            _generate_random_fp8(
-                value_cache, -scale, scale, kv_dtype=str(cache_dtype)
-            )
+            _generate_random_fp8(value_cache, -scale, scale, kv_dtype=str(cache_dtype))
         else:
             raise ValueError(f"Does not support value cache of type {cache_dtype}")
         value_caches.append(value_cache)

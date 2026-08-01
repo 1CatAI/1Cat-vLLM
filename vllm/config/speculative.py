@@ -295,10 +295,14 @@ class SpeculativeConfig:
         factors: list[Any] = []
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
-        uses_aux_hidden_states = self.method in (
-            "eagle3",
-            "extract_hidden_states",
-        ) or self.use_dflash()
+        uses_aux_hidden_states = (
+            self.method
+            in (
+                "eagle3",
+                "extract_hidden_states",
+            )
+            or self.use_dflash()
+        )
         factors.append(uses_aux_hidden_states)
 
         # The specific layers used also affect the computation graph

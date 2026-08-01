@@ -306,11 +306,7 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens
                 and x >= uniform_decode_query_len
-                and (
-                    self._bs_to_padded_graph_size[x]
-                    % uniform_decode_query_len
-                    == 0
-                )
+                and (self._bs_to_padded_graph_size[x] % uniform_decode_query_len == 0)
             ]
             for bs, num_active_loras in product(
                 cudagraph_capture_sizes_for_decode, lora_cases

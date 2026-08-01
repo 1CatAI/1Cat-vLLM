@@ -51,9 +51,7 @@ def _make_input(
     elif pattern == "random_small":
         generator = torch.Generator(device="cuda")
         generator.manual_seed(seed + rank)
-        tensor = (torch.rand(size, device="cuda", generator=generator) - 0.5).to(
-            dtype
-        )
+        tensor = (torch.rand(size, device="cuda", generator=generator) - 0.5).to(dtype)
     elif pattern == "model_like":
         generator = torch.Generator(device="cuda")
         generator.manual_seed(seed + rank)
@@ -292,12 +290,15 @@ def _make_gemma_rms_norm_inputs(
 
     shared_generator = torch.Generator(device="cuda")
     shared_generator.manual_seed(seed + 1009)
-    residual = torch.randn(
-        (tokens, _GEMMA_RMS_NORM_HIDDEN_SIZE),
-        device="cuda",
-        dtype=torch.float32,
-        generator=shared_generator,
-    ) * 0.03
+    residual = (
+        torch.randn(
+            (tokens, _GEMMA_RMS_NORM_HIDDEN_SIZE),
+            device="cuda",
+            dtype=torch.float32,
+            generator=shared_generator,
+        )
+        * 0.03
+    )
     residual = residual.to(residual_dtype)
     weight = (
         torch.randn(
@@ -857,9 +858,7 @@ def main() -> None:
             "custom_allreduce_disabled": False,
             "fully_connected": ca.fully_connected,
             "max_size_bytes": ca.max_size,
-            "sm70_tp4_m5_ar_threads": os.environ.get(
-                "VLLM_SM70_TP4_M5_AR_THREADS"
-            ),
+            "sm70_tp4_m5_ar_threads": os.environ.get("VLLM_SM70_TP4_M5_AR_THREADS"),
             "required_exact_patterns": sorted(require_exact_patterns),
             "required_exact_passed": not required_failures,
             "required_failures": required_failures[:16],

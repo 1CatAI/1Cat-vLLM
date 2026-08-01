@@ -17,6 +17,7 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
+
     try:
         from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
             flash_attn_varlen_func,

@@ -462,8 +462,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
                 )
 
             if modules_to_not_convert and any(
-                str(module) in ("mtp", "model.mtp")
-                for module in modules_to_not_convert
+                str(module) in ("mtp", "model.mtp") for module in modules_to_not_convert
             ):
                 return True
 

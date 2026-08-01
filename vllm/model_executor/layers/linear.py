@@ -1793,14 +1793,10 @@ class RowParallelLinear(LinearBase):
         if output is None:
             output_parallel = _maybe_sm70_dense_forward(self, input_parallel, bias_)
             if output_parallel is None:
-                output_parallel = self.quant_method.apply(
-                    self, input_parallel, bias_
-                )
+                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
             if self.reduce_results and self.tp_size > 1:
-                output = _maybe_sm70_awq_mlp_down_tile_all_reduce(
-                    self, output_parallel
-                )
+                output = _maybe_sm70_awq_mlp_down_tile_all_reduce(self, output_parallel)
                 if output is None:
                     output = tensor_model_parallel_all_reduce(output_parallel)
             else:

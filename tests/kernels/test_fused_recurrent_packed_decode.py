@@ -151,9 +151,7 @@ def test_fused_recurrent_packed_decode_cuda_graph_replay_uses_runtime_indices():
     mixed_qkv_static = torch.empty((B, qkv_dim), device=device, dtype=dtype)
     a_static = torch.empty((B, HV), device=device, dtype=dtype)
     b_static = torch.empty((B, HV), device=device, dtype=dtype)
-    state_static = torch.empty(
-        (num_state_slots, HV, V, K), device=device, dtype=dtype
-    )
+    state_static = torch.empty((num_state_slots, HV, V, K), device=device, dtype=dtype)
     indices_static = torch.empty((B,), device=device, dtype=torch.int32)
     out_static = torch.empty((B, 1, HV, V), device=device, dtype=dtype)
 
@@ -161,9 +159,7 @@ def test_fused_recurrent_packed_decode_cuda_graph_replay_uses_runtime_indices():
     warm_mixed_qkv = torch.randn((B, qkv_dim), device=device, dtype=dtype)
     warm_a = torch.randn((B, HV), device=device, dtype=dtype)
     warm_b = torch.randn((B, HV), device=device, dtype=dtype)
-    warm_state = torch.randn(
-        (num_state_slots, HV, V, K), device=device, dtype=dtype
-    )
+    warm_state = torch.randn((num_state_slots, HV, V, K), device=device, dtype=dtype)
     warm_indices = torch.tensor([0, 1, -1, -1], device=device, dtype=torch.int32)
     warm_out = torch.empty_like(out_static)
     fused_recurrent_gated_delta_rule_packed_decode(
@@ -183,9 +179,7 @@ def test_fused_recurrent_packed_decode_cuda_graph_replay_uses_runtime_indices():
     capture_mixed_qkv = torch.randn((B, qkv_dim), device=device, dtype=dtype)
     capture_a = torch.randn((B, HV), device=device, dtype=dtype)
     capture_b = torch.randn((B, HV), device=device, dtype=dtype)
-    capture_state = torch.randn(
-        (num_state_slots, HV, V, K), device=device, dtype=dtype
-    )
+    capture_state = torch.randn((num_state_slots, HV, V, K), device=device, dtype=dtype)
     capture_indices = torch.tensor([6, -1, 7, -1], device=device, dtype=torch.int32)
     mixed_qkv_static.copy_(capture_mixed_qkv)
     a_static.copy_(capture_a)

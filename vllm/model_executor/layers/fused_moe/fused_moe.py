@@ -1278,9 +1278,7 @@ def get_default_config(
                 "GROUP_SIZE_M": 8,
                 "SPLIT_K": 1,
             }
-        logger.info_once(
-            f"Using SM70 0.0.3 unquantized MoE default config: {config}"
-        )
+        logger.info_once(f"Using SM70 0.0.3 unquantized MoE default config: {config}")
     else:
         # General defaults for bf16/fp16 and fp8 per-tensor.
         # Tile sizes scale with batch: small batches are memory-bound

@@ -44,9 +44,7 @@ def _sm70_env_bool(name: str, default: bool) -> bool:
 
 
 def _sm70_lm_head_top1_default() -> bool:
-    return not _sm70_env_bool(
-        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False
-    )
+    return not _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False)
 
 
 def _trace_sm70_lm_head_skip(reason: str) -> None:
@@ -164,8 +162,7 @@ def _maybe_sm70_lm_head_top1(
         or hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out")
     ):
         logger.warning_once(
-            "SM70 LM head top1 requested, but no top1 op is available; "
-            "falling back."
+            "SM70 LM head top1 requested, but no top1 op is available; falling back."
         )
         return None
     if x.dtype != torch.float16 or not x.is_cuda:
@@ -193,9 +190,7 @@ def _maybe_sm70_lm_head_top1(
 
     values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
     indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
-    if lm_head_top1_tc and hasattr(
-        torch.ops._C, "sm70_f16_lm_head_top1_tc_out"
-    ):
+    if lm_head_top1_tc and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
         k_ld = getattr(layer, "_sm70_f16_k_ld", None)
         if tm_weight is not None and k_ld is not None:
@@ -216,9 +211,7 @@ def _maybe_sm70_lm_head_top1(
     if num_rows != 1:
         return None
 
-    if not lm_head_top1 or not hasattr(
-        torch.ops._C, "sm70_f16_lm_head_top1_out"
-    ):
+    if not lm_head_top1 or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
         return None
 
     sm70_ops.sm70_f16_lm_head_top1_out(

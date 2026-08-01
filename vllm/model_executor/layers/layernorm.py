@@ -62,11 +62,7 @@ def _sm70_gemma_fused_add_rms_norm_eager(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     orig_dtype = x.dtype
     gemma_weight = weight.float() + 1.0
-    x = (
-        x.float() + residual.float()
-        if orig_dtype == torch.float16
-        else x + residual
-    )
+    x = x.float() + residual.float() if orig_dtype == torch.float16 else x + residual
     residual_out = x
     out = ir.ops.rms_norm(x, gemma_weight, variance_epsilon)
     return out.to(orig_dtype), residual_out

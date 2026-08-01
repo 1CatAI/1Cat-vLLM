@@ -21,9 +21,9 @@ from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
-_SEEN_TP_ALLREDUCE_PATHS: set[
-    tuple[str, str, tuple[int, ...], torch.dtype, int]
-] = set()
+_SEEN_TP_ALLREDUCE_PATHS: set[tuple[str, str, tuple[int, ...], torch.dtype, int]] = (
+    set()
+)
 
 
 def _trace_all_reduce_path(
@@ -99,9 +99,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_custom_allreduce = use_custom_allreduce
         self.use_top1_custom_ar = use_top1_custom_ar
         self.use_sm70_awq_mlp_down_tile_ar = use_sm70_awq_mlp_down_tile_ar
-        self.use_sm70_awq_mlp_down_tile_overlap = (
-            use_sm70_awq_mlp_down_tile_overlap
-        )
+        self.use_sm70_awq_mlp_down_tile_overlap = use_sm70_awq_mlp_down_tile_overlap
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
 
@@ -468,18 +466,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             k_ld,
             q_ld,
             tile_numel=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL,
-            reducer_blocks=(
-                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS
-            ),
+            reducer_blocks=(envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS),
             kernel_reducer_blocks=(
                 envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS
             ),
             overlap=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM,
         )
         if out is not None:
-            _trace_all_reduce_path(
-                self, "sm70_awq_mlp_down_tile_overlap", input_
-            )
+            _trace_all_reduce_path(self, "sm70_awq_mlp_down_tile_overlap", input_)
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):

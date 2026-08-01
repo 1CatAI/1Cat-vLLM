@@ -149,8 +149,9 @@ def _cuda_graph_capture_active() -> bool:
         return False
 
 
-def _maybe_sync_top1_all_gather(module: torch.nn.Module,
-                                local_pair: torch.Tensor) -> None:
+def _maybe_sync_top1_all_gather(
+    module: torch.nn.Module, local_pair: torch.Tensor
+) -> None:
     raw_steps = envs.VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS
     if not raw_steps or not local_pair.is_cuda:
         return
@@ -254,8 +255,8 @@ class LogitsProcessor(PluggableLayer):
         pre_stream_sync_ms = 0.0
         pre_device_extra_sync_ms = 0.0
         if profile_enabled:
-            pre_stream_sync_ms, pre_device_extra_sync_ms = (
-                _cuda_sync_breakdown_ms(hidden_states)
+            pre_stream_sync_ms, pre_device_extra_sync_ms = _cuda_sync_breakdown_ms(
+                hidden_states
             )
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
 
@@ -313,9 +314,7 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = get_tensor_model_parallel_world_size()
 
-        local_top1 = lm_head.maybe_get_sm70_lm_head_top1(
-            hidden_states, embedding_bias
-        )
+        local_top1 = lm_head.maybe_get_sm70_lm_head_top1(hidden_states, embedding_bias)
         if local_top1 is None:
             logits = lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
@@ -394,14 +393,12 @@ class LogitsProcessor(PluggableLayer):
         pre_stream_sync_ms = 0.0
         pre_device_extra_sync_ms = 0.0
         if profile_enabled:
-            pre_stream_sync_ms, pre_device_extra_sync_ms = (
-                _cuda_sync_breakdown_ms(hidden_states)
+            pre_stream_sync_ms, pre_device_extra_sync_ms = _cuda_sync_breakdown_ms(
+                hidden_states
             )
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
         stage_start = _cuda_stage_start(profile_enabled)
-        logits = lm_head.quant_method.apply(
-            lm_head, hidden_states, bias=embedding_bias
-        )
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
         local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
         stage_start = _cuda_stage_start(profile_enabled)
@@ -528,15 +525,13 @@ class LogitsProcessor(PluggableLayer):
         pre_stream_sync_ms = 0.0
         pre_device_extra_sync_ms = 0.0
         if profile_enabled:
-            pre_stream_sync_ms, pre_device_extra_sync_ms = (
-                _cuda_sync_breakdown_ms(hidden_states)
+            pre_stream_sync_ms, pre_device_extra_sync_ms = _cuda_sync_breakdown_ms(
+                hidden_states
             )
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
 
         stage_start = _cuda_stage_start(profile_enabled)
-        logits = lm_head.quant_method.apply(
-            lm_head, hidden_states, bias=embedding_bias
-        )
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
         local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
         stage_start = _cuda_stage_start(profile_enabled)

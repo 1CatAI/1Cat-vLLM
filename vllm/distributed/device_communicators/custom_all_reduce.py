@@ -282,9 +282,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(
-            inp, residual, weight
-        ):
+        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(inp, residual, weight):
             raise RuntimeError("SM70 TP2 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)

@@ -77,10 +77,7 @@ def _maybe_dump_sm70_sampler_logits(
             ],
         },
         path
-        / (
-            f"sampler_logits_pid{os.getpid()}"
-            f"_step{_SM70_LOGITS_DUMP_COUNTER:04d}.pt"
-        ),
+        / (f"sampler_logits_pid{os.getpid()}_step{_SM70_LOGITS_DUMP_COUNTER:04d}.pt"),
     )
 
 

@@ -28,10 +28,7 @@ def is_fp4_marlin_supported():
         return False
     if current_platform.has_device_capability(75):
         return True
-    return (
-        current_platform.is_device_capability((7, 0))
-        and ops.sm70_marlin_available()
-    )
+    return current_platform.is_device_capability((7, 0)) and ops.sm70_marlin_available()
 
 
 def _nvfp4_compute_scale_factor(

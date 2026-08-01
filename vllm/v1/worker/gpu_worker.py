@@ -220,9 +220,9 @@ class Worker(WorkerBase):
             yield
             return
 
-        set_allocator_settings = getattr(torch._C,
-                                         "_accelerator_setAllocatorSettings",
-                                         None)
+        set_allocator_settings = getattr(
+            torch._C, "_accelerator_setAllocatorSettings", None
+        )
         if set_allocator_settings is None:
             yield
             return

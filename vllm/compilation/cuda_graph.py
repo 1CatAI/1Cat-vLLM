@@ -192,8 +192,7 @@ class CUDAGraphWrapper:
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self.check_input_addresses = (
-            self.is_debugging_mode
-            or envs.VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG
+            self.is_debugging_mode or envs.VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG
         )
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 

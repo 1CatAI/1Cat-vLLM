@@ -51,10 +51,12 @@ def _load_prompts(args: argparse.Namespace) -> list[dict[str, str]]:
             )
         for index, item in enumerate(loaded):
             if isinstance(item, str):
-                prompts.append({
-                    "id": f"external_{index + 1:02d}",
-                    "content": item,
-                })
+                prompts.append(
+                    {
+                        "id": f"external_{index + 1:02d}",
+                        "content": item,
+                    }
+                )
             elif isinstance(item, dict):
                 raw_content = item.get("content", item.get("prompt"))
                 if not isinstance(raw_content, str):
@@ -62,10 +64,12 @@ def _load_prompts(args: argparse.Namespace) -> list[dict[str, str]]:
                         "--prompts-json dict entries require string "
                         "'content' or 'prompt'"
                     )
-                prompts.append({
-                    "id": str(item.get("id", f"external_{index + 1:02d}")),
-                    "content": raw_content,
-                })
+                prompts.append(
+                    {
+                        "id": str(item.get("id", f"external_{index + 1:02d}")),
+                        "content": raw_content,
+                    }
+                )
             else:
                 raise TypeError("--prompts-json entries must be strings or objects")
     if not prompts:
@@ -147,27 +151,24 @@ def _collect_serving_counters(metrics_text: str) -> dict[str, float]:
     return counters
 
 
-def _metrics_snapshot(metrics_url: str | None,
-                      timeout: float) -> dict[str, float] | None:
+def _metrics_snapshot(
+    metrics_url: str | None, timeout: float
+) -> dict[str, float] | None:
     if metrics_url is None:
         return None
     return _collect_serving_counters(_get_text(metrics_url, timeout))
 
 
-def _counter_delta(before: dict[str, float] | None,
-                   after: dict[str, float] | None) -> dict[str, Any] | None:
+def _counter_delta(
+    before: dict[str, float] | None, after: dict[str, float] | None
+) -> dict[str, Any] | None:
     if before is None or after is None:
         return None
     keys = sorted(set(before) | set(after))
-    delta = {
-        key: after.get(key, 0.0) - before.get(key, 0.0)
-        for key in keys
-    }
+    delta = {key: after.get(key, 0.0) - before.get(key, 0.0) for key in keys}
     drafts = delta.get("vllm:spec_decode_num_drafts_total", 0.0)
     draft_tokens = delta.get("vllm:spec_decode_num_draft_tokens_total", 0.0)
-    accepted_tokens = delta.get(
-        "vllm:spec_decode_num_accepted_tokens_total", 0.0
-    )
+    accepted_tokens = delta.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
     generation_tokens = delta.get("vllm:generation_tokens_total", 0.0)
     prompt_tokens = delta.get("vllm:prompt_tokens_total", 0.0)
     per_position = [
@@ -275,7 +276,7 @@ def _max_repeated_window(text: str, width: int) -> int:
         return 0
     counts: dict[str, int] = {}
     for idx in range(0, len(normalized) - width + 1):
-        window = normalized[idx:idx + width]
+        window = normalized[idx : idx + width]
         if len(window.strip()) < width // 2:
             continue
         counts[window] = counts.get(window, 0) + 1
@@ -299,9 +300,9 @@ def _max_same_line_run(text: str) -> int:
     return best
 
 
-def _quality_metrics(text: str | None,
-                     raw_token_ids: Any,
-                     completion_tokens: Any = None) -> dict[str, Any]:
+def _quality_metrics(
+    text: str | None, raw_token_ids: Any, completion_tokens: Any = None
+) -> dict[str, Any]:
     text = text or ""
     token_ids = [int(token_id) for token_id in (raw_token_ids or [])]
     if token_ids:
@@ -361,8 +362,9 @@ def _quality_metrics(text: str | None,
     return metrics
 
 
-def _summarize_tps(records: list[dict[str, Any]],
-                   elapsed_seconds: float) -> dict[str, Any]:
+def _summarize_tps(
+    records: list[dict[str, Any]], elapsed_seconds: float
+) -> dict[str, Any]:
     completion_tokens = [
         int(record["timing"]["completion_tokens"]) for record in records
     ]
@@ -381,27 +383,28 @@ def _summarize_tps(records: list[dict[str, Any]],
     if request_tps:
         sorted_tps = sorted(request_tps)
         p90_index = min(len(sorted_tps) - 1, math.ceil(0.9 * len(sorted_tps)) - 1)
-        summary.update({
-            "request_tps_min": min(request_tps),
-            "request_tps_mean": statistics.fmean(request_tps),
-            "request_tps_median": statistics.median(request_tps),
-            "request_tps_p90": sorted_tps[p90_index],
-            "request_tps_max": max(request_tps),
-        })
+        summary.update(
+            {
+                "request_tps_min": min(request_tps),
+                "request_tps_mean": statistics.fmean(request_tps),
+                "request_tps_median": statistics.median(request_tps),
+                "request_tps_p90": sorted_tps[p90_index],
+                "request_tps_max": max(request_tps),
+            }
+        )
     return summary
 
 
 def _summarize_spec_metrics(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     per_request = [
-        record.get("serving_metrics_delta") for record in records
+        record.get("serving_metrics_delta")
+        for record in records
         if record.get("serving_metrics_delta") is not None
     ]
     if not per_request:
         return None
     total_drafts = sum(float(item["num_drafts"]) for item in per_request)
-    total_draft_tokens = sum(
-        float(item["num_draft_tokens"]) for item in per_request
-    )
+    total_draft_tokens = sum(float(item["num_draft_tokens"]) for item in per_request)
     total_accepted_tokens = sum(
         float(item["num_accepted_tokens"]) for item in per_request
     )
@@ -417,17 +420,16 @@ def _summarize_spec_metrics(records: list[dict[str, Any]]) -> dict[str, Any] | N
             total_accepted_tokens / total_drafts if total_drafts > 0 else None
         ),
         "mean_acceptance_length": (
-            1.0 + total_accepted_tokens / total_drafts
-            if total_drafts > 0 else None
+            1.0 + total_accepted_tokens / total_drafts if total_drafts > 0 else None
         ),
         "draft_acceptance_rate": (
             total_accepted_tokens / total_draft_tokens
-            if total_draft_tokens > 0 else None
+            if total_draft_tokens > 0
+            else None
         ),
         "accepted_tokens_per_pos": per_position,
         "per_position_acceptance_rate": [
-            value / total_drafts if total_drafts > 0 else None
-            for value in per_position
+            value / total_drafts if total_drafts > 0 else None for value in per_position
         ],
     }
 
@@ -456,18 +458,22 @@ def _dump(args: argparse.Namespace) -> int:
             "stream": False,
         }
         if args.endpoint == "chat":
-            payload["messages"] = [{
-                "role": "user",
-                "content": prompt["content"],
-            }]
+            payload["messages"] = [
+                {
+                    "role": "user",
+                    "content": prompt["content"],
+                }
+            ]
         else:
-            payload.update({
-                "prompt": prompt["content"],
-                "logprobs": args.logprobs,
-                "return_token_ids": True,
-                "return_tokens_as_token_ids": True,
-                "prompt_logprobs": args.prompt_logprobs,
-            })
+            payload.update(
+                {
+                    "prompt": prompt["content"],
+                    "logprobs": args.logprobs,
+                    "return_token_ids": True,
+                    "return_tokens_as_token_ids": True,
+                    "prompt_logprobs": args.prompt_logprobs,
+                }
+            )
         if args.seed is not None:
             payload["seed"] = args.seed
         if args.top_k is not None:
@@ -482,35 +488,36 @@ def _dump(args: argparse.Namespace) -> int:
         choice = _extract_choice(response)
         usage = response.get("usage") or {}
         completion_tokens = int(
-            usage.get("completion_tokens")
-            or len(choice.get("token_ids") or [])
+            usage.get("completion_tokens") or len(choice.get("token_ids") or [])
         )
         prompt_tokens = usage.get("prompt_tokens")
         total_tokens = usage.get("total_tokens")
         completion_tps = (
             completion_tokens / request_elapsed if request_elapsed > 0 else None
         )
-        records.append({
-            "index": index,
-            "id": prompt["id"],
-            "prompt": prompt["content"],
-            "request": payload,
-            "response": response,
-            "choice": choice,
-            "timing": {
-                "elapsed_seconds": request_elapsed,
-                "completion_tokens": completion_tokens,
-                "prompt_tokens": prompt_tokens,
-                "total_tokens": total_tokens,
-                "completion_tokens_per_second": completion_tps,
-            },
-            "serving_metrics_delta": _counter_delta(metrics_before, metrics_after),
-            "metrics": _quality_metrics(
-                choice.get("text"),
-                choice.get("token_ids"),
-                completion_tokens,
-            ),
-        })
+        records.append(
+            {
+                "index": index,
+                "id": prompt["id"],
+                "prompt": prompt["content"],
+                "request": payload,
+                "response": response,
+                "choice": choice,
+                "timing": {
+                    "elapsed_seconds": request_elapsed,
+                    "completion_tokens": completion_tokens,
+                    "prompt_tokens": prompt_tokens,
+                    "total_tokens": total_tokens,
+                    "completion_tokens_per_second": completion_tps,
+                },
+                "serving_metrics_delta": _counter_delta(metrics_before, metrics_after),
+                "metrics": _quality_metrics(
+                    choice.get("text"),
+                    choice.get("token_ids"),
+                    completion_tokens,
+                ),
+            }
+        )
     elapsed = time.perf_counter() - start
     quality_passed = all(record["metrics"]["passed"] for record in records)
     throughput_summary = _summarize_tps(records, elapsed)
@@ -561,9 +568,13 @@ def _dump(args: argparse.Namespace) -> int:
         "records": records,
     }
     args.out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({k: v for k, v in payload.items() if k != "records"},
-                     indent=2,
-                     sort_keys=True))
+    print(
+        json.dumps(
+            {k: v for k, v in payload.items() if k != "records"},
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0 if quality_passed or not args.require_quality_gate else 2
 
 
@@ -626,7 +637,7 @@ def _token_logprobs(choice: dict[str, Any]) -> list[float | None]:
 def _normal_logprob_key(key: Any) -> str:
     text = str(key)
     if text.startswith("token_id:"):
-        return text[len("token_id:"):]
+        return text[len("token_id:") :]
     return text
 
 
@@ -678,8 +689,7 @@ def _diff_top_logprob_maps(
     }
 
 
-def _diff_values(left: list[float | None],
-                 right: list[float | None]) -> dict[str, Any]:
+def _diff_values(left: list[float | None], right: list[float | None]) -> dict[str, Any]:
     diffs: list[float] = []
     same_count = len(left) == len(right)
     for left_value, right_value in zip(left, right, strict=False):
@@ -695,8 +705,9 @@ def _diff_values(left: list[float | None],
     }
 
 
-def _first_mismatch(left: list[int] | None,
-                    right: list[int] | None) -> dict[str, Any] | None:
+def _first_mismatch(
+    left: list[int] | None, right: list[int] | None
+) -> dict[str, Any] | None:
     if left is None or right is None:
         return None if left == right else {"index": 0, "left": left, "right": right}
     for index, (left_id, right_id) in enumerate(zip(left, right, strict=False)):
@@ -719,22 +730,26 @@ def _load_logits_dumps(path: Path) -> list[dict[str, Any]]:
     for file_path in sorted(path.glob("sampler_logits_*.pt")):
         payload = torch.load(file_path, map_location="cpu", weights_only=False)
         logits = payload["logits"].float()
-        entries.append({
-            "path": str(file_path),
-            "step": int(payload["step"]),
-            "pid": payload.get("pid"),
-            "stage": payload.get("stage"),
-            "shape": list(payload.get("shape", tuple(logits.shape))),
-            "dtype": payload.get("dtype"),
-            "all_greedy": bool(payload.get("all_greedy")),
-            "output_token_ids": payload.get("output_token_ids"),
-            "logits": logits,
-        })
-    entries.sort(key=lambda item: (
-        int(item["step"]),
-        str(item.get("stage")),
-        str(item["path"]),
-    ))
+        entries.append(
+            {
+                "path": str(file_path),
+                "step": int(payload["step"]),
+                "pid": payload.get("pid"),
+                "stage": payload.get("stage"),
+                "shape": list(payload.get("shape", tuple(logits.shape))),
+                "dtype": payload.get("dtype"),
+                "all_greedy": bool(payload.get("all_greedy")),
+                "output_token_ids": payload.get("output_token_ids"),
+                "logits": logits,
+            }
+        )
+    entries.sort(
+        key=lambda item: (
+            int(item["step"]),
+            str(item.get("stage")),
+            str(item["path"]),
+        )
+    )
     return entries
 
 
@@ -753,7 +768,8 @@ def _compare_logits_dirs(left_dir: Path, right_dir: Path) -> dict[str, Any]:
     num_argmax_mismatch = 0
     first_argmax_mismatch = None
     for index, (left, right) in enumerate(
-            zip(left_entries, right_entries, strict=False)):
+        zip(left_entries, right_entries, strict=False)
+    ):
         shape_equal = tuple(left["logits"].shape) == tuple(right["logits"].shape)
         all_shape_equal = all_shape_equal and shape_equal
         payload = {
@@ -787,15 +803,17 @@ def _compare_logits_dirs(left_dir: Path, right_dir: Path) -> dict[str, Any]:
             global_max = max(global_max, max_diff)
             total_sum += float(diff.sum().item())
             total_count += int(diff.numel())
-            payload.update({
-                "max_abs_diff": max_diff,
-                "mean_abs_diff": mean_diff,
-                "argmax_equal": argmax_equal,
-                "argmax_first_mismatch": _first_mismatch(
-                    left_argmax.reshape(-1).tolist(),
-                    right_argmax.reshape(-1).tolist(),
-                ),
-            })
+            payload.update(
+                {
+                    "max_abs_diff": max_diff,
+                    "mean_abs_diff": mean_diff,
+                    "argmax_equal": argmax_equal,
+                    "argmax_first_mismatch": _first_mismatch(
+                        left_argmax.reshape(-1).tolist(),
+                        right_argmax.reshape(-1).tolist(),
+                    ),
+                }
+            )
         else:
             all_argmax_equal = False
         comparisons.append(payload)
@@ -831,11 +849,12 @@ def _compare(args: argparse.Namespace) -> int:
     output_top_logprob_diffs: list[float] = []
     prompt_perplexity_diffs: list[float] = []
     for index, (left_record, right_record) in enumerate(
-            zip(left["records"], right["records"], strict=False)):
+        zip(left["records"], right["records"], strict=False)
+    ):
         left_choice = left_record["choice"]
         right_choice = right_record["choice"]
-        prompt_equal = (
-            left_choice.get("prompt_token_ids") == right_choice.get("prompt_token_ids")
+        prompt_equal = left_choice.get("prompt_token_ids") == right_choice.get(
+            "prompt_token_ids"
         )
         output_equal = left_choice.get("token_ids") == right_choice.get("token_ids")
         text_equal = left_choice.get("text") == right_choice.get("text")
@@ -870,32 +889,35 @@ def _compare(args: argparse.Namespace) -> int:
         left_ppl_value = left_ppl["perplexity"]
         right_ppl_value = right_ppl["perplexity"]
         prompt_perplexity_abs_diff = (
-            None if left_ppl_value is None or right_ppl_value is None else
-            abs(float(left_ppl_value) - float(right_ppl_value))
+            None
+            if left_ppl_value is None or right_ppl_value is None
+            else abs(float(left_ppl_value) - float(right_ppl_value))
         )
         if prompt_perplexity_abs_diff is not None:
             prompt_perplexity_diffs.append(prompt_perplexity_abs_diff)
-        pairs.append({
-            "index": index,
-            "prompt_equal": prompt_equal,
-            "output_equal": output_equal,
-            "text_equal": text_equal,
-            "prompt_first_mismatch": _first_mismatch(
-                left_choice.get("prompt_token_ids"),
-                right_choice.get("prompt_token_ids"),
-            ),
-            "output_first_mismatch": _first_mismatch(
-                left_choice.get("token_ids"),
-                right_choice.get("token_ids"),
-            ),
-            "prompt_logprob_diff": prompt_diff,
-            "output_logprob_diff": output_diff,
-            "prompt_top_logprob_diff": prompt_top_diff,
-            "output_top_logprob_diff": output_top_diff,
-            "left_prompt_perplexity": left_ppl,
-            "right_prompt_perplexity": right_ppl,
-            "prompt_perplexity_abs_diff": prompt_perplexity_abs_diff,
-        })
+        pairs.append(
+            {
+                "index": index,
+                "prompt_equal": prompt_equal,
+                "output_equal": output_equal,
+                "text_equal": text_equal,
+                "prompt_first_mismatch": _first_mismatch(
+                    left_choice.get("prompt_token_ids"),
+                    right_choice.get("prompt_token_ids"),
+                ),
+                "output_first_mismatch": _first_mismatch(
+                    left_choice.get("token_ids"),
+                    right_choice.get("token_ids"),
+                ),
+                "prompt_logprob_diff": prompt_diff,
+                "output_logprob_diff": output_diff,
+                "prompt_top_logprob_diff": prompt_top_diff,
+                "output_top_logprob_diff": output_top_diff,
+                "left_prompt_perplexity": left_ppl,
+                "right_prompt_perplexity": right_ppl,
+                "prompt_perplexity_abs_diff": prompt_perplexity_abs_diff,
+            }
+        )
 
     sampler_logits_diff = (
         _compare_logits_dirs(args.left_logits_dir, args.right_logits_dir)
@@ -962,15 +984,9 @@ def _model_quality_gate(
         "token_equal": token_equal,
         "prompt_logprob_max_abs_diff": result.get("max_prompt_logprob_diff"),
         "output_logprob_max_abs_diff": result.get("max_output_logprob_diff"),
-        "prompt_top_logprob_max_abs_diff": result.get(
-            "max_prompt_top_logprob_diff"
-        ),
-        "output_top_logprob_max_abs_diff": result.get(
-            "max_output_top_logprob_diff"
-        ),
-        "prompt_perplexity_max_abs_diff": result.get(
-            "max_prompt_perplexity_abs_diff"
-        ),
+        "prompt_top_logprob_max_abs_diff": result.get("max_prompt_top_logprob_diff"),
+        "output_top_logprob_max_abs_diff": result.get("max_output_top_logprob_diff"),
+        "prompt_perplexity_max_abs_diff": result.get("max_prompt_perplexity_abs_diff"),
         "sampler_logits_max_abs_diff": None
         if sampler_logits_diff is None
         else sampler_logits_diff.get("max_abs_diff"),

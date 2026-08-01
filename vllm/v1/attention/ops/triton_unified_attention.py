@@ -558,9 +558,7 @@ def kernel_unified_attention(
             if PV_INPUT_PRECISION == "":
                 acc += tl.dot(P.to(V.dtype), V)
             else:
-                acc += tl.dot(
-                    P.to(V.dtype), V, input_precision=PV_INPUT_PRECISION
-                )
+                acc += tl.dot(P.to(V.dtype), V, input_precision=PV_INPUT_PRECISION)
 
     # ---- Epilogue ---------------------------------------------------------
     if IS_3D:
@@ -920,12 +918,8 @@ def unified_attention(
         sm70_prefill_tile_size = envs.VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE
         sm70_decode_tile_size = envs.VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE
         sm70_num_warps = envs.VLLM_SM70_TRITON_ATTN_NUM_WARPS
-        sm70_prefill_num_warps = (
-            envs.VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS
-        )
-        sm70_decode_num_warps = (
-            envs.VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS
-        )
+        sm70_prefill_num_warps = envs.VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS
+        sm70_decode_num_warps = envs.VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS
         sm70_safe_defaults = envs.VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS
         sm70_qk_input_precision = _validate_sm70_triton_attn_input_precision(
             envs.VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION,

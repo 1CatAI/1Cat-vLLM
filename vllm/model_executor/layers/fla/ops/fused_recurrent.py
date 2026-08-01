@@ -56,9 +56,7 @@ def _round_num_warps(value: int) -> int:
     return 8
 
 
-_SM70_FLA_RECURRENT_SCHEDULE = (
-    os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1") == "1"
-)
+_SM70_FLA_RECURRENT_SCHEDULE = os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1") == "1"
 _SM70_FLA_BV_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_BV")
 _SM70_FLA_WARPS_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_WARPS")
 _SM70_FLA_STAGES_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_STAGES")

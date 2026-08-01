@@ -695,9 +695,7 @@ class GroupCoordinator:
             raise RuntimeError("Device communicator lacks SM70 fused AR RMSNorm")
         return fused_op(input_, residual, weight, epsilon)
 
-    def sm70_awq_mlp_down_tile_all_reduce(
-        self, input_: torch.Tensor
-    ) -> torch.Tensor:
+    def sm70_awq_mlp_down_tile_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
 

@@ -71,27 +71,38 @@ def main() -> None:
     dtype = torch.float16
     scale = args.dim**-0.5
 
-    q = (torch.randn(1, args.tokens, args.q_heads, args.dim,
-                     device=device, dtype=dtype) * 0.05).contiguous()
+    q = (
+        torch.randn(1, args.tokens, args.q_heads, args.dim, device=device, dtype=dtype)
+        * 0.05
+    ).contiguous()
     k = (torch.randn_like(q) * 0.05).contiguous()
-    v = (torch.randn(1, args.tokens, args.v_heads, args.dim,
-                     device=device, dtype=dtype) * 0.1).contiguous()
-    g = (torch.randn(1, args.tokens, args.v_heads,
-                     device=device, dtype=torch.float32) * 0.02 - 0.04).contiguous()
-    beta = torch.rand(1, args.tokens, args.v_heads,
-                      device=device, dtype=torch.float32).contiguous()
+    v = (
+        torch.randn(1, args.tokens, args.v_heads, args.dim, device=device, dtype=dtype)
+        * 0.1
+    ).contiguous()
+    g = (
+        torch.randn(1, args.tokens, args.v_heads, device=device, dtype=torch.float32)
+        * 0.02
+        - 0.04
+    ).contiguous()
+    beta = torch.rand(
+        1, args.tokens, args.v_heads, device=device, dtype=torch.float32
+    ).contiguous()
     cu_seqlens = torch.tensor([0, args.tokens], device=device, dtype=torch.int32)
     state_indices = torch.tensor([args.state_index], device=device, dtype=torch.long)
     has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
 
-    base_state_cache = (torch.randn(
-        args.state_slots,
-        args.v_heads,
-        args.dim,
-        args.dim,
-        device=device,
-        dtype=torch.float32,
-    ) * 0.01).contiguous()
+    base_state_cache = (
+        torch.randn(
+            args.state_slots,
+            args.v_heads,
+            args.dim,
+            args.dim,
+            device=device,
+            dtype=torch.float32,
+        )
+        * 0.01
+    ).contiguous()
     gather_cache = base_state_cache.clone()
     indexed_cache = base_state_cache.clone()
     gather_out = torch.empty_like(v)
@@ -150,8 +161,9 @@ def main() -> None:
 
     correctness = {
         "out": _diff(gather_result, indexed_result),
-        "state_slot": _diff(gather_cache[args.state_index],
-                            indexed_cache[args.state_index]),
+        "state_slot": _diff(
+            gather_cache[args.state_index], indexed_cache[args.state_index]
+        ),
     }
     if args.state_slots > 1:
         untouched_index = 0 if args.state_index != 0 else args.state_slots - 1

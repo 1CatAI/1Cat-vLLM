@@ -480,15 +480,11 @@ class AutoGPTQLinearMethod(LinearMethodBase):
                     group_size=self.quant_config.group_size,
                 )
                 layer.qweight = torch.nn.Parameter(
-                    torch.empty(
-                        0, dtype=torch.int32, device=layer.qweight.device
-                    ),
+                    torch.empty(0, dtype=torch.int32, device=layer.qweight.device),
                     requires_grad=False,
                 )
                 layer.qzeros = torch.nn.Parameter(
-                    torch.empty(
-                        0, dtype=torch.int32, device=layer.scales.device
-                    ),
+                    torch.empty(0, dtype=torch.int32, device=layer.scales.device),
                     requires_grad=False,
                 )
                 layer.scales = torch.nn.Parameter(
@@ -498,9 +494,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
                     requires_grad=False,
                 )
                 layer.g_idx = torch.nn.Parameter(
-                    torch.empty(
-                        0, dtype=torch.int32, device=layer.scales.device
-                    ),
+                    torch.empty(0, dtype=torch.int32, device=layer.scales.device),
                     requires_grad=False,
                 )
                 logger.info_once("SM70 GPTQ TurboMind dense path enabled.")

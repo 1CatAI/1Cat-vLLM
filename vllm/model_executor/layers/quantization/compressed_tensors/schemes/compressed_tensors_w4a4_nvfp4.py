@@ -25,10 +25,7 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
 def _explicit_nvfp4_emulation_requested() -> bool:
-    if (
-        envs.VLLM_USE_NVFP4_CT_EMULATIONS
-        or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation"
-    ):
+    if envs.VLLM_USE_NVFP4_CT_EMULATIONS or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation":
         return True
 
     from vllm.config import get_current_vllm_config_or_none

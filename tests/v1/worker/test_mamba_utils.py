@@ -689,9 +689,7 @@ class TestPostprocessMambaFusedKernel:
         torch.manual_seed(20260617)
 
         accepted = [1, 2, 3, 4, 5]
-        req_ids = [f"same_{i}" for i in accepted] + [
-            f"cross_{i}" for i in accepted
-        ]
+        req_ids = [f"same_{i}" for i in accepted] + [f"cross_{i}" for i in accepted]
         num_accepted_tokens = accepted + accepted
         # scheduled=5 and draft=4 gives running_state = computed + 1.
         num_scheduled_tokens = {req_id: 5 for req_id in req_ids}
@@ -742,9 +740,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
-        block_table_gpu = torch.zeros(
-            len(req_ids), 8, dtype=torch.int32, device=device
-        )
+        block_table_gpu = torch.zeros(len(req_ids), 8, dtype=torch.int32, device=device)
         for i, block_ids in enumerate(block_ids_per_req):
             block_table_gpu[i, : len(block_ids)] = torch.tensor(
                 block_ids, dtype=torch.int32, device=device

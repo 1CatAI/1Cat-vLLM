@@ -57,9 +57,7 @@ def should_prepare_turbomind_or_marlin(
     tensor: torch.Tensor,
     default_enabled: bool,
 ) -> bool:
-    return is_exact_sm70_cuda(
-        tensor, use_turbomind(default_enabled) or forces_marlin()
-    )
+    return is_exact_sm70_cuda(tensor, use_turbomind(default_enabled) or forces_marlin())
 
 
 def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:
@@ -146,8 +144,7 @@ def prepare_gptq_linear(
 ) -> None:
     if group_size not in GPTQ_GROUP_SIZES:
         raise RuntimeError(
-            "SM70 TurboMind GPTQ supports group_size 128, "
-            f"but got {group_size}."
+            f"SM70 TurboMind GPTQ supports group_size 128, but got {group_size}."
         )
     if not hasattr(torch.ops._C, "uint4_sm70_prepare"):
         raise RuntimeError(
@@ -251,9 +248,13 @@ def prepare_nvfp4_linear(
 
     qweight = unpack_mxfp4_weight(layer.weight.data)
     scales = (
-        layer.weight_scale.data.t().to(torch.float32)
-        * layer.weight_global_scale.to(torch.float32)
-    ).to(torch.float16).contiguous()
+        (
+            layer.weight_scale.data.t().to(torch.float32)
+            * layer.weight_global_scale.to(torch.float32)
+        )
+        .to(torch.float16)
+        .contiguous()
+    )
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
     )

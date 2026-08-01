@@ -116,6 +116,7 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
     raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
     if raw is None:
@@ -281,15 +282,9 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             ba_start = z_start + z_size
             a_start = ba_start + ba_size
             mixed_qkv = mixed_qkvzba[..., :qkv_size]
-            z = _sm70_compile_graph_slice_dim(
-                mixed_qkvzba, -1, z_start, z_size
-            )
-            b = _sm70_compile_graph_slice_dim(
-                mixed_qkvzba, -1, ba_start, ba_size
-            )
-            a = _sm70_compile_graph_slice_dim(
-                mixed_qkvzba, -1, a_start, ba_size
-            )
+            z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
+            b = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, ba_start, ba_size)
+            a = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, a_start, ba_size)
 
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
