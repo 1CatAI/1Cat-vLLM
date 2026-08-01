@@ -3,7 +3,7 @@
 import os
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, SupportsInt, cast
 
 import torch
 import torch.nn.functional as F
@@ -190,7 +190,7 @@ def dump_sm70_moe_runner_graph_buffers(step: int, stage: str) -> None:
         meta = _SM70_MOE_RUNNER_DUMP_META.get(key, {})
         label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
         layer_type = str(meta.get("layer_type", "moe_runner"))
-        layer_idx = int(meta.get("layer_idx", -1))
+        layer_idx = int(cast(SupportsInt, meta.get("layer_idx", -1)))
         shape = "x".join(str(dim) for dim in tuple(buffer.shape))
         path = os.path.join(
             dump_dir,

@@ -305,14 +305,20 @@ class Step3p5MTPProposer(EagleProposer):
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
+        (
+            cudagraph_runtime_mode,
+            num_input_tokens,
+            num_tokens_across_dp,
+            batch_descriptor,
+        ) = self._determine_batch_execution_and_padding(num_tokens)
+        first_batch_descriptor = self._batch_descriptor_for_spec_step(
+            batch_descriptor, 0
         )
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
         )
-        model_kwargs["spec_step_idx"] = 0
+        model_kwargs["spec_step_idx"] = first_batch_descriptor.graph_variant
 
         with set_forward_context(
             per_layer_attn_metadata,
@@ -320,6 +326,7 @@ class Step3p5MTPProposer(EagleProposer):
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=first_batch_descriptor,
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
@@ -369,9 +376,12 @@ class Step3p5MTPProposer(EagleProposer):
 
         draft_token_ids_list = [draft_token_ids]
 
-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
-            self._determine_batch_execution_and_padding(batch_size)
-        )
+        (
+            cudagraph_runtime_mode,
+            input_batch_size,
+            batch_size_across_dp,
+            batch_descriptor,
+        ) = self._determine_batch_execution_and_padding(batch_size)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -389,6 +399,9 @@ class Step3p5MTPProposer(EagleProposer):
         assert block_size > 0, "block_size has not been initialized."
         for token_index in range(self.num_speculative_tokens - 1):
             spec_step_idx = token_index + 1
+            step_batch_descriptor = self._batch_descriptor_for_spec_step(
+                batch_descriptor, spec_step_idx
+            )
             input_ids = draft_token_ids_list[-1].int()
 
             if not self.constant_draft_positions:
@@ -422,7 +435,7 @@ class Step3p5MTPProposer(EagleProposer):
                 "input_ids": input_ids,
                 "positions": self._get_positions(input_batch_size),
                 "inputs_embeds": inputs_embeds,
-                "spec_step_idx": spec_step_idx,
+                "spec_step_idx": step_batch_descriptor.graph_variant,
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
@@ -433,6 +446,7 @@ class Step3p5MTPProposer(EagleProposer):
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=step_batch_descriptor,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
                 ret_hidden_states = self.model(**model_kwargs)

@@ -50,12 +50,8 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
         and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY
     )
     fp8_dynamic = has_fp8_dense and envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
-    mxfp4_dynamic = (
-        "mxfp4" in fp4_kinds and envs.VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES
-    )
-    nvfp4_dynamic = (
-        "nvfp4" in fp4_kinds and envs.VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES
-    )
+    mxfp4_dynamic = "mxfp4" in fp4_kinds and envs.VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES
+    nvfp4_dynamic = "nvfp4" in fp4_kinds and envs.VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES
     return awq_no_preserve or fp8_dynamic or mxfp4_dynamic or nvfp4_dynamic
 
 
@@ -72,9 +68,7 @@ def _load_lut_cache(device: torch.device, skip_import: bool = False) -> int:
         )
         return 0
     if not Path(path).exists():
-        logger.info(
-            "No SM70 GEMM LUT cache found at %s for device %s.", path, device
-        )
+        logger.info("No SM70 GEMM LUT cache found at %s for device %s.", path, device)
         return 0
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
@@ -393,9 +387,7 @@ def _warmup_moe_dense_stage_layers(
         dense_expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
         for num_tokens in token_counts:
             total_slots = num_tokens * top_k
-            expert_offsets = _build_balanced_offsets(
-                total_slots, num_experts, device
-            )
+            expert_offsets = _build_balanced_offsets(total_slots, num_experts, device)
             permuted_input = torch.empty(
                 (total_slots, int(layer.sm70_w13_k_dim)),
                 dtype=torch.float16,
@@ -550,9 +542,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
                 (1, hidden_size), dtype=torch.float16, device=device
             )
             legacy_output.zero_()
-            legacy_offsets = torch.empty(
-                top_k + 1, dtype=torch.int32, device=device
-            )
+            legacy_offsets = torch.empty(top_k + 1, dtype=torch.int32, device=device)
             sm70_ops.awq_moe_single_token_sm70_out(
                 legacy_output,
                 x,
@@ -590,7 +580,9 @@ def sm70_awq_warmup(worker: Worker) -> None:
         return
 
     device = worker.device
-    if device.type != "cuda" or torch.cuda.get_device_capability(device) != (7, 0):
+    if device is None or (
+        device.type != "cuda" or torch.cuda.get_device_capability(device) != (7, 0)
+    ):
         return
 
     model = worker.get_model()
@@ -598,9 +590,7 @@ def sm70_awq_warmup(worker: Worker) -> None:
     fp8_dense_layers = list(_iter_unique_fp8_dense_layers(model))
     fp4_dense_layers = list(_iter_unique_fp4_dense_layers(model))
     moe_layers = list(_iter_unique_moe_layers(model))
-    if not (
-        dense_layers or fp8_dense_layers or fp4_dense_layers or moe_layers
-    ):
+    if not (dense_layers or fp8_dense_layers or fp4_dense_layers or moe_layers):
         return
 
     fp4_kinds = {str(state.op_kind) for state in fp4_dense_layers}
@@ -637,9 +627,7 @@ def sm70_awq_warmup(worker: Worker) -> None:
         dense_calls = _warmup_dense_layers(dense_layers, m_values)
         fp8_dense_calls = _warmup_fp8_dense_layers(fp8_dense_layers, m_values)
         fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
-        moe_stage_calls = _warmup_moe_dense_stage_layers(
-            moe_layers, moe_token_counts
-        )
+        moe_stage_calls = _warmup_moe_dense_stage_layers(moe_layers, moe_token_counts)
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
     torch.cuda.synchronize(device)
     logger.info(

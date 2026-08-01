@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
+from typing import TypeAlias
 
 import torch
 
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-DraftProbTokenIds = Sequence[Sequence[int]] | torch.Tensor
+DraftProbTokenIds: TypeAlias = Sequence[Sequence[int]] | torch.Tensor
 
 
 def _assert_cached_tokens_match(
@@ -38,7 +39,7 @@ def _assert_cached_tokens_match(
 def clone_draft_prob_token_ids(
     draft_token_ids: Sequence[Sequence[int]] | torch.Tensor,
 ) -> DraftProbTokenIds:
-    if torch.is_tensor(draft_token_ids):
+    if isinstance(draft_token_ids, torch.Tensor):
         return draft_token_ids.detach().clone()
     return [list(token_ids) for token_ids in draft_token_ids]
 
@@ -70,7 +71,7 @@ def get_aligned_draft_probs(
             "Cached draft probability row count does not match request ids: "
             f"rows={draft_probs.shape[0]}, req_ids={len(draft_prob_req_ids)}."
         )
-    if torch.is_tensor(draft_prob_token_ids):
+    if isinstance(draft_prob_token_ids, torch.Tensor):
         if draft_prob_token_ids.ndim != 2:
             raise RuntimeError(
                 "Cached draft probability token ids must have shape "
@@ -126,7 +127,7 @@ def get_aligned_draft_probs(
         expected_tokens = spec_decode_metadata.draft_token_ids[
             draft_token_offset : draft_token_offset + num_draft
         ]
-        if torch.is_tensor(draft_prob_token_ids):
+        if isinstance(draft_prob_token_ids, torch.Tensor):
             if draft_prob_token_ids.shape[1] < num_draft:
                 raise RuntimeError(
                     "Cached draft probability token ids do not have enough "

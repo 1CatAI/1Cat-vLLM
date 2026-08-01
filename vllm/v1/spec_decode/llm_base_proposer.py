@@ -176,7 +176,9 @@ class SpecDecodeBaseProposer:
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
         self.draft_model_config = self.speculative_config.draft_model_config
-        self.method = self.speculative_config.method
+        method = self.speculative_config.method
+        assert method is not None
+        self.method: str = method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
 
         self.device = device
@@ -992,7 +994,9 @@ class SpecDecodeBaseProposer:
             self._static_draft_vocab.begin_proposal()
         batch_size = common_attn_metadata.batch_size()
         common_attn_metadata = _clone_drafter_mutable_metadata(common_attn_metadata)
-        profile_events = [] if self._sm70_mtp_profile_enabled() else None
+        profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
+            [] if self._sm70_mtp_profile_enabled() else None
+        )
         profile_cpu_ms: dict[str, float] = {}
         profile_wall_start = time.perf_counter() if profile_events is not None else 0.0
         profile_total_start = self._sm70_mtp_profile_start(profile_events)
@@ -2305,6 +2309,7 @@ class SpecDecodeBaseProposer:
         if target_lm_head is None or not hasattr(target_lm_head, "weight"):
             raise ValueError("MTP model does not expose a shared target LM-head.")
 
+        runtime: StaticDraftVocabRuntime | DynamicDraftVocabRuntime
         if dynamic_tail_size:
             runtime = initialize_dynamic_draft_vocab(
                 target_lm_head,
@@ -2676,10 +2681,12 @@ def compute_probs_and_sample_next_token(
         top_k,
         top_p,
     ):
+        top_k_cpu = sampling_metadata.top_k_cpu
+        assert top_k_cpu is not None
         return _compute_sparse_topk_draft_probs_and_sample_next_token(
             logits,
             sampling_metadata,
-            int(sampling_metadata.top_k_cpu[0]),
+            int(top_k_cpu[0]),
         )
 
     logits = apply_top_k_top_p(logits, top_k, top_p)

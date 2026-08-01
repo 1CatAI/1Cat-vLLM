@@ -3,7 +3,7 @@
 
 import torch
 
-from vllm.v1.spec_decode.ddtree_payload import payload_from_tree
+from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload, payload_from_tree
 from vllm.v1.spec_decode.ddtree_sampler import (
     greedy_sample_ddtree_payloads,
     greedy_sample_ddtree_payloads_from_top_tokens,
@@ -12,7 +12,7 @@ from vllm.v1.spec_decode.ddtree_sampler import (
 from vllm.v1.spec_decode.ddtree_tree import build_ddtree
 
 
-def _payload() -> object:
+def _payload() -> DDTreeDraftPayload:
     tree = build_ddtree(
         [
             [(11, 0.0), (12, -0.1)],

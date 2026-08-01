@@ -387,6 +387,11 @@ class DynamicDraftVocabRuntime(StaticDraftVocabRuntime):
         )
         if self.tp_group is None or any(tensor is None for tensor in tensors):
             raise RuntimeError("Dynamic fused proposal buffers are not initialized.")
+        assert self.fused_exponentials is not None
+        assert self.fused_sampled_tokens is not None
+        assert self.fused_sparse_ids is not None
+        assert self.fused_sparse_probs is not None
+        assert self.fused_dense_probs is not None
 
         sm70_ops = _get_sm70_ops()
         sm70_ops.sm70_f16_lm_head_top20_tc_out(

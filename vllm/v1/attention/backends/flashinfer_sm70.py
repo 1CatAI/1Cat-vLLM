@@ -587,17 +587,9 @@ class FlashInferSM70Impl(FlashAttnV100Impl):
     ):
         if attn_metadata is None:
             self.last_route_proof = None
-            return super().forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-            )
+            assert output is not None
+            _record_route("metadata_none_zero_output")
+            return output.fill_(0)
 
         decision = self._validate_route_proof(attn_metadata)
         attn_metadata.flashinfer_sm70_dispatch_observed = None

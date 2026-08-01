@@ -491,6 +491,7 @@ class FlexAttentionMetadata:
         layout of the query and key/value tensors.
         """
         assert self.doc_ids is not None
+        doc_ids = self.doc_ids
 
         def final_mask_mod(
             b: torch.Tensor,
@@ -499,14 +500,14 @@ class FlexAttentionMetadata:
             physical_kv_idx: torch.Tensor,
         ) -> torch.Tensor:
             (is_valid, logical_q_idx, logical_kv_idx) = (
-                self._convert_physical_to_logical(self.doc_ids, q_idx, physical_kv_idx)
+                self._convert_physical_to_logical(doc_ids, q_idx, physical_kv_idx)
             )
             base_mask = self.logical_mask_mod(b, h, logical_q_idx, logical_kv_idx)
             if (
                 self.ddtree_parent_ids is not None
                 and self.ddtree_num_tree_tokens is not None
             ):
-                q_req = self.doc_ids[q_idx]
+                q_req = doc_ids[q_idx]
                 base_mask = ddtree_logical_mask(
                     base_mask=base_mask,
                     q_req=q_req,
@@ -904,9 +905,10 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+        *,
         ddtree_parent_ids: torch.Tensor | None = None,
         ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
-        fast_build: bool = False,
     ) -> FlexAttentionMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
