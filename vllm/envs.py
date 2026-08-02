@@ -192,7 +192,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
-    VLLM_SM70_NVFP4_LINEAR_ATTN: Literal["auto", "tm", "dequant"] = "auto"
+    VLLM_SM70_NVFP4_LINEAR_ATTN: Literal["auto", "tm", "dequant"] = "tm"
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
@@ -788,20 +788,65 @@ SM70_NVFP4_LINEAR_ATTN_MODES = ("auto", "tm", "dequant")
 SM70Nvfp4LinearAttnMode = Literal["auto", "tm", "dequant"]
 
 
+def _checkpoint_sm70_linear_attn_mode() -> SM70Nvfp4LinearAttnMode | None:
+    """Read optional ``quantization_config.sm70_linear_attn`` from the HF config.
+
+    Stamped at quant/validate time so fragile checkpoints self-declare
+    ``"dequant"`` without requiring operators to set an env var.
+    """
+    try:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        model_config = vllm_config.model_config
+        candidates: list[object] = []
+        hf = getattr(model_config, "hf_config", None)
+        if hf is not None:
+            candidates.append(getattr(hf, "quantization_config", None))
+        arch = getattr(model_config, "model_arch_config", None)
+        if arch is not None:
+            candidates.append(getattr(arch, "quantization_config", None))
+        for qc in candidates:
+            if not isinstance(qc, dict):
+                continue
+            raw = qc.get("sm70_linear_attn") or qc.get("sm70_nvfp4_linear_attn")
+            if raw is None:
+                continue
+            value = str(raw).strip().lower()
+            if value in SM70_NVFP4_LINEAR_ATTN_MODES:
+                return cast(SM70Nvfp4LinearAttnMode, value)
+    except Exception:
+        return None
+    return None
+
+
 def get_sm70_nvfp4_linear_attn_mode() -> SM70Nvfp4LinearAttnMode:
     """Policy for hybrid GDN ``linear_attn`` NVFP4 linears on SM70.
 
-    auto: TurboMind when scale-health passes, else load-time dequant
-    tm: always TurboMind for hybrid candidates
-    dequant: always dequant hybrid candidates (safe for fragile bases)
+    Resolution order:
+      1. Explicit env ``VLLM_SM70_NVFP4_LINEAR_ATTN`` (override)
+      2. Checkpoint stamp ``quantization_config.sm70_linear_attn``
+      3. Default ``tm`` (speed; Aggressive-proven hybrid-on-TM)
+
+    Modes:
+      tm: always TurboMind for hybrid candidates (default)
+      dequant: always load-time dequant → half GEMM (fragile bases)
+      auto: experimental scale-health heuristic (not a quality oracle;
+            prefer stamping the checkpoint over relying on auto)
     """
-    value = os.getenv("VLLM_SM70_NVFP4_LINEAR_ATTN", "auto").strip().lower()
-    if value not in SM70_NVFP4_LINEAR_ATTN_MODES:
-        raise ValueError(
-            "VLLM_SM70_NVFP4_LINEAR_ATTN must be one of auto, tm, dequant; "
-            f"got {value!r}."
-        )
-    return cast(SM70Nvfp4LinearAttnMode, value)
+    if "VLLM_SM70_NVFP4_LINEAR_ATTN" in os.environ:
+        value = os.environ["VLLM_SM70_NVFP4_LINEAR_ATTN"].strip().lower()
+        if value not in SM70_NVFP4_LINEAR_ATTN_MODES:
+            raise ValueError(
+                "VLLM_SM70_NVFP4_LINEAR_ATTN must be one of auto, tm, dequant; "
+                f"got {value!r}."
+            )
+        return cast(SM70Nvfp4LinearAttnMode, value)
+
+    stamped = _checkpoint_sm70_linear_attn_mode()
+    if stamped is not None:
+        return stamped
+    return "tm"
 
 
 def env_list_with_choices(

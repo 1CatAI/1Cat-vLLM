@@ -326,14 +326,17 @@ def apply_prepared_linear(
 # Hybrid linear-attention (GatedDeltaNet) policy for SM70 NVFP4
 # ---------------------------------------------------------------------------
 # Qwen3.6 hybrid layers expose NVFP4-able linears under ``*.linear_attn.*``.
-# Aggressive-style checkpoints often run those on TurboMind safely; abliterated
-# Medium/TC builds can emit garbage if forced through the fused path. Policy:
-#   VLLM_SM70_NVFP4_LINEAR_ATTN=auto|tm|dequant  (default: auto)
-#     auto    – TM when scale-health passes, else load-time dequant → half GEMM
-#     tm      – always TurboMind for hybrid candidates
-#     dequant – always dequant hybrid candidates (safe default for fragile bases)
+# Aggressive-style checkpoints run those on TurboMind safely; abliterated
+# Medium/TC builds can garbage if forced through the fused path.
 #
-# Non-candidate dense linears are unchanged (TM when enabled).
+# Policy resolution (see envs.get_sm70_nvfp4_linear_attn_mode):
+#   1. env VLLM_SM70_NVFP4_LINEAR_ATTN=tm|dequant|auto  (override)
+#   2. checkpoint quantization_config.sm70_linear_attn stamp
+#   3. default tm  (speed; do not tax the good case)
+#
+# Stamp fragile builds at quant time, e.g.:
+#   quantization_config["sm70_linear_attn"] = "dequant"
+# so operators need no env. Non-candidate dense linears always use TM.
 
 DEQUANT_ATTR = "_sm70_nvfp4_dequant_weight"
 HYBRID_LINEAR_ATTN_LEAVES = (
@@ -394,9 +397,26 @@ def has_dequant_linear(layer: torch.nn.Module) -> bool:
     return getattr(layer, DEQUANT_ATTR, None) is not None
 
 
+def _resolve_dequant_dtype(layer: torch.nn.Module) -> torch.dtype:
+    """Prefer the layer/model compute dtype over a hardcoded fp16."""
+    for attr in ("params_dtype", "dtype"):
+        dt = getattr(layer, attr, None)
+        if isinstance(dt, torch.dtype) and dt in (torch.float16, torch.bfloat16):
+            return dt
+    try:
+        from vllm.config import get_current_vllm_config
+
+        dt = get_current_vllm_config().model_config.dtype
+        if dt in (torch.float16, torch.bfloat16):
+            return dt
+    except Exception:
+        pass
+    return torch.float16
+
+
 def prepare_nvfp4_dequant_linear(
     layer: torch.nn.Module,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype | None = None,
 ) -> None:
     """Load-time dequant of packed NVFP4 weights to half/bf16 for F.linear."""
     from vllm.logger import init_logger
@@ -405,6 +425,8 @@ def prepare_nvfp4_dequant_linear(
     )
 
     logger = init_logger(__name__)
+    if dtype is None:
+        dtype = _resolve_dequant_dtype(layer)
     weight = layer.weight.data
     scale = layer.weight_scale.data
     global_scale = layer.weight_global_scale.data
@@ -436,10 +458,15 @@ def prepare_nvfp4_dequant_linear(
     layer.weight_scale = Parameter(
         torch.empty(0, dtype=torch.float8_e4m3fn, device=device), requires_grad=False
     )
+    if hasattr(layer, "weight_global_scale"):
+        layer.weight_global_scale = Parameter(
+            torch.empty(0, dtype=torch.float32, device=device), requires_grad=False
+        )
     logger.info_once(
         "SM70 NVFP4 hybrid linear_attn dequant path enabled "
-        "(VLLM_SM70_NVFP4_LINEAR_ATTN=%s).",
+        "(mode=%s, dtype=%s).",
         hybrid_linear_attn_mode(),
+        dtype,
     )
 
 
@@ -449,7 +476,10 @@ def apply_dequant_linear(
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
     w = getattr(layer, DEQUANT_ATTR)
-    return F.linear(x, w.to(dtype=x.dtype), bias)
+    # Weight already dequanted to compute dtype; cast only if mismatch.
+    if w.dtype != x.dtype:
+        w = w.to(dtype=x.dtype)
+    return F.linear(x, w, bias)
 
 
 def should_dequant_hybrid_linear_attn(layer: torch.nn.Module) -> bool:
@@ -474,7 +504,7 @@ def try_prepare_sm70_nvfp4_linear(layer: torch.nn.Module) -> bool:
         return False
 
     if should_dequant_hybrid_linear_attn(layer):
-        prepare_nvfp4_dequant_linear(layer, dtype=torch.float16)
+        prepare_nvfp4_dequant_linear(layer)
         return True
 
     from vllm.logger import init_logger
@@ -483,7 +513,7 @@ def try_prepare_sm70_nvfp4_linear(layer: torch.nn.Module) -> bool:
     if is_hybrid_linear_attn_nvfp4_candidate(layer):
         logger.info_once(
             "SM70 NVFP4 hybrid linear_attn TurboMind path enabled "
-            "(VLLM_SM70_NVFP4_LINEAR_ATTN=%s).",
+            "(mode=%s).",
             hybrid_linear_attn_mode(),
         )
     else:
