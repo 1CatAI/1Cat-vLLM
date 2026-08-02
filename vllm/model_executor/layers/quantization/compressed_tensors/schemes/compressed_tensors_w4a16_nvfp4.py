@@ -88,10 +88,9 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         # Rename weight_packed to weight that marlin expects
         layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
         del layer.weight_packed
-        # ct stores the inverse of what is expected by the marlin kernel
-        layer.weight_global_scale = Parameter(
-            1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
-        )
+        # Global scale: Aggressive uses 1/disk_global; Medium/TC tiny-block
+        # exports need global=1.0 (do not fold into fp8 block scales).
+        sm70_tm.normalize_nvfp4_global_scale_for_sm70(layer)
 
         # SM70 TurboMind / hybrid linear_attn dequant policy.
         if sm70_tm.try_prepare_sm70_nvfp4_linear(layer):

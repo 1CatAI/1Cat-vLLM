@@ -134,10 +134,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         layer.input_global_scale = Parameter(
             (1.0 / input_global_scale_inv).to(torch.float32), requires_grad=False
         )
-        weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
-        layer.weight_global_scale = Parameter(
-            1.0 / weight_global_scale, requires_grad=False
-        )
+        # Weight global: Medium/TC tiny-block → 1.0; Aggressive → 1/disk.
+        sm70_tm.normalize_nvfp4_global_scale_for_sm70(layer)
 
         # Pre-compute alpha and inverse for runtime quantization
         layer.input_global_scale_inv = Parameter(

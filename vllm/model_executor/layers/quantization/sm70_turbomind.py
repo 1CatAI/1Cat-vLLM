@@ -241,11 +241,18 @@ def prepare_mxfp4_linear(
 
 
 # Block-scale magnitude threshold for NVFP4 scale-convention detection.
-# Aggressive-style CT exports fold magnitude into FP8 block scales (often
-# O(1)–448). Later GPTQ exports (Medium/TC/cyber) leave tiny block scales
-# (max ≪ 1) with a large disk global; after CT's ``global := 1/disk_global``,
-# multiplying block*global underflows (~1e-6) and produces token salad.
-# Detect tiny block scales and skip the global factor for SM70 combine.
+#
+# Aggressive CT exports fold magnitude into FP8 block scales (often O(1)–448)
+# with a large disk global; CT then stores ``global := 1/disk_global`` and
+# TM/dequant do ``e2m1 * block * global`` (= block/disk_global).
+#
+# Medium/TC/cyber GPTQ exports leave *tiny* block scales (max ≪ 1) that
+# already hold the true per-block scale, but still ship a large disk global.
+# Applying 1/disk_global then multiplies under-scales weights by ~G → salad.
+#
+# Fix (do NOT do ``weight_scale *= global`` — that overflows fp8-e4m3 at 448):
+# set ``weight_global_scale = 1.0`` (fp32) and leave block scales untouched.
+# See /rivet-shared/plans/nvfp4-medium-scale-fix.md.
 _NVFP4_TINY_BLOCK_SCALE_MAX = 1.0
 
 
@@ -263,37 +270,73 @@ def nvfp4_block_scales_are_tiny(layer: torch.nn.Module) -> bool:
     return float(scf.abs().max().item()) < _NVFP4_TINY_BLOCK_SCALE_MAX
 
 
+def normalize_nvfp4_global_scale_for_sm70(layer: torch.nn.Module) -> None:
+    """Rewrite ``weight_global_scale`` for SM70-safe dequant/TM combine.
+
+    Call **before** CT's usual ``global := 1/disk_global`` (or instead of it):
+
+    - Tiny block scales (Medium/TC): set global to **1.0** (identity). Block
+      scales already hold the true per-block value; do not touch weight_scale
+      (fp8 overflow if you fold global into block scales without clamping).
+    - Large block scales (Aggressive): ``global := 1/disk_global`` (existing CT
+      convention expected by TurboMind / Marlin).
+    """
+    from vllm.logger import init_logger
+
+    if not hasattr(layer, "weight_global_scale"):
+        return
+    raw = layer.weight_global_scale.detach().float()
+    if raw.numel() == 0:
+        return
+    device = layer.weight_global_scale.device
+    if nvfp4_block_scales_are_tiny(layer):
+        layer.weight_global_scale = Parameter(
+            torch.ones(1, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+        init_logger(__name__).info_once(
+            "SM70 NVFP4: tiny block-scale convention (max |weight_scale| < 1); "
+            "set weight_global_scale=1.0 (leave block scales untouched). "
+            "Fixes Medium/TC GPTQ under-scale without fp8 overflow."
+        )
+        return
+    # Aggressive / folded-block convention: CT stores the reciprocal.
+    g = float(raw.reshape(-1).max().item())
+    layer.weight_global_scale = Parameter(
+        torch.tensor([1.0 / g], dtype=torch.float32, device=device),
+        requires_grad=False,
+    )
+
+
 def combine_nvfp4_scales_for_sm70_tm(layer: torch.nn.Module) -> torch.Tensor:
     """Combine block + global scales for ``nvfp4_sm70_prepare``.
 
-    CT ``process_weights`` stores ``weight_global_scale = 1/disk_global``.
-    TurboMind then does ``block * global``. That matches Aggressive exports
-    (large block scales). Tiny-block exports already encode the effective
-    scale in the block tensor — multiplying by inverted global again is wrong.
+    Expects ``weight_global_scale`` already normalized via
+    ``normalize_nvfp4_global_scale_for_sm70`` (or equivalent). Always
+    ``block * global``; for Medium, global is 1.0 so this is a no-op multiply.
     """
     block = layer.weight_scale.data.t().to(torch.float32)
-    if nvfp4_block_scales_are_tiny(layer):
-        from vllm.logger import init_logger
-
-        init_logger(__name__).info_once(
-            "SM70 NVFP4: tiny block-scale convention detected "
-            "(max |weight_scale| < 1); combining without global factor "
-            "so Medium/TC GPTQ checkpoints match Aggressive effective scale."
-        )
-        return block.to(torch.float16).contiguous()
     g = layer.weight_global_scale.to(torch.float32)
+    # Safety net if a caller skipped normalize_*: treat as identity global.
+    if nvfp4_block_scales_are_tiny(layer):
+        g_abs = float(g.detach().float().abs().max().item()) if g.numel() else 1.0
+        # After proper normalize, g is 1.0. If still ~1/disk_global (≪ 1), skip.
+        if g_abs < 0.5:
+            return block.to(torch.float16).contiguous()
     return (block * g).to(torch.float16).contiguous()
 
 
 def resolve_nvfp4_global_for_dequant(layer: torch.nn.Module) -> torch.Tensor:
-    """Global scale for ``dequantize_to_dtype`` (also does block * global)."""
+    """Global scale for ``dequantize_to_dtype`` (``block * global``)."""
     global_scale = layer.weight_global_scale.data
     if global_scale.numel() > 1:
         global_scale = global_scale.reshape(-1).max().reshape(1)
     else:
         global_scale = global_scale.reshape(1)
     if nvfp4_block_scales_are_tiny(layer):
-        return torch.ones(1, dtype=torch.float32, device=global_scale.device)
+        g_abs = float(global_scale.detach().float().abs().max().item())
+        if g_abs < 0.5:
+            return torch.ones(1, dtype=torch.float32, device=global_scale.device)
     return global_scale.to(torch.float32)
 
 
