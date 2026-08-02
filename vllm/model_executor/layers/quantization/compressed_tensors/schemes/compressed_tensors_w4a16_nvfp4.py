@@ -93,24 +93,8 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
-            logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path "
-                "enabled."
-            )
-            sm70_tm.prepare_nvfp4_linear(layer)
-            layer.weight = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
-                requires_grad=False,
-            )
-            layer.weight_scale = Parameter(
-                torch.empty(
-                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
-                ),
-                requires_grad=False,
-            )
+        # SM70 TurboMind / hybrid linear_attn dequant policy.
+        if sm70_tm.try_prepare_sm70_nvfp4_linear(layer):
             return
 
         prepare_fp4_layer_for_marlin(layer)
@@ -121,8 +105,9 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
+        out = sm70_tm.try_apply_sm70_nvfp4_linear(layer, x, bias)
+        if out is not None:
+            return out
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,

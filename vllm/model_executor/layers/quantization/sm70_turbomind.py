@@ -3,8 +3,11 @@
 
 from dataclasses import dataclass
 from typing import Literal
+from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 
 from vllm import envs
 
@@ -318,3 +321,199 @@ def apply_prepared_linear(
     if bias is not None:
         out.add_(bias)
     return out.reshape(out_shape)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid linear-attention (GatedDeltaNet) policy for SM70 NVFP4
+# ---------------------------------------------------------------------------
+# Qwen3.6 hybrid layers expose NVFP4-able linears under ``*.linear_attn.*``.
+# Aggressive-style checkpoints often run those on TurboMind safely; abliterated
+# Medium/TC builds can emit garbage if forced through the fused path. Policy:
+#   VLLM_SM70_NVFP4_LINEAR_ATTN=auto|tm|dequant  (default: auto)
+#     auto    – TM when scale-health passes, else load-time dequant → half GEMM
+#     tm      – always TurboMind for hybrid candidates
+#     dequant – always dequant hybrid candidates (safe default for fragile bases)
+#
+# Non-candidate dense linears are unchanged (TM when enabled).
+
+DEQUANT_ATTR = "_sm70_nvfp4_dequant_weight"
+HYBRID_LINEAR_ATTN_LEAVES = (
+    "in_proj_qkv",
+    "in_proj_z",
+    "out_proj",
+)
+
+
+def _layer_prefix(layer: torch.nn.Module) -> str:
+    return str(getattr(layer, "prefix", "") or "")
+
+
+def is_hybrid_linear_attn_nvfp4_candidate(layer: torch.nn.Module) -> bool:
+    """True for GDN linears that are commonly NVFP4-packed (not a/b/norm/conv)."""
+    prefix = _layer_prefix(layer)
+    if "linear_attn" not in prefix:
+        return False
+    leaf = prefix.rsplit(".", 1)[-1]
+    return leaf in HYBRID_LINEAR_ATTN_LEAVES
+
+
+def hybrid_linear_attn_mode() -> Literal["auto", "tm", "dequant"]:
+    return envs.get_sm70_nvfp4_linear_attn_mode()
+
+
+def nvfp4_scale_health_ok(layer: torch.nn.Module) -> bool:
+    """Cheap finite / dynamic-range check on NVFP4 scales before TM prepare."""
+    try:
+        if not hasattr(layer, "weight_scale") or not hasattr(layer, "weight_global_scale"):
+            return False
+        gs = layer.weight_global_scale.detach().float().reshape(-1)
+        if gs.numel() == 0 or not torch.isfinite(gs).all():
+            return False
+        gmax = float(gs.abs().max().item())
+        gmin = float(gs.abs().clamp_min(1e-30).min().item())
+        if gmax > 1e6 or gmin < 1e-12:
+            return False
+        sc = layer.weight_scale.detach()
+        if sc.dtype == torch.float8_e4m3fn:
+            scf = sc.to(torch.float32)
+        else:
+            scf = sc.float()
+        if not torch.isfinite(scf).all():
+            return False
+        pos = scf.abs()
+        pos = pos[pos > 0]
+        if pos.numel() > 0:
+            ratio = float((pos.max() / pos.min().clamp_min(1e-30)).item())
+            if ratio > 1e6:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def has_dequant_linear(layer: torch.nn.Module) -> bool:
+    return getattr(layer, DEQUANT_ATTR, None) is not None
+
+
+def prepare_nvfp4_dequant_linear(
+    layer: torch.nn.Module,
+    dtype: torch.dtype = torch.float16,
+) -> None:
+    """Load-time dequant of packed NVFP4 weights to half/bf16 for F.linear."""
+    from vllm.logger import init_logger
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        dequantize_to_dtype,
+    )
+
+    logger = init_logger(__name__)
+    weight = layer.weight.data
+    scale = layer.weight_scale.data
+    global_scale = layer.weight_global_scale.data
+    # PerTensorScaleParameter may be multi-element for fused shards; take max.
+    if global_scale.numel() > 1:
+        global_scale = global_scale.reshape(-1).max().reshape(1)
+    else:
+        global_scale = global_scale.reshape(1)
+
+    # CT/ModelOpt packed layout is linear (non-swizzled) after loader rename.
+    w_hp = dequantize_to_dtype(
+        weight.contiguous(),
+        scale.contiguous(),
+        global_scale.contiguous(),
+        dtype=dtype,
+        block_size=NVFP4_GROUP_SIZE,
+        swizzle=False,
+    )
+    setattr(
+        layer,
+        DEQUANT_ATTR,
+        Parameter(w_hp.contiguous(), requires_grad=False),
+    )
+    # Drop packed tensors to free VRAM (match TM prepare cleanup).
+    device = w_hp.device
+    layer.weight = Parameter(
+        torch.empty(0, dtype=torch.uint8, device=device), requires_grad=False
+    )
+    layer.weight_scale = Parameter(
+        torch.empty(0, dtype=torch.float8_e4m3fn, device=device), requires_grad=False
+    )
+    logger.info_once(
+        "SM70 NVFP4 hybrid linear_attn dequant path enabled "
+        "(VLLM_SM70_NVFP4_LINEAR_ATTN=%s).",
+        hybrid_linear_attn_mode(),
+    )
+
+
+def apply_dequant_linear(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    w = getattr(layer, DEQUANT_ATTR)
+    return F.linear(x, w.to(dtype=x.dtype), bias)
+
+
+def should_dequant_hybrid_linear_attn(layer: torch.nn.Module) -> bool:
+    if not is_hybrid_linear_attn_nvfp4_candidate(layer):
+        return False
+    mode = hybrid_linear_attn_mode()
+    if mode == "dequant":
+        return True
+    if mode == "tm":
+        return False
+    # auto
+    return not nvfp4_scale_health_ok(layer)
+
+
+def try_prepare_sm70_nvfp4_linear(layer: torch.nn.Module) -> bool:
+    """Prepare SM70 NVFP4 for a linear layer.
+
+    Returns True if the layer was handled (TurboMind or hybrid dequant).
+    Callers should fall back to Marlin / default kernels when False.
+    """
+    if not should_prepare_turbomind(layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND):
+        return False
+
+    if should_dequant_hybrid_linear_attn(layer):
+        prepare_nvfp4_dequant_linear(layer, dtype=torch.float16)
+        return True
+
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+    if is_hybrid_linear_attn_nvfp4_candidate(layer):
+        logger.info_once(
+            "SM70 NVFP4 hybrid linear_attn TurboMind path enabled "
+            "(VLLM_SM70_NVFP4_LINEAR_ATTN=%s).",
+            hybrid_linear_attn_mode(),
+        )
+    else:
+        logger.info_once(
+            "SM70 compressed-tensors/ModelOpt NVFP4 TurboMind W4A16 dense path "
+            "enabled."
+        )
+    prepare_nvfp4_linear(layer)
+    # Free packed storage after TM prepare (weights live in STATE_ATTR).
+    device = layer.weight.device
+    layer.weight = Parameter(
+        torch.empty(0, dtype=torch.uint8, device=device), requires_grad=False
+    )
+    if hasattr(layer, "weight_scale"):
+        layer.weight_scale = Parameter(
+            torch.empty(0, dtype=torch.float8_e4m3fn, device=device),
+            requires_grad=False,
+        )
+    return True
+
+
+def try_apply_sm70_nvfp4_linear(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Apply SM70 NVFP4 path if prepared; else return None."""
+    if has_dequant_linear(layer):
+        return apply_dequant_linear(layer, x, bias)
+    if has_prepared_linear(layer):
+        return apply_prepared_linear(layer, x, bias)
+    return None

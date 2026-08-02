@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
+    VLLM_SM70_NVFP4_LINEAR_ATTN: Literal["auto", "tm", "dequant"] = "auto"
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
@@ -781,6 +782,26 @@ def use_sm70_turbomind(default_enabled: bool) -> bool:
 
 def force_sm70_marlin() -> bool:
     return get_sm70_quant_backend() == "marlin"
+
+
+SM70_NVFP4_LINEAR_ATTN_MODES = ("auto", "tm", "dequant")
+SM70Nvfp4LinearAttnMode = Literal["auto", "tm", "dequant"]
+
+
+def get_sm70_nvfp4_linear_attn_mode() -> SM70Nvfp4LinearAttnMode:
+    """Policy for hybrid GDN ``linear_attn`` NVFP4 linears on SM70.
+
+    auto: TurboMind when scale-health passes, else load-time dequant
+    tm: always TurboMind for hybrid candidates
+    dequant: always dequant hybrid candidates (safe for fragile bases)
+    """
+    value = os.getenv("VLLM_SM70_NVFP4_LINEAR_ATTN", "auto").strip().lower()
+    if value not in SM70_NVFP4_LINEAR_ATTN_MODES:
+        raise ValueError(
+            "VLLM_SM70_NVFP4_LINEAR_ATTN must be one of auto, tm, dequant; "
+            f"got {value!r}."
+        )
+    return cast(SM70Nvfp4LinearAttnMode, value)
 
 
 def env_list_with_choices(

@@ -1372,11 +1372,8 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
-            # Match compressed-tensors W4A16 NVFP4: TurboMind SM70 path.
-            sm70_tm.prepare_nvfp4_linear(layer)
+        # SM70 TurboMind / hybrid linear_attn dequant policy.
+        if sm70_tm.try_prepare_sm70_nvfp4_linear(layer):
             return
 
         self.kernel.process_weights_after_loading(layer)
@@ -1387,8 +1384,9 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
+        out = sm70_tm.try_apply_sm70_nvfp4_linear(layer, x, bias)
+        if out is not None:
+            return out
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 

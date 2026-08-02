@@ -147,23 +147,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.input_global_scale * layer.weight_global_scale, requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
-            logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
-            )
-            sm70_tm.prepare_nvfp4_linear(layer)
-            layer.weight = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
-                requires_grad=False,
-            )
-            layer.weight_scale = Parameter(
-                torch.empty(
-                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
-                ),
-                requires_grad=False,
-            )
+        # SM70: serve W4A4 weights via W4A16 TurboMind / hybrid dequant policy
+        # (activations remain half; true W4A4 act-quant is not used on SM70).
+        if sm70_tm.try_prepare_sm70_nvfp4_linear(layer):
             return
 
         # Convert layer to NVFP4 linear kernel format
@@ -180,6 +166,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
+        out = sm70_tm.try_apply_sm70_nvfp4_linear(layer, x, bias)
+        if out is not None:
+            return out
         return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)
