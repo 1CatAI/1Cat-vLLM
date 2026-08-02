@@ -3,7 +3,6 @@
 
 from dataclasses import dataclass
 from typing import Literal
-from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
