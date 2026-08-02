@@ -240,6 +240,63 @@ def prepare_mxfp4_linear(
     )
 
 
+# Block-scale magnitude threshold for NVFP4 scale-convention detection.
+# Aggressive-style CT exports fold magnitude into FP8 block scales (often
+# O(1)–448). Later GPTQ exports (Medium/TC/cyber) leave tiny block scales
+# (max ≪ 1) with a large disk global; after CT's ``global := 1/disk_global``,
+# multiplying block*global underflows (~1e-6) and produces token salad.
+# Detect tiny block scales and skip the global factor for SM70 combine.
+_NVFP4_TINY_BLOCK_SCALE_MAX = 1.0
+
+
+def nvfp4_block_scales_are_tiny(layer: torch.nn.Module) -> bool:
+    """True when per-group weight_scale looks like the "tiny-block" CT export."""
+    if not hasattr(layer, "weight_scale"):
+        return False
+    sc = layer.weight_scale.detach()
+    if sc.dtype == torch.float8_e4m3fn:
+        scf = sc.to(torch.float32)
+    else:
+        scf = sc.float()
+    if scf.numel() == 0 or not torch.isfinite(scf).all():
+        return False
+    return float(scf.abs().max().item()) < _NVFP4_TINY_BLOCK_SCALE_MAX
+
+
+def combine_nvfp4_scales_for_sm70_tm(layer: torch.nn.Module) -> torch.Tensor:
+    """Combine block + global scales for ``nvfp4_sm70_prepare``.
+
+    CT ``process_weights`` stores ``weight_global_scale = 1/disk_global``.
+    TurboMind then does ``block * global``. That matches Aggressive exports
+    (large block scales). Tiny-block exports already encode the effective
+    scale in the block tensor — multiplying by inverted global again is wrong.
+    """
+    block = layer.weight_scale.data.t().to(torch.float32)
+    if nvfp4_block_scales_are_tiny(layer):
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info_once(
+            "SM70 NVFP4: tiny block-scale convention detected "
+            "(max |weight_scale| < 1); combining without global factor "
+            "so Medium/TC GPTQ checkpoints match Aggressive effective scale."
+        )
+        return block.to(torch.float16).contiguous()
+    g = layer.weight_global_scale.to(torch.float32)
+    return (block * g).to(torch.float16).contiguous()
+
+
+def resolve_nvfp4_global_for_dequant(layer: torch.nn.Module) -> torch.Tensor:
+    """Global scale for ``dequantize_to_dtype`` (also does block * global)."""
+    global_scale = layer.weight_global_scale.data
+    if global_scale.numel() > 1:
+        global_scale = global_scale.reshape(-1).max().reshape(1)
+    else:
+        global_scale = global_scale.reshape(1)
+    if nvfp4_block_scales_are_tiny(layer):
+        return torch.ones(1, dtype=torch.float32, device=global_scale.device)
+    return global_scale.to(torch.float32)
+
+
 def prepare_nvfp4_linear(
     layer: torch.nn.Module,
     interleave_gated_silu: bool = False,
@@ -252,10 +309,7 @@ def prepare_nvfp4_linear(
     from vllm import _sm70_ops as sm70_ops
 
     qweight = unpack_mxfp4_weight(layer.weight.data)
-    scales = (
-        layer.weight_scale.data.t().to(torch.float32)
-        * layer.weight_global_scale.to(torch.float32)
-    ).to(torch.float16).contiguous()
+    scales = combine_nvfp4_scales_for_sm70_tm(layer)
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
     )
@@ -326,8 +380,10 @@ def apply_prepared_linear(
 # Hybrid linear-attention (GatedDeltaNet) policy for SM70 NVFP4
 # ---------------------------------------------------------------------------
 # Qwen3.6 hybrid layers expose NVFP4-able linears under ``*.linear_attn.*``.
-# Aggressive-style checkpoints run those on TurboMind safely; abliterated
-# Medium/TC builds can garbage if forced through the fused path.
+# Aggressive-style checkpoints run those on TurboMind safely. Medium/TC dense
+# garbage was largely a block/global scale convention mismatch (see
+# combine_nvfp4_scales_for_sm70_tm); hybrid dequant remains available as a
+# stamp/env override for residual fragility.
 #
 # Policy resolution (see envs.get_sm70_nvfp4_linear_attn_mode):
 #   1. env VLLM_SM70_NVFP4_LINEAR_ATTN=tm|dequant|auto  (override)
@@ -429,12 +485,8 @@ def prepare_nvfp4_dequant_linear(
         dtype = _resolve_dequant_dtype(layer)
     weight = layer.weight.data
     scale = layer.weight_scale.data
-    global_scale = layer.weight_global_scale.data
-    # PerTensorScaleParameter may be multi-element for fused shards; take max.
-    if global_scale.numel() > 1:
-        global_scale = global_scale.reshape(-1).max().reshape(1)
-    else:
-        global_scale = global_scale.reshape(1)
+    # Same tiny-block convention handling as TurboMind combine.
+    global_scale = resolve_nvfp4_global_for_dequant(layer)
 
     # CT/ModelOpt packed layout is linear (non-swizzled) after loader rename.
     w_hp = dequantize_to_dtype(
