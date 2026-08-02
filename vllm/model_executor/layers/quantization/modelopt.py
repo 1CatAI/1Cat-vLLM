@@ -1225,6 +1225,15 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
             (1.0 / layer.input_global_scale).to(torch.float32), requires_grad=False
         )
 
+        # SM70: serve W4A4-on-disk weights via weight-only TurboMind / hybrid
+        # dequant (activations remain half/bf16 — not true act-quant W4A4).
+        if sm70_tm.try_prepare_sm70_nvfp4_linear(layer):
+            logger.info_once(
+                "SM70 ModelOpt NVFP4 W4A4-on-disk: weight-only path "
+                "(W4A16 semantics); activations remain half/bf16."
+            )
+            return
+
         # Convert layer to NVFP4 linear kernel format
         self.kernel.process_weights_after_loading(layer)
 
@@ -1234,6 +1243,9 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        out = sm70_tm.try_apply_sm70_nvfp4_linear(layer, x, bias)
+        if out is not None:
+            return out
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 

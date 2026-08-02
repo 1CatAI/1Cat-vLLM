@@ -157,6 +157,46 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
     )
 
 
+# SM70 has no native nvfp4_moe_* kernels (FlashInfer TRTLLM/CUTLASS FP4, etc.).
+# Prefer weight-only Marlin, then on-the-fly EMULATION, before Blackwell paths.
+_SM70_NVFP4_MOE_COMPAT_BACKENDS = (
+    NvFp4MoeBackend.MARLIN,
+    NvFp4MoeBackend.EMULATION,
+)
+
+
+def prefer_sm70_nvfp4_moe_fallback() -> bool:
+    """Whether auto-select should prefer Marlin/EMULATION for NVFP4 MoE.
+
+    Default: exact Volta SM70 (cap ≥ 70 and not ≥ 75). Override with env
+    ``VLLM_SM70_NVFP4_MOE_FALLBACK=0|1`` for force disable/enable.
+    """
+    import os
+
+    if "VLLM_SM70_NVFP4_MOE_FALLBACK" in os.environ:
+        return bool(int(os.environ["VLLM_SM70_NVFP4_MOE_FALLBACK"]))
+    try:
+        from vllm.platforms import current_platform
+
+        p = current_platform
+        return (
+            p.is_cuda()
+            and p.has_device_capability(70)
+            and not p.has_device_capability(75)
+        )
+    except Exception:
+        return False
+
+
+def sm70_compat_nvfp4_moe_backend_order(
+    backends: list[NvFp4MoeBackend],
+) -> list[NvFp4MoeBackend]:
+    """Reorder so Marlin then EMULATION are tried before native FP4 kernels."""
+    preferred = [b for b in _SM70_NVFP4_MOE_COMPAT_BACKENDS if b in backends]
+    rest = [b for b in backends if b not in _SM70_NVFP4_MOE_COMPAT_BACKENDS]
+    return preferred + rest
+
+
 def select_nvfp4_moe_backend(
     config: FusedMoEConfig,
     weight_key: QuantKey | None,
@@ -189,6 +229,17 @@ def select_nvfp4_moe_backend(
         AVAILABLE_BACKENDS = [
             b for b in AVAILABLE_BACKENDS if b in NVFP4_BACKENDS_WITH_CLAMP
         ]
+
+    # Volta SM70: no native nvfp4_moe_* — put Marlin/EMULATION first so auto
+    # selection does not hard-fail after probing only Blackwell FlashInfer paths.
+    # Explicit moe_backend= / VLLM_USE_FLASHINFER_MOE_FP4 still honored below.
+    if prefer_sm70_nvfp4_moe_fallback() and config.swiglu_limit is None:
+        AVAILABLE_BACKENDS = sm70_compat_nvfp4_moe_backend_order(AVAILABLE_BACKENDS)
+        logger.info_once(
+            "SM70 NVFP4 MoE compat: preferring Marlin then EMULATION "
+            "(no native nvfp4_moe_* SM70 kernels). Marlin is weight-only "
+            "(activations remain half/bf16)."
+        )
 
     use_batched = config.moe_parallel_config.use_batched_activation_format
     activation_format = (

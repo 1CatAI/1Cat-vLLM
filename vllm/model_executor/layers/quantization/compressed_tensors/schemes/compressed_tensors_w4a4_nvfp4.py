@@ -150,6 +150,10 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         # SM70: serve W4A4 weights via W4A16 TurboMind / hybrid dequant policy
         # (activations remain half; true W4A4 act-quant is not used on SM70).
         if sm70_tm.try_prepare_sm70_nvfp4_linear(layer):
+            logger.info_once(
+                "SM70 compressed-tensors NVFP4 W4A4-on-disk: weight-only path "
+                "(W4A16 semantics); activations remain half/bf16."
+            )
             return
 
         # Convert layer to NVFP4 linear kernel format

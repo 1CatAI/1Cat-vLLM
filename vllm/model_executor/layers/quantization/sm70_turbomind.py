@@ -518,8 +518,8 @@ def try_prepare_sm70_nvfp4_linear(layer: torch.nn.Module) -> bool:
         )
     else:
         logger.info_once(
-            "SM70 compressed-tensors/ModelOpt NVFP4 TurboMind W4A16 dense path "
-            "enabled."
+            "SM70 compressed-tensors/ModelOpt NVFP4 TurboMind weight-only "
+            "dense path enabled (W4A16 semantics; acts remain half/bf16)."
         )
     prepare_nvfp4_linear(layer)
     # Free packed storage after TM prepare (weights live in STATE_ATTR).
