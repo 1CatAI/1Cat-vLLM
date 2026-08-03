@@ -113,6 +113,10 @@ python3 scripts/sm70_nvfp4_smoke_paris.py --model my-nvfp4
 
 ## Graph vs eager bisect
 
+pve3 A/B on `tc-medium-nvfp4` (2026-08-03): **graph PASS**, **eager PASS**
+(Paris + 323 both modes) with scale normalize + campaign flags. The graph-safe
+compilation/spec pins above are the preferred production path.
+
 ```bash
 bash scripts/sm70_nvfp4_ab_graph_eager.sh /path/to/ckpt served-name
 ```
