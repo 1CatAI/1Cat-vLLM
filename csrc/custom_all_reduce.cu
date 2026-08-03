@@ -161,12 +161,12 @@ void sm70_all_reduce_gemma_rms_norm_impl(
                 "SM70 TP4 Gemma RMSNorm prototype residual must be float32.");
   } else {
     TORCH_CHECK(residual.scalar_type() == at::ScalarType::Half ||
-                residual.scalar_type() == at::ScalarType::Float,
+                    residual.scalar_type() == at::ScalarType::Float,
                 "SM70 Gemma RMSNorm prototype residual must be float16 or "
                 "float32.");
   }
   TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half ||
-              weight.scalar_type() == at::ScalarType::Float,
+                  weight.scalar_type() == at::ScalarType::Float,
               "SM70 Gemma RMSNorm prototype weight must be float16 or "
               "float32.");
   TORCH_CHECK_EQ(inp.dim(), 2);
@@ -176,8 +176,9 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   TORCH_CHECK(normalized_out.sizes() == inp.sizes(),
               "SM70 Gemma RMSNorm prototype normalized_out shape must match "
               "inp.");
-  TORCH_CHECK(residual_out.sizes() == inp.sizes(),
-              "SM70 Gemma RMSNorm prototype residual_out shape must match inp.");
+  TORCH_CHECK(
+      residual_out.sizes() == inp.sizes(),
+      "SM70 Gemma RMSNorm prototype residual_out shape must match inp.");
   TORCH_CHECK_EQ(weight.dim(), 1);
   TORCH_CHECK_EQ(weight.numel(), kHiddenSize);
   TORCH_CHECK_EQ(residual.get_device(), inp.get_device());
@@ -307,17 +308,17 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
 
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
-      fa->allreduce_sum2<float>(stream, reinterpret_cast<float*>(inp_a.data_ptr()),
-                                reinterpret_cast<float*>(inp_b.data_ptr()),
-                                reinterpret_cast<float*>(out.data_ptr()),
-                                out.numel());
+      fa->allreduce_sum2<float>(
+          stream, reinterpret_cast<float*>(inp_a.data_ptr()),
+          reinterpret_cast<float*>(inp_b.data_ptr()),
+          reinterpret_cast<float*>(out.data_ptr()), out.numel());
       break;
     }
     case at::ScalarType::Half: {
-      fa->allreduce_sum2<half>(stream, reinterpret_cast<half*>(inp_a.data_ptr()),
-                               reinterpret_cast<half*>(inp_b.data_ptr()),
-                               reinterpret_cast<half*>(out.data_ptr()),
-                               out.numel());
+      fa->allreduce_sum2<half>(
+          stream, reinterpret_cast<half*>(inp_a.data_ptr()),
+          reinterpret_cast<half*>(inp_b.data_ptr()),
+          reinterpret_cast<half*>(out.data_ptr()), out.numel());
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -363,8 +364,7 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
 }
 
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
-                             fptr_t _reg_buffer,
-                             int64_t reg_buffer_sz_bytes,
+                             fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes,
                              int64_t tile_numel, int64_t engine_blocks,
                              int64_t compute_iters) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
@@ -412,8 +412,7 @@ void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
 void tile_runtime_all_reduce_engine(fptr_t _fa, torch::Tensor& inp,
                                     torch::Tensor& out, fptr_t _reg_buffer,
                                     int64_t reg_buffer_sz_bytes,
-                                    int64_t tile_numel,
-                                    int64_t producer_blocks,
+                                    int64_t tile_numel, int64_t producer_blocks,
                                     int64_t reducer_blocks,
                                     int64_t compute_iters) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);

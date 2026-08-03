@@ -28,14 +28,13 @@ struct __align__(16) RankSignals {
 #if !defined(USE_ROCM)
 static __device__ __forceinline__ void store_flag_sys_visible(
     FlagType* flag_addr, FlagType flag) {
-  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;"
-               ::"r"(flag),
+  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag),
                "l"(flag_addr)
                : "memory");
 }
 
-static __device__ __forceinline__ FlagType load_flag_sys_visible(
-    FlagType* flag_addr) {
+static __device__ __forceinline__ FlagType
+load_flag_sys_visible(FlagType* flag_addr) {
   FlagType flag;
   asm volatile("ld.volatile.global.u32 %0, [%1]; membar.sys;"
                : "=r"(flag)

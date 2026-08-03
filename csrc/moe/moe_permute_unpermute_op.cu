@@ -28,9 +28,7 @@ torch::Tensor maybe_allocate_tensor(
   return torch::empty(expected_sizes, torch::dtype(dtype).device(device));
 }
 
-int64_t pad_to_multiple_of_16(int64_t value) {
-  return (value + 15) / 16 * 16;
-}
+int64_t pad_to_multiple_of_16(int64_t value) { return (value + 15) / 16 * 16; }
 
 }  // namespace
 
@@ -72,16 +70,15 @@ void moe_permute_impl(
   auto expanded_rows = n_token * topk;
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  if (canUseSingleTokenMoePermuteFastPath(
-          n_token, topk, expert_map.has_value(), n_expert, n_local_expert)) {
+  if (canUseSingleTokenMoePermuteFastPath(n_token, topk, expert_map.has_value(),
+                                          n_expert, n_local_expert)) {
     if (input.scalar_type() == at::ScalarType::Half) {
       singleTokenMoePermuteLauncher<half>(
           get_ptr<half>(input), get_ptr<int>(topk_ids),
           get_ptr<half>(permuted_input),
           get_ptr<int64_t>(expert_first_token_offset),
           get_ptr<int>(inv_permuted_idx), get_ptr<int>(permuted_idx),
-          static_cast<int>(n_expert), static_cast<int>(topk), n_hidden,
-          stream);
+          static_cast<int>(n_expert), static_cast<int>(topk), n_hidden, stream);
       return;
     }
     if (input.scalar_type() == at::ScalarType::BFloat16) {
@@ -90,8 +87,7 @@ void moe_permute_impl(
           get_ptr<__nv_bfloat16>(permuted_input),
           get_ptr<int64_t>(expert_first_token_offset),
           get_ptr<int>(inv_permuted_idx), get_ptr<int>(permuted_idx),
-          static_cast<int>(n_expert), static_cast<int>(topk), n_hidden,
-          stream);
+          static_cast<int>(n_expert), static_cast<int>(topk), n_hidden, stream);
       return;
     }
     if (input.scalar_type() == at::ScalarType::Float) {
@@ -100,8 +96,7 @@ void moe_permute_impl(
           get_ptr<float>(permuted_input),
           get_ptr<int64_t>(expert_first_token_offset),
           get_ptr<int>(inv_permuted_idx), get_ptr<int>(permuted_idx),
-          static_cast<int>(n_expert), static_cast<int>(topk), n_hidden,
-          stream);
+          static_cast<int>(n_expert), static_cast<int>(topk), n_hidden, stream);
       return;
     }
   }
