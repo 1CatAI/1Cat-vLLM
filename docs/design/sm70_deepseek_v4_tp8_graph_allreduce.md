@@ -185,6 +185,27 @@ The extra final-shard synchronization dominated this 8 KiB collective:
 The candidate code was removed. Partitioning may help larger messages, but it
 is the wrong tradeoff for the fixed 4096-element decode collective.
 
+### Arrival-Prefetch Screen
+
+The corrected combined trace reports 34.165 us mean rank-arrival skew and
+42.262 us after the last arrival across 87 calls. A prototype replaced the
+full clique barrier with four independent poller warps. The remaining warps
+loaded each ready peer into registers while waiting for the slowest peer, then
+performed the unchanged rank-ordered FP32 reduction.
+
+The candidate retained the accepted output SHA256 and was bitwise equal on all
+eight ranks, but register lifetime and shared-ready polling cost more than the
+hidden loads:
+
+| Route | Pure collective | Graph-join | Projected graph-join change |
+|---|---:|---:|---:|
+| Accepted hierarchical | 19.849 us | 37.919 us | - |
+| Arrival prefetch | 24.501 us | 42.474 us | +0.396 ms/token |
+
+The code was removed. The measured arrival skew comes primarily from the
+upstream MoE segment; moving peer loads into the wait loop does not shorten its
+critical path.
+
 ## Rejected Paths
 
 | Path | Evidence | Decision |
@@ -198,6 +219,7 @@ is the wrong tradeoff for the fixed 4096-element decode collective.
 | Serialized clique completion | Stable at 21.055 ms/token in the stacked endpoint | Correct diagnostic; replaced by concurrent acknowledgement at 20.765 ms/token |
 | Deferred fence/acquire polling | Best graph-join projection is 0.032 ms/token | Reject and remove; below continuation threshold |
 | Partitioned clique reduction | Exact output, but graph-join regressed by 5.865-7.643 us/call | Reject and remove; synchronization dominates the 8 KiB message |
+| Arrival-time peer prefetch | Exact output, but graph-join regressed by 4.556 us/call | Reject and remove; polling/register cost exceeds hidden load work |
 
 ## Artifacts
 
@@ -211,6 +233,7 @@ is the wrong tradeoff for the fixed 4096-element decode collective.
   dsv4-tp8-latest-graphtrace-20260803/
   dsv4-tp8-deferred-fence-poll-micro-20260803/
   dsv4-tp8-partitioned-allreduce-micro-20260803/
+  dsv4-tp8-arrival-prefetch-micro-20260803/
 ```
 
 ## Remaining Gates
