@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -1816,6 +1817,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device tensors and can change between CUDA Graph replays.
     "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
+    ),
+    # Process all populated prefill experts in one TurboMind grouped launch.
+    # Keep this opt-in until the exact operator and model quality gates pass.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL", "0"))
     ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics

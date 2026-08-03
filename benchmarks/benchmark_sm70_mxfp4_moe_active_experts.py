@@ -149,29 +149,49 @@ def _validate_permute_contract(
         top_k, num_experts
     )
     workspace = torch.empty(workspace_size, dtype=torch.int8, device=device)
-
-    torch.ops._moe_C.moe_permute_with_scratch(
-        x,
-        topk_ids,
-        token_expert_indices,
-        None,
-        num_experts,
-        num_experts,
-        top_k,
-        permuted_input,
-        expert_offsets64,
-        inv_permuted_idx,
-        permuted_idx,
-        workspace,
-        permuted_experts_id,
-        sorted_row_idx,
-        topk_ids_for_sort,
-    )
-    expert_offsets = expert_offsets64.to(torch.int32)
+    expert_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
     dense_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
     compact_offsets = torch.arange(top_k + 1, dtype=torch.int32, device=device)
     dense_out = torch.empty(top_k, shape.n, dtype=torch.float16, device=device)
     active_out = torch.empty_like(dense_out)
+
+    def permute_call() -> None:
+        permuted_idx.fill_(top_k)
+        torch.ops._moe_C.moe_permute_with_scratch(
+            x,
+            topk_ids,
+            token_expert_indices,
+            None,
+            num_experts,
+            num_experts,
+            top_k,
+            permuted_input,
+            expert_offsets64,
+            inv_permuted_idx,
+            permuted_idx,
+            workspace,
+            permuted_experts_id,
+            sorted_row_idx,
+            topk_ids_for_sort,
+        )
+        expert_offsets.copy_(expert_offsets64, non_blocking=True)
+
+    def active_graph_call() -> None:
+        permute_call()
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            active_out,
+            permuted_input,
+            compact_offsets,
+            permuted_experts_id,
+            ptrs_w,
+            ptrs_s,
+            top_k,
+            shape.k,
+            shape.n,
+            32,
+        )
+
+    permute_call()
     sm70_ops.mxfp4_moe_dense_stage_sm70_out(
         dense_out,
         permuted_input,
@@ -184,29 +204,61 @@ def _validate_permute_contract(
         shape.n,
         32,
     )
+    active_graph_call()
+    torch.cuda.synchronize()
+    expected_sorted = sorted(route)
+    actual_sorted = permuted_experts_id.cpu().tolist()
+    initial_equal = torch.equal(dense_out, active_out)
+    initial_max_abs = float((dense_out - active_out).abs().max().item())
+
+    graph = _capture(active_graph_call)
+    route_a_graph_out = active_out.clone()
+    route_b = [1, 9, 63, 111, 177, 240]
+    topk_ids.copy_(torch.tensor([route_b], dtype=torch.int32, device=device))
+    graph.replay()
+    torch.cuda.synchronize()
+    route_b_graph_out = active_out.clone()
+    graph_sorted = permuted_experts_id.cpu().tolist()
+
+    permute_call()
     sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-        active_out,
+        dense_out,
         permuted_input,
-        compact_offsets,
-        permuted_experts_id,
+        expert_offsets,
+        dense_ids,
         ptrs_w,
         ptrs_s,
-        top_k,
+        num_experts,
         shape.k,
         shape.n,
         32,
     )
     torch.cuda.synchronize()
-    expected_sorted = sorted(route)
-    actual_sorted = permuted_experts_id.cpu().tolist()
+    graph_equal = torch.equal(dense_out, route_b_graph_out)
+    graph_max_abs = float((dense_out - route_b_graph_out).abs().max().item())
+    graph_route_changes_output = not torch.equal(route_a_graph_out, route_b_graph_out)
     result = {
-        "bitwise_equal": torch.equal(dense_out, active_out),
-        "max_abs": float((dense_out - active_out).abs().max().item()),
+        "bitwise_equal": initial_equal,
+        "max_abs": initial_max_abs,
         "expected_sorted_expert_ids": expected_sorted,
         "actual_sorted_expert_ids": actual_sorted,
         "sorted_expert_ids_match": actual_sorted == expected_sorted,
+        "full_graph_dynamic_replay_bitwise_equal": graph_equal,
+        "full_graph_dynamic_replay_max_abs": graph_max_abs,
+        "full_graph_expected_sorted_expert_ids": sorted(route_b),
+        "full_graph_actual_sorted_expert_ids": graph_sorted,
+        "full_graph_sorted_expert_ids_match": graph_sorted == sorted(route_b),
+        "full_graph_dynamic_route_changes_output": graph_route_changes_output,
     }
-    if not result["bitwise_equal"] or not result["sorted_expert_ids_match"]:
+    if not all(
+        (
+            result["bitwise_equal"],
+            result["sorted_expert_ids_match"],
+            result["full_graph_dynamic_replay_bitwise_equal"],
+            result["full_graph_sorted_expert_ids_match"],
+            result["full_graph_dynamic_route_changes_output"],
+        )
+    ):
         raise RuntimeError(f"MXFP4 permute contract gate failed: {result}")
     return result
 

@@ -1067,6 +1067,12 @@ bool mxfp4_tune_small_shapes_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool mxfp4_moe_grouped_prefill_enabled() {
+  const char* raw =
+      std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
 bool nvfp4_tune_small_shapes_enabled() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES");
   return raw == nullptr || std::atoi(raw) != 0;
@@ -7289,6 +7295,13 @@ void mxfp4_moe_dense_stage_sm70_out(
       logged_mxfp4_dense_stage,
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
+  if (vllm::awq_sm70::mxfp4_moe_grouped_prefill_enabled() &&
+      input.size(0) >= num_experts) {
+    mxfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                                 num_experts, k, n, group_size,
+                                 dense_expert_ids);
+    return;
+  }
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
     torch::Tensor offsets = expert_offsets.narrow(0, expert, 2);
     torch::Tensor expert_idx = dense_expert_ids.narrow(0, expert, 1);
