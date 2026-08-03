@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -1784,6 +1785,25 @@ class EngineArgs:
         spec_method = self.speculative_config.get("method")
         if spec_method not in ("mtp", "dflash"):
             return
+
+        # SM70 dynamic draft-vocab keeps a per-step, LRU-mutated vocabulary tail
+        # (see v1/spec_decode/static_draft_vocab.py) whose shapes and device
+        # addresses change during decode. That is not CUDA-graph-capture-safe:
+        # under graph capture it corrupts the SM70 NVFP4 decode path into garbage
+        # output ("!!!!" / token salad), while --enforce-eager stays coherent.
+        # Default it off whenever cudagraphs are active so the static (fixed-shape)
+        # draft vocab is used. Probabilistic rejection sampling and its draft_probs
+        # are unaffected, so draft acceptance is preserved. Operators can force the
+        # dynamic vocab back on by setting the env var explicitly.
+        if (
+            not self.enforce_eager
+            and "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT" not in os.environ
+        ):
+            os.environ["VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT"] = "0"
+            profile_updates.append(
+                "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT=0 "
+                "(cudagraph-capture-safety; set explicitly to override)"
+            )
 
         if "draft_sample_method" not in self.speculative_config:
             # For SM70 native MTP, official Qwen sampling is non-greedy
