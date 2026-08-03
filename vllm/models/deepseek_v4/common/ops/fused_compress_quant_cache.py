@@ -53,12 +53,23 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    fresh_kv: torch.Tensor | None = None,
+    fresh_score: torch.Tensor | None = None,
+    fresh_ape: torch.Tensor | None = None,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    fuse_save = fresh_kv is not None
+    if fuse_save != (fresh_score is not None) or fuse_save != (fresh_ape is not None):
+        raise ValueError(
+            "fresh_kv, fresh_score, and fresh_ape must be provided together"
+        )
+    if fuse_save and use_fp4_cache:
+        raise ValueError("fused compressor save does not support the MXFP4 cache")
+
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
@@ -69,11 +80,22 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
 
+    fresh_kv_arg = state_cache if fresh_kv is None else fresh_kv
+    fresh_score_arg = state_cache if fresh_score is None else fresh_score
+    fresh_ape_arg = state_cache if fresh_ape is None else fresh_ape
+
     kernel[(num_actual,)](
         # state cache
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
+        # current uncompressed state, used only by exact SM70 M=1 decode
+        fresh_kv_arg,
+        0 if fresh_kv is None else fresh_kv.stride(0),
+        fresh_score_arg,
+        0 if fresh_score is None else fresh_score.stride(0),
+        fresh_ape_arg,
+        0 if fresh_ape is None else fresh_ape.stride(0),
         # metadata
         token_to_req_indices,
         positions,
@@ -103,6 +125,8 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        FUSE_SAVE=fuse_save,
+        FRESH_BLOCK_SIZE=triton.next_power_of_2(state_width),
         USE_SOFTWARE_FP8=(
             current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
         ),
@@ -120,6 +144,13 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current uncompressed state (optional fused save) ──
+    fresh_kv_ptr,
+    fresh_kv_stride,
+    fresh_score_ptr,
+    fresh_score_stride,
+    fresh_ape_ptr,
+    fresh_ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -149,6 +180,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    FUSE_SAVE: tl.constexpr,
+    FRESH_BLOCK_SIZE: tl.constexpr,
     USE_SOFTWARE_FP8: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
@@ -166,6 +199,36 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         return
 
     position = tl.load(positions_ptr + token_idx)
+    if FUSE_SAVE:
+        fresh_block = tl.arange(0, FRESH_BLOCK_SIZE)
+        fresh_mask = fresh_block < STATE_WIDTH
+        state_block_idx = slot_id // block_size
+        state_pos_in_block = slot_id % block_size
+        fresh_base = (
+            state_cache_ptr
+            + state_block_idx * state_cache_stride0
+            + state_pos_in_block * state_cache_stride1
+        )
+        fresh_kv = tl.load(
+            fresh_kv_ptr + token_idx * fresh_kv_stride + fresh_block,
+            mask=fresh_mask,
+        )
+        ape_row = position % COMPRESS_RATIO
+        fresh_score = tl.load(
+            fresh_score_ptr + token_idx * fresh_score_stride + fresh_block,
+            mask=fresh_mask,
+        )
+        fresh_ape = tl.load(
+            fresh_ape_ptr + ape_row * fresh_ape_stride + fresh_block,
+            mask=fresh_mask,
+        )
+        tl.store(fresh_base + fresh_block, fresh_kv, mask=fresh_mask)
+        tl.store(
+            fresh_base + STATE_WIDTH + fresh_block,
+            fresh_score + fresh_ape,
+            mask=fresh_mask,
+        )
+
     if (position + 1) % COMPRESS_RATIO != 0:
         return
 
@@ -206,6 +269,27 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         mask=combined_mask,
         other=float("-inf"),
     )
+    if FUSE_SAVE:
+        current_offset: tl.constexpr = OVERLAP * HEAD_SIZE
+        current_score = tl.load(
+            fresh_score_ptr + token_idx * fresh_score_stride + current_offset + block,
+            mask=mask,
+            other=float("-inf"),
+        )
+        current_ape = tl.load(
+            fresh_ape_ptr
+            + (position % COMPRESS_RATIO) * fresh_ape_stride
+            + current_offset
+            + block,
+            mask=mask,
+            other=0.0,
+        )
+        is_current = pos == position
+        score = tl.where(
+            is_current[:, None],
+            (current_score + current_ape)[None, :],
+            score,
+        )
     score = tl.softmax(score, dim=0)
 
     kv = tl.load(
@@ -213,6 +297,14 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         mask=combined_mask,
         other=0.0,
     )
+    if FUSE_SAVE:
+        current_kv = tl.load(
+            fresh_kv_ptr + token_idx * fresh_kv_stride + OVERLAP * HEAD_SIZE + block,
+            mask=mask,
+            other=0.0,
+        )
+        is_current = pos == position
+        kv = tl.where(is_current[:, None], current_kv[None, :], kv)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -314,6 +406,13 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current uncompressed state (optional fused save) ──
+    fresh_kv_ptr,
+    fresh_kv_stride,
+    fresh_score_ptr,
+    fresh_score_stride,
+    fresh_ape_ptr,
+    fresh_ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -343,6 +442,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    FUSE_SAVE: tl.constexpr,
+    FRESH_BLOCK_SIZE: tl.constexpr,
     USE_SOFTWARE_FP8: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
@@ -364,6 +465,36 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         return
 
     position = tl.load(positions_ptr + token_idx)
+    if FUSE_SAVE:
+        fresh_block = tl.arange(0, FRESH_BLOCK_SIZE)
+        fresh_mask = fresh_block < STATE_WIDTH
+        state_block_idx = slot_id // block_size
+        state_pos_in_block = slot_id % block_size
+        fresh_base = (
+            state_cache_ptr
+            + state_block_idx * state_cache_stride0
+            + state_pos_in_block * state_cache_stride1
+        )
+        fresh_kv = tl.load(
+            fresh_kv_ptr + token_idx * fresh_kv_stride + fresh_block,
+            mask=fresh_mask,
+        )
+        ape_row = position % COMPRESS_RATIO
+        fresh_score = tl.load(
+            fresh_score_ptr + token_idx * fresh_score_stride + fresh_block,
+            mask=fresh_mask,
+        )
+        fresh_ape = tl.load(
+            fresh_ape_ptr + ape_row * fresh_ape_stride + fresh_block,
+            mask=fresh_mask,
+        )
+        tl.store(fresh_base + fresh_block, fresh_kv, mask=fresh_mask)
+        tl.store(
+            fresh_base + STATE_WIDTH + fresh_block,
+            fresh_score + fresh_ape,
+            mask=fresh_mask,
+        )
+
     if (position + 1) % COMPRESS_RATIO != 0:
         return
 
@@ -402,6 +533,27 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         mask=combined_mask,
         other=float("-inf"),
     )
+    if FUSE_SAVE:
+        current_offset: tl.constexpr = OVERLAP * HEAD_SIZE
+        current_score = tl.load(
+            fresh_score_ptr + token_idx * fresh_score_stride + current_offset + block,
+            mask=mask,
+            other=float("-inf"),
+        )
+        current_ape = tl.load(
+            fresh_ape_ptr
+            + (position % COMPRESS_RATIO) * fresh_ape_stride
+            + current_offset
+            + block,
+            mask=mask,
+            other=0.0,
+        )
+        is_current = pos == position
+        score = tl.where(
+            is_current[:, None],
+            (current_score + current_ape)[None, :],
+            score,
+        )
     score = tl.softmax(score, dim=0)
 
     kv = tl.load(
@@ -409,6 +561,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         mask=combined_mask,
         other=0.0,
     )
+    if FUSE_SAVE:
+        current_kv = tl.load(
+            fresh_kv_ptr + token_idx * fresh_kv_stride + OVERLAP * HEAD_SIZE + block,
+            mask=mask,
+            other=0.0,
+        )
+        is_current = pos == position
+        kv = tl.where(is_current[:, None], current_kv[None, :], kv)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -495,6 +655,13 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── unused fused-save operands; MXFP4 remains on the separate save path ──
+    fresh_kv_ptr,
+    fresh_kv_stride,
+    fresh_score_ptr,
+    fresh_score_stride,
+    fresh_ape_ptr,
+    fresh_ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -524,6 +691,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
+    FUSE_SAVE: tl.constexpr,
+    FRESH_BLOCK_SIZE: tl.constexpr,
     USE_SOFTWARE_FP8: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
@@ -540,6 +709,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
         (byte = exponent + 127).
       - Max representable magnitude = 6.0.
     """
+    tl.static_assert(not FUSE_SAVE, "MXFP4 compressor save fusion is unsupported")
     token_idx = tl.program_id(0)
 
     slot_id = tl.load(slot_mapping_ptr + token_idx)

@@ -7,8 +7,10 @@ from typing import Any, ClassVar, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
@@ -32,6 +34,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+logger = init_logger(__name__)
 
 
 def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
@@ -322,24 +326,43 @@ class DeepseekCompressor(nn.Module):
             else {"launch_pdl": False}
         )
 
+        capability = (
+            current_platform.get_device_capability()
+            if current_platform.is_cuda()
+            else None
+        )
+        use_sm70_fused_save = (
+            envs.VLLM_SM70_DSV4_FUSED_COMPRESSOR_SAVE
+            and capability is not None
+            and capability.to_int() == 70
+            and num_actual == 1
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not self.use_fp4_cache
+        )
+        if use_sm70_fused_save:
+            logger.info_once(
+                "DeepSeek V4 SM70 M=1 compressor state-save fusion enabled."
+            )
+
         # Store the KV and score (with fused APE addition) in the state.
         # NOTE: PDL is disabled — both this kernel and the compress kernels
         # below depend on preceding kernel outputs (kv/score from the cublas
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a
         # read-after-write race and non-deterministic output.
-        save_partial_states(
-            kv=kv,
-            score=score,
-            ape=self.ape,
-            positions=positions,
-            state_cache=state_cache,
-            slot_mapping=slot_mapping,
-            block_size=block_size,
-            state_width=state_width,
-            compress_ratio=self.compress_ratio,
-            pdl_kwargs=pdl_kwargs,
-        )
+        if not use_sm70_fused_save:
+            save_partial_states(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_cache=state_cache,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
 
         if (
             current_platform.is_cuda()
@@ -405,4 +428,13 @@ class DeepseekCompressor(nn.Module):
             quant_block=self._quant_block,
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
+            **(
+                {
+                    "fresh_kv": kv,
+                    "fresh_score": score,
+                    "fresh_ape": self.ape,
+                }
+                if use_sm70_fused_save
+                else {}
+            ),
         )

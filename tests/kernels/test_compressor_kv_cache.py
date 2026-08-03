@@ -594,6 +594,12 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
+        state_cache,
+        0,
+        state_cache,
+        0,
+        state_cache,
+        0,
         token_to_req,
         positions,
         slot_mapping,
@@ -618,6 +624,9 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         TOKEN_STRIDE=TOKEN_STRIDE,
         SCALE_DIM=SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        FUSE_SAVE=False,
+        FRESH_BLOCK_SIZE=coff * HEAD_DIM,
+        USE_SOFTWARE_FP8=True,
         num_warps=1,
     )
 
