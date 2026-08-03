@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import statistics
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -56,7 +57,30 @@ def _time_graph(graph: torch.cuda.CUDAGraph, replays: int, repeats: int) -> list
     return samples_ms
 
 
-def _measure(shape: Shape, replays: int, repeats: int) -> dict[str, object]:
+def _profile_graph_replay(graph: torch.cuda.CUDAGraph) -> None:
+    cudart = torch.cuda.cudart()
+    cudart.cudaProfilerStart()
+    graph.replay()
+    torch.cuda.synchronize()
+    cudart.cudaProfilerStop()
+
+
+def _capture_graph(run: Callable[[], None]) -> torch.cuda.CUDAGraph:
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        run()
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        run()
+    return graph
+
+
+def _measure(
+    shape: Shape, replays: int, repeats: int, profile_replay: bool
+) -> dict[str, object]:
     qweight = torch.randn((shape.n, shape.k), device="cuda", dtype=torch.float16).to(
         torch.float8_e4m3fn
     )
@@ -79,15 +103,19 @@ def _measure(shape: Shape, replays: int, repeats: int) -> dict[str, object]:
         )
     torch.cuda.synchronize()
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    def run_graph() -> None:
         sm70_ops.fp8_gemm_sm70_out_meta(
             graph_out, x, weight, tm_scales, meta, shape.gated_silu
         )
+
+    graph = _capture_graph(run_graph)
     graph.replay()
     torch.cuda.synchronize()
     equal = torch.equal(direct, graph_out)
     max_abs = float((direct.float() - graph_out.float()).abs().max().item())
+
+    if profile_replay:
+        _profile_graph_replay(graph)
 
     samples_ms = _time_graph(graph, replays, repeats)
 
@@ -152,12 +180,8 @@ def _measure_split_parity(replays: int, repeats: int) -> dict[str, object]:
         run_split()
     torch.cuda.synchronize()
 
-    fused_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(fused_graph):
-        run_fused()
-    split_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(split_graph):
-        run_split()
+    fused_graph = _capture_graph(run_fused)
+    split_graph = _capture_graph(run_split)
     fused_graph.replay()
     split_graph.replay()
     torch.cuda.synchronize()
@@ -187,6 +211,7 @@ def main() -> int:
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--replays", type=int, default=1000)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--profile-replay", action="store_true")
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument(
         "--name", choices=[shape.name for shape in SHAPES + DIAGNOSTIC_SHAPES]
@@ -213,7 +238,10 @@ def main() -> int:
     )
     if args.name is None:
         selected_shapes = SHAPES
-    results = [_measure(shape, args.replays, args.repeats) for shape in selected_shapes]
+    results = [
+        _measure(shape, args.replays, args.repeats, args.profile_replay)
+        for shape in selected_shapes
+    ]
     projected_ms = sum(float(item["projected_ms_per_token"]) for item in results)
     failures = [item["name"] for item in results if not item["graph_equal"]]
     payload = {
