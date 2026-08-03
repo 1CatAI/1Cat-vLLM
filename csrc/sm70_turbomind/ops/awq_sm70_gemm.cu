@@ -1067,6 +1067,17 @@ bool mxfp4_tune_small_shapes_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool mxfp4_moe_grouped_prefill_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
+int mxfp4_moe_grouped_prefill_experts_per_launch() {
+  const char* raw = std::getenv(
+      "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL_EXPERTS_PER_LAUNCH");
+  return raw != nullptr ? std::clamp(std::atoi(raw), 1, 64) : 64;
+}
+
 bool mxfp4_moe_compact_grouped_decode_enabled() {
   const char* raw =
       std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
@@ -7112,7 +7123,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    torch::Tensor b_group_indices, bool compact_grouped_rows = false) {
+    torch::Tensor b_group_indices, bool compact_grouped_rows = false,
+    bool preserve_per_expert_dispatch = false) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "mxfp4_moe_gemm_sm70: input must be CUDA float16.");
@@ -7241,7 +7253,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
-  op.dispatch_num_override = compact_grouped_rows ? 1 : 0;
+  op.dispatch_num_override =
+      compact_grouped_rows || preserve_per_expert_dispatch ? 1 : 0;
   op.active_group_count =
       compact_grouped_rows ? -static_cast<int>(num_experts) : 0;
 
@@ -7300,6 +7313,33 @@ void mxfp4_moe_dense_stage_sm70_out(
       logged_mxfp4_dense_stage,
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
+  constexpr int kDeepSeekV4Experts = 256;
+  constexpr int kDeepSeekV4PrefillMinRows = 1024 * 6;
+  if (vllm::awq_sm70::mxfp4_moe_grouped_prefill_enabled() &&
+      num_experts == kDeepSeekV4Experts &&
+      input.size(0) >= kDeepSeekV4PrefillMinRows) {
+    static std::atomic<unsigned> logged_mxfp4_grouped_prefill{0u};
+    maybe_log_sm70_moe_route_once(
+        logged_mxfp4_grouped_prefill,
+        "SM70 MXFP4 MoE grouped prefill path enabled C++ op reached", input,
+        input.size(0), num_experts);
+    const int experts_per_launch = std::min(
+        static_cast<int>(num_experts),
+        vllm::awq_sm70::mxfp4_moe_grouped_prefill_experts_per_launch());
+    for (int expert = 0; expert < static_cast<int>(num_experts);
+         expert += experts_per_launch) {
+      const int launch_experts = std::min(
+          experts_per_launch, static_cast<int>(num_experts) - expert);
+      torch::Tensor offsets =
+          expert_offsets.narrow(0, expert, launch_experts + 1);
+      torch::Tensor expert_ids =
+          dense_expert_ids.narrow(0, expert, launch_experts);
+      mxfp4_moe_gemm_sm70_out_impl(
+          out, input, offsets, ptrs_w, ptrs_s, launch_experts, k, n,
+          group_size, expert_ids, false, true);
+    }
+    return;
+  }
   const bool compact_decode_shape =
       input.size(0) == num_experts && num_experts == 6 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));

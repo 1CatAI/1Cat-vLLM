@@ -161,7 +161,7 @@ def sm70_indexer_prefill_logits(
     weighted_q = _combine_index_queries(q, weights)
     k_fp16 = torch.empty(k_quant.shape, dtype=torch.float16, device=k_quant.device)
     _dequant_contiguous_index_k_kernel[(k_quant.shape[0],)](
-        k_quant,
+        k_quant.view(torch.uint8),
         k_scales,
         k_fp16,
         k_quant.stride(0),

@@ -196,6 +196,8 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL_EXPERTS_PER_LAUNCH: int = 64
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
@@ -1845,6 +1847,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device tensors and can change between CUDA Graph replays.
     "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1", "0"))
+    ),
+    # Process populated prefill experts in bounded TurboMind grouped launches.
+    # Keep this opt-in until exact operator and endpoint quality gates pass.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL", "0"))
+    ),
+    "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL_EXPERTS_PER_LAUNCH": lambda: max(
+        1,
+        min(
+            int(
+                os.getenv(
+                    "VLLM_SM70_MXFP4_MOE_GROUPED_PREFILL_EXPERTS_PER_LAUNCH",
+                    "64",
+                )
+            ),
+            64,
+        ),
     ),
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.

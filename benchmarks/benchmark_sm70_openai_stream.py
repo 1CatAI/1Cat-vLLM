@@ -54,8 +54,11 @@ def _build_prompt_ids(base_url: str, model: str, input_len: int) -> list[int]:
     context_ids = _tokenize(base_url, model, paragraph * 80)
     suffix_ids = _tokenize(base_url, model, suffix)
     context_len = input_len - len(prefix_ids) - len(suffix_ids)
-    if context_len < 0 or len(context_ids) < context_len:
+    if context_len < 0 or not context_ids:
         raise ValueError("Unable to construct the requested input length")
+    if len(context_ids) < context_len:
+        repeats = (context_len + len(context_ids) - 1) // len(context_ids)
+        context_ids *= repeats
     prompt_ids = prefix_ids + context_ids[:context_len] + suffix_ids
     if len(prompt_ids) != input_len:
         raise AssertionError(
