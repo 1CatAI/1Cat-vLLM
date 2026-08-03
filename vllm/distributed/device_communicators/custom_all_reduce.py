@@ -28,6 +28,19 @@ except Exception:
 logger = init_logger(__name__)
 
 
+def _allow_sm70_tp8_nonfull_custom_ar(
+    world_size: int,
+    fully_connected: bool,
+    device_capability: tuple[int, int] | None,
+) -> bool:
+    return (
+        envs.VLLM_SM70_TP8_NONFULL_CUSTOM_AR
+        and world_size == 8
+        and not fully_connected
+        and device_capability == (7, 0)
+    )
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
         if i == rank:
@@ -149,7 +162,14 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if world_size > 2 and not fully_connected:
+        capability = current_platform.get_device_capability()
+        capability_tuple = None
+        if capability is not None:
+            capability_tuple = (capability.major, capability.minor)
+        allow_nonfull = _allow_sm70_tp8_nonfull_custom_ar(
+            world_size, fully_connected, capability_tuple
+        )
+        if world_size > 2 and not fully_connected and not allow_nonfull:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -190,8 +210,17 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
+        self.allow_nonfull = allow_nonfull
+        if allow_nonfull:
+            logger.warning_once(
+                "Experimental SM70 TP8 custom allreduce enabled on a non-fully "
+                "connected topology after all-pairs P2P validation."
+            )
         self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
+            self.meta_ptrs,
+            self.rank_data,
+            rank,
+            self.fully_connected or self.allow_nonfull,
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
 
@@ -240,7 +269,7 @@ class CustomAllreduce:
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
+        if self.world_size == 2 or self.fully_connected or self.allow_nonfull:
             return inp_size < self.max_size
         return False
 
@@ -282,9 +311,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(
-            inp, residual, weight
-        ):
+        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(inp, residual, weight):
             raise RuntimeError("SM70 TP2 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)

@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
+    VLLM_SM70_TP8_NONFULL_CUSTOM_AR: bool = False
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
@@ -1637,6 +1638,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": lambda: int(
         os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "16")
+    ),
+    "VLLM_SM70_TP8_NONFULL_CUSTOM_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP8_NONFULL_CUSTOM_AR", "0"))
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
