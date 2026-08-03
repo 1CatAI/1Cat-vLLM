@@ -165,6 +165,26 @@ the 0.2 ms/token continuation threshold, so the deferred-poll code was removed.
 The remaining TP opportunity is upstream rank-arrival skew or a larger
 compute/collective boundary change, not further flag-loop tuning.
 
+### Partitioned Reduction Screen
+
+A reduce-scatter/all-gather prototype assigned one quarter of the 4096-wide
+vector to each rank in a four-GPU clique. It preserved the existing FP32 rank
+order, paired the corresponding shards across cliques, and reduced estimated
+per-rank data movement from 48 KiB to 20 KiB. Both the CTA-wide gather and a
+four-warp owner gather produced the same output SHA256 as the accepted kernel
+and remained bitwise equal across all eight ranks.
+
+The extra final-shard synchronization dominated this 8 KiB collective:
+
+| Route | Pure collective | Graph-join | Projected graph-join change |
+|---|---:|---:|---:|
+| Accepted hierarchical | 19.849 us | 37.898 us | - |
+| Partitioned, CTA gather | 24.696 us | 43.763 us | +0.510 ms/token |
+| Partitioned, warp gather | 26.463 us | 45.541 us | +0.665 ms/token |
+
+The candidate code was removed. Partitioning may help larger messages, but it
+is the wrong tradeoff for the fixed 4096-element decode collective.
+
 ## Rejected Paths
 
 | Path | Evidence | Decision |
@@ -177,6 +197,7 @@ compute/collective boundary change, not further flag-loop tuning.
 | Partial double-buffer only | 87-call graph microbenchmark entered synchronization spin | Reject; signal overtake remains |
 | Serialized clique completion | Stable at 21.055 ms/token in the stacked endpoint | Correct diagnostic; replaced by concurrent acknowledgement at 20.765 ms/token |
 | Deferred fence/acquire polling | Best graph-join projection is 0.032 ms/token | Reject and remove; below continuation threshold |
+| Partitioned clique reduction | Exact output, but graph-join regressed by 5.865-7.643 us/call | Reject and remove; synchronization dominates the 8 KiB message |
 
 ## Artifacts
 
@@ -189,6 +210,7 @@ compute/collective boundary change, not further flag-loop tuning.
   dsv4-sparse-mla-qk-dsplit-fullmodel-20260803/
   dsv4-tp8-latest-graphtrace-20260803/
   dsv4-tp8-deferred-fence-poll-micro-20260803/
+  dsv4-tp8-partitioned-allreduce-micro-20260803/
 ```
 
 ## Remaining Gates
