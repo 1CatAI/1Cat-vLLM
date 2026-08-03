@@ -89,6 +89,19 @@ struct SchedulerSm70 {
     __host__ void set_active_groups(const int* group_idxs, int group_count)
     {
         if constexpr (group_axis >= 0) {
+            if (group_count < 0 && -group_count <= gemm_shape_[3]) {
+                active_group_count_ = group_count;
+                const int compact_group_count = -group_count;
+
+                constexpr int i = group_axis;
+
+                Array<int, 2> log_unit{};
+                log_unit[1 - (int)order] = log_tile_;
+
+                tiles_[i] = ((gemm_shape_[i] / tile_shape[i] >> log_unit[i]) + compact_group_count)
+                            << log_unit[i];
+                return;
+            }
             if (group_idxs && group_count > 0 && group_count <= gemm_shape_[3]) {
                 active_group_idxs_  = group_idxs;
                 active_group_count_ = group_count;
@@ -165,7 +178,16 @@ struct SchedulerSm70 {
         constexpr int axis = group_axis;
 
         if constexpr (axis >= 0) {
-            if (offsets_) {
+            if (active_group_count_ < 0) {
+                const int group_id = tile_id[axis];
+                if (group_id >= -active_group_count_) {
+                    return false;
+                }
+                tile_id[axis] = 0;
+                shape[axis]   = 1;
+                tile.group_id = group_id;
+            }
+            else if (offsets_) {
                 if constexpr (!Reinit::value) {
                     if (!find_group(tile_id, storage)) {
                         return false;

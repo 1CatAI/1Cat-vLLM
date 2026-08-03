@@ -437,6 +437,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_single_token_weighted_reduce_out);
 
   ops.def(
+      "sm70_moe_single_token_weighted_reduce_add_out("
+      "Tensor sorted_output, Tensor topk_weights, Tensor inv_permuted_idx, "
+      "Tensor shared_output, Tensor(a!) out, float shared_scale, int top_k, "
+      "int hidden_logical_size) -> ()");
+  ops.impl("sm70_moe_single_token_weighted_reduce_add_out", torch::kCUDA,
+           &sm70_moe_single_token_weighted_reduce_add_out);
+
+  ops.def(
       "awq_moe_single_token_sm70_out("
       "Tensor(a!) out, Tensor x, Tensor topk_weights, Tensor topk_ids, "
       "Tensor src_w13_ptrs_w_rows, Tensor src_w13_ptrs_s_rows, "
@@ -480,6 +488,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int k, int n, int group_size) -> ()");
   ops.impl("mxfp4_moe_dense_stage_sm70_out", torch::kCUDA,
            &mxfp4_moe_dense_stage_sm70_out);
+
+  ops.def(
+      "mxfp4_moe_single_token_prepare_w13_sm70_out("
+      "Tensor(a!) gate_up, Tensor(b!) compact_input, Tensor x, "
+      "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
+      "Tensor(c!) expert_offsets, Tensor(d!) inv_permuted_idx, "
+      "Tensor(e!) sorted_expert_ids, int w13_k, int w13_n, "
+      "int group_size, int hidden_logical_size) -> ()");
+  ops.impl("mxfp4_moe_single_token_prepare_w13_sm70_out", torch::kCUDA,
+           &mxfp4_moe_single_token_prepare_w13_sm70_out);
 
   ops.def(
       "fp8_moe_single_token_dense_stage_sm70_out("

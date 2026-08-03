@@ -473,9 +473,7 @@ def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
         )
         topk_weights = torch.randn((1, topk), device=device, dtype=torch.float32)
         dummy_hidden = torch.randn((1, hidden), device=device, dtype=torch.float16)
-        _, _, offsets, inv, _ = moe_permute(
-            dummy_hidden, None, topk_ids, n_expert
-        )
+        _, _, offsets, inv, _ = moe_permute(dummy_hidden, None, topk_ids, n_expert)
         sorted_output_storage = torch.randn(
             (topk, hidden + pad), device=device, dtype=torch.float16
         )
@@ -483,12 +481,8 @@ def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
 
         expected = torch.empty((1, hidden), device=device, dtype=torch.float16)
         actual = torch.empty_like(expected)
-        reference_sorted_output = (
-            sorted_output.contiguous() if pad else sorted_output
-        )
-        moe_unpermute(
-            expected, reference_sorted_output, topk_weights, inv, offsets
-        )
+        reference_sorted_output = sorted_output.contiguous() if pad else sorted_output
+        moe_unpermute(expected, reference_sorted_output, topk_weights, inv, offsets)
         torch.ops._C.awq_moe_single_token_weighted_reduce_out(
             sorted_output,
             topk_weights,
@@ -503,3 +497,46 @@ def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
                 "single-token weighted-reduce mismatch "
                 f"name={name} max_diff={float(diff.max().item())}"
             )
+
+
+def test_sm70_single_token_weighted_reduce_add_matches_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for SM70 MoE weighted reduce")
+    current_platform.import_kernels()
+    if not hasattr(
+        torch.ops._C,
+        "sm70_moe_single_token_weighted_reduce_add_out",
+    ):
+        pytest.skip("SM70 fused weighted-reduce-add op is not available.")
+    if not moe_permute_unpermute_supported():
+        pytest.skip("moe_permute_unpermute is not supported on this platform.")
+
+    torch.manual_seed(20260803)
+    device = "cuda"
+    topk = 6
+    hidden = 4096
+    topk_ids = torch.tensor([[7, 2, 0, 63, 1, 4]], device=device)
+    topk_weights = torch.randn((1, topk), device=device, dtype=torch.float32)
+    dummy_hidden = torch.randn((1, hidden), device=device, dtype=torch.float16)
+    _, _, offsets, inv, _ = moe_permute(dummy_hidden, None, topk_ids, 64)
+    sorted_output = torch.randn((topk, hidden), device=device, dtype=torch.float16)
+    shared_output = torch.randn((1, hidden), device=device, dtype=torch.float16)
+
+    routed = torch.empty_like(shared_output)
+    moe_unpermute(routed, sorted_output, topk_weights, inv, offsets)
+    for shared_scale in (1.0, 1.0 / 1.5):
+        scaled_shared = shared_output.clone()
+        scaled_shared.mul_(shared_scale)
+        expected = scaled_shared + routed
+        actual = torch.empty_like(expected)
+        torch.ops._C.sm70_moe_single_token_weighted_reduce_add_out(
+            sorted_output,
+            topk_weights,
+            inv,
+            shared_output,
+            actual,
+            shared_scale,
+            topk,
+            hidden,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

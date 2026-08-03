@@ -55,6 +55,54 @@ def test_sm70_selects_triton_sparse_impl():
         assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
 
 
+def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    q = torch.empty((1, 8, 512), dtype=torch.float16)
+    output = torch.empty_like(q)
+    layer = MagicMock()
+    layer.compress_ratio = 1
+    layer.swa_cache_layer.kv_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
+    layer.scale = 512**-0.5
+    layer.attn_sink = torch.zeros(8, dtype=torch.float32)
+
+    metadata = MagicMock()
+    metadata.num_decode_tokens = 1
+    metadata.decode_swa_indices = torch.zeros((1, 1, 128), dtype=torch.int32)
+    metadata.decode_swa_lens = torch.full((1,), 128, dtype=torch.int32)
+
+    workspace_manager = MagicMock()
+    workspace_manager.get_simultaneous.side_effect = lambda *specs: tuple(
+        torch.empty(shape, dtype=dtype) for shape, dtype in specs
+    )
+    with (
+        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", True),
+        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", True),
+        patch.object(
+            sparse, "current_workspace_manager", return_value=workspace_manager
+        ),
+        patch.object(
+            sparse, "sm70_sparse_attention_paged_fp8_splitk_qk_dsplit"
+        ) as qk_dsplit,
+        patch.object(sparse, "sm70_sparse_attention_paged_fp8_splitk") as splitk,
+    ):
+        sparse.DeepseekV4SM70SparseImpl._forward_decode(
+            layer=layer,
+            q=q,
+            compressed_cache=None,
+            output=output,
+            sparse_metadata=None,
+            swa_metadata=metadata,
+            swa_only=True,
+        )
+
+    splitk.assert_not_called()
+    qk_dsplit.assert_called_once()
+    kwargs = qk_dsplit.call_args.kwargs
+    assert kwargs["partial_qk"].shape == (1, 8, 8, 8, 16)
+    assert kwargs["partial_probs"].shape == (1, 8, 8, 16)
+
+
 def test_sm75_does_not_select_sm70_impl():
     from vllm.models.deepseek_v4 import attention
     from vllm.models.deepseek_v4.nvidia.flashmla import (

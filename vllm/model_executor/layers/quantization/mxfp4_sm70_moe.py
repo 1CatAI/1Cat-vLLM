@@ -50,6 +50,18 @@ def _mxfp4_active_expert_b1_enabled() -> bool:
     )
 
 
+def _single_token_weighted_reduce_enabled() -> bool:
+    if not (
+        envs.VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE
+        and (
+            envs.VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH
+            or envs.VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH
+        )
+    ):
+        return False
+    return hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out")
+
+
 def _select_mxfp4_stage_dispatch(
     buffers: dict[str, torch.Tensor],
     *,
@@ -226,6 +238,8 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "mxfp4_moe_dense_stage_sm70_out",
             "awq_moe_build_strided_ptrs",
         )
+        if envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE:
+            required_ops += ("mxfp4_moe_single_token_prepare_w13_sm70_out",)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing_ops:
             raise RuntimeError(
@@ -419,6 +433,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer._mxfp4_sm70_buf_compact_expert_offsets = torch.arange(
             top_k + 1, dtype=torch.int32, device=device
         )
+        layer._mxfp4_sm70_buf_compact_expert_offsets64 = torch.arange(
+            top_k + 1, dtype=torch.int64, device=device
+        )
 
     @staticmethod
     def _persistent_b1_buffers(layer: RoutedExperts) -> dict[str, torch.Tensor]:
@@ -440,6 +457,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             "topk_ids_for_sort": layer._mxfp4_sm70_buf_topk_ids_for_sort,
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
             "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
+            "compact_expert_offsets64": (
+                layer._mxfp4_sm70_buf_compact_expert_offsets64
+            ),
         }
 
     @staticmethod
@@ -504,6 +524,9 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             ),
             "dense_expert_ids": layer._mxfp4_sm70_buf_dense_expert_ids,
             "compact_expert_offsets": (layer._mxfp4_sm70_buf_compact_expert_offsets),
+            "compact_expert_offsets64": (
+                layer._mxfp4_sm70_buf_compact_expert_offsets64
+            ),
         }
 
     def _get_buffers(
@@ -537,7 +560,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        del shared_experts, shared_experts_input
+        del shared_experts_input
         if not x.is_cuda or x.dtype != torch.float16 or x.ndim != 2:
             raise TypeError("SM70 MXFP4 MoE requires CUDA FP16 activations [M, H].")
         if not is_exact_sm70_cuda(x, enabled=True):
@@ -566,6 +589,82 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             return x.new_empty((0, _DEEPSEEK_V4_FLASH_HIDDEN_SIZE))
         buffers = self._get_buffers(layer, num_tokens)
         output = buffers["output"]
+        self._sm70_mxfp4_shared_output_finalized = False
+
+        direct_top6 = (
+            num_tokens == 1
+            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
+            and layer.expert_map is None
+            and layer.local_num_experts == layer.global_num_experts
+        )
+        fused_shared_reduce = bool(
+            direct_top6
+            and shared_experts is not None
+            and envs.VLLM_SM70_MXFP4_MOE_FUSED_SHARED_REDUCE
+            and hasattr(
+                torch.ops._C,
+                "sm70_moe_single_token_weighted_reduce_add_out",
+            )
+        )
+        layer._sm70_mxfp4_pending_shared_reduce = False
+        if direct_top6:
+            sm70_ops.mxfp4_moe_single_token_prepare_w13_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                x,
+                topk_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                buffers["compact_expert_offsets"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_experts_id"],
+                layer.sm70_mxfp4_w13_k_dim,
+                layer.sm70_mxfp4_w13_n_dim,
+                layer.sm70_mxfp4_group_size,
+                layer.sm70_mxfp4_hidden_size,
+            )
+            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["compact_expert_offsets"],
+                buffers["permuted_experts_id"],
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                layer.sm70_mxfp4_w2_k_dim,
+                layer.sm70_mxfp4_w2_n_dim,
+                layer.sm70_mxfp4_group_size,
+            )
+            if fused_shared_reduce:
+                layer._sm70_mxfp4_pending_shared_reduce = True
+                layer._sm70_mxfp4_pending_topk_weights = topk_weights
+            elif _single_token_weighted_reduce_enabled():
+                if not torch.compiler.is_compiling():
+                    logger.info_once(
+                        "SM70 MXFP4 MoE single-token weighted-reduce path "
+                        "enabled (top_k=%d).",
+                        _DEEPSEEK_V4_FLASH_TOP_K,
+                    )
+                sm70_ops.awq_moe_single_token_weighted_reduce_out(
+                    buffers["sorted_output"],
+                    topk_weights,
+                    buffers["inv_permuted_idx"],
+                    output,
+                    _DEEPSEEK_V4_FLASH_TOP_K,
+                    layer.sm70_mxfp4_hidden_size,
+                )
+            else:
+                torch.ops._moe_C.moe_unpermute(
+                    buffers["sorted_output"],
+                    topk_weights,
+                    buffers["inv_permuted_idx"],
+                    buffers["compact_expert_offsets64"],
+                    _DEEPSEEK_V4_FLASH_TOP_K,
+                    output,
+                )
+            return output
+
         output.zero_()
 
         total_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
@@ -637,6 +736,46 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             output,
         )
         return output
+
+    def finalize_shared_expert_output(
+        self,
+        layer: RoutedExperts,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        if not getattr(layer, "_sm70_mxfp4_pending_shared_reduce", False):
+            return shared_output, fused_output
+        if shared_output is None:
+            raise RuntimeError(
+                "SM70 MXFP4 fused shared reduce requires shared-expert output."
+            )
+        topk_weights = layer._sm70_mxfp4_pending_topk_weights
+        buffers = self._persistent_b1_buffers(layer)
+        shared_scale = 1.0 / routed_scaling_factor
+        sm70_ops.sm70_moe_single_token_weighted_reduce_add_out(
+            buffers["sorted_output"],
+            topk_weights,
+            buffers["inv_permuted_idx"],
+            shared_output,
+            fused_output,
+            shared_scale,
+            _DEEPSEEK_V4_FLASH_TOP_K,
+            layer.sm70_mxfp4_hidden_size,
+        )
+        layer._sm70_mxfp4_pending_shared_reduce = False
+        layer._sm70_mxfp4_pending_topk_weights = None
+        self._sm70_mxfp4_shared_output_finalized = True
+        if not torch.compiler.is_compiling():
+            logger.info_once(
+                "SM70 MXFP4 MoE weighted-reduce + shared-add fusion enabled."
+            )
+        # The shared-MoE custom-op schema requires two Tensor outputs. The
+        # outer runner discards this already-consumed tensor after unpacking.
+        return shared_output, fused_output
+
+    def is_shared_expert_output_finalized(self) -> bool:
+        return getattr(self, "_sm70_mxfp4_shared_output_finalized", False)
 
     def apply_monolithic(
         self,

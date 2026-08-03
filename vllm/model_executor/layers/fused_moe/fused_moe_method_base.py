@@ -171,6 +171,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def finalize_shared_expert_output(
+        self,
+        layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        del layer, routed_scaling_factor
+        return shared_output, fused_output
+
+    def is_shared_expert_output_finalized(self) -> bool:
+        return False
+
     def apply_monolithic(
         self,
         layer: "RoutedExperts",  # type: ignore[name-defined] # noqa: F821

@@ -50,6 +50,8 @@ inline hipPointer_attribute rangeStartAddrAttr =
 #endif
 
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
+constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
+constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
 
@@ -81,6 +83,17 @@ inline bool custom_allreduce_current_device_is_sm70() {
 #else
   return false;
 #endif
+}
+
+inline bool sm70_tp8_hierarchical_custom_ar_enabled(int world_size,
+                                                     bool fully_connected) {
+  const char* raw = std::getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR");
+  return raw != nullptr && std::atoi(raw) != 0 && world_size == 8 &&
+         !fully_connected && custom_allreduce_current_device_is_sm70();
+}
+
+inline bool sm70_tp8_hierarchical_peer(int rank, int peer) {
+  return rank / 4 == peer / 4 || rank + 4 == peer || peer + 4 == rank;
 }
 
 inline int custom_allreduce_block_limit(int default_limit,
@@ -678,6 +691,81 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg,
+                                         Signal* self_sg, int rank,
+                                         int signal_slot) {
+  const int tid = threadIdx.x;
+  const int clique_base = rank < 4 ? 0 : 4;
+  const FlagType flag = self_sg->_flag[0] + 1;
+  if (tid < 4) {
+    const int peer = clique_base + tid;
+    st_flag_sys_visible(&sg.signals[peer]->start[signal_slot][rank], flag);
+    while (ld_flag_sys_visible(&self_sg->start[signal_slot][peer]) != flag);
+  }
+  __syncthreads();
+  if (tid == 0) self_sg->_flag[0] = flag;
+  return flag;
+}
+
+static __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    half* __restrict__ result, int rank, int packed_size) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+
+  const int tid = threadIdx.x;
+  const int clique_base = rank < 4 ? 0 : 4;
+  const int pair_rank = rank < 4 ? rank + 4 : rank - 4;
+  auto dp = *_dp;
+
+  // The counter advances twice per call. Alternate signal/data slots so one
+  // clique may safely run one round ahead of its paired clique.
+  const int partial_slot = (self_sg->_flag[0] >> 1) & 1;
+  const FlagType clique_flag =
+      sm70_tp8_clique_barrier(sg, self_sg, rank, partial_slot);
+  A* const self_partial =
+      get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
+  const A* const pair_partial =
+      get_tmp_buf<A>(sg.signals[pair_rank]) + partial_slot * packed_size;
+
+  A partial{};
+  if (tid < packed_size) {
+    partial = upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base])[tid]);
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+      packed_assign_add(
+          partial,
+          upcast(reinterpret_cast<const P*>(dp.ptrs[clique_base + i])[tid]));
+    }
+    self_partial[tid] = partial;
+  }
+
+  // Publish the FP32 clique partial only after every producer thread has made
+  // its store visible to the paired GPU.
+  __threadfence_system();
+  __syncthreads();
+  const FlagType pair_flag = clique_flag + 1;
+  if (tid < 4) {
+    const int peer = clique_base + tid;
+    const int completion_slot =
+        kSm70Tp8CompletionSignalSlotBase + partial_slot;
+    st_flag_volatile(&sg.signals[peer]->end[completion_slot][rank], pair_flag);
+    while (ld_flag_volatile(&self_sg->end[completion_slot][peer]) !=
+           pair_flag);
+  } else if (tid == 4) {
+    st_flag_release(&sg.signals[pair_rank]->end[partial_slot][rank], pair_flag);
+    while (ld_flag_acquire(&self_sg->end[partial_slot][pair_rank]) !=
+           pair_flag);
+  }
+  __syncthreads();
+
+  if (tid < packed_size) {
+    packed_assign_add(partial, pair_partial[tid]);
+    reinterpret_cast<P*>(result)[tid] = downcast<P>(partial);
+  }
+  if (tid == 0) self_sg->_flag[0] = pair_flag;
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -954,6 +1042,12 @@ class CustomAllreduce {
       auto& rd = rank_data[i];
       for (int j = 0; j < world_size_; j++) {
         if (j != rank_) {
+          if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
+                                                      fully_connected_) &&
+              !sm70_tp8_hierarchical_peer(rank_, j)) {
+            rd.ptrs[j] = nullptr;
+            continue;
+          }
           char* handle =
               open_ipc_handle(&handles[j][i * sizeof(cudaIpcMemHandle_t)]);
           handle += offsets[j][i];
@@ -1013,6 +1107,15 @@ class CustomAllreduce {
 
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
+    if constexpr (std::is_same_v<T, half>) {
+      if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
+                                                  fully_connected_) &&
+          bytes == kSm70Tp8HierarchicalAllreduceBytes) {
+        sm70_tp8_hierarchical_reduce<<<1, 512, 0, stream>>>(
+            ptrs, sg_, self_sg_, output, rank_, size);
+        return;
+      }
+    }
     threads = sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_,
                                             bytes);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);

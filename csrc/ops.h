@@ -430,6 +430,12 @@ void awq_moe_single_token_weighted_reduce_out(torch::Tensor sorted_output,
                                               int64_t top_k,
                                               int64_t hidden_logical_size);
 
+void sm70_moe_single_token_weighted_reduce_add_out(
+    torch::Tensor sorted_output, torch::Tensor topk_weights,
+    torch::Tensor inv_permuted_idx, torch::Tensor shared_output,
+    torch::Tensor out, double shared_scale, int64_t top_k,
+    int64_t hidden_logical_size);
+
 void awq_moe_single_token_sm70_out(
     torch::Tensor out,
     torch::Tensor x,
@@ -499,6 +505,21 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out,
                                     int64_t k,
                                     int64_t n,
                                     int64_t group_size);
+
+void mxfp4_moe_single_token_prepare_w13_sm70_out(
+    torch::Tensor gate_up,
+    torch::Tensor compact_input,
+    torch::Tensor x,
+    torch::Tensor topk_ids,
+    torch::Tensor w13_ptrs_w,
+    torch::Tensor w13_ptrs_s,
+    torch::Tensor expert_offsets,
+    torch::Tensor inv_permuted_idx,
+    torch::Tensor sorted_expert_ids,
+    int64_t w13_k,
+    int64_t w13_n,
+    int64_t group_size,
+    int64_t hidden_logical_size);
 
 void fp8_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out,

@@ -452,6 +452,59 @@ if hasattr(torch.ops._C, "mxfp4_moe_dense_stage_sm70_out"):
         return None
 
 
+def mxfp4_moe_single_token_prepare_w13_sm70_out(
+    gate_up: torch.Tensor,
+    compact_input: torch.Tensor,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_ptrs_w: torch.Tensor,
+    w13_ptrs_s: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    w13_k: int,
+    w13_n: int,
+    group_size: int,
+    hidden_logical_size: int,
+) -> None:
+    _op("mxfp4_moe_single_token_prepare_w13_sm70_out")(
+        gate_up,
+        compact_input,
+        x,
+        topk_ids,
+        w13_ptrs_w,
+        w13_ptrs_s,
+        expert_offsets,
+        inv_permuted_idx,
+        sorted_expert_ids,
+        w13_k,
+        w13_n,
+        group_size,
+        hidden_logical_size,
+    )
+
+
+if hasattr(torch.ops._C, "mxfp4_moe_single_token_prepare_w13_sm70_out"):
+
+    @register_fake("_C::mxfp4_moe_single_token_prepare_w13_sm70_out")
+    def _mxfp4_moe_single_token_prepare_w13_sm70_out_fake(
+        gate_up: torch.Tensor,
+        compact_input: torch.Tensor,
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        w13_ptrs_w: torch.Tensor,
+        w13_ptrs_s: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        w13_k: int,
+        w13_n: int,
+        group_size: int,
+        hidden_logical_size: int,
+    ) -> None:
+        return None
+
+
 def nvfp4_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1418,6 +1471,44 @@ if hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out"):
         topk_weights: torch.Tensor,
         inv_permuted_idx: torch.Tensor,
         out: torch.Tensor,
+        top_k: int,
+        hidden_logical_size: int,
+    ) -> None:
+        return None
+
+
+def sm70_moe_single_token_weighted_reduce_add_out(
+    sorted_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    shared_output: torch.Tensor,
+    out: torch.Tensor,
+    shared_scale: float,
+    top_k: int,
+    hidden_logical_size: int,
+) -> None:
+    _op("sm70_moe_single_token_weighted_reduce_add_out")(
+        sorted_output,
+        topk_weights,
+        inv_permuted_idx,
+        shared_output,
+        out,
+        shared_scale,
+        top_k,
+        hidden_logical_size,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_moe_single_token_weighted_reduce_add_out"):
+
+    @register_fake("_C::sm70_moe_single_token_weighted_reduce_add_out")
+    def _sm70_moe_single_token_weighted_reduce_add_out_fake(
+        sorted_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        shared_output: torch.Tensor,
+        out: torch.Tensor,
+        shared_scale: float,
         top_k: int,
         hidden_logical_size: int,
     ) -> None:

@@ -533,6 +533,8 @@ class MoERunner(MoERunnerInterface):
         avoid overflow by dividing shared_output by the scale instead
         (the decoder layer compensates with matching divisions).
         """
+        if self._quant_method.is_shared_expert_output_finalized():
+            return shared_output, fused_output
         if self.routed_scaling_factor != 1.0:
             if fused_output.dtype != torch.float16 or shared_output is None:
                 fused_output *= self.routed_scaling_factor
@@ -781,6 +783,12 @@ class MoERunner(MoERunnerInterface):
         shared_out = (
             self._shared_experts.output if self._shared_experts is not None else None
         )
+        shared_out, fused_out = self._quant_method.finalize_shared_expert_output(
+            layer,
+            shared_out,
+            fused_out,
+            self.routed_scaling_factor,
+        )
         if shared_out is not None:
             shared_out = _sm70_dump_moe_runner_tensor(
                 shared_out,
@@ -896,6 +904,8 @@ class MoERunner(MoERunnerInterface):
 
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
+        if self._quant_method.is_shared_expert_output_finalized():
+            shared_output = None
         if (
             shared_output is not None or self.routed_output_transform is not None
         ) and hidden_dim_was_padded:

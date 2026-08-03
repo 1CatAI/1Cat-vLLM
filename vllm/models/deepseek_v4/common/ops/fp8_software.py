@@ -34,6 +34,22 @@ def fp8_e4m3fn_bits_to_fp32(bits):
 
 
 @triton.jit
+def fp8_e4m3fn_bits_to_fp32_bitcast(bits):
+    """Decode E4M3FN bytes by constructing exact IEEE FP32 normal values."""
+    value_bits = bits.to(tl.int32)
+    exponent = (value_bits >> 3) & 0x0F
+    mantissa = value_bits & 0x07
+    sign_bits = (value_bits & 0x80) << 24
+    normal_bits = sign_bits | ((exponent + 120) << 23) | (mantissa << 20)
+    normal = normal_bits.to(tl.float32, bitcast=True)
+
+    sign = tl.where((value_bits & 0x80) != 0, -1.0, 1.0)
+    subnormal = mantissa.to(tl.float32) * (2.0**-9) * sign
+    decoded = tl.where(exponent == 0, subnormal, normal)
+    return tl.where((exponent == 15) & (mantissa == 7), float("nan"), decoded)
+
+
+@triton.jit
 def fp32_to_fp8_e4m3fn_bits(x):
     """Encode finite FP32 values to saturated E4M3FN round-to-nearest-even."""
     sign_bit = (x.to(tl.int32, bitcast=True) >> 24) & 0x80

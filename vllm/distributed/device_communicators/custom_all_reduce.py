@@ -27,6 +27,17 @@ except Exception:
 
 logger = init_logger(__name__)
 
+_SM70_TP8_HIERARCHICAL_ELEMENTS = 4096
+
+
+def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
+    """Return the four-rank clique and its direct cross-clique peer."""
+    if not 0 <= rank < 8:
+        raise ValueError(f"SM70 TP8 hierarchical rank must be in [0, 8), got {rank}")
+    clique_base = 0 if rank < 4 else 4
+    pair_rank = rank + 4 if rank < 4 else rank - 4
+    return (*range(clique_base, clique_base + 4), pair_rank)
+
 
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
@@ -149,18 +160,60 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        tp8_hierarchical = False
+        hierarchical_peer_ranks: tuple[int, ...] | None = None
         if world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+            sm70_tp8_candidate = (
+                envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
+                and world_size == 8
+                and device_capability is not None
+                and device_capability.major == 7
+                and device_capability.minor == 0
             )
-            return
+            if not sm70_tp8_candidate:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
+
+            hierarchical_peer_ranks = _sm70_tp8_hierarchical_peer_ranks(rank)
+            try:
+                rank_device_indices = [
+                    device_ids.index(physical_id) for physical_id in physical_device_ids
+                ]
+            except ValueError:
+                logger.warning(
+                    "SM70 TP8 hierarchical custom allreduce cannot map all rank "
+                    "devices into CUDA_VISIBLE_DEVICES."
+                )
+                return
+            local_topology_ok = all(
+                peer == rank
+                or torch.cuda.can_device_access_peer(
+                    device.index, rank_device_indices[peer]
+                )
+                for peer in hierarchical_peer_ranks
+            )
+            topology_status: list[bool | None] = [None] * world_size
+            dist.all_gather_object(topology_status, local_topology_ok, group=self.group)
+            if not all(status is True for status in topology_status):
+                logger.warning(
+                    "SM70 TP8 hierarchical custom allreduce is disabled because "
+                    "a required clique or paired NVLink P2P edge is unavailable."
+                )
+                return
+            tp8_hierarchical = True
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if not current_platform.is_rocm() and not _can_p2p(rank, world_size):
+        if (
+            not tp8_hierarchical
+            and not current_platform.is_rocm()
+            and not _can_p2p(rank, world_size)
+        ):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
@@ -173,11 +226,22 @@ class CustomAllreduce:
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
         self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size, group=group, uncached=True
+            ops.meta_size() + max_size,
+            group=group,
+            uncached=True,
+            peer_ranks=set(hierarchical_peer_ranks)
+            if hierarchical_peer_ranks is not None
+            else None,
         )
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
-        self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+        self.buffer_ptrs = self.create_shared_buffer(
+            max_size,
+            group=group,
+            peer_ranks=set(hierarchical_peer_ranks)
+            if hierarchical_peer_ranks is not None
+            else None,
+        )
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -190,6 +254,7 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
+        self.tp8_hierarchical = tp8_hierarchical
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
@@ -238,6 +303,11 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
+        if self.tp8_hierarchical:
+            return (
+                inp.dtype == torch.float16
+                and inp.numel() == _SM70_TP8_HIERARCHICAL_ELEMENTS
+            )
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
@@ -282,9 +352,7 @@ class CustomAllreduce:
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(
-            inp, residual, weight
-        ):
+        if not self.can_sm70_tp2_all_reduce_gemma_rms_norm(inp, residual, weight):
             raise RuntimeError("SM70 TP2 fused all-reduce RMSNorm is unavailable")
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
@@ -659,6 +727,7 @@ class CustomAllreduce:
         size_in_bytes: int,
         group: ProcessGroup | None = None,
         uncached: bool | None = False,
+        peer_ranks: set[int] | None = None,
     ) -> list[int]:
         pointer, handle = ops.allocate_shared_buffer_and_handle(size_in_bytes)
 
@@ -671,7 +740,10 @@ class CustomAllreduce:
         for i, h in enumerate(handles):
             if i == rank:
                 pointers.append(pointer)  # type: ignore
+            elif peer_ranks is not None and i not in peer_ranks:
+                pointers.append(0)
             else:
+                assert h is not None
                 pointers.append(ops.open_mem_handle(h))
         return pointers
 
