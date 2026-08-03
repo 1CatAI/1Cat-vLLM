@@ -18,32 +18,32 @@
 
 namespace ft_nvtx {
 static std::string scope;
-std::string        getScope();
-void               addScope(std::string name);
-void               setScope(std::string name);
-void               resetScope();
-static int         domain = 0;
-void               setDeviceDomain(int deviceId);
-int                getDeviceDomain();
-void               resetDeviceDomain();
-bool               isEnableNvtx();
+std::string getScope();
+void addScope(std::string name);
+void setScope(std::string name);
+void resetScope();
+static int domain = 0;
+void setDeviceDomain(int deviceId);
+int getDeviceDomain();
+void resetDeviceDomain();
+bool isEnableNvtx();
 
 static bool has_read_nvtx_env = false;
 static bool is_enable_ft_nvtx = false;
-void        ftNvtxRangePush(std::string name);
-void        ftNvtxRangePop();
+void ftNvtxRangePush(std::string name);
+void ftNvtxRangePop();
 }  // namespace ft_nvtx
 
-#define PUSH_RANGE(name)                                                                                               \
-    {                                                                                                                  \
-        if (ft_nvtx::isEnableNvtx()) {                                                                                 \
-            ft_nvtx::ftNvtxRangePush(name);                                                                            \
-        }                                                                                                              \
-    }
+#define PUSH_RANGE(name)              \
+  {                                   \
+    if (ft_nvtx::isEnableNvtx()) {    \
+      ft_nvtx::ftNvtxRangePush(name); \
+    }                                 \
+  }
 
-#define POP_RANGE                                                                                                      \
-    {                                                                                                                  \
-        if (ft_nvtx::isEnableNvtx()) {                                                                                 \
-            ft_nvtx::ftNvtxRangePop();                                                                                 \
-        }                                                                                                              \
-    }
+#define POP_RANGE                  \
+  {                                \
+    if (ft_nvtx::isEnableNvtx()) { \
+      ft_nvtx::ftNvtxRangePop();   \
+    }                              \
+  }

@@ -21,274 +21,268 @@
 
 namespace turbomind::gemm {
 
-template<class Gemm>
-class KernelImpl: public Kernel {
-public:
-    // import frequently used constants
-    static constexpr int CTA_M = Gemm::CTA_M;
-    static constexpr int CTA_N = Gemm::CTA_N;
-    static constexpr int CTA_K = Gemm::CTA_K;
+template <class Gemm>
+class KernelImpl : public Kernel {
+ public:
+  // import frequently used constants
+  static constexpr int CTA_M = Gemm::CTA_M;
+  static constexpr int CTA_N = Gemm::CTA_N;
+  static constexpr int CTA_K = Gemm::CTA_K;
 
-    using Impl  = typename Gemm::Impl;
-    using Sched = typename Gemm::Scheduler;
+  using Impl = typename Gemm::Impl;
+  using Sched = typename Gemm::Scheduler;
 
-    using OpA = typename Gemm::OperandA;
-    using OpB = typename Gemm::OperandB;
-    using OpU = typename Gemm::OperandU;
-    using OpV = typename Gemm::OperandV;
+  using OpA = typename Gemm::OperandA;
+  using OpB = typename Gemm::OperandB;
+  using OpU = typename Gemm::OperandU;
+  using OpV = typename Gemm::OperandV;
 
-    KernelImpl()
-    {
-        desc_.order_a = OpA::kOrder;
-        desc_.order_b = transpose(OpB::kOrder);
-        desc_.order_c = Gemm::kOrderC;
+  KernelImpl() {
+    desc_.order_a = OpA::kOrder;
+    desc_.order_b = transpose(OpB::kOrder);
+    desc_.order_c = Gemm::kOrderC;
 
-        desc_.type_a = data_type_v<typename Gemm::Ta>;
-        desc_.type_b = data_type_v<typename Gemm::Tb>;
-        desc_.type_c = data_type_v<typename Gemm::Tc>;
+    desc_.type_a = data_type_v<typename Gemm::Ta>;
+    desc_.type_b = data_type_v<typename Gemm::Tb>;
+    desc_.type_c = data_type_v<typename Gemm::Tc>;
 
-        using IterA = typename OpA::GmemIter;
-        using IterB = typename OpB::GmemIter;
+    using IterA = typename OpA::GmemIter;
+    using IterB = typename OpB::GmemIter;
 
-        desc_.striding_a = IterA::kMode;
-        desc_.striding_b = IterB::kMode;
-        desc_.striding_c = Gemm::Epilogue::kMode;
+    desc_.striding_a = IterA::kMode;
+    desc_.striding_b = IterB::kMode;
+    desc_.striding_c = Gemm::Epilogue::kMode;
 
-        desc_.pack_a = OpA::kPack;
-        desc_.pack_b = OpB::kPack;
-        desc_.pack_u = OpU::kPack;
-        desc_.pack_v = OpV::kPack;
+    desc_.pack_a = OpA::kPack;
+    desc_.pack_b = OpB::kPack;
+    desc_.pack_u = OpU::kPack;
+    desc_.pack_v = OpV::kPack;
 
-        desc_.quant_a = QuantDesc{};
-        desc_.quant_b = QuantDesc{};
+    desc_.quant_a = QuantDesc{};
+    desc_.quant_b = QuantDesc{};
 
-        if constexpr (OpU::SmemLayout::kSize > 1) {
-            desc_.quant_a = QuantDesc{QuantType::kDefault, OpU::kGroupSize};
-        }
-
-        if constexpr (OpV::SmemLayout::kSize > 1) {
-            desc_.quant_b = QuantDesc{QuantType::kDefault, OpV::kGroupSize};
-        }
-
-        desc_.cta_tile = {Gemm::CTA_M, Gemm::CTA_N, Gemm::CTA_K};
-        desc_.mma_tile = {Impl::MMA_Map::kGroupM, Impl::MMA_Map::kGroupN, Impl::MMA_Map::kGroupK};
-
-        info_.chunk_size_k = Gemm::kChunkSizeK;
-
-        desc_.align.x = OpA::kOrder == kColMajor ? IterA::ThreadMap::kAccessC : 1;
-        desc_.align.y = OpB::kOrder == kColMajor ? IterB::ThreadMap::kAccessC : 1;
-        desc_.align.z = Gemm::CTA_K;
-
-        desc_.policy_a = (int)IterA::Policy::kEvictPolicy;
-        desc_.policy_b = (int)IterB::Policy::kEvictPolicy;
-        desc_.c_tile   = {Gemm::Epilogue::TM, Gemm::Epilogue::TN};
-        desc_.op_class = Impl::kOpClass;
-
-        desc_.cluster_shape = {1, 1};
-
-        auto func = gemm_kernel<Gemm, GemmParam, EpilogueParam, Sched>;
-
-        cudaFuncGetAttributes(&info_.attr, func);
-
-        info_.dynamic_smem_size = sizeof(typename Gemm::SharedStorage);
-
-        if (info_.dynamic_smem_size > (48 << 10)) {
-            cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, info_.dynamic_smem_size);
-        }
-
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &info_.max_active_ctas, func, Impl::WARPS * WARP_SIZE, info_.dynamic_smem_size);
-
-        desc_.stages     = Impl::Stages;
-        desc_.split_k    = Gemm::kSplitK;
-        desc_.group_axis = Sched::group_axis;
-
-        desc_.arch = Gemm::Arch::value;
-
-        info_.name = GetName();
+    if constexpr (OpU::SmemLayout::kSize > 1) {
+      desc_.quant_a = QuantDesc{QuantType::kDefault, OpU::kGroupSize};
     }
 
-    int Launch(const Operation&    operation,
-               float               alpha,
-               const void*         A,
-               const MatrixLayout& _Adesc,
-               const void*         U,
-               const MatrixLayout& Udesc,
-               const void*         B,
-               const MatrixLayout& _Bdesc,
-               const void*         V,
-               const MatrixLayout& _Vdesc,
-               float               beta,
-               const void*         C,
-               const MatrixLayout& Cdesc,
-               void*               D,
-               const MatrixLayout& Ddesc,
-               int                 swizzle,
-               int                 splits,
-               Workspace&          workspace,
-               cudaStream_t        stream) override
-    {
-        MatrixLayout Adesc = _Adesc;
+    if constexpr (OpV::SmemLayout::kSize > 1) {
+      desc_.quant_b = QuantDesc{QuantType::kDefault, OpV::kGroupSize};
+    }
 
-        const int m = Ddesc.rows;
-        const int n = Ddesc.cols;
-        const int k = Adesc.cols;
-        const int l = std::max(1, Ddesc.num);
+    desc_.cta_tile = {Gemm::CTA_M, Gemm::CTA_N, Gemm::CTA_K};
+    desc_.mma_tile = {Impl::MMA_Map::kGroupM, Impl::MMA_Map::kGroupN,
+                      Impl::MMA_Map::kGroupK};
 
-        auto transpose = [](MatrixLayout x) {
-            std::swap(x.rows, x.cols);
-            x.order = gemm::transpose(x.order);
-            return x;
-        };
+    info_.chunk_size_k = Gemm::kChunkSizeK;
 
-        MatrixLayout Bdesc = transpose(_Bdesc);
-        MatrixLayout Vdesc = transpose(_Vdesc);
+    desc_.align.x = OpA::kOrder == kColMajor ? IterA::ThreadMap::kAccessC : 1;
+    desc_.align.y = OpB::kOrder == kColMajor ? IterB::ThreadMap::kAccessC : 1;
+    desc_.align.z = Gemm::CTA_K;
 
-        auto max_splits = GetMaxSplits({m, n, k, l}, swizzle, workspace.barriers_size, workspace.partials_size);
+    desc_.policy_a = (int)IterA::Policy::kEvictPolicy;
+    desc_.policy_b = (int)IterB::Policy::kEvictPolicy;
+    desc_.c_tile = {Gemm::Epilogue::TM, Gemm::Epilogue::TN};
+    desc_.op_class = Impl::kOpClass;
 
-        Sched sched{{m, n, k, l}, swizzle, std::min(splits, max_splits)};
-        sched.offsets_ = Ddesc.offsets;
-        sched.set_active_groups(Ddesc.group_idxs, operation.active_group_count);
+    desc_.cluster_shape = {1, 1};
 
-        using Ta = typename Gemm::Ta;
-        using Tb = typename Gemm::Tb;
-        using Tc = typename Gemm::Tc;
+    auto func = gemm_kernel<Gemm, GemmParam, EpilogueParam, Sched>;
 
-        if constexpr (0) {
-            [[maybe_unused]] static const int _ = [] {
-                std::cout << "A:\n";
-                Print(typename Gemm::OperandA::GmemIter::ThreadMap{});
-                std::cout << "\nB:\n";
-                Print(typename Gemm::OperandB::GmemIter::ThreadMap{});
-                if constexpr (!std::is_same_v<Ta, Tc>) {
-                    std::cout << "\nU:\n";
-                    Print(typename Gemm::OperandU::GmemIter::ThreadMap{});
-                }
-                if constexpr (!std::is_same_v<Tb, Tc>) {
-                    std::cout << "\nV:\n";
-                    Print(typename Gemm::OperandV::GmemIter::ThreadMap{});
-                }
-                printf("warp count: %d\n", Impl::WARPS);
-                Print_(typename Gemm::Impl::MMA_Map{});
+    cudaFuncGetAttributes(&info_.attr, func);
 
-                printf("C:\n");
-                Print(typename Gemm::Epilogue::Map{});
+    info_.dynamic_smem_size = sizeof(typename Gemm::SharedStorage);
 
-                std::cout << "Smem for mainloop: " << sizeof(Gemm::SharedStorage::mainloop) << "\n";
-                std::cout << "Smem for epilogue: " << sizeof(Gemm::SharedStorage::epilogue) << "\n";
+    if (info_.dynamic_smem_size > (48 << 10)) {
+      cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           info_.dynamic_smem_size);
+    }
 
-                return 0;
-            }();
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info_.max_active_ctas, func,
+                                                  Impl::WARPS * WARP_SIZE,
+                                                  info_.dynamic_smem_size);
+
+    desc_.stages = Impl::Stages;
+    desc_.split_k = Gemm::kSplitK;
+    desc_.group_axis = Sched::group_axis;
+
+    desc_.arch = Gemm::Arch::value;
+
+    info_.name = GetName();
+  }
+
+  int Launch(const Operation& operation, float alpha, const void* A,
+             const MatrixLayout& _Adesc, const void* U,
+             const MatrixLayout& Udesc, const void* B,
+             const MatrixLayout& _Bdesc, const void* V,
+             const MatrixLayout& _Vdesc, float beta, const void* C,
+             const MatrixLayout& Cdesc, void* D, const MatrixLayout& Ddesc,
+             int swizzle, int splits, Workspace& workspace,
+             cudaStream_t stream) override {
+    MatrixLayout Adesc = _Adesc;
+
+    const int m = Ddesc.rows;
+    const int n = Ddesc.cols;
+    const int k = Adesc.cols;
+    const int l = std::max(1, Ddesc.num);
+
+    auto transpose = [](MatrixLayout x) {
+      std::swap(x.rows, x.cols);
+      x.order = gemm::transpose(x.order);
+      return x;
+    };
+
+    MatrixLayout Bdesc = transpose(_Bdesc);
+    MatrixLayout Vdesc = transpose(_Vdesc);
+
+    auto max_splits =
+        GetMaxSplits({m, n, k, l}, swizzle, workspace.barriers_size,
+                     workspace.partials_size);
+
+    Sched sched{{m, n, k, l}, swizzle, std::min(splits, max_splits)};
+    sched.offsets_ = Ddesc.offsets;
+    sched.set_active_groups(Ddesc.group_idxs, operation.active_group_count);
+
+    using Ta = typename Gemm::Ta;
+    using Tb = typename Gemm::Tb;
+    using Tc = typename Gemm::Tc;
+
+    if constexpr (0) {
+      [[maybe_unused]] static const int _ = [] {
+        std::cout << "A:\n";
+        Print(typename Gemm::OperandA::GmemIter::ThreadMap{});
+        std::cout << "\nB:\n";
+        Print(typename Gemm::OperandB::GmemIter::ThreadMap{});
+        if constexpr (!std::is_same_v<Ta, Tc>) {
+          std::cout << "\nU:\n";
+          Print(typename Gemm::OperandU::GmemIter::ThreadMap{});
         }
-
-        const bool silu_act = ((int)operation.epilogue & (int)Epilogue::kGatedSilu);
-        const bool moe_weighted_reduce =
-            ((int)operation.epilogue & (int)Epilogue::kMoeWeightedReduce);
-        const bool tile_allreduce =
-            ((int)operation.epilogue & (int)Epilogue::kTileAllReduce);
-        const auto* moe_reduce =
-            static_cast<const MoeWeightedReduceParam*>(operation.reserved);
-        const auto* tile_reduce =
-            static_cast<const TileAllReduceParam*>(operation.tile_allreduce);
-
-        MatrixLayout Pdesc = Ddesc;
-        Pdesc.ld           = mk2cs<Gemm::kOrderC>(Pdesc.rows, Pdesc.cols).x;
-
-        MatrixCombination_v3 combin_mat{to_param((void*)C, Cdesc), alpha, beta};
-
-        EpilogueParam epilogue{to_param((void*)D, Ddesc),
-                               to_param((void*)workspace.partials, Pdesc),
-                               (int*)workspace.barriers,
-                               combin_mat,
-                               silu_act,
-                               moe_weighted_reduce,
-                               moe_reduce ? moe_reduce->out : nullptr,
-                               moe_reduce ? moe_reduce->sorted_weights : nullptr,
-                               moe_reduce ? moe_reduce->offsets : nullptr,
-                               tile_allreduce,
-                               tile_reduce ? *tile_reduce : TileAllReduceParam{}};
-
-        // std::cout << Adesc.offsets << " " << Adesc.idxs << "\n";
-
-        GemmParam param{
-            to_param((void*)A, Adesc),
-            to_param((void*)B, Bdesc),
-            to_param((void*)U, Udesc),
-            to_param((void*)V, Vdesc),
-        };
-
-        auto       grid  = sched.get_grid_shape();
-        const auto block = Gemm::Impl::WARPS * WARP_SIZE;
-
-        if (epilogue.tile_allreduce && epilogue.tile_allreduce_param.kernel_reducer_blocks > 0) {
-            auto& tile_ar = epilogue.tile_allreduce_param;
-            tile_ar.producer_grid_x = static_cast<int>(grid.x);
-            tile_ar.producer_grid_y = static_cast<int>(grid.y);
-            tile_ar.producer_grid_z = static_cast<int>(grid.z);
-            if (tile_ar.world_size == 2 && tile_ar.rank_data != nullptr && tile_ar.output != nullptr &&
-                tile_ar.output_numel > 0 && tile_ar.tile_numel > 0 && grid.z < 65535) {
-                grid.z += 1;
-            }
-            else {
-                tile_ar.kernel_reducer_blocks = 0;
-            }
+        if constexpr (!std::is_same_v<Tb, Tc>) {
+          std::cout << "\nV:\n";
+          Print(typename Gemm::OperandV::GmemIter::ThreadMap{});
         }
+        printf("warp count: %d\n", Impl::WARPS);
+        Print_(typename Gemm::Impl::MMA_Map{});
 
-        // std::cout << info_.name << " " << splits << " " << swizzle << " " << sched.tiles_[0] << " " <<
-        // sched.tiles_[1]
-        //           << std::endl;
-        // std::cout << grid.x << " " << grid.y << " " << grid.z << "\n";
+        printf("C:\n");
+        Print(typename Gemm::Epilogue::Map{});
 
-        gemm_kernel<Gemm><<<grid, block, info_.dynamic_smem_size, stream>>>(param, epilogue, sched);
+        std::cout << "Smem for mainloop: "
+                  << sizeof(Gemm::SharedStorage::mainloop) << "\n";
+        std::cout << "Smem for epilogue: "
+                  << sizeof(Gemm::SharedStorage::epilogue) << "\n";
 
         return 0;
+      }();
     }
 
-    std::array<size_t, 2> GetWorkspaceSize(int tiles, int splits) const
-    {
-        static constexpr bool kSerial = true;
+    const bool silu_act = ((int)operation.epilogue & (int)Epilogue::kGatedSilu);
+    const bool moe_weighted_reduce =
+        ((int)operation.epilogue & (int)Epilogue::kMoeWeightedReduce);
+    const bool tile_allreduce =
+        ((int)operation.epilogue & (int)Epilogue::kTileAllReduce);
+    const auto* moe_reduce =
+        static_cast<const MoeWeightedReduceParam*>(operation.reserved);
+    const auto* tile_reduce =
+        static_cast<const TileAllReduceParam*>(operation.tile_allreduce);
 
-        size_t barriers_size = sizeof(int) * tiles;
-        size_t partials_size = sizeof(float) * CTA_M * CTA_N * tiles;
+    MatrixLayout Pdesc = Ddesc;
+    Pdesc.ld = mk2cs<Gemm::kOrderC>(Pdesc.rows, Pdesc.cols).x;
 
-        if constexpr (!kSerial) {
-            barriers_size *= splits;
-            partials_size *= splits;
-        }
+    MatrixCombination_v3 combin_mat{to_param((void*)C, Cdesc), alpha, beta};
 
-        return {barriers_size, partials_size};
+    EpilogueParam epilogue{to_param((void*)D, Ddesc),
+                           to_param((void*)workspace.partials, Pdesc),
+                           (int*)workspace.barriers,
+                           combin_mat,
+                           silu_act,
+                           moe_weighted_reduce,
+                           moe_reduce ? moe_reduce->out : nullptr,
+                           moe_reduce ? moe_reduce->sorted_weights : nullptr,
+                           moe_reduce ? moe_reduce->offsets : nullptr,
+                           tile_allreduce,
+                           tile_reduce ? *tile_reduce : TileAllReduceParam{}};
+
+    // std::cout << Adesc.offsets << " " << Adesc.idxs << "\n";
+
+    GemmParam param{
+        to_param((void*)A, Adesc),
+        to_param((void*)B, Bdesc),
+        to_param((void*)U, Udesc),
+        to_param((void*)V, Vdesc),
+    };
+
+    auto grid = sched.get_grid_shape();
+    const auto block = Gemm::Impl::WARPS * WARP_SIZE;
+
+    if (epilogue.tile_allreduce &&
+        epilogue.tile_allreduce_param.kernel_reducer_blocks > 0) {
+      auto& tile_ar = epilogue.tile_allreduce_param;
+      tile_ar.producer_grid_x = static_cast<int>(grid.x);
+      tile_ar.producer_grid_y = static_cast<int>(grid.y);
+      tile_ar.producer_grid_z = static_cast<int>(grid.z);
+      if (tile_ar.world_size == 2 && tile_ar.rank_data != nullptr &&
+          tile_ar.output != nullptr && tile_ar.output_numel > 0 &&
+          tile_ar.tile_numel > 0 && grid.z < 65535) {
+        grid.z += 1;
+      } else {
+        tile_ar.kernel_reducer_blocks = 0;
+      }
     }
 
-    int GetMaxSplits(const int4& shape, int swizzle, size_t bsize, size_t psize) const override
-    {
-        if (!Gemm::kSplitK) {
-            return 1;
-        }
+    // std::cout << info_.name << " " << splits << " " << swizzle << " " <<
+    // sched.tiles_[0] << " " << sched.tiles_[1]
+    //           << std::endl;
+    // std::cout << grid.x << " " << grid.y << " " << grid.z << "\n";
 
-        const auto& [m, n, k, l] = shape;
+    gemm_kernel<Gemm><<<grid, block, info_.dynamic_smem_size, stream>>>(
+        param, epilogue, sched);
 
-        Sched sched{{m, n, k, l}, swizzle};  // for getting padded tiles
+    return 0;
+  }
 
-        const auto& [a, b] = GetWorkspaceSize(sched.tiles_[0] * sched.tiles_[1], 1);
+  std::array<size_t, 2> GetWorkspaceSize(int tiles, int splits) const {
+    static constexpr bool kSerial = true;
 
-        if (bsize >= a && psize >= b) {
-            // Serial split-k requires workspace for 1 split only
-            // But it can't exceed num of k chunks
-            return cdiv(k, Gemm::kChunkSizeK);
-        }
-        else {
-            return 1;
-        }
+    size_t barriers_size = sizeof(int) * tiles;
+    size_t partials_size = sizeof(float) * CTA_M * CTA_N * tiles;
+
+    if constexpr (!kSerial) {
+      barriers_size *= splits;
+      partials_size *= splits;
     }
 
-    int GetMaxSwizzle(const int4& shape) const override
-    {
-        const auto& [m, n, k, l] = shape;
+    return {barriers_size, partials_size};
+  }
 
-        auto swizzle = Sched{{m, n, k, l}}.get_max_swizzle();
-        // std::cout << m << " " << n << " " << k << " " << l << " " << swizzle << "\n";
-        return swizzle;
+  int GetMaxSplits(const int4& shape, int swizzle, size_t bsize,
+                   size_t psize) const override {
+    if (!Gemm::kSplitK) {
+      return 1;
     }
+
+    const auto& [m, n, k, l] = shape;
+
+    Sched sched{{m, n, k, l}, swizzle};  // for getting padded tiles
+
+    const auto& [a, b] = GetWorkspaceSize(sched.tiles_[0] * sched.tiles_[1], 1);
+
+    if (bsize >= a && psize >= b) {
+      // Serial split-k requires workspace for 1 split only
+      // But it can't exceed num of k chunks
+      return cdiv(k, Gemm::kChunkSizeK);
+    } else {
+      return 1;
+    }
+  }
+
+  int GetMaxSwizzle(const int4& shape) const override {
+    const auto& [m, n, k, l] = shape;
+
+    auto swizzle = Sched{{m, n, k, l}}.get_max_swizzle();
+    // std::cout << m << " " << n << " " << k << " " << l << " " << swizzle <<
+    // "\n";
+    return swizzle;
+  }
 };
 
 }  // namespace turbomind::gemm

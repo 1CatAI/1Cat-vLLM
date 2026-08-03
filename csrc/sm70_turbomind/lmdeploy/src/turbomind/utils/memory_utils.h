@@ -20,8 +20,9 @@
 
 namespace turbomind {
 
-template<typename T>
-void invokeInPlaceTranspose102(
-    T* data, T* workspace, const int dim0, const int dim1, const int dim2, bool copy = true, cudaStream_t stream = 0);
+template <typename T>
+void invokeInPlaceTranspose102(T* data, T* workspace, const int dim0,
+                               const int dim1, const int dim2, bool copy = true,
+                               cudaStream_t stream = 0);
 
 }  // namespace turbomind

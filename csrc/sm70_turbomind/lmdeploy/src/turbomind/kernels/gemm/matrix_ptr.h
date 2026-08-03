@@ -6,28 +6,26 @@
 
 namespace turbomind::gemm {
 
-struct __align__(16) StridedPtr
-{
-    void* ptr;
-    int   stride;
+struct __align__(16) StridedPtr {
+  void* ptr;
+  int stride;
 };
 
 struct MatrixParam {
-    void* ptr;
-    int   stride;
-    int*  offsets;
-    int*  idxs;
-    int*  group_idxs;
+  void* ptr;
+  int stride;
+  int* offsets;
+  int* idxs;
+  int* group_idxs;
 };
 
 struct MatrixData {
-    StridedPtr ptr;
-    const int* idxs;
+  StridedPtr ptr;
+  const int* idxs;
 };
 
-inline MatrixParam to_param(void* ptr, MatrixLayout layout)
-{
-    return {ptr, layout.ld, layout.offsets, layout.idxs, layout.group_idxs};
+inline MatrixParam to_param(void* ptr, MatrixLayout layout) {
+  return {ptr, layout.ld, layout.offsets, layout.idxs, layout.group_idxs};
 }
 
 #if 0
@@ -59,43 +57,40 @@ __inline__ __device__ MatrixData resolve(const MatrixParam& param, int gemm_id)
 }
 #endif
 
-template<class T, Striding mode>
-__inline__ __device__ MatrixData resolve(const MatrixParam& param, int g)
-{
-    StridedPtr ptr{param.ptr, param.stride};
-    const int* idxs{};
-    if constexpr (mode == Striding::kFlat) {
-        // pass
+template <class T, Striding mode>
+__inline__ __device__ MatrixData resolve(const MatrixParam& param, int g) {
+  StridedPtr ptr{param.ptr, param.stride};
+  const int* idxs{};
+  if constexpr (mode == Striding::kFlat) {
+    // pass
+  } else if constexpr (mode == Striding::kBlocked) {
+    const int ptr_group = param.group_idxs ? __ldg(param.group_idxs + g) : g;
+    if (ptr.stride == 0) {
+      (uint4&)ptr = __ldg((const uint4*)param.ptr + ptr_group);
+    }  // Post-condition: ptr.stride != 0
+    if (param.offsets) {
+      ptr.ptr = (char*)ptr.ptr + __ldg(param.offsets + g) * (size_t)ptr.stride *
+                                     bitsof<T> / bitsof<char>;
     }
-    else if constexpr (mode == Striding::kBlocked) {
-        const int ptr_group = param.group_idxs ? __ldg(param.group_idxs + g) : g;
-        if (ptr.stride == 0) {
-            (uint4&)ptr = __ldg((const uint4*)param.ptr + ptr_group);
-        }  // Post-condition: ptr.stride != 0
-        if (param.offsets) {
-            ptr.ptr = (char*)ptr.ptr + __ldg(param.offsets + g) * (size_t)ptr.stride * bitsof<T> / bitsof<char>;
-        }
+  } else if constexpr (mode == Striding::kIndexed) {
+    idxs = param.idxs;
+    if (ptr.stride == 0) {
+      (uint4&)ptr = __ldg((const uint4*)param.ptr + g);
+      idxs = idxs ? ((int**)idxs)[g] : nullptr;
+    }  // Post-condition: ptr.stride != 0
+    if (param.offsets) {
+      const int offset = __ldg(param.offsets + g);
+      if (idxs) {
+        idxs += offset;
+      } else {
+        ptr.ptr = (char*)ptr.ptr +
+                  offset * (size_t)ptr.stride * bitsof<T> / bitsof<char>;
+      }
     }
-    else if constexpr (mode == Striding::kIndexed) {
-        idxs = param.idxs;
-        if (ptr.stride == 0) {
-            (uint4&)ptr = __ldg((const uint4*)param.ptr + g);
-            idxs        = idxs ? ((int**)idxs)[g] : nullptr;
-        }  // Post-condition: ptr.stride != 0
-        if (param.offsets) {
-            const int offset = __ldg(param.offsets + g);
-            if (idxs) {
-                idxs += offset;
-            }
-            else {
-                ptr.ptr = (char*)ptr.ptr + offset * (size_t)ptr.stride * bitsof<T> / bitsof<char>;
-            }
-        }
-    }
-    else {
-        static_assert(mode != mode, "Not implemented.");
-    }
-    return {ptr, idxs};
+  } else {
+    static_assert(mode != mode, "Not implemented.");
+  }
+  return {ptr, idxs};
 }
 
 // p <- dat_ptrs[g]

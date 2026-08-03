@@ -10,14 +10,16 @@
 namespace turbomind::gemm {
 
 class Sampler {
-public:
-    explicit Sampler(Measurer& measurer, int k_clusters): measurer_{measurer}, k_clusters_{k_clusters} {}
+ public:
+  explicit Sampler(Measurer& measurer, int k_clusters)
+      : measurer_{measurer}, k_clusters_{k_clusters} {}
 
-    std::vector<LaunchSpec> Run(std::vector<LaunchSpec> specs, const Launcher& launcher, cudaStream_t stream);
+  std::vector<LaunchSpec> Run(std::vector<LaunchSpec> specs,
+                              const Launcher& launcher, cudaStream_t stream);
 
-private:
-    Measurer& measurer_;
-    int       k_clusters_;
+ private:
+  Measurer& measurer_;
+  int k_clusters_;
 };
 
 }  // namespace turbomind::gemm

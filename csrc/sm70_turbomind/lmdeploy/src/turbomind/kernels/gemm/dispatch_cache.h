@@ -9,24 +9,24 @@
 namespace turbomind::gemm {
 
 class DispatchCache {
-public:
-    DispatchCache(std::vector<Kernel*> kernels);
+ public:
+  DispatchCache(std::vector<Kernel*> kernels);
 
-    ~DispatchCache();
+  ~DispatchCache();
 
-    std::optional<LaunchSpec> LowerBound(const GemmDesc& desc) const;
+  std::optional<LaunchSpec> LowerBound(const GemmDesc& desc) const;
 
-    std::optional<LaunchSpec> Find(const GemmDesc& desc) const;
+  std::optional<LaunchSpec> Find(const GemmDesc& desc) const;
 
-    bool Insert(const GemmDesc& desc, const LaunchSpec& spec);
+  bool Insert(const GemmDesc& desc, const LaunchSpec& spec);
 
-    int Export(std::ostream& os) const;
+  int Export(std::ostream& os) const;
 
-    int Import(std::istream& is);
+  int Import(std::istream& is);
 
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace turbomind::gemm

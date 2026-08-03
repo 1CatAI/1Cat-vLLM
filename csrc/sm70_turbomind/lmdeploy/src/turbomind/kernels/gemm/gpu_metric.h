@@ -10,6 +10,6 @@ namespace turbomind::gemm {
 float MeasureL2CacheThroughput();
 
 // fused multiply-add / second
-float MeasureMmaThroughput(int proble_size = 16384);
+float MeasureMmaThroughput(int problem_size = 16384);
 
 }  // namespace turbomind::gemm

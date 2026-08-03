@@ -9,21 +9,21 @@
 namespace turbomind::gemm {
 
 struct TuningParams {
-    // Split-k params
-    int max_splits = 8;
-    int max_waves  = 10;
+  // Split-k params
+  int max_splits = 8;
+  int max_waves = 10;
 
-    // Swizzling params
-    std::vector<int> swizzle{0, 3};
+  // Swizzling params
+  std::vector<int> swizzle{0, 3};
 
-    // Sampling params for hierarchical kernel selection
-    float top_k    = 0;
-    int   clusters = 5;
-    int   min_iter = 1;
-    int   max_iter = 10;
-    float max_time = 1.f;
+  // Sampling params for hierarchical kernel selection
+  float top_k = 0;
+  int clusters = 5;
+  int min_iter = 1;
+  int max_iter = 10;
+  float max_time = 1.f;
 
-    std::vector<int> seq;
+  std::vector<int> seq;
 };
 
 // example
@@ -34,7 +34,8 @@ void ParseTuningParams(TuningParams& params, const std::string& str);
 //   16-16-128,256-128-1024,8192
 std::vector<int> ParseTuningSequence(const std::string& str);
 
-std::vector<int> GenerateTuningSequence(const std::vector<std::array<int, 3>>& generators);
+std::vector<int> GenerateTuningSequence(
+    const std::vector<std::array<int, 3>>& generators);
 
 std::vector<std::array<int, 3>> GetDefaultTuningGenerators();
 

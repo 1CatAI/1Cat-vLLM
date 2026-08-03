@@ -13,18 +13,18 @@
 
 namespace turbomind {
 
-using core::ssize_t;
+using core::Allocator;
+using core::BatchCopy;
 using core::Buffer;
 using core::Buffer_;
+using core::Event;
+using core::Layout;
+using core::Ref;
+using core::ssize_t;
+using core::Stream;
 using core::Tensor;
 using core::Tensor_;
 using core::TensorMap;
-using core::Ref;
-using core::Layout;
-using core::Allocator;
-using core::Stream;
-using core::Event;
-using core::BatchCopy;
 
 using core::subrange;
 

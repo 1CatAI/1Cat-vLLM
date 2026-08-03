@@ -270,47 +270,49 @@ inline std::ostream& operator<<(std::ostream& os, DataType type) {
 
 // clang-format on
 
-#define TM_PP_NARGS(...) TM_PP_NARGS_IMPL(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define TM_PP_NARGS(...) \
+  TM_PP_NARGS_IMPL(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0)
 #define TM_PP_NARGS_IMPL(_0, _1, _2, _3, _4, _5, _6, _7, N, ...) N
 
 #define TM_PP_CAT(a, b) a##b
 #define TM_PP_STR(x) #x
 
-#define TM_PP_DISPATCH_N(macro, ...) TM_PP_DISPATCH_N_IMPL(macro, TM_PP_NARGS(__VA_ARGS__))
+#define TM_PP_DISPATCH_N(macro, ...) \
+  TM_PP_DISPATCH_N_IMPL(macro, TM_PP_NARGS(__VA_ARGS__))
 #define TM_PP_DISPATCH_N_IMPL(macro, x) TM_PP_CAT(macro, x)
 
 #define TM_PP_INVOKE_1(macro, f, _0) macro(f, _0)
 
-#define TM_PP_INVOKE_2(macro, f, _0, _1)                                                                               \
-    macro(f, _0);                                                                                                      \
-    macro(f, _1)
+#define TM_PP_INVOKE_2(macro, f, _0, _1) \
+  macro(f, _0);                          \
+  macro(f, _1)
 
-#define TM_PP_INVOKE_3(macro, f, _0, _1, _2)                                                                           \
-    macro(f, _0);                                                                                                      \
-    macro(f, _1);                                                                                                      \
-    macro(f, _2)
+#define TM_PP_INVOKE_3(macro, f, _0, _1, _2) \
+  macro(f, _0);                              \
+  macro(f, _1);                              \
+  macro(f, _2)
 
-#define TM_PP_INVOKE_4(macro, f, _0, _1, _2, _3)                                                                       \
-    macro(f, _0);                                                                                                      \
-    macro(f, _1);                                                                                                      \
-    macro(f, _2);                                                                                                      \
-    macro(f, _3)
+#define TM_PP_INVOKE_4(macro, f, _0, _1, _2, _3) \
+  macro(f, _0);                                  \
+  macro(f, _1);                                  \
+  macro(f, _2);                                  \
+  macro(f, _3)
 
-#define TM_PP_INVOKE_5(macro, f, _0, _1, _2, _3, _4)                                                                   \
-    macro(f, _0);                                                                                                      \
-    macro(f, _1);                                                                                                      \
-    macro(f, _2);                                                                                                      \
-    macro(f, _3);                                                                                                      \
-    macro(f, _4)
+#define TM_PP_INVOKE_5(macro, f, _0, _1, _2, _3, _4) \
+  macro(f, _0);                                      \
+  macro(f, _1);                                      \
+  macro(f, _2);                                      \
+  macro(f, _3);                                      \
+  macro(f, _4)
 
-#define TM_DISPATCH_DTYPE_RET_CASE(f, t)                                                                               \
-    case ::turbomind::data_type_v<t>:                                                                                  \
-        return f(t{});
+#define TM_DISPATCH_DTYPE_RET_CASE(f, t) \
+  case ::turbomind::data_type_v<t>:      \
+    return f(t{});
 
-#define TM_DISPATCH_DTYPE_CASE(f, t)                                                                                   \
-    case ::turbomind::data_type_v<t>:                                                                                  \
-        f(t{});                                                                                                        \
-        break
+#define TM_DISPATCH_DTYPE_CASE(f, t) \
+  case ::turbomind::data_type_v<t>:  \
+    f(t{});                          \
+    break
 
 // clang-format off
 #define TM_DISPATCH_DTYPES_RET(var, f, ...)                                                                            \
@@ -332,19 +334,21 @@ inline std::ostream& operator<<(std::ostream& os, DataType type) {
 #define TM_PRIMARY_DTYPES_0 ::turbomind::half_t
 
 #if ENABLE_BF16
-#define TM_PRIMARY_DTYPES_1 TM_PRIMARY_DTYPES_0, ::turbomind::bfloat16_t
+  #define TM_PRIMARY_DTYPES_1 TM_PRIMARY_DTYPES_0, ::turbomind::bfloat16_t
 #else
-#define TM_PRIMARY_DTYPES_1 TM_PRIMARY_DTYPES_0
+  #define TM_PRIMARY_DTYPES_1 TM_PRIMARY_DTYPES_0
 #endif
 
 #if ENABLE_FP32
-#define TM_PRIMARY_DTYPES TM_PRIMARY_DTYPES_1, float
+  #define TM_PRIMARY_DTYPES TM_PRIMARY_DTYPES_1, float
 #else
-#define TM_PRIMARY_DTYPES TM_PRIMARY_DTYPES_1
+  #define TM_PRIMARY_DTYPES TM_PRIMARY_DTYPES_1
 #endif
 
-#define TM_DISPATCH_PRIMARY_DTYPES(var, func) TM_DISPATCH_DTYPES(var, func, TM_PRIMARY_DTYPES)
+#define TM_DISPATCH_PRIMARY_DTYPES(var, func) \
+  TM_DISPATCH_DTYPES(var, func, TM_PRIMARY_DTYPES)
 
-#define TM_DISPATCH_PRIMARY_DTYPES_RET(var, func) TM_DISPATCH_DTYPES_RET(var, func, TM_PRIMARY_DTYPES)
+#define TM_DISPATCH_PRIMARY_DTYPES_RET(var, func) \
+  TM_DISPATCH_DTYPES_RET(var, func, TM_PRIMARY_DTYPES)
 
 }  // namespace turbomind

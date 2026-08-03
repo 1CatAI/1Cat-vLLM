@@ -27,94 +27,83 @@ namespace turbomind {
 // cub.cuh brings windows.h
 // should be included after cub.cuh
 #ifdef ERROR
-#undef ERROR
+  #undef ERROR
 #endif
 
 class Logger {
+ public:
+  enum Level { TRACE = 0, DEBUG = 10, INFO = 20, WARNING = 30, ERROR = 40 };
 
-public:
-    enum Level
-    {
-        TRACE   = 0,
-        DEBUG   = 10,
-        INFO    = 20,
-        WARNING = 30,
-        ERROR   = 40
-    };
+  static Logger& getLogger();
+  Logger(Logger const&) = delete;
+  void operator=(Logger const&) = delete;
 
-    static Logger& getLogger();
-    Logger(Logger const&) = delete;
-    void operator=(Logger const&) = delete;
-
-    template<typename... Args>
-    void log(const Level level, const std::string format, const Args&... args)
-    {
-        if (level_ <= level) {
-            std::string fmt = getPrefix(level) + format + "\n";
-            // FILE*       out    = level_ < WARNING ? stdout : stderr;
-            std::string logstr = fmtstr(fmt, args...);
-            fprintf(stderr, "%s", logstr.c_str());
-        }
+  template <typename... Args>
+  void log(const Level level, const std::string format, const Args&... args) {
+    if (level_ <= level) {
+      std::string fmt = getPrefix(level) + format + "\n";
+      // FILE*       out    = level_ < WARNING ? stdout : stderr;
+      std::string logstr = fmtstr(fmt, args...);
+      fprintf(stderr, "%s", logstr.c_str());
     }
+  }
 
-    template<typename... Args>
-    void log(const Level level, const int rank, const std::string format, const Args&... args)
-    {
-        if (level_ <= level) {
-            std::string fmt = getPrefix(level, rank) + format + "\n";
-            // FILE*       out    = level_ < WARNING ? stdout : stderr;
-            std::string logstr = fmtstr(fmt, args...);
-            fprintf(stderr, "%s", logstr.c_str());
-        }
+  template <typename... Args>
+  void log(const Level level, const int rank, const std::string format,
+           const Args&... args) {
+    if (level_ <= level) {
+      std::string fmt = getPrefix(level, rank) + format + "\n";
+      // FILE*       out    = level_ < WARNING ? stdout : stderr;
+      std::string logstr = fmtstr(fmt, args...);
+      fprintf(stderr, "%s", logstr.c_str());
     }
+  }
 
-    void setLevel(const Level level)
-    {
-        level_ = level;
-        log(DEBUG, "Set logger level by %s", getLevelName(level).c_str());
-    }
+  void setLevel(const Level level) {
+    level_ = level;
+    log(DEBUG, "Set logger level by %s", getLevelName(level).c_str());
+  }
 
-    int getLevel() const
-    {
-        return level_;
-    }
+  int getLevel() const { return level_; }
 
-private:
-    const std::string                              PREFIX      = "[TM]";
-    const std::map<const Level, const std::string> level_name_ = {
-        {TRACE, "TRACE"}, {DEBUG, "DEBUG"}, {INFO, "INFO"}, {WARNING, "WARNING"}, {ERROR, "ERROR"}};
+ private:
+  const std::string PREFIX = "[TM]";
+  const std::map<const Level, const std::string> level_name_ = {
+      {TRACE, "TRACE"},
+      {DEBUG, "DEBUG"},
+      {INFO, "INFO"},
+      {WARNING, "WARNING"},
+      {ERROR, "ERROR"}};
 
 #ifndef NDEBUG
-    const Level DEFAULT_LOG_LEVEL = DEBUG;
+  const Level DEFAULT_LOG_LEVEL = DEBUG;
 #else
-    const Level DEFAULT_LOG_LEVEL = INFO;
+  const Level DEFAULT_LOG_LEVEL = INFO;
 #endif
-    Level level_ = DEFAULT_LOG_LEVEL;
+  Level level_ = DEFAULT_LOG_LEVEL;
 
-    Logger();
+  Logger();
 
-    inline const std::string getLevelName(const Level level)
-    {
-        return level_name_.at(level);
-    }
+  inline const std::string getLevelName(const Level level) {
+    return level_name_.at(level);
+  }
 
-    inline const std::string getPrefix(const Level level)
-    {
-        return PREFIX + "[" + getLevelName(level) + "] ";
-    }
+  inline const std::string getPrefix(const Level level) {
+    return PREFIX + "[" + getLevelName(level) + "] ";
+  }
 
-    inline const std::string getPrefix(const Level level, const int rank)
-    {
-        return PREFIX + "[" + getLevelName(level) + "][" + std::to_string(rank) + "] ";
-    }
+  inline const std::string getPrefix(const Level level, const int rank) {
+    return PREFIX + "[" + getLevelName(level) + "][" + std::to_string(rank) +
+           "] ";
+  }
 };
 
-#define TM_LOG(level, ...)                                                                                             \
-    do {                                                                                                               \
-        if (turbomind::Logger::getLogger().getLevel() <= level) {                                                      \
-            turbomind::Logger::getLogger().log(level, __VA_ARGS__);                                                    \
-        }                                                                                                              \
-    } while (0)
+#define TM_LOG(level, ...)                                    \
+  do {                                                        \
+    if (turbomind::Logger::getLogger().getLevel() <= level) { \
+      turbomind::Logger::getLogger().log(level, __VA_ARGS__); \
+    }                                                         \
+  } while (0)
 
 #define TM_LOG_TRACE(...) TM_LOG(turbomind::Logger::TRACE, __VA_ARGS__)
 #define TM_LOG_DEBUG(...) TM_LOG(turbomind::Logger::DEBUG, __VA_ARGS__)

@@ -5,68 +5,65 @@
 #include <type_traits>
 
 #if (__CUDACC_VER_MAJOR__ >= 11) && (__CUDACC_VER_MINOR__ >= 4)
-#define L2_CACHEHINT(size) ".L2::" #size "B"
+  #define L2_CACHEHINT(size) ".L2::" #size "B"
 #else
-#define L2_CACHEHINT(size)
+  #define L2_CACHEHINT(size)
 #endif
 
 namespace turbomind {
 
-enum class CacheOp
-{
-    kDefault,  // use global when possible
-    kAlways,
-    kGlobal,
+enum class CacheOp {
+  kDefault,  // use global when possible
+  kAlways,
+  kGlobal,
 };
 
-template<CacheOp cache_op, int size>
+template <CacheOp cache_op, int size>
 struct GetCacheOp {
-    static constexpr auto value = cache_op;
+  static constexpr auto value = cache_op;
 };
 
-template<>
+template <>
 struct GetCacheOp<CacheOp::kDefault, 16> {
-    static constexpr auto value = CacheOp::kGlobal;
+  static constexpr auto value = CacheOp::kGlobal;
 };
 
-template<int size>
+template <int size>
 struct GetCacheOp<CacheOp::kDefault, size> {
-    static constexpr auto value = CacheOp::kAlways;
+  static constexpr auto value = CacheOp::kAlways;
 };
 
-enum class EvictPolicy
-{
-    kEvictNormal,
-    kEvictFirst,
-    kEvictLast,
+enum class EvictPolicy {
+  kEvictNormal,
+  kEvictFirst,
+  kEvictLast,
 };
 
 namespace cache_policy {
 
 struct Default {
-    static constexpr auto kCacheOp     = CacheOp::kDefault;
-    static constexpr auto kEvictPolicy = EvictPolicy::kEvictNormal;
+  static constexpr auto kCacheOp = CacheOp::kDefault;
+  static constexpr auto kEvictPolicy = EvictPolicy::kEvictNormal;
 };
 
 struct Stream {
-    static constexpr auto kCacheOp     = CacheOp::kDefault;
-    static constexpr auto kEvictPolicy = EvictPolicy::kEvictFirst;
+  static constexpr auto kCacheOp = CacheOp::kDefault;
+  static constexpr auto kEvictPolicy = EvictPolicy::kEvictFirst;
 };
 
 struct Reuse {
-    static constexpr auto kCacheOp     = CacheOp::kAlways;
-    static constexpr auto kEvictPolicy = EvictPolicy::kEvictNormal;
+  static constexpr auto kCacheOp = CacheOp::kAlways;
+  static constexpr auto kEvictPolicy = EvictPolicy::kEvictNormal;
 };
 
 };  // namespace cache_policy
 
-template<CacheOp, int size, int prefetch_size>
-struct CP_ASYNC {
-};
+template <CacheOp, int size, int prefetch_size>
+struct CP_ASYNC {};
 
-template<int prefetch_size>
+template <int prefetch_size>
 struct CP_ASYNC<CacheOp::kGlobal, 16, prefetch_size> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -79,12 +76,12 @@ struct CP_ASYNC<CacheOp::kGlobal, 16, prefetch_size> {
                      "  @p cp.async.cg.shared.global.L2::cache_hint [%1], [%2], 16, %3;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<>
+template <>
 struct CP_ASYNC<CacheOp::kGlobal, 16, 64> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -97,12 +94,12 @@ struct CP_ASYNC<CacheOp::kGlobal, 16, 64> {
                      "  @p cp.async.cg.shared.global.L2::cache_hint" L2_CACHEHINT(64) " [%1], [%2], 16, %3;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<>
+template <>
 struct CP_ASYNC<CacheOp::kGlobal, 16, 128> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -115,12 +112,12 @@ struct CP_ASYNC<CacheOp::kGlobal, 16, 128> {
                      "  @p cp.async.cg.shared.global.L2::cache_hint" L2_CACHEHINT(128) " [%1], [%2], 16, %3;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<>
+template <>
 struct CP_ASYNC<CacheOp::kGlobal, 16, 256> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -133,12 +130,12 @@ struct CP_ASYNC<CacheOp::kGlobal, 16, 256> {
                      "  @p cp.async.cg.shared.global.L2::cache_hint" L2_CACHEHINT(256) " [%1], [%2], 16, %3;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<int size, int prefetch_size>
+template <int size, int prefetch_size>
 struct CP_ASYNC<CacheOp::kAlways, size, prefetch_size> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -151,12 +148,12 @@ struct CP_ASYNC<CacheOp::kAlways, size, prefetch_size> {
                      "  @p cp.async.ca.shared.global.L2::cache_hint [%1], [%2], %3, %4;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "n"(size), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<int size>
+template <int size>
 struct CP_ASYNC<CacheOp::kAlways, size, 64> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -169,12 +166,12 @@ struct CP_ASYNC<CacheOp::kAlways, size, 64> {
                      "  @p cp.async.ca.shared.global.L2::cache_hint" L2_CACHEHINT(64) " [%1], [%2], %3, %4;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "n"(size), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<int size>
+template <int size>
 struct CP_ASYNC<CacheOp::kAlways, size, 128> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -187,12 +184,12 @@ struct CP_ASYNC<CacheOp::kAlways, size, 128> {
                      "  @p cp.async.ca.shared.global.L2::cache_hint" L2_CACHEHINT(128) " [%1], [%2], %3, %4;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "n"(size), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
-template<int size>
+template <int size>
 struct CP_ASYNC<CacheOp::kAlways, size, 256> {
-    // clang-format off
+  // clang-format off
     __device__ static void apply(int smem_ptr, const void* __restrict__ src, bool mask)
     {
         asm volatile("{\n  .reg .pred p;\n  setp.ne.b32 p, %0, 0;\n"
@@ -205,7 +202,7 @@ struct CP_ASYNC<CacheOp::kAlways, size, 256> {
                      "  @p cp.async.ca.shared.global.L2::cache_hint" L2_CACHEHINT(256) " [%1], [%2], %3, %4;\n"
                      "}\n" ::"r"((int)mask), "r"(smem_ptr), "l"(src), "n"(size), "l"(cache_policy));
     }
-    // clang-format on
+  // clang-format on
 };
 
 }  // namespace turbomind
