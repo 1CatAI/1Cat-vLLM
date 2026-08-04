@@ -5,11 +5,11 @@
 Note that all future modules must be lazily loaded within main
 to avoid certain eager import breakage."""
 
-import importlib.metadata
 import sys
 from importlib.util import find_spec
 
 from vllm.logger import init_logger
+from vllm.version import get_vllm_distribution_version
 
 logger = init_logger(__name__)
 
@@ -75,7 +75,7 @@ def main():
             "-v",
             "--version",
             action="version",
-            version=importlib.metadata.version("vllm"),
+            version=get_vllm_distribution_version(),
         )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}

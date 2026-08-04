@@ -3,12 +3,12 @@
 
 import argparse
 import asyncio
-import importlib.metadata
 import typing
 
 from vllm.entrypoints.cli.types import CLISubcommand
 from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
+from vllm.version import get_vllm_distribution_version
 
 if typing.TYPE_CHECKING:
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -28,7 +28,7 @@ class RunBatchSubcommand(CLISubcommand):
         from vllm.entrypoints.openai.run_batch import main as run_batch_main
 
         logger.info(
-            "vLLM batch processing API version %s", importlib.metadata.version("vllm")
+            "vLLM batch processing API version %s", get_vllm_distribution_version()
         )
         logger.info("args: %s", args)
 

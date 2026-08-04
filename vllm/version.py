@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.metadata
+
 try:
     from ._version import __version__, __version_tuple__
 except Exception as e:
@@ -10,6 +12,16 @@ except Exception as e:
 
     __version__ = "dev"
     __version_tuple__ = (0, 0, __version__)
+
+
+def get_vllm_distribution_version() -> str:
+    """Return the installed distribution version for vLLM CLI entrypoints."""
+    for distribution_name in ("1cat-vllm", "vllm"):
+        try:
+            return importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return __version__
 
 
 def _prev_minor_version_was(version_str):
