@@ -69,7 +69,7 @@ def _time_cuda(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     samples = []
@@ -146,7 +146,7 @@ def main() -> None:
     if args.tail_size <= 0 or args.correctness_rounds <= 0:
         raise ValueError("Tail size and correctness rounds must be positive.")
 
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     try:
         device = torch.device("cuda", local_rank)
@@ -266,7 +266,7 @@ def main() -> None:
         update_and_compact(empty_observed, empty_candidates)
         refresh_weight()
         gather_and_map()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         expected_seed = torch.tensor(
             tuple(token_id for seed in shard_seeds for token_id in seed),
@@ -308,7 +308,7 @@ def main() -> None:
             update_and_compact(observed, candidates)
             refresh_weight()
             gather_and_map()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             expected_lru = torch.tensor(tuple(host_lru), dtype=torch.int64)
             if not torch.equal(gpu_lru.cpu(), expected_lru):

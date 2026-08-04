@@ -349,7 +349,7 @@ def _time_cuda_call(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     times_ms: list[float] = []
     for _ in range(iters):
@@ -639,7 +639,7 @@ def _capture_outputs(
 ) -> dict[str, torch.Tensor]:
     for prepared in prepared_cases:
         prepared.run()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return {
         prepared.case.label: prepared.output.detach().cpu().clone()
         for prepared in prepared_cases
@@ -738,7 +738,7 @@ def _run_gated_silu_candidate(
 
     run_baseline()
     run_fused()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     diff = (baseline - fused).float().abs()
     baseline_timing = _time_cuda_call(run_baseline, device, warmup, iters)
     fused_timing = _time_cuda_call(run_fused, device, warmup, iters)

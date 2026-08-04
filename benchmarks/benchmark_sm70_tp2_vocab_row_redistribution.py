@@ -59,7 +59,7 @@ def _time_cuda(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     samples = []
@@ -108,7 +108,7 @@ def main() -> None:
     if args.hidden_size <= 0 or args.model_vocab_size <= 0:
         raise ValueError("Model dimensions must be positive.")
 
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     try:
         device = torch.device("cuda", local_rank)
@@ -170,7 +170,7 @@ def main() -> None:
 
         gather_rows()
         redistribute()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         dist.barrier()
 
         timings = {

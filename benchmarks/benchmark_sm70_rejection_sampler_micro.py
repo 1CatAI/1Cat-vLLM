@@ -18,6 +18,7 @@ from pathlib import Path
 
 import torch
 
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
@@ -57,7 +58,7 @@ def _make_sampling_metadata(device: torch.device, top_k: int, top_p: float):
 def _time_cuda(fn, warmup: int, iters: int) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     samples_ms: list[float] = []
     for _ in range(iters):
@@ -310,9 +311,9 @@ def main() -> None:
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
+    set_random_seed(args.seed)
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
 
     num_tokens = args.num_spec_tokens
     cu_num_draft_tokens = torch.tensor([num_tokens], dtype=torch.int32, device=device)
@@ -424,7 +425,7 @@ def main() -> None:
         "top_ids_equal": bool(torch.equal(full_ref[1], compact_ref[1])),
         "residual_max_abs": float((full_ref[2] - compact_ref[2]).abs().max().item()),
     }
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     def _set_combined_bonus(enabled: bool) -> None:
         os.environ["VLLM_SM70_REJECTION_COMBINE_BONUS"] = "1" if enabled else "0"

@@ -14,6 +14,7 @@ from typing import Any
 import torch
 
 from vllm import _sm70_ops as sm70_ops
+from vllm.utils.torch_utils import set_random_seed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,7 +38,7 @@ def _time_cuda(
 ) -> dict[str, float]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     samples = []
     for _ in range(iters):
@@ -64,15 +65,14 @@ def main() -> int:
     if args.top_k != 20:
         raise ValueError("The prototype epilogue is fixed to top-k=20.")
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     capability = torch.cuda.get_device_capability(device)
     if capability != (7, 0):
         raise RuntimeError(f"Expected SM70, got sm_{capability[0]}{capability[1]}.")
     if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
         raise RuntimeError("The experimental top-20 op is not built.")
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    set_random_seed(args.seed)
     hidden = torch.randn((1, args.k), dtype=torch.float16, device=device)
     weight = torch.randn((args.n, args.k), dtype=torch.float16, device=device)
     prepared = sm70_ops.sm70_f16_prepare(weight)
@@ -109,7 +109,7 @@ def main() -> int:
 
     reference_values, reference_indices = dense_gemm_topk()
     fused_top20()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     values_equal = bool(torch.equal(reference_values, fused_values))
     indices_equal = bool(torch.equal(reference_indices, fused_indices))
     reference_order = reference_indices.argsort(dim=-1)

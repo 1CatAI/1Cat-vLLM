@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 
 from vllm import _sm70_ops as sm70_ops
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 
@@ -76,7 +77,7 @@ def _time_cuda(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     samples: list[float] = []
@@ -108,7 +109,7 @@ def main() -> None:
     if args.num_steps <= 0:
         raise ValueError("--num-steps must be positive.")
 
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     try:
         device = torch.device("cuda", local_rank)
@@ -119,8 +120,7 @@ def main() -> None:
             if not hasattr(torch.ops._C, name):
                 raise RuntimeError(f"Missing torch op _C::{name}.")
 
-        torch.manual_seed(args.seed + rank)
-        torch.cuda.manual_seed_all(args.seed + rank)
+        set_random_seed(args.seed + rank)
         local_vocab_size = args.shortlist_size // world_size
         if local_vocab_size % 8:
             raise ValueError("Local vocabulary size must be divisible by 8.")
@@ -227,7 +227,7 @@ def main() -> None:
 
         w4_gemm()
         gather_logits()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         dist.barrier()
 
         timings = {

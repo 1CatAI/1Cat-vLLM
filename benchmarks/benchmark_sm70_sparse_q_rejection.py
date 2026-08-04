@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
 
@@ -40,7 +41,7 @@ def _time_cuda(
 ) -> dict[str, float]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     events = [
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -186,13 +187,12 @@ def main() -> int:
         raise ValueError("Draft vocabulary cannot exceed the full vocabulary.")
 
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     capability = torch.cuda.get_device_capability(device)
     if capability != (7, 0):
         raise RuntimeError(f"Expected SM70, got sm_{capability[0]}{capability[1]}.")
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    set_random_seed(args.seed)
     num_draft = args.num_spec_tokens
     draft_id_map = torch.randperm(args.full_vocab_size, device=device)[
         : args.draft_vocab_size

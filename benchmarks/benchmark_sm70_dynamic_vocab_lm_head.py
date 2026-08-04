@@ -12,6 +12,8 @@ from pathlib import Path
 
 import torch
 
+from vllm.utils.torch_utils import set_random_seed
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -42,7 +44,7 @@ def _time_cuda(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     events = [
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -67,7 +69,7 @@ def _time_cuda(
 def main() -> int:
     args = _parse_args()
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     _require_sm70(device)
     if args.local_vocab_size <= 0 or args.hidden_size <= 0:
         raise ValueError("Vocabulary and hidden sizes must be positive.")
@@ -76,8 +78,7 @@ def main() -> int:
     if any(size <= 0 or size > args.local_vocab_size for size in active_sizes):
         raise ValueError("Active sizes must be in [1, local vocab size].")
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    set_random_seed(args.seed)
     weight = torch.zeros(
         (args.local_vocab_size, args.hidden_size),
         dtype=torch.float16,

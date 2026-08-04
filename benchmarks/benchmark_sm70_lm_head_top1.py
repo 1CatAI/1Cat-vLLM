@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from vllm import _sm70_ops as sm70_ops
+from vllm.utils.torch_utils import set_random_seed
 
 
 def _require_sm70(device: torch.device) -> None:
@@ -38,7 +39,7 @@ def _require_torch_op(name: str) -> None:
 def _bench_cuda_ms(fn: Callable[[], Any], warmup: int, iters: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -46,7 +47,7 @@ def _bench_cuda_ms(fn: Callable[[], Any], warmup: int, iters: int) -> float:
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return float(start.elapsed_time(end) / iters)
 
 
@@ -106,8 +107,7 @@ def main() -> int:
     else:
         _require_torch_op("sm70_f16_lm_head_top1_tc_out")
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    set_random_seed(args.seed)
 
     x = torch.randn((args.m, args.k), device=device, dtype=torch.float16)
     weight = torch.randn((args.n, args.k), device=device, dtype=torch.float16)
@@ -129,7 +129,7 @@ def main() -> int:
         return torch.mm(x, weight.t(), out=torch_logits_out)
 
     ref_values, ref_indices = torch_mm_max()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     results = []
 
@@ -149,7 +149,7 @@ def main() -> int:
             )
 
         scalar_top1()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         scalar_ms = _bench_cuda_ms(scalar_top1, args.warmup, args.iters)
         results.append(
             _stats("scalar", values, indices, ref_values, ref_indices, scalar_ms)
@@ -171,7 +171,7 @@ def main() -> int:
             )
 
         tensor_core_top1()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         tc_ms = _bench_cuda_ms(tensor_core_top1, args.warmup, args.iters)
         results.append(
             _stats(

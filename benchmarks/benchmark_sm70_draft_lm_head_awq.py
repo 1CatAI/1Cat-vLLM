@@ -51,7 +51,7 @@ def _time_cuda(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     events = [
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
@@ -126,7 +126,7 @@ def _run_case(
 def main() -> int:
     args = _parse_args()
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     _require_sm70(device)
     vocab_sizes = args.n or [124160]
     cases = [

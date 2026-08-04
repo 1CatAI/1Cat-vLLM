@@ -72,7 +72,7 @@ def _time_cuda(
 ) -> tuple[dict[str, Any], Any]:
     for _ in range(warmup):
         result = operation()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     start = torch.cuda.Event(enable_timing=True)
@@ -100,7 +100,7 @@ def main() -> None:
     if args.top_k <= 0 or args.top_k > args.vocab_size // world_size:
         raise ValueError("--top-k must be in [1, vocab_size / TP].")
 
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     try:
         device = torch.device("cuda", local_rank)
@@ -241,7 +241,7 @@ def main() -> None:
         dist.all_gather_into_tensor(gathered_logits, local_logits)
         dist.all_gather_into_tensor(gathered_values, local_values)
         dist.all_gather_into_tensor(gathered_indices, local_indices)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         dist.barrier()
 
         component_timings = {

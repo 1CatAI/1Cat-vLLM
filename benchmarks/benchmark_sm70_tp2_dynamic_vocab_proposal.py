@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 
 from vllm import _sm70_ops as sm70_ops
+from vllm.utils.torch_utils import set_random_seed
 
 
 def _parse_args() -> argparse.Namespace:
@@ -68,7 +69,7 @@ def _time_cuda(
 ) -> dict[str, Any]:
     for _ in range(warmup):
         operation()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     samples = []
@@ -95,7 +96,7 @@ def _capture_cuda_graph(operation: Callable[[], Any]) -> torch.cuda.CUDAGraph:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         operation()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     return graph
 
@@ -117,7 +118,7 @@ def main() -> None:
     if not 0.0 < args.top_p <= 1.0:
         raise ValueError("top-p must be in (0, 1].")
 
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     try:
         device = torch.device("cuda", local_rank)
@@ -127,8 +128,7 @@ def main() -> None:
         if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
             raise RuntimeError("The experimental fused top-20 op is not built.")
 
-        torch.manual_seed(args.seed + rank)
-        torch.cuda.manual_seed_all(args.seed + rank)
+        set_random_seed(args.seed + rank)
         local_base_size = args.base_size // world_size
         local_tail_size = args.tail_size // world_size
         local_active_tail_size = active_tail_size // world_size
@@ -402,7 +402,7 @@ def main() -> None:
 
         four_steps_fused()
         expand_dense_q()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         dist.barrier()
         dense_q_row_sums = dense_q.sum(dim=-1)
         dense_q_nonzero_per_row = (dense_q != 0).sum(dim=-1)
@@ -531,7 +531,7 @@ def main() -> None:
         if not args.skip_cuda_graph:
             del graph, refresh_graph, end_to_end_graph
             gc.collect()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             dist.barrier()
     finally:
         dist.destroy_process_group()
