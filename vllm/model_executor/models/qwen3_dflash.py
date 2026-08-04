@@ -672,7 +672,7 @@ class DFlashQwen3Model(nn.Module):
                 if i == max(debug_direct_refs):
                     self._debug_context_kv_dumped = True
             if _debug_sync_context_kv_enabled():
-                torch.cuda.synchronize(all_k_final.device)
+                torch.accelerator.synchronize(all_k_final.device)
 
     def forward(
         self,
