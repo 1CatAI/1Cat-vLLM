@@ -83,6 +83,28 @@ Based on measured operator deltas, the current projection is approximately
 25.3 ms/token, or 39.5 tok/s. Only an unprofiled three-run TP8 result can replace
 that projection.
 
+## Latest Accepted Endpoint
+
+The accumulated TP8 1024/256 run measured 25.663779, 25.605544, and
+25.621125 ms/token. The accepted mean is **25.630149 ms/token**, or
+**39.01655 tok/s**. Relative to the original 33.853 ms/token baseline, this is
+a 24.3% TPOT reduction and a 32.1% decode-throughput increase.
+
+The latest graph-node trace attributes the following aggregate GPU service per
+token. These categories overlap across streams and are not additive wall-time
+savings.
+
+| Category | Service per token |
+|---|---:|
+| FP8 dense | 5.964 ms |
+| TP communication | 4.192 ms |
+| Sparse MLA | 3.448 ms |
+| mHC | 2.977 ms |
+| FP16 GEMV/compressor | 2.395 ms |
+| Routing | 2.134 ms |
+| MXFP4 | 1.979 ms |
+| Q/KV preparation | 1.364 ms |
+
 ## Rejected Paths
 
 | Path | Evidence | Decision |
@@ -97,6 +119,37 @@ The FP8 split result is the key scheduling lesson: service-time improvements
 on an auxiliary stream are invalid unless the full overlap timeline also
 shortens.
 
+## FP8 Dense CTA Screen
+
+The first exact-shape FP8 microbenchmark accidentally initialized the
+TurboMind workspace during CUDA Graph capture. Its replay therefore included
+workspace fill kernels and overestimated standalone FP8 service. The benchmark
+now warms the operation on the capture stream before capture and can delimit a
+single steady replay with `cudaProfilerStart`/`cudaProfilerStop`.
+
+With the corrected method, the six dense FP8 shapes project to 3.906 ms/token
+in isolation. The latest full-model trace reports 5.964 ms/token of aggregate
+FP8 service; the difference is multi-stream contention and profiling overhead,
+not extra model GEMMs.
+
+NCU on the main `M1 K4096 N1536` projection showed only 60 CTAs, 6.21% achieved
+occupancy, 82.76% scheduler cycles with no eligible warp, and 8.2-way average
+shared-load conflict. Exact `CTA_N=64/32` candidates increased the launch to
+120/240 CTAs and used the existing conflict-free `A[8,64]` shared layout. They
+were tested with the baseline `split-K=5`; allowing the tuner to choose
+`split-K=7` is not a quality-equivalent comparison.
+
+| Exact route | Median | Delta from CTA_N=128 |
+|---|---:|---:|
+| CTA_N=128, split-K=5 | 21.212 us | baseline |
+| CTA_N=64, split-K=5 | 22.558 us | +6.3% |
+| CTA_N=32, split-K=5 | 23.541 us | +11.0% |
+
+The smaller tiles duplicate activation/metadata traffic and add scheduling and
+split epilogue work. Other model streams already consume the nominally idle
+SMs, so increasing this kernel's CTA count does not recover end-to-end wall
+time. The candidates are rejected before endpoint testing.
+
 ## Artifacts
 
 ```text
@@ -104,6 +157,7 @@ shortens.
   dsv4-mxfp4-grouped-decode-micro-20260802/
   dsv4-mxfp4-direct-top6-clamp10-micro-20260802/
   dsv4-fp8-dense-shapes-20260802/
+  dsv4-fp8-dense-ncu-20260803/
   dsv4-sm70-kv-insert-parallel-micro-20260802/
   dsv4-tp8-stacked-mxfp4-fp8split-i1024-o256-20260802/
   dsv4-tp8-stacked-candidate-nsys-i1024-o128-20260802/
@@ -111,7 +165,8 @@ shortens.
 
 ## Remaining Gates
 
-1. Run one accumulated TP8 1024/256 three-seed endpoint benchmark.
-2. Verify route-hit logs and absence of the rejected FP8 split.
-3. Re-capture graph nodes and confirm the projected routing and SWA reductions.
-4. Run official-sampling text health and the model-specific quality gate.
+1. Finish official-sampling text health and the model-specific quality gate.
+2. Measure exposed, non-overlapped TP communication on the graph critical path.
+3. Screen a topology-aware TP8 collective only if its projected wall-time
+   saving exceeds 0.2 ms/token.
+4. Move to sparse MLA or mHC when the TP path is below that threshold.
