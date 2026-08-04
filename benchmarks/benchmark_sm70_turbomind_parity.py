@@ -185,7 +185,7 @@ def _dump(args: argparse.Namespace) -> int:
         out, details = _dump_awq(args, device)
     else:
         out, details = _dump_fp8(args, device)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     exported_cache_entries = _maybe_export_cache(args, device)
     payload = {
         "mode": args.mode,
@@ -241,7 +241,7 @@ def _time_cuda_call(
 ) -> dict[str, float]:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     times_ms: list[float] = []
     for _ in range(iters):
@@ -289,7 +289,7 @@ def _bench_awq(
         )
 
     timing = _time_cuda_call(run, device, args.warmup, args.iters)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return timing, out
 
 
@@ -309,7 +309,7 @@ def _bench_fp8(
         ops.fp8_gemm_sm70_out_meta(out, x, tm_weight, tm_scales, meta)
 
     timing = _time_cuda_call(run, device, args.warmup, args.iters)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return timing, out
 
 

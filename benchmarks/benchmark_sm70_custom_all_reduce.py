@@ -68,7 +68,7 @@ def _make_input(
 def _reference_all_reduce(inp: torch.Tensor) -> torch.Tensor:
     ref = inp.clone()
     dist.all_reduce(ref, op=dist.ReduceOp.SUM)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return ref
 
 
@@ -106,7 +106,7 @@ def _reference_custom_order(
 ) -> torch.Tensor:
     gathered = [torch.empty_like(inp) for _ in range(world_size)]
     dist.all_gather(gathered, inp)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     if algo == "1stage":
         acc = gathered[0].float()
         for item in gathered[1:]:
@@ -154,12 +154,12 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> dict[str, Any]:
 
 
 def _run_eager(ca: CustomAllreduce, inp: torch.Tensor) -> torch.Tensor:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     out = ca.custom_all_reduce(inp)
     if out is None:
         raise RuntimeError("custom allreduce rejected eager input")
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     return out
 
@@ -168,12 +168,12 @@ def _capture_graph(
     ca: CustomAllreduce,
     inputs: list[torch.Tensor],
 ) -> tuple[torch.cuda.CUDAGraph, list[torch.Tensor]]:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with ca.capture(), torch.cuda.graph(graph):
         outputs = [ca.custom_all_reduce(inp) for inp in inputs]
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     if any(out is None for out in outputs):
         raise RuntimeError("custom allreduce rejected graph input")
@@ -188,7 +188,7 @@ def _run_graph(
     graph, outputs = _capture_graph(ca, inputs)
     for _ in range(replays):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     return outputs
 
@@ -211,13 +211,13 @@ def _time_custom_ar_graph(
 
 
 def _run_warmup(ca: CustomAllreduce, inp: torch.Tensor) -> torch.Tensor:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     with ca.capture():
         out = ca.custom_all_reduce(inp)
     if out is None:
         raise RuntimeError("custom allreduce rejected warmup input")
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     return out
 
@@ -230,20 +230,20 @@ def _run_compile_graph(
     def _compiled_fn(x: torch.Tensor) -> torch.Tensor:
         return ca.all_reduce(x, registered=False)
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     compiled_fn = torch.compile(_compiled_fn, fullgraph=True, backend="inductor")
     out = compiled_fn(inp)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with ca.capture(), torch.cuda.graph(graph):
         out = compiled_fn(inp)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     for _ in range(replays):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     return out
 
@@ -351,12 +351,12 @@ def _gemma_rms_norm_candidate(
 
 
 def _capture_gemma_rms_norm_graph(ca: CustomAllreduce, callback):
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.no_grad(), ca.capture(), torch.cuda.graph(graph):
         outputs = callback()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     return graph, outputs
 
@@ -372,7 +372,7 @@ def _repeat_gemma_rms_norm(callback, joins: int):
 def _time_graph(graph: torch.cuda.CUDAGraph, warmup: int, iterations: int) -> float:
     for _ in range(warmup):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -435,7 +435,7 @@ def _prepare_gemma_rms_norm_prototype(
 
     baseline_graph.replay()
     candidate_graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
 
     normalized_comparison = _strict_compare_tensor(
@@ -677,7 +677,7 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     gloo_group = dist.new_group(backend="gloo")
 

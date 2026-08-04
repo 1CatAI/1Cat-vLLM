@@ -103,9 +103,9 @@ def _check_one(
         world_size,
         shared.numel() * shared.element_size(),
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     with graph_capture(device=device) as graph_capture_context:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=graph_capture_context.stream):
@@ -117,7 +117,7 @@ def _check_one(
             )
             ref_out = tensor_model_parallel_all_reduce(shared + routed)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     if hook_out is None:
         return {
@@ -161,7 +161,7 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     torch.set_default_device(torch.device("cuda", local_rank))
 
     config = VllmConfig(

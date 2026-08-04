@@ -72,7 +72,7 @@ def _run_sum2_vs_custom_ar(
     sum2_out = torch.empty_like(a)
     ref_out = torch.empty_like(a)
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with ca.capture(), torch.cuda.graph(graph):
@@ -81,7 +81,7 @@ def _run_sum2_vs_custom_ar(
         ca.all_reduce_sum2(a, b, out=sum2_out)
     dist.barrier()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return sum2_out, ref_out
 
 
@@ -101,7 +101,7 @@ def _check_one(
     if "nccl" in references:
         nccl_ref = a + b
         dist.all_reduce(nccl_ref, op=dist.ReduceOp.SUM)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         comparisons.append(_compare(out, nccl_ref, "nccl"))
 
     return {
@@ -130,7 +130,7 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)
+    torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
     gloo_group = dist.new_group(backend="gloo")
 
