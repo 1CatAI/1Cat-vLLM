@@ -144,11 +144,11 @@ def _require_accepted_runtime() -> None:
     _load_torch()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if torch.cuda.device_count() != 1:
+    if torch.accelerator.device_count() != 1:
         raise RuntimeError(
             "benchmark must expose only physical GPU0 through CUDA_VISIBLE_DEVICES=0"
         )
-    torch.cuda.set_device(0)
+    torch.accelerator.set_device_index(0)
     if torch.cuda.get_device_capability(0) != (7, 0):
         raise RuntimeError(
             "fixed entry requires SM70; got "
@@ -262,9 +262,7 @@ def _active_ctas_per_sm(
     threads_per_cta: int,
     shared_bytes_per_cta: int,
 ) -> int:
-    register_limited = SM70_REGISTERS_PER_SM // (
-        registers_per_thread * threads_per_cta
-    )
+    register_limited = SM70_REGISTERS_PER_SM // (registers_per_thread * threads_per_cta)
     shared_limited = SM70_SHARED_BYTES_PER_SM // shared_bytes_per_cta
     thread_limited = SM70_THREADS_PER_SM // threads_per_cta
     return min(register_limited, shared_limited, thread_limited, SM70_MAX_CTA_PER_SM)
@@ -349,9 +347,7 @@ def _paged_resource_gate(kernel: Mapping[str, Any]) -> dict[str, Any]:
             f"requires <= {PAGED_MAX_SHARED_BYTES}"
         )
     if kernel["active_ctas_per_sm"] != 2:
-        reasons.append(
-            f"active_ctas_per_sm={kernel['active_ctas_per_sm']}, requires 2"
-        )
+        reasons.append(f"active_ctas_per_sm={kernel['active_ctas_per_sm']}, requires 2")
     instructions = kernel["instructions"]
     if instructions["hmma"] == 0:
         reasons.append("paged target has no HMMA")
@@ -616,15 +612,9 @@ def _pairwise_stats(
     return {
         "right_minus_left_mean_ms": float(statistics.mean(deltas)),
         "right_minus_left_p50_ms": float(statistics.median(deltas)),
-        "right_faster_wins": sum(
-            right_ms < left_ms for left_ms, right_ms in paired
-        ),
-        "left_faster_wins": sum(
-            left_ms < right_ms for left_ms, right_ms in paired
-        ),
-        "ties": sum(
-            left_ms == right_ms for left_ms, right_ms in paired
-        ),
+        "right_faster_wins": sum(right_ms < left_ms for left_ms, right_ms in paired),
+        "left_faster_wins": sum(left_ms < right_ms for left_ms, right_ms in paired),
+        "ties": sum(left_ms == right_ms for left_ms, right_ms in paired),
         "right_vs_left_mean_pct": (
             (right_stats["mean_ms"] / left_stats["mean_ms"] - 1.0) * 100.0
         ),
@@ -678,7 +668,7 @@ def _interleaved_time(
     for warmup_index in range(warmup_rounds):
         for name in orders[warmup_index % len(orders)]:
             routes[name]()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     samples = {name: [] for name in names}
     for round_index in range(rounds):
@@ -888,7 +878,7 @@ def main() -> None:
                     out=case["fixed_out"],
                     softmax_lse=case["fixed_lse"],
                 )
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 if fixed_out.data_ptr() != case["fixed_out"].data_ptr():
                     raise RuntimeError("fixed entry allocated replacement output")
                 if fixed_lse.data_ptr() != case["fixed_lse"].data_ptr():
@@ -918,7 +908,7 @@ def main() -> None:
                         causal=True,
                         out=case["dense_out"],
                     )
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     if dense_out.data_ptr() != case["dense_out"].data_ptr():
                         raise RuntimeError("dense entry allocated replacement output")
                     dense_evidence = _dense_diagnostic_evidence(generic_out, dense_out)

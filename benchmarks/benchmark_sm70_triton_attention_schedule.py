@@ -194,7 +194,7 @@ def _time_attention(
             q_heads=q_heads,
             head_dim=head_dim,
         )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     times = []
     out = None
@@ -214,7 +214,7 @@ def _time_attention(
             head_dim=head_dim,
         )
         end.record()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         times.append(start.elapsed_time(end))
     assert out is not None
     times.sort()

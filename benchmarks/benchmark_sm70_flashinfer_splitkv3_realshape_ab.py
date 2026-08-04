@@ -561,11 +561,11 @@ def _require_cuda_runtime() -> None:
     _load_torch()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if torch.cuda.device_count() != 1:
+    if torch.accelerator.device_count() != 1:
         raise RuntimeError(
             "benchmark must expose exactly one GPU through CUDA_VISIBLE_DEVICES"
         )
-    torch.cuda.set_device(0)
+    torch.accelerator.set_device_index(0)
     if torch.cuda.get_device_capability(0) != (7, 0):
         raise RuntimeError(
             "fixed splitkv3 entry requires SM70; got "
@@ -1282,7 +1282,7 @@ def _run_correctness(
             case=case,
             actual_n=shape.n,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         _assert_alias(unsplit_out, case["unsplit_out"], f"{name} unsplit output")
         _assert_alias(unsplit_lse, case["unsplit_lse"], f"{name} unsplit LSE")
         _assert_alias(splitkv3_out, case["splitkv3_out"], f"{name} splitkv3 output")
@@ -1422,7 +1422,7 @@ def _run_interleaved_timing(
         for name in ORDER_SCHEDULE[warmup_round % len(ORDER_SCHEDULE)]:
             routes[name].launch()
         health_check()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     health_check()
 
     events = {
@@ -1765,7 +1765,7 @@ def _run_gpu_benchmark(
         "screening_not_acceptance": args.screen,
     }
     result["split_workspace"] = _workspace_metadata(workspace)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _record_gpu_snapshot(
         result,
         physical_gpu=args.physical_gpu,
@@ -1804,7 +1804,7 @@ def _run_gpu_benchmark(
                 result["numerical_gate"]["status"] = "failed"
                 raise
             result["numerical_gate"]["status"] = "passed"
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             monitor.assert_healthy()
             _record_gpu_snapshot(
                 result,
@@ -1862,7 +1862,7 @@ def _run_gpu_benchmark(
                         paired_rounds=timing_paired_rounds,
                         health_check=monitor.assert_healthy,
                     )
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     monitor.assert_healthy()
                     _record_gpu_snapshot(
                         result,

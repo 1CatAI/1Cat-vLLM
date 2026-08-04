@@ -275,11 +275,11 @@ def _require_cuda_runtime() -> None:
     _load_torch()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if torch.cuda.device_count() != 1:
+    if torch.accelerator.device_count() != 1:
         raise RuntimeError(
             "benchmark must expose exactly one GPU through CUDA_VISIBLE_DEVICES"
         )
-    torch.cuda.set_device(0)
+    torch.accelerator.set_device_index(0)
     if torch.cuda.get_device_capability(0) != (7, 0):
         raise RuntimeError(
             "fixed entry requires SM70; got "
@@ -823,7 +823,7 @@ def _run_correctness(
             sequence_lengths,
             SOFTMAX_SCALE,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         _assert_alias(fixed_out, case["fixed_out"], f"{name} fixed output")
         _assert_alias(fixed_lse, case["fixed_lse"], f"{name} fixed LSE")
 
@@ -847,7 +847,7 @@ def _run_correctness(
                 causal=True,
                 out=case["dense_out"],
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             _assert_alias(dense_out, case["dense_out"], f"{name} dense output")
             dense_evidence = _comparison_evidence(generic_out, dense_out)
             dense_evidence["output_preallocated"] = True
@@ -964,7 +964,7 @@ def _run_interleaved_timing(
             _set_environment(routes[name].environment)
             routes[name].launch()
         health_check()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     events = {
         name: (
@@ -1164,7 +1164,7 @@ def _run_gpu_benchmark(args: argparse.Namespace, result: dict[str, Any]) -> None
     result["page_tables"]["identity"]["dense_zero_copy"]["value_view"] = (
         dense_value_details
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     _record_gpu_snapshot(
         result,
         physical_gpu=args.physical_gpu,
@@ -1194,7 +1194,7 @@ def _run_gpu_benchmark(args: argparse.Namespace, result: dict[str, Any]) -> None
                 dense_value=dense_value,
                 health_check=monitor.assert_healthy,
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             monitor.assert_healthy()
             _record_gpu_snapshot(
                 result,
@@ -1220,7 +1220,7 @@ def _run_gpu_benchmark(args: argparse.Namespace, result: dict[str, Any]) -> None
                 warmup_rounds=args.warmup_rounds,
                 health_check=monitor.assert_healthy,
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             monitor.assert_healthy()
         finally:
             monitor_record = monitor.stop()

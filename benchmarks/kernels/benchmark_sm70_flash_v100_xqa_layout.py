@@ -103,7 +103,7 @@ def elapsed_ms(
             seq_len=seq_len,
             partition_size=partition_size,
         )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -249,8 +249,9 @@ def main() -> None:
         raise ValueError("--candidate-partition-size must be one of 256, 512, 1024")
 
     # Qwen3.6-27B-AWQ TP4 full-attention per-rank shape: Hq=6, Hkv=1, D=256.
-    torch.manual_seed(20260713)
-    torch.cuda.manual_seed_all(20260713)
+    from vllm.utils.torch_utils import set_random_seed
+
+    set_random_seed(20260713)
     block_size, q_heads, kv_heads, head_dim = (
         args.block_size,
         6,
@@ -313,7 +314,7 @@ def main() -> None:
                 candidate_partition_size if padded else args.partition_size
             ),
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return
 
     baseline = run_once(
@@ -350,7 +351,7 @@ def main() -> None:
         seq_len=args.seq_len,
         partition_size=candidate_partition_size,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     diff_mask = baseline.ne(padded)
     mismatch_indices = diff_mask.nonzero(as_tuple=False)

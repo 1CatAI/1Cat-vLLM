@@ -64,7 +64,7 @@ PROFILE_SHAPES = {
 
 
 def _sync() -> None:
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
 
 def _paged_block_m(
@@ -609,7 +609,7 @@ def bench_chunked_prompt(
         chunk_results.append(chunk)
         pos += q_len
         chunk_idx += 1
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
     total_layer_ms = sum(float(chunk["median_ms"]) for chunk in chunk_results)
     total_flops = sum(
@@ -788,7 +788,7 @@ def main() -> None:
         raise ValueError(f"heads_q={heads_q} must be divisible by heads_kv={heads_kv}")
 
     torch.manual_seed(args.seed)
-    torch.cuda.set_device(args.device)
+    torch.accelerator.set_device_index(args.device)
     device = torch.device(f"cuda:{args.device}")
     props = torch.cuda.get_device_properties(device)
     if props.major != 7 or props.minor != 0:
@@ -911,7 +911,7 @@ def main() -> None:
     results: list[dict[str, Any]] = []
     if args.mode in ("dense", "all"):
         for length in args.dense_lens or args.prompt_lens:
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             result = bench_dense(
                 length,
                 heads_q=heads_q,
@@ -929,7 +929,7 @@ def main() -> None:
 
     if args.mode in ("paged-step", "all"):
         for q_len, kv_len in args.paged_steps:
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             result = bench_paged_step(
                 q_len,
                 kv_len,
@@ -956,7 +956,7 @@ def main() -> None:
 
     if args.mode in ("chunked", "all"):
         for prompt_len in args.prompt_lens:
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             result = bench_chunked_prompt(
                 prompt_len,
                 chunk_size=args.chunk_size,
