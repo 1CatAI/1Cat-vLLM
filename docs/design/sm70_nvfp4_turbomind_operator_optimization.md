@@ -640,11 +640,11 @@ Required run shape unless a note says otherwise:
 - CUDA device: one V100/SM70 rank
 - verifier shape: `m=17`, matching `budget=16` plus root
 - weighted verifier suite:
-  - `63` MLP gate/up calls
-  - `63` MLP down calls
-  - `47` linear-attention qkv calls
-  - `47` linear-attention z calls
-  - `16` full-attention o-proj calls
+    - `63` MLP gate/up calls
+    - `63` MLP down calls
+    - `47` linear-attention qkv calls
+    - `47` linear-attention z calls
+    - `16` full-attention o-proj calls
 - time only `awq_gemm_sm70_out` after `awq_sm70_prepare` and warmup
 - record exact env, JSON artifact, selected kernel when tracing is enabled, and
   whether the candidate is default behavior or env-forced only

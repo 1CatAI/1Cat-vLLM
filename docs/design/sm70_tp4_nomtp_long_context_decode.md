@@ -863,7 +863,7 @@ tail improved `0.38862 -> 0.37598 ms` (`-3.25%`) but was not bitwise equal:
 The two expressions are algebraically equivalent, but Volta does not promise
 that different WMMA shapes have the same internal floating-point association or
 rounding. There is a second exactness risk: this padded route uses Q/K leading
-dimensions `264/136` halfs (`528/272 B`), which are only `16 mod 32` bytes and
+dimensions `264/136` halves (`528/272 B`), which are only `16 mod 32` bytes and
 therefore do not provide a clean WMMA fragment-alignment proof. The accepted
 `m8n32` route already uses those strides, but the `m32n8` mapping can expose a
 different sensitivity to that contract. This experiment did not export the

@@ -251,7 +251,7 @@ generic MTP, Flash attention, or sampling parameters.
     `num_accepted_tokens`, `num_computed_tokens`, and block rollover behavior
     around the first corrupted-token region.
 
-## Do Not Repeat
+## Do Not Repeat: Rejected Latest Paths
 
 - Do not rerun the exact-CPU `seq_lens_cpu_upper_bound` A/B unless the related
   code changes. It failed and is not sufficient root.
