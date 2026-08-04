@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark one FlashInfer prefill layer for Qwen3.6-27B on SM120."""
 
 import argparse

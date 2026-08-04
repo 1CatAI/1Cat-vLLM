@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark the FlashInfer paged-decode shape used by Qwen3.6-27B.
 
 This isolates one full-attention layer with FP16 queries and FP8 KV cache.

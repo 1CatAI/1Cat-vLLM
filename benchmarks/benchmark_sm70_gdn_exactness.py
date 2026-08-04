@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Strict exactness harness for the GDN/FLA chunk prefill op on SM70.
 
 This script intentionally does not import vLLM at module import time. Run the

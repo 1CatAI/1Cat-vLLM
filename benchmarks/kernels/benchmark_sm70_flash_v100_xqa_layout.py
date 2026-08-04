@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact-layout A/B microbenchmark for the SM70 q=1 XQA decode kernel."""
 
 from __future__ import annotations
