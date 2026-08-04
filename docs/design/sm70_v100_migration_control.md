@@ -41107,3 +41107,14 @@ Interpretation:
   Long-window, token-run, malformed-tag, closure, and natural-stop guards are
   unchanged and still reject the P256 failure. Full evidence is in
   `docs/design/sm70_qwen36_27b_awq_mtp4_optimization.md`.
+
+### 2026-08-01 SM70 Concurrent Throughput Campaign
+
+- The next V100 objective is aggregate decode throughput at active request
+  counts B1/B2/B4/B8/B16, with exact offline batch diagnosis followed by API
+  continuous-batching confirmation. The dedicated contract, static route map,
+  and result ledger are in `docs/design/sm70_concurrency_throughput.md`.
+- The current default MTP dynamic GPU-LRU proposal is explicitly B1-only; a
+  B>1 run must not silently fall back and be represented as default MTP. The
+  required work is a batch-safe fused proposal plus high-M verifier/MoE/Flash
+  route coverage, each admitted by a matching microbenchmark and quality gate.
