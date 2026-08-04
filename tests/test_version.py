@@ -27,8 +27,7 @@ def test_version_tuple():
         ((1, 2, 3), "1.1", True),
         ((1, 2, 3), "1.0", False),
         ((1, 2, 3), "1.2", False),
-        # This won't work as expected
-        ((1, 0, 0), "1.-1", True),
+        ((1, 0, 0), "1.-1", False),
         ((1, 0, 0), "0.9", False),
         ((1, 0, 0), "0.17", False),
     ],
