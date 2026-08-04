@@ -39,9 +39,9 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 
 ## Recommended Model Providers
 
-- `tclf90/Qwen3.6-27B-AWQ`
-- `tclf90/Qwen3.6-35B-A3B-AWQ`
-- `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
+- [QuantTrio/Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)
+- [QuantTrio/Qwen3.6-35B-A3B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-35B-A3B-AWQ)
+- [QuantTrio/Qwen3.5-122B-A10B-AWQ](https://huggingface.co/QuantTrio/Qwen3.5-122B-A10B-AWQ) for larger 4-GPU setups
 
 The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
 Replace them with your local model path or a Hugging Face repository id.
