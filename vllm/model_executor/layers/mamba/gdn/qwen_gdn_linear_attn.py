@@ -580,6 +580,18 @@ def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config: object) -> bo
     )
 
 
+def _sm70_qwen_gdn_auto_full_forward_enabled(
+    *,
+    block_003_deep_mtp: bool,
+) -> bool:
+    """Enable the safe full-forward boundary for all SM70 graph engines."""
+    return (
+        envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+        and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
+    )
+
+
 def _sm70_qwen_gdn_num_speculative_tokens(vllm_config: object) -> int:
     spec_config = getattr(vllm_config, "speculative_config", None)
     return int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
@@ -607,8 +619,8 @@ def _sm70_qwen_gdn_full_forward_enabled(
     # trace commonly comes from a profile/prefill batch without active spec
     # metadata.  If we re-check per-batch active metadata here, the quality
     # guard is captured as disabled and active verifier replays fall through to
-    # the split path.  The caller only sets auto_enabled for MTP engines, so
-    # no-MTP decode still keeps the lightweight standard path.
+    # the split path. The caller enables this for every SM70 graph engine, so
+    # non-MTP decode is protected from the same recurrent-state ordering bug.
     return auto_enabled
 
 
@@ -2224,11 +2236,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.disable_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD and not block_003_deep_mtp
         )
-        self.auto_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and vllm_config.speculative_config is not None
-            and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
-            and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
+        self.auto_sm70_qwen_gdn_full_forward = _sm70_qwen_gdn_auto_full_forward_enabled(
+            block_003_deep_mtp=block_003_deep_mtp
         )
         self.auto_sm70_qwen_gdn_spec_core = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH

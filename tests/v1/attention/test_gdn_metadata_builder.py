@@ -928,7 +928,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     assert live_meta.num_accepted_tokens is not padded_accepted
 
 
-def test_sm70_qwen_gdn_full_forward_auto_is_mtp_engine_scoped(
+def test_sm70_qwen_gdn_full_forward_guard_honors_auto_flag(
     monkeypatch,
     local_gdn_model,
 ):
@@ -1005,6 +1005,35 @@ def test_sm70_qwen_gdn_full_forward_auto_is_mtp_engine_scoped(
             disabled=False,
             auto_enabled=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("spec_core", "spec_core_003", "block_003_deep_mtp", "expected"),
+    [
+        (False, False, False, True),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, True, True, True),
+    ],
+)
+def test_sm70_qwen_gdn_full_forward_auto_protects_non_mtp(
+    monkeypatch,
+    spec_core,
+    spec_core_003,
+    block_003_deep_mtp,
+    expected,
+):
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", str(int(spec_core)))
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", str(int(spec_core_003)))
+    _clear_envs_cache()
+
+    assert (
+        qwen_gdn._sm70_qwen_gdn_auto_full_forward_enabled(
+            block_003_deep_mtp=block_003_deep_mtp
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
