@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -135,7 +136,8 @@ struct KernelConfig {
         alignas(16) float  pipeline_s[PIPELINE_S_ELEMENTS];
         alignas(16) int    pipeline_page_idx[PIPELINE_PAGE_ELEMENTS];
         alignas(16) int    pipeline_page_offset[PIPELINE_PAGE_ELEMENTS];
-        alignas(16) float  o      [BLOCK_M * O_STRIDE];
+        // WMMA accumulator loads and stores require 256-bit alignment.
+        alignas(32) float  o      [BLOCK_M * O_STRIDE];
         alignas(16) float  row_max[BLOCK_M];
         alignas(16) float  row_sum[BLOCK_M];
         alignas(16) int    page_idx[LOW_SMEM_PAGE_COUNT];
@@ -143,6 +145,8 @@ struct KernelConfig {
     };
 
     static constexpr size_t TOTAL_SMEM = ((sizeof(SmemLayout) + 127) & ~size_t(127));
+    static_assert(offsetof(SmemLayout, o) % 32 == 0,
+                  "WMMA accumulator storage must be 256-bit aligned");
 };
 
 template<typename Config>
@@ -480,7 +484,7 @@ flash_attention_forward_kernel_paged(
     const int64_t k_row_stride = k_token_stride;
     const int64_t v_row_stride = v_token_stride;
 
-    extern __shared__ char smem_raw[];
+    extern __shared__ __align__(128) char smem_raw[];
     init_smem<Config>(smem_raw);
     auto& smem = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
 
