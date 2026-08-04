@@ -21,23 +21,23 @@
 #include "cutlass/layout/tensor_op_multiplicand_sm70.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 
-using marlin::sm70::Sm70CtaGeometry;
-using marlin::sm70::Sm70AtomicFp16Epilogue;
-using marlin::sm70::Sm70MarlinGemmTraits;
-using marlin::sm70::Sm70SplitKPartition;
-using marlin::sm70::validate_sm70_marlin_dense_cta_geometry_supported;
-using marlin::sm70::validate_sm70_marlin_dense_cta_n_alignment;
 using marlin::sm70::configure_sm70_dynamic_smem;
 using marlin::sm70::dispatch_sm70_marlin_fixed_group_geometry;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
-using marlin::sm70::sm70_marlin_dense_auto_params;
 using marlin::sm70::load_qword_vector;
 using marlin::sm70::qword_from_vector;
-using marlin::sm70::sm70_marlin_cta_grid;
 using marlin::sm70::sm70_active_split_k;
+using marlin::sm70::sm70_marlin_cta_grid;
+using marlin::sm70::sm70_marlin_dense_auto_params;
 using marlin::sm70::sm70_splitk_partition;
+using marlin::sm70::Sm70AtomicFp16Epilogue;
+using marlin::sm70::Sm70CtaGeometry;
+using marlin::sm70::Sm70MarlinGemmTraits;
+using marlin::sm70::Sm70SplitKPartition;
 using marlin::sm70::u4_packed_macro_n_qweight_offset_from_logical;
+using marlin::sm70::validate_sm70_marlin_dense_cta_geometry_supported;
+using marlin::sm70::validate_sm70_marlin_dense_cta_n_alignment;
 
 namespace {
 
@@ -76,7 +76,8 @@ void dequant_e8m0_scales_to_half2(int q, half2* scale_cache) {
   *reinterpret_cast<uint2*>(scale_cache) = vec_res;
 }
 
-template <typename Shape_, typename ThreadMap_, int GroupSize_, int PackedMacroN_>
+template <typename Shape_, typename ThreadMap_, int GroupSize_,
+          int PackedMacroN_>
 class Sm70Mxfp4IteratorB {
  public:
   using Shape = Shape_;
@@ -84,12 +85,11 @@ class Sm70Mxfp4IteratorB {
   static int const kGroupSize = GroupSize_;
   static int const kPackedMacroN = PackedMacroN_;
   using Element = cutlass::half_t;
-  using Fragment = cutlass::Array<
-      Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+  using Fragment = cutlass::Array<Element, ThreadMap::Iterations::kCount *
+                                               ThreadMap::kElementsPerAccess>;
   static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
                 "SM70 Marlin MXFP4 IteratorB expects CTA_N in {64, 128, 256}.");
-  static_assert(ThreadMap::Iterations::kContiguous ==
-                    Shape::kN / kQuantTileN,
+  static_assert(ThreadMap::Iterations::kContiguous == Shape::kN / kQuantTileN,
                 "SM70 Marlin MXFP4 IteratorB expects one contiguous iteration "
                 "per 64-column quant tile.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
@@ -98,7 +98,8 @@ class Sm70Mxfp4IteratorB {
                 "SM70 Marlin MXFP4 IteratorB expects one packed FP4 word per "
                 "access.");
   static_assert(ThreadMap::Iterations::kStrided >= 1,
-                "SM70 Marlin U4-family IteratorB expects one or more strided iterations.");
+                "SM70 Marlin U4-family IteratorB expects one or more strided "
+                "iterations.");
   struct Params {
     int size_n;
     int aligned_initial_k_step;
@@ -180,8 +181,8 @@ class Sm70Mxfp4IteratorB {
   CUTLASS_DEVICE
   static int qweight_offset_from_logical(Params const& params, int logical_k,
                                          int logical_n) {
-    return u4_packed_macro_n_qweight_offset_from_logical<kPackedMacroN>(params.size_n, logical_k,
-                                                     logical_n);
+    return u4_packed_macro_n_qweight_offset_from_logical<kPackedMacroN>(
+        params.size_n, logical_k, logical_n);
   }
 
   CUTLASS_DEVICE
@@ -200,14 +201,12 @@ class Sm70Mxfp4IteratorB {
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
       int const logical_k =
-          k_offset_ + thread_offset_.strided() +
-          s * ThreadMap::Delta::kStrided;
+          k_offset_ + thread_offset_.strided() + s * ThreadMap::Delta::kStrided;
       int const group = scale_group(logical_k);
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const cache_n =
-            n_offset_ + thread_offset_.contiguous() +
-            c * ThreadMap::Delta::kContiguous;
+        int const cache_n = n_offset_ + thread_offset_.contiguous() +
+                            c * ThreadMap::Delta::kContiguous;
         int const cache_index = c + s * ThreadMap::Iterations::kContiguous;
         cache_metadata_e8m0_scales(cache_index, group, cache_n);
       }
@@ -260,9 +259,11 @@ class Sm70Mxfp4IteratorB {
           frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
         }
       } else {
-        static_assert(ThreadMap::Iterations::kContiguous == 1,
-                      "Unsupported SM70 Marlin MXFP4 contiguous iteration count.");
-        uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_offset_);
+        static_assert(
+            ThreadMap::Iterations::kContiguous == 1,
+            "Unsupported SM70 Marlin MXFP4 contiguous iteration count.");
+        uint32_t const qword =
+            load_qword_vector<1>(qweight_ + qweight_base_offset_);
         half2 const* scale_vec = cached_scales_;
 
         half2 deq[2];
@@ -280,14 +281,12 @@ class Sm70Mxfp4IteratorB {
       int const logical_n_base = n_offset_ + thread_offset_.contiguous();
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-        int const logical_k_s =
-            k_offset_ + thread_offset_.strided() +
-            s * ThreadMap::Delta::kStrided;
+        int const logical_k_s = k_offset_ + thread_offset_.strided() +
+                                s * ThreadMap::Delta::kStrided;
         int const qweight_base_s =
             qweight_offset_from_logical(params_, logical_k_s, logical_n_base);
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
-          auto const qwords =
-              load_qword_vector<4>(qweight_ + qweight_base_s);
+          auto const qwords = load_qword_vector<4>(qweight_ + qweight_base_s);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -308,8 +307,7 @@ class Sm70Mxfp4IteratorB {
             frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
-          auto const qwords =
-              load_qword_vector<2>(qweight_ + qweight_base_s);
+          auto const qwords = load_qword_vector<2>(qweight_ + qweight_base_s);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -330,9 +328,11 @@ class Sm70Mxfp4IteratorB {
             frag_vec[3] = __hmul2(deq[1], scale_vec[3]);
           }
         } else {
-          static_assert(ThreadMap::Iterations::kContiguous == 1,
-                        "Unsupported SM70 Marlin MXFP4 contiguous iteration count.");
-          uint32_t const qword = load_qword_vector<1>(qweight_ + qweight_base_s);
+          static_assert(
+              ThreadMap::Iterations::kContiguous == 1,
+              "Unsupported SM70 Marlin MXFP4 contiguous iteration count.");
+          uint32_t const qword =
+              load_qword_vector<1>(qweight_ + qweight_base_s);
           constexpr int kAccess = ThreadMap::kElementsPerAccess;
           int const frag_base = s * kAccess;
           half2 const* scale_vec = cached_scales_;
@@ -365,26 +365,25 @@ class Sm70Mxfp4IteratorB {
 
 struct Sm70Mxfp4GemmSpec {
   template <typename Shape, typename ThreadMap, int GroupSize, int PackedMacroN>
-  using IteratorB = Sm70Mxfp4IteratorB<Shape, ThreadMap, GroupSize, PackedMacroN>;
+  using IteratorB =
+      Sm70Mxfp4IteratorB<Shape, ThreadMap, GroupSize, PackedMacroN>;
 };
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int GroupSize, int PackedMacroN>
 using Sm70Mxfp4GemmTraits =
-    Sm70MarlinGemmTraits<Sm70Mxfp4GemmSpec, CtaM, CtaN, CtaK,
-                         Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>;
+    Sm70MarlinGemmTraits<Sm70Mxfp4GemmSpec, CtaM, CtaN, CtaK, Warps, WarpM,
+                         WarpN, WarpK, GroupSize, PackedMacroN>;
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
-__global__ __launch_bounds__(Warps * 32, 1)
-void sm70_marlin_mxfp4_gemm_kernel(
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int GroupSize, int PackedMacroN>
+__global__ __launch_bounds__(Warps * 32, 1) void sm70_marlin_mxfp4_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
-    uint8_t const* __restrict__ b_scales,
-    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda) {
-  using Traits =
-      Sm70Mxfp4GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
-                                  WarpN, WarpK, GroupSize, PackedMacroN>;
+    uint8_t const* __restrict__ b_scales, cutlass::half_t* __restrict__ c,
+    int m, int n, int k, int lda) {
+  using Traits = Sm70Mxfp4GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                     WarpK, GroupSize, PackedMacroN>;
   using Mma = typename Traits::Mma;
   using Epilogue = typename Traits::Epilogue;
 
@@ -404,10 +403,10 @@ void sm70_marlin_mxfp4_gemm_kernel(
   typename Traits::LayoutA layout_a(lda);
   typename Traits::LayoutC layout_c(n);
 
-  typename Mma::IteratorA iterator_A(
-      typename Mma::IteratorA::Params(layout_a),
-      const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
-      tb_offset_A);
+  typename Mma::IteratorA iterator_A(typename Mma::IteratorA::Params(layout_a),
+                                     const_cast<cutlass::half_t*>(a),
+                                     cutlass::MatrixCoord(m, k), thread_idx,
+                                     tb_offset_A);
   typename Mma::IteratorB iterator_B(
       typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
@@ -432,16 +431,16 @@ void sm70_marlin_mxfp4_gemm_kernel(
   epilogue(output_op, iterator_D, accumulators, iterator_C);
 }
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
-__global__ __launch_bounds__(Warps * 32, 1)
-void sm70_marlin_mxfp4_gemm_splitk_kernel(
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int GroupSize, int PackedMacroN>
+__global__
+__launch_bounds__(Warps * 32, 1) void sm70_marlin_mxfp4_gemm_splitk_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
-    uint8_t const* __restrict__ b_scales,
-    cutlass::half_t* __restrict__ c, int m, int n, int k, int lda, int requested_split_k) {
-  using Traits = Sm70Mxfp4GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
-                                  WarpN, WarpK, GroupSize, PackedMacroN>;
+    uint8_t const* __restrict__ b_scales, cutlass::half_t* __restrict__ c,
+    int m, int n, int k, int lda, int requested_split_k) {
+  using Traits = Sm70Mxfp4GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                     WarpK, GroupSize, PackedMacroN>;
   using Mma = typename Traits::Mma;
   using AtomicEpilogue = Sm70AtomicFp16Epilogue<Traits>;
 
@@ -452,14 +451,13 @@ void sm70_marlin_mxfp4_gemm_splitk_kernel(
   int const thread_idx = threadIdx.x;
   int const warp_idx = cutlass::canonical_warp_idx_sync();
   int const lane_idx = threadIdx.x % 32;
-  Sm70SplitKPartition const partition =
-      sm70_splitk_partition<GroupSize, CtaK>(k, requested_split_k, int(blockIdx.z));
+  Sm70SplitKPartition const partition = sm70_splitk_partition<GroupSize, CtaK>(
+      k, requested_split_k, int(blockIdx.z));
   if (partition.partition_k == 0) {
     return;
   }
 
-  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CtaM,
-                                   partition.k_begin};
+  cutlass::MatrixCoord tb_offset_A{int(blockIdx.x) * CtaM, partition.k_begin};
   cutlass::MatrixCoord tb_offset_B{partition.k_begin, int(blockIdx.y) * CtaN};
   cutlass::MatrixCoord tb_offset_C{int(blockIdx.x) * CtaM,
                                    int(blockIdx.y) * CtaN};
@@ -467,10 +465,10 @@ void sm70_marlin_mxfp4_gemm_splitk_kernel(
   typename Traits::LayoutA layout_a(lda);
   typename Traits::LayoutC layout_c(n);
 
-  typename Mma::IteratorA iterator_A(
-      typename Mma::IteratorA::Params(layout_a),
-      const_cast<cutlass::half_t*>(a), cutlass::MatrixCoord(m, k), thread_idx,
-      tb_offset_A);
+  typename Mma::IteratorA iterator_A(typename Mma::IteratorA::Params(layout_a),
+                                     const_cast<cutlass::half_t*>(a),
+                                     cutlass::MatrixCoord(m, k), thread_idx,
+                                     tb_offset_A);
   typename Mma::IteratorB iterator_B(
       typename Mma::IteratorB::Params(k, n),
       reinterpret_cast<uint32_t const*>(b_q_weight),
@@ -484,9 +482,8 @@ void sm70_marlin_mxfp4_gemm_splitk_kernel(
   mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
 
   typename AtomicEpilogue::OutputTileIterator iterator_D(
-      typename AtomicEpilogue::OutputTileIterator::Params(layout_c),
-      c, cutlass::MatrixCoord(m, n),
-      thread_idx, tb_offset_C);
+      typename AtomicEpilogue::OutputTileIterator::Params(layout_c), c,
+      cutlass::MatrixCoord(m, n), thread_idx, tb_offset_C);
 
   AtomicEpilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx,
                           lane_idx);
@@ -495,18 +492,20 @@ void sm70_marlin_mxfp4_gemm_splitk_kernel(
 
 }  // namespace
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
-torch::Tensor launch_sm70_marlin_mxfp4_gemm(
-    torch::Tensor& a, torch::Tensor& c, torch::Tensor& b_q_weight,
-    torch::Tensor& b_scales, int64_t size_m, int64_t size_n, int64_t size_k,
-    int requested_split_k) {
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int GroupSize, int PackedMacroN>
+torch::Tensor launch_sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
+                                            torch::Tensor& b_q_weight,
+                                            torch::Tensor& b_scales,
+                                            int64_t size_m, int64_t size_n,
+                                            int64_t size_k,
+                                            int requested_split_k) {
   auto kernel =
-      sm70_marlin_mxfp4_gemm_kernel<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
-                  GroupSize, PackedMacroN>;
-  using SharedStorage = typename Sm70Mxfp4GemmTraits<
-      CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
-      PackedMacroN>::SharedStorage;
+      sm70_marlin_mxfp4_gemm_kernel<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                    WarpK, GroupSize, PackedMacroN>;
+  using SharedStorage =
+      typename Sm70Mxfp4GemmTraits<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
+                                   GroupSize, PackedMacroN>::SharedStorage;
   size_t smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(kernel);
 
   dim3 block(Warps * 32);
@@ -526,19 +525,18 @@ torch::Tensor launch_sm70_marlin_mxfp4_gemm(
   }
 
   TORCH_CHECK(size_k % int64_t(CtaK) == 0,
-              "SM70 Marlin mxfp4 requires K divisible by CTA_K=",
-              CtaK, " for requested_split_k > 1. Got K=", size_k,
+              "SM70 Marlin mxfp4 requires K divisible by CTA_K=", CtaK,
+              " for requested_split_k > 1. Got K=", size_k,
               ", requested_split_k=", requested_split_k, ".");
 
-  auto split_kernel =
-      sm70_marlin_mxfp4_gemm_splitk_kernel<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
-                  WarpK, GroupSize, PackedMacroN>;
+  auto split_kernel = sm70_marlin_mxfp4_gemm_splitk_kernel<
+      CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>;
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * size_n;
-  C10_CUDA_CHECK(cudaMemsetAsync(
-      c.data_ptr<at::Half>(), 0,
-      static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  C10_CUDA_CHECK(cudaMemsetAsync(c.data_ptr<at::Half>(), 0,
+                                 static_cast<size_t>(numel) * sizeof(at::Half),
+                                 stream));
 
   dim3 grid = sm70_marlin_cta_grid(size_m, size_n, CtaM, CtaN);
   int const active_split_k =
@@ -550,7 +548,8 @@ torch::Tensor launch_sm70_marlin_mxfp4_gemm(
       reinterpret_cast<uint8_t const*>(b_scales.data_ptr()),
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
       static_cast<int>(size_m), static_cast<int>(size_n),
-      static_cast<int>(size_k), static_cast<int>(a.stride(0)), requested_split_k);
+      static_cast<int>(size_k), static_cast<int>(a.stride(0)),
+      requested_split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return c;
@@ -566,11 +565,11 @@ struct Sm70Mxfp4Launcher {
   int64_t size_k;
   int requested_split_k;
 
-  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-            int WarpN, int WarpK, int GroupSize, int PackedMacroN>
+  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+            int WarpK, int GroupSize, int PackedMacroN>
   torch::Tensor operator()() const {
-    return launch_sm70_marlin_mxfp4_gemm<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
-                  GroupSize, PackedMacroN>(
+    return launch_sm70_marlin_mxfp4_gemm<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                         WarpK, GroupSize, PackedMacroN>(
         a, c, b_q_weight, b_scales, size_m, size_n, size_k, requested_split_k);
   }
 };
@@ -582,14 +581,16 @@ torch::Tensor sm70_marlin_mxfp4_gemm(torch::Tensor& a, torch::Tensor& c,
                                      int64_t group_size) {
   c10::cuda::CUDAGuard device_guard(a.device());
 
-  auto const params = sm70_marlin_dense_auto_params(
-      "mxfp4", group_size, size_m, size_n, size_k);
+  auto const params = sm70_marlin_dense_auto_params("mxfp4", group_size, size_m,
+                                                    size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
-  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin mxfp4", geometry);
-  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin mxfp4", geometry, size_n);
+  validate_sm70_marlin_dense_cta_geometry_supported("SM70 Marlin mxfp4",
+                                                    geometry);
+  validate_sm70_marlin_dense_cta_n_alignment("SM70 Marlin mxfp4", geometry,
+                                             size_n);
   Sm70Mxfp4Launcher const launcher{
-      a, c, b_q_weight, b_scales, size_m, size_n, size_k,
-      params.requested_split_k};
+      a,      c,      b_q_weight, b_scales,
+      size_m, size_n, size_k,     params.requested_split_k};
   return dispatch_sm70_marlin_fixed_group_geometry<32>(
       launcher, geometry, params.packed_macro_n, group_size, "mxfp4");
 }

@@ -35,22 +35,24 @@ class Sm70MoeU8ZpIteratorB {
   static int const kPackedMacroN = PackedMacroN_;
   static constexpr bool kUseMetadataVectorWords = UseMetadataVectorWords_;
   using Element = cutlass::half_t;
-  using Fragment = cutlass::Array<
-      Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
-    static_assert(Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
-                "SM70 Marlin MoE U8 IteratorB expects CTA_N in {64, 128, 256}.");
-  static_assert(ThreadMap::Iterations::kContiguous ==
-                    Shape::kN / kQuantTileN,
-                "SM70 Marlin MoE U8 IteratorB expects one contiguous iteration per "
-                "64-column quant tile.");
+  using Fragment = cutlass::Array<Element, ThreadMap::Iterations::kCount *
+                                               ThreadMap::kElementsPerAccess>;
+  static_assert(
+      Shape::kN == 64 || Shape::kN == 128 || Shape::kN == 256,
+      "SM70 Marlin MoE U8 IteratorB expects CTA_N in {64, 128, 256}.");
+  static_assert(
+      ThreadMap::Iterations::kContiguous == Shape::kN / kQuantTileN,
+      "SM70 Marlin MoE U8 IteratorB expects one contiguous iteration per "
+      "64-column quant tile.");
   static_assert(ThreadMap::Delta::kContiguous == kQuantTileN,
                 "SM70 Marlin MoE U8 IteratorB expects 64-column deltas.");
   static_assert(ThreadMap::kElementsPerAccess == kU8ValuesPerAccess,
                 "SM70 Marlin MoE U8 IteratorB expects two packed U8 words per "
                 "access.");
-  static_assert(ThreadMap::Iterations::kStrided >= 1,
-                "SM70 Marlin MoE U8-family IteratorB expects one or more strided "
-                "iterations.");
+  static_assert(
+      ThreadMap::Iterations::kStrided >= 1,
+      "SM70 Marlin MoE U8-family IteratorB expects one or more strided "
+      "iterations.");
   static constexpr int kQweightWordStrideWords = kPackedMacroN / kQuantTileN;
 
   struct Params {
@@ -88,11 +90,10 @@ class Sm70MoeU8ZpIteratorB {
                        half const* scales, half const* zp, int thread_id,
                        int expert, int k_offset, int n_offset)
       : qweight_(qweight),
-        scales_expert_base_(scales +
-                            (expert >= 0 ? expert : 0) *
-                                params.num_groups * params.size_n),
-        zp_expert_base_(zp + (expert >= 0 ? expert : 0) *
-                                 params.num_groups * params.size_n),
+        scales_expert_base_(scales + (expert >= 0 ? expert : 0) *
+                                         params.num_groups * params.size_n),
+        zp_expert_base_(zp + (expert >= 0 ? expert : 0) * params.num_groups *
+                                 params.size_n),
         params_(params),
         thread_offset_(ThreadMap::initial_offset(thread_id)),
         expert_(expert),
@@ -134,17 +135,14 @@ class Sm70MoeU8ZpIteratorB {
   }
 
   CUTLASS_DEVICE
-  int metadata_group_offset(int group) const {
-    return group * params_.size_n;
-  }
+  int metadata_group_offset(int group) const { return group * params_.size_n; }
 
   CUTLASS_DEVICE
   int scale_group(int logical_k) const {
     if constexpr (kGroupSize == -1) {
       return 0;
     } else {
-      static_assert(kGroupSize == 32 || kGroupSize == 64 ||
-                        kGroupSize == 128,
+      static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128,
                     "SM70 Marlin MoE U8 supports only group sizes -1, 32, 64, "
                     "and 128.");
       return logical_k / kGroupSize;
@@ -161,16 +159,16 @@ class Sm70MoeU8ZpIteratorB {
   CUTLASS_DEVICE
   void cache_metadata_lane_vectors(int c, int group, int cache_n) const {
     int const metadata_offset = metadata_group_offset(group) + cache_n;
-    half2 const* scale_vec = reinterpret_cast<half2 const*>(
-        scales_expert_base_ + metadata_offset);
+    half2 const* scale_vec =
+        reinterpret_cast<half2 const*>(scales_expert_base_ + metadata_offset);
     half2* scale_cache = cached_scales_ + c * 4;
     scale_cache[0] = scale_vec[0];
     scale_cache[1] = scale_vec[1];
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
 
-    half2 const* zp_vec = reinterpret_cast<half2 const*>(
-        zp_expert_base_ + metadata_offset);
+    half2 const* zp_vec =
+        reinterpret_cast<half2 const*>(zp_expert_base_ + metadata_offset);
     half2* zp_cache = cached_zp_ + c * 4;
     zp_cache[0] = zp_vec[0];
     zp_cache[1] = zp_vec[1];
@@ -181,8 +179,8 @@ class Sm70MoeU8ZpIteratorB {
   CUTLASS_DEVICE
   void cache_metadata_vector_words(int c, int group, int cache_n) const {
     int const metadata_offset = metadata_group_offset(group) + cache_n;
-    uint4 const scale_words = *reinterpret_cast<uint4 const*>(
-        scales_expert_base_ + metadata_offset);
+    uint4 const scale_words =
+        *reinterpret_cast<uint4 const*>(scales_expert_base_ + metadata_offset);
     half2 const* scale_vec = reinterpret_cast<half2 const*>(&scale_words);
     half2* scale_cache = cached_scales_ + c * 4;
     scale_cache[0] = scale_vec[0];
@@ -190,8 +188,8 @@ class Sm70MoeU8ZpIteratorB {
     scale_cache[2] = scale_vec[2];
     scale_cache[3] = scale_vec[3];
 
-    uint4 const zp_words = *reinterpret_cast<uint4 const*>(
-        zp_expert_base_ + metadata_offset);
+    uint4 const zp_words =
+        *reinterpret_cast<uint4 const*>(zp_expert_base_ + metadata_offset);
     half2 const* zp_vec = reinterpret_cast<half2 const*>(&zp_words);
     half2* zp_cache = cached_zp_ + c * 4;
     zp_cache[0] = zp_vec[0];
@@ -204,9 +202,8 @@ class Sm70MoeU8ZpIteratorB {
   void cache_current_group_metadata(int group) const {
     CUTLASS_PRAGMA_UNROLL
     for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-      int const cache_n =
-          n_offset_ + thread_offset_.contiguous() +
-          c * ThreadMap::Delta::kContiguous;
+      int const cache_n = n_offset_ + thread_offset_.contiguous() +
+                          c * ThreadMap::Delta::kContiguous;
       if constexpr (kUseMetadataVectorWords) {
         cache_metadata_vector_words(c, group, cache_n);
       } else {
@@ -269,8 +266,9 @@ class Sm70MoeU8ZpIteratorB {
           frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
         }
       } else {
-        static_assert(ThreadMap::Iterations::kContiguous == 1,
-                      "Unsupported SM70 Marlin MoE U8 contiguous iteration count.");
+        static_assert(
+            ThreadMap::Iterations::kContiguous == 1,
+            "Unsupported SM70 Marlin MoE U8 contiguous iteration count.");
         uint32_t const qword0 =
             load_qword_vector<1>(qweight_ + qweight_base_offset_);
         uint32_t const qword1 = load_qword_vector<1>(
@@ -280,12 +278,12 @@ class Sm70MoeU8ZpIteratorB {
 
         half2 deq[2];
         half2* frag_vec = reinterpret_cast<half2*>(frag.data());
-        marlin::dequant<half2, vllm::kU8.id(), false>(
-            static_cast<int>(qword0), deq);
+        marlin::dequant<half2, vllm::kU8.id(), false>(static_cast<int>(qword0),
+                                                      deq);
         frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
         frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
-        marlin::dequant<half2, vllm::kU8.id(), false>(
-            static_cast<int>(qword1), deq);
+        marlin::dequant<half2, vllm::kU8.id(), false>(static_cast<int>(qword1),
+                                                      deq);
         frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
         frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
       }
@@ -293,9 +291,8 @@ class Sm70MoeU8ZpIteratorB {
       int const logical_n_base = n_offset_ + thread_offset_.contiguous();
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-        int const logical_k_s =
-            k_offset_ + thread_offset_.strided() +
-            s * ThreadMap::Delta::kStrided;
+        int const logical_k_s = k_offset_ + thread_offset_.strided() +
+                                s * ThreadMap::Delta::kStrided;
         if constexpr (kGroupSize != -1) {
           cache_current_group_metadata(scale_group(logical_k_s));
         }
@@ -303,10 +300,9 @@ class Sm70MoeU8ZpIteratorB {
             expert_qweight_base_offset() +
             qweight_offset_from_logical(params_, logical_k_s, logical_n_base);
         if constexpr (ThreadMap::Iterations::kContiguous == 4) {
-          uint4 const qwords0 =
-              load_qword_vector<4>(qweight_ + qweight_base_s);
-          uint4 const qwords1 = load_qword_vector<4>(
-              qweight_ + qweight_base_s + kQweightWordStrideWords);
+          uint4 const qwords0 = load_qword_vector<4>(qweight_ + qweight_base_s);
+          uint4 const qwords1 = load_qword_vector<4>(qweight_ + qweight_base_s +
+                                                     kQweightWordStrideWords);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -321,22 +317,17 @@ class Sm70MoeU8ZpIteratorB {
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword0), deq);
-            frag_vec[0] =
-                __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-            frag_vec[1] =
-                __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
+            frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+            frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword1), deq);
-            frag_vec[2] =
-                __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-            frag_vec[3] =
-                __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+            frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+            frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
           }
         } else if constexpr (ThreadMap::Iterations::kContiguous == 2) {
-          uint2 const qwords0 =
-              load_qword_vector<2>(qweight_ + qweight_base_s);
-          uint2 const qwords1 = load_qword_vector<2>(
-              qweight_ + qweight_base_s + kQweightWordStrideWords);
+          uint2 const qwords0 = load_qword_vector<2>(qweight_ + qweight_base_s);
+          uint2 const qwords1 = load_qword_vector<2>(qweight_ + qweight_base_s +
+                                                     kQweightWordStrideWords);
           CUTLASS_PRAGMA_UNROLL
           for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
             constexpr int kAccess = ThreadMap::kElementsPerAccess;
@@ -351,20 +342,17 @@ class Sm70MoeU8ZpIteratorB {
             half2* frag_vec = reinterpret_cast<half2*>(frag.data() + frag_base);
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword0), deq);
-            frag_vec[0] =
-                __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
-            frag_vec[1] =
-                __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
+            frag_vec[0] = __hfma2(deq[0], scale_vec[0], __hneg2(zp_vec[0]));
+            frag_vec[1] = __hfma2(deq[1], scale_vec[1], __hneg2(zp_vec[1]));
             marlin::dequant<half2, vllm::kU8.id(), false>(
                 static_cast<int>(qword1), deq);
-            frag_vec[2] =
-                __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
-            frag_vec[3] =
-                __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
+            frag_vec[2] = __hfma2(deq[0], scale_vec[2], __hneg2(zp_vec[2]));
+            frag_vec[3] = __hfma2(deq[1], scale_vec[3], __hneg2(zp_vec[3]));
           }
         } else {
-          static_assert(ThreadMap::Iterations::kContiguous == 1,
-                        "Unsupported SM70 Marlin MoE U8 contiguous iteration count.");
+          static_assert(
+              ThreadMap::Iterations::kContiguous == 1,
+              "Unsupported SM70 Marlin MoE U8 contiguous iteration count.");
           uint32_t const qword0 =
               load_qword_vector<1>(qweight_ + qweight_base_s);
           uint32_t const qword1 = load_qword_vector<1>(
@@ -395,8 +383,7 @@ class Sm70MoeU8ZpIteratorB {
       return;
     }
 
-    if constexpr (kGroupSize != -1 &&
-                  ThreadMap::Iterations::kStrided == 1) {
+    if constexpr (kGroupSize != -1 && ThreadMap::Iterations::kStrided == 1) {
       int const first_logical_k = k_offset_ + thread_offset_.strided();
       cache_current_group_metadata(scale_group(first_logical_k));
     }
@@ -415,18 +402,17 @@ struct Sm70MoeU8ZpGemmSpec {
   using IteratorA = Sm70MoeGatherIteratorA<Shape, ThreadMap>;
 
   template <typename Shape, typename ThreadMap, int GroupSize, int PackedMacroN>
-  using IteratorB =
-      Sm70MoeU8ZpIteratorB<Shape, ThreadMap, GroupSize, PackedMacroN,
-                           UseMetadataVectorWords>;
+  using IteratorB = Sm70MoeU8ZpIteratorB<Shape, ThreadMap, GroupSize,
+                                         PackedMacroN, UseMetadataVectorWords>;
 };
 
-template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-          int WarpN, int WarpK, int GroupSize, int PackedMacroN,
+template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+          int WarpK, int GroupSize, int PackedMacroN,
           bool UseMetadataVectorWords = true>
 using Sm70MoeU8ZpGemmTraits =
-    Sm70MarlinMoeGemmTraits<
-        Sm70MoeU8ZpGemmSpec<UseMetadataVectorWords>, CtaM, CtaN, CtaK,
-        Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>;
+    Sm70MarlinMoeGemmTraits<Sm70MoeU8ZpGemmSpec<UseMetadataVectorWords>, CtaM,
+                            CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
+                            PackedMacroN>;
 
 template <bool UseMetadataVectorWords = true>
 struct Sm70MoeU8Launcher {
@@ -448,16 +434,16 @@ struct Sm70MoeU8Launcher {
   int64_t size_k;
   int requested_split_k;
 
-  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM,
-          int WarpN, int WarpK, int GroupSize, int PackedMacroN>
+  template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
+            int WarpK, int GroupSize, int PackedMacroN>
   torch::Tensor operator()() const {
-    using Traits = Sm70MoeU8ZpGemmTraits<CtaM, CtaN, CtaK, Warps, WarpM,
-                                         WarpN, WarpK, GroupSize, PackedMacroN,
-                                         UseMetadataVectorWords>;
+    using Traits =
+        Sm70MoeU8ZpGemmTraits<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK,
+                              GroupSize, PackedMacroN, UseMetadataVectorWords>;
     return launch_sm70_marlin_moe_gemm<Traits>(
         a, c, b_q_weight, b_scales, b_zeros, global_scale, sorted_token_ids,
-        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size,
-        top_k, mul_topk_weights, size_m, size_n, size_k, requested_split_k);
+        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        mul_topk_weights, size_m, size_n, size_k, requested_split_k);
   }
 };
 
@@ -475,9 +461,10 @@ torch::Tensor sm70_marlin_u8_gemm(
   auto const params = sm70_marlin_moe_auto_stage_params(
       "uint8", group_size, moe_block_size, top_k, size_m, size_n, size_k);
   Sm70CtaGeometry const geometry = params.geometry;
-  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE uint8", geometry);
-  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE uint8", geometry,
-                                        size_n);
+  validate_sm70_marlin_moe_stage_cta_geometry_supported("SM70 Marlin MoE uint8",
+                                                        geometry);
+  validate_sm70_marlin_moe_stage_cta_n_alignment("SM70 Marlin MoE uint8",
+                                                 geometry, size_n);
   TORCH_CHECK(size_k % geometry.cta_k == 0,
               "SM70 Marlin MoE uint8 requires K divisible by CTA_K=",
               geometry.cta_k, ". Got K=", size_k, ".");
@@ -485,19 +472,45 @@ torch::Tensor sm70_marlin_u8_gemm(
   auto empty_float = torch::empty(
       {0}, torch::TensorOptions().dtype(at::kFloat).device(a.device()));
   if (params.use_metadata_vector_words) {
-    Sm70MoeU8Launcher<true> const launcher{
-        a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
-        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-        mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
-    return dispatch_sm70_marlin_moe_geometry_with_group32(launcher, geometry, params.packed_macro_n, group_size,
-        "uint8");
+    Sm70MoeU8Launcher<true> const launcher{a,
+                                           c,
+                                           b_q_weight,
+                                           b_scales,
+                                           b_zeros,
+                                           empty_float,
+                                           sorted_token_ids,
+                                           expert_ids,
+                                           num_tokens_past_padded,
+                                           topk_weights,
+                                           moe_block_size,
+                                           top_k,
+                                           mul_topk_weights,
+                                           size_m,
+                                           size_n,
+                                           size_k,
+                                           params.requested_split_k};
+    return dispatch_sm70_marlin_moe_geometry_with_group32(
+        launcher, geometry, params.packed_macro_n, group_size, "uint8");
   }
-  Sm70MoeU8Launcher<false> const launcher{
-      a, c, b_q_weight, b_scales, b_zeros, empty_float, sorted_token_ids,
-      expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
-      mul_topk_weights, size_m, size_n, size_k, params.requested_split_k};
-  return dispatch_sm70_marlin_moe_geometry_with_group32(launcher, geometry, params.packed_macro_n, group_size,
-      "uint8");
+  Sm70MoeU8Launcher<false> const launcher{a,
+                                          c,
+                                          b_q_weight,
+                                          b_scales,
+                                          b_zeros,
+                                          empty_float,
+                                          sorted_token_ids,
+                                          expert_ids,
+                                          num_tokens_past_padded,
+                                          topk_weights,
+                                          moe_block_size,
+                                          top_k,
+                                          mul_topk_weights,
+                                          size_m,
+                                          size_n,
+                                          size_k,
+                                          params.requested_split_k};
+  return dispatch_sm70_marlin_moe_geometry_with_group32(
+      launcher, geometry, params.packed_macro_n, group_size, "uint8");
 }
 
 }  // namespace marlin_moe_wna16

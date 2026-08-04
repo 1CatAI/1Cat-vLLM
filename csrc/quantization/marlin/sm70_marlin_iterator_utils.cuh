@@ -30,23 +30,23 @@ struct QwordVector<4> {
 template <int ContiguousWords>
 CUTLASS_DEVICE typename QwordVector<ContiguousWords>::Type load_qword_vector(
     uint32_t const* ptr) {
-  static_assert(ContiguousWords == 1 || ContiguousWords == 2 ||
-                    ContiguousWords == 4,
-                "SM70 qword vector load supports 1, 2, or 4 words.");
+  static_assert(
+      ContiguousWords == 1 || ContiguousWords == 2 || ContiguousWords == 4,
+      "SM70 qword vector load supports 1, 2, or 4 words.");
   if constexpr (ContiguousWords == 1) {
     return *ptr;
   } else {
-    return *reinterpret_cast<typename QwordVector<ContiguousWords>::Type const*>(
-        ptr);
+    return *reinterpret_cast<
+        typename QwordVector<ContiguousWords>::Type const*>(ptr);
   }
 }
 
 template <int ContiguousWords>
 CUTLASS_DEVICE uint32_t qword_from_vector(
     typename QwordVector<ContiguousWords>::Type const& words, int c) {
-  static_assert(ContiguousWords == 1 || ContiguousWords == 2 ||
-                    ContiguousWords == 4,
-                "SM70 qword vector access supports 1, 2, or 4 words.");
+  static_assert(
+      ContiguousWords == 1 || ContiguousWords == 2 || ContiguousWords == 4,
+      "SM70 qword vector access supports 1, 2, or 4 words.");
   if constexpr (ContiguousWords == 1) {
     return words;
   } else {
@@ -68,9 +68,9 @@ CUTLASS_DEVICE uint32_t qword_from_vector(uint2 const& words, int c) {
 template <int PackedMacroN>
 CUTLASS_DEVICE int u4_packed_macro_n_qweight_offset_from_logical(
     int size_n, int logical_k, int logical_n) {
-  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
-                    PackedMacroN == 256,
-                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  static_assert(
+      PackedMacroN == 64 || PackedMacroN == 128 || PackedMacroN == 256,
+      "SM70 Marlin packed macro-N must be 64, 128, or 256.");
   constexpr int kGroupTiles = PackedMacroN / kQuantTileN;
   int const k_tile = logical_k / kQuantTileK;
   int const local_k = logical_k - k_tile * kQuantTileK;
@@ -89,9 +89,9 @@ CUTLASS_DEVICE int u4_packed_macro_n_qweight_offset_from_logical(
 template <int PackedMacroN>
 CUTLASS_DEVICE int u8_packed_macro_n_qweight_offset_from_logical(
     int size_n, int logical_k, int logical_n) {
-  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
-                    PackedMacroN == 256,
-                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  static_assert(
+      PackedMacroN == 64 || PackedMacroN == 128 || PackedMacroN == 256,
+      "SM70 Marlin packed macro-N must be 64, 128, or 256.");
   constexpr int kGroupTiles = PackedMacroN / kQuantTileN;
   int const k_tile = logical_k / kQuantTileK;
   int const local_k = logical_k - k_tile * kQuantTileK;
@@ -109,9 +109,9 @@ CUTLASS_DEVICE int u8_packed_macro_n_qweight_offset_from_logical(
 
 template <int PackedMacroN>
 CUTLASS_DEVICE int u8_packed_macro_n_qweight_word_stride() {
-  static_assert(PackedMacroN == 64 || PackedMacroN == 128 ||
-                    PackedMacroN == 256,
-                "SM70 Marlin packed macro-N must be 64, 128, or 256.");
+  static_assert(
+      PackedMacroN == 64 || PackedMacroN == 128 || PackedMacroN == 256,
+      "SM70 Marlin packed macro-N must be 64, 128, or 256.");
   return PackedMacroN / kQuantTileN;
 }
 
