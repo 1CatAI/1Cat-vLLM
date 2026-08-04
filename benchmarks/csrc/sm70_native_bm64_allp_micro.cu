@@ -46,17 +46,17 @@ static_assert(kBaselineThreads / 32 == 2 * kQKWarps);
 static_assert(kCandidateThreads / 32 == 3 * (kM64 / kPanelM));
 
 using MatrixAFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using QKMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::col_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::col_major>;
 using PVMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using AccumulatorFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN,
-                          kPanelK, float>;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN, kPanelK,
+                           float>;
 
 // This is the accepted ALL_P=true, PAIR_SCRATCH=true BM32 storage layout.
 struct alignas(16) BM32PairScratchShared {
@@ -194,35 +194,31 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     MatrixAFragment& fragment, const __half* __restrict__ matrix,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_row_slot(row);
   const int tile_offset = (k_offset / kPanelK) * kPanelM * kPanelK;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      matrix + tile_offset + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kPanelM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
 
-__device__ __forceinline__ int accumulator_fragment_row(int lane,
-                                                         int element) {
+__device__ __forceinline__ int accumulator_fragment_row(int lane, int element) {
   const int row_base =
       (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
   return row_base + ((element >> 1) & 1) * 2;
 }
 
 __device__ __forceinline__ int accumulator_fragment_column(int lane,
-                                                            int element) {
+                                                           int element) {
   const int column_base = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8;
   return column_base + (element & 1) + ((element >> 2) & 1) * 4;
 }
@@ -243,8 +239,7 @@ __device__ __forceinline__ void qk_pair_accumulate(
     load_swizzled_matrix_a_fragment(a_fragment, shared_query_top, k_offset);
     nvcuda::wmma::mma_sync(top_accumulator, a_fragment, b_fragment,
                            top_accumulator);
-    load_swizzled_matrix_a_fragment(a_fragment, shared_query_bottom,
-                                    k_offset);
+    load_swizzled_matrix_a_fragment(a_fragment, shared_query_bottom, k_offset);
     nvcuda::wmma::mma_sync(bottom_accumulator, a_fragment, b_fragment,
                            bottom_accumulator);
   }
@@ -265,8 +260,8 @@ __device__ __forceinline__ float make_probability_row(
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_max = fmaxf(thread_max,
-                        __shfl_down_sync(0xffffffffU, thread_max, offset));
+    thread_max =
+        fmaxf(thread_max, __shfl_down_sync(0xffffffffU, thread_max, offset));
   }
   const float panel_max = __shfl_sync(0xffffffffU, thread_max, 0);
   const float old_max = row_max[state_row];
@@ -323,8 +318,7 @@ __device__ __forceinline__ void scale_phase_reuse_accumulators(
   const int row = accumulator_fragment_row(threadIdx.x & 31, 0);
   scale_accumulator_two_rows(accumulator_top, row_exp_diff[row],
                              row_exp_diff[row + 2]);
-  scale_accumulator_two_rows(accumulator_bottom,
-                             row_exp_diff[kPanelM + row],
+  scale_accumulator_two_rows(accumulator_bottom, row_exp_diff[kPanelM + row],
                              row_exp_diff[kPanelM + row + 2]);
 }
 
@@ -348,8 +342,8 @@ __device__ __forceinline__ void update_phase_reuse_pv_panel(
   {
     MatrixAFragment a_fragment;
     PVMatrixBFragment b_fragment;
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, value_panel + kPanelK * kD + d_offset, kD);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   value_panel + kPanelK * kD + d_offset, kD);
     load_swizzled_matrix_a_fragment(a_fragment, probability_top, kPanelK);
     nvcuda::wmma::mma_sync(accumulator_top, a_fragment, b_fragment,
                            accumulator_top);
@@ -389,31 +383,29 @@ __device__ __forceinline__ void spill_qk_warp_pv_accumulators(
 #pragma unroll
   for (int element_pair = 0; element_pair < 4; ++element_pair) {
     const int top_offset =
-        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN
-        + pair_column;
+        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN +
+        pair_column;
     const uint32_t top_address = static_cast<uint32_t>(
         __cvta_generic_to_shared(shared_score + top_offset));
     asm volatile("st.shared.v2.u32 [%0], {%1, %2};"
                  :
                  : "r"(top_address),
-                   "r"(__float_as_uint(
-                       accumulator_top.x[2 * element_pair])),
-                   "r"(__float_as_uint(
-                       accumulator_top.x[2 * element_pair + 1]))
+                   "r"(__float_as_uint(accumulator_top.x[2 * element_pair])),
+                   "r"(__float_as_uint(accumulator_top.x[2 * element_pair + 1]))
                  : "memory");
-    asm volatile("st.shared.v2.u32 [%0+4096], {%1, %2};"
-                 :
-                 : "r"(top_address),
-                   "r"(__float_as_uint(
-                       accumulator_bottom.x[2 * element_pair])),
-                   "r"(__float_as_uint(
-                       accumulator_bottom.x[2 * element_pair + 1]))
-                 : "memory");
+    asm volatile(
+        "st.shared.v2.u32 [%0+4096], {%1, %2};"
+        :
+        : "r"(top_address),
+          "r"(__float_as_uint(accumulator_bottom.x[2 * element_pair])),
+          "r"(__float_as_uint(accumulator_bottom.x[2 * element_pair + 1]))
+        : "memory");
   }
 }
 
 __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
-    const float* __restrict__ shared_score, AccumulatorFragment& accumulator_top,
+    const float* __restrict__ shared_score,
+    AccumulatorFragment& accumulator_top,
     AccumulatorFragment& accumulator_bottom) {
   const int warp = threadIdx.x >> 5;
   if (warp >= kQKWarps) {
@@ -428,8 +420,8 @@ __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
 #pragma unroll
   for (int element_pair = 0; element_pair < 4; ++element_pair) {
     const int top_offset =
-        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN
-        + pair_column;
+        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN +
+        pair_column;
     const uint32_t top_address = static_cast<uint32_t>(
         __cvta_generic_to_shared(shared_score + top_offset));
     uint32_t first_word;
@@ -445,8 +437,7 @@ __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
                  : "r"(top_address)
                  : "memory");
     accumulator_bottom.x[2 * element_pair] = __uint_as_float(first_word);
-    accumulator_bottom.x[2 * element_pair + 1] =
-        __uint_as_float(second_word);
+    accumulator_bottom.x[2 * element_pair + 1] = __uint_as_float(second_word);
   }
 }
 
@@ -455,8 +446,8 @@ __device__ __forceinline__ void sync_qk_warp_pair(int warp_pair) {
   asm volatile("bar.sync %0, 64;" : : "r"(barrier_id) : "memory");
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
+extern "C" __global__
+__launch_bounds__(kBaselineThreads, 2) void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -469,14 +460,14 @@ void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
   }
   const int m32_panel = block & 1;
   {
-    const __half* query_group =
-        query + static_cast<int64_t>(group) * kM64QElements +
-        m32_panel * kQElements;
+    const __half* query_group = query +
+                                static_cast<int64_t>(group) * kM64QElements +
+                                m32_panel * kQElements;
     stage_swizzled_q_panel(query_group, shared.query, threadIdx.x,
                            kBaselineThreads);
     stage_swizzled_q_panel(query_group + kQPanelElements,
-                            shared.query + kQPanelElements, threadIdx.x,
-                            kBaselineThreads);
+                           shared.query + kQPanelElements, threadIdx.x,
+                           kBaselineThreads);
   }
   if (threadIdx.x < kM) {
     shared.row_max[threadIdx.x] = kNegativeInfinity;
@@ -499,23 +490,22 @@ void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
     const int qk_warp = threadIdx.x >> 5;
     if (qk_warp < kQKWarps) {
       const int n_offset = qk_warp * kPanelN;
-      const __half* key_group = key + static_cast<int64_t>(group) * nblocks *
-                                        kBlockN * kD;
+      const __half* key_group =
+          key + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
       spill_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                     accumulator_bottom);
       asm volatile("" ::: "memory");
       AccumulatorFragment qk_top;
       AccumulatorFragment qk_bottom;
-      qk_pair_accumulate(shared.query, shared.query + kQPanelElements,
-                         key_group +
-                             (shared.block_index * kBlockN + n_offset) * kD,
-                         qk_top, qk_bottom);
+      qk_pair_accumulate(
+          shared.query, shared.query + kQPanelElements,
+          key_group + (shared.block_index * kBlockN + n_offset) * kD, qk_top,
+          qk_bottom);
       asm volatile("" ::: "memory");
       reload_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                      accumulator_bottom);
       sync_qk_warp_pair(qk_warp >> 1);
-      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top,
-                                      kBlockN,
+      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top, kBlockN,
                                       nvcuda::wmma::mem_row_major);
       nvcuda::wmma::store_matrix_sync(
           shared.score + kPanelM * kBlockN + n_offset, qk_bottom, kBlockN,
@@ -527,9 +517,8 @@ void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
     for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
       const int phase_warp = threadIdx.x >> 5;
       const float top_exp_diff = make_probability_row(
-          shared.score + phase_warp * kBlockN,
-          shared.probability_top[panel], phase_warp, shared.row_max,
-          shared.row_sum, phase_warp, panel);
+          shared.score + phase_warp * kBlockN, shared.probability_top[panel],
+          phase_warp, shared.row_max, shared.row_sum, phase_warp, panel);
       const float bottom_exp_diff = make_probability_row(
           shared.score + (kPanelM + phase_warp) * kBlockN,
           shared.probability_bottom[panel], phase_warp, shared.row_max,
@@ -567,9 +556,9 @@ void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
     __syncthreads();
   }
 
-  __half* output_group =
-      output + static_cast<int64_t>(group) * kM64OutputElements +
-      m32_panel * kOutputElements;
+  __half* output_group = output +
+                         static_cast<int64_t>(group) * kM64OutputElements +
+                         m32_panel * kOutputElements;
   const int d_offset = (threadIdx.x >> 5) * kPanelN;
   store_accumulator_output(accumulator_top, output_group, shared.row_sum, 0,
                            d_offset);
@@ -579,8 +568,7 @@ void sm70_native_bm64_allp_bm32_pair_scratch_baseline(
 
 __device__ __forceinline__ void q_owner_qk_pair_accumulate(
     const __half* __restrict__ shared_query,
-    const __half* __restrict__ key_panel,
-    AccumulatorFragment& qk_0,
+    const __half* __restrict__ key_panel, AccumulatorFragment& qk_0,
     AccumulatorFragment& qk_1) {
   MatrixAFragment a_fragment;
   QKMatrixBFragment b_fragment;
@@ -592,15 +580,14 @@ __device__ __forceinline__ void q_owner_qk_pair_accumulate(
     load_swizzled_matrix_a_fragment(a_fragment, shared_query, k_offset);
     nvcuda::wmma::load_matrix_sync(b_fragment, key_panel + k_offset, kD);
     nvcuda::wmma::mma_sync(qk_0, a_fragment, b_fragment, qk_0);
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, key_panel + kPanelN * kD + k_offset, kD);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   key_panel + kPanelN * kD + k_offset, kD);
     nvcuda::wmma::mma_sync(qk_1, a_fragment, b_fragment, qk_1);
   }
 }
 
 template <bool MAX_REDUCTION>
-__device__ __forceinline__ float q_owner_reduce_pair(
-    float left, float right) {
+__device__ __forceinline__ float q_owner_reduce_pair(float left, float right) {
   if constexpr (MAX_REDUCTION) {
     return fmaxf(left, right);
   }
@@ -610,8 +597,7 @@ __device__ __forceinline__ float q_owner_reduce_pair(
 template <bool MAX_REDUCTION>
 __device__ __forceinline__ float q_owner_reduce_panel_row(
     const AccumulatorFragment& fragment_0,
-    const AccumulatorFragment& fragment_1,
-    int element_base) {
+    const AccumulatorFragment& fragment_1, int element_base) {
   constexpr unsigned kMask = 0xffffffffU;
   const int lane = threadIdx.x & 31;
   const int canonical_lane = lane & ~0xa;
@@ -634,13 +620,12 @@ __device__ __forceinline__ float q_owner_reduce_panel_row(
   const float quartet_1_high = q_owner_reduce_pair<MAX_REDUCTION>(
       fragment_1_high, __shfl_xor_sync(kMask, fragment_1_high, 2));
 
-  const float even_group = q_owner_reduce_pair<MAX_REDUCTION>(
-      quartet_0_low, quartet_1_low);
-  const float odd_group = q_owner_reduce_pair<MAX_REDUCTION>(
-      quartet_0_high, quartet_1_high);
+  const float even_group =
+      q_owner_reduce_pair<MAX_REDUCTION>(quartet_0_low, quartet_1_low);
+  const float odd_group =
+      q_owner_reduce_pair<MAX_REDUCTION>(quartet_0_high, quartet_1_high);
   const float even_0 = __shfl_sync(kMask, even_group, canonical_lane);
-  const float even_2 =
-      __shfl_sync(kMask, even_group, canonical_lane | 8);
+  const float even_2 = __shfl_sync(kMask, even_group, canonical_lane | 8);
   const float odd_0 = __shfl_sync(kMask, odd_group, canonical_lane);
   const float odd_2 = __shfl_sync(kMask, odd_group, canonical_lane | 8);
   return q_owner_reduce_pair<MAX_REDUCTION>(
@@ -649,11 +634,8 @@ __device__ __forceinline__ float q_owner_reduce_panel_row(
 }
 
 __device__ __forceinline__ void q_owner_write_probability(
-    AccumulatorFragment& fragment,
-    __half* __restrict__ probability,
-    int column_offset,
-    float first_row_max,
-    float second_row_max) {
+    AccumulatorFragment& fragment, __half* __restrict__ probability,
+    int column_offset, float first_row_max, float second_row_max) {
   const int lane = threadIdx.x & 31;
 #pragma unroll
   for (int element = 0; element < fragment.num_elements; ++element) {
@@ -661,41 +643,30 @@ __device__ __forceinline__ void q_owner_write_probability(
     const int column =
         column_offset + accumulator_fragment_column(lane, element);
     const float row_max = (element & 2) == 0 ? first_row_max : second_row_max;
-    const float value =
-        __expf(fmaxf(fragment.x[element] - row_max, -80.0f));
+    const float value = __expf(fmaxf(fragment.x[element] - row_max, -80.0f));
     fragment.x[element] = value;
-    probability[swizzled_matrix_a_offset(row, column)] =
-        __float2half_rn(value);
+    probability[swizzled_matrix_a_offset(row, column)] = __float2half_rn(value);
   }
 }
 
 __device__ __forceinline__ void q_owner_softmax(
-    AccumulatorFragment& qk_0,
-    AccumulatorFragment& qk_1,
-    __half* __restrict__ probability,
-    float& first_row_max,
-    float& first_row_sum,
-    float& second_row_max,
-    float& second_row_sum,
-    float& first_row_exp_diff,
-    float& second_row_exp_diff) {
-  const float panel_max_first =
-      q_owner_reduce_panel_row<true>(qk_0, qk_1, 0);
-  const float panel_max_second =
-      q_owner_reduce_panel_row<true>(qk_0, qk_1, 2);
+    AccumulatorFragment& qk_0, AccumulatorFragment& qk_1,
+    __half* __restrict__ probability, float& first_row_max,
+    float& first_row_sum, float& second_row_max, float& second_row_sum,
+    float& first_row_exp_diff, float& second_row_exp_diff) {
+  const float panel_max_first = q_owner_reduce_panel_row<true>(qk_0, qk_1, 0);
+  const float panel_max_second = q_owner_reduce_panel_row<true>(qk_0, qk_1, 2);
   const float new_max_first = fmaxf(first_row_max, panel_max_first);
   const float new_max_second = fmaxf(second_row_max, panel_max_second);
   first_row_exp_diff = __expf(first_row_max - new_max_first);
   second_row_exp_diff = __expf(second_row_max - new_max_second);
 
-  q_owner_write_probability(
-      qk_0, probability, 0, new_max_first, new_max_second);
-  q_owner_write_probability(
-      qk_1, probability, kPanelN, new_max_first, new_max_second);
-  const float panel_sum_first =
-      q_owner_reduce_panel_row<false>(qk_0, qk_1, 0);
-  const float panel_sum_second =
-      q_owner_reduce_panel_row<false>(qk_0, qk_1, 2);
+  q_owner_write_probability(qk_0, probability, 0, new_max_first,
+                            new_max_second);
+  q_owner_write_probability(qk_1, probability, kPanelN, new_max_first,
+                            new_max_second);
+  const float panel_sum_first = q_owner_reduce_panel_row<false>(qk_0, qk_1, 0);
+  const float panel_sum_second = q_owner_reduce_panel_row<false>(qk_0, qk_1, 2);
   first_row_sum = first_row_exp_diff * first_row_sum + panel_sum_first;
   second_row_sum = second_row_exp_diff * second_row_sum + panel_sum_second;
   first_row_max = new_max_first;
@@ -703,19 +674,14 @@ __device__ __forceinline__ void q_owner_softmax(
 }
 
 __device__ __forceinline__ void q_owner_store_output_tile(
-    const AccumulatorFragment& accumulator,
-    __half* __restrict__ output,
-    int d_offset,
-    float first_row_sum,
-    float second_row_sum) {
+    const AccumulatorFragment& accumulator, __half* __restrict__ output,
+    int d_offset, float first_row_sum, float second_row_sum) {
   const int lane = threadIdx.x & 31;
 #pragma unroll
   for (int element = 0; element < accumulator.num_elements; ++element) {
     const int row = accumulator_fragment_row(lane, element);
-    const int column =
-        d_offset + accumulator_fragment_column(lane, element);
-    const float row_sum =
-        (element & 2) == 0 ? first_row_sum : second_row_sum;
+    const int column = d_offset + accumulator_fragment_column(lane, element);
+    const float row_sum = (element & 2) == 0 ? first_row_sum : second_row_sum;
     const float inverse_sum = 1.0f / fmaxf(row_sum, 1e-24f);
     output[row * kD + column] =
         __float2half_rn(accumulator.x[element] * inverse_sum);
@@ -737,8 +703,8 @@ __device__ __forceinline__ void q_owner_sync_group(int query_owner) {
   OP(6)                     \
   OP(7)
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 2)
-void sm70_native_bm64_allp_m64_candidate(
+extern "C" __global__
+__launch_bounds__(kCandidateThreads, 2) void sm70_native_bm64_allp_m64_candidate(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -754,9 +720,9 @@ void sm70_native_bm64_allp_m64_candidate(
   const int query_owner = warp / 3;
   const int owner_role = warp - query_owner * 3;
   const int owner_thread = owner_role * 32 + lane;
-  const __half* query_panel =
-      query + static_cast<int64_t>(group) * kM64QElements
-      + query_owner * kQPanelElements;
+  const __half* query_panel = query +
+                              static_cast<int64_t>(group) * kM64QElements +
+                              query_owner * kQPanelElements;
   __half* shared_query = shared.query + query_owner * kQPanelElements;
   __half* probability = shared.probability[query_owner];
   stage_swizzled_q_panel(query_panel, shared_query, owner_thread, 96);
@@ -780,15 +746,13 @@ void sm70_native_bm64_allp_m64_candidate(
         const int panel_token = block * kBlockN + panel * kSoftmaxPanelN;
         AccumulatorFragment qk_0;
         AccumulatorFragment qk_1;
-        q_owner_qk_pair_accumulate(
-            shared_query, key_group + panel_token * kD, qk_0, qk_1);
+        q_owner_qk_pair_accumulate(shared_query, key_group + panel_token * kD,
+                                   qk_0, qk_1);
         float first_row_exp_diff;
         float second_row_exp_diff;
-        q_owner_softmax(
-            qk_0, qk_1, probability,
-            first_row_max, first_row_sum,
-            second_row_max, second_row_sum,
-            first_row_exp_diff, second_row_exp_diff);
+        q_owner_softmax(qk_0, qk_1, probability, first_row_max, first_row_sum,
+                        second_row_max, second_row_sum, first_row_exp_diff,
+                        second_row_exp_diff);
         if ((lane & 0xa) == 0) {
           const int first_row = accumulator_fragment_row(lane, 0);
           const int first_state_row = query_owner * kPanelM + first_row;
@@ -828,32 +792,29 @@ void sm70_native_bm64_allp_m64_candidate(
               shared.row_exp_diff[query_owner * kPanelM + first_row];
           const float second_row_exp_diff =
               shared.row_exp_diff[query_owner * kPanelM + first_row + 2];
-#define Q_OWNER_SCALE_ACCUMULATOR(INDEX)                         \
-  scale_accumulator_two_rows(accumulator_##INDEX,                \
-                             first_row_exp_diff, second_row_exp_diff);
+#define Q_OWNER_SCALE_ACCUMULATOR(INDEX)                              \
+  scale_accumulator_two_rows(accumulator_##INDEX, first_row_exp_diff, \
+                             second_row_exp_diff);
           Q_OWNER_D_TILES(Q_OWNER_SCALE_ACCUMULATOR)
 #undef Q_OWNER_SCALE_ACCUMULATOR
         }
         const __half* value_panel = value_group + panel_token * kD;
         MatrixAFragment probability_fragment;
         PVMatrixBFragment value_fragment;
-        load_swizzled_matrix_a_fragment(
-            probability_fragment, probability, 0);
-#define Q_OWNER_UPDATE_PV_0(INDEX)                                      \
-  nvcuda::wmma::load_matrix_sync(                                      \
-      value_fragment,                                                  \
-      value_panel + (d_half * 8 + INDEX) * kPanelN, kD);                \
-  nvcuda::wmma::mma_sync(accumulator_##INDEX, probability_fragment,     \
+        load_swizzled_matrix_a_fragment(probability_fragment, probability, 0);
+#define Q_OWNER_UPDATE_PV_0(INDEX)                                       \
+  nvcuda::wmma::load_matrix_sync(                                        \
+      value_fragment, value_panel + (d_half * 8 + INDEX) * kPanelN, kD); \
+  nvcuda::wmma::mma_sync(accumulator_##INDEX, probability_fragment,      \
                          value_fragment, accumulator_##INDEX);
         Q_OWNER_D_TILES(Q_OWNER_UPDATE_PV_0)
 #undef Q_OWNER_UPDATE_PV_0
-        load_swizzled_matrix_a_fragment(
-            probability_fragment, probability, kPanelK);
+        load_swizzled_matrix_a_fragment(probability_fragment, probability,
+                                        kPanelK);
 #define Q_OWNER_UPDATE_PV_1(INDEX)                                      \
-  nvcuda::wmma::load_matrix_sync(                                      \
-      value_fragment,                                                  \
-      value_panel + kPanelK * kD                                       \
-          + (d_half * 8 + INDEX) * kPanelN, kD);                       \
+  nvcuda::wmma::load_matrix_sync(                                       \
+      value_fragment,                                                   \
+      value_panel + kPanelK * kD + (d_half * 8 + INDEX) * kPanelN, kD); \
   nvcuda::wmma::mma_sync(accumulator_##INDEX, probability_fragment,     \
                          value_fragment, accumulator_##INDEX);
         Q_OWNER_D_TILES(Q_OWNER_UPDATE_PV_1)
@@ -862,19 +823,18 @@ void sm70_native_bm64_allp_m64_candidate(
       }
     }
 
-    __half* output_panel =
-        output + static_cast<int64_t>(group) * kM64OutputElements
-        + query_owner * kQPanelElements;
+    __half* output_panel = output +
+                           static_cast<int64_t>(group) * kM64OutputElements +
+                           query_owner * kQPanelElements;
     const int first_row = accumulator_fragment_row(lane, 0);
     const float output_first_row_sum =
         shared.row_sum[query_owner * kPanelM + first_row];
     const float output_second_row_sum =
         shared.row_sum[query_owner * kPanelM + first_row + 2];
-#define Q_OWNER_STORE_ACCUMULATOR(INDEX)                              \
-  q_owner_store_output_tile(accumulator_##INDEX, output_panel,        \
-                            (d_half * 8 + INDEX) * kPanelN,            \
-                            output_first_row_sum,                      \
-                            output_second_row_sum);
+#define Q_OWNER_STORE_ACCUMULATOR(INDEX)                       \
+  q_owner_store_output_tile(accumulator_##INDEX, output_panel, \
+                            (d_half * 8 + INDEX) * kPanelN,    \
+                            output_first_row_sum, output_second_row_sum);
     Q_OWNER_D_TILES(Q_OWNER_STORE_ACCUMULATOR)
 #undef Q_OWNER_STORE_ACCUMULATOR
   }
@@ -897,8 +857,7 @@ float random_half_value(uint32_t* state) {
 }
 
 float alternating_half_value(size_t index, uint32_t salt) {
-  const int magnitude =
-      1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
+  const int magnitude = 1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
   const float value = static_cast<float>(magnitude) / 512.0f;
   return ((index + salt) & 1u) == 0 ? value : -value;
 }
@@ -931,9 +890,8 @@ Exactness compare_outputs(const std::vector<__half>& baseline,
   result.bitwise_equal = true;
   const size_t word_count = baseline.size() / 2;
   for (size_t word = 0; word < word_count; ++word) {
-    const uint32_t word_xor =
-        half_word_bits(baseline.data(), word) ^
-        half_word_bits(candidate.data(), word);
+    const uint32_t word_xor = half_word_bits(baseline.data(), word) ^
+                              half_word_bits(candidate.data(), word);
     result.xor_reduction ^= word_xor;
     result.max_word_xor = std::max(result.max_word_xor, word_xor);
     result.bitwise_equal &= word_xor == 0;
@@ -952,10 +910,9 @@ Exactness compare_outputs(const std::vector<__half>& baseline,
     }
   }
   for (size_t index = 0; index < baseline.size(); ++index) {
-    result.max_abs_error =
-        std::max(result.max_abs_error,
-                 std::fabs(__half2float(baseline[index]) -
-                           __half2float(candidate[index])));
+    result.max_abs_error = std::max(result.max_abs_error,
+                                    std::fabs(__half2float(baseline[index]) -
+                                              __half2float(candidate[index])));
   }
   return result;
 }
@@ -968,8 +925,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -1036,10 +992,10 @@ void configure_m64_shared_memory() {
   CUDA_CHECK(cudaFuncSetAttribute(sm70_native_bm64_allp_m64_candidate,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
                                   sizeof(M64Shared)));
-  CUDA_CHECK(cudaFuncSetAttribute(
-      sm70_native_bm64_allp_m64_candidate,
-      cudaFuncAttributePreferredSharedMemoryCarveout,
-      static_cast<int>(cudaSharedmemCarveoutMaxShared)));
+  CUDA_CHECK(
+      cudaFuncSetAttribute(sm70_native_bm64_allp_m64_candidate,
+                           cudaFuncAttributePreferredSharedMemoryCarveout,
+                           static_cast<int>(cudaSharedmemCarveoutMaxShared)));
 }
 
 void print_json_string(const std::string& value) {
@@ -1063,9 +1019,9 @@ void print_json_string(const std::string& value) {
         break;
       default:
         if (character < 0x20) {
-          std::cout << "\\u00" << std::hex << std::setw(2)
-                    << std::setfill('0') << static_cast<int>(character)
-                    << std::dec << std::setfill(' ');
+          std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -1075,27 +1031,23 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
-            << ", \"dynamic_shared_bytes\": "
-            << resources.dynamic_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
+            << ", \"dynamic_shared_bytes\": " << resources.dynamic_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm << ", \"threads_per_cta\": "
-            << resources.threads_per_cta << ", \"warps_per_cta\": "
-            << resources.warps_per_cta << ", \"resident_warps\": "
-            << resources.resident_warps << '}';
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"threads_per_cta\": " << resources.threads_per_cta
+            << ", \"warps_per_cta\": " << resources.warps_per_cta
+            << ", \"resident_warps\": " << resources.resident_warps << '}';
 }
 
 void print_exactness(const Exactness& exactness, int64_t word_count) {
@@ -1113,16 +1065,13 @@ void print_exactness(const Exactness& exactness, int64_t word_count) {
     const int64_t element = exactness.first_mismatch_element;
     const int64_t group = element / kM64OutputElements;
     const int64_t in_group = element % kM64OutputElements;
-    std::cout << "{\"element\": " << element << ", \"group\": "
-              << group << ", \"row\": " << in_group / kD
+    std::cout << "{\"element\": " << element << ", \"group\": " << group
+              << ", \"row\": " << in_group / kD
               << ", \"column\": " << in_group % kD
               << ", \"baseline_bits\": " << exactness.first_baseline_bits
-              << ", \"candidate_bits\": "
-              << exactness.first_candidate_bits
-              << ", \"baseline_value\": "
-              << exactness.first_baseline_value
-              << ", \"candidate_value\": "
-              << exactness.first_candidate_value
+              << ", \"candidate_bits\": " << exactness.first_candidate_bits
+              << ", \"baseline_value\": " << exactness.first_baseline_value
+              << ", \"candidate_value\": " << exactness.first_candidate_value
               << ", \"reason\": \"per-row FP32 QK, online-softmax, or PV "
                  "accumulation order diverged before fp16 rounding\"}";
   }
@@ -1149,8 +1098,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"name\": ";
   print_json_string(properties.name);
   std::cout << ", \"capability\": [" << properties.major << ", "
-            << properties.minor << "], \"cuda_runtime\": "
-            << runtime_version << ", \"sm_count\": " << sm_count << "},\n";
+            << properties.minor << "], \"cuda_runtime\": " << runtime_version
+            << ", \"sm_count\": " << sm_count << "},\n";
   std::cout << "  \"target\": \"sm_70\",\n";
   std::cout << "  \"shape\": {\"groups\": " << args.groups
             << ", \"nblocks\": " << args.nblocks
@@ -1181,42 +1130,43 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"candidate_shared_layout_bytes\": " << sizeof(M64Shared)
             << "\n";
   std::cout << "  },\n";
-  std::cout << "  \"baseline_pair_scratch\": {\"storage\": \"shared.score\", "
-               "\"ownership\": \"each QK warp pair owns one disjoint 32-column score slab\", "
-               "\"row\": \"16*warp_in_pair+2*element_pair+lane/16 (+8 for bottom)\", "
-               "\"column\": \"32*warp_pair+2*(lane%16)\", "
-               "\"minimum_bank_replay\": 2, "
-               "\"handoff\": \"one 64-thread named barrier per QK warp pair\", "
-               "\"qk_warps\": 8, \"fragments_per_warp\": 2, "
-               "\"shared_v2_spills_per_fragment\": 4, "
-               "\"shared_v2_reloads_per_fragment\": 4, "
-               "\"shared_v2_spills_per_qk_warp\": 8, "
-               "\"shared_v2_reloads_per_qk_warp\": 8, "
-               "\"shared_v2_spills_per_cta\": 64, "
-               "\"shared_v2_reloads_per_cta\": 64},\n";
-  std::cout << "  \"candidate_storage\": {\"q_persistent_across_kv_blocks\": true, "
-               "\"qk_scores_in_registers\": true, "
-               "\"cta_barriers\": 0, "
-               "\"q_bytes\": "
-            << kM64QElements * sizeof(__half)
-            << ", \"score_bytes\": 0"
-            << ", \"probability_bytes\": "
-            << (kM64 / kPanelM) * kPPanelElements * sizeof(__half)
-            << "},\n";
+  std::cout
+      << "  \"baseline_pair_scratch\": {\"storage\": \"shared.score\", "
+         "\"ownership\": \"each QK warp pair owns one disjoint 32-column score "
+         "slab\", "
+         "\"row\": \"16*warp_in_pair+2*element_pair+lane/16 (+8 for bottom)\", "
+         "\"column\": \"32*warp_pair+2*(lane%16)\", "
+         "\"minimum_bank_replay\": 2, "
+         "\"handoff\": \"one 64-thread named barrier per QK warp pair\", "
+         "\"qk_warps\": 8, \"fragments_per_warp\": 2, "
+         "\"shared_v2_spills_per_fragment\": 4, "
+         "\"shared_v2_reloads_per_fragment\": 4, "
+         "\"shared_v2_spills_per_qk_warp\": 8, "
+         "\"shared_v2_reloads_per_qk_warp\": 8, "
+         "\"shared_v2_spills_per_cta\": 64, "
+         "\"shared_v2_reloads_per_cta\": 64},\n";
+  std::cout
+      << "  \"candidate_storage\": {\"q_persistent_across_kv_blocks\": true, "
+         "\"qk_scores_in_registers\": true, "
+         "\"cta_barriers\": 0, "
+         "\"q_bytes\": "
+      << kM64QElements * sizeof(__half) << ", \"score_bytes\": 0"
+      << ", \"probability_bytes\": "
+      << (kM64 / kPanelM) * kPPanelElements * sizeof(__half) << "},\n";
   std::cout << "  \"execution\": {\"profile_only\": "
             << (args.profile_only ? "true" : "false")
-            << ", \"smoke_only\": "
-            << (args.smoke_only ? "true" : "false")
+            << ", \"smoke_only\": " << (args.smoke_only ? "true" : "false")
             << ", \"resource_gate_pass\": "
             << (resource_pass ? "true" : "false")
-            << ", \"kernels_executed\": "
-            << (executed ? "true" : "false") << "},\n";
+            << ", \"kernels_executed\": " << (executed ? "true" : "false")
+            << "},\n";
   std::cout << "  \"resources\": {\"baseline\": ";
   print_resources(baseline_resources);
   std::cout << ", \"candidate\": ";
   print_resources(candidate_resources);
   std::cout << "},\n";
-  std::cout << "  \"resource_gate\": {\"baseline_required_registers_per_thread\": 64, "
+  std::cout << "  \"resource_gate\": "
+               "{\"baseline_required_registers_per_thread\": 64, "
                "\"candidate_max_registers_per_thread\": 85, "
                "\"requires_zero_stack_local_spills\": true, "
                "\"candidate_max_static_shared_bytes\": "
@@ -1231,8 +1181,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "  \"exactness\": ";
   if (exactness_available) {
     print_exactness(exactness,
-                    static_cast<int64_t>(args.groups) * kM64OutputElements /
-                        2);
+                    static_cast<int64_t>(args.groups) * kM64OutputElements / 2);
   } else {
     std::cout << "null";
   }
@@ -1274,8 +1223,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
                "\"candidate_minus_baseline_median_us\": ";
   if (timing_available) {
     std::cout << pairs.candidate_minus_baseline_median_us
-              << ", \"candidate_speedup_pct\": "
-              << candidate_speedup_pct
+              << ", \"candidate_speedup_pct\": " << candidate_speedup_pct
               << ", \"reuse_offsets_lost_occupancy_at_wall_time\": "
               << (candidate_timing.median_us < baseline_timing.median_us
                       ? "true"
@@ -1288,7 +1236,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "  \"measurement\": {\"warmup_pairs\": " << args.warmup
             << ", \"rounds\": " << args.rounds
             << ", \"launches_per_sample\": " << args.launches_per_sample
-            << ", \"interleaving\": \"baseline/candidate order alternates each round\"}\n";
+            << ", \"interleaving\": \"baseline/candidate order alternates each "
+               "round\"}\n";
   std::cout << "}\n";
 }
 
@@ -1333,9 +1282,9 @@ int run(const Args& args) {
   configure_m64_shared_memory();
   const KernelResources baseline_resources = query_resources(
       sm70_native_bm64_allp_bm32_pair_scratch_baseline, kBaselineThreads);
-  const KernelResources candidate_resources = query_resources(
-      sm70_native_bm64_allp_m64_candidate, kCandidateThreads,
-      sizeof(M64Shared));
+  const KernelResources candidate_resources =
+      query_resources(sm70_native_bm64_allp_m64_candidate, kCandidateThreads,
+                      sizeof(M64Shared));
   const Exactness no_exactness;
   const TimingSummary no_timing;
   const PairSummary no_pairs;
@@ -1349,8 +1298,8 @@ int run(const Args& args) {
 
   const size_t query_elements =
       static_cast<size_t>(args.groups) * kM64QElements;
-  const size_t kv_elements = static_cast<size_t>(args.groups) * args.nblocks *
-                             kBlockN * kD;
+  const size_t kv_elements =
+      static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kM64OutputElements;
   std::vector<__half> host_query(query_elements);
@@ -1377,9 +1326,10 @@ int run(const Args& args) {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_candidate),
                         output_elements * sizeof(__half)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
-                        query_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(), kv_elements * sizeof(__half),
+                        query_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
+                        kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -1387,15 +1337,14 @@ int run(const Args& args) {
   const dim3 candidate_grid(args.groups);
   auto launch_baseline = [&] {
     sm70_native_bm64_allp_bm32_pair_scratch_baseline<<<baseline_grid,
-                                                         kBaselineThreads>>>(
+                                                       kBaselineThreads>>>(
         device_query, device_key, device_value, device_baseline, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
   };
   auto launch_candidate = [&] {
-    sm70_native_bm64_allp_m64_candidate<<<candidate_grid,
-                                           kCandidateThreads,
-                                           sizeof(M64Shared)>>>(
+    sm70_native_bm64_allp_m64_candidate<<<candidate_grid, kCandidateThreads,
+                                          sizeof(M64Shared)>>>(
         device_query, device_key, device_value, device_candidate, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
@@ -1418,8 +1367,8 @@ int run(const Args& args) {
     CUDA_CHECK(cudaDeviceSynchronize());
     free_device_buffers();
     print_json(args, properties, runtime_version, sm_count, baseline_resources,
-               candidate_resources, true, false, no_exactness, false,
-               no_timing, no_timing, no_pairs);
+               candidate_resources, true, false, no_exactness, false, no_timing,
+               no_timing, no_pairs);
     return EXIT_SUCCESS;
   }
 
@@ -1440,9 +1389,11 @@ int run(const Args& args) {
   std::vector<__half> host_baseline(output_elements);
   std::vector<__half> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   const Exactness exactness = compare_outputs(host_baseline, host_candidate);
   if (!exactness.bitwise_equal) {
     free_device_buffers();
@@ -1476,8 +1427,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -1550,8 +1500,7 @@ Args parse_args(int argc, char** argv) {
     } else if (argument == "--profile-kernel" && index + 1 < argc) {
       args.profile_kernel = argv[++index];
       if (args.profile_kernel != "baseline" &&
-          args.profile_kernel != "candidate" &&
-          args.profile_kernel != "both") {
+          args.profile_kernel != "candidate" && args.profile_kernel != "both") {
         std::cerr << "--profile-kernel must be baseline, candidate, or both\n";
         std::exit(EXIT_FAILURE);
       }
@@ -1570,6 +1519,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

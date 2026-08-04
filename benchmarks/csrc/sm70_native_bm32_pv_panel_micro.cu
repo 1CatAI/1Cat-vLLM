@@ -36,12 +36,12 @@ static_assert(kK / kTileK == 2);
 
 using AFragment =
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kTileM, kTileD, kTileK,
-                          __half, nvcuda::wmma::row_major>;
+                           __half, nvcuda::wmma::row_major>;
 using BFragment =
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTileM, kTileD, kTileK,
-                          __half, nvcuda::wmma::row_major>;
+                           __half, nvcuda::wmma::row_major>;
 using CFragment = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kTileM,
-                                          kTileD, kTileK, float>;
+                                         kTileD, kTileK, float>;
 
 struct Args {
   int device = 0;
@@ -113,10 +113,12 @@ __device__ __forceinline__ void stage_p_to_shared(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void native_bm32_pv_baseline_kernel(const __half* __restrict__ p,
-                                    const __half* __restrict__ v,
-                                    float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kBaselineThreads,
+    2) void native_bm32_pv_baseline_kernel(const __half* __restrict__ p,
+                                           const __half* __restrict__ v,
+                                           float* __restrict__ output,
+                                           int groups) {
   __shared__ __align__(16) __half shared_p[kBaselinePElements];
 
   const int block = blockIdx.x;
@@ -125,17 +127,14 @@ void native_bm32_pv_baseline_kernel(const __half* __restrict__ p,
     return;
   }
   const int m_offset = (block & 1) * kTileM;
-  const __half* p_tile = p + static_cast<int64_t>(group) *
-                                 kPElementsPerGroup +
-                         m_offset * kK;
-  stage_p_to_shared(p_tile, shared_p, kBaselinePElements,
-                    kBaselineThreads);
+  const __half* p_tile =
+      p + static_cast<int64_t>(group) * kPElementsPerGroup + m_offset * kK;
+  stage_p_to_shared(p_tile, shared_p, kBaselinePElements, kBaselineThreads);
   __syncthreads();
 
   const int warp = threadIdx.x >> 5;
   const int d_offset = warp * kTileD;
-  const __half* v_group =
-      v + static_cast<int64_t>(group) * kVElementsPerGroup;
+  const __half* v_group = v + static_cast<int64_t>(group) * kVElementsPerGroup;
   AFragment a_fragment;
   BFragment b_fragment;
   CFragment accumulator;
@@ -145,34 +144,32 @@ void native_bm32_pv_baseline_kernel(const __half* __restrict__ p,
   nvcuda::wmma::load_matrix_sync(b_fragment, v_group + d_offset, kD);
   nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
   nvcuda::wmma::load_matrix_sync(a_fragment, shared_p + kTileK, kK);
-  nvcuda::wmma::load_matrix_sync(
-      b_fragment, v_group + kTileK * kD + d_offset, kD);
+  nvcuda::wmma::load_matrix_sync(b_fragment, v_group + kTileK * kD + d_offset,
+                                 kD);
   nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
 
-  float* output_tile = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup +
+  float* output_tile = output +
+                       static_cast<int64_t>(group) * kOutputElementsPerGroup +
                        m_offset * kD + d_offset;
   nvcuda::wmma::store_matrix_sync(output_tile, accumulator, kD,
                                   nvcuda::wmma::mem_row_major);
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 4)
-void native_bm32_pv_candidate_kernel(const __half* __restrict__ p,
-                                     const __half* __restrict__ v,
-                                     unsigned int groups) {
+extern "C" __global__ __launch_bounds__(
+    kCandidateThreads,
+    4) void native_bm32_pv_candidate_kernel(const __half* __restrict__ p,
+                                            const __half* __restrict__ v,
+                                            unsigned int groups) {
   __shared__ __align__(16) __half shared_p[kPElementsPerGroup];
 
   const unsigned int group = blockIdx.x;
-  const __half* p_group =
-      p + static_cast<uint64_t>(group) * kPElementsPerGroup;
-  stage_p_to_shared(p_group, shared_p, kPElementsPerGroup,
-                    kCandidateThreads);
+  const __half* p_group = p + static_cast<uint64_t>(group) * kPElementsPerGroup;
+  stage_p_to_shared(p_group, shared_p, kPElementsPerGroup, kCandidateThreads);
   __syncthreads();
 
   const unsigned int warp = threadIdx.x >> 5;
   const unsigned int d0 = warp * (2 * kTileD);
-  const __half* v_group =
-      v + static_cast<uint64_t>(group) * kVElementsPerGroup;
+  const __half* v_group = v + static_cast<uint64_t>(group) * kVElementsPerGroup;
   AFragment a_fragment;
   BFragment b_fragment;
   CFragment accumulator_d0_top;
@@ -200,21 +197,20 @@ void native_bm32_pv_candidate_kernel(const __half* __restrict__ p,
   nvcuda::wmma::mma_sync(accumulator_d1_bottom, a_fragment, b_fragment,
                          accumulator_d1_bottom);
 
-  nvcuda::wmma::load_matrix_sync(b_fragment,
-                                 v_group + kTileK * kD + d0, kD);
+  nvcuda::wmma::load_matrix_sync(b_fragment, v_group + kTileK * kD + d0, kD);
   nvcuda::wmma::load_matrix_sync(a_fragment, shared_p + kTileK, kK);
   nvcuda::wmma::mma_sync(accumulator_d0_top, a_fragment, b_fragment,
                          accumulator_d0_top);
-  nvcuda::wmma::load_matrix_sync(
-      a_fragment, shared_p + kTileM * kK + kTileK, kK);
+  nvcuda::wmma::load_matrix_sync(a_fragment, shared_p + kTileM * kK + kTileK,
+                                 kK);
   nvcuda::wmma::mma_sync(accumulator_d0_bottom, a_fragment, b_fragment,
                          accumulator_d0_bottom);
 
-  float* output = reinterpret_cast<float*>(
-      const_cast<__half*>(v) + static_cast<uint64_t>(groups) *
-                                   kVElementsPerGroup);
-  float* output_group = output + static_cast<uint64_t>(group) *
-                                     kOutputElementsPerGroup;
+  float* output = reinterpret_cast<float*>(const_cast<__half*>(v) +
+                                           static_cast<uint64_t>(groups) *
+                                               kVElementsPerGroup);
+  float* output_group =
+      output + static_cast<uint64_t>(group) * kOutputElementsPerGroup;
   nvcuda::wmma::store_matrix_sync(output_group + d0, accumulator_d0_top, kD,
                                   nvcuda::wmma::mem_row_major);
   nvcuda::wmma::store_matrix_sync(output_group + kTileM * kD + d0,
@@ -225,18 +221,17 @@ void native_bm32_pv_candidate_kernel(const __half* __restrict__ p,
   asm volatile("mov.u32 %0, %%tid.x;" : "=r"(late_tid));
   const unsigned int warp_base = __shfl_sync(0xffffffffU, late_tid, 0);
   const unsigned int d1_late = warp_base + kTileD;
-  nvcuda::wmma::load_matrix_sync(
-      b_fragment, v_group + kTileK * kD + d1_late, kD);
+  nvcuda::wmma::load_matrix_sync(b_fragment, v_group + kTileK * kD + d1_late,
+                                 kD);
   nvcuda::wmma::load_matrix_sync(a_fragment, shared_p + kTileK, kK);
   nvcuda::wmma::mma_sync(accumulator_d1_top, a_fragment, b_fragment,
                          accumulator_d1_top);
-  nvcuda::wmma::load_matrix_sync(
-      a_fragment, shared_p + kTileM * kK + kTileK, kK);
+  nvcuda::wmma::load_matrix_sync(a_fragment, shared_p + kTileM * kK + kTileK,
+                                 kK);
   nvcuda::wmma::mma_sync(accumulator_d1_bottom, a_fragment, b_fragment,
                          accumulator_d1_bottom);
-  nvcuda::wmma::store_matrix_sync(output_group + d1_late,
-                                  accumulator_d1_top, kD,
-                                  nvcuda::wmma::mem_row_major);
+  nvcuda::wmma::store_matrix_sync(output_group + d1_late, accumulator_d1_top,
+                                  kD, nvcuda::wmma::mem_row_major);
   nvcuda::wmma::store_matrix_sync(output_group + kTileM * kD + d1_late,
                                   accumulator_d1_bottom, kD,
                                   nvcuda::wmma::mem_row_major);
@@ -270,8 +265,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -310,9 +304,8 @@ Exactness compare_outputs(const std::vector<float>& baseline,
     result.max_word_xor = std::max(result.max_word_xor, word_xor);
     result.bitwise_equal &= word_xor == 0;
     result.mismatch_words += word_xor != 0;
-    result.max_abs_error =
-        std::max(result.max_abs_error,
-                 std::fabs(baseline[index] - candidate[index]));
+    result.max_abs_error = std::max(
+        result.max_abs_error, std::fabs(baseline[index] - candidate[index]));
   }
   return result;
 }
@@ -322,8 +315,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta) {
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -355,8 +348,8 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
@@ -383,14 +376,11 @@ void print_exactness(const Exactness& exactness) {
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
             << ", \"resident_active_warps\": "
             << resources.resident_active_warps
             << ", \"threads_per_cta\": " << resources.threads_per_cta
@@ -401,8 +391,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
                 int runtime_version, int sm_count, int max_threads_per_sm,
                 const Exactness& exactness,
                 const TimingSummary& baseline_timing,
-                const TimingSummary& candidate_timing,
-                const PairSummary& pairs,
+                const TimingSummary& candidate_timing, const PairSummary& pairs,
                 const KernelResources& baseline_resources,
                 const KernelResources& candidate_resources) {
   const double candidate_speedup_pct =
@@ -426,12 +415,17 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "  \"layouts\": {\"p\": \"[group, M32, K32] row-major\", "
                "\"v\": \"[group, K32, D256] row-major stride 256\"},\n";
   std::cout << "  \"paths\": {\n";
-  std::cout << "    \"baseline\": \"2 CTA/group, BM16xD256, 512 threads, 16 warps x D16; two K16 native row.row\",\n";
-  std::cout << "    \"candidate\": \"1 CTA/group, BM32xD256, 256 threads, 8 warps x two D16; four accumulators and one B load per D tile/K16 reused top then bottom\"\n";
+  std::cout << "    \"baseline\": \"2 CTA/group, BM16xD256, 512 threads, 16 "
+               "warps x D16; two K16 native row.row\",\n";
+  std::cout << "    \"candidate\": \"1 CTA/group, BM32xD256, 256 threads, 8 "
+               "warps x two D16; four accumulators and one B load per D "
+               "tile/K16 reused top then bottom\"\n";
   std::cout << "  },\n";
   std::cout << "  \"launch_topology\": {\n";
-  std::cout << "    \"baseline\": {\"ctas_per_group\": 2, \"threads_per_cta\": 512, \"warps_per_cta\": 16},\n";
-  std::cout << "    \"candidate\": {\"ctas_per_group\": 1, \"threads_per_cta\": 256, \"warps_per_cta\": 8}\n";
+  std::cout << "    \"baseline\": {\"ctas_per_group\": 2, \"threads_per_cta\": "
+               "512, \"warps_per_cta\": 16},\n";
+  std::cout << "    \"candidate\": {\"ctas_per_group\": 1, "
+               "\"threads_per_cta\": 256, \"warps_per_cta\": 8}\n";
   std::cout << "  },\n";
   std::cout << "  \"exactness\": {\"word_dtype\": \"uint32\", "
                "\"word_count\": "
@@ -452,7 +446,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "  \"measurement\": {\"warmup_pairs\": " << args.warmup
             << ", \"rounds\": " << args.rounds
             << ", \"launches_per_sample\": " << args.launches_per_sample
-            << ", \"interleaving\": \"baseline/candidate order alternates each round\"},\n";
+            << ", \"interleaving\": \"baseline/candidate order alternates each "
+               "round\"},\n";
   std::cout << "  \"resources\": {\"baseline\": ";
   print_resources(baseline_resources);
   std::cout << ", \"candidate\": ";
@@ -520,9 +515,9 @@ int run(const Args& args) {
   float* device_candidate = nullptr;
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_p),
                         p_elements * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_v),
-                        v_elements * sizeof(__half) +
-                            output_elements * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(
+      reinterpret_cast<void**>(&device_v),
+      v_elements * sizeof(__half) + output_elements * sizeof(float)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_baseline),
                         output_elements * sizeof(float)));
   device_candidate = reinterpret_cast<float*>(device_v + v_elements);
@@ -575,11 +570,12 @@ int run(const Args& args) {
   std::vector<float> host_baseline(output_elements);
   std::vector<float> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
-  const Exactness exactness =
-      compare_outputs(host_baseline, host_candidate);
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  const Exactness exactness = compare_outputs(host_baseline, host_candidate);
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
@@ -598,8 +594,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -671,6 +666,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

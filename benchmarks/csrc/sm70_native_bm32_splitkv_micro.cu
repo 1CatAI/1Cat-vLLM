@@ -52,17 +52,17 @@ static_assert(kBm32Threads / 32 == 2 * kQKWarps);
 static_assert(kMergeThreads == kM * 8);
 
 using MatrixAFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using QKMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::col_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::col_major>;
 using PVMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using AccumulatorFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN,
-                          kPanelK, float>;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN, kPanelK,
+                           float>;
 
 // This is the accepted ALL_P=true, PAIR_SCRATCH=true BM32 storage layout.
 struct alignas(16) BM32PairScratchShared {
@@ -185,35 +185,31 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     MatrixAFragment& fragment, const __half* __restrict__ matrix,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_row_slot(row);
   const int tile_offset = (k_offset / kPanelK) * kPanelM * kPanelK;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      matrix + tile_offset + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kPanelM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
 
-__device__ __forceinline__ int accumulator_fragment_row(int lane,
-                                                         int element) {
+__device__ __forceinline__ int accumulator_fragment_row(int lane, int element) {
   const int row_base =
       (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
   return row_base + ((element >> 1) & 1) * 2;
 }
 
 __device__ __forceinline__ int accumulator_fragment_column(int lane,
-                                                            int element) {
+                                                           int element) {
   const int column_base = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8;
   return column_base + (element & 1) + ((element >> 2) & 1) * 4;
 }
@@ -234,8 +230,7 @@ __device__ __forceinline__ void qk_pair_accumulate(
     load_swizzled_matrix_a_fragment(a_fragment, shared_query_top, k_offset);
     nvcuda::wmma::mma_sync(top_accumulator, a_fragment, b_fragment,
                            top_accumulator);
-    load_swizzled_matrix_a_fragment(a_fragment, shared_query_bottom,
-                                    k_offset);
+    load_swizzled_matrix_a_fragment(a_fragment, shared_query_bottom, k_offset);
     nvcuda::wmma::mma_sync(bottom_accumulator, a_fragment, b_fragment,
                            bottom_accumulator);
   }
@@ -256,8 +251,8 @@ __device__ __forceinline__ float make_probability_row(
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_max = fmaxf(thread_max,
-                        __shfl_down_sync(0xffffffffU, thread_max, offset));
+    thread_max =
+        fmaxf(thread_max, __shfl_down_sync(0xffffffffU, thread_max, offset));
   }
   const float panel_max = __shfl_sync(0xffffffffU, thread_max, 0);
   const float old_max = row_max[state_row];
@@ -314,8 +309,7 @@ __device__ __forceinline__ void scale_phase_reuse_accumulators(
   const int row = accumulator_fragment_row(threadIdx.x & 31, 0);
   scale_accumulator_two_rows(accumulator_top, row_exp_diff[row],
                              row_exp_diff[row + 2]);
-  scale_accumulator_two_rows(accumulator_bottom,
-                             row_exp_diff[kPanelM + row],
+  scale_accumulator_two_rows(accumulator_bottom, row_exp_diff[kPanelM + row],
                              row_exp_diff[kPanelM + row + 2]);
 }
 
@@ -339,8 +333,8 @@ __device__ __forceinline__ void update_phase_reuse_pv_panel(
   {
     MatrixAFragment a_fragment;
     PVMatrixBFragment b_fragment;
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, value_panel + kPanelK * kD + d_offset, kD);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   value_panel + kPanelK * kD + d_offset, kD);
     load_swizzled_matrix_a_fragment(a_fragment, probability_top, kPanelK);
     nvcuda::wmma::mma_sync(accumulator_top, a_fragment, b_fragment,
                            accumulator_top);
@@ -399,24 +393,22 @@ __device__ __forceinline__ void spill_qk_warp_pv_accumulators(
     asm volatile("st.shared.v2.u32 [%0], {%1, %2};"
                  :
                  : "r"(top_address),
-                   "r"(__float_as_uint(
-                       accumulator_top.x[2 * element_pair])),
-                   "r"(__float_as_uint(
-                       accumulator_top.x[2 * element_pair + 1]))
+                   "r"(__float_as_uint(accumulator_top.x[2 * element_pair])),
+                   "r"(__float_as_uint(accumulator_top.x[2 * element_pair + 1]))
                  : "memory");
-    asm volatile("st.shared.v2.u32 [%0+4096], {%1, %2};"
-                 :
-                 : "r"(top_address),
-                   "r"(__float_as_uint(
-                       accumulator_bottom.x[2 * element_pair])),
-                   "r"(__float_as_uint(
-                       accumulator_bottom.x[2 * element_pair + 1]))
-                 : "memory");
+    asm volatile(
+        "st.shared.v2.u32 [%0+4096], {%1, %2};"
+        :
+        : "r"(top_address),
+          "r"(__float_as_uint(accumulator_bottom.x[2 * element_pair])),
+          "r"(__float_as_uint(accumulator_bottom.x[2 * element_pair + 1]))
+        : "memory");
   }
 }
 
 __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
-    const float* __restrict__ shared_score, AccumulatorFragment& accumulator_top,
+    const float* __restrict__ shared_score,
+    AccumulatorFragment& accumulator_top,
     AccumulatorFragment& accumulator_bottom) {
   const int warp = threadIdx.x >> 5;
   if (warp >= kQKWarps) {
@@ -448,8 +440,7 @@ __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
                  : "r"(top_address)
                  : "memory");
     accumulator_bottom.x[2 * element_pair] = __uint_as_float(first_word);
-    accumulator_bottom.x[2 * element_pair + 1] =
-        __uint_as_float(second_word);
+    accumulator_bottom.x[2 * element_pair + 1] = __uint_as_float(second_word);
   }
 }
 
@@ -458,8 +449,8 @@ __device__ __forceinline__ void sync_qk_warp_pair(int warp_pair) {
   asm volatile("bar.sync %0, 64;" : : "r"(barrier_id) : "memory");
 }
 
-extern "C" __global__ __launch_bounds__(kBm32Threads, 2)
-void sm70_native_bm32_splitkv_unsplit_baseline(
+extern "C" __global__
+__launch_bounds__(kBm32Threads, 2) void sm70_native_bm32_splitkv_unsplit_baseline(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -471,11 +462,10 @@ void sm70_native_bm32_splitkv_unsplit_baseline(
     return;
   }
   const int m32_panel = m32_index & 1;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kM64QElements +
-      m32_panel * kQElements;
-  stage_swizzled_q_panel(query_group, shared.query, threadIdx.x,
-                         kBm32Threads);
+  const __half* query_group = query +
+                              static_cast<int64_t>(group) * kM64QElements +
+                              m32_panel * kQElements;
+  stage_swizzled_q_panel(query_group, shared.query, threadIdx.x, kBm32Threads);
   stage_swizzled_q_panel(query_group + kQPanelElements,
                          shared.query + kQPanelElements, threadIdx.x,
                          kBm32Threads);
@@ -506,15 +496,13 @@ void sm70_native_bm32_splitkv_unsplit_baseline(
       AccumulatorFragment qk_top;
       AccumulatorFragment qk_bottom;
       qk_pair_accumulate(shared.query, shared.query + kQPanelElements,
-                         key +
-                             (shared.block_index * kBlockN + n_offset) * kD,
+                         key + (shared.block_index * kBlockN + n_offset) * kD,
                          qk_top, qk_bottom);
       asm volatile("" ::: "memory");
       reload_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                      accumulator_bottom);
       sync_qk_warp_pair(qk_warp >> 1);
-      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top,
-                                      kBlockN,
+      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top, kBlockN,
                                       nvcuda::wmma::mem_row_major);
       nvcuda::wmma::store_matrix_sync(
           shared.score + kPanelM * kBlockN + n_offset, qk_bottom, kBlockN,
@@ -526,9 +514,8 @@ void sm70_native_bm32_splitkv_unsplit_baseline(
     for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
       const int phase_warp = threadIdx.x >> 5;
       const float top_exp_diff = make_probability_row(
-          shared.score + phase_warp * kBlockN,
-          shared.probability_top[panel], phase_warp, shared.row_max,
-          shared.row_sum, phase_warp, panel);
+          shared.score + phase_warp * kBlockN, shared.probability_top[panel],
+          phase_warp, shared.row_max, shared.row_sum, phase_warp, panel);
       const float bottom_exp_diff = make_probability_row(
           shared.score + (kPanelM + phase_warp) * kBlockN,
           shared.probability_bottom[panel], phase_warp, shared.row_max,
@@ -550,8 +537,7 @@ void sm70_native_bm32_splitkv_unsplit_baseline(
       }
       update_phase_reuse_pv_panel(
           shared.probability_top[panel], shared.probability_bottom[panel],
-          value +
-              (shared.block_index * kBlockN + panel * kSoftmaxPanelN) * kD,
+          value + (shared.block_index * kBlockN + panel * kSoftmaxPanelN) * kD,
           d_offset, accumulator_top, accumulator_bottom);
     }
     __syncthreads();
@@ -570,8 +556,8 @@ void sm70_native_bm32_splitkv_unsplit_baseline(
                            kPanelM, d_offset);
 }
 
-extern "C" __global__ __launch_bounds__(kBm32Threads, 2)
-void sm70_native_bm32_splitkv_partial(
+extern "C" __global__
+__launch_bounds__(kBm32Threads, 2) void sm70_native_bm32_splitkv_partial(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, float* __restrict__ partial_accumulator,
     float* __restrict__ partial_row_max, float* __restrict__ partial_row_sum,
@@ -587,11 +573,10 @@ void sm70_native_bm32_splitkv_partial(
   const int m32_panel = m32_index & 1;
   const int split_begin_block = split_index * nblocks / kSplitParts;
   const int split_end_block = (split_index + 1) * nblocks / kSplitParts;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kM64QElements +
-      m32_panel * kQElements;
-  stage_swizzled_q_panel(query_group, shared.query, threadIdx.x,
-                         kBm32Threads);
+  const __half* query_group = query +
+                              static_cast<int64_t>(group) * kM64QElements +
+                              m32_panel * kQElements;
+  stage_swizzled_q_panel(query_group, shared.query, threadIdx.x, kBm32Threads);
   stage_swizzled_q_panel(query_group + kQPanelElements,
                          shared.query + kQPanelElements, threadIdx.x,
                          kBm32Threads);
@@ -622,15 +607,13 @@ void sm70_native_bm32_splitkv_partial(
       AccumulatorFragment qk_top;
       AccumulatorFragment qk_bottom;
       qk_pair_accumulate(shared.query, shared.query + kQPanelElements,
-                         key +
-                             (shared.block_index * kBlockN + n_offset) * kD,
+                         key + (shared.block_index * kBlockN + n_offset) * kD,
                          qk_top, qk_bottom);
       asm volatile("" ::: "memory");
       reload_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                      accumulator_bottom);
       sync_qk_warp_pair(qk_warp >> 1);
-      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top,
-                                      kBlockN,
+      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top, kBlockN,
                                       nvcuda::wmma::mem_row_major);
       nvcuda::wmma::store_matrix_sync(
           shared.score + kPanelM * kBlockN + n_offset, qk_bottom, kBlockN,
@@ -642,9 +625,8 @@ void sm70_native_bm32_splitkv_partial(
     for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
       const int phase_warp = threadIdx.x >> 5;
       const float top_exp_diff = make_probability_row(
-          shared.score + phase_warp * kBlockN,
-          shared.probability_top[panel], phase_warp, shared.row_max,
-          shared.row_sum, phase_warp, panel);
+          shared.score + phase_warp * kBlockN, shared.probability_top[panel],
+          phase_warp, shared.row_max, shared.row_sum, phase_warp, panel);
       const float bottom_exp_diff = make_probability_row(
           shared.score + (kPanelM + phase_warp) * kBlockN,
           shared.probability_bottom[panel], phase_warp, shared.row_max,
@@ -666,8 +648,7 @@ void sm70_native_bm32_splitkv_partial(
       }
       update_phase_reuse_pv_panel(
           shared.probability_top[panel], shared.probability_bottom[panel],
-          value +
-              (shared.block_index * kBlockN + panel * kSoftmaxPanelN) * kD,
+          value + (shared.block_index * kBlockN + panel * kSoftmaxPanelN) * kD,
           d_offset, accumulator_top, accumulator_bottom);
     }
     __syncthreads();
@@ -679,13 +660,11 @@ void sm70_native_bm32_splitkv_partial(
 
   const int64_t partial_slot =
       static_cast<int64_t>(m32_index) * kSplitParts + split_index;
-  float* partial_output =
-      partial_accumulator + partial_slot * kOutputElements;
+  float* partial_output = partial_accumulator + partial_slot * kOutputElements;
   const int d_offset = (threadIdx.x >> 5) * kPanelN;
-  store_unnormalized_accumulator(accumulator_top, partial_output, 0,
+  store_unnormalized_accumulator(accumulator_top, partial_output, 0, d_offset);
+  store_unnormalized_accumulator(accumulator_bottom, partial_output, kPanelM,
                                  d_offset);
-  store_unnormalized_accumulator(accumulator_bottom, partial_output,
-                                 kPanelM, d_offset);
   if (threadIdx.x < kM) {
     partial_row_max[partial_slot * kM + threadIdx.x] =
         shared.row_max[threadIdx.x];
@@ -694,8 +673,8 @@ void sm70_native_bm32_splitkv_partial(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kMergeThreads)
-void sm70_native_bm32_splitkv_merge(
+extern "C" __global__
+__launch_bounds__(kMergeThreads) void sm70_native_bm32_splitkv_merge(
     const float* __restrict__ partial_accumulator,
     const float* __restrict__ partial_row_max,
     const float* __restrict__ partial_row_sum, __half* __restrict__ output,
@@ -715,17 +694,14 @@ void sm70_native_bm32_splitkv_merge(
   const float weight_0 = __expf(max_0 - merged_max);
   const float weight_1 = __expf(max_1 - merged_max);
   const float weight_2 = __expf(max_2 - merged_max);
-  const float denominator =
-      weight_0 * partial_row_sum[stats_base] +
-      weight_1 * partial_row_sum[stats_base + kM] +
-      weight_2 * partial_row_sum[stats_base + 2 * kM];
+  const float denominator = weight_0 * partial_row_sum[stats_base] +
+                            weight_1 * partial_row_sum[stats_base + kM] +
+                            weight_2 * partial_row_sum[stats_base + 2 * kM];
   const float inverse_denominator = 1.0f / fmaxf(denominator, 1e-24f);
   const int64_t output_base = static_cast<int64_t>(m32_index) * kOutputElements;
   const int64_t partial_base_0 = first_slot * kOutputElements + row * kD;
-  const int64_t partial_base_1 =
-      (first_slot + 1) * kOutputElements + row * kD;
-  const int64_t partial_base_2 =
-      (first_slot + 2) * kOutputElements + row * kD;
+  const int64_t partial_base_1 = (first_slot + 1) * kOutputElements + row * kD;
+  const int64_t partial_base_2 = (first_slot + 2) * kOutputElements + row * kD;
 
 #pragma unroll
   for (int column = lane_in_row; column < kD; column += 8) {
@@ -753,8 +729,7 @@ float random_half_value(uint32_t* state) {
 }
 
 float alternating_half_value(size_t index, uint32_t salt) {
-  const int magnitude =
-      1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
+  const int magnitude = 1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
   const float value = static_cast<float>(magnitude) / 512.0f;
   return ((index + salt) & 1u) == 0 ? value : -value;
 }
@@ -783,7 +758,8 @@ Comparison compare_outputs(const std::vector<__half>& baseline,
     const uint16_t split_bits = half_bits(split.data(), index);
     const float baseline_value = __half2float(baseline[index]);
     const float split_value = __half2float(split[index]);
-    const bool finite = std::isfinite(baseline_value) && std::isfinite(split_value);
+    const bool finite =
+        std::isfinite(baseline_value) && std::isfinite(split_value);
     if (!finite) {
       result.all_finite = false;
       result.max_abs_error = std::numeric_limits<float>::infinity();
@@ -816,8 +792,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -850,8 +825,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta) {
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -894,9 +869,9 @@ void print_json_string(const std::string& value) {
         break;
       default:
         if (character < 0x20) {
-          std::cout << "\\u00" << std::hex << std::setw(2)
-                    << std::setfill('0') << static_cast<int>(character)
-                    << std::dec << std::setfill(' ');
+          std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -906,27 +881,23 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
-            << ", \"dynamic_shared_bytes\": "
-            << resources.dynamic_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
+            << ", \"dynamic_shared_bytes\": " << resources.dynamic_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm << ", \"threads_per_cta\": "
-            << resources.threads_per_cta << ", \"warps_per_cta\": "
-            << resources.warps_per_cta << ", \"resident_warps\": "
-            << resources.resident_warps << '}';
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"threads_per_cta\": " << resources.threads_per_cta
+            << ", \"warps_per_cta\": " << resources.warps_per_cta
+            << ", \"resident_warps\": " << resources.resident_warps << '}';
 }
 
 void print_comparison(const Comparison& comparison) {
@@ -952,14 +923,13 @@ void print_comparison(const Comparison& comparison) {
     const int64_t element = comparison.first_mismatch_element;
     const int64_t group = element / kM64OutputElements;
     const int64_t in_group = element % kM64OutputElements;
-    std::cout << "{\"element\": " << element << ", \"group\": "
-              << group << ", \"row\": " << in_group / kD
+    std::cout << "{\"element\": " << element << ", \"group\": " << group
+              << ", \"row\": " << in_group / kD
               << ", \"column\": " << in_group % kD
-              << ", \"baseline_bits\": "
-              << comparison.first_baseline_bits << ", \"split_bits\": "
-              << comparison.first_split_bits << ", \"baseline_value\": "
-              << comparison.first_baseline_value << ", \"split_value\": "
-              << comparison.first_split_value << '}';
+              << ", \"baseline_bits\": " << comparison.first_baseline_bits
+              << ", \"split_bits\": " << comparison.first_split_bits
+              << ", \"baseline_value\": " << comparison.first_baseline_value
+              << ", \"split_value\": " << comparison.first_split_value << '}';
   }
   std::cout << '}';
 }
@@ -970,9 +940,10 @@ void print_split_ranges(int nblocks) {
     if (split != 0) {
       std::cout << ", ";
     }
-    std::cout << "{\"split\": " << split << ", \"begin_block\": "
-              << split * nblocks / kSplitParts << ", \"end_block\": "
-              << (split + 1) * nblocks / kSplitParts << '}';
+    std::cout << "{\"split\": " << split
+              << ", \"begin_block\": " << split * nblocks / kSplitParts
+              << ", \"end_block\": " << (split + 1) * nblocks / kSplitParts
+              << '}';
   }
   std::cout << ']';
 }
@@ -991,7 +962,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   const bool resource_pass = bm32_resource_gate(baseline_resources) &&
                              bm32_resource_gate(partial_resources);
   const bool comparison_pass =
-      comparison.all_finite && comparison.max_abs_error <= kComparisonAbsTolerance;
+      comparison.all_finite &&
+      comparison.max_abs_error <= kComparisonAbsTolerance;
   const int baseline_ctas = args.groups * 2;
   const int partial_ctas = baseline_ctas * kSplitParts;
   const int runtime_wave_ctas = sm_count * 2;
@@ -1005,16 +977,16 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"name\": ";
   print_json_string(properties.name);
   std::cout << ", \"capability\": [" << properties.major << ", "
-            << properties.minor << "], \"cuda_runtime\": "
-            << runtime_version << ", \"sm_count\": " << sm_count << "},\n";
+            << properties.minor << "], \"cuda_runtime\": " << runtime_version
+            << ", \"sm_count\": " << sm_count << "},\n";
   std::cout << "  \"target\": \"sm_70\",\n";
   std::cout << "  \"shape\": {\"m64_query_groups\": " << args.groups
             << ", \"m32_ctas_per_unsplit_grid\": " << baseline_ctas
             << ", \"m32_ctas_per_split_partial_grid\": " << partial_ctas
             << ", \"split_parts\": " << kSplitParts
             << ", \"M\": 64, \"BM\": 32, \"D\": " << kD
-            << ", \"BN\": " << kBlockN << ", \"nblocks\": "
-            << args.nblocks << ", \"N\": " << args.nblocks * kBlockN
+            << ", \"BN\": " << kBlockN << ", \"nblocks\": " << args.nblocks
+            << ", \"N\": " << args.nblocks * kBlockN
             << ", \"hkv\": 1, \"kv_shared_across_query_groups\": true, "
                "\"split_block_ranges\": ";
   print_split_ranges(args.nblocks);
@@ -1023,18 +995,15 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"ctas_per_sm\": 2, \"runtime_full_wave_ctas\": "
             << runtime_wave_ctas << ", \"baseline_full_waves\": "
             << baseline_ctas / runtime_wave_ctas
-            << ", \"baseline_tail_ctas\": "
-            << baseline_ctas % runtime_wave_ctas
-            << ", \"partial_full_waves\": "
-            << partial_ctas / runtime_wave_ctas
-            << ", \"partial_tail_ctas\": "
-            << partial_ctas % runtime_wave_ctas
+            << ", \"baseline_tail_ctas\": " << baseline_ctas % runtime_wave_ctas
+            << ", \"partial_full_waves\": " << partial_ctas / runtime_wave_ctas
+            << ", \"partial_tail_ctas\": " << partial_ctas % runtime_wave_ctas
             << ", \"v100_72sm_reference\": {\"full_wave_ctas\": 144, "
                "\"baseline_full_waves\": "
-            << baseline_ctas / 144 << ", \"baseline_tail_ctas\": "
-            << baseline_ctas % 144 << ", \"partial_full_waves\": "
-            << partial_ctas / 144 << ", \"partial_tail_ctas\": "
-            << partial_ctas % 144 << "}},\n";
+            << baseline_ctas / 144
+            << ", \"baseline_tail_ctas\": " << baseline_ctas % 144
+            << ", \"partial_full_waves\": " << partial_ctas / 144
+            << ", \"partial_tail_ctas\": " << partial_ctas % 144 << "}},\n";
   std::cout << "  \"input_pattern\": ";
   print_json_string(args.pattern);
   std::cout << ",\n";
@@ -1051,8 +1020,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
                "merge of three unnormalized FP32 accumulators\"},\n";
   std::cout << "  \"execution\": {\"profile_only\": "
             << (args.profile_only ? "true" : "false")
-            << ", \"smoke_only\": "
-            << (args.smoke_only ? "true" : "false")
+            << ", \"smoke_only\": " << (args.smoke_only ? "true" : "false")
             << ", \"kernels_executed\": " << (executed ? "true" : "false")
             << ", \"resource_gate_pass\": "
             << (resource_pass ? "true" : "false")
@@ -1066,21 +1034,22 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << ", \"merge\": ";
   print_resources(merge_resources);
   std::cout << "},\n";
-  std::cout << "  \"resource_gate\": {\"partial_required_threads_per_cta\": "
-            << kBm32Threads
-            << ", \"partial_required_registers_per_thread\": 64, "
-               "\"partial_required_static_shared_bytes\": "
-            << sizeof(BM32PairScratchShared)
-            << ", \"partial_required_dynamic_shared_bytes\": 0, "
-               "\"partial_required_local_bytes_per_thread\": 0, "
-               "\"partial_required_active_ctas_per_sm\": 2, "
-               "\"baseline_required_same_shape\": true, "
-               "\"runtime_pass\": "
-            << (resource_pass ? "true" : "false")
-            << ", \"ptxas_validation\": \"Python harness requires 0 stack "
-               "frame, spill stores, and spill loads for baseline and partial\", "
-               "\"sass_validation\": \"Python harness rejects LDL/STL in "
-               "baseline and partial\"},\n";
+  std::cout
+      << "  \"resource_gate\": {\"partial_required_threads_per_cta\": "
+      << kBm32Threads
+      << ", \"partial_required_registers_per_thread\": 64, "
+         "\"partial_required_static_shared_bytes\": "
+      << sizeof(BM32PairScratchShared)
+      << ", \"partial_required_dynamic_shared_bytes\": 0, "
+         "\"partial_required_local_bytes_per_thread\": 0, "
+         "\"partial_required_active_ctas_per_sm\": 2, "
+         "\"baseline_required_same_shape\": true, "
+         "\"runtime_pass\": "
+      << (resource_pass ? "true" : "false")
+      << ", \"ptxas_validation\": \"Python harness requires 0 stack "
+         "frame, spill stores, and spill loads for baseline and partial\", "
+         "\"sass_validation\": \"Python harness rejects LDL/STL in "
+         "baseline and partial\"},\n";
   std::cout << "  \"comparison\": ";
   if (comparison_available) {
     print_comparison(comparison);
@@ -1165,8 +1134,8 @@ int run(const Args& args) {
   CUDA_CHECK(cudaRuntimeGetVersion(&runtime_version));
   CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
                                     args.device));
-  const KernelResources baseline_resources = query_resources(
-      sm70_native_bm32_splitkv_unsplit_baseline, kBm32Threads);
+  const KernelResources baseline_resources =
+      query_resources(sm70_native_bm32_splitkv_unsplit_baseline, kBm32Threads);
   const KernelResources partial_resources =
       query_resources(sm70_native_bm32_splitkv_partial, kBm32Threads);
   const KernelResources merge_resources =
@@ -1184,11 +1153,11 @@ int run(const Args& args) {
 
   const size_t query_elements =
       static_cast<size_t>(args.groups) * kM64QElements;
-  const size_t kv_elements =
-      static_cast<size_t>(args.nblocks) * kBlockN * kD;
+  const size_t kv_elements = static_cast<size_t>(args.nblocks) * kBlockN * kD;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kM64OutputElements;
-  const size_t partial_slots = static_cast<size_t>(args.groups) * 2 * kSplitParts;
+  const size_t partial_slots =
+      static_cast<size_t>(args.groups) * 2 * kSplitParts;
   const size_t partial_accumulator_elements = partial_slots * kOutputElements;
   const size_t partial_row_elements = partial_slots * kM;
   std::vector<__half> host_query(query_elements);
@@ -1224,7 +1193,8 @@ int run(const Args& args) {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_partial_row_sum),
                         partial_row_elements * sizeof(float)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
-                        query_elements * sizeof(__half), cudaMemcpyHostToDevice));
+                        query_elements * sizeof(__half),
+                        cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
@@ -1308,24 +1278,27 @@ int run(const Args& args) {
   std::vector<__half> host_baseline(output_elements);
   std::vector<__half> host_split(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_split.data(), device_split,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   const Comparison comparison = compare_outputs(host_baseline, host_split);
-  const bool comparison_pass = comparison.all_finite &&
-                               comparison.max_abs_error <= kComparisonAbsTolerance;
+  const bool comparison_pass =
+      comparison.all_finite &&
+      comparison.max_abs_error <= kComparisonAbsTolerance;
   if (!comparison_pass) {
     free_device_buffers();
     print_json(args, properties, runtime_version, sm_count, baseline_resources,
-               partial_resources, merge_resources, true, true, comparison, false,
-               no_timing, no_timing, no_timing, no_timing, no_pairs);
+               partial_resources, merge_resources, true, true, comparison,
+               false, no_timing, no_timing, no_timing, no_timing, no_pairs);
     return EXIT_FAILURE;
   }
   if (args.smoke_only) {
     free_device_buffers();
     print_json(args, properties, runtime_version, sm_count, baseline_resources,
-               partial_resources, merge_resources, true, true, comparison, false,
-               no_timing, no_timing, no_timing, no_timing, no_pairs);
+               partial_resources, merge_resources, true, true, comparison,
+               false, no_timing, no_timing, no_timing, no_timing, no_pairs);
     return EXIT_SUCCESS;
   }
 
@@ -1343,8 +1316,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -1425,8 +1397,8 @@ Args parse_args(int argc, char** argv) {
       if (args.profile_kernel != "baseline" &&
           args.profile_kernel != "partial" && args.profile_kernel != "merge" &&
           args.profile_kernel != "combined" && args.profile_kernel != "all") {
-        std::cerr
-            << "--profile-kernel must be baseline, partial, merge, combined, or all\n";
+        std::cerr << "--profile-kernel must be baseline, partial, merge, "
+                     "combined, or all\n";
         std::exit(EXIT_FAILURE);
       }
     } else if (argument == "--pattern" && index + 1 < argc) {
@@ -1444,6 +1416,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

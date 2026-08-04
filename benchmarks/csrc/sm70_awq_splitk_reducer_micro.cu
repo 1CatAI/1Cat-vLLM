@@ -37,10 +37,8 @@ __device__ void wait_for_split(int* lock, int split) {
 __global__ void serial_reduce_kernel(const float* __restrict__ partials,
                                      float* __restrict__ running,
                                      int* __restrict__ locks,
-                                     float* __restrict__ output,
-                                     int tiles,
-                                     int elements,
-                                     int splits) {
+                                     float* __restrict__ output, int tiles,
+                                     int elements, int splits) {
   const int tile = blockIdx.x;
   const int split = blockIdx.y;
   if (tile >= tiles || split >= splits) {
@@ -50,7 +48,8 @@ __global__ void serial_reduce_kernel(const float* __restrict__ partials,
   int* lock = locks + tile;
   wait_for_split(lock, split);
 
-  const int64_t offset = (static_cast<int64_t>(split) * tiles + tile) * elements;
+  const int64_t offset =
+      (static_cast<int64_t>(split) * tiles + tile) * elements;
   float* running_tile = running + static_cast<int64_t>(tile) * elements;
   float* output_tile = output + static_cast<int64_t>(tile) * elements;
   for (int index = threadIdx.x; index < elements; index += blockDim.x) {
@@ -72,8 +71,7 @@ __global__ void last_arrival_reduce_kernel(const float* __restrict__ partials,
                                            float* __restrict__ staged,
                                            int* __restrict__ counters,
                                            float* __restrict__ output,
-                                           int tiles,
-                                           int elements,
+                                           int tiles, int elements,
                                            int splits) {
   const int tile = blockIdx.x;
   const int split = blockIdx.y;
@@ -81,7 +79,8 @@ __global__ void last_arrival_reduce_kernel(const float* __restrict__ partials,
     return;
   }
 
-  const int64_t offset = (static_cast<int64_t>(split) * tiles + tile) * elements;
+  const int64_t offset =
+      (static_cast<int64_t>(split) * tiles + tile) * elements;
   for (int index = threadIdx.x; index < elements; index += blockDim.x) {
     staged[offset + index] = partials[offset + index];
   }
@@ -106,7 +105,9 @@ __global__ void last_arrival_reduce_kernel(const float* __restrict__ partials,
     float value = staged[static_cast<int64_t>(tile) * elements + index];
 #pragma unroll 1
     for (int z = 1; z < splits; ++z) {
-      value = staged[(static_cast<int64_t>(z) * tiles + tile) * elements + index] + value;
+      value =
+          staged[(static_cast<int64_t>(z) * tiles + tile) * elements + index] +
+          value;
     }
     output_tile[index] = value;
   }
@@ -118,15 +119,14 @@ __global__ void last_arrival_reduce_kernel(const float* __restrict__ partials,
   }
 }
 
-void check_inputs(const torch::Tensor& partials,
-                  const torch::Tensor& workspace,
-                  const torch::Tensor& locks,
-                  const torch::Tensor& output) {
+void check_inputs(const torch::Tensor& partials, const torch::Tensor& workspace,
+                  const torch::Tensor& locks, const torch::Tensor& output) {
   TORCH_CHECK(partials.is_cuda(), "partials must be CUDA.");
   TORCH_CHECK(partials.scalar_type() == torch::kFloat32,
               "partials must be float32.");
   TORCH_CHECK(partials.is_contiguous(), "partials must be contiguous.");
-  TORCH_CHECK(partials.dim() == 3, "partials must have shape [splits, tiles, elements].");
+  TORCH_CHECK(partials.dim() == 3,
+              "partials must have shape [splits, tiles, elements].");
   TORCH_CHECK(workspace.is_cuda() && workspace.scalar_type() == torch::kFloat32,
               "workspace must be CUDA float32.");
   TORCH_CHECK(workspace.sizes() == partials.sizes(),
@@ -143,38 +143,37 @@ void check_inputs(const torch::Tensor& partials,
   const int splits = static_cast<int>(partials.size(0));
   const int tiles = static_cast<int>(partials.size(1));
   const int elements = static_cast<int>(partials.size(2));
-  TORCH_CHECK(splits > 1 && tiles > 0 && elements > 0,
-              "partials dimensions must be positive and splits must exceed one.");
+  TORCH_CHECK(
+      splits > 1 && tiles > 0 && elements > 0,
+      "partials dimensions must be positive and splits must exceed one.");
   TORCH_CHECK(locks.numel() == tiles, "locks must have one element per tile.");
   TORCH_CHECK(output.size(0) == tiles && output.size(1) == elements,
               "output must have shape [tiles, elements].");
 }
 
-void launch_serial(torch::Tensor partials,
-                   torch::Tensor running,
-                   torch::Tensor locks,
-                   torch::Tensor output) {
+void launch_serial(torch::Tensor partials, torch::Tensor running,
+                   torch::Tensor locks, torch::Tensor output) {
   check_inputs(partials, running, locks, output);
   const c10::cuda::CUDAGuard guard(partials.device());
   const dim3 grid(partials.size(1), partials.size(0));
   const auto stream = at::cuda::getCurrentCUDAStream(partials.get_device());
   serial_reduce_kernel<<<grid, kThreads, 0, stream>>>(
-      partials.data_ptr<float>(), running.data_ptr<float>(), locks.data_ptr<int>(),
-      output.data_ptr<float>(), partials.size(1), partials.size(2), partials.size(0));
+      partials.data_ptr<float>(), running.data_ptr<float>(),
+      locks.data_ptr<int>(), output.data_ptr<float>(), partials.size(1),
+      partials.size(2), partials.size(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void launch_last_arrival(torch::Tensor partials,
-                         torch::Tensor staged,
-                         torch::Tensor counters,
-                         torch::Tensor output) {
+void launch_last_arrival(torch::Tensor partials, torch::Tensor staged,
+                         torch::Tensor counters, torch::Tensor output) {
   check_inputs(partials, staged, counters, output);
   const c10::cuda::CUDAGuard guard(partials.device());
   const dim3 grid(partials.size(1), partials.size(0));
   const auto stream = at::cuda::getCurrentCUDAStream(partials.get_device());
   last_arrival_reduce_kernel<<<grid, kThreads, 0, stream>>>(
-      partials.data_ptr<float>(), staged.data_ptr<float>(), counters.data_ptr<int>(),
-      output.data_ptr<float>(), partials.size(1), partials.size(2), partials.size(0));
+      partials.data_ptr<float>(), staged.data_ptr<float>(),
+      counters.data_ptr<int>(), output.data_ptr<float>(), partials.size(1),
+      partials.size(2), partials.size(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

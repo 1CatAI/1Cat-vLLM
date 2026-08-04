@@ -137,23 +137,20 @@ __device__ __forceinline__ void flashinfer_qk_n16(
 }
 
 __device__ __forceinline__ void flashinfer_exponentiate_probability(
-    AccumulatorFragment& fragment, float first_row_max,
-    float second_row_max) {
+    AccumulatorFragment& fragment, float first_row_max, float second_row_max) {
 #pragma unroll
   for (int element = 0; element < fragment.num_elements; ++element) {
-    const float row_max =
-        (element & 2) == 0 ? first_row_max : second_row_max;
-    fragment.x[element] =
-        __expf(fmaxf(fragment.x[element] - row_max, -80.0f));
+    const float row_max = (element & 2) == 0 ? first_row_max : second_row_max;
+    fragment.x[element] = __expf(fmaxf(fragment.x[element] - row_max, -80.0f));
   }
 }
 
-__device__ __forceinline__ uint32_t flashinfer_pack_probability_pair(
-    float first, float second) {
-  const uint32_t low = static_cast<uint32_t>(
-      __half_as_ushort(__float2half_rn(first)));
-  const uint32_t high = static_cast<uint32_t>(
-      __half_as_ushort(__float2half_rn(second)));
+__device__ __forceinline__ uint32_t
+flashinfer_pack_probability_pair(float first, float second) {
+  const uint32_t low =
+      static_cast<uint32_t>(__half_as_ushort(__float2half_rn(first)));
+  const uint32_t high =
+      static_cast<uint32_t>(__half_as_ushort(__float2half_rn(second)));
   return low | (high << 16);
 }
 
@@ -183,7 +180,8 @@ __device__ __forceinline__ void flashinfer_store_probability_pair(
 }
 
 __device__ __forceinline__ void flashinfer_store_packed_probability(
-    const FlashInferPackedProbability& packed, __half* __restrict__ probability) {
+    const FlashInferPackedProbability& packed,
+    __half* __restrict__ probability) {
   const int lane = threadIdx.x & 31;
   flashinfer_store_probability_pair(probability, lane, 0, packed.word_0);
   flashinfer_store_probability_pair(probability, lane, 2, packed.word_1);
@@ -199,10 +197,8 @@ __device__ __forceinline__ void flashinfer_prepare_n32_softmax(
     __half* __restrict__ probability, float& first_row_max,
     float& first_row_sum, float& second_row_max, float& second_row_sum,
     float& first_row_exp_diff, float& second_row_exp_diff) {
-  const float panel_max_first =
-      q_owner_reduce_panel_row<true>(qk_0, qk_1, 0);
-  const float panel_max_second =
-      q_owner_reduce_panel_row<true>(qk_0, qk_1, 2);
+  const float panel_max_first = q_owner_reduce_panel_row<true>(qk_0, qk_1, 0);
+  const float panel_max_second = q_owner_reduce_panel_row<true>(qk_0, qk_1, 2);
   const float new_max_first = fmaxf(first_row_max, panel_max_first);
   const float new_max_second = fmaxf(second_row_max, panel_max_second);
   first_row_exp_diff = __expf(first_row_max - new_max_first);
@@ -211,10 +207,8 @@ __device__ __forceinline__ void flashinfer_prepare_n32_softmax(
   q_owner_write_probability(qk_0, probability, 0, new_max_first,
                             new_max_second);
   flashinfer_exponentiate_probability(qk_1, new_max_first, new_max_second);
-  const float panel_sum_first =
-      q_owner_reduce_panel_row<false>(qk_0, qk_1, 0);
-  const float panel_sum_second =
-      q_owner_reduce_panel_row<false>(qk_0, qk_1, 2);
+  const float panel_sum_first = q_owner_reduce_panel_row<false>(qk_0, qk_1, 0);
+  const float panel_sum_second = q_owner_reduce_panel_row<false>(qk_0, qk_1, 2);
   first_row_sum = first_row_exp_diff * first_row_sum + panel_sum_first;
   second_row_sum = second_row_exp_diff * second_row_sum + panel_sum_second;
   first_row_max = new_max_first;
@@ -222,13 +216,13 @@ __device__ __forceinline__ void flashinfer_prepare_n32_softmax(
 }
 
 #define FLASHINFER_PIPELINE_D_TILES(OP) \
-  OP(0)                                  \
-  OP(1)                                  \
-  OP(2)                                  \
-  OP(3)                                  \
-  OP(4)                                  \
-  OP(5)                                  \
-  OP(6)                                  \
+  OP(0)                                 \
+  OP(1)                                 \
+  OP(2)                                 \
+  OP(3)                                 \
+  OP(4)                                 \
+  OP(5)                                 \
+  OP(6)                                 \
   OP(7)
 
 __device__ __forceinline__ void flashinfer_scale_output_fragments(
@@ -237,8 +231,8 @@ __device__ __forceinline__ void flashinfer_scale_output_fragments(
     AccumulatorFragment& accumulator_4, AccumulatorFragment& accumulator_5,
     AccumulatorFragment& accumulator_6, AccumulatorFragment& accumulator_7,
     float first_row_exp_diff, float second_row_exp_diff) {
-#define FLASHINFER_SCALE_OUTPUT(INDEX)                                  \
-  scale_accumulator_two_rows(accumulator_##INDEX, first_row_exp_diff,   \
+#define FLASHINFER_SCALE_OUTPUT(INDEX)                                \
+  scale_accumulator_two_rows(accumulator_##INDEX, first_row_exp_diff, \
                              second_row_exp_diff);
   FLASHINFER_PIPELINE_D_TILES(FLASHINFER_SCALE_OUTPUT)
 #undef FLASHINFER_SCALE_OUTPUT
@@ -254,10 +248,10 @@ __device__ __forceinline__ void flashinfer_pv_n16(
   MatrixAFragment probability_fragment;
   PVMatrixBFragment value_fragment;
   load_swizzled_matrix_a_fragment(probability_fragment, probability, 0);
-#define FLASHINFER_UPDATE_OUTPUT(INDEX)                                 \
-  nvcuda::wmma::load_matrix_sync(                                      \
-      value_fragment, value + (d_half * 8 + INDEX) * kPanelN, kD);     \
-  nvcuda::wmma::mma_sync(accumulator_##INDEX, probability_fragment,    \
+#define FLASHINFER_UPDATE_OUTPUT(INDEX)                                       \
+  nvcuda::wmma::load_matrix_sync(value_fragment,                              \
+                                 value + (d_half * 8 + INDEX) * kPanelN, kD); \
+  nvcuda::wmma::mma_sync(accumulator_##INDEX, probability_fragment,           \
                          value_fragment, accumulator_##INDEX);
   FLASHINFER_PIPELINE_D_TILES(FLASHINFER_UPDATE_OUTPUT)
 #undef FLASHINFER_UPDATE_OUTPUT
@@ -273,16 +267,16 @@ __device__ __forceinline__ void flashinfer_store_output_fragments(
     const AccumulatorFragment& accumulator_6,
     const AccumulatorFragment& accumulator_7, __half* __restrict__ output,
     int d_half, float first_row_sum, float second_row_sum) {
-#define FLASHINFER_STORE_OUTPUT(INDEX)                                  \
-  q_owner_store_output_tile(accumulator_##INDEX, output,               \
-                            (d_half * 8 + INDEX) * kPanelN,             \
-                            first_row_sum, second_row_sum);
+#define FLASHINFER_STORE_OUTPUT(INDEX)                                     \
+  q_owner_store_output_tile(accumulator_##INDEX, output,                   \
+                            (d_half * 8 + INDEX) * kPanelN, first_row_sum, \
+                            second_row_sum);
   FLASHINFER_PIPELINE_D_TILES(FLASHINFER_STORE_OUTPUT)
 #undef FLASHINFER_STORE_OUTPUT
 }
 
-extern "C" __global__ __launch_bounds__(kPipelineThreads, 2)
-void sm70_flashinfer_bm64_pipeline_candidate(
+extern "C" __global__
+__launch_bounds__(kPipelineThreads, 2) void sm70_flashinfer_bm64_pipeline_candidate(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -299,9 +293,9 @@ void sm70_flashinfer_bm64_pipeline_candidate(
   const bool qk_warp = (warp & 1) == 0;
   const int owner_thread = (warp & 1) * 32 + lane;
 
-  const __half* query_panel =
-      query + static_cast<int64_t>(group) * kM64QElements +
-      owner * kQPanelElements;
+  const __half* query_panel = query +
+                              static_cast<int64_t>(group) * kM64QElements +
+                              owner * kQPanelElements;
   __half* shared_query = shared.query + owner * kQPanelElements;
   __half* probability = shared.probability[owner];
   stage_swizzled_q_panel(query_panel, shared_query, owner_thread, 64);
@@ -313,7 +307,8 @@ void sm70_flashinfer_bm64_pipeline_candidate(
   }
   flashinfer_owner_q_barrier(owner);
 
-#define FLASHINFER_DECLARE_OUTPUT(INDEX) AccumulatorFragment accumulator_##INDEX;
+#define FLASHINFER_DECLARE_OUTPUT(INDEX) \
+  AccumulatorFragment accumulator_##INDEX;
   FLASHINFER_PIPELINE_D_TILES(FLASHINFER_DECLARE_OUTPUT)
 #undef FLASHINFER_DECLARE_OUTPUT
 #define FLASHINFER_FILL_OUTPUT(INDEX) \
@@ -345,8 +340,8 @@ void sm70_flashinfer_bm64_pipeline_candidate(
       // qk_0 is intentionally scoped to the first physical N16 lifetime.
       flashinfer_pipeline_barrier();
 
-      flashinfer_stage_key_tile(
-          key_group + (token_0 + kPipelinePhysicalN) * kD, shared.kv_stage);
+      flashinfer_stage_key_tile(key_group + (token_0 + kPipelinePhysicalN) * kD,
+                                shared.kv_stage);
       flashinfer_pipeline_barrier();
       flashinfer_qk_n16(shared_query, shared.kv_stage, qk_1);
       flashinfer_pipeline_barrier();
@@ -374,14 +369,14 @@ void sm70_flashinfer_bm64_pipeline_candidate(
       const int value_vector_offset =
           (owner * 32 + lane) * kPipelineValueVectorsPerPartnerThread;
       const __half* value_panel =
-          value + (static_cast<int64_t>(group) * nblocks * kBlockN + token_0) *
-                      kD;
+          value +
+          (static_cast<int64_t>(group) * nblocks * kBlockN + token_0) * kD;
       flashinfer_load_value_payload(value_panel, value_vector_offset,
                                     role_state.value_payload);
       flashinfer_pipeline_barrier();
 
-      flashinfer_stage_key_tile(
-          key_group + (token_0 + kPipelinePhysicalN) * kD, shared.kv_stage);
+      flashinfer_stage_key_tile(key_group + (token_0 + kPipelinePhysicalN) * kD,
+                                shared.kv_stage);
       flashinfer_pipeline_barrier();
       flashinfer_pipeline_barrier();
 
@@ -399,21 +394,21 @@ void sm70_flashinfer_bm64_pipeline_candidate(
           shared.row_exp_diff[owner * kPanelM + first_row + 2]);
     }
     flashinfer_pv_n16(probability, shared.kv_stage, qk_warp ? 0 : 1,
-                       accumulator_0, accumulator_1, accumulator_2,
-                       accumulator_3, accumulator_4, accumulator_5,
-                       accumulator_6, accumulator_7);
+                      accumulator_0, accumulator_1, accumulator_2,
+                      accumulator_3, accumulator_4, accumulator_5,
+                      accumulator_6, accumulator_7);
     flashinfer_pipeline_barrier();
 
     if (qk_warp) {
       flashinfer_store_packed_probability(role_state.qk.probability_1,
-                                           probability);
+                                          probability);
     } else {
       const int value_vector_offset =
           (owner * 32 + lane) * kPipelineValueVectorsPerPartnerThread;
-      const __half* value_panel = value +
-          (static_cast<int64_t>(group) * nblocks * kBlockN + token_0 +
-           kPipelinePhysicalN) *
-              kD;
+      const __half* value_panel =
+          value + (static_cast<int64_t>(group) * nblocks * kBlockN + token_0 +
+                   kPipelinePhysicalN) *
+                      kD;
       flashinfer_load_value_payload(value_panel, value_vector_offset,
                                     role_state.value_payload);
       flashinfer_store_value_payload(role_state.value_payload,
@@ -422,23 +417,22 @@ void sm70_flashinfer_bm64_pipeline_candidate(
     flashinfer_pipeline_barrier();
 
     flashinfer_pv_n16(probability, shared.kv_stage, qk_warp ? 0 : 1,
-                       accumulator_0, accumulator_1, accumulator_2,
-                       accumulator_3, accumulator_4, accumulator_5,
-                       accumulator_6, accumulator_7);
+                      accumulator_0, accumulator_1, accumulator_2,
+                      accumulator_3, accumulator_4, accumulator_5,
+                      accumulator_6, accumulator_7);
     if (panel + 1 != logical_panels) {
       flashinfer_pipeline_barrier();
     }
   }
 
-  __half* output_panel =
-      output + static_cast<int64_t>(group) * kM64OutputElements +
-      owner * kQPanelElements;
+  __half* output_panel = output +
+                         static_cast<int64_t>(group) * kM64OutputElements +
+                         owner * kQPanelElements;
   const int first_row = accumulator_fragment_row(lane, 0);
   flashinfer_store_output_fragments(
-      accumulator_0, accumulator_1, accumulator_2, accumulator_3,
-      accumulator_4, accumulator_5, accumulator_6, accumulator_7,
-      output_panel, qk_warp ? 0 : 1,
-      shared.row_sum[owner * kPanelM + first_row],
+      accumulator_0, accumulator_1, accumulator_2, accumulator_3, accumulator_4,
+      accumulator_5, accumulator_6, accumulator_7, output_panel,
+      qk_warp ? 0 : 1, shared.row_sum[owner * kPanelM + first_row],
       shared.row_sum[owner * kPanelM + first_row + 2]);
 }
 
@@ -447,7 +441,8 @@ void sm70_flashinfer_bm64_pipeline_candidate(
 bool flashinfer_pipeline_resource_gate(const KernelResources& resources) {
   return resources.registers_per_thread <= 128 &&
          resources.local_bytes_per_thread == 0 &&
-         resources.static_shared_bytes == sizeof(FlashInferBm64PipelineShared) &&
+         resources.static_shared_bytes ==
+             sizeof(FlashInferBm64PipelineShared) &&
          resources.dynamic_shared_bytes == 0 &&
          resources.active_ctas_per_sm == 2;
 }
@@ -456,17 +451,17 @@ void print_flashinfer_pipeline_json(
     const Args& args, const cudaDeviceProp& properties, int runtime_version,
     int sm_count, const KernelResources& baseline_resources,
     const KernelResources& candidate_resources, bool executed,
-    bool exactness_available, const Exactness& exactness,
-    bool timing_available, const TimingSummary& baseline_timing,
-    const TimingSummary& candidate_timing, const PairSummary& pairs) {
-  const bool resource_pass = bm32_resource_gate(baseline_resources) &&
-                             flashinfer_pipeline_resource_gate(
-                                 candidate_resources);
-  const double speedup = timing_available
-                             ? 100.0 * (baseline_timing.median_us -
-                                        candidate_timing.median_us) /
-                                   baseline_timing.median_us
-                             : 0.0;
+    bool exactness_available, const Exactness& exactness, bool timing_available,
+    const TimingSummary& baseline_timing, const TimingSummary& candidate_timing,
+    const PairSummary& pairs) {
+  const bool resource_pass =
+      bm32_resource_gate(baseline_resources) &&
+      flashinfer_pipeline_resource_gate(candidate_resources);
+  const double speedup =
+      timing_available
+          ? 100.0 * (baseline_timing.median_us - candidate_timing.median_us) /
+                baseline_timing.median_us
+          : 0.0;
   std::cout << "{\n";
   std::cout << "  \"benchmark\": \"sm70_flashinfer_bm64_pipeline_micro\",\n";
   std::cout << "  \"target\": \"sm_70\",\n";
@@ -474,8 +469,8 @@ void print_flashinfer_pipeline_json(
             << ", \"name\": ";
   print_json_string(properties.name);
   std::cout << ", \"capability\": [" << properties.major << ", "
-            << properties.minor << "], \"cuda_runtime\": "
-            << runtime_version << ", \"sm_count\": " << sm_count << "},\n";
+            << properties.minor << "], \"cuda_runtime\": " << runtime_version
+            << ", \"sm_count\": " << sm_count << "},\n";
   std::cout << "  \"shape\": {\"groups\": " << args.groups
             << ", \"nblocks\": " << args.nblocks
             << ", \"M\": 64, \"D\": 256, \"BN\": 128, \"N\": "
@@ -490,34 +485,34 @@ void print_flashinfer_pipeline_json(
   std::cout << "    \"candidate\": \"1 CTA/M64 GQA-packed BM64; BN16 "
                "physical tiles; eight warps\"\n";
   std::cout << "  },\n";
-  std::cout << "  \"candidate_contract\": {"
-            << "\"warps\": 8, \"m16_owners\": 4, "
-            << "\"qk_warps\": \"even: D0-127\", "
-            << "\"partner_warps\": \"odd: D128-255\", "
-            << "\"d16_fp32_output_fragments_per_warp\": 8, "
-            << "\"fp32_output_values_per_warp\": "
-            << kPipelineOutputFp32ValuesPerWarp << ", "
-            << "\"physical_bn\": 16, \"logical_softmax_bn\": 32, "
-            << "\"value_payload_gprs_per_partner\": 16, "
-            << "\"q_shared_bytes\": " << kM64QElements * sizeof(__half)
-            << ", \"reusable_kv_stage_bytes\": "
-            << kPipelinePhysicalN * kD * sizeof(__half)
-            << ", \"probability_bytes\": "
-            << kPipelineOwners * kPipelineProbabilityElements * sizeof(__half)
-            << ", \"row_state_bytes\": " << kPipelineRowStateBytes
-            << ", \"total_shared_bytes\": "
-            << sizeof(FlashInferBm64PipelineShared) << ", "
-            << "\"barriers\": {\"q_ready\": \"4x bar.sync count=64\", "
-            << "\"stage_epochs\": \"bar.sync id=5 count=256\"}, "
-            << "\"bn16_bitwise_incompatibility_proof\": "
-            << "\"BN16 rounds P(N0) with max(N0) and updates FP32 sum before "
-               "N1; the BM32 reference rounds both tiles with max(N0,N1) and "
-               "reduces one N32 sum, so only a two-N16 logical boundary preserves "
-               "the reference recurrence\"},\n";
+  std::cout
+      << "  \"candidate_contract\": {"
+      << "\"warps\": 8, \"m16_owners\": 4, "
+      << "\"qk_warps\": \"even: D0-127\", "
+      << "\"partner_warps\": \"odd: D128-255\", "
+      << "\"d16_fp32_output_fragments_per_warp\": 8, "
+      << "\"fp32_output_values_per_warp\": " << kPipelineOutputFp32ValuesPerWarp
+      << ", "
+      << "\"physical_bn\": 16, \"logical_softmax_bn\": 32, "
+      << "\"value_payload_gprs_per_partner\": 16, "
+      << "\"q_shared_bytes\": " << kM64QElements * sizeof(__half)
+      << ", \"reusable_kv_stage_bytes\": "
+      << kPipelinePhysicalN * kD * sizeof(__half) << ", \"probability_bytes\": "
+      << kPipelineOwners * kPipelineProbabilityElements * sizeof(__half)
+      << ", \"row_state_bytes\": " << kPipelineRowStateBytes
+      << ", \"total_shared_bytes\": " << sizeof(FlashInferBm64PipelineShared)
+      << ", "
+      << "\"barriers\": {\"q_ready\": \"4x bar.sync count=64\", "
+      << "\"stage_epochs\": \"bar.sync id=5 count=256\"}, "
+      << "\"bn16_bitwise_incompatibility_proof\": "
+      << "\"BN16 rounds P(N0) with max(N0) and updates FP32 sum before "
+         "N1; the BM32 reference rounds both tiles with max(N0,N1) and "
+         "reduces one N32 sum, so only a two-N16 logical boundary preserves "
+         "the reference recurrence\"},\n";
   std::cout << "  \"execution\": {\"resource_gate_pass\": "
             << (resource_pass ? "true" : "false")
-            << ", \"kernels_executed\": "
-            << (executed ? "true" : "false") << "},\n";
+            << ", \"kernels_executed\": " << (executed ? "true" : "false")
+            << "},\n";
   std::cout << "  \"resources\": {\"baseline\": ";
   print_resources(baseline_resources);
   std::cout << ", \"candidate\": ";
@@ -526,8 +521,7 @@ void print_flashinfer_pipeline_json(
   std::cout << "  \"exactness\": ";
   if (exactness_available) {
     print_exactness(exactness,
-                    static_cast<int64_t>(args.groups) * kM64OutputElements /
-                        2);
+                    static_cast<int64_t>(args.groups) * kM64OutputElements / 2);
   } else {
     std::cout << "null";
   }
@@ -538,8 +532,7 @@ void print_flashinfer_pipeline_json(
     print_timing(baseline_timing);
     std::cout << ", \"candidate\": ";
     print_timing(candidate_timing);
-    std::cout << ", \"candidate_speedup_vs_baseline_pct\": " << speedup
-              << '}';
+    std::cout << ", \"candidate_speedup_vs_baseline_pct\": " << speedup << '}';
   } else {
     std::cout << "null";
   }
@@ -601,17 +594,17 @@ int run_flashinfer_pipeline(const Args& args) {
   const PairSummary no_pairs;
   if (!bm32_resource_gate(baseline_resources) ||
       !flashinfer_pipeline_resource_gate(candidate_resources)) {
-    print_flashinfer_pipeline_json(
-        args, properties, runtime_version, sm_count, baseline_resources,
-        candidate_resources, false, false, no_exactness, false, no_timing,
-        no_timing, no_pairs);
+    print_flashinfer_pipeline_json(args, properties, runtime_version, sm_count,
+                                   baseline_resources, candidate_resources,
+                                   false, false, no_exactness, false, no_timing,
+                                   no_timing, no_pairs);
     return EXIT_FAILURE;
   }
 
   const size_t query_elements =
       static_cast<size_t>(args.groups) * kM64QElements;
-  const size_t kv_elements = static_cast<size_t>(args.groups) * args.nblocks *
-                             kBlockN * kD;
+  const size_t kv_elements =
+      static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kM64OutputElements;
   std::vector<__half> host_query(query_elements);
@@ -638,9 +631,10 @@ int run_flashinfer_pipeline(const Args& args) {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_candidate),
                         output_elements * sizeof(__half)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
-                        query_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(), kv_elements * sizeof(__half),
+                        query_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
+                        kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -648,14 +642,14 @@ int run_flashinfer_pipeline(const Args& args) {
   const dim3 candidate_grid(args.groups);
   auto launch_baseline = [&] {
     sm70_native_bm64_allp_bm32_pair_scratch_baseline<<<baseline_grid,
-                                                         kBaselineThreads>>>(
+                                                       kBaselineThreads>>>(
         device_query, device_key, device_value, device_baseline, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
   };
   auto launch_candidate = [&] {
     sm70_flashinfer_bm64_pipeline_candidate<<<candidate_grid,
-                                               kPipelineThreads>>>(
+                                              kPipelineThreads>>>(
         device_query, device_key, device_value, device_candidate, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
@@ -677,10 +671,10 @@ int run_flashinfer_pipeline(const Args& args) {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     free_device_buffers();
-    print_flashinfer_pipeline_json(
-        args, properties, runtime_version, sm_count, baseline_resources,
-        candidate_resources, true, false, no_exactness, false, no_timing,
-        no_timing, no_pairs);
+    print_flashinfer_pipeline_json(args, properties, runtime_version, sm_count,
+                                   baseline_resources, candidate_resources,
+                                   true, false, no_exactness, false, no_timing,
+                                   no_timing, no_pairs);
     return EXIT_SUCCESS;
   }
 
@@ -701,24 +695,26 @@ int run_flashinfer_pipeline(const Args& args) {
   std::vector<__half> host_baseline(output_elements);
   std::vector<__half> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   const Exactness exactness = compare_outputs(host_baseline, host_candidate);
   if (!exactness.bitwise_equal) {
     free_device_buffers();
-    print_flashinfer_pipeline_json(
-        args, properties, runtime_version, sm_count, baseline_resources,
-        candidate_resources, true, true, exactness, false, no_timing, no_timing,
-        no_pairs);
+    print_flashinfer_pipeline_json(args, properties, runtime_version, sm_count,
+                                   baseline_resources, candidate_resources,
+                                   true, true, exactness, false, no_timing,
+                                   no_timing, no_pairs);
     return EXIT_FAILURE;
   }
   if (args.smoke_only) {
     free_device_buffers();
-    print_flashinfer_pipeline_json(
-        args, properties, runtime_version, sm_count, baseline_resources,
-        candidate_resources, true, true, exactness, false, no_timing, no_timing,
-        no_pairs);
+    print_flashinfer_pipeline_json(args, properties, runtime_version, sm_count,
+                                   baseline_resources, candidate_resources,
+                                   true, true, exactness, false, no_timing,
+                                   no_timing, no_pairs);
     return EXIT_SUCCESS;
   }
 
@@ -739,8 +735,7 @@ int run_flashinfer_pipeline(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -768,10 +763,10 @@ int run_flashinfer_pipeline(const Args& args) {
   const PairSummary pairs =
       summarize_pairs(baseline_samples, candidate_samples);
   free_device_buffers();
-  print_flashinfer_pipeline_json(
-      args, properties, runtime_version, sm_count, baseline_resources,
-      candidate_resources, true, true, exactness, true, baseline_timing,
-      candidate_timing, pairs);
+  print_flashinfer_pipeline_json(args, properties, runtime_version, sm_count,
+                                 baseline_resources, candidate_resources, true,
+                                 true, exactness, true, baseline_timing,
+                                 candidate_timing, pairs);
   return EXIT_SUCCESS;
 }
 

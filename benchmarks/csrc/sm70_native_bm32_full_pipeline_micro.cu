@@ -49,17 +49,17 @@ static_assert(kD == kPVWarps * 2 * kPanelN);
 static_assert(kSoftmaxPanelN == 2 * kPanelK);
 
 using MatrixAFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using QKMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::col_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::col_major>;
 using PVMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using AccumulatorFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN,
-                          kPanelK, float>;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN, kPanelK,
+                           float>;
 
 struct alignas(16) BaselineShared {
   __half query[kQPanelElements];
@@ -192,35 +192,31 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     MatrixAFragment& fragment, const __half* __restrict__ matrix,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_row_slot(row);
   const int tile_offset = (k_offset / kPanelK) * kPanelM * kPanelK;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      matrix + tile_offset + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kPanelM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
 
-__device__ __forceinline__ int accumulator_fragment_row(int lane,
-                                                         int element) {
+__device__ __forceinline__ int accumulator_fragment_row(int lane, int element) {
   const int row_base =
       (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
   return row_base + ((element >> 1) & 1) * 2;
 }
 
 __device__ __forceinline__ int accumulator_fragment_column(int lane,
-                                                            int element) {
+                                                           int element) {
   const int column_base = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8;
   return column_base + (element & 1) + ((element >> 2) & 1) * 4;
 }
@@ -277,8 +273,8 @@ __device__ __forceinline__ float make_probability_row(
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_max = fmaxf(thread_max,
-                        __shfl_down_sync(0xffffffffU, thread_max, offset));
+    thread_max =
+        fmaxf(thread_max, __shfl_down_sync(0xffffffffU, thread_max, offset));
   }
   const float panel_max = __shfl_sync(0xffffffffU, thread_max, 0);
   const float old_max = row_max[state_row];
@@ -379,8 +375,7 @@ __device__ __forceinline__ void update_baseline_pv_panel(
   for (int k_offset = 0; k_offset < kSoftmaxPanelN; k_offset += kPanelK) {
     load_swizzled_matrix_a_fragment(a_fragment, probability, k_offset);
     nvcuda::wmma::load_matrix_sync(b_fragment,
-                                   value_panel + k_offset * kD + d_offset,
-                                   kD);
+                                   value_panel + k_offset * kD + d_offset, kD);
     nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
   }
   nvcuda::wmma::store_matrix_sync(output + d_offset, accumulator, kD,
@@ -409,8 +404,7 @@ __device__ __forceinline__ void update_candidate_pv_panel(
       load_swizzled_matrix_a_fragment(a_fragment, probability_top, k_offset);
       nvcuda::wmma::mma_sync(accumulator_d0_top, a_fragment, b_fragment,
                              accumulator_d0_top);
-      load_swizzled_matrix_a_fragment(a_fragment, probability_bottom,
-                                      k_offset);
+      load_swizzled_matrix_a_fragment(a_fragment, probability_bottom, k_offset);
       nvcuda::wmma::mma_sync(accumulator_d0_bottom, a_fragment, b_fragment,
                              accumulator_d0_bottom);
     }
@@ -422,8 +416,7 @@ __device__ __forceinline__ void update_candidate_pv_panel(
       load_swizzled_matrix_a_fragment(a_fragment, probability_top, k_offset);
       nvcuda::wmma::mma_sync(accumulator_d1_top, a_fragment, b_fragment,
                              accumulator_d1_top);
-      load_swizzled_matrix_a_fragment(a_fragment, probability_bottom,
-                                      k_offset);
+      load_swizzled_matrix_a_fragment(a_fragment, probability_bottom, k_offset);
       nvcuda::wmma::mma_sync(accumulator_d1_bottom, a_fragment, b_fragment,
                              accumulator_d1_bottom);
     }
@@ -431,8 +424,8 @@ __device__ __forceinline__ void update_candidate_pv_panel(
 }
 
 __device__ __forceinline__ void produce_candidate_probability_panel(
-    CandidateShared* shared, const float* __restrict__ score_top,
-    int qk_warp, int panel, int probability_slot) {
+    CandidateShared* shared, const float* __restrict__ score_top, int qk_warp,
+    int panel, int probability_slot) {
 #pragma unroll 1
   for (int row_step = 0; row_step < 4; ++row_step) {
     const int row = qk_warp + row_step * kPVWarps;
@@ -457,8 +450,9 @@ __device__ __forceinline__ void publish_warp_counter(int* counter) {
   }
 }
 
-__device__ __forceinline__ bool wait_for_counter(
-    int* counter, int expected, CandidateShared* shared, uint32_t phase) {
+__device__ __forceinline__ bool wait_for_counter(int* counter, int expected,
+                                                 CandidateShared* shared,
+                                                 uint32_t phase) {
   const int lane = threadIdx.x & 31;
   int observed = 0;
 #pragma unroll 1
@@ -496,8 +490,8 @@ __device__ __forceinline__ void store_accumulator_output(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void sm70_native_bm32_full_pipeline_baseline(
+extern "C" __global__
+__launch_bounds__(kBaselineThreads, 2) void sm70_native_bm32_full_pipeline_baseline(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -512,23 +506,22 @@ void sm70_native_bm32_full_pipeline_baseline(
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
   const int lane = thread & 31;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements + m_panel * kQPanelElements;
-  const __half* key_group = key + static_cast<int64_t>(group) * nblocks *
-                                       kBlockN * kD;
-  const __half* value_group = value + static_cast<int64_t>(group) * nblocks *
-                                           kBlockN * kD;
-  __half* output_group =
-      output + static_cast<int64_t>(group) * kOutputElements +
-      m_panel * kPanelM * kD;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements +
+                              m_panel * kQPanelElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
+  const __half* value_group =
+      value + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
+  __half* output_group = output +
+                         static_cast<int64_t>(group) * kOutputElements +
+                         m_panel * kPanelM * kD;
 
   stage_swizzled_q_panel(query_group, shared.query, thread, kBaselineThreads);
   if (thread < kPanelM) {
     shared.row_max[thread] = kNegativeInfinity;
     shared.row_sum[thread] = 0.0f;
   }
-  for (int index = thread; index < kPanelM * kD;
-       index += kBaselineThreads) {
+  for (int index = thread; index < kPanelM * kD; index += kBaselineThreads) {
     shared.output[index] = 0.0f;
   }
   __syncthreads();
@@ -538,12 +531,10 @@ void sm70_native_bm32_full_pipeline_baseline(
       const int n_offset = warp * kPanelN;
       AccumulatorFragment accumulator;
       qk_single_accumulate(shared.query,
-                           key_group + block_n * kBlockN * kD +
-                               n_offset * kD,
+                           key_group + block_n * kBlockN * kD + n_offset * kD,
                            accumulator);
       nvcuda::wmma::store_matrix_sync(shared.score + n_offset, accumulator,
-                                      kBlockN,
-                                      nvcuda::wmma::mem_row_major);
+                                      kBlockN, nvcuda::wmma::mem_row_major);
     }
     __syncthreads();
 
@@ -565,8 +556,7 @@ void sm70_native_bm32_full_pipeline_baseline(
     }
   }
 
-  for (int index = thread; index < kPanelM * kD;
-       index += kBaselineThreads) {
+  for (int index = thread; index < kPanelM * kD; index += kBaselineThreads) {
     const int row = index / kD;
     const int column = index - row * kD;
     const float inverse_sum = 1.0f / fmaxf(shared.row_sum[row], 1e-24f);
@@ -576,8 +566,8 @@ void sm70_native_bm32_full_pipeline_baseline(
   (void)lane;
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 2)
-void sm70_native_bm32_full_pipeline_candidate(
+extern "C" __global__
+__launch_bounds__(kCandidateThreads, 2) void sm70_native_bm32_full_pipeline_candidate(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks, uint32_t* __restrict__ protocol_error) {
@@ -595,8 +585,8 @@ void sm70_native_bm32_full_pipeline_candidate(
     stage_swizzled_q_panel(query_group, shared.query, thread,
                            kCandidateThreads);
     stage_swizzled_q_panel(query_group + kQPanelElements,
-                            shared.query + kQPanelElements, thread,
-                            kCandidateThreads);
+                           shared.query + kQPanelElements, thread,
+                           kCandidateThreads);
   }
   if (thread < kM) {
     shared.row_max[thread] = kNegativeInfinity;
@@ -609,8 +599,8 @@ void sm70_native_bm32_full_pipeline_candidate(
     shared.p_consumed[1] = 0;
     shared.qk_boot_ready = 0;
     shared.next_score_ready = 0;
-    shared.protocol_error_address = static_cast<uint64_t>(
-        reinterpret_cast<uintptr_t>(protocol_error));
+    shared.protocol_error_address =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(protocol_error));
   }
   // The only full-CTA synchronization: query/row-state initialization ends
   // before the PV accumulator fragments are created below.
@@ -648,9 +638,8 @@ void sm70_native_bm32_full_pipeline_candidate(
                             kProtocolTimeoutPConsumed)) {
         return;
       }
-      produce_candidate_probability_panel(&shared,
-                                           shared.score_top[block_n & 1],
-                                           warp, 0, 0);
+      produce_candidate_probability_panel(
+          &shared, shared.score_top[block_n & 1], warp, 0, 0);
       publish_warp_counter(&shared.p_ready[0]);
       if (!wait_for_counter(&shared.p_ready[0],
                             kQKWarps * ((generation0 >> 1) + 1), &shared,
@@ -669,14 +658,13 @@ void sm70_native_bm32_full_pipeline_candidate(
                                 kProtocolTimeoutPConsumed)) {
             return;
           }
-          produce_candidate_probability_panel(
-              &shared, shared.score_top[block_n & 1], warp, panel,
-              probability_slot);
+          produce_candidate_probability_panel(&shared,
+                                              shared.score_top[block_n & 1],
+                                              warp, panel, probability_slot);
           publish_warp_counter(&shared.p_ready[probability_slot]);
-          if (!wait_for_counter(
-                  &shared.p_ready[probability_slot],
-                  kQKWarps * ((generation >> 1) + 1), &shared,
-                  kProtocolTimeoutPReady)) {
+          if (!wait_for_counter(&shared.p_ready[probability_slot],
+                                kQKWarps * ((generation >> 1) + 1), &shared,
+                                kProtocolTimeoutPReady)) {
             return;
           }
         }
@@ -715,9 +703,9 @@ void sm70_native_bm32_full_pipeline_candidate(
                               kProtocolTimeoutPConsumed)) {
           return;
         }
-        produce_candidate_probability_panel(
-            &shared, shared.score_top[block_n & 1], warp, panel,
-            probability_slot);
+        produce_candidate_probability_panel(&shared,
+                                            shared.score_top[block_n & 1], warp,
+                                            panel, probability_slot);
         publish_warp_counter(&shared.p_ready[probability_slot]);
         if (!wait_for_counter(&shared.p_ready[probability_slot],
                               kQKWarps * ((generation >> 1) + 1), &shared,
@@ -732,63 +720,61 @@ void sm70_native_bm32_full_pipeline_candidate(
           publish_warp_counter(&shared.next_score_ready);
         }
       }
-      if (!wait_for_counter(&shared.next_score_ready,
-                            kQKWarps * (block_n + 1), &shared,
-                            kProtocolTimeoutNextScore)) {
+      if (!wait_for_counter(&shared.next_score_ready, kQKWarps * (block_n + 1),
+                            &shared, kProtocolTimeoutNextScore)) {
         return;
       }
     }
     return;
   }
 
-    const __half* value_group =
-        value + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
-    const int pv_warp = warp - kQKWarps;
-    const int d0 = pv_warp * (2 * kPanelN);
-    AccumulatorFragment accumulator_d0_top;
-    AccumulatorFragment accumulator_d0_bottom;
-    AccumulatorFragment accumulator_d1_top;
-    AccumulatorFragment accumulator_d1_bottom;
-    nvcuda::wmma::fill_fragment(accumulator_d0_top, 0.0f);
-    nvcuda::wmma::fill_fragment(accumulator_d0_bottom, 0.0f);
-    nvcuda::wmma::fill_fragment(accumulator_d1_top, 0.0f);
-    nvcuda::wmma::fill_fragment(accumulator_d1_bottom, 0.0f);
+  const __half* value_group =
+      value + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
+  const int pv_warp = warp - kQKWarps;
+  const int d0 = pv_warp * (2 * kPanelN);
+  AccumulatorFragment accumulator_d0_top;
+  AccumulatorFragment accumulator_d0_bottom;
+  AccumulatorFragment accumulator_d1_top;
+  AccumulatorFragment accumulator_d1_bottom;
+  nvcuda::wmma::fill_fragment(accumulator_d0_top, 0.0f);
+  nvcuda::wmma::fill_fragment(accumulator_d0_bottom, 0.0f);
+  nvcuda::wmma::fill_fragment(accumulator_d1_top, 0.0f);
+  nvcuda::wmma::fill_fragment(accumulator_d1_bottom, 0.0f);
 
-    for (int block_n = 0; block_n < nblocks; ++block_n) {
+  for (int block_n = 0; block_n < nblocks; ++block_n) {
 #pragma unroll 1
-      for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
-        const int generation = block_n * kSoftmaxPanelsPerBlock + panel;
-        const int probability_slot = panel & 1;
-        const int ready_epoch = kQKWarps * ((generation >> 1) + 1);
-        if (!wait_for_counter(&shared.p_ready[probability_slot], ready_epoch,
-                              &shared, kProtocolTimeoutPReady)) {
-          return;
-        }
-        if (generation != 0) {
-          scale_candidate_accumulators(
-              accumulator_d0_top, accumulator_d0_bottom, accumulator_d1_top,
-              accumulator_d1_bottom, shared.row_exp_diff[probability_slot]);
-        }
-        update_candidate_pv_panel(
-            shared.probability[probability_slot][0],
-            shared.probability[probability_slot][1],
-            value_group + (block_n * kBlockN + panel * kSoftmaxPanelN) * kD,
-            d0, accumulator_d0_top, accumulator_d0_bottom,
-            accumulator_d1_top, accumulator_d1_bottom);
-        publish_warp_counter(&shared.p_consumed[probability_slot]);
+    for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
+      const int generation = block_n * kSoftmaxPanelsPerBlock + panel;
+      const int probability_slot = panel & 1;
+      const int ready_epoch = kQKWarps * ((generation >> 1) + 1);
+      if (!wait_for_counter(&shared.p_ready[probability_slot], ready_epoch,
+                            &shared, kProtocolTimeoutPReady)) {
+        return;
       }
+      if (generation != 0) {
+        scale_candidate_accumulators(accumulator_d0_top, accumulator_d0_bottom,
+                                     accumulator_d1_top, accumulator_d1_bottom,
+                                     shared.row_exp_diff[probability_slot]);
+      }
+      update_candidate_pv_panel(
+          shared.probability[probability_slot][0],
+          shared.probability[probability_slot][1],
+          value_group + (block_n * kBlockN + panel * kSoftmaxPanelN) * kD, d0,
+          accumulator_d0_top, accumulator_d0_bottom, accumulator_d1_top,
+          accumulator_d1_bottom);
+      publish_warp_counter(&shared.p_consumed[probability_slot]);
     }
+  }
 
-    __half* output_group =
-        output + static_cast<int64_t>(group) * kOutputElements;
-    store_accumulator_output(accumulator_d0_top, output_group, shared.row_sum,
-                             0, d0);
-    store_accumulator_output(accumulator_d0_bottom, output_group,
-                             shared.row_sum, kPanelM, d0);
-    store_accumulator_output(accumulator_d1_top, output_group, shared.row_sum,
-                             0, d0 + kPanelN);
-    store_accumulator_output(accumulator_d1_bottom, output_group,
-                             shared.row_sum, kPanelM, d0 + kPanelN);
+  __half* output_group = output + static_cast<int64_t>(group) * kOutputElements;
+  store_accumulator_output(accumulator_d0_top, output_group, shared.row_sum, 0,
+                           d0);
+  store_accumulator_output(accumulator_d0_bottom, output_group, shared.row_sum,
+                           kPanelM, d0);
+  store_accumulator_output(accumulator_d1_top, output_group, shared.row_sum, 0,
+                           d0 + kPanelN);
+  store_accumulator_output(accumulator_d1_bottom, output_group, shared.row_sum,
+                           kPanelM, d0 + kPanelN);
 }
 
 uint32_t next_random(uint32_t* state) {
@@ -806,8 +792,7 @@ float random_half_value(uint32_t* state) {
 }
 
 float alternating_half_value(size_t index, uint32_t salt) {
-  const int magnitude =
-      1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
+  const int magnitude = 1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
   const float value = static_cast<float>(magnitude) / 512.0f;
   return ((index + salt) & 1u) == 0 ? value : -value;
 }
@@ -836,8 +821,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -871,18 +855,17 @@ Exactness compare_outputs(const std::vector<__half>& baseline,
   result.bitwise_equal = true;
   const size_t word_count = baseline.size() / 2;
   for (size_t word = 0; word < word_count; ++word) {
-    const uint32_t word_xor =
-        half_word_bits(baseline.data(), word) ^ half_word_bits(candidate.data(), word);
+    const uint32_t word_xor = half_word_bits(baseline.data(), word) ^
+                              half_word_bits(candidate.data(), word);
     result.xor_reduction ^= word_xor;
     result.max_word_xor = std::max(result.max_word_xor, word_xor);
     result.bitwise_equal &= word_xor == 0;
     result.mismatch_words += word_xor != 0;
   }
   for (size_t index = 0; index < baseline.size(); ++index) {
-    result.max_abs_error =
-        std::max(result.max_abs_error,
-                 std::fabs(__half2float(baseline[index]) -
-                           __half2float(candidate[index])));
+    result.max_abs_error = std::max(result.max_abs_error,
+                                    std::fabs(__half2float(baseline[index]) -
+                                              __half2float(candidate[index])));
   }
   return result;
 }
@@ -913,9 +896,9 @@ void report_protocol_timeout(const ProtocolDiagnostics& diagnostics) {
     return;
   }
   std::cerr << "Candidate counter protocol timeout: groups="
-            << diagnostics.timeout_groups << ", first_group="
-            << diagnostics.first_group << ", code=0x" << std::hex
-            << diagnostics.first_code << std::dec << '\n';
+            << diagnostics.timeout_groups
+            << ", first_group=" << diagnostics.first_group << ", code=0x"
+            << std::hex << diagnostics.first_code << std::dec << '\n';
 }
 
 template <typename Kernel>
@@ -923,8 +906,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta) {
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -957,9 +940,9 @@ void print_json_string(const std::string& value) {
         break;
       default:
         if (character < 0x20) {
-          std::cout << "\\u00" << std::hex << std::setw(2)
-                    << std::setfill('0') << static_cast<int>(character)
-                    << std::dec << std::setfill(' ');
+          std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -969,32 +952,28 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm << ", \"threads_per_cta\": "
-            << resources.threads_per_cta << ", \"warps_per_cta\": "
-            << resources.warps_per_cta << ", \"resident_warps\": "
-            << resources.resident_warps << '}';
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"threads_per_cta\": " << resources.threads_per_cta
+            << ", \"warps_per_cta\": " << resources.warps_per_cta
+            << ", \"resident_warps\": " << resources.resident_warps << '}';
 }
 
 void print_json(const Args& args, const cudaDeviceProp& properties,
                 int runtime_version, int sm_count, const Exactness& exactness,
                 const TimingSummary& baseline_timing,
-                const TimingSummary& candidate_timing,
-                const PairSummary& pairs,
+                const TimingSummary& candidate_timing, const PairSummary& pairs,
                 const KernelResources& baseline_resources,
                 const KernelResources& candidate_resources,
                 const ProtocolDiagnostics& protocol_diagnostics) {
@@ -1011,8 +990,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"name\": ";
   print_json_string(properties.name);
   std::cout << ", \"capability\": [" << properties.major << ", "
-            << properties.minor << "], \"cuda_runtime\": "
-            << runtime_version << ", \"sm_count\": " << sm_count << "},\n";
+            << properties.minor << "], \"cuda_runtime\": " << runtime_version
+            << ", \"sm_count\": " << sm_count << "},\n";
   std::cout << "  \"target\": \"sm_70\",\n";
   std::cout << "  \"shape\": {\"groups\": " << args.groups
             << ", \"nblocks\": " << args.nblocks
@@ -1036,14 +1015,15 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"candidate_score_buffers\": 3,\n";
   std::cout << "    \"candidate_probability_slots\": 2,\n";
   std::cout << "    \"candidate_shared_output\": false,\n";
-  std::cout << "    \"candidate_pv_sync\": \"monotonic shared ready/consumed epochs; warp-local fences and syncwarp\",\n";
-  std::cout << "    \"candidate_counter_overhead\": {\"p_ready_publishes_per_block\": "
+  std::cout << "    \"candidate_pv_sync\": \"monotonic shared ready/consumed "
+               "epochs; warp-local fences and syncwarp\",\n";
+  std::cout << "    \"candidate_counter_overhead\": "
+               "{\"p_ready_publishes_per_block\": "
             << kQKWarps * kSoftmaxPanelsPerBlock
             << ", \"p_consumed_publishes_per_block\": "
             << kPVWarps * kSoftmaxPanelsPerBlock
-            << ", \"next_score_publishes_per_transition\": "
-            << kQKWarps << ", \"spin_limit\": " << kCounterSpinLimit
-            << "}\n";
+            << ", \"next_score_publishes_per_transition\": " << kQKWarps
+            << ", \"spin_limit\": " << kCounterSpinLimit << "}\n";
   std::cout << "  },\n";
   std::cout << "  \"exactness\": {\"word_dtype\": \"uint32 packed "
                "fp16\", \"word_count\": "
@@ -1081,8 +1061,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "},\n";
   std::cout << "  \"protocol_diagnostics\": {\"timed_out\": "
             << (protocol_diagnostics.timed_out ? "true" : "false")
-            << ", \"timeout_groups\": "
-            << protocol_diagnostics.timeout_groups
+            << ", \"timeout_groups\": " << protocol_diagnostics.timeout_groups
             << ", \"first_group\": " << protocol_diagnostics.first_group
             << ", \"first_code\": " << protocol_diagnostics.first_code
             << "},\n";
@@ -1134,8 +1113,8 @@ int run(const Args& args) {
                                     args.device));
 
   const size_t query_elements = static_cast<size_t>(args.groups) * kQElements;
-  const size_t kv_elements = static_cast<size_t>(args.groups) * args.nblocks *
-                             kBlockN * kD;
+  const size_t kv_elements =
+      static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kOutputElements;
   std::vector<__half> host_query(query_elements);
@@ -1165,9 +1144,10 @@ int run(const Args& args) {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_protocol_error),
                         static_cast<size_t>(args.groups) * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
-                        query_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(), kv_elements * sizeof(__half),
+                        query_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
+                        kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(device_protocol_error, 0,
@@ -1176,14 +1156,15 @@ int run(const Args& args) {
   const dim3 baseline_grid(args.groups * 2);
   const dim3 candidate_grid(args.groups);
   auto launch_baseline = [&] {
-    sm70_native_bm32_full_pipeline_baseline<<<baseline_grid, kBaselineThreads>>>(
+    sm70_native_bm32_full_pipeline_baseline<<<baseline_grid,
+                                              kBaselineThreads>>>(
         device_query, device_key, device_value, device_baseline, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
   };
   auto launch_candidate = [&] {
     sm70_native_bm32_full_pipeline_candidate<<<candidate_grid,
-                                                kCandidateThreads>>>(
+                                               kCandidateThreads>>>(
         device_query, device_key, device_value, device_candidate, args.groups,
         args.nblocks, device_protocol_error);
     CUDA_CHECK(cudaGetLastError());
@@ -1243,9 +1224,11 @@ int run(const Args& args) {
   std::vector<__half> host_baseline(output_elements);
   std::vector<__half> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   const Exactness exactness = compare_outputs(host_baseline, host_candidate);
 
   cudaEvent_t start = nullptr;
@@ -1265,8 +1248,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -1340,8 +1322,7 @@ Args parse_args(int argc, char** argv) {
     } else if (argument == "--profile-kernel" && index + 1 < argc) {
       args.profile_kernel = argv[++index];
       if (args.profile_kernel != "baseline" &&
-          args.profile_kernel != "candidate" &&
-          args.profile_kernel != "both") {
+          args.profile_kernel != "candidate" && args.profile_kernel != "both") {
         std::cerr << "--profile-kernel must be baseline, candidate, or both\n";
         std::exit(EXIT_FAILURE);
       }
@@ -1361,6 +1342,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

@@ -53,17 +53,17 @@ static_assert(kSoftmaxPanelN == 2 * kPanelK);
 static_assert(kQKWarps + kCandidatePVWarps == kCandidateThreads / 32);
 
 using MatrixAFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using QKMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::col_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::col_major>;
 using PVMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using AccumulatorFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN,
-                          kPanelK, float>;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN, kPanelK,
+                           float>;
 
 struct alignas(16) BaselineShared {
   __half query[kQPanelElements];
@@ -197,35 +197,31 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     MatrixAFragment& fragment, const __half* __restrict__ matrix,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_row_slot(row);
   const int tile_offset = (k_offset / kPanelK) * kPanelM * kPanelK;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      matrix + tile_offset + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kPanelM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
 
-__device__ __forceinline__ int accumulator_fragment_row(int lane,
-                                                         int element) {
+__device__ __forceinline__ int accumulator_fragment_row(int lane, int element) {
   const int row_base =
       (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
   return row_base + ((element >> 1) & 1) * 2;
 }
 
 __device__ __forceinline__ int accumulator_fragment_column(int lane,
-                                                            int element) {
+                                                           int element) {
   const int column_base = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8;
   return column_base + (element & 1) + ((element >> 2) & 1) * 4;
 }
@@ -258,8 +254,7 @@ __device__ __forceinline__ void qk_pair_accumulate(
 
 #pragma unroll
   for (int k_offset = 0; k_offset < kD; k_offset += kPanelK) {
-    load_swizzled_matrix_a_fragment(top_a_fragment, shared_query_top,
-                                    k_offset);
+    load_swizzled_matrix_a_fragment(top_a_fragment, shared_query_top, k_offset);
     load_swizzled_matrix_a_fragment(bottom_a_fragment, shared_query_bottom,
                                     k_offset);
     nvcuda::wmma::load_matrix_sync(b_fragment, key_tile + k_offset, kD);
@@ -285,8 +280,8 @@ __device__ __forceinline__ float make_probability_row(
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_max = fmaxf(thread_max,
-                        __shfl_down_sync(kFullWarpMask, thread_max, offset));
+    thread_max =
+        fmaxf(thread_max, __shfl_down_sync(kFullWarpMask, thread_max, offset));
   }
   const float panel_max = __shfl_sync(kFullWarpMask, thread_max, 0);
   const float old_max = row_max[state_row];
@@ -352,14 +347,14 @@ __device__ __forceinline__ void scale_accumulator_two_rows(
 }
 
 __device__ __forceinline__ void scale_candidate_accumulators(
-    AccumulatorFragment& top_accumulator, AccumulatorFragment& bottom_accumulator,
+    AccumulatorFragment& top_accumulator,
+    AccumulatorFragment& bottom_accumulator,
     const float* __restrict__ row_exp_diff) {
   const int lane = threadIdx.x & 31;
   const int row = accumulator_fragment_row(lane, 0);
   scale_accumulator_two_rows(top_accumulator, row_exp_diff[row],
                              row_exp_diff[row + 2]);
-  scale_accumulator_two_rows(bottom_accumulator,
-                             row_exp_diff[kPanelM + row],
+  scale_accumulator_two_rows(bottom_accumulator, row_exp_diff[kPanelM + row],
                              row_exp_diff[kPanelM + row + 2]);
 }
 
@@ -377,8 +372,7 @@ __device__ __forceinline__ void update_baseline_pv_panel(
   for (int k_offset = 0; k_offset < kSoftmaxPanelN; k_offset += kPanelK) {
     load_swizzled_matrix_a_fragment(a_fragment, probability, k_offset);
     nvcuda::wmma::load_matrix_sync(b_fragment,
-                                   value_panel + k_offset * kD + d_offset,
-                                   kD);
+                                   value_panel + k_offset * kD + d_offset, kD);
     nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
   }
   nvcuda::wmma::store_matrix_sync(output + d_offset, accumulator, kD,
@@ -402,8 +396,8 @@ __device__ __forceinline__ void update_candidate_pv_panel(
   nvcuda::wmma::mma_sync(bottom_accumulator, a_fragment, b_fragment,
                          bottom_accumulator);
 
-  nvcuda::wmma::load_matrix_sync(
-      b_fragment, value_panel + kPanelK * kD + d_offset, kD);
+  nvcuda::wmma::load_matrix_sync(b_fragment,
+                                 value_panel + kPanelK * kD + d_offset, kD);
   load_swizzled_matrix_a_fragment(a_fragment, probability_top, kPanelK);
   nvcuda::wmma::mma_sync(top_accumulator, a_fragment, b_fragment,
                          top_accumulator);
@@ -420,8 +414,7 @@ __device__ __forceinline__ void produce_candidate_probability_panel(
     const int local_row = row & (kPanelM - 1);
     const bool top = row < kPanelM;
     const float exp_diff = make_probability_row(
-        (top ? shared->score_top : shared->score_bottom) +
-            local_row * kBlockN,
+        (top ? shared->score_top : shared->score_bottom) + local_row * kBlockN,
         shared->probability[probability_slot][top ? 0 : 1], local_row,
         shared->row_max, shared->row_sum, row, panel);
     if ((threadIdx.x & 31) == 0) {
@@ -441,16 +434,16 @@ __device__ __forceinline__ void publish_warp_counter(int* counter) {
 }
 
 __device__ __forceinline__ uint32_t protocol_error_code(uint32_t phase,
-                                                         int generation,
-                                                         int warp) {
-  return phase |
-         ((static_cast<uint32_t>(generation) & 0xffffu) << 8) |
+                                                        int generation,
+                                                        int warp) {
+  return phase | ((static_cast<uint32_t>(generation) & 0xffffu) << 8) |
          (static_cast<uint32_t>(warp) & 0xffu);
 }
 
-__device__ __forceinline__ bool wait_for_counter(
-    int* counter, int expected, uint32_t* protocol_error, uint32_t phase,
-    int generation, int warp) {
+__device__ __forceinline__ bool wait_for_counter(int* counter, int expected,
+                                                 uint32_t* protocol_error,
+                                                 uint32_t phase, int generation,
+                                                 int warp) {
   const int lane = threadIdx.x & 31;
   int observed = 0;
 #pragma unroll 1
@@ -489,11 +482,13 @@ __device__ __forceinline__ void store_accumulator_output(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void sm70_native_bm32_d128_baseline(
-    const __half* __restrict__ query, const __half* __restrict__ key,
-    const __half* __restrict__ value, __half* __restrict__ output, int groups,
-    int nblocks) {
+extern "C" __global__ __launch_bounds__(
+    kBaselineThreads,
+    2) void sm70_native_bm32_d128_baseline(const __half* __restrict__ query,
+                                           const __half* __restrict__ key,
+                                           const __half* __restrict__ value,
+                                           __half* __restrict__ output,
+                                           int groups, int nblocks) {
   __shared__ __align__(16) BaselineShared shared;
 
   const int block = blockIdx.x;
@@ -504,24 +499,22 @@ void sm70_native_bm32_d128_baseline(
   const int m_panel = block & 1;
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements +
-      m_panel * kQPanelElements;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements +
+                              m_panel * kQPanelElements;
   const __half* key_group =
       key + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
   const __half* value_group =
       value + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
-  __half* output_group =
-      output + static_cast<int64_t>(group) * kOutputElements +
-      m_panel * kPanelM * kD;
+  __half* output_group = output +
+                         static_cast<int64_t>(group) * kOutputElements +
+                         m_panel * kPanelM * kD;
 
   stage_swizzled_q_panel(query_group, shared.query, thread, kBaselineThreads);
   if (thread < kPanelM) {
     shared.row_max[thread] = kNegativeInfinity;
     shared.row_sum[thread] = 0.0f;
   }
-  for (int index = thread; index < kPanelM * kD;
-       index += kBaselineThreads) {
+  for (int index = thread; index < kPanelM * kD; index += kBaselineThreads) {
     shared.output[index] = 0.0f;
   }
   __syncthreads();
@@ -531,12 +524,10 @@ void sm70_native_bm32_d128_baseline(
       const int n_offset = warp * kPanelN;
       AccumulatorFragment accumulator;
       qk_single_accumulate(shared.query,
-                           key_group + block_n * kBlockN * kD +
-                               n_offset * kD,
+                           key_group + block_n * kBlockN * kD + n_offset * kD,
                            accumulator);
       nvcuda::wmma::store_matrix_sync(shared.score + n_offset, accumulator,
-                                      kBlockN,
-                                      nvcuda::wmma::mem_row_major);
+                                      kBlockN, nvcuda::wmma::mem_row_major);
     }
     __syncthreads();
 
@@ -558,8 +549,7 @@ void sm70_native_bm32_d128_baseline(
     }
   }
 
-  for (int index = thread; index < kPanelM * kD;
-       index += kBaselineThreads) {
+  for (int index = thread; index < kPanelM * kD; index += kBaselineThreads) {
     const int row = index / kD;
     const int column = index - row * kD;
     const float inverse_sum = 1.0f / fmaxf(shared.row_sum[row], 1e-24f);
@@ -568,8 +558,8 @@ void sm70_native_bm32_d128_baseline(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 2)
-void sm70_native_bm32_d128_candidate(
+extern "C" __global__
+__launch_bounds__(kCandidateThreads, 2) void sm70_native_bm32_d128_candidate(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks, uint32_t* __restrict__ protocol_error) {
@@ -583,10 +573,8 @@ void sm70_native_bm32_d128_candidate(
   const int d_half = candidate_cta & 1;
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  stage_swizzled_q_panel(query_group, shared.query, thread,
-                         kCandidateThreads);
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  stage_swizzled_q_panel(query_group, shared.query, thread, kCandidateThreads);
   stage_swizzled_q_panel(query_group + kQPanelElements,
                          shared.query + kQPanelElements, thread,
                          kCandidateThreads);
@@ -627,9 +615,9 @@ void sm70_native_bm32_d128_candidate(
                                         nvcuda::wmma::mem_row_major);
       }
       publish_warp_counter(&shared.score_ready);
-      if (!wait_for_counter(&shared.score_ready,
-                            kQKWarps * (block_n + 1), protocol_error,
-                            kProtocolTimeoutScore, block_n, warp)) {
+      if (!wait_for_counter(&shared.score_ready, kQKWarps * (block_n + 1),
+                            protocol_error, kProtocolTimeoutScore, block_n,
+                            warp)) {
         return;
       }
 
@@ -646,10 +634,9 @@ void sm70_native_bm32_d128_candidate(
         }
 
         produce_candidate_probability_panel(&shared, warp, panel,
-                                             probability_slot);
+                                            probability_slot);
         publish_warp_counter(&shared.p_ready[probability_slot]);
-        const int ready_epoch =
-            kQKWarps * ((generation >> 1) + 1);
+        const int ready_epoch = kQKWarps * ((generation >> 1) + 1);
         if (!wait_for_counter(&shared.p_ready[probability_slot], ready_epoch,
                               protocol_error, kProtocolTimeoutPReady,
                               generation, warp)) {
@@ -672,17 +659,15 @@ void sm70_native_bm32_d128_candidate(
       for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
         const int generation = block_n * kSoftmaxPanelsPerBlock + panel;
         const int probability_slot = panel & 1;
-        const int ready_epoch =
-            kQKWarps * ((generation >> 1) + 1);
+        const int ready_epoch = kQKWarps * ((generation >> 1) + 1);
         if (!wait_for_counter(&shared.p_ready[probability_slot], ready_epoch,
                               protocol_error, kProtocolTimeoutPReady,
                               generation, warp)) {
           return;
         }
         if (generation != 0) {
-          scale_candidate_accumulators(
-              top_accumulator, bottom_accumulator,
-              shared.row_exp_diff[probability_slot]);
+          scale_candidate_accumulators(top_accumulator, bottom_accumulator,
+                                       shared.row_exp_diff[probability_slot]);
         }
         update_candidate_pv_panel(
             shared.probability[probability_slot][0],
@@ -695,8 +680,8 @@ void sm70_native_bm32_d128_candidate(
 
     __half* output_group =
         output + static_cast<int64_t>(group) * kOutputElements;
-    store_accumulator_output(top_accumulator, output_group, shared.row_sum,
-                             0, d_offset);
+    store_accumulator_output(top_accumulator, output_group, shared.row_sum, 0,
+                             d_offset);
     store_accumulator_output(bottom_accumulator, output_group, shared.row_sum,
                              kPanelM, d_offset);
   }
@@ -717,8 +702,7 @@ float random_half_value(uint32_t* state) {
 }
 
 float alternating_half_value(size_t index, uint32_t salt) {
-  const int magnitude =
-      1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
+  const int magnitude = 1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
   const float value = static_cast<float>(magnitude) / 512.0f;
   return ((index + salt) & 1u) == 0 ? value : -value;
 }
@@ -747,8 +731,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -782,19 +765,17 @@ Exactness compare_outputs(const std::vector<__half>& baseline,
   result.bitwise_equal = true;
   const size_t word_count = baseline.size() / 2;
   for (size_t word = 0; word < word_count; ++word) {
-    const uint32_t word_xor =
-        half_word_bits(baseline.data(), word) ^
-        half_word_bits(candidate.data(), word);
+    const uint32_t word_xor = half_word_bits(baseline.data(), word) ^
+                              half_word_bits(candidate.data(), word);
     result.xor_reduction ^= word_xor;
     result.max_word_xor = std::max(result.max_word_xor, word_xor);
     result.bitwise_equal &= word_xor == 0;
     result.mismatch_words += word_xor != 0;
   }
   for (size_t index = 0; index < baseline.size(); ++index) {
-    result.max_abs_error =
-        std::max(result.max_abs_error,
-                 std::fabs(__half2float(baseline[index]) -
-                           __half2float(candidate[index])));
+    result.max_abs_error = std::max(result.max_abs_error,
+                                    std::fabs(__half2float(baseline[index]) -
+                                              __half2float(candidate[index])));
   }
   return result;
 }
@@ -825,9 +806,9 @@ void report_protocol_timeout(const ProtocolDiagnostics& diagnostics) {
     return;
   }
   std::cerr << "Candidate counter protocol timeout: ctas="
-            << diagnostics.timeout_ctas << ", first_cta="
-            << diagnostics.first_cta << ", code=0x" << std::hex
-            << diagnostics.first_code << std::dec << '\n';
+            << diagnostics.timeout_ctas
+            << ", first_cta=" << diagnostics.first_cta << ", code=0x"
+            << std::hex << diagnostics.first_code << std::dec << '\n';
 }
 
 template <typename Kernel>
@@ -835,8 +816,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta) {
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -876,9 +857,9 @@ void print_json_string(const std::string& value) {
         break;
       default:
         if (character < 0x20) {
-          std::cout << "\\u00" << std::hex << std::setw(2)
-                    << std::setfill('0') << static_cast<int>(character)
-                    << std::dec << std::setfill(' ');
+          std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -888,25 +869,22 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm << ", \"threads_per_cta\": "
-            << resources.threads_per_cta << ", \"warps_per_cta\": "
-            << resources.warps_per_cta << ", \"resident_warps\": "
-            << resources.resident_warps << '}';
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"threads_per_cta\": " << resources.threads_per_cta
+            << ", \"warps_per_cta\": " << resources.warps_per_cta
+            << ", \"resident_warps\": " << resources.resident_warps << '}';
 }
 
 void print_resource_gate(const KernelResources& candidate_resources) {
@@ -926,8 +904,8 @@ void print_header_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"name\": ";
   print_json_string(properties.name);
   std::cout << ", \"capability\": [" << properties.major << ", "
-            << properties.minor << "], \"cuda_runtime\": "
-            << runtime_version << ", \"sm_count\": " << sm_count << "},\n";
+            << properties.minor << "], \"cuda_runtime\": " << runtime_version
+            << ", \"sm_count\": " << sm_count << "},\n";
   std::cout << "  \"target\": \"sm_70\",\n";
   std::cout << "  \"shape\": {\"groups\": " << args.groups
             << ", \"nblocks\": " << args.nblocks
@@ -980,30 +958,37 @@ void print_resource_failure_json(const Args& args,
 void print_json(const Args& args, const cudaDeviceProp& properties,
                 int runtime_version, int sm_count, const Exactness& exactness,
                 const TimingSummary& baseline_timing,
-                const TimingSummary& candidate_timing,
-                const PairSummary& pairs,
+                const TimingSummary& candidate_timing, const PairSummary& pairs,
                 const KernelResources& baseline_resources,
                 const KernelResources& candidate_resources,
                 const ProtocolDiagnostics& protocol_diagnostics) {
   const double candidate_speedup_pct =
       100.0 * (baseline_timing.median_us - candidate_timing.median_us) /
       baseline_timing.median_us;
-  const bool candidate_faster = candidate_timing.median_us < baseline_timing.median_us;
+  const bool candidate_faster =
+      candidate_timing.median_us < baseline_timing.median_us;
   std::cout << "{\n";
   print_header_json(args, properties, runtime_version, sm_count);
   std::cout << "  \"layouts\": {\"q\": \"[group,M32,D256] fp16\", "
                "\"k_v\": \"[group,N,D256] contiguous fp16\", "
                "\"output\": \"[group,M32,D256] fp16\"},\n";
   std::cout << "  \"paths\": {\n";
-  std::cout << "    \"baseline\": \"2 CTA/group; BM16, D256, 512 threads; serial QK-softmax-PV\",\n";
-  std::cout << "    \"candidate\": \"2 CTA/group; each BM32, D128, 512 threads; 8 QK producer and 8 PV consumer warps\",\n";
-  std::cout << "    \"candidate_output_halves\": \"CTA 0 writes D[0:128], CTA 1 writes D[128:256]\",\n";
-  std::cout << "    \"candidate_qk_order\": \"one K fragment, top then bottom M16\",\n";
-  std::cout << "    \"candidate_pv_order\": \"one V fragment, top then bottom M16 for one D16\",\n";
+  std::cout << "    \"baseline\": \"2 CTA/group; BM16, D256, 512 threads; "
+               "serial QK-softmax-PV\",\n";
+  std::cout << "    \"candidate\": \"2 CTA/group; each BM32, D128, 512 "
+               "threads; 8 QK producer and 8 PV consumer warps\",\n";
+  std::cout << "    \"candidate_output_halves\": \"CTA 0 writes D[0:128], CTA "
+               "1 writes D[128:256]\",\n";
+  std::cout << "    \"candidate_qk_order\": \"one K fragment, top then bottom "
+               "M16\",\n";
+  std::cout << "    \"candidate_pv_order\": \"one V fragment, top then bottom "
+               "M16 for one D16\",\n";
   std::cout << "    \"candidate_pv_accumulators_per_warp\": 2,\n";
-  std::cout << "    \"candidate_sync\": \"one initialization CTA barrier; warp-local score/P epochs afterwards\"\n";
+  std::cout << "    \"candidate_sync\": \"one initialization CTA barrier; "
+               "warp-local score/P epochs afterwards\"\n";
   std::cout << "  },\n";
-  std::cout << "  \"exactness\": {\"word_dtype\": \"uint32 packed fp16\", \"word_count\": "
+  std::cout << "  \"exactness\": {\"word_dtype\": \"uint32 packed fp16\", "
+               "\"word_count\": "
             << static_cast<int64_t>(args.groups) * kOutputElements / 2
             << ", \"full_output\": true, \"bitwise_equal\": "
             << (exactness.bitwise_equal ? "true" : "false")
@@ -1011,7 +996,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"xor\": {\"max_word\": " << exactness.max_word_xor
             << ", \"reduction\": " << exactness.xor_reduction
             << "}, \"max_abs_error\": " << exactness.max_abs_error << "},\n";
-  std::cout << "  \"timing\": {\"unit\": \"us per grid launch\", \"baseline\": ";
+  std::cout
+      << "  \"timing\": {\"unit\": \"us per grid launch\", \"baseline\": ";
   print_timing(baseline_timing);
   std::cout << ", \"candidate\": ";
   print_timing(candidate_timing);
@@ -1025,10 +1011,11 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << pairs.candidate_minus_baseline_median_us
             << ", \"candidate_minus_baseline_mean_us\": "
             << pairs.candidate_minus_baseline_mean_us << "},\n";
-  std::cout << "  \"measurement\": {\"warmup_pairs\": " << args.warmup
-            << ", \"rounds\": " << args.rounds
-            << ", \"launches_per_sample\": " << args.launches_per_sample
-            << ", \"interleaving\": \"baseline/candidate alternates each round\"},\n";
+  std::cout
+      << "  \"measurement\": {\"warmup_pairs\": " << args.warmup
+      << ", \"rounds\": " << args.rounds
+      << ", \"launches_per_sample\": " << args.launches_per_sample
+      << ", \"interleaving\": \"baseline/candidate alternates each round\"},\n";
   std::cout << "  \"resources\": {\"baseline\": ";
   print_resources(baseline_resources);
   std::cout << ", \"candidate\": ";
@@ -1098,8 +1085,8 @@ int run(const Args& args) {
   }
 
   const size_t query_elements = static_cast<size_t>(args.groups) * kQElements;
-  const size_t kv_elements = static_cast<size_t>(args.groups) * args.nblocks *
-                             kBlockN * kD;
+  const size_t kv_elements =
+      static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kOutputElements;
   std::vector<__half> host_query(query_elements);
@@ -1127,9 +1114,9 @@ int run(const Args& args) {
                         output_elements * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_candidate),
                         output_elements * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_protocol_error),
-                        static_cast<size_t>(candidate_ctas) *
-                            sizeof(uint32_t)));
+  CUDA_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&device_protocol_error),
+                 static_cast<size_t>(candidate_ctas) * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
                         query_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
@@ -1137,9 +1124,9 @@ int run(const Args& args) {
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(device_protocol_error, 0,
-                        static_cast<size_t>(candidate_ctas) *
-                            sizeof(uint32_t)));
+  CUDA_CHECK(
+      cudaMemset(device_protocol_error, 0,
+                 static_cast<size_t>(candidate_ctas) * sizeof(uint32_t)));
 
   const dim3 baseline_grid(args.groups * 2);
   const dim3 candidate_grid(candidate_ctas);
@@ -1236,8 +1223,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -1307,8 +1293,7 @@ Args parse_args(int argc, char** argv) {
     } else if (argument == "--profile-kernel" && index + 1 < argc) {
       args.profile_kernel = argv[++index];
       if (args.profile_kernel != "baseline" &&
-          args.profile_kernel != "candidate" &&
-          args.profile_kernel != "both") {
+          args.profile_kernel != "candidate" && args.profile_kernel != "both") {
         std::cerr << "--profile-kernel must be baseline, candidate, or both\n";
         std::exit(EXIT_FAILURE);
       }
@@ -1328,6 +1313,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

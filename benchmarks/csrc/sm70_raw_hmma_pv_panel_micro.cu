@@ -41,12 +41,12 @@ static_assert(kD / kRawD == 8);
 
 using NativeAFragment =
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kM, kNativeN, kNativeK,
-                          __half, nvcuda::wmma::row_major>;
+                           __half, nvcuda::wmma::row_major>;
 using NativeBFragment =
     nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kM, kNativeN, kNativeK,
-                          __half, nvcuda::wmma::row_major>;
+                           __half, nvcuda::wmma::row_major>;
 using NativeCFragment = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kM,
-                                                kNativeN, kNativeK, float>;
+                                               kNativeN, kNativeK, float>;
 
 struct Args {
   int device = 0;
@@ -116,9 +116,10 @@ void check_cuda(cudaError_t status, const char* expression, const char* file,
 #define CUDA_CHECK(expression) \
   check_cuda((expression), #expression, __FILE__, __LINE__)
 
-__device__ __forceinline__ void stage_p_to_shared(
-    const __half* __restrict__ p, __half* __restrict__ shared_p, int thread,
-    int thread_count) {
+__device__ __forceinline__ void stage_p_to_shared(const __half* __restrict__ p,
+                                                  __half* __restrict__ shared_p,
+                                                  int thread,
+                                                  int thread_count) {
   constexpr int kHalfPerUint4 = sizeof(uint4) / sizeof(__half);
   constexpr int kPVectorCount = kPElementsPerGroup / kHalfPerUint4;
   const uint4* p_vectors = reinterpret_cast<const uint4*>(p);
@@ -136,13 +137,9 @@ __device__ __forceinline__ int raw_a_row(int lane) {
   return (lane & 3) + ((lane >> 4) * 4);
 }
 
-__device__ __forceinline__ int raw_n_tile(int lane) {
-  return (lane & 12) * 2;
-}
+__device__ __forceinline__ int raw_n_tile(int lane) { return (lane & 12) * 2; }
 
-__device__ __forceinline__ int raw_b_row_k(int lane) {
-  return lane & 3;
-}
+__device__ __forceinline__ int raw_b_row_k(int lane) { return lane & 3; }
 
 __device__ __forceinline__ int raw_b_row_d(int lane) {
   return raw_n_tile(lane) + ((lane >> 4) * 4);
@@ -156,23 +153,26 @@ __device__ __forceinline__ int raw_c_col(int lane, int reg) {
   return raw_n_tile(lane) + (lane & 2) + (reg & 4) + (reg & 1);
 }
 
-__device__ __forceinline__ uint64_t load_shared_half4(
-    const __half* __restrict__ pointer) {
-  const uint32_t address = static_cast<uint32_t>(
-      __cvta_generic_to_shared(pointer));
+__device__ __forceinline__ uint64_t
+load_shared_half4(const __half* __restrict__ pointer) {
+  const uint32_t address =
+      static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
   uint64_t packed;
-  asm volatile("ld.volatile.shared.u64 %0, [%1];" : "=l"(packed)
+  asm volatile("ld.volatile.shared.u64 %0, [%1];"
+               : "=l"(packed)
                : "r"(address)
                : "memory");
   return packed;
 }
 
-__device__ __forceinline__ uint64_t load_global_half4(
-    const __half* __restrict__ pointer) {
+__device__ __forceinline__ uint64_t
+load_global_half4(const __half* __restrict__ pointer) {
   uint64_t packed;
   // ld.global.nc.u64 lowers to the one aligned LDG.E.64 required for each
   // four-D row.row operand; scalar half loads are intentionally absent.
-  asm volatile("ld.global.nc.u64 %0, [%1];" : "=l"(packed) : "l"(pointer)
+  asm volatile("ld.global.nc.u64 %0, [%1];"
+               : "=l"(packed)
+               : "l"(pointer)
                : "memory");
   return packed;
 }
@@ -196,11 +196,10 @@ __device__ __forceinline__ void mma_m8n8k4_row_row(
       "mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, "
       "{%8, %9}, {%10, %11}, {%12, %13, %14, %15, %16, %17, %18, %19};"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]),
-        "=f"(d[5]), "=f"(d[6]), "=f"(d[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
-        "f"(c[2]), "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]),
-        "f"(c[7])
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]), "=f"(d[5]),
+        "=f"(d[6]), "=f"(d[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
+        "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7])
       : "memory");
 }
 
@@ -220,8 +219,7 @@ __device__ __forceinline__ void raw_single_step(
 }
 
 __device__ __forceinline__ void mma_packed_raw_operands(
-    float (&accumulator)[kRawRegisters], uint64_t packed_p,
-    uint64_t packed_v) {
+    float (&accumulator)[kRawRegisters], uint64_t packed_p, uint64_t packed_v) {
   const uint32_t a0 = static_cast<uint32_t>(packed_p);
   const uint32_t a1 = static_cast<uint32_t>(packed_p >> 32);
   const uint32_t b0 = static_cast<uint32_t>(packed_v);
@@ -275,10 +273,11 @@ __device__ __forceinline__ void store_raw_output(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void pv_panel_baseline_kernel(const __half* __restrict__ p,
-                              const __half* __restrict__ v,
-                              float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kBaselineThreads,
+    2) void pv_panel_baseline_kernel(const __half* __restrict__ p,
+                                     const __half* __restrict__ v,
+                                     float* __restrict__ output, int groups) {
   __shared__ __align__(16) __half shared_p[kPElementsPerGroup];
 
   const int group = blockIdx.x;
@@ -286,15 +285,13 @@ void pv_panel_baseline_kernel(const __half* __restrict__ p,
     return;
   }
   const int thread = threadIdx.x;
-  const __half* p_group =
-      p + static_cast<int64_t>(group) * kPElementsPerGroup;
+  const __half* p_group = p + static_cast<int64_t>(group) * kPElementsPerGroup;
   stage_p_to_shared(p_group, shared_p, thread, kBaselineThreads);
   __syncthreads();
 
   const int warp = thread >> 5;
   const int d_offset = warp * kNativeN;
-  const __half* v_group =
-      v + static_cast<int64_t>(group) * kVElementsPerGroup;
+  const __half* v_group = v + static_cast<int64_t>(group) * kVElementsPerGroup;
   NativeAFragment a_fragment;
   NativeBFragment b_fragment;
   NativeCFragment accumulator;
@@ -304,20 +301,21 @@ void pv_panel_baseline_kernel(const __half* __restrict__ p,
   nvcuda::wmma::load_matrix_sync(b_fragment, v_group + d_offset, kD);
   nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
   nvcuda::wmma::load_matrix_sync(a_fragment, shared_p + kNativeK, kK);
-  nvcuda::wmma::load_matrix_sync(b_fragment,
-                                 v_group + kNativeK * kD + d_offset, kD);
+  nvcuda::wmma::load_matrix_sync(b_fragment, v_group + kNativeK * kD + d_offset,
+                                 kD);
   nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
 
-  float* output_tile = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup + d_offset;
+  float* output_tile =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup + d_offset;
   nvcuda::wmma::store_matrix_sync(output_tile, accumulator, kD,
                                   nvcuda::wmma::mem_row_major);
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void pv_panel_raw_single_kernel(const __half* __restrict__ p,
-                                const __half* __restrict__ v,
-                                float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kRawThreads,
+    4) void pv_panel_raw_single_kernel(const __half* __restrict__ p,
+                                       const __half* __restrict__ v,
+                                       float* __restrict__ output, int groups) {
   __shared__ __align__(16) __half shared_p[kPElementsPerGroup];
 
   const int block = blockIdx.x;
@@ -331,15 +329,13 @@ void pv_panel_raw_single_kernel(const __half* __restrict__ p,
   const int m_offset = (block & 1) * kRawM;
   const int d_offset = warp * kRawD;
   const int p_row = m_offset + raw_a_row(lane);
-  const __half* p_group =
-      p + static_cast<int64_t>(group) * kPElementsPerGroup;
-  const __half* v_group =
-      v + static_cast<int64_t>(group) * kVElementsPerGroup;
+  const __half* p_group = p + static_cast<int64_t>(group) * kPElementsPerGroup;
+  const __half* v_group = v + static_cast<int64_t>(group) * kVElementsPerGroup;
   stage_p_to_shared(p_group, shared_p, thread, kRawThreads);
   __syncthreads();
 
   float accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                        0.0f, 0.0f, 0.0f, 0.0f};
+                                      0.0f, 0.0f, 0.0f, 0.0f};
   // Each K4 call uses exactly one LDS.64 P load and one LDG.E.64 V load.
   // The eight calls deliberately preserve canonical FP32 accumulation order.
   raw_single_step(shared_p, v_group, p_row, lane, d_offset, 0, accumulator);
@@ -351,15 +347,17 @@ void pv_panel_raw_single_kernel(const __half* __restrict__ p,
   raw_single_step(shared_p, v_group, p_row, lane, d_offset, 24, accumulator);
   raw_single_step(shared_p, v_group, p_row, lane, d_offset, 28, accumulator);
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
   store_raw_output(output_group, m_offset, d_offset, lane, accumulator);
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void pv_panel_raw_pipelined_kernel(const __half* __restrict__ p,
-                                   const __half* __restrict__ v,
-                                   float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kRawThreads,
+    4) void pv_panel_raw_pipelined_kernel(const __half* __restrict__ p,
+                                          const __half* __restrict__ v,
+                                          float* __restrict__ output,
+                                          int groups) {
   __shared__ __align__(16) __half shared_p[kPElementsPerGroup];
 
   const int block = blockIdx.x;
@@ -373,15 +371,13 @@ void pv_panel_raw_pipelined_kernel(const __half* __restrict__ p,
   const int m_offset = (block & 1) * kRawM;
   const int d_offset = warp * kRawD;
   const int p_row = m_offset + raw_a_row(lane);
-  const __half* p_group =
-      p + static_cast<int64_t>(group) * kPElementsPerGroup;
-  const __half* v_group =
-      v + static_cast<int64_t>(group) * kVElementsPerGroup;
+  const __half* p_group = p + static_cast<int64_t>(group) * kPElementsPerGroup;
+  const __half* v_group = v + static_cast<int64_t>(group) * kVElementsPerGroup;
   stage_p_to_shared(p_group, shared_p, thread, kRawThreads);
   __syncthreads();
 
   float accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                        0.0f, 0.0f, 0.0f, 0.0f};
+                                      0.0f, 0.0f, 0.0f, 0.0f};
   uint64_t p0_k0;
   uint64_t v0_k0;
   uint64_t p0_k4;
@@ -403,12 +399,9 @@ void pv_panel_raw_pipelined_kernel(const __half* __restrict__ p,
   // V loads produce eight P and eight V 32-bit operand words before its four
   // canonical HMMAs. Bank 1 is filled during those HMMAs and becomes the
   // next complete K16 stage without changing FP32 accumulation order.
-  load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 0, p0_k0,
-                    v0_k0);
-  load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 4, p0_k4,
-                    v0_k4);
-  load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 8, p0_k8,
-                    v0_k8);
+  load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 0, p0_k0, v0_k0);
+  load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 4, p0_k4, v0_k4);
+  load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 8, p0_k8, v0_k8);
   load_raw_operands(shared_p, v_group, p_row, lane, d_offset, 12, p0_k12,
                     v0_k12);
 
@@ -430,16 +423,17 @@ void pv_panel_raw_pipelined_kernel(const __half* __restrict__ p,
   mma_packed_raw_operands(accumulator, p1_k24, v1_k24);
   mma_packed_raw_operands(accumulator, p1_k28, v1_k28);
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
   store_raw_output(output_group, m_offset, d_offset, lane, accumulator);
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void pv_panel_raw_m16d256_reuse_v_kernel(const __half* __restrict__ p,
-                                         const __half* __restrict__ v,
-                                         float* __restrict__ output,
-                                         int groups) {
+extern "C" __global__ __launch_bounds__(
+    kRawThreads,
+    4) void pv_panel_raw_m16d256_reuse_v_kernel(const __half* __restrict__ p,
+                                                const __half* __restrict__ v,
+                                                float* __restrict__ output,
+                                                int groups) {
   __shared__ __align__(16) __half shared_p[kPElementsPerGroup];
 
   const int group = blockIdx.x;
@@ -450,43 +444,41 @@ void pv_panel_raw_m16d256_reuse_v_kernel(const __half* __restrict__ p,
   const int lane = thread & 31;
   const int warp = thread >> 5;
   const int d_offset = warp * kRawD;
-  const __half* p_group =
-      p + static_cast<int64_t>(group) * kPElementsPerGroup;
-  const __half* v_group =
-      v + static_cast<int64_t>(group) * kVElementsPerGroup;
+  const __half* p_group = p + static_cast<int64_t>(group) * kPElementsPerGroup;
+  const __half* v_group = v + static_cast<int64_t>(group) * kVElementsPerGroup;
   stage_p_to_shared(p_group, shared_p, thread, kRawThreads);
   __syncthreads();
 
   float accumulator_top[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                            0.0f, 0.0f, 0.0f, 0.0f};
+                                          0.0f, 0.0f, 0.0f, 0.0f};
   float accumulator_bottom[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                               0.0f, 0.0f, 0.0f, 0.0f};
+                                             0.0f, 0.0f, 0.0f, 0.0f};
   // Every K4 issues top then bottom with one shared V operand register pair.
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 0,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 4,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 8,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 12,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 16,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 20,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 24,
-                       accumulator_top, accumulator_bottom);
-  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 28,
-                       accumulator_top, accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 0, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 4, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 8, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 12, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 16, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 20, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 24, accumulator_top,
+                       accumulator_bottom);
+  raw_m16_reuse_v_step(shared_p, v_group, lane, d_offset, 28, accumulator_top,
+                       accumulator_bottom);
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
   store_raw_output(output_group, 0, d_offset, lane, accumulator_top);
   store_raw_output(output_group, kRawM, d_offset, lane, accumulator_bottom);
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void pv_panel_raw_m16d256_reuse_v_k16_double_kernel(
+extern "C" __global__
+__launch_bounds__(kRawThreads, 4) void pv_panel_raw_m16d256_reuse_v_k16_double_kernel(
     const __half* __restrict__ p, const __half* __restrict__ v,
     float* __restrict__ output, int groups) {
   __shared__ __align__(16) __half shared_p[kPElementsPerGroup];
@@ -499,17 +491,15 @@ void pv_panel_raw_m16d256_reuse_v_k16_double_kernel(
   const int lane = thread & 31;
   const int warp = thread >> 5;
   const int d_offset = warp * kRawD;
-  const __half* p_group =
-      p + static_cast<int64_t>(group) * kPElementsPerGroup;
-  const __half* v_group =
-      v + static_cast<int64_t>(group) * kVElementsPerGroup;
+  const __half* p_group = p + static_cast<int64_t>(group) * kPElementsPerGroup;
+  const __half* v_group = v + static_cast<int64_t>(group) * kVElementsPerGroup;
   stage_p_to_shared(p_group, shared_p, thread, kRawThreads);
   __syncthreads();
 
   float accumulator_top[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                            0.0f, 0.0f, 0.0f, 0.0f};
+                                          0.0f, 0.0f, 0.0f, 0.0f};
   float accumulator_bottom[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                               0.0f, 0.0f, 0.0f, 0.0f};
+                                             0.0f, 0.0f, 0.0f, 0.0f};
   uint64_t p0_top_k0;
   uint64_t p0_bottom_k0;
   uint64_t v0_k0;
@@ -546,16 +536,16 @@ void pv_panel_raw_m16d256_reuse_v_k16_double_kernel(
 
   load_reuse_v_operands(shared_p, v_group, lane, d_offset, 16, p1_top_k16,
                         p1_bottom_k16, v1_k16);
-  mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k0,
-                   p0_bottom_k0, v0_k0);
+  mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k0, p0_bottom_k0,
+                   v0_k0);
   load_reuse_v_operands(shared_p, v_group, lane, d_offset, 20, p1_top_k20,
                         p1_bottom_k20, v1_k20);
-  mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k4,
-                   p0_bottom_k4, v0_k4);
+  mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k4, p0_bottom_k4,
+                   v0_k4);
   load_reuse_v_operands(shared_p, v_group, lane, d_offset, 24, p1_top_k24,
                         p1_bottom_k24, v1_k24);
-  mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k8,
-                   p0_bottom_k8, v0_k8);
+  mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k8, p0_bottom_k8,
+                   v0_k8);
   load_reuse_v_operands(shared_p, v_group, lane, d_offset, 28, p1_top_k28,
                         p1_bottom_k28, v1_k28);
   mma_reuse_v_pair(accumulator_top, accumulator_bottom, p0_top_k12,
@@ -570,8 +560,8 @@ void pv_panel_raw_m16d256_reuse_v_k16_double_kernel(
   mma_reuse_v_pair(accumulator_top, accumulator_bottom, p1_top_k28,
                    p1_bottom_k28, v1_k28);
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
   store_raw_output(output_group, 0, d_offset, lane, accumulator_top);
   store_raw_output(output_group, kRawM, d_offset, lane, accumulator_bottom);
 }
@@ -604,8 +594,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -659,8 +648,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta) {
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -705,8 +694,8 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
@@ -733,14 +722,11 @@ void print_exactness(const Exactness& exactness) {
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
             << ", \"resident_active_warps\": "
             << resources.resident_active_warps
             << ", \"threads_per_cta\": " << resources.threads_per_cta
@@ -775,12 +761,13 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
                 const KernelResources& raw_pipelined_resources,
                 const KernelResources& raw_m16_reuse_v_resources,
                 const KernelResources& raw_m16_reuse_v_k16_double_resources) {
-  const bool all_bitwise_equal = baseline_raw_single.bitwise_equal &&
-                                 baseline_raw_pipelined.bitwise_equal &&
-                                 raw_single_raw_pipelined.bitwise_equal &&
-                                 baseline_raw_m16_reuse_v.bitwise_equal &&
-                                 baseline_raw_m16_reuse_v_k16_double.bitwise_equal &&
-                                 raw_m16_reuse_v_pair.bitwise_equal;
+  const bool all_bitwise_equal =
+      baseline_raw_single.bitwise_equal &&
+      baseline_raw_pipelined.bitwise_equal &&
+      raw_single_raw_pipelined.bitwise_equal &&
+      baseline_raw_m16_reuse_v.bitwise_equal &&
+      baseline_raw_m16_reuse_v_k16_double.bitwise_equal &&
+      raw_m16_reuse_v_pair.bitwise_equal;
   std::cout << "{\n";
   std::cout << "  \"device\": {\n";
   std::cout << "    \"logical_index\": " << args.device << ",\n";
@@ -791,8 +778,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << properties.minor << "],\n";
   std::cout << "    \"cuda_runtime\": " << runtime_version << ",\n";
   std::cout << "    \"sm_count\": " << sm_count << ",\n";
-  std::cout << "    \"max_threads_per_sm\": " << max_threads_per_sm
-            << ",\n";
+  std::cout << "    \"max_threads_per_sm\": " << max_threads_per_sm << ",\n";
   std::cout << "    \"max_shared_per_sm\": " << max_shared_per_sm << "\n";
   std::cout << "  },\n";
   std::cout << "  \"target\": \"sm_70\",\n";
@@ -801,29 +787,46 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"output\": \"[groups, M16, D256]\",\n";
   std::cout << "    \"K\": 32,\n";
   std::cout << "    \"p_layout\": \"[group, M16, K32] staged in shared\",\n";
-  std::cout << "    \"v_layout\": \"[group, K32, D256] row-major token-major stride 256\"\n";
+  std::cout << "    \"v_layout\": \"[group, K32, D256] row-major token-major "
+               "stride 256\"\n";
   std::cout << "  },\n";
   std::cout << "  \"paths\": {\n";
-  std::cout << "    \"baseline\": \"A: 1 CTA/group, BM16xD256, 512 threads, 16 warps x D16; two native m16n16k16 row.row\",\n";
-  std::cout << "    \"raw_single\": \"legacy BM8 split/raw-vector: 2 CTA/group, 256 threads each; V is read by both M halves\",\n";
-  std::cout << "    \"raw_pipelined\": \"legacy BM8 split/K16-stage-double: 2 CTA/group; V is read by both M halves\",\n";
-  std::cout << "    \"raw_m16d256_reuse_v\": \"1 CTA/group, 256 threads, 8 warps x D32; one V LDG.E.64 feeds top then bottom raw row.row HMMA per K4\",\n";
-  std::cout << "    \"raw_m16d256_reuse_v_k16_double\": \"same M16 V reuse with a complete K16 operand bank and ping-pong next K16\",\n";
+  std::cout << "    \"baseline\": \"A: 1 CTA/group, BM16xD256, 512 threads, 16 "
+               "warps x D16; two native m16n16k16 row.row\",\n";
+  std::cout << "    \"raw_single\": \"legacy BM8 split/raw-vector: 2 "
+               "CTA/group, 256 threads each; V is read by both M halves\",\n";
+  std::cout << "    \"raw_pipelined\": \"legacy BM8 split/K16-stage-double: 2 "
+               "CTA/group; V is read by both M halves\",\n";
+  std::cout << "    \"raw_m16d256_reuse_v\": \"1 CTA/group, 256 threads, 8 "
+               "warps x D32; one V LDG.E.64 feeds top then bottom raw row.row "
+               "HMMA per K4\",\n";
+  std::cout << "    \"raw_m16d256_reuse_v_k16_double\": \"same M16 V reuse "
+               "with a complete K16 operand bank and ping-pong next K16\",\n";
   std::cout << "    \"raw_k4_offsets\": [0, 4, 8, 12, 16, 20, 24, 28]\n";
   std::cout << "  },\n";
   std::cout << "  \"loader_classes\": {\n";
-  std::cout << "    \"raw_scalar\": \"not_built; never used for a structural gate\",\n";
-  std::cout << "    \"raw_vector\": \"raw_single: 8 K4 vector P/V operand loads\",\n";
-  std::cout << "    \"k16_stage_double\": \"raw_pipelined: two named K16 operand banks\",\n";
-  std::cout << "    \"raw_m16_reuse_v\": \"8 vector V operands reused by top and bottom\",\n";
-  std::cout << "    \"raw_m16_reuse_v_k16_double\": \"M16 reuse-V with two named K16 banks\"\n";
+  std::cout << "    \"raw_scalar\": \"not_built; never used for a structural "
+               "gate\",\n";
+  std::cout
+      << "    \"raw_vector\": \"raw_single: 8 K4 vector P/V operand loads\",\n";
+  std::cout << "    \"k16_stage_double\": \"raw_pipelined: two named K16 "
+               "operand banks\",\n";
+  std::cout << "    \"raw_m16_reuse_v\": \"8 vector V operands reused by top "
+               "and bottom\",\n";
+  std::cout << "    \"raw_m16_reuse_v_k16_double\": \"M16 reuse-V with two "
+               "named K16 banks\"\n";
   std::cout << "  },\n";
   std::cout << "  \"launch_topology\": {\n";
-  std::cout << "    \"baseline\": {\"ctas_per_group\": 1, \"threads_per_cta\": 512},\n";
-  std::cout << "    \"raw_single\": {\"ctas_per_group\": 2, \"threads_per_cta\": 256},\n";
-  std::cout << "    \"raw_pipelined\": {\"ctas_per_group\": 2, \"threads_per_cta\": 256},\n";
-  std::cout << "    \"raw_m16d256_reuse_v\": {\"ctas_per_group\": 1, \"threads_per_cta\": 256},\n";
-  std::cout << "    \"raw_m16d256_reuse_v_k16_double\": {\"ctas_per_group\": 1, \"threads_per_cta\": 256}\n";
+  std::cout << "    \"baseline\": {\"ctas_per_group\": 1, \"threads_per_cta\": "
+               "512},\n";
+  std::cout << "    \"raw_single\": {\"ctas_per_group\": 2, "
+               "\"threads_per_cta\": 256},\n";
+  std::cout << "    \"raw_pipelined\": {\"ctas_per_group\": 2, "
+               "\"threads_per_cta\": 256},\n";
+  std::cout << "    \"raw_m16d256_reuse_v\": {\"ctas_per_group\": 1, "
+               "\"threads_per_cta\": 256},\n";
+  std::cout << "    \"raw_m16d256_reuse_v_k16_double\": {\"ctas_per_group\": "
+               "1, \"threads_per_cta\": 256}\n";
   std::cout << "  },\n";
   std::cout << "  \"exactness\": {\n";
   std::cout << "    \"word_dtype\": \"uint32\",\n";
@@ -863,10 +866,10 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << speedup_pct(baseline_timing, raw_pipelined_timing);
   std::cout << ",\n    \"raw_m16d256_reuse_v_speedup_vs_baseline_pct\": "
             << speedup_pct(baseline_timing, raw_m16_reuse_v_timing);
-  std::cout << ",\n    \"raw_m16d256_reuse_v_k16_double_speedup_vs_baseline_pct\": "
-            << speedup_pct(baseline_timing,
-                           raw_m16_reuse_v_k16_double_timing)
-            << "\n";
+  std::cout
+      << ",\n    \"raw_m16d256_reuse_v_k16_double_speedup_vs_baseline_pct\": "
+      << speedup_pct(baseline_timing, raw_m16_reuse_v_k16_double_timing)
+      << "\n";
   std::cout << "  },\n";
   std::cout << "  \"pairs\": {\n";
   std::cout << "    \"raw_single_vs_baseline\": ";
@@ -880,12 +883,12 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "\n  },\n";
   std::cout << "  \"measurement\": {\n";
   std::cout << "    \"warmup_rounds\": " << args.warmup << ",\n";
-  std::cout << "    \"warmup_launches_per_variant\": " << args.warmup
-            << ",\n";
+  std::cout << "    \"warmup_launches_per_variant\": " << args.warmup << ",\n";
   std::cout << "    \"rounds\": " << args.rounds << ",\n";
   std::cout << "    \"launches_per_sample\": " << args.launches_per_sample
             << ",\n";
-  std::cout << "    \"interleaving\": \"five-variant start order rotates every round\"\n";
+  std::cout << "    \"interleaving\": \"five-variant start order rotates every "
+               "round\"\n";
   std::cout << "  },\n";
   std::cout << "  \"resources\": {\n";
   std::cout << "    \"baseline\": ";
@@ -983,9 +986,9 @@ int run(const Args& args) {
                         output_elements * sizeof(float)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_raw_m16_reuse_v),
                         output_elements * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(
-      reinterpret_cast<void**>(&device_raw_m16_reuse_v_k16_double),
-      output_elements * sizeof(float)));
+  CUDA_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&device_raw_m16_reuse_v_k16_double),
+                 output_elements * sizeof(float)));
   CUDA_CHECK(cudaMemcpy(device_p, host_p.data(), p_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_v, host_v.data(), v_elements * sizeof(__half),
@@ -1015,8 +1018,7 @@ int run(const Args& args) {
       case Variant::kRawM16ReuseVK16Double:
         pv_panel_raw_m16d256_reuse_v_k16_double_kernel<<<raw_m16_grid,
                                                          kRawThreads>>>(
-            device_p, device_v, device_raw_m16_reuse_v_k16_double,
-            args.groups);
+            device_p, device_v, device_raw_m16_reuse_v_k16_double, args.groups);
         break;
     }
     CUDA_CHECK(cudaGetLastError());
@@ -1035,8 +1037,7 @@ int run(const Args& args) {
     if (profile_kernel_selected(args, "raw_m16d256_reuse_v")) {
       launch(Variant::kRawM16ReuseV);
     }
-    if (profile_kernel_selected(args,
-                                "raw_m16d256_reuse_v_k16_double")) {
+    if (profile_kernel_selected(args, "raw_m16d256_reuse_v_k16_double")) {
       launch(Variant::kRawM16ReuseVK16Double);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1069,18 +1070,20 @@ int run(const Args& args) {
   std::vector<float> host_raw_m16_reuse_v(output_elements);
   std::vector<float> host_raw_m16_reuse_v_k16_double(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_raw_single.data(), device_raw_single,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_raw_pipelined.data(), device_raw_pipelined,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_raw_m16_reuse_v.data(), device_raw_m16_reuse_v,
                         output_elements * sizeof(float),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(host_raw_m16_reuse_v_k16_double.data(),
-                        device_raw_m16_reuse_v_k16_double,
-                        output_elements * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(
+      host_raw_m16_reuse_v_k16_double.data(), device_raw_m16_reuse_v_k16_double,
+      output_elements * sizeof(float), cudaMemcpyDeviceToHost));
 
   const Exactness baseline_raw_single =
       compare_outputs(host_baseline, host_raw_single);
@@ -1092,8 +1095,8 @@ int run(const Args& args) {
       compare_outputs(host_baseline, host_raw_m16_reuse_v);
   const Exactness baseline_raw_m16_reuse_v_k16_double =
       compare_outputs(host_baseline, host_raw_m16_reuse_v_k16_double);
-  const Exactness raw_m16_reuse_v_pair = compare_outputs(
-      host_raw_m16_reuse_v, host_raw_m16_reuse_v_k16_double);
+  const Exactness raw_m16_reuse_v_pair =
+      compare_outputs(host_raw_m16_reuse_v, host_raw_m16_reuse_v_k16_double);
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
@@ -1109,8 +1112,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::array<std::vector<double>, kVariantCount> samples;
@@ -1140,8 +1142,7 @@ int run(const Args& args) {
   const TimingSummary raw_single_timing = summarize(samples[1]);
   const TimingSummary raw_pipelined_timing = summarize(samples[2]);
   const TimingSummary raw_m16_reuse_v_timing = summarize(samples[3]);
-  const TimingSummary raw_m16_reuse_v_k16_double_timing =
-      summarize(samples[4]);
+  const TimingSummary raw_m16_reuse_v_k16_double_timing = summarize(samples[4]);
   const PairSummary raw_single_pairs = summarize_pairs(samples[0], samples[1]);
   const PairSummary raw_pipelined_pairs =
       summarize_pairs(samples[0], samples[2]);
@@ -1166,8 +1167,7 @@ int run(const Args& args) {
              raw_single_pairs, raw_pipelined_pairs, raw_m16_reuse_v_pairs,
              raw_m16_reuse_v_k16_double_pairs, baseline_resources,
              raw_single_resources, raw_pipelined_resources,
-             raw_m16_reuse_v_resources,
-             raw_m16_reuse_v_k16_double_resources);
+             raw_m16_reuse_v_resources, raw_m16_reuse_v_k16_double_resources);
   return EXIT_SUCCESS;
 }
 
@@ -1204,6 +1204,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

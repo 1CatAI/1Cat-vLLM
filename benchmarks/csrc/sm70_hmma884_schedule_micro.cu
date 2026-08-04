@@ -31,12 +31,12 @@ constexpr int kWarpsPerBlock = 4;
 constexpr int kWarpThreads = 32;
 constexpr int kThreads = kWarpsPerBlock * kWarpThreads;
 
-using AFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kTile, kTile,
-                                         kTile, __half,
-                                         nvcuda::wmma::row_major>;
-using BFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTile, kTile,
-                                         kTile, __half,
-                                         nvcuda::wmma::row_major>;
+using AFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kTile, kTile, kTile, __half,
+                           nvcuda::wmma::row_major>;
+using BFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTile, kTile, kTile, __half,
+                           nvcuda::wmma::row_major>;
 using CFragment = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kTile,
                                          kTile, kTile, float>;
 
@@ -114,20 +114,21 @@ void check_driver(CUresult status, const char* expression, const char* file,
 // load overwrites the B0 register bundle only after the first 16 HMMA.884
 // instructions.  A patch may move an individual B1 LDG only after the target
 // B0 sub-register's final HMMA use.
-extern "C" __global__ __launch_bounds__(kThreads)
-void hmma884_patch_target_kernel(const __half* __restrict__ a,
-                                 const __half* __restrict__ b,
-                                 float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kThreads) void hmma884_patch_target_kernel(const __half* __restrict__ a,
+                                               const __half* __restrict__ b,
+                                               float* __restrict__ output,
+                                               int groups) {
   const int group = static_cast<int>(blockIdx.x) * kWarpsPerBlock +
                     static_cast<int>(threadIdx.x) / kWarpThreads;
   if (group >= groups) {
     return;
   }
 
-  const __half* a_group = a + static_cast<int64_t>(group) *
-                                   kKTileCount * kTileElements;
-  const __half* b_group = b + static_cast<int64_t>(group) *
-                                   kKTileCount * kTileElements;
+  const __half* a_group =
+      a + static_cast<int64_t>(group) * kKTileCount * kTileElements;
+  const __half* b_group =
+      b + static_cast<int64_t>(group) * kKTileCount * kTileElements;
   float* output_group = output + static_cast<int64_t>(group) * kTileElements;
 
   AFragment a_fragment;
@@ -276,19 +277,20 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\":" << std::setprecision(9)
-            << timing.median_us << ",\"p90_us\":" << timing.p90_us
-            << ",\"mean_us\":" << timing.mean_us << ",\"min_us\":"
-            << timing.min_us << ",\"max_us\":" << timing.max_us << '}';
+  std::cout << "{\"median_us\":" << std::setprecision(9) << timing.median_us
+            << ",\"p90_us\":" << timing.p90_us
+            << ",\"mean_us\":" << timing.mean_us
+            << ",\"min_us\":" << timing.min_us
+            << ",\"max_us\":" << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\":"
-            << resources.registers_per_thread << ",\"static_shared_bytes\":"
-            << resources.static_shared_bytes << ",\"local_bytes_per_thread\":"
+  std::cout << "{\"registers_per_thread\":" << resources.registers_per_thread
+            << ",\"static_shared_bytes\":" << resources.static_shared_bytes
+            << ",\"local_bytes_per_thread\":"
             << resources.local_bytes_per_thread
-            << ",\"max_threads_per_block\":"
-            << resources.max_threads_per_block << '}';
+            << ",\"max_threads_per_block\":" << resources.max_threads_per_block
+            << '}';
 }
 
 void print_result(const Args& args, const cudaDeviceProp& properties,
@@ -303,17 +305,17 @@ void print_result(const Args& args, const cudaDeviceProp& properties,
       baseline_timing.median_us;
   std::cout << "{\n";
   std::cout << "\"target\":\"sm_70\",\n";
-  std::cout << "\"device\":{\"logical_index\":" << args.device
-            << ",\"name\":";
+  std::cout << "\"device\":{\"logical_index\":" << args.device << ",\"name\":";
   print_json_string(properties.name);
   std::cout << ",\"capability\":[" << properties.major << ','
             << properties.minor << "]},\n";
   std::cout << "\"shape\":{\"groups\":" << args.groups
             << ",\"a\":[\"groups\",2,16,16],\"b\":[\"groups\",2,16,16],"
                "\"output\":[\"groups\",16,16]},\n";
-  std::cout << "\"work\":{\"wmma_m16n16k16_calls_per_warp\":2,"
-               "\"hmma884_per_wmma\":16,\"b_fragment_instances\":1,"
-               "\"arithmetic\":\"A0*B0 + A1*B1, FP16 inputs/FP32 accumulate\"},\n";
+  std::cout
+      << "\"work\":{\"wmma_m16n16k16_calls_per_warp\":2,"
+         "\"hmma884_per_wmma\":16,\"b_fragment_instances\":1,"
+         "\"arithmetic\":\"A0*B0 + A1*B1, FP16 inputs/FP32 accumulate\"},\n";
   std::cout << "\"exactness\":{\"word_dtype\":\"uint32(fp32)\","
                "\"word_count\":"
             << static_cast<int64_t>(args.groups) * kTileElements
@@ -373,7 +375,8 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.candidate_cubin.empty() || args.groups < 1 || args.warmup < 0 ||
       args.rounds < 1 || args.launches_per_sample < 1) {
-    std::cerr << "A candidate cubin and positive benchmark dimensions are required\n";
+    std::cerr
+        << "A candidate cubin and positive benchmark dimensions are required\n";
     std::exit(EXIT_FAILURE);
   }
   return args;
@@ -411,8 +414,8 @@ int run(const Args& args) {
   DRIVER_CHECK(cuModuleGetFunction(&candidate_kernel, candidate_module,
                                    "hmma884_patch_target_kernel"));
 
-  const size_t input_elements = static_cast<size_t>(args.groups) *
-                                kKTileCount * kTileElements;
+  const size_t input_elements =
+      static_cast<size_t>(args.groups) * kKTileCount * kTileElements;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kTileElements;
   std::vector<__half> host_a(input_elements);
@@ -437,9 +440,11 @@ int run(const Args& args) {
                         output_elements * sizeof(float)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&candidate_output),
                         output_elements * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(device_a, host_a.data(), input_elements * sizeof(__half),
+  CUDA_CHECK(cudaMemcpy(device_a, host_a.data(),
+                        input_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_b, host_b.data(), input_elements * sizeof(__half),
+  CUDA_CHECK(cudaMemcpy(device_b, host_b.data(),
+                        input_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
 
   const int blocks = (args.groups + kWarpsPerBlock - 1) / kWarpsPerBlock;
@@ -477,9 +482,11 @@ int run(const Args& args) {
   std::vector<float> host_baseline(output_elements);
   std::vector<float> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), baseline_output,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), candidate_output,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   const Exactness exactness = compare_outputs(host_baseline, host_candidate);
 
   cudaEvent_t start = nullptr;
@@ -499,8 +506,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -524,10 +530,12 @@ int run(const Args& args) {
   CUDA_CHECK(cudaEventDestroy(start));
 
   const KernelResources baseline_resources = native_resources();
-  const KernelResources candidate_resources = driver_resources(candidate_kernel);
+  const KernelResources candidate_resources =
+      driver_resources(candidate_kernel);
   const TimingSummary baseline_timing = summarize(baseline_samples);
   const TimingSummary candidate_timing = summarize(candidate_samples);
-  const PairSummary pairs = summarize_pairs(baseline_samples, candidate_samples);
+  const PairSummary pairs =
+      summarize_pairs(baseline_samples, candidate_samples);
 
   CUDA_CHECK(cudaFree(candidate_output));
   CUDA_CHECK(cudaFree(baseline_output));
@@ -541,6 +549,4 @@ int run(const Args& args) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

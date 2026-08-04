@@ -38,12 +38,12 @@ constexpr int kQElements = kM * kK;
 constexpr int kOutputElementsPerGroup = kM * kN;
 constexpr int kKeyElementsPerGroup = kN * kK;
 
-using AFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kM, kNativeN,
-                                         kNativeK, __half,
-                                         nvcuda::wmma::row_major>;
-using BFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kM, kNativeN,
-                                         kNativeK, __half,
-                                         nvcuda::wmma::col_major>;
+using AFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kM, kNativeN, kNativeK,
+                           __half, nvcuda::wmma::row_major>;
+using BFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kM, kNativeN, kNativeK,
+                           __half, nvcuda::wmma::col_major>;
 using CFragment = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kM,
                                          kNativeN, kNativeK, float>;
 
@@ -104,7 +104,8 @@ void check_cuda(cudaError_t status, const char* expression, const char* file,
   std::exit(EXIT_FAILURE);
 }
 
-#define CUDA_CHECK(expression) check_cuda((expression), #expression, __FILE__, __LINE__)
+#define CUDA_CHECK(expression) \
+  check_cuda((expression), #expression, __FILE__, __LINE__)
 
 __device__ __forceinline__ int swizzled_q_row_slot(int row) {
   return (row & 3) | ((row & 8) >> 1) | ((row & 4) << 1);
@@ -143,22 +144,19 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     AFragment& fragment, const __half* __restrict__ shared_query,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_q_row_slot(row);
   const int tile_offset = (k_offset / kNativeK) * kM * kNativeK;
   uint32_t address = static_cast<uint32_t>(
       __cvta_generic_to_shared(shared_query + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
@@ -170,9 +168,7 @@ __device__ __forceinline__ int raw_a_row(int lane) {
   return (lane & 3) + ((lane >> 4) * 4);
 }
 
-__device__ __forceinline__ int raw_n_tile(int lane) {
-  return (lane & 12) * 2;
-}
+__device__ __forceinline__ int raw_n_tile(int lane) { return (lane & 12) * 2; }
 
 __device__ __forceinline__ int raw_b_col_n(int lane) {
   return raw_n_tile(lane) + (lane & 3) + ((lane >> 4) * 4);
@@ -193,27 +189,28 @@ __device__ __forceinline__ uint32_t pack_half2(__half low, __half high) {
 
 // cudaMalloc provides the base alignment; the group, token, K4, and K16 strides
 // preserve the natural 8-byte and 16-byte alignment of the vector loads below.
-__device__ __forceinline__ void load_key_k4_v2_u32(uint32_t& b0,
-                                                     uint32_t& b1,
-                                                     const __half* key_k4) {
+__device__ __forceinline__ void load_key_k4_v2_u32(uint32_t& b0, uint32_t& b1,
+                                                   const __half* key_k4) {
   asm volatile("ld.global.v2.u32 {%0, %1}, [%2];"
                : "=r"(b0), "=r"(b1)
                : "l"(key_k4)
                : "memory");
 }
 
-__device__ __forceinline__ void load_key_k8_v4_u32(
-    uint32_t& b0, uint32_t& b1, uint32_t& b2, uint32_t& b3,
-    const __half* key_k8) {
+__device__ __forceinline__ void load_key_k8_v4_u32(uint32_t& b0, uint32_t& b1,
+                                                   uint32_t& b2, uint32_t& b3,
+                                                   const __half* key_k8) {
   asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
                : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
                : "l"(key_k8)
                : "memory");
 }
 
-__device__ __forceinline__ void load_key_k16_v4_u32(
-    uint32_t& b0, uint32_t& b1, uint32_t& b2, uint32_t& b3, uint32_t& b4,
-    uint32_t& b5, uint32_t& b6, uint32_t& b7, const __half* key_k16) {
+__device__ __forceinline__ void load_key_k16_v4_u32(uint32_t& b0, uint32_t& b1,
+                                                    uint32_t& b2, uint32_t& b3,
+                                                    uint32_t& b4, uint32_t& b5,
+                                                    uint32_t& b6, uint32_t& b7,
+                                                    const __half* key_k16) {
   load_key_k8_v4_u32(b0, b1, b2, b3, key_k16);
   load_key_k8_v4_u32(b4, b5, b6, b7, key_k16 + 8);
 }
@@ -246,9 +243,9 @@ __device__ __forceinline__ void load_swizzled_raw_a_k4_v2_u32(
   const int tile_offset = (k16 / kNativeK) * kM * kNativeK;
   const int plane = k4 >> 1;
   const int k4_in_plane = k4 & 1;
-  const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      shared_query + tile_offset + plane * kM * 8 + slot * 8 +
-      k4_in_plane * kRawK));
+  const uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(shared_query + tile_offset + plane * kM * 8 +
+                               slot * 8 + k4_in_plane * kRawK));
   asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];"
                : "=r"(a0), "=r"(a1)
                : "r"(address)
@@ -262,17 +259,17 @@ __device__ __forceinline__ void mma_m8n8k4_row_col(
       "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, "
       "{%8, %9}, {%10, %11}, {%12, %13, %14, %15, %16, %17, %18, %19};"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]),
-        "=f"(d[5]), "=f"(d[6]), "=f"(d[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
-        "f"(c[2]), "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]),
-        "f"(c[7]));
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]), "=f"(d[5]),
+        "=f"(d[6]), "=f"(d[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
+        "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7]));
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void qk_panel_baseline_kernel(const __half* __restrict__ query,
-                              const __half* __restrict__ key,
-                              float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kBaselineThreads,
+    2) void qk_panel_baseline_kernel(const __half* __restrict__ query,
+                                     const __half* __restrict__ key,
+                                     float* __restrict__ output, int groups) {
   __shared__ __align__(16) __half shared_query[kQElements];
 
   const int block = blockIdx.x;
@@ -281,8 +278,7 @@ void qk_panel_baseline_kernel(const __half* __restrict__ query,
     return;
   }
   const int thread = threadIdx.x;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
   stage_swizzled_query(query_group, shared_query, thread, kBaselineThreads);
   __syncthreads();
 
@@ -291,8 +287,8 @@ void qk_panel_baseline_kernel(const __half* __restrict__ query,
     return;
   }
   const int n_offset = (block & 1) * kBaselineN + warp * kNativeN;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   AFragment a_fragment;
   BFragment b_fragment;
   CFragment accumulator;
@@ -301,21 +297,23 @@ void qk_panel_baseline_kernel(const __half* __restrict__ query,
 #pragma unroll
   for (int k_offset = 0; k_offset < kK; k_offset += kNativeK) {
     load_swizzled_matrix_a_fragment(a_fragment, shared_query, k_offset);
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, key_group + n_offset * kK + k_offset, kK);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   key_group + n_offset * kK + k_offset, kK);
     nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
   }
 
-  float* output_tile = output + static_cast<int64_t>(group) *
-                                     kOutputElementsPerGroup + n_offset;
+  float* output_tile =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup + n_offset;
   nvcuda::wmma::store_matrix_sync(output_tile, accumulator, kN,
                                   nvcuda::wmma::mem_row_major);
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void qk_panel_raw_k4_vector_kernel(const __half* __restrict__ query,
-                                   const __half* __restrict__ key,
-                                   float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kRawThreads,
+    4) void qk_panel_raw_k4_vector_kernel(const __half* __restrict__ query,
+                                          const __half* __restrict__ key,
+                                          float* __restrict__ output,
+                                          int groups) {
   __shared__ __align__(16) __half shared_query[kQElements];
 
   const int block = blockIdx.x;
@@ -328,15 +326,14 @@ void qk_panel_raw_k4_vector_kernel(const __half* __restrict__ query,
   const int warp = thread >> 5;
   const int m_offset = (block & 1) * kRawM;
   const int n_offset = warp * kRawN;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   stage_swizzled_query(query_group, shared_query, thread, kRawThreads);
   __syncthreads();
 
   float accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                        0.0f, 0.0f, 0.0f, 0.0f};
+                                      0.0f, 0.0f, 0.0f, 0.0f};
   const int q_row = m_offset + raw_a_row(lane);
   const int key_token = n_offset + raw_b_col_n(lane);
 
@@ -345,22 +342,21 @@ void qk_panel_raw_k4_vector_kernel(const __half* __restrict__ query,
 #pragma unroll
     for (int k4 = 0; k4 < kNativeK / kRawK; ++k4) {
       const int k_offset = k16 + k4 * kRawK;
-      const uint32_t a0 = pack_half2(
-          shared_query[swizzled_q_offset(q_row, k_offset)],
-          shared_query[swizzled_q_offset(q_row, k_offset + 1)]);
-      const uint32_t a1 = pack_half2(
-          shared_query[swizzled_q_offset(q_row, k_offset + 2)],
-          shared_query[swizzled_q_offset(q_row, k_offset + 3)]);
+      const uint32_t a0 =
+          pack_half2(shared_query[swizzled_q_offset(q_row, k_offset)],
+                     shared_query[swizzled_q_offset(q_row, k_offset + 1)]);
+      const uint32_t a1 =
+          pack_half2(shared_query[swizzled_q_offset(q_row, k_offset + 2)],
+                     shared_query[swizzled_q_offset(q_row, k_offset + 3)]);
       uint32_t b0;
       uint32_t b1;
-      load_key_k4_v2_u32(b0, b1,
-                          key_group + key_token * kK + k_offset);
+      load_key_k4_v2_u32(b0, b1, key_group + key_token * kK + k_offset);
       mma_m8n8k4_row_col(accumulator, a0, a1, b0, b1, accumulator);
     }
   }
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
 #pragma unroll
   for (int reg = 0; reg < kRawRegisters; ++reg) {
     const int row = m_offset + raw_c_row(lane, reg);
@@ -369,10 +365,12 @@ void qk_panel_raw_k4_vector_kernel(const __half* __restrict__ query,
   }
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void qk_panel_raw_k16_stage_kernel(const __half* __restrict__ query,
-                                   const __half* __restrict__ key,
-                                   float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kRawThreads,
+    4) void qk_panel_raw_k16_stage_kernel(const __half* __restrict__ query,
+                                          const __half* __restrict__ key,
+                                          float* __restrict__ output,
+                                          int groups) {
   __shared__ __align__(16) __half shared_query[kQElements];
 
   const int block = blockIdx.x;
@@ -385,15 +383,14 @@ void qk_panel_raw_k16_stage_kernel(const __half* __restrict__ query,
   const int warp = thread >> 5;
   const int m_offset = (block & 1) * kRawM;
   const int n_offset = warp * kRawN;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   stage_swizzled_query(query_group, shared_query, thread, kRawThreads);
   __syncthreads();
 
   float accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                        0.0f, 0.0f, 0.0f, 0.0f};
+                                      0.0f, 0.0f, 0.0f, 0.0f};
   const int q_row = m_offset + raw_a_row(lane);
   const int key_token = n_offset + raw_b_col_n(lane);
 
@@ -417,16 +414,16 @@ void qk_panel_raw_k16_stage_kernel(const __half* __restrict__ query,
     uint32_t b7;
     const __half* key_k16 = key_group + key_token * kK + k16;
     load_key_k16_v4_u32(b0, b1, b2, b3, b4, b5, b6, b7, key_k16);
-    load_swizzled_raw_a_k16_v4_u32(a0, a1, a2, a3, a4, a5, a6, a7,
-                                    shared_query, q_row, k16);
+    load_swizzled_raw_a_k16_v4_u32(a0, a1, a2, a3, a4, a5, a6, a7, shared_query,
+                                   q_row, k16);
     mma_m8n8k4_row_col(accumulator, a0, a1, b0, b1, accumulator);
     mma_m8n8k4_row_col(accumulator, a2, a3, b2, b3, accumulator);
     mma_m8n8k4_row_col(accumulator, a4, a5, b4, b5, accumulator);
     mma_m8n8k4_row_col(accumulator, a6, a7, b6, b7, accumulator);
   }
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
 #pragma unroll
   for (int reg = 0; reg < kRawRegisters; ++reg) {
     const int row = m_offset + raw_c_row(lane, reg);
@@ -435,10 +432,12 @@ void qk_panel_raw_k16_stage_kernel(const __half* __restrict__ query,
   }
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void qk_panel_raw_k16_double_kernel(const __half* __restrict__ query,
-                                    const __half* __restrict__ key,
-                                    float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kRawThreads,
+    4) void qk_panel_raw_k16_double_kernel(const __half* __restrict__ query,
+                                           const __half* __restrict__ key,
+                                           float* __restrict__ output,
+                                           int groups) {
   __shared__ __align__(16) __half shared_query[kQElements];
 
   const int block = blockIdx.x;
@@ -451,15 +450,14 @@ void qk_panel_raw_k16_double_kernel(const __half* __restrict__ query,
   const int warp = thread >> 5;
   const int m_offset = (block & 1) * kRawM;
   const int n_offset = warp * kRawN;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   stage_swizzled_query(query_group, shared_query, thread, kRawThreads);
   __syncthreads();
 
   float accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                        0.0f, 0.0f, 0.0f, 0.0f};
+                                      0.0f, 0.0f, 0.0f, 0.0f};
   const int q_row = m_offset + raw_a_row(lane);
   const int key_token = n_offset + raw_b_col_n(lane);
   const __half* first_key_k16 = key_group + key_token * kK;
@@ -495,20 +493,16 @@ void qk_panel_raw_k16_double_kernel(const __half* __restrict__ query,
     const __half* next_key_k16 = first_key_k16 + k16 + kNativeK;
 
     // Keep the accumulator-dependent K4 order while preloading the next K16.
-    load_swizzled_raw_a_k8_v4_u32(a0, a1, a2, a3, shared_query, q_row,
-                                   k16, 0);
+    load_swizzled_raw_a_k8_v4_u32(a0, a1, a2, a3, shared_query, q_row, k16, 0);
     mma_m8n8k4_row_col(accumulator, a0, a1, b0, b1, accumulator);
     if (has_next) {
-      load_key_k8_v4_u32(next_b0, next_b1, next_b2, next_b3,
-                          next_key_k16);
+      load_key_k8_v4_u32(next_b0, next_b1, next_b2, next_b3, next_key_k16);
     }
     mma_m8n8k4_row_col(accumulator, a2, a3, b2, b3, accumulator);
     if (has_next) {
-      load_key_k8_v4_u32(next_b4, next_b5, next_b6, next_b7,
-                          next_key_k16 + 8);
+      load_key_k8_v4_u32(next_b4, next_b5, next_b6, next_b7, next_key_k16 + 8);
     }
-    load_swizzled_raw_a_k8_v4_u32(a4, a5, a6, a7, shared_query, q_row,
-                                   k16, 1);
+    load_swizzled_raw_a_k8_v4_u32(a4, a5, a6, a7, shared_query, q_row, k16, 1);
     mma_m8n8k4_row_col(accumulator, a4, a5, b4, b5, accumulator);
     mma_m8n8k4_row_col(accumulator, a6, a7, b6, b7, accumulator);
     if (has_next) {
@@ -523,8 +517,8 @@ void qk_panel_raw_k16_double_kernel(const __half* __restrict__ query,
     }
   }
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
 #pragma unroll
   for (int reg = 0; reg < kRawRegisters; ++reg) {
     const int row = m_offset + raw_c_row(lane, reg);
@@ -533,8 +527,8 @@ void qk_panel_raw_k16_double_kernel(const __half* __restrict__ query,
   }
 }
 
-extern "C" __global__ __launch_bounds__(kRawThreads, 4)
-void qk_panel_raw_m16n256_reuse_b_kernel(
+extern "C" __global__
+__launch_bounds__(kRawThreads, 4) void qk_panel_raw_m16n256_reuse_b_kernel(
     const __half* __restrict__ query, const __half* __restrict__ key,
     float* __restrict__ output, int groups) {
   __shared__ __align__(16) __half shared_query[kQElements];
@@ -547,17 +541,16 @@ void qk_panel_raw_m16n256_reuse_b_kernel(
   const int lane = thread & 31;
   const int warp = thread >> 5;
   const int n_offset = warp * kRawN;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   stage_swizzled_query(query_group, shared_query, thread, kRawThreads);
   __syncthreads();
 
   float top_accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                            0.0f, 0.0f, 0.0f, 0.0f};
+                                          0.0f, 0.0f, 0.0f, 0.0f};
   float bottom_accumulator[kRawRegisters] = {0.0f, 0.0f, 0.0f, 0.0f,
-                                               0.0f, 0.0f, 0.0f, 0.0f};
+                                             0.0f, 0.0f, 0.0f, 0.0f};
   const int top_q_row = raw_a_row(lane);
   const int bottom_q_row = top_q_row + kRawM;
   const int key_token = n_offset + raw_b_col_n(lane);
@@ -579,35 +572,27 @@ void qk_panel_raw_m16n256_reuse_b_kernel(
 
     load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, top_q_row, k16, 0);
     mma_m8n8k4_row_col(top_accumulator, a0, a1, b0, b1, top_accumulator);
-    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16,
-                                   0);
-    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b0, b1,
-                        bottom_accumulator);
+    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16, 0);
+    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b0, b1, bottom_accumulator);
 
     load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, top_q_row, k16, 1);
     mma_m8n8k4_row_col(top_accumulator, a0, a1, b2, b3, top_accumulator);
-    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16,
-                                   1);
-    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b2, b3,
-                        bottom_accumulator);
+    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16, 1);
+    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b2, b3, bottom_accumulator);
 
     load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, top_q_row, k16, 2);
     mma_m8n8k4_row_col(top_accumulator, a0, a1, b4, b5, top_accumulator);
-    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16,
-                                   2);
-    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b4, b5,
-                        bottom_accumulator);
+    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16, 2);
+    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b4, b5, bottom_accumulator);
 
     load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, top_q_row, k16, 3);
     mma_m8n8k4_row_col(top_accumulator, a0, a1, b6, b7, top_accumulator);
-    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16,
-                                   3);
-    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b6, b7,
-                        bottom_accumulator);
+    load_swizzled_raw_a_k4_v2_u32(a0, a1, shared_query, bottom_q_row, k16, 3);
+    mma_m8n8k4_row_col(bottom_accumulator, a0, a1, b6, b7, bottom_accumulator);
   }
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
 #pragma unroll
   for (int reg = 0; reg < kRawRegisters; ++reg) {
     const int row = raw_c_row(lane, reg);
@@ -645,8 +630,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -680,8 +664,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta,
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -716,7 +700,8 @@ void print_json_string(const std::string& value) {
       default:
         if (character < 0x20) {
           std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
-                    << static_cast<int>(character) << std::dec << std::setfill(' ');
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -726,29 +711,23 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm
-            << ", \"resident_total_warps\": "
-            << resources.resident_total_warps
-            << ", \"resident_qk_warps\": "
-            << resources.resident_qk_warps
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"resident_total_warps\": " << resources.resident_total_warps
+            << ", \"resident_qk_warps\": " << resources.resident_qk_warps
             << ", \"threads_per_cta\": " << resources.threads_per_cta
-            << ", \"qk_warps_per_cta\": " << resources.qk_warps_per_cta
-            << '}';
+            << ", \"qk_warps_per_cta\": " << resources.qk_warps_per_cta << '}';
 }
 
 void print_json(const Args& args, const cudaDeviceProp& properties,
@@ -771,8 +750,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << properties.minor << "],\n";
   std::cout << "    \"cuda_runtime\": " << runtime_version << ",\n";
   std::cout << "    \"sm_count\": " << sm_count << ",\n";
-  std::cout << "    \"max_threads_per_sm\": " << max_threads_per_sm
-            << ",\n";
+  std::cout << "    \"max_threads_per_sm\": " << max_threads_per_sm << ",\n";
   std::cout << "    \"max_shared_per_sm\": " << max_shared_per_sm << "\n";
   std::cout << "  },\n";
   std::cout << "  \"target\": \"sm_70\",\n";
@@ -781,14 +759,17 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"output\": \"[groups, M16, N256]\",\n";
   std::cout << "    \"K\": 256,\n";
   std::cout << "    \"query_layout\": \"[group, M16, K256] token-major\",\n";
-  std::cout << "    \"key_layout\": \"[group, N256, K256] token-major stride 256\"\n";
+  std::cout
+      << "    \"key_layout\": \"[group, N256, K256] token-major stride 256\"\n";
   std::cout << "  },\n";
   std::cout << "  \"paths\": {\n";
-  std::cout << "    \"baseline\": \"2 CTA/group, BM16xBN128, 512 threads; first 8 warps run native WMMA\",\n";
+  std::cout << "    \"baseline\": \"2 CTA/group, BM16xBN128, 512 threads; "
+               "first 8 warps run native WMMA\",\n";
   std::cout << "    \"raw\": ";
   if (args.raw_variant == "raw_m16n256_reuse_b") {
     print_json_string(
-        "1 CTA/group, BM16xBN256, 256 threads; 8 warps reuse B across M8 halves");
+        "1 CTA/group, BM16xBN256, 256 threads; 8 warps reuse B across M8 "
+        "halves");
   } else {
     print_json_string(
         "2 CTA/group, BM8xBN256, 256 threads; 8 warps run raw m8n8k4 row.col");
@@ -800,7 +781,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"baseline_ctas_per_group\": 2,\n";
   std::cout << "    \"raw_ctas_per_group\": "
             << (args.raw_variant == "raw_m16n256_reuse_b" ? 1 : 2) << ",\n";
-  std::cout << "    \"shared_q\": \"accepted-path swizzled uint4 staging and canonical K order\",\n";
+  std::cout << "    \"shared_q\": \"accepted-path swizzled uint4 staging and "
+               "canonical K order\",\n";
   std::cout << "    \"raw_k4_order\": [0, 1, 2, 3],\n";
   std::cout << "    \"raw_b_load\": ";
   if (args.raw_variant == "raw_k4_vector") {
@@ -811,10 +793,12 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
         "two aligned inline PTX ld.global.v4.u32 loads per token/K16");
   } else if (args.raw_variant == "raw_k16_double") {
     print_json_string(
-        "K16 ping-pong: next two ld.global.v4.u32 loads interleaved with current HMMA");
+        "K16 ping-pong: next two ld.global.v4.u32 loads interleaved with "
+        "current HMMA");
   } else {
     print_json_string(
-        "two aligned inline PTX ld.global.v4.u32 loads per token/K16 reused by top and bottom M8 HMMA");
+        "two aligned inline PTX ld.global.v4.u32 loads per token/K16 reused by "
+        "top and bottom M8 HMMA");
   }
   std::cout << "\n";
   std::cout << "  },\n";
@@ -825,11 +809,9 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ",\n";
   std::cout << "    \"bitwise_equal\": "
             << (exactness.bitwise_equal ? "true" : "false") << ",\n";
-  std::cout << "    \"mismatch_words\": " << exactness.mismatch_words
-            << ",\n";
-  std::cout << "    \"xor\": {\"max_word\": "
-            << exactness.max_word_xor << ", \"reduction\": "
-            << exactness.xor_reduction << "},\n";
+  std::cout << "    \"mismatch_words\": " << exactness.mismatch_words << ",\n";
+  std::cout << "    \"xor\": {\"max_word\": " << exactness.max_word_xor
+            << ", \"reduction\": " << exactness.xor_reduction << "},\n";
   std::cout << "    \"max_abs_error\": " << exactness.max_abs_error << "\n";
   std::cout << "  },\n";
   std::cout << "  \"timing\": {\n";
@@ -838,14 +820,13 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   print_timing(baseline_timing);
   std::cout << ",\n    \"raw\": ";
   print_timing(raw_timing);
-  std::cout << ",\n    \"raw_speedup_vs_baseline_pct\": "
-            << raw_speedup_pct << "\n";
+  std::cout << ",\n    \"raw_speedup_vs_baseline_pct\": " << raw_speedup_pct
+            << "\n";
   std::cout << "  },\n";
   std::cout << "  \"pairs\": {\n";
   std::cout << "    \"count\": " << pairs.count << ",\n";
   std::cout << "    \"raw_faster\": " << pairs.raw_faster << ",\n";
-  std::cout << "    \"baseline_faster\": " << pairs.baseline_faster
-            << ",\n";
+  std::cout << "    \"baseline_faster\": " << pairs.baseline_faster << ",\n";
   std::cout << "    \"ties\": " << pairs.ties << ",\n";
   std::cout << "    \"raw_minus_baseline_median_us\": "
             << pairs.raw_minus_baseline_median_us << ",\n";
@@ -857,7 +838,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"rounds\": " << args.rounds << ",\n";
   std::cout << "    \"launches_per_sample\": " << args.launches_per_sample
             << ",\n";
-  std::cout << "    \"interleaving\": \"baseline/raw order alternates every round\"\n";
+  std::cout << "    \"interleaving\": \"baseline/raw order alternates every "
+               "round\"\n";
   std::cout << "  },\n";
   std::cout << "  \"resources\": {\n";
   std::cout << "    \"baseline\": ";
@@ -882,7 +864,8 @@ int run(const Args& args) {
   CUDA_CHECK(cudaGetDeviceCount(&device_count));
   if (args.device < 0 || args.device >= device_count) {
     std::cerr << "Requested logical CUDA device " << args.device
-              << " is unavailable; visible device count is " << device_count << '\n';
+              << " is unavailable; visible device count is " << device_count
+              << '\n';
     return EXIT_FAILURE;
   }
   if (args.groups < 1 || args.warmup < 0 || args.rounds < 1 ||
@@ -952,8 +935,9 @@ int run(const Args& args) {
                         key_elements * sizeof(__half), cudaMemcpyHostToDevice));
 
   const dim3 baseline_grid(args.groups * 2);
-  const dim3 raw_grid(args.raw_variant == "raw_m16n256_reuse_b" ? args.groups
-                                                                   : args.groups * 2);
+  const dim3 raw_grid(args.raw_variant == "raw_m16n256_reuse_b"
+                          ? args.groups
+                          : args.groups * 2);
   auto launch_baseline = [&] {
     qk_panel_baseline_kernel<<<baseline_grid, kBaselineThreads>>>(
         device_query, device_key, device_baseline, args.groups);
@@ -1006,7 +990,8 @@ int run(const Args& args) {
                         output_elements * sizeof(float),
                         cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_raw.data(), device_raw,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
 
   Exactness exactness;
   exactness.bitwise_equal = true;
@@ -1038,8 +1023,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -1062,19 +1046,19 @@ int run(const Args& args) {
   CUDA_CHECK(cudaEventDestroy(stop));
   CUDA_CHECK(cudaEventDestroy(start));
 
-  const KernelResources baseline_resources = query_resources(
-      qk_panel_baseline_kernel, kBaselineThreads, kBaselineQKWarps,
-      args.device);
+  const KernelResources baseline_resources =
+      query_resources(qk_panel_baseline_kernel, kBaselineThreads,
+                      kBaselineQKWarps, args.device);
   KernelResources raw_resources;
   if (args.raw_variant == "raw_k4_vector") {
-    raw_resources = query_resources(qk_panel_raw_k4_vector_kernel,
-                                    kRawThreads, kRawQKWarps, args.device);
+    raw_resources = query_resources(qk_panel_raw_k4_vector_kernel, kRawThreads,
+                                    kRawQKWarps, args.device);
   } else if (args.raw_variant == "raw_k16_stage") {
-    raw_resources = query_resources(qk_panel_raw_k16_stage_kernel,
-                                    kRawThreads, kRawQKWarps, args.device);
+    raw_resources = query_resources(qk_panel_raw_k16_stage_kernel, kRawThreads,
+                                    kRawQKWarps, args.device);
   } else if (args.raw_variant == "raw_k16_double") {
-    raw_resources = query_resources(qk_panel_raw_k16_double_kernel,
-                                    kRawThreads, kRawQKWarps, args.device);
+    raw_resources = query_resources(qk_panel_raw_k16_double_kernel, kRawThreads,
+                                    kRawQKWarps, args.device);
   } else {
     raw_resources = query_resources(qk_panel_raw_m16n256_reuse_b_kernel,
                                     kRawThreads, kRawQKWarps, args.device);

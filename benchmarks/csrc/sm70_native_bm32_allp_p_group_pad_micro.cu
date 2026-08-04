@@ -40,21 +40,22 @@ constexpr float kNegativeInfinity = -1e30f;
 static_assert(kM == 2 * kPanelM);
 static_assert(kBlockN == kQKWarps * kPanelN);
 static_assert(kSoftmaxPanelN == 2 * kPanelK);
-static_assert(kPPanelElements == kProbabilityGroups * kPanelM * kProbabilityGroupN);
+static_assert(kPPanelElements ==
+              kProbabilityGroups * kPanelM * kProbabilityGroupN);
 static_assert(kCandidateThreads / 32 == kM / 2);
 
 using MatrixAFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using QKMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::col_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::col_major>;
 using PVMatrixBFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN,
-                          kPanelK, __half, nvcuda::wmma::row_major>;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kPanelN, kPanelK,
+                           __half, nvcuda::wmma::row_major>;
 using AccumulatorFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN,
-                          kPanelK, float>;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM, kPanelN, kPanelK,
+                           float>;
 
 // Retain each 32-column probability panel until its matching PV phase.
 struct alignas(16) BaselineShared {
@@ -73,9 +74,9 @@ struct alignas(16) CandidateShared {
   __half query[kQElements];
   float score[kM * kBlockN];
   __half probability_top[kSoftmaxPanelsPerBlock]
-                         [3 * 136 + kPanelM * kProbabilityGroupN];
+                        [3 * 136 + kPanelM * kProbabilityGroupN];
   __half probability_bottom[kSoftmaxPanelsPerBlock]
-                            [3 * 136 + kPanelM * kProbabilityGroupN];
+                           [3 * 136 + kPanelM * kProbabilityGroupN];
   float row_max[kM];
   float row_sum[kM];
   float row_exp_diff[kSoftmaxPanelsPerBlock][kM];
@@ -189,22 +190,19 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     MatrixAFragment& fragment, const __half* __restrict__ matrix,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_row_slot(row);
   const int tile_offset = (k_offset / kPanelK) * kPanelM * kPanelK;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      matrix + tile_offset + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(matrix + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kPanelM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
@@ -225,35 +223,31 @@ __device__ __forceinline__ void load_group_padded_probability_matrix_a_fragment(
     MatrixAFragment& fragment, const __half* __restrict__ probability,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_row_slot(row);
   const int first_group = k_offset / kProbabilityGroupN;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      probability + first_group * 136 + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(probability + first_group * 136 + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += 136 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
 
-__device__ __forceinline__ int accumulator_fragment_row(int lane,
-                                                         int element) {
+__device__ __forceinline__ int accumulator_fragment_row(int lane, int element) {
   const int row_base =
       (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
   return row_base + ((element >> 1) & 1) * 2;
 }
 
 __device__ __forceinline__ int accumulator_fragment_column(int lane,
-                                                            int element) {
+                                                           int element) {
   const int column_base = ((lane >> 1) & 1) * 2 + ((lane >> 3) & 1) * 8;
   return column_base + (element & 1) + ((element >> 2) & 1) * 4;
 }
@@ -274,8 +268,7 @@ __device__ __forceinline__ void qk_pair_accumulate(
     load_swizzled_matrix_a_fragment(a_fragment, shared_query_top, k_offset);
     nvcuda::wmma::mma_sync(top_accumulator, a_fragment, b_fragment,
                            top_accumulator);
-    load_swizzled_matrix_a_fragment(a_fragment, shared_query_bottom,
-                                    k_offset);
+    load_swizzled_matrix_a_fragment(a_fragment, shared_query_bottom, k_offset);
     nvcuda::wmma::mma_sync(bottom_accumulator, a_fragment, b_fragment,
                            bottom_accumulator);
   }
@@ -296,8 +289,8 @@ __device__ __forceinline__ float make_probability_row(
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_max = fmaxf(thread_max,
-                        __shfl_down_sync(0xffffffffU, thread_max, offset));
+    thread_max =
+        fmaxf(thread_max, __shfl_down_sync(0xffffffffU, thread_max, offset));
   }
   const float panel_max = __shfl_sync(0xffffffffU, thread_max, 0);
   const float old_max = row_max[state_row];
@@ -349,8 +342,8 @@ __device__ __forceinline__ float make_group_padded_probability_row(
 
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    thread_max = fmaxf(thread_max,
-                        __shfl_down_sync(0xffffffffU, thread_max, offset));
+    thread_max =
+        fmaxf(thread_max, __shfl_down_sync(0xffffffffU, thread_max, offset));
   }
   const float panel_max = __shfl_sync(0xffffffffU, thread_max, 0);
   const float old_max = row_max[state_row];
@@ -368,11 +361,11 @@ __device__ __forceinline__ float make_group_padded_probability_row(
 
     const int column = lane * 4;
     __half2* first_pair = reinterpret_cast<__half2*>(
-        probability + group_padded_probability_matrix_a_offset(
-                          probability_row, column));
+        probability +
+        group_padded_probability_matrix_a_offset(probability_row, column));
     __half2* second_pair = reinterpret_cast<__half2*>(
-        probability + group_padded_probability_matrix_a_offset(
-                          probability_row, column + 2));
+        probability +
+        group_padded_probability_matrix_a_offset(probability_row, column + 2));
     *first_pair = __float22half2_rn(make_float2(values.x, values.y));
     *second_pair = __float22half2_rn(make_float2(values.z, values.w));
   }
@@ -409,8 +402,7 @@ __device__ __forceinline__ void scale_phase_reuse_accumulators(
   const int row = accumulator_fragment_row(threadIdx.x & 31, 0);
   scale_accumulator_two_rows(accumulator_top, row_exp_diff[row],
                              row_exp_diff[row + 2]);
-  scale_accumulator_two_rows(accumulator_bottom,
-                             row_exp_diff[kPanelM + row],
+  scale_accumulator_two_rows(accumulator_bottom, row_exp_diff[kPanelM + row],
                              row_exp_diff[kPanelM + row + 2]);
 }
 
@@ -434,8 +426,8 @@ __device__ __forceinline__ void update_phase_reuse_pv_panel(
   {
     MatrixAFragment a_fragment;
     PVMatrixBFragment b_fragment;
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, value_panel + kPanelK * kD + d_offset, kD);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   value_panel + kPanelK * kD + d_offset, kD);
     load_swizzled_matrix_a_fragment(a_fragment, probability_top, kPanelK);
     nvcuda::wmma::mma_sync(accumulator_top, a_fragment, b_fragment,
                            accumulator_top);
@@ -455,22 +447,22 @@ __device__ __forceinline__ void update_group_padded_probability_pv_panel(
     MatrixAFragment a_fragment;
     PVMatrixBFragment b_fragment;
     nvcuda::wmma::load_matrix_sync(b_fragment, value_panel + d_offset, kD);
-    load_group_padded_probability_matrix_a_fragment(a_fragment,
-                                                     probability_top, 0);
+    load_group_padded_probability_matrix_a_fragment(a_fragment, probability_top,
+                                                    0);
     nvcuda::wmma::mma_sync(accumulator_top, a_fragment, b_fragment,
                            accumulator_top);
     load_group_padded_probability_matrix_a_fragment(a_fragment,
-                                                     probability_bottom, 0);
+                                                    probability_bottom, 0);
     nvcuda::wmma::mma_sync(accumulator_bottom, a_fragment, b_fragment,
                            accumulator_bottom);
   }
   {
     MatrixAFragment a_fragment;
     PVMatrixBFragment b_fragment;
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, value_panel + kPanelK * kD + d_offset, kD);
-    load_group_padded_probability_matrix_a_fragment(a_fragment,
-                                                     probability_top, kPanelK);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   value_panel + kPanelK * kD + d_offset, kD);
+    load_group_padded_probability_matrix_a_fragment(a_fragment, probability_top,
+                                                    kPanelK);
     nvcuda::wmma::mma_sync(accumulator_top, a_fragment, b_fragment,
                            accumulator_top);
     load_group_padded_probability_matrix_a_fragment(
@@ -510,31 +502,29 @@ __device__ __forceinline__ void spill_qk_warp_pv_accumulators(
 #pragma unroll
   for (int element_pair = 0; element_pair < 4; ++element_pair) {
     const int top_offset =
-        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN
-        + pair_column;
+        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN +
+        pair_column;
     const uint32_t top_address = static_cast<uint32_t>(
         __cvta_generic_to_shared(shared_score + top_offset));
     asm volatile("st.shared.v2.u32 [%0], {%1, %2};"
                  :
                  : "r"(top_address),
-                   "r"(__float_as_uint(
-                       accumulator_top.x[2 * element_pair])),
-                   "r"(__float_as_uint(
-                       accumulator_top.x[2 * element_pair + 1]))
+                   "r"(__float_as_uint(accumulator_top.x[2 * element_pair])),
+                   "r"(__float_as_uint(accumulator_top.x[2 * element_pair + 1]))
                  : "memory");
-    asm volatile("st.shared.v2.u32 [%0+4096], {%1, %2};"
-                 :
-                 : "r"(top_address),
-                   "r"(__float_as_uint(
-                       accumulator_bottom.x[2 * element_pair])),
-                   "r"(__float_as_uint(
-                       accumulator_bottom.x[2 * element_pair + 1]))
-                 : "memory");
+    asm volatile(
+        "st.shared.v2.u32 [%0+4096], {%1, %2};"
+        :
+        : "r"(top_address),
+          "r"(__float_as_uint(accumulator_bottom.x[2 * element_pair])),
+          "r"(__float_as_uint(accumulator_bottom.x[2 * element_pair + 1]))
+        : "memory");
   }
 }
 
 __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
-    const float* __restrict__ shared_score, AccumulatorFragment& accumulator_top,
+    const float* __restrict__ shared_score,
+    AccumulatorFragment& accumulator_top,
     AccumulatorFragment& accumulator_bottom) {
   const int warp = threadIdx.x >> 5;
   if (warp >= kQKWarps) {
@@ -549,8 +539,8 @@ __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
 #pragma unroll
   for (int element_pair = 0; element_pair < 4; ++element_pair) {
     const int top_offset =
-        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN
-        + pair_column;
+        (warp_in_pair * 16 + element_pair * 2 + lane_row) * kBlockN +
+        pair_column;
     const uint32_t top_address = static_cast<uint32_t>(
         __cvta_generic_to_shared(shared_score + top_offset));
     uint32_t first_word;
@@ -566,8 +556,7 @@ __device__ __forceinline__ void reload_qk_warp_pv_accumulators(
                  : "r"(top_address)
                  : "memory");
     accumulator_bottom.x[2 * element_pair] = __uint_as_float(first_word);
-    accumulator_bottom.x[2 * element_pair + 1] =
-        __uint_as_float(second_word);
+    accumulator_bottom.x[2 * element_pair + 1] = __uint_as_float(second_word);
   }
 }
 
@@ -576,8 +565,8 @@ __device__ __forceinline__ void sync_qk_warp_pair(int warp_pair) {
   asm volatile("bar.sync %0, 64;" : : "r"(barrier_id) : "memory");
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 2)
-void sm70_native_bm32_allp_p_group_pad_baseline(
+extern "C" __global__
+__launch_bounds__(kCandidateThreads, 2) void sm70_native_bm32_allp_p_group_pad_baseline(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -593,8 +582,8 @@ void sm70_native_bm32_allp_p_group_pad_baseline(
     stage_swizzled_q_panel(query_group, shared.query, threadIdx.x,
                            kCandidateThreads);
     stage_swizzled_q_panel(query_group + kQPanelElements,
-                            shared.query + kQPanelElements, threadIdx.x,
-                            kCandidateThreads);
+                           shared.query + kQPanelElements, threadIdx.x,
+                           kCandidateThreads);
   }
   if (threadIdx.x < kM) {
     shared.row_max[threadIdx.x] = kNegativeInfinity;
@@ -617,23 +606,22 @@ void sm70_native_bm32_allp_p_group_pad_baseline(
     const int qk_warp = threadIdx.x >> 5;
     if (qk_warp < kQKWarps) {
       const int n_offset = qk_warp * kPanelN;
-      const __half* key_group = key + static_cast<int64_t>(group) * nblocks *
-                                        kBlockN * kD;
+      const __half* key_group =
+          key + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
       spill_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                     accumulator_bottom);
       asm volatile("" ::: "memory");
       AccumulatorFragment qk_top;
       AccumulatorFragment qk_bottom;
-      qk_pair_accumulate(shared.query, shared.query + kQPanelElements,
-                         key_group +
-                             (shared.block_index * kBlockN + n_offset) * kD,
-                         qk_top, qk_bottom);
+      qk_pair_accumulate(
+          shared.query, shared.query + kQPanelElements,
+          key_group + (shared.block_index * kBlockN + n_offset) * kD, qk_top,
+          qk_bottom);
       asm volatile("" ::: "memory");
       reload_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                      accumulator_bottom);
       sync_qk_warp_pair(qk_warp >> 1);
-      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top,
-                                      kBlockN,
+      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top, kBlockN,
                                       nvcuda::wmma::mem_row_major);
       nvcuda::wmma::store_matrix_sync(
           shared.score + kPanelM * kBlockN + n_offset, qk_bottom, kBlockN,
@@ -645,9 +633,8 @@ void sm70_native_bm32_allp_p_group_pad_baseline(
     for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
       const int phase_warp = threadIdx.x >> 5;
       const float top_exp_diff = make_probability_row(
-          shared.score + phase_warp * kBlockN,
-          shared.probability_top[panel], phase_warp, shared.row_max,
-          shared.row_sum, phase_warp, panel);
+          shared.score + phase_warp * kBlockN, shared.probability_top[panel],
+          phase_warp, shared.row_max, shared.row_sum, phase_warp, panel);
       const float bottom_exp_diff = make_probability_row(
           shared.score + (kPanelM + phase_warp) * kBlockN,
           shared.probability_bottom[panel], phase_warp, shared.row_max,
@@ -685,8 +672,7 @@ void sm70_native_bm32_allp_p_group_pad_baseline(
     __syncthreads();
   }
 
-  __half* output_group =
-      output + static_cast<int64_t>(group) * kOutputElements;
+  __half* output_group = output + static_cast<int64_t>(group) * kOutputElements;
   const int d_offset = (threadIdx.x >> 5) * kPanelN;
   store_accumulator_output(accumulator_top, output_group, shared.row_sum, 0,
                            d_offset);
@@ -694,8 +680,8 @@ void sm70_native_bm32_allp_p_group_pad_baseline(
                            kPanelM, d_offset);
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 2)
-void sm70_native_bm32_allp_p_group_pad_candidate(
+extern "C" __global__
+__launch_bounds__(kCandidateThreads, 2) void sm70_native_bm32_allp_p_group_pad_candidate(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -712,8 +698,8 @@ void sm70_native_bm32_allp_p_group_pad_candidate(
     stage_swizzled_q_panel(query_group, shared.query, threadIdx.x,
                            kCandidateThreads);
     stage_swizzled_q_panel(query_group + kQPanelElements,
-                            shared.query + kQPanelElements, threadIdx.x,
-                            kCandidateThreads);
+                           shared.query + kQPanelElements, threadIdx.x,
+                           kCandidateThreads);
   }
   if (threadIdx.x < kM) {
     shared.row_max[threadIdx.x] = kNegativeInfinity;
@@ -736,23 +722,22 @@ void sm70_native_bm32_allp_p_group_pad_candidate(
     const int qk_warp = threadIdx.x >> 5;
     if (qk_warp < kQKWarps) {
       const int n_offset = qk_warp * kPanelN;
-      const __half* key_group = key + static_cast<int64_t>(group) * nblocks *
-                                        kBlockN * kD;
+      const __half* key_group =
+          key + static_cast<int64_t>(group) * nblocks * kBlockN * kD;
       spill_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                     accumulator_bottom);
       asm volatile("" ::: "memory");
       AccumulatorFragment qk_top;
       AccumulatorFragment qk_bottom;
-      qk_pair_accumulate(shared.query, shared.query + kQPanelElements,
-                         key_group +
-                             (shared.block_index * kBlockN + n_offset) * kD,
-                         qk_top, qk_bottom);
+      qk_pair_accumulate(
+          shared.query, shared.query + kQPanelElements,
+          key_group + (shared.block_index * kBlockN + n_offset) * kD, qk_top,
+          qk_bottom);
       asm volatile("" ::: "memory");
       reload_qk_warp_pv_accumulators(shared.score, accumulator_top,
                                      accumulator_bottom);
       sync_qk_warp_pair(qk_warp >> 1);
-      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top,
-                                      kBlockN,
+      nvcuda::wmma::store_matrix_sync(shared.score + n_offset, qk_top, kBlockN,
                                       nvcuda::wmma::mem_row_major);
       nvcuda::wmma::store_matrix_sync(
           shared.score + kPanelM * kBlockN + n_offset, qk_bottom, kBlockN,
@@ -764,9 +749,8 @@ void sm70_native_bm32_allp_p_group_pad_candidate(
     for (int panel = 0; panel < kSoftmaxPanelsPerBlock; ++panel) {
       const int phase_warp = threadIdx.x >> 5;
       const float top_exp_diff = make_group_padded_probability_row(
-          shared.score + phase_warp * kBlockN,
-          shared.probability_top[panel], phase_warp, shared.row_max,
-          shared.row_sum, phase_warp, panel);
+          shared.score + phase_warp * kBlockN, shared.probability_top[panel],
+          phase_warp, shared.row_max, shared.row_sum, phase_warp, panel);
       const float bottom_exp_diff = make_group_padded_probability_row(
           shared.score + (kPanelM + phase_warp) * kBlockN,
           shared.probability_bottom[panel], phase_warp, shared.row_max,
@@ -804,8 +788,7 @@ void sm70_native_bm32_allp_p_group_pad_candidate(
     __syncthreads();
   }
 
-  __half* output_group =
-      output + static_cast<int64_t>(group) * kOutputElements;
+  __half* output_group = output + static_cast<int64_t>(group) * kOutputElements;
   const int d_offset = (threadIdx.x >> 5) * kPanelN;
   store_accumulator_output(accumulator_top, output_group, shared.row_sum, 0,
                            d_offset);
@@ -828,8 +811,7 @@ float random_half_value(uint32_t* state) {
 }
 
 float alternating_half_value(size_t index, uint32_t salt) {
-  const int magnitude =
-      1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
+  const int magnitude = 1 + static_cast<int>((index * 17u + salt * 29u) % 127u);
   const float value = static_cast<float>(magnitude) / 512.0f;
   return ((index + salt) & 1u) == 0 ? value : -value;
 }
@@ -856,19 +838,17 @@ Exactness compare_outputs(const std::vector<__half>& baseline,
   result.bitwise_equal = true;
   const size_t word_count = baseline.size() / 2;
   for (size_t word = 0; word < word_count; ++word) {
-    const uint32_t word_xor =
-        half_word_bits(baseline.data(), word) ^
-        half_word_bits(candidate.data(), word);
+    const uint32_t word_xor = half_word_bits(baseline.data(), word) ^
+                              half_word_bits(candidate.data(), word);
     result.xor_reduction ^= word_xor;
     result.max_word_xor = std::max(result.max_word_xor, word_xor);
     result.bitwise_equal &= word_xor == 0;
     result.mismatch_words += word_xor != 0;
   }
   for (size_t index = 0; index < baseline.size(); ++index) {
-    result.max_abs_error =
-        std::max(result.max_abs_error,
-                 std::fabs(__half2float(baseline[index]) -
-                           __half2float(candidate[index])));
+    result.max_abs_error = std::max(result.max_abs_error,
+                                    std::fabs(__half2float(baseline[index]) -
+                                              __half2float(candidate[index])));
   }
   return result;
 }
@@ -881,8 +861,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -915,8 +894,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta) {
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -956,9 +935,9 @@ void print_json_string(const std::string& value) {
         break;
       default:
         if (character < 0x20) {
-          std::cout << "\\u00" << std::hex << std::setw(2)
-                    << std::setfill('0') << static_cast<int>(character)
-                    << std::dec << std::setfill(' ');
+          std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -968,25 +947,22 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm << ", \"threads_per_cta\": "
-            << resources.threads_per_cta << ", \"warps_per_cta\": "
-            << resources.warps_per_cta << ", \"resident_warps\": "
-            << resources.resident_warps << '}';
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"threads_per_cta\": " << resources.threads_per_cta
+            << ", \"warps_per_cta\": " << resources.warps_per_cta
+            << ", \"resident_warps\": " << resources.resident_warps << '}';
 }
 
 void print_exactness(const Exactness& exactness, int64_t word_count) {
@@ -1020,8 +996,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
             << ", \"name\": ";
   print_json_string(properties.name);
   std::cout << ", \"capability\": [" << properties.major << ", "
-            << properties.minor << "], \"cuda_runtime\": "
-            << runtime_version << ", \"sm_count\": " << sm_count << "},\n";
+            << properties.minor << "], \"cuda_runtime\": " << runtime_version
+            << ", \"sm_count\": " << sm_count << "},\n";
   std::cout << "  \"target\": \"sm_70\",\n";
   std::cout << "  \"shape\": {\"groups\": " << args.groups
             << ", \"nblocks\": " << args.nblocks
@@ -1038,60 +1014,76 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
                "\"panel_fp16\": 512, \"physical_panel_fp16\": 536, "
                "\"top_bottom_panels\": 8, \"baseline_top_bottom_bytes\": 8192, "
                "\"candidate_top_bottom_bytes\": 8576, "
-               "\"baseline_offset\": \"group*128 + swizzled_slot(row)*8 + inner; group=column/8\", "
-               "\"candidate_offset\": \"group*136 + swizzled_slot(row)*8 + inner; group=column/8\", "
-               "\"bank_proof\": \"group base is 136 fp16 = 272B = 68 banks, or +4 mod 32; 32-bit store bank=(4*swizzled_slot+4*group+inner/2) mod 32, so groups 0..3 use four distinct banks and reduce the static four-way collision to one-way\", "
-               "\"pv_matrix_a_loader\": \"P-only; two ld.shared.v4.u32 (LDS.128) per M16xK16 fragment; second address is first +272B with no second generic offset/cvta; Q loader unchanged\"},\n";
+               "\"baseline_offset\": \"group*128 + swizzled_slot(row)*8 + "
+               "inner; group=column/8\", "
+               "\"candidate_offset\": \"group*136 + swizzled_slot(row)*8 + "
+               "inner; group=column/8\", "
+               "\"bank_proof\": \"group base is 136 fp16 = 272B = 68 banks, or "
+               "+4 mod 32; 32-bit store bank=(4*swizzled_slot+4*group+inner/2) "
+               "mod 32, so groups 0..3 use four distinct banks and reduce the "
+               "static four-way collision to one-way\", "
+               "\"pv_matrix_a_loader\": \"P-only; two ld.shared.v4.u32 "
+               "(LDS.128) per M16xK16 fragment; second address is first +272B "
+               "with no second generic offset/cvta; Q loader unchanged\"},\n";
   std::cout << "  \"paths\": {\n";
-  std::cout << "    \"baseline\": \"1 CTA/group; BM32, 512 threads; accepted all-P pair-scratch QK, softmax, PV\",\n";
-  std::cout << "    \"candidate\": \"1 CTA/group; BM32, 512 threads; same accepted pair-scratch path with P 136-half group-pad layout only\",\n";
-  std::cout << "    \"qk\": \"warps 0..7; one K fragment then top/bottom M16\",\n";
-  std::cout << "    \"softmax\": \"16 warps; matching top/bottom rows with 32-lane reductions\",\n";
-  std::cout << "    \"pv\": \"16 warps; one D16 and two FP32 accumulators, one V fragment then top/bottom M16\",\n";
+  std::cout << "    \"baseline\": \"1 CTA/group; BM32, 512 threads; accepted "
+               "all-P pair-scratch QK, softmax, PV\",\n";
+  std::cout
+      << "    \"candidate\": \"1 CTA/group; BM32, 512 threads; same accepted "
+         "pair-scratch path with P 136-half group-pad layout only\",\n";
+  std::cout
+      << "    \"qk\": \"warps 0..7; one K fragment then top/bottom M16\",\n";
+  std::cout << "    \"softmax\": \"16 warps; matching top/bottom rows with "
+               "32-lane reductions\",\n";
+  std::cout << "    \"pv\": \"16 warps; one D16 and two FP32 accumulators, one "
+               "V fragment then top/bottom M16\",\n";
   std::cout << "    \"cross_block_overlap\": \"disabled\",\n";
   std::cout << "    \"score_buffers\": 1,\n";
   std::cout << "    \"probability_panels\": 4,\n";
-  std::cout << "    \"baseline_shared_layout_bytes\": " << sizeof(BaselineShared)
-            << ",\n"
-            << "    \"candidate_shared_layout_bytes\": " << sizeof(CandidateShared)
-            << "\n";
+  std::cout << "    \"baseline_shared_layout_bytes\": "
+            << sizeof(BaselineShared) << ",\n"
+            << "    \"candidate_shared_layout_bytes\": "
+            << sizeof(CandidateShared) << "\n";
   std::cout << "  },\n";
-  std::cout << "  \"scratch\": {\"storage\": \"shared.score\", "
-               "\"ownership\": \"each QK warp pair owns one disjoint 32-column score slab\", "
-               "\"row\": \"16*warp_in_pair+2*element_pair+lane/16 (+8 for bottom)\", "
-               "\"column\": \"32*warp_pair+2*(lane%16)\", "
-               "\"minimum_bank_replay\": 2, "
-               "\"handoff\": \"one 64-thread named barrier per QK warp pair\", "
-               "\"qk_warps\": 8, \"fragments_per_warp\": 2, "
-               "\"shared_v2_spills_per_fragment\": 4, "
-               "\"shared_v2_reloads_per_fragment\": 4, "
-               "\"shared_v2_spills_per_qk_warp\": 8, "
-               "\"shared_v2_reloads_per_qk_warp\": 8, "
-               "\"shared_v2_spills_per_cta\": 64, "
-               "\"shared_v2_reloads_per_cta\": 64},\n";
+  std::cout
+      << "  \"scratch\": {\"storage\": \"shared.score\", "
+         "\"ownership\": \"each QK warp pair owns one disjoint 32-column score "
+         "slab\", "
+         "\"row\": \"16*warp_in_pair+2*element_pair+lane/16 (+8 for bottom)\", "
+         "\"column\": \"32*warp_pair+2*(lane%16)\", "
+         "\"minimum_bank_replay\": 2, "
+         "\"handoff\": \"one 64-thread named barrier per QK warp pair\", "
+         "\"qk_warps\": 8, \"fragments_per_warp\": 2, "
+         "\"shared_v2_spills_per_fragment\": 4, "
+         "\"shared_v2_reloads_per_fragment\": 4, "
+         "\"shared_v2_spills_per_qk_warp\": 8, "
+         "\"shared_v2_reloads_per_qk_warp\": 8, "
+         "\"shared_v2_spills_per_cta\": 64, "
+         "\"shared_v2_reloads_per_cta\": 64},\n";
   std::cout << "  \"execution\": {\"profile_only\": "
             << (args.profile_only ? "true" : "false")
-            << ", \"smoke_only\": "
-            << (args.smoke_only ? "true" : "false")
+            << ", \"smoke_only\": " << (args.smoke_only ? "true" : "false")
             << ", \"resource_gate_pass\": "
             << (resource_pass ? "true" : "false")
-            << ", \"kernels_executed\": "
-            << (executed ? "true" : "false") << "},\n";
+            << ", \"kernels_executed\": " << (executed ? "true" : "false")
+            << "},\n";
   std::cout << "  \"resources\": {\"baseline\": ";
   print_resources(baseline_resources);
   std::cout << ", \"candidate\": ";
   print_resources(candidate_resources);
   std::cout << "},\n";
-  std::cout << "  \"resource_gate\": {\"max_registers_per_thread\": 64, "
-               "\"requires_zero_stack_local_spills\": true, "
-               "\"baseline_required_static_shared_bytes\": "
-            << sizeof(BaselineShared)
-            << ", \"candidate_required_static_shared_bytes\": "
-            << sizeof(CandidateShared)
-            << ", \"min_active_ctas_per_sm\": 2, "
-               "\"runtime_pass\": "
-            << (resource_pass ? "true" : "false")
-            << ", \"ptxas_validation\": \"compile with -O3 and --ptxas-options=-v; require 0 stack frame, 0 spill stores, 0 spill loads\"},\n";
+  std::cout
+      << "  \"resource_gate\": {\"max_registers_per_thread\": 64, "
+         "\"requires_zero_stack_local_spills\": true, "
+         "\"baseline_required_static_shared_bytes\": "
+      << sizeof(BaselineShared)
+      << ", \"candidate_required_static_shared_bytes\": "
+      << sizeof(CandidateShared)
+      << ", \"min_active_ctas_per_sm\": 2, "
+         "\"runtime_pass\": "
+      << (resource_pass ? "true" : "false")
+      << ", \"ptxas_validation\": \"compile with -O3 and --ptxas-options=-v; "
+         "require 0 stack frame, 0 spill stores, 0 spill loads\"},\n";
   std::cout << "  \"exactness\": ";
   if (exactness_available) {
     print_exactness(exactness,
@@ -1126,16 +1118,17 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
     std::cout << "null";
   }
   std::cout << ",\n";
-  std::cout << "  \"tradeoff\": {\"candidate_extra_shared_bytes\": 384, "
-               "\"candidate_extra_fp16_per_panel\": 24, "
-               "\"baseline_shared_bytes\": 41744, "
-               "\"candidate_shared_bytes\": 42128, "
-               "\"qk_k_fragment_reuse\": 2, "
-               "\"pv_v_fragment_reuse\": 2, "
-               "\"cross_block_overlap\": \"disabled\", "
-               "\"panel_qk_reuse_evidence_pct\": 17.856, "
-               "\"panel_pv_reuse_evidence_pct\": 10.890, "
-               "\"net_candidate_minus_baseline_median_us_after_overlap_removal\": ";
+  std::cout
+      << "  \"tradeoff\": {\"candidate_extra_shared_bytes\": 384, "
+         "\"candidate_extra_fp16_per_panel\": 24, "
+         "\"baseline_shared_bytes\": 41744, "
+         "\"candidate_shared_bytes\": 42128, "
+         "\"qk_k_fragment_reuse\": 2, "
+         "\"pv_v_fragment_reuse\": 2, "
+         "\"cross_block_overlap\": \"disabled\", "
+         "\"panel_qk_reuse_evidence_pct\": 17.856, "
+         "\"panel_pv_reuse_evidence_pct\": 10.890, "
+         "\"net_candidate_minus_baseline_median_us_after_overlap_removal\": ";
   if (timing_available) {
     std::cout << pairs.candidate_minus_baseline_median_us
               << ", \"net_candidate_speedup_pct_after_overlap_removal\": "
@@ -1145,15 +1138,18 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
                       ? "true"
                       : "false");
   } else {
-    std::cout << "null, \"net_candidate_speedup_pct_after_overlap_removal\": null, "
-                 "\"reuse_exceeds_lost_overlap_at_wall_time\": null";
+    std::cout
+        << "null, \"net_candidate_speedup_pct_after_overlap_removal\": null, "
+           "\"reuse_exceeds_lost_overlap_at_wall_time\": null";
   }
   std::cout << "},\n";
   std::cout << "  \"measurement\": {\"warmup_pairs\": " << args.warmup
             << ", \"rounds\": " << args.rounds
             << ", \"launches_per_sample\": " << args.launches_per_sample
-            << ", \"interleaving\": \"baseline/candidate order alternates each round\", "
-               "\"formal_gate\": \"100 paired rounds x 8 launches; at least 95 candidate wins and at least 2 percent wall-time win\"}\n";
+            << ", \"interleaving\": \"baseline/candidate order alternates each "
+               "round\", "
+               "\"formal_gate\": \"100 paired rounds x 8 launches; at least 95 "
+               "candidate wins and at least 2 percent wall-time win\"}\n";
   std::cout << "}\n";
 }
 
@@ -1211,8 +1207,8 @@ int run(const Args& args) {
   }
 
   const size_t query_elements = static_cast<size_t>(args.groups) * kQElements;
-  const size_t kv_elements = static_cast<size_t>(args.groups) * args.nblocks *
-                             kBlockN * kD;
+  const size_t kv_elements =
+      static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
   const size_t output_elements =
       static_cast<size_t>(args.groups) * kOutputElements;
   std::vector<__half> host_query(query_elements);
@@ -1239,9 +1235,10 @@ int run(const Args& args) {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_candidate),
                         output_elements * sizeof(__half)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
-                        query_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(), kv_elements * sizeof(__half),
+                        query_elements * sizeof(__half),
                         cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
+                        kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
                         kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -1249,14 +1246,14 @@ int run(const Args& args) {
   const dim3 candidate_grid(args.groups);
   auto launch_baseline = [&] {
     sm70_native_bm32_allp_p_group_pad_baseline<<<baseline_grid,
-                                                kBaselineThreads>>>(
+                                                 kBaselineThreads>>>(
         device_query, device_key, device_value, device_baseline, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
   };
   auto launch_candidate = [&] {
     sm70_native_bm32_allp_p_group_pad_candidate<<<candidate_grid,
-                                                 kCandidateThreads>>>(
+                                                  kCandidateThreads>>>(
         device_query, device_key, device_value, device_candidate, args.groups,
         args.nblocks);
     CUDA_CHECK(cudaGetLastError());
@@ -1279,8 +1276,8 @@ int run(const Args& args) {
     CUDA_CHECK(cudaDeviceSynchronize());
     free_device_buffers();
     print_json(args, properties, runtime_version, sm_count, baseline_resources,
-               candidate_resources, true, false, no_exactness, false,
-               no_timing, no_timing, no_pairs);
+               candidate_resources, true, false, no_exactness, false, no_timing,
+               no_timing, no_pairs);
     return EXIT_SUCCESS;
   }
 
@@ -1303,9 +1300,11 @@ int run(const Args& args) {
   std::vector<__half> host_baseline(output_elements);
   std::vector<__half> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
-                        output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   const Exactness exactness = compare_outputs(host_baseline, host_candidate);
   if (!exactness.bitwise_equal) {
     free_device_buffers();
@@ -1339,8 +1338,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -1413,8 +1411,7 @@ Args parse_args(int argc, char** argv) {
     } else if (argument == "--profile-kernel" && index + 1 < argc) {
       args.profile_kernel = argv[++index];
       if (args.profile_kernel != "baseline" &&
-          args.profile_kernel != "candidate" &&
-          args.profile_kernel != "both") {
+          args.profile_kernel != "candidate" && args.profile_kernel != "both") {
         std::cerr << "--profile-kernel must be baseline, candidate, or both\n";
         std::exit(EXIT_FAILURE);
       }
@@ -1433,6 +1430,4 @@ Args parse_args(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  return run(parse_args(argc, argv));
-}
+int main(int argc, char** argv) { return run(parse_args(argc, argv)); }

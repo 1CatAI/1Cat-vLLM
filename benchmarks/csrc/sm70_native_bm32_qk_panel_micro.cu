@@ -33,12 +33,12 @@ constexpr int kQElements = kM * kK;
 constexpr int kKeyElementsPerGroup = kN * kK;
 constexpr int kOutputElementsPerGroup = kM * kN;
 
-using AFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM,
-                                         kNativeN, kNativeK, __half,
-                                         nvcuda::wmma::row_major>;
-using BFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM,
-                                         kNativeN, kNativeK, __half,
-                                         nvcuda::wmma::col_major>;
+using AFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kPanelM, kNativeN, kNativeK,
+                           __half, nvcuda::wmma::row_major>;
+using BFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kPanelM, kNativeN, kNativeK,
+                           __half, nvcuda::wmma::col_major>;
 using CFragment = nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kPanelM,
                                          kNativeN, kNativeK, float>;
 
@@ -98,7 +98,8 @@ void check_cuda(cudaError_t status, const char* expression, const char* file,
   std::exit(EXIT_FAILURE);
 }
 
-#define CUDA_CHECK(expression) check_cuda((expression), #expression, __FILE__, __LINE__)
+#define CUDA_CHECK(expression) \
+  check_cuda((expression), #expression, __FILE__, __LINE__)
 
 __device__ __forceinline__ int swizzled_q_row_slot(int row) {
   return (row & 3) | ((row & 8) >> 1) | ((row & 4) << 1);
@@ -128,30 +129,29 @@ __device__ __forceinline__ void load_swizzled_matrix_a_fragment(
     AFragment& fragment, const __half* __restrict__ shared_query_panel,
     int k_offset) {
   const int lane = threadIdx.x & 31;
-  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 +
-                  ((lane >> 2) & 1) * 8;
+  const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = swizzled_q_row_slot(row);
   const int tile_offset = (k_offset / kNativeK) * kPanelM * kNativeK;
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      shared_query_panel + tile_offset + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(shared_query_panel + tile_offset + slot * 8));
   uint32_t* words = reinterpret_cast<uint32_t*>(&fragment);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "r"(address)
                : "memory");
   address += kPanelM * 8 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]),
-                 "=r"(words[7])
+               : "=r"(words[4]), "=r"(words[5]), "=r"(words[6]), "=r"(words[7])
                : "r"(address)
                : "memory");
 }
 
-extern "C" __global__ __launch_bounds__(kBaselineThreads, 2)
-void native_bm32_baseline_kernel(const __half* __restrict__ query,
-                                 const __half* __restrict__ key,
-                                 float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kBaselineThreads,
+    2) void native_bm32_baseline_kernel(const __half* __restrict__ query,
+                                        const __half* __restrict__ key,
+                                        float* __restrict__ output,
+                                        int groups) {
   __shared__ __align__(16) __half shared_query[kQPanelElements];
 
   const int block = blockIdx.x;
@@ -161,12 +161,11 @@ void native_bm32_baseline_kernel(const __half* __restrict__ query,
   }
   const int m_offset = (block & 1) * kPanelM;
   const int thread = threadIdx.x;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   stage_swizzled_q_panel(query_group + m_offset * kK, shared_query, thread,
-                          kBaselineThreads);
+                         kBaselineThreads);
   __syncthreads();
 
   const int warp = thread >> 5;
@@ -182,22 +181,24 @@ void native_bm32_baseline_kernel(const __half* __restrict__ query,
 #pragma unroll
   for (int k_offset = 0; k_offset < kK; k_offset += kNativeK) {
     load_swizzled_matrix_a_fragment(a_fragment, shared_query, k_offset);
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, key_group + n_offset * kK + k_offset, kK);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   key_group + n_offset * kK + k_offset, kK);
     nvcuda::wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
   }
 
-  float* output_tile = output + static_cast<int64_t>(group) *
-                                     kOutputElementsPerGroup +
+  float* output_tile = output +
+                       static_cast<int64_t>(group) * kOutputElementsPerGroup +
                        m_offset * kN + n_offset;
   nvcuda::wmma::store_matrix_sync(output_tile, accumulator, kN,
                                   nvcuda::wmma::mem_row_major);
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 4)
-void native_bm32_candidate_kernel(const __half* __restrict__ query,
-                                  const __half* __restrict__ key,
-                                  float* __restrict__ output, int groups) {
+extern "C" __global__ __launch_bounds__(
+    kCandidateThreads,
+    4) void native_bm32_candidate_kernel(const __half* __restrict__ query,
+                                         const __half* __restrict__ key,
+                                         float* __restrict__ output,
+                                         int groups) {
   __shared__ __align__(16) __half shared_query[2 * kQPanelElements];
 
   const int group = blockIdx.x;
@@ -207,14 +208,13 @@ void native_bm32_candidate_kernel(const __half* __restrict__ query,
   const int thread = threadIdx.x;
   const int warp = thread >> 5;
   const int n_offset = warp * kNativeN;
-  const __half* query_group =
-      query + static_cast<int64_t>(group) * kQElements;
-  const __half* key_group = key + static_cast<int64_t>(group) *
-                                       kKeyElementsPerGroup;
+  const __half* query_group = query + static_cast<int64_t>(group) * kQElements;
+  const __half* key_group =
+      key + static_cast<int64_t>(group) * kKeyElementsPerGroup;
   stage_swizzled_q_panel(query_group, shared_query, thread, kCandidateThreads);
   stage_swizzled_q_panel(query_group + kQPanelElements,
-                          shared_query + kQPanelElements, thread,
-                          kCandidateThreads);
+                         shared_query + kQPanelElements, thread,
+                         kCandidateThreads);
   __syncthreads();
 
   AFragment top_a_fragment;
@@ -230,18 +230,18 @@ void native_bm32_candidate_kernel(const __half* __restrict__ query,
     load_swizzled_matrix_a_fragment(top_a_fragment, shared_query, k_offset);
     load_swizzled_matrix_a_fragment(bottom_a_fragment,
                                     shared_query + kQPanelElements, k_offset);
-    nvcuda::wmma::load_matrix_sync(
-        b_fragment, key_group + n_offset * kK + k_offset, kK);
+    nvcuda::wmma::load_matrix_sync(b_fragment,
+                                   key_group + n_offset * kK + k_offset, kK);
     nvcuda::wmma::mma_sync(top_accumulator, top_a_fragment, b_fragment,
                            top_accumulator);
     nvcuda::wmma::mma_sync(bottom_accumulator, bottom_a_fragment, b_fragment,
                            bottom_accumulator);
   }
 
-  float* output_group = output + static_cast<int64_t>(group) *
-                                      kOutputElementsPerGroup;
-  nvcuda::wmma::store_matrix_sync(output_group + n_offset, top_accumulator,
-                                  kN, nvcuda::wmma::mem_row_major);
+  float* output_group =
+      output + static_cast<int64_t>(group) * kOutputElementsPerGroup;
+  nvcuda::wmma::store_matrix_sync(output_group + n_offset, top_accumulator, kN,
+                                  nvcuda::wmma::mem_row_major);
   nvcuda::wmma::store_matrix_sync(output_group + kPanelM * kN + n_offset,
                                   bottom_accumulator, kN,
                                   nvcuda::wmma::mem_row_major);
@@ -275,8 +275,7 @@ TimingSummary summarize(const std::vector<double>& samples) {
   const double median = ordered.size() % 2 == 0
                             ? (ordered[middle - 1] + ordered[middle]) / 2.0
                             : ordered[middle];
-  return {median,
-          ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
+  return {median, ordered[static_cast<size_t>(0.9 * (ordered.size() - 1))],
           sum / static_cast<double>(samples.size()), ordered.front(),
           ordered.back()};
 }
@@ -310,8 +309,8 @@ KernelResources query_resources(Kernel kernel, int threads_per_cta,
   cudaFuncAttributes attributes{};
   CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
   int active_ctas = 0;
-  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_ctas, kernel, threads_per_cta, 0));
+  CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_ctas, kernel,
+                                                           threads_per_cta, 0));
   KernelResources result;
   result.registers_per_thread = attributes.numRegs;
   result.static_shared_bytes = attributes.sharedSizeBytes;
@@ -346,7 +345,8 @@ void print_json_string(const std::string& value) {
       default:
         if (character < 0x20) {
           std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
-                    << static_cast<int>(character) << std::dec << std::setfill(' ');
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -356,36 +356,29 @@ void print_json_string(const std::string& value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\": " << std::setprecision(9)
-            << timing.median_us << ", \"p90_us\": " << timing.p90_us
+  std::cout << "{\"median_us\": " << std::setprecision(9) << timing.median_us
+            << ", \"p90_us\": " << timing.p90_us
             << ", \"mean_us\": " << timing.mean_us
             << ", \"min_us\": " << timing.min_us
             << ", \"max_us\": " << timing.max_us << '}';
 }
 
 void print_resources(const KernelResources& resources) {
-  std::cout << "{\"registers_per_thread\": "
-            << resources.registers_per_thread
-            << ", \"static_shared_bytes\": "
-            << resources.static_shared_bytes
+  std::cout << "{\"registers_per_thread\": " << resources.registers_per_thread
+            << ", \"static_shared_bytes\": " << resources.static_shared_bytes
             << ", \"local_bytes_per_thread\": "
             << resources.local_bytes_per_thread
-            << ", \"active_ctas_per_sm\": "
-            << resources.active_ctas_per_sm
-            << ", \"resident_total_warps\": "
-            << resources.resident_total_warps
-            << ", \"resident_qk_warps\": "
-            << resources.resident_qk_warps
+            << ", \"active_ctas_per_sm\": " << resources.active_ctas_per_sm
+            << ", \"resident_total_warps\": " << resources.resident_total_warps
+            << ", \"resident_qk_warps\": " << resources.resident_qk_warps
             << ", \"threads_per_cta\": " << resources.threads_per_cta
-            << ", \"qk_warps_per_cta\": " << resources.qk_warps_per_cta
-            << '}';
+            << ", \"qk_warps_per_cta\": " << resources.qk_warps_per_cta << '}';
 }
 
 void print_json(const Args& args, const cudaDeviceProp& properties,
                 int runtime_version, int sm_count, const Exactness& exactness,
                 const TimingSummary& baseline_timing,
-                const TimingSummary& candidate_timing,
-                const PairSummary& pairs,
+                const TimingSummary& candidate_timing, const PairSummary& pairs,
                 const KernelResources& baseline_resources,
                 const KernelResources& candidate_resources) {
   const double candidate_speedup_pct =
@@ -408,11 +401,14 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"output\": \"[groups, M32, N128]\",\n";
   std::cout << "    \"K\": 256,\n";
   std::cout << "    \"query_layout\": \"[group, M32, K256] token-major\",\n";
-  std::cout << "    \"key_layout\": \"[group, N128, K256] token-major stride 256\"\n";
+  std::cout
+      << "    \"key_layout\": \"[group, N128, K256] token-major stride 256\"\n";
   std::cout << "  },\n";
   std::cout << "  \"paths\": {\n";
-  std::cout << "    \"baseline\": \"2 CTA/group, BM16xBN128, 512 threads; first 8 warps native WMMA\",\n";
-  std::cout << "    \"candidate\": \"1 CTA/group, BM32xBN128, 256 threads; 8 warps native WMMA B reuse\",\n";
+  std::cout << "    \"baseline\": \"2 CTA/group, BM16xBN128, 512 threads; "
+               "first 8 warps native WMMA\",\n";
+  std::cout << "    \"candidate\": \"1 CTA/group, BM32xBN128, 256 threads; 8 "
+               "warps native WMMA B reuse\",\n";
   std::cout << "    \"baseline_ctas_per_group\": 2,\n";
   std::cout << "    \"candidate_ctas_per_group\": 1,\n";
   std::cout << "    \"candidate_threads\": 256,\n";
@@ -429,11 +425,9 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"full_32x128\": true,\n";
   std::cout << "    \"bitwise_equal\": "
             << (exactness.bitwise_equal ? "true" : "false") << ",\n";
-  std::cout << "    \"mismatch_words\": " << exactness.mismatch_words
-            << ",\n";
-  std::cout << "    \"xor\": {\"max_word\": "
-            << exactness.max_word_xor << ", \"reduction\": "
-            << exactness.xor_reduction << "},\n";
+  std::cout << "    \"mismatch_words\": " << exactness.mismatch_words << ",\n";
+  std::cout << "    \"xor\": {\"max_word\": " << exactness.max_word_xor
+            << ", \"reduction\": " << exactness.xor_reduction << "},\n";
   std::cout << "    \"max_abs_error\": " << exactness.max_abs_error << "\n";
   std::cout << "  },\n";
   std::cout << "  \"timing\": {\n";
@@ -448,8 +442,7 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "  \"pairs\": {\n";
   std::cout << "    \"count\": " << pairs.count << ",\n";
   std::cout << "    \"candidate_faster\": " << pairs.candidate_faster << ",\n";
-  std::cout << "    \"baseline_faster\": " << pairs.baseline_faster
-            << ",\n";
+  std::cout << "    \"baseline_faster\": " << pairs.baseline_faster << ",\n";
   std::cout << "    \"ties\": " << pairs.ties << ",\n";
   std::cout << "    \"candidate_minus_baseline_median_us\": "
             << pairs.candidate_minus_baseline_median_us << ",\n";
@@ -461,7 +454,8 @@ void print_json(const Args& args, const cudaDeviceProp& properties,
   std::cout << "    \"rounds\": " << args.rounds << ",\n";
   std::cout << "    \"launches_per_sample\": " << args.launches_per_sample
             << ",\n";
-  std::cout << "    \"interleaving\": \"baseline/candidate order alternates every round\"\n";
+  std::cout << "    \"interleaving\": \"baseline/candidate order alternates "
+               "every round\"\n";
   std::cout << "  },\n";
   std::cout << "  \"resources\": {\n";
   std::cout << "    \"baseline\": ";
@@ -481,7 +475,8 @@ int run(const Args& args) {
   CUDA_CHECK(cudaGetDeviceCount(&device_count));
   if (args.device < 0 || args.device >= device_count) {
     std::cerr << "Requested logical CUDA device " << args.device
-              << " is unavailable; visible device count is " << device_count << '\n';
+              << " is unavailable; visible device count is " << device_count
+              << '\n';
     return EXIT_FAILURE;
   }
   if (args.groups < 1 || args.warmup < 0 || args.rounds < 1 ||
@@ -533,7 +528,8 @@ int run(const Args& args) {
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_candidate),
                         output_elements * sizeof(float)));
   CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
-                        query_elements * sizeof(__half), cudaMemcpyHostToDevice));
+                        query_elements * sizeof(__half),
+                        cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
                         key_elements * sizeof(__half), cudaMemcpyHostToDevice));
 
@@ -577,9 +573,11 @@ int run(const Args& args) {
   std::vector<float> host_baseline(output_elements);
   std::vector<float> host_candidate(output_elements);
   CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
-                        output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                        output_elements * sizeof(float),
+                        cudaMemcpyDeviceToHost));
 
   Exactness exactness;
   exactness.bitwise_equal = true;
@@ -612,8 +610,7 @@ int run(const Args& args) {
     CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed_ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
-    return static_cast<double>(elapsed_ms) * 1000.0 /
-           args.launches_per_sample;
+    return static_cast<double>(elapsed_ms) * 1000.0 / args.launches_per_sample;
   };
 
   std::vector<double> baseline_samples;
@@ -636,15 +633,16 @@ int run(const Args& args) {
   CUDA_CHECK(cudaEventDestroy(stop));
   CUDA_CHECK(cudaEventDestroy(start));
 
-  const KernelResources baseline_resources = query_resources(
-      native_bm32_baseline_kernel, kBaselineThreads, kBaselineQKWarps,
-      args.device);
-  const KernelResources candidate_resources = query_resources(
-      native_bm32_candidate_kernel, kCandidateThreads, kCandidateQKWarps,
-      args.device);
+  const KernelResources baseline_resources =
+      query_resources(native_bm32_baseline_kernel, kBaselineThreads,
+                      kBaselineQKWarps, args.device);
+  const KernelResources candidate_resources =
+      query_resources(native_bm32_candidate_kernel, kCandidateThreads,
+                      kCandidateQKWarps, args.device);
   const TimingSummary baseline_timing = summarize(baseline_samples);
   const TimingSummary candidate_timing = summarize(candidate_samples);
-  const PairSummary pairs = summarize_pairs(baseline_samples, candidate_samples);
+  const PairSummary pairs =
+      summarize_pairs(baseline_samples, candidate_samples);
 
   CUDA_CHECK(cudaFree(device_candidate));
   CUDA_CHECK(cudaFree(device_baseline));
@@ -684,8 +682,7 @@ int main(int argc, char** argv) {
     } else if (argument == "--profile-kernel" && index + 1 < argc) {
       args.profile_kernel = argv[++index];
       if (args.profile_kernel != "baseline" &&
-          args.profile_kernel != "candidate" &&
-          args.profile_kernel != "both") {
+          args.profile_kernel != "candidate" && args.profile_kernel != "both") {
         std::cerr << "--profile-kernel must be baseline, candidate, or both\n";
         return EXIT_FAILURE;
       }

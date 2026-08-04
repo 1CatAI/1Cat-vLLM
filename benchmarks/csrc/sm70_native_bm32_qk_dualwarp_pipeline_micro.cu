@@ -46,17 +46,15 @@ __device__ __forceinline__ void spill_bottom_pv_accumulator(
     int warp) {
   // score is 16 KiB. One 16x16 FP32 accumulator per one of 16 warps fits
   // exactly and is no longer needed after the QK handoff.
-  nvcuda::wmma::store_matrix_sync(score + warp * kPanelM * kPanelN,
-                                  accumulator, kPanelN,
-                                  nvcuda::wmma::mem_row_major);
+  nvcuda::wmma::store_matrix_sync(score + warp * kPanelM * kPanelN, accumulator,
+                                  kPanelN, nvcuda::wmma::mem_row_major);
 }
 
 __device__ __forceinline__ void reload_bottom_pv_accumulator(
     const float* __restrict__ score, AccumulatorFragment& accumulator,
     int warp) {
-  nvcuda::wmma::load_matrix_sync(accumulator,
-                                 score + warp * kPanelM * kPanelN, kPanelN,
-                                 nvcuda::wmma::mem_row_major);
+  nvcuda::wmma::load_matrix_sync(accumulator, score + warp * kPanelM * kPanelN,
+                                 kPanelN, nvcuda::wmma::mem_row_major);
 }
 
 __device__ __forceinline__ void dualwarp_qk_accumulate(
@@ -93,8 +91,8 @@ __device__ __forceinline__ void dualwarp_qk_accumulate(
   }
 }
 
-extern "C" __global__ __launch_bounds__(kCandidateThreads, 2)
-void sm70_native_bm32_qk_dualwarp_pipeline_candidate(
+extern "C" __global__
+__launch_bounds__(kCandidateThreads, 2) void sm70_native_bm32_qk_dualwarp_pipeline_candidate(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, __half* __restrict__ output, int groups,
     int nblocks) {
@@ -146,8 +144,8 @@ void sm70_native_bm32_qk_dualwarp_pipeline_candidate(
       dualwarp_qk_accumulate(
           bottom_qk ? shared.query + kQPanelElements : shared.query,
           key_group + (shared.block_index * kBlockN + n_offset) * kD,
-          reinterpret_cast<__half*>(shared.probability_top), pair,
-          !bottom_qk, qk_accumulator);
+          reinterpret_cast<__half*>(shared.probability_top), pair, !bottom_qk,
+          qk_accumulator);
       // This compile-only sketch aliases query for FP32 QK bits. Query is
       // persistent across KV blocks, so a correct multi-block implementation
       // would have to restage it before the next iteration. The harness marks
@@ -231,12 +229,15 @@ struct DualArgs {
   std::string pattern = "random";
 };
 
-void print_double(double value) { std::cout << std::fixed << std::setprecision(6) << value; }
+void print_double(double value) {
+  std::cout << std::fixed << std::setprecision(6) << value;
+}
 
 void print_resources_json(const KernelResources& resources) {
   std::cout << "{\"registers_per_thread\":" << resources.registers_per_thread
             << ",\"static_shared_bytes\":" << resources.static_shared_bytes
-            << ",\"local_bytes_per_thread\":" << resources.local_bytes_per_thread
+            << ",\"local_bytes_per_thread\":"
+            << resources.local_bytes_per_thread
             << ",\"active_ctas_per_sm\":" << resources.active_ctas_per_sm
             << ",\"threads_per_cta\":" << resources.threads_per_cta << '}';
 }
@@ -249,17 +250,27 @@ DualArgs parse_dual_args(int argc, char** argv) {
       if (++index >= argc) std::exit(EXIT_FAILURE);
       *destination = std::stoi(argv[index]);
     };
-    if (argument == "--device") integer(&args.device);
-    else if (argument == "--groups") integer(&args.groups);
-    else if (argument == "--nblocks") integer(&args.nblocks);
-    else if (argument == "--warmup") integer(&args.warmup);
-    else if (argument == "--rounds") integer(&args.rounds);
-    else if (argument == "--launches" || argument == "--launches-per-sample") integer(&args.launches);
-    else if (argument == "--smoke") args.smoke = true;
-    else if (argument == "--pattern" && ++index < argc) args.pattern = argv[index];
-    else std::exit(EXIT_FAILURE);
+    if (argument == "--device")
+      integer(&args.device);
+    else if (argument == "--groups")
+      integer(&args.groups);
+    else if (argument == "--nblocks")
+      integer(&args.nblocks);
+    else if (argument == "--warmup")
+      integer(&args.warmup);
+    else if (argument == "--rounds")
+      integer(&args.rounds);
+    else if (argument == "--launches" || argument == "--launches-per-sample")
+      integer(&args.launches);
+    else if (argument == "--smoke")
+      args.smoke = true;
+    else if (argument == "--pattern" && ++index < argc)
+      args.pattern = argv[index];
+    else
+      std::exit(EXIT_FAILURE);
   }
-  if (args.pattern != "random" && args.pattern != "alternating") std::exit(EXIT_FAILURE);
+  if (args.pattern != "random" && args.pattern != "alternating")
+    std::exit(EXIT_FAILURE);
   return args;
 }
 
@@ -270,49 +281,106 @@ int run_dualwarp(const DualArgs& args) {
   const KernelResources candidate_resources = query_resources(
       sm70_native_bm32_qk_dualwarp_pipeline_candidate, kCandidateThreads);
   const size_t query_elements = static_cast<size_t>(args.groups) * kQElements;
-  const size_t kv_elements = static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
-  const size_t output_elements = static_cast<size_t>(args.groups) * kOutputElements;
-  std::vector<__half> host_query(query_elements), host_key(kv_elements), host_value(kv_elements);
+  const size_t kv_elements =
+      static_cast<size_t>(args.groups) * args.nblocks * kBlockN * kD;
+  const size_t output_elements =
+      static_cast<size_t>(args.groups) * kOutputElements;
+  std::vector<__half> host_query(query_elements), host_key(kv_elements),
+      host_value(kv_elements);
   uint32_t random_state = 0x12345678u;
   fill_input(&host_query, args.pattern, &random_state, 1);
   fill_input(&host_key, args.pattern, &random_state, 2);
   fill_input(&host_value, args.pattern, &random_state, 3);
-  __half *device_query = nullptr, *device_key = nullptr, *device_value = nullptr;
+  __half *device_query = nullptr, *device_key = nullptr,
+         *device_value = nullptr;
   __half *device_baseline = nullptr, *device_candidate = nullptr;
   CUDA_CHECK(cudaMalloc(&device_query, query_elements * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(&device_key, kv_elements * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(&device_value, kv_elements * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(&device_baseline, output_elements * sizeof(__half)));
   CUDA_CHECK(cudaMalloc(&device_candidate, output_elements * sizeof(__half)));
-  CUDA_CHECK(cudaMemcpy(device_query, host_query.data(), query_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(), kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(device_value, host_value.data(), kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_query, host_query.data(),
+                        query_elements * sizeof(__half),
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_key, host_key.data(),
+                        kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(device_value, host_value.data(),
+                        kv_elements * sizeof(__half), cudaMemcpyHostToDevice));
   const dim3 grid(args.groups);
-  auto baseline = [&] { sm70_native_bm32_qk_dualwarp_pipeline_baseline<<<grid, kCandidateThreads>>>(device_query, device_key, device_value, device_baseline, args.groups, args.nblocks); CUDA_CHECK(cudaGetLastError()); };
-  auto candidate = [&] { sm70_native_bm32_qk_dualwarp_pipeline_candidate<<<grid, kCandidateThreads>>>(device_query, device_key, device_value, device_candidate, args.groups, args.nblocks); CUDA_CHECK(cudaGetLastError()); };
-  for (int index = 0; index < args.warmup; ++index) { baseline(); candidate(); }
+  auto baseline = [&] {
+    sm70_native_bm32_qk_dualwarp_pipeline_baseline<<<grid, kCandidateThreads>>>(
+        device_query, device_key, device_value, device_baseline, args.groups,
+        args.nblocks);
+    CUDA_CHECK(cudaGetLastError());
+  };
+  auto candidate = [&] {
+    sm70_native_bm32_qk_dualwarp_pipeline_candidate<<<grid,
+                                                      kCandidateThreads>>>(
+        device_query, device_key, device_value, device_candidate, args.groups,
+        args.nblocks);
+    CUDA_CHECK(cudaGetLastError());
+  };
+  for (int index = 0; index < args.warmup; ++index) {
+    baseline();
+    candidate();
+  }
   CUDA_CHECK(cudaDeviceSynchronize());
-  baseline(); candidate();
+  baseline();
+  candidate();
   CUDA_CHECK(cudaDeviceSynchronize());
-  std::vector<__half> host_baseline(output_elements), host_candidate(output_elements);
-  CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline, output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate, output_elements * sizeof(__half), cudaMemcpyDeviceToHost));
+  std::vector<__half> host_baseline(output_elements),
+      host_candidate(output_elements);
+  CUDA_CHECK(cudaMemcpy(host_baseline.data(), device_baseline,
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(host_candidate.data(), device_candidate,
+                        output_elements * sizeof(__half),
+                        cudaMemcpyDeviceToHost));
   const Exactness exactness = compare_outputs(host_baseline, host_candidate);
   if (args.smoke) {
-    std::cout << "{\"dataflow\":{\"equivalence_check_passed\":true,\"closed_schedule\":\"8 dedicated K-staging producers plus 8 non-QK consumers\",\"candidate_schedule\":\"8 pairs: producer loads one K tile then computes top QK; consumer computes bottom QK\",\"all_16_warps_execute_qk_hmma\":true,\"global_k_loads_per_pair_k16\":1},\"paths\":{\"baseline\":\"production all-P reference\",\"candidate\":\"16-warp 8-pair dualwarp K-stage pipeline\"},\"resources\":{\"baseline\":";
-    print_resources_json(baseline_resources); std::cout << ",\"candidate\":"; print_resources_json(candidate_resources);
-    std::cout << "},\"exactness\":{\"word_dtype\":\"uint32 packed fp16\",\"word_count\":" << output_elements / 2 << ",\"full_output\":true,\"bitwise_equal\":" << (exactness.bitwise_equal ? "true" : "false") << ",\"mismatch_words\":" << exactness.mismatch_words << ",\"xor\":{\"reduction\":" << exactness.xor_reduction << ",\"max_word\":" << exactness.max_word_xor << "}},\"timing\":null,\"pairs\":null}\n";
-    CUDA_CHECK(cudaFree(device_candidate)); CUDA_CHECK(cudaFree(device_baseline)); CUDA_CHECK(cudaFree(device_value)); CUDA_CHECK(cudaFree(device_key)); CUDA_CHECK(cudaFree(device_query));
+    std::cout << "{\"dataflow\":{\"equivalence_check_passed\":true,\"closed_"
+                 "schedule\":\"8 dedicated K-staging producers plus 8 non-QK "
+                 "consumers\",\"candidate_schedule\":\"8 pairs: producer loads "
+                 "one K tile then computes top QK; consumer computes bottom "
+                 "QK\",\"all_16_warps_execute_qk_hmma\":true,\"global_k_loads_"
+                 "per_pair_k16\":1},\"paths\":{\"baseline\":\"production all-P "
+                 "reference\",\"candidate\":\"16-warp 8-pair dualwarp K-stage "
+                 "pipeline\"},\"resources\":{\"baseline\":";
+    print_resources_json(baseline_resources);
+    std::cout << ",\"candidate\":";
+    print_resources_json(candidate_resources);
+    std::cout << "},\"exactness\":{\"word_dtype\":\"uint32 packed "
+                 "fp16\",\"word_count\":"
+              << output_elements / 2
+              << ",\"full_output\":true,\"bitwise_equal\":"
+              << (exactness.bitwise_equal ? "true" : "false")
+              << ",\"mismatch_words\":" << exactness.mismatch_words
+              << ",\"xor\":{\"reduction\":" << exactness.xor_reduction
+              << ",\"max_word\":" << exactness.max_word_xor
+              << "}},\"timing\":null,\"pairs\":null}\n";
+    CUDA_CHECK(cudaFree(device_candidate));
+    CUDA_CHECK(cudaFree(device_baseline));
+    CUDA_CHECK(cudaFree(device_value));
+    CUDA_CHECK(cudaFree(device_key));
+    CUDA_CHECK(cudaFree(device_query));
     return exactness.bitwise_equal ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   std::vector<double> baseline_samples, candidate_samples;
   cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start)); CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
   auto time = [&](bool dual) {
     CUDA_CHECK(cudaEventRecord(start));
-    for (int launch = 0; launch < args.launches; ++launch) { if (dual) candidate(); else baseline(); }
-    CUDA_CHECK(cudaEventRecord(stop)); CUDA_CHECK(cudaEventSynchronize(stop));
-    float elapsed = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
+    for (int launch = 0; launch < args.launches; ++launch) {
+      if (dual)
+        candidate();
+      else
+        baseline();
+    }
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed, start, stop));
     return 1000.0 * elapsed / args.launches;
   };
   for (int round = 0; round < args.rounds; ++round) {
@@ -322,18 +390,53 @@ int run_dualwarp(const DualArgs& args) {
     baseline_samples.push_back(baseline_first ? first : second);
     candidate_samples.push_back(baseline_first ? second : first);
   }
-  CUDA_CHECK(cudaEventDestroy(stop)); CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
+  CUDA_CHECK(cudaEventDestroy(start));
   const TimingSummary baseline_timing = summarize(baseline_samples);
   const TimingSummary candidate_timing = summarize(candidate_samples);
-  const PairSummary pairs = summarize_pairs(baseline_samples, candidate_samples);
-  const double speedup = 100.0 * (baseline_timing.median_us - candidate_timing.median_us) / baseline_timing.median_us;
-  std::cout << "{\"dataflow\":{\"equivalence_check_passed\":true,\"closed_schedule\":\"8 dedicated K-staging producers plus 8 non-QK consumers\",\"candidate_schedule\":\"8 pairs: producer loads one K tile then computes top QK; consumer computes bottom QK\",\"all_16_warps_execute_qk_hmma\":true,\"global_k_loads_per_pair_k16\":1},\"paths\":{\"baseline\":\"production all-P reference\",\"candidate\":\"16-warp 8-pair dualwarp K-stage pipeline\"},\"resources\":{\"baseline\":";
-  print_resources_json(baseline_resources); std::cout << ",\"candidate\":"; print_resources_json(candidate_resources);
-  std::cout << "},\"exactness\":{\"word_dtype\":\"uint32 packed fp16\",\"word_count\":" << output_elements / 2 << ",\"full_output\":true,\"bitwise_equal\":" << (exactness.bitwise_equal ? "true" : "false") << ",\"mismatch_words\":" << exactness.mismatch_words << ",\"xor\":{\"reduction\":" << exactness.xor_reduction << ",\"max_word\":" << exactness.max_word_xor << "}},\"timing\":{\"baseline_median_us\":"; print_double(baseline_timing.median_us); std::cout << ",\"candidate_median_us\":"; print_double(candidate_timing.median_us); std::cout << ",\"candidate_speedup_vs_baseline_pct\":"; print_double(speedup); std::cout << "},\"pairs\":{\"count\":" << pairs.count << ",\"candidate_faster\":" << pairs.candidate_faster << ",\"baseline_faster\":" << pairs.baseline_faster << ",\"ties\":" << pairs.ties << "}}\n";
-  CUDA_CHECK(cudaFree(device_candidate)); CUDA_CHECK(cudaFree(device_baseline)); CUDA_CHECK(cudaFree(device_value)); CUDA_CHECK(cudaFree(device_key)); CUDA_CHECK(cudaFree(device_query));
+  const PairSummary pairs =
+      summarize_pairs(baseline_samples, candidate_samples);
+  const double speedup =
+      100.0 * (baseline_timing.median_us - candidate_timing.median_us) /
+      baseline_timing.median_us;
+  std::cout << "{\"dataflow\":{\"equivalence_check_passed\":true,\"closed_"
+               "schedule\":\"8 dedicated K-staging producers plus 8 non-QK "
+               "consumers\",\"candidate_schedule\":\"8 pairs: producer loads "
+               "one K tile then computes top QK; consumer computes bottom "
+               "QK\",\"all_16_warps_execute_qk_hmma\":true,\"global_k_loads_"
+               "per_pair_k16\":1},\"paths\":{\"baseline\":\"production all-P "
+               "reference\",\"candidate\":\"16-warp 8-pair dualwarp K-stage "
+               "pipeline\"},\"resources\":{\"baseline\":";
+  print_resources_json(baseline_resources);
+  std::cout << ",\"candidate\":";
+  print_resources_json(candidate_resources);
+  std::cout << "},\"exactness\":{\"word_dtype\":\"uint32 packed "
+               "fp16\",\"word_count\":"
+            << output_elements / 2 << ",\"full_output\":true,\"bitwise_equal\":"
+            << (exactness.bitwise_equal ? "true" : "false")
+            << ",\"mismatch_words\":" << exactness.mismatch_words
+            << ",\"xor\":{\"reduction\":" << exactness.xor_reduction
+            << ",\"max_word\":" << exactness.max_word_xor
+            << "}},\"timing\":{\"baseline_median_us\":";
+  print_double(baseline_timing.median_us);
+  std::cout << ",\"candidate_median_us\":";
+  print_double(candidate_timing.median_us);
+  std::cout << ",\"candidate_speedup_vs_baseline_pct\":";
+  print_double(speedup);
+  std::cout << "},\"pairs\":{\"count\":" << pairs.count
+            << ",\"candidate_faster\":" << pairs.candidate_faster
+            << ",\"baseline_faster\":" << pairs.baseline_faster
+            << ",\"ties\":" << pairs.ties << "}}\n";
+  CUDA_CHECK(cudaFree(device_candidate));
+  CUDA_CHECK(cudaFree(device_baseline));
+  CUDA_CHECK(cudaFree(device_value));
+  CUDA_CHECK(cudaFree(device_key));
+  CUDA_CHECK(cudaFree(device_query));
   return exactness.bitwise_equal ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 }  // namespace
 
-int main(int argc, char** argv) { return run_dualwarp(parse_dual_args(argc, argv)); }
+int main(int argc, char** argv) {
+  return run_dualwarp(parse_dual_args(argc, argv));
+}

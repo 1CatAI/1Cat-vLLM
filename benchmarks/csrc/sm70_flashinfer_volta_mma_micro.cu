@@ -146,20 +146,20 @@ uint32_t float_bits(float value) {
 }
 
 template <Operation operation>
-__device__ __forceinline__ void direct_wmma_reference(
-    float* output, const __half* a, const __half* b, const float* initial_c) {
+__device__ __forceinline__ void direct_wmma_reference(float* output,
+                                                      const __half* a,
+                                                      const __half* b,
+                                                      const float* initial_c) {
   namespace wmma = nvcuda::wmma;
   using AFragment =
-      wmma::fragment<wmma::matrix_a, kM, kN, kMmaK, __half,
-                     wmma::row_major>;
-  using CFragment =
-      wmma::fragment<wmma::accumulator, kM, kN, kMmaK, float>;
+      wmma::fragment<wmma::matrix_a, kM, kN, kMmaK, __half, wmma::row_major>;
+  using CFragment = wmma::fragment<wmma::accumulator, kM, kN, kMmaK, float>;
 
   CFragment accumulator;
   wmma::load_matrix_sync(accumulator, initial_c, kN, wmma::mem_row_major);
   if constexpr (operation == Operation::kQKRowCol) {
-    using BFragment = wmma::fragment<wmma::matrix_b, kM, kN, kMmaK, __half,
-                                     wmma::col_major>;
+    using BFragment =
+        wmma::fragment<wmma::matrix_b, kM, kN, kMmaK, __half, wmma::col_major>;
     AFragment a_fragment;
     BFragment b_fragment;
 #pragma unroll
@@ -169,8 +169,8 @@ __device__ __forceinline__ void direct_wmma_reference(
       wmma::mma_sync(accumulator, a_fragment, b_fragment, accumulator);
     }
   } else {
-    using BFragment = wmma::fragment<wmma::matrix_b, kM, kN, kMmaK, __half,
-                                     wmma::row_major>;
+    using BFragment =
+        wmma::fragment<wmma::matrix_b, kM, kN, kMmaK, __half, wmma::row_major>;
     AFragment a_fragment;
     BFragment b_fragment;
 #pragma unroll
@@ -199,7 +199,7 @@ __device__ __forceinline__ void compatibility_mma(float* output,
       sm70::load_a_fragment(a_fragment, a + k_offset, kReductionK);
       sm70::load_qk_b_fragment(b_fragment, b + k_offset, kReductionK);
       sm70::mma_sync_m16n16k16_row_col_f16f16f32(accumulator, a_fragment,
-                                                  b_fragment);
+                                                 b_fragment);
     }
   } else {
     sm70::AFragment a_fragment;
@@ -209,7 +209,7 @@ __device__ __forceinline__ void compatibility_mma(float* output,
       sm70::load_a_fragment(a_fragment, a + k_offset, kReductionK);
       sm70::load_pv_b_fragment(b_fragment, b + k_offset * kN, kN);
       sm70::mma_sync_m16n16k16_row_row_f16f16f32(accumulator, a_fragment,
-                                                  b_fragment);
+                                                 b_fragment);
     }
   }
   sm70::store_accumulator_fragment(output, accumulator, kN);
@@ -225,10 +225,8 @@ __device__ __forceinline__ void run_warp(const __half* a, const __half* b,
     return;
   }
 
-  const int64_t a_offset =
-      static_cast<int64_t>(group) * kAElementsPerGroup;
-  const int64_t b_offset =
-      static_cast<int64_t>(group) * kBElementsPerGroup;
+  const int64_t a_offset = static_cast<int64_t>(group) * kAElementsPerGroup;
+  const int64_t b_offset = static_cast<int64_t>(group) * kBElementsPerGroup;
   const int64_t output_offset =
       static_cast<int64_t>(group) * kOutputElementsPerGroup;
   float* output_tile = output + output_offset;
@@ -243,39 +241,38 @@ __device__ __forceinline__ void run_warp(const __half* a, const __half* b,
   }
 }
 
-extern "C" __global__ __launch_bounds__(kThreads)
-void sm70_flashinfer_volta_mma_qk_reference_kernel(
+extern "C" __global__
+__launch_bounds__(kThreads) void sm70_flashinfer_volta_mma_qk_reference_kernel(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const float* __restrict__ initial_c, float* __restrict__ output,
     int groups) {
-  run_warp<Operation::kQKRowCol, false>(query, key, initial_c, output,
-                                         groups);
+  run_warp<Operation::kQKRowCol, false>(query, key, initial_c, output, groups);
 }
 
-extern "C" __global__ __launch_bounds__(kThreads)
-void sm70_flashinfer_volta_mma_qk_compat_kernel(
+extern "C" __global__
+__launch_bounds__(kThreads) void sm70_flashinfer_volta_mma_qk_compat_kernel(
     const __half* __restrict__ query, const __half* __restrict__ key,
     const float* __restrict__ initial_c, float* __restrict__ output,
     int groups) {
   run_warp<Operation::kQKRowCol, true>(query, key, initial_c, output, groups);
 }
 
-extern "C" __global__ __launch_bounds__(kThreads)
-void sm70_flashinfer_volta_mma_pv_reference_kernel(
+extern "C" __global__
+__launch_bounds__(kThreads) void sm70_flashinfer_volta_mma_pv_reference_kernel(
     const __half* __restrict__ probability, const __half* __restrict__ value,
     const float* __restrict__ initial_c, float* __restrict__ output,
     int groups) {
   run_warp<Operation::kPVRowRow, false>(probability, value, initial_c, output,
-                                         groups);
+                                        groups);
 }
 
-extern "C" __global__ __launch_bounds__(kThreads)
-void sm70_flashinfer_volta_mma_pv_compat_kernel(
+extern "C" __global__
+__launch_bounds__(kThreads) void sm70_flashinfer_volta_mma_pv_compat_kernel(
     const __half* __restrict__ probability, const __half* __restrict__ value,
     const float* __restrict__ initial_c, float* __restrict__ output,
     int groups) {
   run_warp<Operation::kPVRowRow, true>(probability, value, initial_c, output,
-                                        groups);
+                                       groups);
 }
 
 uint32_t next_random(uint32_t* state) {
@@ -316,10 +313,9 @@ void fill_half_input(std::vector<__half>* output, int groups, int rows,
   for (int group = 0; group < groups; ++group) {
     for (int row = 0; row < rows; ++row) {
       for (int column = 0; column < columns; ++column) {
-        const float value =
-            pattern == InputPattern::kRandom
-                ? random_half_value(&state)
-                : alternating_value(group, row, column, salt);
+        const float value = pattern == InputPattern::kRandom
+                                ? random_half_value(&state)
+                                : alternating_value(group, row, column, salt);
         (*output)[static_cast<size_t>(group) * elements_per_group +
                   row * columns + column] = __float2half_rn(value);
       }
@@ -330,8 +326,7 @@ void fill_half_input(std::vector<__half>* output, int groups, int rows,
 void fill_initial_c(std::vector<float>* output, InputPattern pattern,
                     uint32_t seed) {
   uint32_t state = seed;
-  const int groups =
-      static_cast<int>(output->size() / kOutputElementsPerGroup);
+  const int groups = static_cast<int>(output->size() / kOutputElementsPerGroup);
   for (int group = 0; group < groups; ++group) {
     for (int row = 0; row < kM; ++row) {
       for (int column = 0; column < kN; ++column) {
@@ -352,42 +347,41 @@ HostInputs make_inputs(int groups, InputPattern pattern) {
       static_cast<size_t>(groups) * kBElementsPerGroup;
   const size_t output_element_count =
       static_cast<size_t>(groups) * kOutputElementsPerGroup;
-  HostInputs inputs{
-      std::vector<__half>(a_element_count),
-      std::vector<__half>(b_element_count),
-      std::vector<__half>(a_element_count),
-      std::vector<__half>(b_element_count),
-      std::vector<float>(output_element_count)};
-  fill_half_input(&inputs.query, groups, kM, kReductionK, pattern,
-                  0x6d2b79f5U, 3);
-  fill_half_input(&inputs.key, groups, kN, kReductionK, pattern,
-                  0x9e3779b9U, 7);
+  HostInputs inputs{std::vector<__half>(a_element_count),
+                    std::vector<__half>(b_element_count),
+                    std::vector<__half>(a_element_count),
+                    std::vector<__half>(b_element_count),
+                    std::vector<float>(output_element_count)};
+  fill_half_input(&inputs.query, groups, kM, kReductionK, pattern, 0x6d2b79f5U,
+                  3);
+  fill_half_input(&inputs.key, groups, kN, kReductionK, pattern, 0x9e3779b9U,
+                  7);
   fill_half_input(&inputs.probability, groups, kM, kReductionK, pattern,
                   0x243f6a88U, 11);
-  fill_half_input(&inputs.value, groups, kReductionK, kN, pattern,
-                  0xb7e15162U, 19);
+  fill_half_input(&inputs.value, groups, kReductionK, kN, pattern, 0xb7e15162U,
+                  19);
   fill_initial_c(&inputs.initial_c, pattern, 0x85ebca6bU);
   return inputs;
 }
 
 void allocate_buffers(DeviceBuffers* buffers, int groups) {
-  const size_t a_bytes = static_cast<size_t>(groups) * kAElementsPerGroup *
-                         sizeof(__half);
-  const size_t b_bytes = static_cast<size_t>(groups) * kBElementsPerGroup *
-                         sizeof(__half);
+  const size_t a_bytes =
+      static_cast<size_t>(groups) * kAElementsPerGroup * sizeof(__half);
+  const size_t b_bytes =
+      static_cast<size_t>(groups) * kBElementsPerGroup * sizeof(__half);
   const size_t output_bytes =
       static_cast<size_t>(groups) * kOutputElementsPerGroup * sizeof(float);
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->query), a_bytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->key), b_bytes));
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->probability),
-                        a_bytes));
+  CUDA_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&buffers->probability), a_bytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->value), b_bytes));
   CUDA_CHECK(
       cudaMalloc(reinterpret_cast<void**>(&buffers->initial_c), output_bytes));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->reference_output),
                         output_bytes));
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->compatibility_output),
-                        output_bytes));
+  CUDA_CHECK(cudaMalloc(
+      reinterpret_cast<void**>(&buffers->compatibility_output), output_bytes));
 }
 
 void release_buffers(DeviceBuffers* buffers) {
@@ -430,8 +424,8 @@ void launch_kernel(Operation operation, bool compatibility,
           buffers.compatibility_output, groups);
     } else {
       sm70_flashinfer_volta_mma_qk_reference_kernel<<<grid, block>>>(
-          buffers.query, buffers.key, buffers.initial_c, buffers.reference_output,
-          groups);
+          buffers.query, buffers.key, buffers.initial_c,
+          buffers.reference_output, groups);
     }
   } else if (compatibility) {
     sm70_flashinfer_volta_mma_pv_compat_kernel<<<grid, block>>>(
@@ -535,7 +529,8 @@ CaseResult run_case(InputPattern pattern, Operation operation, const Args& args,
   launch_kernel(operation, false, buffers, args.groups);
   CUDA_CHECK(cudaDeviceSynchronize());
   CUDA_CHECK(cudaMemcpy(reference.data(), buffers.reference_output,
-                        reference.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        reference.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
   launch_kernel(operation, true, buffers, args.groups);
   CUDA_CHECK(cudaDeviceSynchronize());
   CUDA_CHECK(cudaMemcpy(compatibility.data(), buffers.compatibility_output,
@@ -561,19 +556,19 @@ CaseResult run_case(InputPattern pattern, Operation operation, const Args& args,
     const bool compatibility_first = (round & 1) != 0;
     compatibility_first_count += compatibility_first;
     if (compatibility_first) {
-      compatibility_samples.push_back(
-          time_kernel(start, stop, operation, true, buffers, args.groups,
-                      args.launches_per_sample));
-      reference_samples.push_back(
-          time_kernel(start, stop, operation, false, buffers, args.groups,
-                      args.launches_per_sample));
+      compatibility_samples.push_back(time_kernel(start, stop, operation, true,
+                                                  buffers, args.groups,
+                                                  args.launches_per_sample));
+      reference_samples.push_back(time_kernel(start, stop, operation, false,
+                                              buffers, args.groups,
+                                              args.launches_per_sample));
     } else {
-      reference_samples.push_back(
-          time_kernel(start, stop, operation, false, buffers, args.groups,
-                      args.launches_per_sample));
-      compatibility_samples.push_back(
-          time_kernel(start, stop, operation, true, buffers, args.groups,
-                      args.launches_per_sample));
+      reference_samples.push_back(time_kernel(start, stop, operation, false,
+                                              buffers, args.groups,
+                                              args.launches_per_sample));
+      compatibility_samples.push_back(time_kernel(start, stop, operation, true,
+                                                  buffers, args.groups,
+                                                  args.launches_per_sample));
     }
   }
   CUDA_CHECK(cudaEventDestroy(stop));
@@ -607,17 +602,18 @@ void print_json_string(const char* value) {
 }
 
 void print_timing(const TimingSummary& timing) {
-  std::cout << "{\"median_us\":" << std::setprecision(9)
-            << timing.median_us << ",\"p90_us\":" << timing.p90_us
-            << ",\"mean_us\":" << timing.mean_us << ",\"min_us\":"
-            << timing.min_us << ",\"max_us\":" << timing.max_us << '}';
+  std::cout << "{\"median_us\":" << std::setprecision(9) << timing.median_us
+            << ",\"p90_us\":" << timing.p90_us
+            << ",\"mean_us\":" << timing.mean_us
+            << ",\"min_us\":" << timing.min_us
+            << ",\"max_us\":" << timing.max_us << '}';
 }
 
 void print_case(const CaseResult& result) {
-  const double relative_delta_pct =
-      100.0 * (result.compatibility_timing.median_us -
-               result.reference_timing.median_us) /
-      result.reference_timing.median_us;
+  const double relative_delta_pct = 100.0 *
+                                    (result.compatibility_timing.median_us -
+                                     result.reference_timing.median_us) /
+                                    result.reference_timing.median_us;
   std::cout << "{\"input_pattern\":";
   print_json_string(pattern_name(result.pattern));
   std::cout << ",\"operation\":";
@@ -649,13 +645,11 @@ void print_case(const CaseResult& result) {
   print_timing(result.compatibility_timing);
   std::cout << ",\"compatibility_minus_reference_median_us\":"
             << result.pairs.compatibility_minus_reference_median_us
-            << ",\"compatibility_relative_delta_pct\":"
-            << relative_delta_pct << '}'
-            << ",\"pairs\":{\"count\":" << result.pairs.count
+            << ",\"compatibility_relative_delta_pct\":" << relative_delta_pct
+            << '}' << ",\"pairs\":{\"count\":" << result.pairs.count
             << ",\"compatibility_first_count\":"
             << result.pairs.compatibility_first_count
-            << ",\"compatibility_faster\":"
-            << result.pairs.compatibility_faster
+            << ",\"compatibility_faster\":" << result.pairs.compatibility_faster
             << ",\"reference_faster\":" << result.pairs.reference_faster
             << ",\"ties\":" << result.pairs.ties
             << ",\"compatibility_minus_reference_median_us\":"
@@ -677,7 +671,8 @@ void print_results(const Args& args, const cudaDeviceProp& properties,
             << args.device << ",\"name\":";
   print_json_string(properties.name);
   std::cout << ",\"capability\":[" << properties.major << ','
-            << properties.minor << "]},\n"
+            << properties.minor
+            << "]},\n"
                "\"shape\":{\"groups\":"
             << args.groups
             << ",\"a\":[\"groups\",16,256],"
@@ -716,7 +711,8 @@ void print_results(const Args& args, const cudaDeviceProp& properties,
 int parse_int(const char* option, const char* value) {
   char* end = nullptr;
   const long parsed = std::strtol(value, &end, 10);
-  if (end == value || *end != '\0' || parsed < std::numeric_limits<int>::min() ||
+  if (end == value || *end != '\0' ||
+      parsed < std::numeric_limits<int>::min() ||
       parsed > std::numeric_limits<int>::max()) {
     std::cerr << "Invalid value for " << option << ": " << value << '\n';
     std::exit(EXIT_FAILURE);
@@ -768,8 +764,8 @@ Args parse_args(int argc, char** argv) {
     args.rounds = 1;
     args.launches_per_sample = 1;
   }
-  if (args.device < 0 || args.groups < 1 || args.warmup < 0 || args.rounds < 1 ||
-      args.launches_per_sample < 1) {
+  if (args.device < 0 || args.groups < 1 || args.warmup < 0 ||
+      args.rounds < 1 || args.launches_per_sample < 1) {
     std::cerr << "device must be non-negative; groups, rounds, and launches "
                  "must be positive; warmup must be non-negative\n";
     std::exit(EXIT_FAILURE);
@@ -795,11 +791,14 @@ int main(int argc, char** argv) {
   allocate_buffers(&buffers, args.groups);
   std::array<CaseResult, 4> results{};
   size_t result_index = 0;
-  for (InputPattern pattern : {InputPattern::kRandom, InputPattern::kAlternating}) {
+  for (InputPattern pattern :
+       {InputPattern::kRandom, InputPattern::kAlternating}) {
     const HostInputs inputs = make_inputs(args.groups, pattern);
     upload_inputs(inputs, buffers);
-    results[result_index++] = run_case(pattern, Operation::kQKRowCol, args, buffers);
-    results[result_index++] = run_case(pattern, Operation::kPVRowRow, args, buffers);
+    results[result_index++] =
+        run_case(pattern, Operation::kQKRowCol, args, buffers);
+    results[result_index++] =
+        run_case(pattern, Operation::kPVRowRow, args, buffers);
   }
   release_buffers(&buffers);
   print_results(args, properties, results);

@@ -69,7 +69,8 @@ void check_cuda(cudaError_t status, const char* expression, const char* file,
   std::exit(EXIT_FAILURE);
 }
 
-#define CUDA_CHECK(expression) check_cuda((expression), #expression, __FILE__, __LINE__)
+#define CUDA_CHECK(expression) \
+  check_cuda((expression), #expression, __FILE__, __LINE__)
 
 // These formulas are derived from SM70_MMA_884::thread_offset_C(),
 // static_offset_C(), and ReshapeC() in mma_sm70.h. They agree with the
@@ -98,9 +99,7 @@ __host__ __device__ constexpr int raw_b_col_n(int lane) {
   return raw_n_tile(lane) + (lane & 3) + ((lane >> 4) * 4);
 }
 
-__host__ __device__ constexpr int raw_b_row_k(int lane) {
-  return lane & 3;
-}
+__host__ __device__ constexpr int raw_b_row_k(int lane) { return lane & 3; }
 
 __host__ __device__ constexpr int raw_b_row_n(int lane, int element) {
   return raw_n_tile(lane) + ((lane >> 4) * 4) + element;
@@ -118,11 +117,10 @@ __device__ __forceinline__ void mma_m8n8k4_row_col(
       "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, "
       "{%8, %9}, {%10, %11}, {%12, %13, %14, %15, %16, %17, %18, %19};"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]),
-        "=f"(d[5]), "=f"(d[6]), "=f"(d[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
-        "f"(c[2]), "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]),
-        "f"(c[7]));
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]), "=f"(d[5]),
+        "=f"(d[6]), "=f"(d[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
+        "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7]));
 }
 
 __device__ __forceinline__ void mma_m8n8k4_row_row(
@@ -132,17 +130,17 @@ __device__ __forceinline__ void mma_m8n8k4_row_row(
       "mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, "
       "{%8, %9}, {%10, %11}, {%12, %13, %14, %15, %16, %17, %18, %19};"
-      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]),
-        "=f"(d[5]), "=f"(d[6]), "=f"(d[7])
-      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]),
-        "f"(c[2]), "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]),
-        "f"(c[7]));
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3]), "=f"(d[4]), "=f"(d[5]),
+        "=f"(d[6]), "=f"(d[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]),
+        "f"(c[3]), "f"(c[4]), "f"(c[5]), "f"(c[6]), "f"(c[7]));
 }
 
 template <bool kRowCol>
-__device__ __forceinline__ void native_wmma(
-    const __half* shared_a, const __half* shared_b,
-    const float* shared_c_tile, float* native_output_tile) {
+__device__ __forceinline__ void native_wmma(const __half* shared_a,
+                                            const __half* shared_b,
+                                            const float* shared_c_tile,
+                                            float* native_output_tile) {
   namespace wmma = nvcuda::wmma;
   wmma::fragment<wmma::matrix_a, kM, kN, kK, __half, wmma::row_major> a;
   wmma::fragment<wmma::accumulator, kM, kN, kK, float> c;
@@ -158,8 +156,7 @@ __device__ __forceinline__ void native_wmma(
     wmma::load_matrix_sync(b, shared_b, kN);
     wmma::mma_sync(d, a, b, c);
   }
-  wmma::store_matrix_sync(native_output_tile, d, kRawN,
-                          wmma::mem_row_major);
+  wmma::store_matrix_sync(native_output_tile, d, kRawN, wmma::mem_row_major);
 }
 
 template <bool kRowCol>
@@ -193,7 +190,7 @@ __global__ __launch_bounds__(kThreads) void raw_hmma_probe_kernel(
     }
     __syncthreads();
     native_wmma<kRowCol>(shared_a, shared_b, shared_c + native_n,
-                          native_output + native_n);
+                         native_output + native_n);
     __syncthreads();
   }
 
@@ -222,9 +219,8 @@ __global__ __launch_bounds__(kThreads) void raw_hmma_probe_kernel(
       if constexpr (kRowCol) {
         b_values[element] = b[(k_base + element) * kRawN + raw_b_col_n(lane)];
       } else {
-        b_values[element] =
-            b[(k_base + raw_b_row_k(lane)) * kRawN +
-              raw_b_row_n(lane, element)];
+        b_values[element] = b[(k_base + raw_b_row_k(lane)) * kRawN +
+                              raw_b_row_n(lane, element)];
       }
     }
 
@@ -238,12 +234,10 @@ __global__ __launch_bounds__(kThreads) void raw_hmma_probe_kernel(
     const uint32_t b_1 = pack_half2(b_values[2], b_values[3]);
     if constexpr (kRowCol) {
       mma_m8n8k4_row_col(next_low, a_low_0, a_low_1, b_0, b_1, accum_low);
-      mma_m8n8k4_row_col(next_high, a_high_0, a_high_1, b_0, b_1,
-                           accum_high);
+      mma_m8n8k4_row_col(next_high, a_high_0, a_high_1, b_0, b_1, accum_high);
     } else {
       mma_m8n8k4_row_row(next_low, a_low_0, a_low_1, b_0, b_1, accum_low);
-      mma_m8n8k4_row_row(next_high, a_high_0, a_high_1, b_0, b_1,
-                           accum_high);
+      mma_m8n8k4_row_row(next_high, a_high_0, a_high_1, b_0, b_1, accum_high);
     }
 #pragma unroll
     for (int reg = 0; reg < kRawRegisters; ++reg) {
@@ -452,7 +446,8 @@ void print_json_string(const std::string& value) {
       default:
         if (character < 0x20) {
           std::cout << "\\u00" << std::hex << std::setw(2) << std::setfill('0')
-                    << static_cast<int>(character) << std::dec << std::setfill(' ');
+                    << static_cast<int>(character) << std::dec
+                    << std::setfill(' ');
         } else {
           std::cout << character;
         }
@@ -462,8 +457,8 @@ void print_json_string(const std::string& value) {
 }
 
 void print_order(const std::array<int, 4>& order) {
-  std::cout << '[' << order[0] << ", " << order[1] << ", " << order[2]
-            << ", " << order[3] << ']';
+  std::cout << '[' << order[0] << ", " << order[1] << ", " << order[2] << ", "
+            << order[3] << ']';
 }
 
 void print_float_or_null(float value) {
@@ -477,9 +472,10 @@ void print_float_or_null(float value) {
 bool result_matches_all_inputs(const std::vector<Result>& results,
                                Layout layout, int order_index) {
   for (int input = 0; input < 3; ++input) {
-    const auto match = std::find_if(
-        results.begin(), results.end(), [&](const Result& result) {
-          return result.layout == layout && result.input == static_cast<InputKind>(input) &&
+    const auto match =
+        std::find_if(results.begin(), results.end(), [&](const Result& result) {
+          return result.layout == layout &&
+                 result.input == static_cast<InputKind>(input) &&
                  result.order_index == order_index;
         });
     if (match == results.end() || !match->comparison.bitwise_equal) {
@@ -504,9 +500,9 @@ void print_json(const cudaDeviceProp& properties, int device,
       pv_matching_orders.push_back(order_index);
     }
   }
-  const bool mapping_valid = mapping.c_exact_cover && mapping.a_fourfold_cover &&
-                             mapping.b_row_col_exact_cover &&
-                             mapping.b_row_row_exact_cover;
+  const bool mapping_valid =
+      mapping.c_exact_cover && mapping.a_fourfold_cover &&
+      mapping.b_row_col_exact_cover && mapping.b_row_row_exact_cover;
   const bool gate = mapping_valid && !qk_matching_orders.empty() &&
                     !pv_matching_orders.empty();
 
@@ -525,11 +521,15 @@ void print_json(const cudaDeviceProp& properties, int device,
                         : std::getenv("CUDA_VISIBLE_DEVICES"));
   std::cout << "\n  },\n";
   std::cout << "  \"target\": \"sm_70\",\n";
-  std::cout << "  \"native\": \"two wmma.m16n16k16.f32 accumulator tiles at N=0,16\",\n";
+  std::cout << "  \"native\": \"two wmma.m16n16k16.f32 accumulator tiles at "
+               "N=0,16\",\n";
   std::cout << "  \"raw\": {\n";
-  std::cout << "    \"qk\": \"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32\",\n";
-  std::cout << "    \"pv\": \"mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32\",\n";
-  std::cout << "    \"shape\": \"two M=8 raw fragments form one complete M=16, N=32 result\"\n";
+  std::cout
+      << "    \"qk\": \"mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32\",\n";
+  std::cout
+      << "    \"pv\": \"mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32\",\n";
+  std::cout << "    \"shape\": \"two M=8 raw fragments form one complete M=16, "
+               "N=32 result\"\n";
   std::cout << "  },\n";
   std::cout << "  \"mapping_validation\": {\n";
   std::cout << "    \"c_exact_cover_8x32\": "
@@ -542,7 +542,8 @@ void print_json(const cudaDeviceProp& properties, int device,
             << (mapping.b_row_row_exact_cover ? "true" : "false") << "\n";
   std::cout << "  },\n";
   std::cout << "  \"c_initialization\": \"nonzero_fp32_for_every_case\",\n";
-  std::cout << "  \"comparison\": \"512 per-element uint32_t IEEE-754 words over full 16x32 output\",\n";
+  std::cout << "  \"comparison\": \"512 per-element uint32_t IEEE-754 words "
+               "over full 16x32 output\",\n";
   std::cout << "  \"results\": [\n";
   for (size_t index = 0; index < results.size(); ++index) {
     const Result& result = results[index];
@@ -553,8 +554,7 @@ void print_json(const cudaDeviceProp& properties, int device,
     print_json_string(input_name(result.input));
     std::cout << ", \"order\": ";
     print_order(orders[result.order_index]);
-    std::cout << ", \"xor\": {\"max_word\": "
-              << comparison.max_word_xor
+    std::cout << ", \"xor\": {\"max_word\": " << comparison.max_word_xor
               << ", \"reduction\": " << comparison.xor_reduction << '}';
     std::cout << ", \"differing_words\": " << comparison.differing_words;
     std::cout << ", \"max_abs_error\": ";
@@ -569,7 +569,8 @@ void print_json(const cudaDeviceProp& properties, int device,
   std::cout << "    \"full_16x32\": true,\n";
   std::cout << "    \"criterion\": ";
   print_json_string(
-      "each layout needs one fixed k4 order bitwise-equal for every input case");
+      "each layout needs one fixed k4 order bitwise-equal for every input "
+      "case");
   std::cout << ",\n    \"qk_row_col_matching_orders\": [";
   for (size_t index = 0; index < qk_matching_orders.size(); ++index) {
     print_order(orders[qk_matching_orders[index]]);
@@ -591,7 +592,8 @@ int run(int device) {
   CUDA_CHECK(cudaGetDeviceCount(&device_count));
   if (device < 0 || device >= device_count) {
     std::cerr << "Requested logical CUDA device " << device
-              << " is unavailable; visible device count is " << device_count << '\n';
+              << " is unavailable; visible device count is " << device_count
+              << '\n';
     return EXIT_FAILURE;
   }
   CUDA_CHECK(cudaSetDevice(device));
@@ -659,13 +661,13 @@ int run(int device) {
         CUDA_CHECK(cudaMemcpy(device_order, orders[order_index].data(),
                               kKStep * sizeof(int), cudaMemcpyHostToDevice));
         if (layout == Layout::kRowCol) {
-          raw_hmma_probe_kernel<true><<<1, kThreads>>>(
-              device_a, device_b, device_c, device_order, device_native,
-              device_raw);
+          raw_hmma_probe_kernel<true>
+              <<<1, kThreads>>>(device_a, device_b, device_c, device_order,
+                                device_native, device_raw);
         } else {
-          raw_hmma_probe_kernel<false><<<1, kThreads>>>(
-              device_a, device_b, device_c, device_order, device_native,
-              device_raw);
+          raw_hmma_probe_kernel<false>
+              <<<1, kThreads>>>(device_a, device_b, device_c, device_order,
+                                device_native, device_raw);
         }
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -675,8 +677,8 @@ int run(int device) {
         CUDA_CHECK(cudaMemcpy(host_raw.data(), device_raw,
                               kOutputElements * sizeof(float),
                               cudaMemcpyDeviceToHost));
-        results.push_back(
-            {layout, input, order_index, compare_outputs(host_native, host_raw)});
+        results.push_back({layout, input, order_index,
+                           compare_outputs(host_native, host_raw)});
       }
     }
   }

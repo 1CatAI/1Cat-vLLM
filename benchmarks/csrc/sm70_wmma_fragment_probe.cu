@@ -20,14 +20,12 @@ __device__ __forceinline__ int swizzled_row_slot(int row) {
   return (row & 3) | ((row & 8) >> 1) | ((row & 4) << 1);
 }
 
-__global__ void dump_matrix_a_fragment_kernel(
-    const __half* __restrict__ input,
-    int32_t* __restrict__ output,
-    int stride) {
+__global__ void dump_matrix_a_fragment_kernel(const __half* __restrict__ input,
+                                              int32_t* __restrict__ output,
+                                              int stride) {
   __shared__ __align__(16) __half smem[kRows * kMaxStride];
 
-  for (int index = threadIdx.x; index < kRows * kCols;
-       index += blockDim.x) {
+  for (int index = threadIdx.x; index < kRows * kCols; index += blockDim.x) {
     const int row = index / kCols;
     const int col = index - row * kCols;
     smem[row * stride + col] = input[index];
@@ -35,8 +33,8 @@ __global__ void dump_matrix_a_fragment_kernel(
   __syncthreads();
 
   if (threadIdx.x < 32) {
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
-                           __half, nvcuda::wmma::row_major>
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half,
+                           nvcuda::wmma::row_major>
         fragment;
     nvcuda::wmma::load_matrix_sync(fragment, smem, stride);
     const uint32_t* words = reinterpret_cast<const uint32_t*>(&fragment);
@@ -49,14 +47,12 @@ __global__ void dump_matrix_a_fragment_kernel(
 }
 
 __global__ void compare_swizzled_matrix_a_fragment_kernel(
-    const __half* __restrict__ input,
-    int32_t* __restrict__ reference_output,
+    const __half* __restrict__ input, int32_t* __restrict__ reference_output,
     int32_t* __restrict__ swizzled_output) {
   __shared__ __align__(16) __half reference[kRows * kCols];
   __shared__ __align__(16) __half swizzled[kRows * kCols];
 
-  for (int index = threadIdx.x; index < kRows * kCols;
-       index += blockDim.x) {
+  for (int index = threadIdx.x; index < kRows * kCols; index += blockDim.x) {
     const int row = index / kCols;
     const int col = index - row * kCols;
     reference[index] = input[index];
@@ -68,23 +64,19 @@ __global__ void compare_swizzled_matrix_a_fragment_kernel(
   __syncthreads();
 
   if (threadIdx.x < 32) {
-    using Fragment =
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
-                               __half, nvcuda::wmma::row_major>;
+    using Fragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                                            __half, nvcuda::wmma::row_major>;
     Fragment reference_fragment;
     Fragment swizzled_fragment;
     nvcuda::wmma::load_matrix_sync(reference_fragment, reference, kCols);
 
     const int lane = threadIdx.x;
-    const int row =
-        (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
+    const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
     const int slot = swizzled_row_slot(row);
-    const uint4 low =
-        *reinterpret_cast<const uint4*>(swizzled + slot * 8);
+    const uint4 low = *reinterpret_cast<const uint4*>(swizzled + slot * 8);
     const uint4 high =
         *reinterpret_cast<const uint4*>(swizzled + 128 + slot * 8);
-    uint32_t* swizzled_words =
-        reinterpret_cast<uint32_t*>(&swizzled_fragment);
+    uint32_t* swizzled_words = reinterpret_cast<uint32_t*>(&swizzled_fragment);
     swizzled_words[0] = low.x;
     swizzled_words[1] = low.y;
     swizzled_words[2] = low.z;
@@ -107,13 +99,11 @@ __global__ void compare_swizzled_matrix_a_fragment_kernel(
   }
 }
 
-template<typename Layout>
-__global__ void dump_matrix_b_fragment_kernel(
-    const __half* __restrict__ input,
-    int32_t* __restrict__ output) {
+template <typename Layout>
+__global__ void dump_matrix_b_fragment_kernel(const __half* __restrict__ input,
+                                              int32_t* __restrict__ output) {
   if (threadIdx.x < 32) {
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
-                           __half, Layout>
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, Layout>
         fragment;
     nvcuda::wmma::load_matrix_sync(fragment, input, kCols);
     const uint32_t* words = reinterpret_cast<const uint32_t*>(&fragment);
@@ -126,23 +116,19 @@ __global__ void dump_matrix_b_fragment_kernel(
 }
 
 __device__ __forceinline__ void load_global_v4_u32(
-    const __half* __restrict__ address,
-    uint32_t* __restrict__ words) {
+    const __half* __restrict__ address, uint32_t* __restrict__ words) {
   asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]),
-                 "=r"(words[2]), "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "l"(address)
                : "memory");
 }
 
 __global__ void compare_compact_matrix_b_col_fragment_kernel(
-    const __half* __restrict__ input,
-    int32_t* __restrict__ reference_output,
+    const __half* __restrict__ input, int32_t* __restrict__ reference_output,
     int32_t* __restrict__ compact_output) {
   if (threadIdx.x < 32) {
-    using Fragment =
-        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
-                               __half, nvcuda::wmma::col_major>;
+    using Fragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                                            __half, nvcuda::wmma::col_major>;
     Fragment reference_fragment;
     Fragment compact_fragment;
     nvcuda::wmma::load_matrix_sync(reference_fragment, input, kCols);
@@ -162,8 +148,7 @@ __global__ void compare_compact_matrix_b_col_fragment_kernel(
       const int output_index = threadIdx.x * kFragmentWords + word;
       reference_output[output_index] =
           static_cast<int32_t>(reference_words[word]);
-      compact_output[output_index] =
-          static_cast<int32_t>(compact_words[word]);
+      compact_output[output_index] = static_cast<int32_t>(compact_words[word]);
     }
   }
 }
@@ -227,13 +212,15 @@ torch::Tensor dump_matrix_b_fragment(torch::Tensor input, bool col_major) {
       torch::TensorOptions().device(input.device()).dtype(torch::kInt32));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
   if (col_major) {
-    dump_matrix_b_fragment_kernel<nvcuda::wmma::col_major><<<1, 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
-        output.data_ptr<int32_t>());
+    dump_matrix_b_fragment_kernel<nvcuda::wmma::col_major>
+        <<<1, 32, 0, stream>>>(
+            reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+            output.data_ptr<int32_t>());
   } else {
-    dump_matrix_b_fragment_kernel<nvcuda::wmma::row_major><<<1, 32, 0, stream>>>(
-        reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
-        output.data_ptr<int32_t>());
+    dump_matrix_b_fragment_kernel<nvcuda::wmma::row_major>
+        <<<1, 32, 0, stream>>>(
+            reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+            output.data_ptr<int32_t>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;

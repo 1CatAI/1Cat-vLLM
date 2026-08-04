@@ -19,22 +19,19 @@ constexpr int kWarpsPerBlock = kBlockN / 16;
 constexpr int kThreads = kWarpsPerBlock * 32;
 constexpr uint32_t kFullWarpMask = 0xffffffff;
 
-using AFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a,
-                                         16, 16, 16, __half,
-                                         nvcuda::wmma::row_major>;
-using BFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b,
-                                         16, 16, 16, __half,
-                                         nvcuda::wmma::col_major>;
-using CFragment = nvcuda::wmma::fragment<nvcuda::wmma::accumulator,
-                                         16, 16, 16, float>;
+using AFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                                         __half, nvcuda::wmma::row_major>;
+using BFragment = nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                                         __half, nvcuda::wmma::col_major>;
+using CFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>;
 
 enum class BLoadPath : int { kNative, kDirect, kShuffle };
 
 __device__ __forceinline__ void load_global_v4_u32(
     const __half* __restrict__ address, uint32_t* __restrict__ words) {
   asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]),
-                 "=r"(words[3])
+               : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3])
                : "l"(address)
                : "memory");
 }
@@ -45,10 +42,10 @@ __device__ __forceinline__ int matrix_b_column_for_lane(int lane) {
   return (lane & 3) + 4 * ((lane >> 4) & 1) + 8 * ((lane >> 3) & 1);
 }
 
-template<BLoadPath kPath>
-__device__ __forceinline__ void load_matrix_b(
-    BFragment& fragment, const __half* __restrict__ tile, int token_stride,
-    int lane) {
+template <BLoadPath kPath>
+__device__ __forceinline__ void load_matrix_b(BFragment& fragment,
+                                              const __half* __restrict__ tile,
+                                              int token_stride, int lane) {
   if constexpr (kPath == BLoadPath::kNative) {
     nvcuda::wmma::load_matrix_sync(fragment, tile, token_stride);
     return;
@@ -81,7 +78,7 @@ __device__ __forceinline__ void load_matrix_b(
   }
 }
 
-template<BLoadPath kPath>
+template <BLoadPath kPath>
 __device__ __forceinline__ void qk_b_load_body(
     const __half* __restrict__ query, const __half* __restrict__ key,
     float* __restrict__ output, __half* __restrict__ shared_query, int panels,
@@ -101,8 +98,8 @@ __device__ __forceinline__ void qk_b_load_body(
   const int lane = threadIdx.x & 31;
   const int tile_n = (threadIdx.x >> 5) * 16;
   const __half* key_tile =
-      key + static_cast<int64_t>(panel) * kBlockN * token_stride
-      + tile_n * token_stride;
+      key + static_cast<int64_t>(panel) * kBlockN * token_stride +
+      tile_n * token_stride;
 
   AFragment a_fragment;
   BFragment b_fragment;
@@ -124,30 +121,27 @@ __device__ __forceinline__ void qk_b_load_body(
 }
 
 __global__ void qk_b_load_native_kernel(const __half* __restrict__ query,
-                                         const __half* __restrict__ key,
-                                         float* __restrict__ output,
-                                         int panels,
-                                         int token_stride) {
+                                        const __half* __restrict__ key,
+                                        float* __restrict__ output, int panels,
+                                        int token_stride) {
   __shared__ __align__(16) __half shared_query[kBlockM * kHeadDim];
   qk_b_load_body<BLoadPath::kNative>(query, key, output, shared_query, panels,
                                      token_stride);
 }
 
 __global__ void qk_b_load_direct_kernel(const __half* __restrict__ query,
-                                         const __half* __restrict__ key,
-                                         float* __restrict__ output,
-                                         int panels,
-                                         int token_stride) {
+                                        const __half* __restrict__ key,
+                                        float* __restrict__ output, int panels,
+                                        int token_stride) {
   __shared__ __align__(16) __half shared_query[kBlockM * kHeadDim];
   qk_b_load_body<BLoadPath::kDirect>(query, key, output, shared_query, panels,
                                      token_stride);
 }
 
 __global__ void qk_b_load_shuffle_kernel(const __half* __restrict__ query,
-                                          const __half* __restrict__ key,
-                                          float* __restrict__ output,
-                                          int panels,
-                                          int token_stride) {
+                                         const __half* __restrict__ key,
+                                         float* __restrict__ output, int panels,
+                                         int token_stride) {
   __shared__ __align__(16) __half shared_query[kBlockM * kHeadDim];
   qk_b_load_body<BLoadPath::kShuffle>(query, key, output, shared_query, panels,
                                       token_stride);
@@ -166,23 +160,23 @@ void check_inputs(const torch::Tensor& query, const torch::Tensor& key,
   TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
   TORCH_CHECK(key.is_contiguous(), "key must be contiguous");
   TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
-  TORCH_CHECK(query.dim() == 3 && query.size(1) == kBlockM
-                  && query.size(2) == kHeadDim,
-              "query must have shape [panels, 16, 256]");
-  TORCH_CHECK(key.dim() == 3 && key.size(0) == query.size(0)
-                  && key.size(1) == kBlockN && key.size(2) >= kHeadDim,
+  TORCH_CHECK(
+      query.dim() == 3 && query.size(1) == kBlockM && query.size(2) == kHeadDim,
+      "query must have shape [panels, 16, 256]");
+  TORCH_CHECK(key.dim() == 3 && key.size(0) == query.size(0) &&
+                  key.size(1) == kBlockN && key.size(2) >= kHeadDim,
               "key must have shape [panels, 128, token_stride >= 256]");
   TORCH_CHECK(key.size(2) % 8 == 0,
               "token_stride must preserve 16-byte vector alignment");
-  TORCH_CHECK(output.dim() == 3 && output.size(0) == query.size(0)
-                  && output.size(1) == kBlockM && output.size(2) == kBlockN,
+  TORCH_CHECK(output.dim() == 3 && output.size(0) == query.size(0) &&
+                  output.size(1) == kBlockM && output.size(2) == kBlockN,
               "output must have shape [panels, 16, 128]");
-  TORCH_CHECK(query.get_device() == key.get_device()
-                  && query.get_device() == output.get_device(),
+  TORCH_CHECK(query.get_device() == key.get_device() &&
+                  query.get_device() == output.get_device(),
               "query, key, and output must use the same device");
 }
 
-template<BLoadPath kPath>
+template <BLoadPath kPath>
 void launch(torch::Tensor query, torch::Tensor key, torch::Tensor output) {
   check_inputs(query, key, output);
   const c10::cuda::CUDAGuard device_guard(query.device());
@@ -209,15 +203,18 @@ void launch(torch::Tensor query, torch::Tensor key, torch::Tensor output) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void launch_native(torch::Tensor query, torch::Tensor key, torch::Tensor output) {
+void launch_native(torch::Tensor query, torch::Tensor key,
+                   torch::Tensor output) {
   launch<BLoadPath::kNative>(query, key, output);
 }
 
-void launch_direct(torch::Tensor query, torch::Tensor key, torch::Tensor output) {
+void launch_direct(torch::Tensor query, torch::Tensor key,
+                   torch::Tensor output) {
   launch<BLoadPath::kDirect>(query, key, output);
 }
 
-void launch_shuffle(torch::Tensor query, torch::Tensor key, torch::Tensor output) {
+void launch_shuffle(torch::Tensor query, torch::Tensor key,
+                    torch::Tensor output) {
   launch<BLoadPath::kShuffle>(query, key, output);
 }
 
