@@ -1091,12 +1091,12 @@ def run_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         for _ in range(args.warmup):
             out, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         for _ in range(args.repeat):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             out, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             timings_s.append(time.perf_counter() - start)
 
     assert out is not None
@@ -1110,7 +1110,7 @@ def run_case(args: argparse.Namespace) -> int:
     }
     if args.save_intermediates:
         pipeline_outputs = _run_chunk_pipeline(cuda_inputs, cu_seqlens, scale)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         outputs.update(
             {
                 name: tensor.detach().cpu() if tensor is not None else None
@@ -1210,12 +1210,12 @@ def run_recurrent_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         for _ in range(args.warmup):
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         for _ in range(args.repeat):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             timings_s.append(time.perf_counter() - start)
 
     assert out_result is not None
@@ -1325,12 +1325,12 @@ def run_sigmoid_gating_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         for _ in range(args.warmup):
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         for _ in range(args.repeat):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             timings_s.append(time.perf_counter() - start)
 
     assert out_result is not None
@@ -1452,12 +1452,12 @@ def run_sigmoid_gating_mixed_qkv_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         for _ in range(args.warmup):
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         for _ in range(args.repeat):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             timings_s.append(time.perf_counter() - start)
 
     assert out_result is not None
@@ -1676,7 +1676,7 @@ def run_model_mixed_qkv_route_case(args: argparse.Namespace) -> int:
                 enable_mixed_qkv=True,
                 compare_mixed_qkv=True,
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
     finally:
         qwen_gdn.get_forward_context = original_get_forward_context
         qwen_gdn.causal_conv1d_update = original_causal_conv1d_update
@@ -1795,12 +1795,12 @@ def run_packed_recurrent_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         for _ in range(args.warmup):
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         for _ in range(args.repeat):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             timings_s.append(time.perf_counter() - start)
 
     assert out_result is not None
@@ -1926,12 +1926,12 @@ def run_flashqla_decode_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         for _ in range(args.warmup):
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
         for _ in range(args.repeat):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             out_result, final_state = run_op()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             timings_s.append(time.perf_counter() - start)
 
     assert out_result is not None
@@ -2068,7 +2068,7 @@ def run_packed_recurrent_cudagraph_case(args: argparse.Namespace) -> int:
             warm_out,
             state_indices,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         for step in range(args.seqlen):
             launch_one(
@@ -2080,7 +2080,7 @@ def run_packed_recurrent_cudagraph_case(args: argparse.Namespace) -> int:
                 state_indices,
             )
             eager_out[step].copy_(step_out)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         capture_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture_graph):
@@ -2092,11 +2092,11 @@ def run_packed_recurrent_cudagraph_case(args: argparse.Namespace) -> int:
                 graph_step_out,
                 graph_state_indices,
             )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         graph_state.copy_(initial_state)
         graph_state_indices.copy_(state_indices)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         for step in range(args.seqlen):
             mixed_buf.copy_(mixed_qkv_seq[step])
@@ -2104,7 +2104,7 @@ def run_packed_recurrent_cudagraph_case(args: argparse.Namespace) -> int:
             b_buf.copy_(b_seq[step])
             capture_graph.replay()
             graph_out[step].copy_(graph_step_out)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         elapsed_s = time.perf_counter() - start
 
     outputs: dict[str, torch.Tensor | None] = {
@@ -2214,28 +2214,28 @@ def run_conv_update_cudagraph_case(args: argparse.Namespace) -> int:
     with torch.inference_mode():
         warm_state = initial_state.clone()
         _ = launch_one(x_seq[0].clone(), warm_state, state_indices)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         for step in range(args.seqlen):
             eager_out[step].copy_(
                 launch_one(eager_x_seq[step], eager_state, state_indices)
             )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         capture_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture_graph):
             graph_step_out = launch_one(x_buf, graph_state, graph_state_indices)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         graph_state.copy_(initial_state)
         graph_state_indices.copy_(state_indices)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         for step in range(args.seqlen):
             x_buf.copy_(graph_x_seq[step])
             capture_graph.replay()
             graph_out[step].copy_(graph_step_out)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         elapsed_s = time.perf_counter() - start
 
     outputs: dict[str, torch.Tensor | None] = {
@@ -2416,7 +2416,7 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             num_accepted_tokens_seq[0],
             query_start_loc_seq[0],
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         for step in range(steps):
             mixed_step = mixed_qkv_seq[step].clone()
@@ -2434,7 +2434,7 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             )
             eager_out[step].copy_(step_out)
             eager_mixed_after[step].copy_(mixed_step)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         capture_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture_graph):
@@ -2449,11 +2449,11 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
                 num_accepted_tokens_buf,
                 query_start_loc_buf,
             )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         graph_conv_state.copy_(initial_conv_state)
         graph_ssm_state.copy_(initial_ssm_state)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         for step in range(steps):
             mixed_buf.copy_(mixed_qkv_seq[step])
@@ -2465,7 +2465,7 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             capture_graph.replay()
             graph_out[step].copy_(graph_step_out)
             graph_mixed_after[step].copy_(mixed_buf)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         elapsed_s = time.perf_counter() - start
 
     query_lens = inputs["query_lens"].to(torch.int64)
@@ -2760,7 +2760,7 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
             num_accepted_tokens_buf,
             query_start_loc_buf,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch_fn(
@@ -2774,10 +2774,10 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
                 num_accepted_tokens_buf,
                 query_start_loc_buf,
             )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         conv_state.copy_(initial_conv_state)
         ssm_state.copy_(initial_ssm_state)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = time.perf_counter()
         for step in range(steps):
             mixed_buf.copy_(mixed_qkv_seq[step])
@@ -2787,7 +2787,7 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
             num_accepted_tokens_buf.copy_(num_accepted_tokens_seq[step])
             query_start_loc_buf.copy_(query_start_loc_seq[step])
             graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return time.perf_counter() - start
 
     with torch.inference_mode():
@@ -2797,7 +2797,7 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
         mixed_out, mixed_after, mixed_conv, mixed_ssm = run_eager_sequence(
             launch_mixed_qkv
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         split_graph_s = time_graph_sequence(launch_split)
         mixed_graph_s = time_graph_sequence(launch_mixed_qkv)
 
@@ -3096,7 +3096,7 @@ def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
                 state_indices_seq[0],
                 num_accepted_tokens_seq[0],
             )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             for step in range(steps):
                 mixed_step = mixed_qkv_seq[step].clone()
@@ -3130,7 +3130,7 @@ def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
                 )
                 spec_eager_out[step].copy_(step_out)
                 spec_eager_mixed_after[step].copy_(mixed_step)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             capture_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(capture_graph):
@@ -3145,11 +3145,11 @@ def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
                     state_indices_buf,
                     num_accepted_tokens_buf,
                 )
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             spec_graph_conv.copy_(conv_state_cache)
             spec_graph_ssm.copy_(ssm_state_cache)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             for step in range(steps):
                 mixed_buf.copy_(mixed_qkv_seq[step])
@@ -3161,7 +3161,7 @@ def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
                 capture_graph.replay()
                 spec_graph_out[step].copy_(graph_step_out)
                 spec_graph_mixed_after[step].copy_(mixed_buf)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             elapsed_s = time.perf_counter() - start
     finally:
         qwen_gdn.get_forward_context = original_get_forward_context
@@ -3585,7 +3585,7 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                 num_accepted_tokens_seq[0],
             )
             direct_projection(warm_core, z_seq[0], warm_output)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             for step in range(steps):
                 mixed_step = mixed_qkv_seq[step].clone()
@@ -3628,7 +3628,7 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                 compute_logits(step_output, step_logits)
                 spec_direct_eager_output[step].copy_(step_output)
                 spec_direct_eager_logits[step].copy_(step_logits)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             direct_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(direct_graph):
@@ -3645,7 +3645,7 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                 )
                 direct_projection(graph_direct_core, z_buf, graph_direct_output)
                 compute_logits(graph_direct_output, graph_direct_logits)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             opaque_graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(opaque_graph):
@@ -3662,13 +3662,13 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                 )
                 opaque_projection(graph_opaque_core, z_buf, graph_opaque_output)
                 compute_logits(graph_opaque_output, graph_opaque_logits)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
             spec_direct_graph_conv.copy_(conv_state_cache)
             spec_direct_graph_ssm.copy_(ssm_state_cache)
             spec_opaque_graph_conv.copy_(conv_state_cache)
             spec_opaque_graph_ssm.copy_(ssm_state_cache)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             start = time.perf_counter()
             for step in range(steps):
                 mixed_buf.copy_(mixed_qkv_seq[step])
@@ -3694,7 +3694,7 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                 spec_opaque_graph_core[step].copy_(graph_opaque_core)
                 spec_opaque_graph_output[step].copy_(graph_opaque_output)
                 spec_opaque_graph_logits[step].copy_(graph_opaque_logits)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             elapsed_s = time.perf_counter() - start
 
             if args.compile_direct:
@@ -3754,10 +3754,10 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                         state_indices_seq[0],
                         num_accepted_tokens_seq[0],
                     )
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     spec_direct_compile_conv.copy_(conv_state_cache)
                     spec_direct_compile_ssm.copy_(ssm_state_cache)
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     assert spec_direct_compile_core is not None
                     assert spec_direct_compile_output is not None
                     assert spec_direct_compile_logits is not None
@@ -3786,7 +3786,7 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                         spec_direct_compile_core[step].copy_(step_core_snapshot)
                         spec_direct_compile_output[step].copy_(step_output)
                         spec_direct_compile_logits[step].copy_(step_logits)
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
                     elapsed_s += time.perf_counter() - start
                 except Exception as exc:
                     compile_step_error = repr(exc)
