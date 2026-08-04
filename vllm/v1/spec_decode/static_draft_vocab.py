@@ -789,7 +789,7 @@ def initialize_static_draft_vocab(
             input_split_sizes=input_splits,
             group=tp_group.device_group,
         )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     fingerprints = payload.get("fingerprints")
     ranking_fingerprint = None
@@ -1051,5 +1051,5 @@ def initialize_dynamic_draft_vocab(
         )
     else:
         runtime._refresh_tail()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     return runtime
