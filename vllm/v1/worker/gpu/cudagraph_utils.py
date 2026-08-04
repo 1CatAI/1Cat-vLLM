@@ -250,7 +250,7 @@ class CudaGraphManager:
                             get_offloader().sync_prev_onload()
                             forward_fn(CUDAGraphMode.NONE)
                             get_offloader().join_after_forward()
-                            torch.cuda.synchronize()
+                            torch.accelerator.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
