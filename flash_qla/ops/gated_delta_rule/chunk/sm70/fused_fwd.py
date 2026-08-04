@@ -10,24 +10,47 @@ import torch
 from torch.utils.cpp_extension import load
 
 _EXT = None
+_EXT_LOAD_ERROR: Exception | None = None
+
+# Passing these directly avoids PyTorch's CUDA-device auto-detection during a
+# worker's first JIT build. That detection can report no visible accelerator
+# while distributed workers are still initializing, even though the SM70
+# extension has a fixed target architecture.
+_SM70_GENCODE_FLAGS = [
+    "-gencode=arch=compute_70,code=sm_70",
+    "-gencode=arch=compute_75,code=sm_75",
+]
 
 
 def _load_ext():
-    global _EXT
+    global _EXT, _EXT_LOAD_ERROR
     if _EXT is not None:
         return _EXT
+    if _EXT_LOAD_ERROR is not None:
+        raise RuntimeError(
+            "SM70 FlashQLA JIT extension initialization previously failed. "
+            "The original compiler or loader error is chained below. "
+            "Set FLASH_QLA_SM70_VERBOSE_BUILD=1 to log the full build command."
+        ) from _EXT_LOAD_ERROR
     if not torch.cuda.is_available():
         raise RuntimeError("SM70 FlashQLA backend requires CUDA.")
 
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0;7.5")
     src = Path(__file__).with_name("csrc") / "gdn_forward.cu"
-    _EXT = load(
-        name="flash_qla_sm70_gdn_strided",
-        sources=[str(src)],
-        extra_cuda_cflags=["-O3"],
-        extra_cflags=["-O3"],
-        verbose=bool(int(os.environ.get("FLASH_QLA_SM70_VERBOSE_BUILD", "0"))),
-    )
+    try:
+        _EXT = load(
+            name="flash_qla_sm70_gdn_strided",
+            sources=[str(src)],
+            extra_cuda_cflags=["-O3", *_SM70_GENCODE_FLAGS],
+            extra_cflags=["-O3"],
+            verbose=bool(int(os.environ.get("FLASH_QLA_SM70_VERBOSE_BUILD", "0"))),
+        )
+    except Exception as exc:
+        # ``torch.utils.cpp_extension`` marks a failed build as current in its
+        # process-local versioner. A later load then skips compilation and
+        # reports only a missing .so. Retain the first error so users see the
+        # actionable compiler failure instead.
+        _EXT_LOAD_ERROR = exc
+        raise
     return _EXT
 
 
