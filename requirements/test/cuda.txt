@@ -1115,7 +1115,7 @@ uvicorn==0.35.0
     # via gpt-oss
 vector-quantize-pytorch==1.21.2
     # via -r requirements/test/cuda.in
-virtualenv==20.31.2
+virtualenv==21.7.1
     # via ray
 vocos==0.1.0
     # via -r requirements/test/cuda.in
