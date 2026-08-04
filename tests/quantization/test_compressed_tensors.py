@@ -16,10 +16,15 @@ from compressed_tensors.quantization import (
 )
 
 from tests.models.utils import check_logprobs_close
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.device import DeviceConfig
 from vllm.model_executor.kernels.linear import (
     Fp8BlockScaledMMLinearKernel,
 )
-from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
     CompressedTensorsLinearMethod,
@@ -32,6 +37,12 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsW8A8Mxfp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+    compressed_tensors_moe_wna16_marlin,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16_marlin import (  # noqa: E501
+    CompressedTensorsWNA16MarlinMoEMethod,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -590,6 +601,87 @@ def _make_ct_config(*, target: str = "Linear") -> CompressedTensorsConfig:
         ignore=[],
         quant_format="pack-quantized",
     )
+
+
+def _make_qwen3_coder_awq4_config() -> CompressedTensorsConfig:
+    """Build the 4-bit grouped MoE scheme from issue #35's checkpoint."""
+    weight_quant = QuantizationArgs(
+        num_bits=4,
+        type=QuantizationType.INT,
+        strategy=QuantizationStrategy.GROUP,
+        symmetric=True,
+        dynamic=False,
+        group_size=32,
+    )
+    return CompressedTensorsConfig(
+        target_scheme_map={
+            "Linear": {
+                "weights": weight_quant,
+                "input_activations": None,
+                "format": "pack-quantized",
+            }
+        },
+        ignore=[],
+        quant_format="pack-quantized",
+    )
+
+
+def test_qwen3_coder_awq4_moe_postload_does_not_require_sm70_hidden_size(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Issue #35: current compressed-tensors MoE must not use legacy SM70 state.
+
+    The reported checkpoint is Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit: packed
+    symmetric INT4, group size 32, with hidden size 2048 and MoE intermediate
+    size 768. Keep the real selection and post-load path, replacing only the
+    CUDA-only Marlin repack primitives so the contract is testable on CPU.
+    """
+    quant_config = _make_qwen3_coder_awq4_config()
+    with set_current_vllm_config(
+        VllmConfig(
+            device_config=DeviceConfig(device="cpu"),
+            quant_config=quant_config,
+        )
+    ):
+        layer = FusedMoE(
+            num_experts=2,
+            top_k=1,
+            hidden_size=2048,
+            intermediate_size=768,
+            params_dtype=torch.float16,
+            quant_config=quant_config,
+            prefix="model.layers.0.mlp.experts",
+            tp_size=1,
+            dp_size=1,
+            pcp_size=1,
+            ep_size=1,
+        )
+
+    assert isinstance(layer.quant_method, CompressedTensorsWNA16MarlinMoEMethod)
+    assert not hasattr(layer, "sm70_hidden_logical_size")
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_wna16_marlin.ops,
+        "gptq_marlin_moe_repack",
+        lambda weight, *_args, **_kwargs: weight,
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_wna16_marlin,
+        "marlin_moe_permute_scales",
+        lambda *, s, **_kwargs: s,
+    )
+    monkeypatch.setattr(
+        compressed_tensors_moe_wna16_marlin,
+        "marlin_make_workspace_new",
+        lambda device, _max_parallel: torch.empty(0, dtype=torch.int32, device=device),
+    )
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert not hasattr(layer, "sm70_hidden_logical_size")
+    assert layer.w13_weight_g_idx.shape == (2, 0)
+    assert layer.w2_weight_g_idx.shape == (2, 0)
+    assert layer.workspace.numel() == 0
 
 
 def test_get_quant_method_returns_linear_method_for_parallel_lm_head():
