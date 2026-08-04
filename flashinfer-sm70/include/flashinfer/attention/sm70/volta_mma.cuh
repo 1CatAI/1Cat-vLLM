@@ -20,18 +20,18 @@ constexpr int kVoltaMmaM = 16;
 constexpr int kVoltaMmaN = 16;
 constexpr int kVoltaMmaK = 16;
 
-using AFragment = nvcuda::wmma::fragment<
-    nvcuda::wmma::matrix_a, kVoltaMmaM, kVoltaMmaN, kVoltaMmaK, __half,
-    nvcuda::wmma::row_major>;
-using QKBFragment = nvcuda::wmma::fragment<
-    nvcuda::wmma::matrix_b, kVoltaMmaM, kVoltaMmaN, kVoltaMmaK, __half,
-    nvcuda::wmma::col_major>;
-using PVBFragment = nvcuda::wmma::fragment<
-    nvcuda::wmma::matrix_b, kVoltaMmaM, kVoltaMmaN, kVoltaMmaK, __half,
-    nvcuda::wmma::row_major>;
+using AFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kVoltaMmaM, kVoltaMmaN,
+                           kVoltaMmaK, __half, nvcuda::wmma::row_major>;
+using QKBFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kVoltaMmaM, kVoltaMmaN,
+                           kVoltaMmaK, __half, nvcuda::wmma::col_major>;
+using PVBFragment =
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kVoltaMmaM, kVoltaMmaN,
+                           kVoltaMmaK, __half, nvcuda::wmma::row_major>;
 using AccumulatorFragment =
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kVoltaMmaM,
-                           kVoltaMmaN, kVoltaMmaK, float>;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kVoltaMmaM, kVoltaMmaN,
+                           kVoltaMmaK, float>;
 
 __device__ __forceinline__ void load_a_fragment(AFragment& fragment,
                                                 const __half* source,
@@ -84,8 +84,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_row_f16f16f32(
 __device__ __forceinline__ void store_accumulator_fragment(
     float* destination, const AccumulatorFragment& accumulator,
     int leading_dimension = kVoltaMmaN) {
-  nvcuda::wmma::store_matrix_sync(destination, accumulator,
-                                  leading_dimension,
+  nvcuda::wmma::store_matrix_sync(destination, accumulator, leading_dimension,
                                   nvcuda::wmma::mem_row_major);
 }
 
@@ -142,8 +141,8 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(
     int c_ld = attention::sm70::kVoltaMmaN,
     int a_ld = attention::sm70::kVoltaMmaK,
     int b_ld = attention::sm70::kVoltaMmaK) {
-  attention::sm70::mma_sync_m16n16k16_row_col_f16f16f32<mma_mode>(
-      c, a, b, c_ld, a_ld, b_ld);
+  attention::sm70::mma_sync_m16n16k16_row_col_f16f16f32<mma_mode>(c, a, b, c_ld,
+                                                                  a_ld, b_ld);
 }
 
 template <SM70MMAMode mma_mode = SM70MMAMode::kInplaceUpdate>
@@ -152,8 +151,8 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_row_f16f16f32(
     int c_ld = attention::sm70::kVoltaMmaN,
     int a_ld = attention::sm70::kVoltaMmaK,
     int b_ld = attention::sm70::kVoltaMmaN) {
-  attention::sm70::mma_sync_m16n16k16_row_row_f16f16f32<mma_mode>(
-      c, a, b, c_ld, a_ld, b_ld);
+  attention::sm70::mma_sync_m16n16k16_row_row_f16f16f32<mma_mode>(c, a, b, c_ld,
+                                                                  a_ld, b_ld);
 }
 
 }  // namespace mma
