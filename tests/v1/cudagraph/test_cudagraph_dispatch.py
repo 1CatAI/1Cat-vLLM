@@ -401,6 +401,56 @@ class TestCudagraphDispatcher:
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
 
+    def test_dsv4_context_bucket_is_derived_for_mtp_on_sm70(self, monkeypatch):
+        monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
+        monkeypatch.delenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", raising=False)
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        config.speculative_config = MagicMock(num_speculative_tokens=7)
+        config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        config.model_config.max_model_len = 4096
+        config.model_config.hf_config.index_topk = 512
+        config.model_config.hf_config.compress_ratios = [128, 4, 128]
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+        ):
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=8,
+        )
+
+        bounded = BatchDescriptor(
+            num_tokens=8,
+            num_reqs=1,
+            uniform=True,
+            attention_context_bucket=2048,
+        )
+        assert dispatcher.has_attention_context_buckets
+        assert bounded in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            attention_context_len=1024,
+        )
+        assert mode == CUDAGraphMode.FULL
+        assert desc == bounded
+
+        monkeypatch.setenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", "")
+        explicitly_disabled = CudagraphDispatcher(config)
+        explicitly_disabled.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=8,
+        )
+        assert not explicitly_disabled.has_attention_context_buckets
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:

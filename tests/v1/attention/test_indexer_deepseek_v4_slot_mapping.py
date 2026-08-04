@@ -63,6 +63,9 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
 
     md = builder.build(common_prefix_len=0, common_attn_metadata=common)
 
+    assert md.max_seq_len == 280
+    assert md.max_kv_seq_len == 70
+
     # The compressed slot_mapping retains the original uncompressed size (40).
     # Only every compress_ratio-th position gets a valid slot; the rest are -1.
     assert md.slot_mapping.numel() == 40

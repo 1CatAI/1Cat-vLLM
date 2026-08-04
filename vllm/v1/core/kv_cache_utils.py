@@ -1455,42 +1455,36 @@ def group_and_unify_kv_cache_specs(
     return [mla_uniform_spec, *swa_uniform_specs]
 
 
-def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
-    """Pick a chunk size that minimizes total upward padding.
+def _select_deepseek_v4_tuple_width(
+    vllm_config: VllmConfig,
+    grouped_specs: list[UniformTypeKVCacheSpecs],
+) -> int:
+    """Pick the DeepSeek V4 tuple width with the smallest physical pool.
 
-    Each x is rounded up to a multiple of d:
-
-      x -> ceil(x / d) * d
-
-    Total padding is:
-
-      pad(d) = sum_i (ceil(x_i / d) * d - x_i)
-
-    We brute-force d in [lower_bound, max(values)] (fine for small lists / small
-    maxima) and return the d with minimum padding. Ties prefer larger d.
+    Padding layer counts alone is insufficient: full/compressed MLA may need
+    thousands more pages than a short sliding-window group at long context.
+    Widening every physical block to save one SWA subgroup can therefore cost
+    substantially more memory than it saves.
     """
-    if not values:
-        raise ValueError("values must be non-empty")
-    if any(x <= 0 for x in values):
-        raise ValueError(f"values must be positive, got: {list(values)!r}")
+    tuple_counts = [spec.get_num_layer_tuples() for spec in grouped_specs]
+    page_counts = [spec.max_memory_usage_pages(vllm_config) for spec in grouped_specs]
+    min_width = tuple_counts[0]
+    max_width = max(tuple_counts)
 
-    min_d = max(1, lower_bound if lower_bound is not None else 1)
-    max_d = max(values)
-    if min_d > max_d:
-        return min_d
+    def pool_pages(width: int) -> int:
+        return width * sum(
+            cdiv(tuple_count, width) * page_count
+            for tuple_count, page_count in zip(tuple_counts, page_counts)
+        )
 
-    best_d = min_d
-    best_pad: int | None = None
-    for d in range(min_d, max_d + 1):
-        pad = sum((d - (x % d)) % d for x in values)
-        if best_pad is None or pad < best_pad or (pad == best_pad and d > best_d):
-            best_pad = pad
-            best_d = d
-
-    return best_d
+    return min(
+        range(min_width, max_width + 1),
+        key=lambda width: (pool_pages(width), width),
+    )
 
 
 def _get_kv_cache_groups_uniform_groups(
+    vllm_config: VllmConfig,
     grouped_specs: list[UniformTypeKVCacheSpecs],
 ) -> list[KVCacheGroupSpec]:
     """
@@ -1521,10 +1515,8 @@ def _get_kv_cache_groups_uniform_groups(
     num_layer_tuples_per_group: list[int] = [
         g_spec.get_num_layer_tuples() for g_spec in grouped_specs
     ]
-    # Choose `num_layer_tuples` to minimize total padding across groups.
-    num_layer_tuples = _approximate_gcd(
-        num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]
-    )
+    # Choose `num_layer_tuples` by physical bytes, not layer-count padding.
+    num_layer_tuples = _select_deepseek_v4_tuple_width(vllm_config, grouped_specs)
     # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)
     num_layer_tuples_per_group = [
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
@@ -1651,7 +1643,9 @@ def get_kv_cache_groups(
         # yet some layers are full attention while others are sliding window
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
-        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        kv_cache_groups = _get_kv_cache_groups_uniform_groups(
+            vllm_config, grouped_specs
+        )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 

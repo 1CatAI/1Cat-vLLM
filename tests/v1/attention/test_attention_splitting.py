@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from vllm.v1.attention.backends.mla.sparse_swa import (
+    DeepseekSparseSWAMetadataBuilder,
+)
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
+from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
     _make_metadata_with_slice,
@@ -179,6 +185,49 @@ def apply_split_decodes_and_prefills(
         decode_threshold=decode_threshold,
         require_uniform=require_uniform,
     )
+
+
+@pytest.mark.parametrize(
+    ("parallel_drafting", "expected_threshold"),
+    [(False, 8), (True, 15)],
+)
+def test_deepseek_sparse_swa_spec_decode_threshold(
+    parallel_drafting: bool,
+    expected_threshold: int,
+):
+    kv_cache_spec = SlidingWindowMLASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float16,
+        sliding_window=2048,
+        compress_ratio=1,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=4096,
+            hf_config=SimpleNamespace(
+                sliding_window=2048,
+                compress_ratios=[1, 4, 128],
+            ),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=7,
+            parallel_drafting=parallel_drafting,
+            use_dspark=lambda: True,
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+
+    builder = DeepseekSparseSWAMetadataBuilder(
+        kv_cache_spec,
+        ["layer"],
+        vllm_config,
+        torch.device("cpu"),
+    )
+
+    assert builder.decode_threshold == expected_threshold
 
 
 def test_split_decodes_and_prefills_nonuniform_all_ones():

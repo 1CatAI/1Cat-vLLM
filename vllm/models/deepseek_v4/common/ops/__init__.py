@@ -11,7 +11,11 @@ from .fused_indexer_q import MXFP4_BLOCK_SIZE, fused_indexer_q_rope_quant
 from .fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from .fused_mtp_input_rmsnorm import fused_mtp_input_rmsnorm, mtp_shared_head_rmsnorm
 from .fused_qk_rmsnorm import fused_q_kv_rmsnorm
-from .save_partial_states import save_partial_states
+from .save_partial_states import (
+    save_partial_states,
+    save_partial_states_to_ring,
+    stage_partial_states_from_ring,
+)
 
 __all__ = [
     "MXFP4_BLOCK_SIZE",
@@ -25,4 +29,6 @@ __all__ = [
     "mtp_shared_head_rmsnorm",
     "quantize_and_insert_k_cache",
     "save_partial_states",
+    "save_partial_states_to_ring",
+    "stage_partial_states_from_ring",
 ]

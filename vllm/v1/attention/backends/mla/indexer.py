@@ -203,6 +203,7 @@ class DeepseekV32IndexerMetadata:
     # hacky way to access the data now, need to be in chunked meta
     seq_lens: torch.Tensor
     max_seq_len: int
+    max_kv_seq_len: int
     slot_mapping: torch.Tensor
 
     # New for MLA (compared to FlashAttention)
@@ -627,6 +628,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         attn_metadata = DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
+            max_kv_seq_len=cdiv(common_attn_metadata.max_seq_len, self.compress_ratio),
             slot_mapping=compressed_slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,

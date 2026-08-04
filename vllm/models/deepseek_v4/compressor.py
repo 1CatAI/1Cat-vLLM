@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
@@ -18,6 +19,8 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
+    save_partial_states_to_ring,
+    stage_partial_states_from_ring,
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
@@ -32,6 +35,23 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
+
+
+def _can_use_sm70_private_compressor_state(vllm_config: VllmConfig) -> bool:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
+        and vllm_config.scheduler_config.max_num_seqs == 1
+        and not vllm_config.cache_config.enable_prefix_caching
+        and vllm_config.parallel_config.pipeline_parallel_size == 1
+        and (
+            kv_transfer_config is None or not kv_transfer_config.is_kv_transfer_instance
+        )
+    )
 
 
 def _get_c128_boundary(metadata: CommonAttentionMetadata) -> bool | None:
@@ -141,12 +161,27 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         compress_ratio: int,
         prefix: str,
+        private_ring_size: int = 0,
+        max_num_reqs: int = 1,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.dtype = dtype
         self.prefix = prefix
         self.kv_cache = torch.tensor([])
+        self.private_ring_size = private_ring_size
+        if private_ring_size > 0:
+            self.register_buffer(
+                "private_state",
+                torch.empty(
+                    (max_num_reqs, private_ring_size, state_dim),
+                    dtype=dtype,
+                    device=current_platform.device_type,
+                ),
+                persistent=False,
+            )
+        else:
+            self.private_state = None
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -170,7 +205,9 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         else:
             raise ValueError(f"Invalid compress ratio: {compress_ratio}")
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        if self.private_state is not None:
+            return None
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
@@ -206,6 +243,7 @@ class DeepseekCompressor(nn.Module):
         rotate: bool = False,
         prefix: str = "",
         k_cache_prefix="",
+        validity_cache_prefix="",
         use_fp4_cache: bool = False,
     ):
         super().__init__()
@@ -215,6 +253,7 @@ class DeepseekCompressor(nn.Module):
         self.rotate = rotate
         self.prefix = prefix
         self.k_cache_prefix = k_cache_prefix
+        self.validity_cache_prefix = validity_cache_prefix
         self.use_fp4_cache = use_fp4_cache
 
         config = vllm_config.model_config.hf_config
@@ -227,6 +266,17 @@ class DeepseekCompressor(nn.Module):
 
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
+        self.use_private_state = _can_use_sm70_private_compressor_state(vllm_config)
+        num_speculative_tokens = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config is not None
+            else 0
+        )
+        private_ring_size = (
+            self.coff * compress_ratio + max(1, num_speculative_tokens + 1)
+            if self.use_private_state
+            else 0
+        )
 
         state_dtype = torch.float32
         self.ape = nn.Parameter(
@@ -254,7 +304,15 @@ class DeepseekCompressor(nn.Module):
             dtype=state_dtype,
             compress_ratio=compress_ratio,
             prefix=f"{prefix}.state_cache",
+            private_ring_size=private_ring_size,
+            max_num_reqs=self.max_num_reqs,
         )
+        if self.use_private_state:
+            logger.info_once(
+                "Using SM70 private DeepSeek V4 compressor state rings "
+                "(max_num_seqs=1, prefix cache disabled); paged compressor "
+                "state allocation is disabled."
+            )
 
         # Save reference to static_forward_context for forward-time KV cache lookup.
         # get_current_vllm_config() is only available during __init__, not forward.
@@ -303,19 +361,33 @@ class DeepseekCompressor(nn.Module):
         if not isinstance(attn_metadata, dict):
             return
 
-        state_metadata = cast(
-            CompressorMetadata, attn_metadata[self.state_cache.prefix]
-        )
-        token_to_req_indices = state_metadata.token_to_req_indices
-        slot_mapping = state_metadata.slot_mapping
+        seq_lens = None
+        if self.use_private_state:
+            assert self.validity_cache_prefix, (
+                "Private compressor state requires an SWA metadata source."
+            )
+            validity_metadata = cast(Any, attn_metadata[self.validity_cache_prefix])
+            token_to_req_indices = validity_metadata.token_to_req_indices
+            slot_mapping = validity_metadata.slot_mapping
+            block_table = validity_metadata.block_table
+            block_size = validity_metadata.block_size
+            seq_lens = validity_metadata.seq_lens
+            state_cache = self.state_cache.private_state
+            assert state_cache is not None
+            assert token_to_req_indices is not None and seq_lens is not None
+            state_width = self.state_cache.state_dim // 2
+            state_metadata = None
+        else:
+            state_metadata = cast(
+                CompressorMetadata, attn_metadata[self.state_cache.prefix]
+            )
+            token_to_req_indices = state_metadata.token_to_req_indices
+            slot_mapping = state_metadata.slot_mapping
+            block_table = state_metadata.block_table
+            block_size = state_metadata.block_size
+            state_cache = self.state_cache.kv_cache
+            state_width = state_cache.shape[-1] // 2
         num_actual = slot_mapping.shape[0]
-        block_table = state_metadata.block_table
-        block_size = state_metadata.block_size
-
-        # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
-        state_cache = self.state_cache.kv_cache
-        # kv_state stored in first half, score_state stored in second half
-        state_width = state_cache.shape[-1] // 2
         pdl_kwargs = (
             {}
             if current_platform.is_rocm() or current_platform.is_xpu()
@@ -328,21 +400,48 @@ class DeepseekCompressor(nn.Module):
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a
         # read-after-write race and non-deterministic output.
-        save_partial_states(
-            kv=kv,
-            score=score,
-            ape=self.ape,
-            positions=positions,
-            state_cache=state_cache,
-            slot_mapping=slot_mapping,
-            block_size=block_size,
-            state_width=state_width,
-            compress_ratio=self.compress_ratio,
-            pdl_kwargs=pdl_kwargs,
-        )
+        if not self.use_private_state:
+            save_partial_states(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_cache=state_cache,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
+
+        use_dense_private_state = self.use_private_state and self.compress_ratio == 128
+        compression_state_cache = state_cache
+        private_history_size = self.coff * self.compress_ratio
+        if use_dense_private_state:
+            (dense_state,) = current_workspace_manager().get_simultaneous(
+                (
+                    (private_history_size + num_actual, 2 * state_width),
+                    torch.float32,
+                )
+            )
+            stage_partial_states_from_ring(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_ring=state_cache,
+                dense_state=dense_state,
+                slot_mapping=slot_mapping,
+                state_width=state_width,
+                history_size=private_history_size,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
+            compression_state_cache = dense_state.unsqueeze(0)
 
         if (
             current_platform.is_cuda()
+            and not self.use_private_state
             and self.head_dim == 512
             and self.compress_ratio == 128
             and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
@@ -382,8 +481,8 @@ class DeepseekCompressor(nn.Module):
             # Always use a triton kernel.
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
 
-        compress_norm_rope_store_fn(
-            state_cache=state_cache,
+        compress_kwargs = dict(
+            state_cache=compression_state_cache,
             num_actual=num_actual,
             token_to_req_indices=token_to_req_indices,
             positions=positions,
@@ -406,3 +505,31 @@ class DeepseekCompressor(nn.Module):
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
         )
+        if compress_norm_rope_store_fn is compress_norm_rope_store_triton:
+            compress_kwargs.update(
+                current_kv=kv,
+                current_score=score,
+                ape=self.ape,
+                use_private_state=self.use_private_state
+                and not use_dense_private_state,
+                use_dense_private_state=use_dense_private_state,
+                ring_size=self.state_cache.private_ring_size or 1,
+                private_history_size=private_history_size,
+            )
+        compress_norm_rope_store_fn(**compress_kwargs)
+
+        if self.use_private_state:
+            assert seq_lens is not None
+            save_partial_states_to_ring(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_ring=state_cache,
+                slot_mapping=slot_mapping,
+                token_to_req_indices=token_to_req_indices,
+                seq_lens=seq_lens,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )

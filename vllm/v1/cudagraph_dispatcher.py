@@ -39,9 +39,6 @@ def _get_sm70_dsv4_decode_context_buckets(
     env_name = "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
     if env_name in os.environ:
         return _get_sm70_context_buckets(env_name)
-    if vllm_config.speculative_config is not None:
-        return ()
-
     model_config = vllm_config.model_config
     architectures = getattr(model_config, "architectures", ())
     if not isinstance(architectures, (list, tuple)) or (
@@ -246,7 +243,10 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def _active_context_buckets(self) -> tuple[int, ...]:
-        if self.uniform_decode_query_len > 1:
+        if (
+            self.uniform_decode_query_len > 1
+            and "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ
+        ):
             return self.sm70_mtp_context_buckets
         return self.sm70_dsv4_decode_context_buckets
 

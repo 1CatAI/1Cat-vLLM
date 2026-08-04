@@ -780,6 +780,10 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=prefix,
         )
+        if self.indexer is not None:
+            self.indexer.compressor.validity_cache_prefix = (
+                self.mla_attn.swa_cache_layer.prefix
+            )
 
     def forward(
         self,

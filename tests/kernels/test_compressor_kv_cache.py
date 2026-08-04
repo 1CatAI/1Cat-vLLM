@@ -12,6 +12,7 @@ These tests cover:
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -24,6 +25,11 @@ from vllm.models.deepseek_v4.common.ops import (
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
+    compress_norm_rope_store_triton,
+)
+from vllm.models.deepseek_v4.common.ops.save_partial_states import (
+    save_partial_states_to_ring,
+    stage_partial_states_from_ring,
 )
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
@@ -607,6 +613,12 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         kv_cache,
         slot_mapping,
         kv_block_size,
+        state_cache,
+        state_cache.stride(0),
+        state_cache,
+        state_cache.stride(0),
+        rms_weight,
+        rms_weight.stride(0),
         HEAD_SIZE=HEAD_DIM,
         TRITON_BLOCK_SIZE=HEAD_DIM,
         STATE_WIDTH=coff * HEAD_DIM,
@@ -618,6 +630,10 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
         TOKEN_STRIDE=TOKEN_STRIDE,
         SCALE_DIM=SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        USE_PRIVATE_STATE=False,
+        USE_DENSE_PRIVATE_STATE=False,
+        RING_SIZE=1,
+        PRIVATE_HISTORY_SIZE=1,
         num_warps=1,
     )
 
@@ -667,3 +683,212 @@ def test_fused_kv_insert_indexer(num_tokens: int, kv_block_size: int, use_fp4: b
             assert torch.equal(actual_scale, scale[i : i + 1]), (
                 f"token {i}: scale {actual_scale.item()} != {scale[i].item()}"
             )
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "compress_ratio", "use_fp4_cache"),
+    [(512, 4, False), (512, 128, False), (128, 4, False)],
+)
+def test_private_compressor_ring_matches_paged_state_bytes(
+    head_dim: int, compress_ratio: int, use_fp4_cache: bool
+):
+    """The SM70 private-state gather must preserve final cache bytes exactly."""
+    torch.manual_seed(19)
+    device = "cuda"
+    overlap = compress_ratio == 4
+    coff = 1 + overlap
+    state_width = coff * head_dim
+    state_block_size = 4 if compress_ratio == 4 else 8
+    chunk_start = 12 if compress_ratio == 4 else 120
+    num_tokens = 12 if compress_ratio == 4 else 136
+    total_tokens = chunk_start + num_tokens
+    ring_size = coff * compress_ratio + 8
+
+    all_kv = torch.randn(total_tokens, state_width, dtype=torch.float32, device=device)
+    all_score = torch.randn_like(all_kv)
+    ape = torch.randn(compress_ratio, state_width, dtype=torch.float32, device=device)
+    absolute_positions = torch.arange(total_tokens, device=device)
+    stored_score = all_score + ape[absolute_positions % compress_ratio]
+    dense_state = torch.cat((all_kv, stored_score), dim=-1)
+
+    num_state_blocks = math.ceil(total_tokens / state_block_size)
+    state_cache = torch.zeros(
+        num_state_blocks,
+        state_block_size,
+        2 * state_width,
+        dtype=torch.float32,
+        device=device,
+    )
+    state_cache.view(-1, 2 * state_width)[:total_tokens].copy_(dense_state)
+    block_table = torch.arange(
+        num_state_blocks, dtype=torch.int32, device=device
+    ).unsqueeze(0)
+
+    state_ring = torch.empty(
+        1, ring_size, 2 * state_width, dtype=torch.float32, device=device
+    )
+    history_start = max(0, chunk_start - ring_size)
+    history_positions = torch.arange(history_start, chunk_start, device=device)
+    state_ring[0, history_positions % ring_size] = dense_state[history_positions]
+
+    positions = torch.arange(
+        chunk_start, total_tokens, dtype=torch.int64, device=device
+    )
+    valid_slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    compressed_slot_mapping = torch.where(
+        (positions + 1) % compress_ratio == 0,
+        positions // compress_ratio,
+        -1,
+    )
+    kv_block_size = 16
+    num_compressed_tokens = math.ceil(total_tokens / compress_ratio)
+    num_kv_blocks = math.ceil(num_compressed_tokens / kv_block_size) + 1
+
+    if head_dim == 512:
+        token_stride, scale_dim, quant_block = 576, 8, 64
+    elif use_fp4_cache:
+        token_stride, scale_dim, quant_block = 64, 4, 32
+    else:
+        token_stride, scale_dim, quant_block = 128, 4, 128
+    bytes_per_token = token_stride + scale_dim
+    paged_output = torch.zeros(
+        num_kv_blocks,
+        kv_block_size,
+        bytes_per_token,
+        dtype=torch.uint8,
+        device=device,
+    )
+    private_output = torch.zeros_like(paged_output)
+    k_cache_metadata = SimpleNamespace(slot_mapping=compressed_slot_mapping)
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = torch.randn(total_tokens + 1, 64, device=device)
+    current_kv = all_kv[chunk_start:]
+    current_score = all_score[chunk_start:]
+
+    common_kwargs = dict(
+        current_kv=current_kv,
+        current_score=current_score,
+        ape=ape,
+        num_actual=num_tokens,
+        token_to_req_indices=token_to_req,
+        positions=positions,
+        slot_mapping=valid_slot_mapping,
+        block_table=block_table,
+        block_size=state_block_size,
+        state_width=state_width,
+        cos_sin_cache=cos_sin_cache,
+        k_cache_metadata=k_cache_metadata,
+        pdl_kwargs={},
+        head_dim=head_dim,
+        rope_head_dim=64,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        use_fp4_cache=use_fp4_cache,
+        rms_norm_weight=rms_weight,
+        rms_norm_eps=1e-6,
+        quant_block=quant_block,
+        token_stride=token_stride,
+        scale_dim=scale_dim,
+    )
+    compress_norm_rope_store_triton(
+        state_cache=state_cache,
+        kv_cache=paged_output,
+        use_private_state=False,
+        **common_kwargs,
+    )
+    compress_norm_rope_store_triton(
+        state_cache=state_ring,
+        kv_cache=private_output,
+        use_private_state=True,
+        ring_size=ring_size,
+        **common_kwargs,
+    )
+
+    assert torch.equal(private_output, paged_output)
+
+    if compress_ratio == 128:
+        dense_state = torch.empty(
+            compress_ratio + num_tokens,
+            2 * state_width,
+            dtype=torch.float32,
+            device=device,
+        )
+        stage_partial_states_from_ring(
+            kv=current_kv,
+            score=current_score,
+            ape=ape,
+            positions=positions,
+            state_ring=state_ring,
+            dense_state=dense_state,
+            slot_mapping=valid_slot_mapping,
+            state_width=state_width,
+            history_size=compress_ratio,
+            compress_ratio=compress_ratio,
+        )
+        dense_output = torch.zeros_like(paged_output)
+        compress_norm_rope_store_triton(
+            state_cache=dense_state.unsqueeze(0),
+            kv_cache=dense_output,
+            use_dense_private_state=True,
+            private_history_size=compress_ratio,
+            **common_kwargs,
+        )
+        assert torch.equal(dense_output, paged_output)
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "compress_ratio"), [(512, 4), (512, 128), (128, 4)]
+)
+def test_private_compressor_ring_keeps_only_chunk_tail(
+    head_dim: int, compress_ratio: int
+):
+    overlap = compress_ratio == 4
+    state_width = (1 + overlap) * head_dim
+    ring_size = (1 + overlap) * compress_ratio + 8
+    chunk_start = 4096
+    num_tokens = 8192
+    positions = torch.arange(
+        chunk_start,
+        chunk_start + num_tokens,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    kv = torch.randn(num_tokens, state_width, dtype=torch.float32, device="cuda")
+    score = torch.randn_like(kv)
+    ape = torch.randn(compress_ratio, state_width, dtype=torch.float32, device="cuda")
+    state_ring = torch.full(
+        (1, ring_size, 2 * state_width),
+        float("nan"),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor(
+        [chunk_start + num_tokens], dtype=torch.int32, device="cuda"
+    )
+
+    save_partial_states_to_ring(
+        kv=kv,
+        score=score,
+        ape=ape,
+        positions=positions,
+        state_ring=state_ring,
+        slot_mapping=slot_mapping,
+        token_to_req_indices=token_to_req,
+        seq_lens=seq_lens,
+        state_width=state_width,
+        compress_ratio=compress_ratio,
+    )
+
+    tail_positions = positions[-ring_size:]
+    actual = state_ring[0, tail_positions % ring_size]
+    expected = torch.cat(
+        (
+            kv[-ring_size:],
+            score[-ring_size:] + ape[tail_positions % compress_ratio],
+        ),
+        dim=-1,
+    )
+    assert torch.equal(actual, expected)

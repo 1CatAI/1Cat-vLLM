@@ -308,6 +308,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.mla_attn.prefix,
+                validity_cache_prefix=self.swa_cache_layer.prefix,
             )
 
     def forward(
@@ -923,7 +924,7 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
+            if indexer_metadata.max_kv_seq_len <= self.topk_tokens:
                 compressor(compressed_kv_score, positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
