@@ -32,6 +32,7 @@ from vllm.config.utils import get_field
 from vllm.config.vllm import (
     OPTIMIZATION_LEVEL_TO_CONFIG,
     OptimizationLevel,
+    _sm70_non_spec_cudagraph_capture_sizes,
 )
 from vllm.platforms import current_platform
 
@@ -65,6 +66,32 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env_value)
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "dense_capture", "expected"),
+    [
+        (1, False, [1]),
+        (2, False, [1, 2]),
+        (3, False, [1, 2, 4]),
+        (5, False, [1, 2, 4, 8]),
+        (64, False, [1, 2, 4, 8]),
+        (5, True, [1, 2, 3, 4, 5]),
+        (80, True, list(range(1, 65))),
+    ],
+)
+def test_sm70_non_spec_cudagraph_capture_sizes(
+    max_num_seqs,
+    dense_capture,
+    expected,
+):
+    assert (
+        _sm70_non_spec_cudagraph_capture_sizes(
+            max_num_seqs=max_num_seqs,
+            dense_capture=dense_capture,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

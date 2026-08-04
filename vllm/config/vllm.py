@@ -206,6 +206,28 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
 
 
+def _sm70_non_spec_cudagraph_capture_sizes(
+    *,
+    max_num_seqs: int,
+    dense_capture: bool,
+) -> list[int]:
+    """Return bounded SM70 decode graph sizes for a non-speculative engine.
+
+    The SM70 compile-graph policy needs a graph above batch size two for even
+    modest serving concurrency. Keep the default bounded at eight to preserve
+    the low startup and graph-memory cost of the single-request policy. The
+    existing opt-in dense mode remains available for larger services.
+    """
+    max_live_batch = max(int(max_num_seqs), 1)
+    if dense_capture:
+        return list(range(1, min(max_live_batch, 64) + 1))
+
+    capture_sizes = [1]
+    while capture_sizes[-1] < min(max_live_batch, 8):
+        capture_sizes.append(capture_sizes[-1] * 2)
+    return capture_sizes
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -1324,7 +1346,10 @@ class VllmConfig:
                     CUDAGraphMode.FULL_AND_PIECEWISE
                 )
                 if self.compilation_config.cudagraph_capture_sizes is None:
-                    cudagraph_capture_sizes = [1, 2]
+                    cudagraph_capture_sizes = _sm70_non_spec_cudagraph_capture_sizes(
+                        max_num_seqs=self.scheduler_config.max_num_seqs,
+                        dense_capture=envs.VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE,
+                    )
                     if (
                         self.speculative_config is not None
                         and self.speculative_config.num_speculative_tokens
