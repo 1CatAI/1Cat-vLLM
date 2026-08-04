@@ -15,7 +15,7 @@ def _clear_decode_caches() -> None:
 def _sm70_device_or_skip() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    for index in range(torch.cuda.device_count()):
+    for index in range(torch.accelerator.device_count()):
         if torch.cuda.get_device_capability(index) == (7, 0):
             return torch.device(f"cuda:{index}")
     pytest.skip("SM70/V100 CUDA device is required")
@@ -234,5 +234,5 @@ def test_stale_active_num_partitions_does_not_truncate_decode(
         active_num_partitions=stale_active,
     )
 
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     assert torch.equal(actual, expected)

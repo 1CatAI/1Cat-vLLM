@@ -88,7 +88,7 @@ def _run_case(
             softmax_scale,
         )
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert returned_out.data_ptr() == split_out.data_ptr()
     assert returned_lse.data_ptr() == split_lse.data_ptr()
@@ -191,7 +191,7 @@ def test_splitkv3_python_wrapper_reuses_stream_workspace() -> None:
             785,
         )
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert first_out.data_ptr() == second_out.data_ptr()
     assert first_lse.data_ptr() == second_lse.data_ptr()

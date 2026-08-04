@@ -178,7 +178,7 @@ def test_fused_recurrent_packed_decode_cuda_graph_replay_uses_runtime_indices():
         ssm_state_indices=warm_indices,
         use_qk_l2norm_in_kernel=True,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     capture_mixed_qkv = torch.randn((B, qkv_dim), device=device, dtype=dtype)
     capture_a = torch.randn((B, HV), device=device, dtype=dtype)
@@ -192,7 +192,7 @@ def test_fused_recurrent_packed_decode_cuda_graph_replay_uses_runtime_indices():
     b_static.copy_(capture_b)
     state_static.copy_(capture_state)
     indices_static.copy_(capture_indices)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -240,7 +240,7 @@ def test_fused_recurrent_packed_decode_cuda_graph_replay_uses_runtime_indices():
         indices_static.copy_(state_indices)
         out_static.fill_(float("nan"))
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         live_rows = state_indices >= 0
         torch.testing.assert_close(
@@ -333,7 +333,7 @@ def test_gdn_decode_chain_cuda_graph_replay_uses_runtime_indices():
         ssm_state_indices=warm_indices,
         use_qk_l2norm_in_kernel=True,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     capture_x = torch.randn((B, qkv_dim), device=device, dtype=dtype)
     capture_a = torch.randn((B, HV), device=device, dtype=dtype)
@@ -351,7 +351,7 @@ def test_gdn_decode_chain_cuda_graph_replay_uses_runtime_indices():
     conv_state_static.copy_(capture_conv_state)
     recurrent_state_static.copy_(capture_recurrent_state)
     indices_static.copy_(capture_indices)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -425,7 +425,7 @@ def test_gdn_decode_chain_cuda_graph_replay_uses_runtime_indices():
         indices_static.copy_(state_indices)
         out_static.fill_(float("nan"))
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         live_rows = state_indices >= 0
         torch.testing.assert_close(

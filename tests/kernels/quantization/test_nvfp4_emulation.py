@@ -34,7 +34,7 @@ def test_nvfp4_quant_dequant_sm70_fallback_compiles(monkeypatch) -> None:
     )
 
     output = compiled(x)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert output.shape == x.shape
     assert output.dtype == x.dtype

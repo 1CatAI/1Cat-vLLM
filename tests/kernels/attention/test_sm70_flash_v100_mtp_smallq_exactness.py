@@ -106,7 +106,7 @@ def test_flash_v100_mtp_smallq_decode_matches_causal_prefill(
         workspace_seq_capacity_hint=seq_len,
     )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     max_diff = (smallq_out - prefill_out).abs().max().item()
     assert max_diff <= 1.5e-2
     torch.testing.assert_close(smallq_out, prefill_out, atol=1.5e-2, rtol=1e-2)

@@ -703,7 +703,7 @@ def test_reshape_and_cache_flash_fp8_e5m2_smoke(
             expected_key[block_idx, :, block_offset, :] = key[i]
             expected_value[block_idx, :, block_offset, :] = value[i]
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert torch.equal(dequant(key_cache), expected_key)
     assert torch.equal(dequant(value_cache), expected_value)
 

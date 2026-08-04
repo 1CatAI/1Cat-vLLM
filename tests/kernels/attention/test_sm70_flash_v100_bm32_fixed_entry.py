@@ -78,7 +78,7 @@ def test_fixed_bm32_entry_is_exact_and_ignores_dispatch_env(
         )
     )
 
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert actual.data_ptr() == out.data_ptr()
     assert actual_lse.data_ptr() == softmax_lse.data_ptr()
     assert torch.equal(actual, expected)
