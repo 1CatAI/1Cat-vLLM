@@ -7,11 +7,11 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-import re
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 from transformers import AutoTokenizer
 

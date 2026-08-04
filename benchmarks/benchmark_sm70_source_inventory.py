@@ -11,10 +11,11 @@ silently dropping old V100-specific routes during upstream migration.
 import argparse
 import json
 import os
-import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 DEFAULT_OLD_ROOT = Path("/home/ymzx/桌面/1cat-vllm/1Cat-vLLM-0.0.3/vllm")
 DEFAULT_LATEST_ROOT = Path("/home/ymzx/桌面/1cat-vllm/vllm")

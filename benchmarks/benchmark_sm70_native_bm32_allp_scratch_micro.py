@@ -9,13 +9,14 @@ import csv
 import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 K_REQUIRED_VISIBLE_DEVICES = "2"
 K_REQUIRED_PHYSICAL_GPU = 2

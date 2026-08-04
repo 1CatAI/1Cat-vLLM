@@ -8,13 +8,14 @@ import argparse
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 K_TARGET = "sm_70"
 K_DEFAULT_GROUPS = 4096

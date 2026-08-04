@@ -31,7 +31,6 @@ import argparse
 import importlib
 import json
 import os
-import re
 import shutil
 import statistics
 import subprocess
@@ -44,6 +43,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 BATCH_SIZE = 1
 M = 8096

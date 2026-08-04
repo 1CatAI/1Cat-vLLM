@@ -17,7 +17,6 @@ import itertools
 import json
 import os
 import platform
-import re
 import shutil
 import statistics
 import subprocess
@@ -27,6 +26,8 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 # These must precede importing torch so logical cuda:0 is physical GPU0.
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

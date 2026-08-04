@@ -10,10 +10,11 @@ as route-hit, quality, or throughput evidence.
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 DEFAULT_REQUIRED_POLICIES = (
     "sm70_tune_policy",

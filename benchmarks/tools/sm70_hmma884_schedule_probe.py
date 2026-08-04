@@ -16,7 +16,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import struct
 import subprocess
@@ -24,6 +23,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 KERNEL_NAME = "hmma884_patch_target_kernel"
 TEXT_SECTION_PREFIX = ".text."

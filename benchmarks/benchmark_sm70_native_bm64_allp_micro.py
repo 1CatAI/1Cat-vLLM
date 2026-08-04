@@ -7,13 +7,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 K_GROUPS = 72
 K_M = 64

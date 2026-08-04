@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 import math
-import re
 import statistics
 import time
 import urllib.error
@@ -20,6 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import regex as re
 from benchmark_sm70_model_tokens import (
     _parse_extra_engine_args,
     _sm70_attention_policy,

@@ -8,13 +8,13 @@ import argparse
 import hashlib
 import json
 import math
-import re
 from array import array
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 from transformers import AutoConfig, AutoTokenizer
 

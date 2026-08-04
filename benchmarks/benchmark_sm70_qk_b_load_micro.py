@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import statistics
 import subprocess
@@ -16,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 from torch.utils.cpp_extension import load
 

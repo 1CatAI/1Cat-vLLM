@@ -14,10 +14,10 @@ import argparse
 import itertools
 import json
 import math
-import re
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 
 BoundRule = tuple[str, re.Pattern[str], float]
