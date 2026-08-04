@@ -691,7 +691,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
-        self._spec_token_indx_initialized_size = 0
+        self._spec_token_indx_initialized_size: int = 0
         self.spec_query_start_loc: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs + 1,),
             dtype=torch.int32,
