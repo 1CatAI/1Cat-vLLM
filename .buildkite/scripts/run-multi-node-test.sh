@@ -43,21 +43,23 @@ start_network() {
 }
 
 start_nodes() {
+    local device_list
+    local -a gpu_devices
+
     for node in $(seq 0 $(($NUM_NODES-1))); do
-        if [ "$IS_ROCM" -eq 1 ]; then
-            GPU_DEVICES='--device /dev/kfd --device /dev/dri -e HIP_VISIBLE_DEVICES='
-        else
-            GPU_DEVICES='--gpus "device='
-        fi
+        device_list=""
         for node_gpu in $(seq 0 $(($NUM_GPUS - 1))); do
             DEVICE_NUM=$(($node * $NUM_GPUS + $node_gpu))
-            GPU_DEVICES+=$(($DEVICE_NUM))
+            device_list+=$(($DEVICE_NUM))
             if [ "$node_gpu" -lt $(($NUM_GPUS - 1)) ]; then
-                GPU_DEVICES+=','
+                device_list+=','
             fi
         done
-        if [ "$IS_ROCM" -eq 0 ]; then
-            GPU_DEVICES+='"'
+        if [ "$IS_ROCM" -eq 1 ]; then
+            gpu_devices=(--device /dev/kfd --device /dev/dri -e \
+                "HIP_VISIBLE_DEVICES=${device_list}")
+        else
+            gpu_devices=(--gpus "device=${device_list}")
         fi
 
         # start the container in detached mode
@@ -67,7 +69,7 @@ start_nodes() {
         # 3. map the huggingface cache directory to the container
         # 3. assign ip addresses to the containers (head node: 192.168.10.10, worker nodes:
         #    starting from 192.168.10.11)
-        docker run -d $GPU_DEVICES --shm-size=10.24gb -e HF_TOKEN \
+        docker run -d "${gpu_devices[@]}" --shm-size=10.24gb -e HF_TOKEN \
             -v ~/.cache/huggingface:/root/.cache/huggingface --name "node$node" \
             --network docker-net --ip 192.168.10.$((10 + $node)) --rm "$DOCKER_IMAGE" \
             /bin/bash -c "tail -f /dev/null"
@@ -123,4 +125,3 @@ trap cleanup EXIT
 start_network
 start_nodes
 run_nodes
-
