@@ -83,7 +83,7 @@ def _is_sm70_device(device: torch.device) -> bool:
         return False
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.accelerator.current_device_index()
     major, minor = torch.cuda.get_device_capability(device_index)
     return major == 7 and minor == 0
 
@@ -110,7 +110,7 @@ def _select_sm70_bv(V: int, N: int, HV: int, device: torch.device) -> int:
 
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.accelerator.current_device_index()
     sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
     target_ctas = sm_count * _SM70_FLA_TARGET_WAVES
     fallback = candidates[-1]
