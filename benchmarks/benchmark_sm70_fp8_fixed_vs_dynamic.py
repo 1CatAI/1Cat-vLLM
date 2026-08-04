@@ -21,6 +21,7 @@ import torch
 from safetensors import safe_open
 
 from vllm import _sm70_ops as sm70_ops
+from vllm.utils.torch_utils import set_random_seed
 
 
 def _digest(tensor: torch.Tensor) -> str:
@@ -106,22 +107,22 @@ def _run_case(
     fixed = torch.empty((m, n), device=qweight.device, dtype=torch.float16)
     os.environ["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = "0"
     sm70_ops.fp8_gemm_sm70_out_meta(fixed, x, tm_weight, tm_scales, meta)
-    torch.cuda.synchronize(qweight.device)
+    torch.accelerator.synchronize(qweight.device)
 
     os.environ["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = "1"
     warm = torch.empty((m, n), device=qweight.device, dtype=torch.float16)
     sm70_ops.fp8_gemm_sm70_out_meta(warm, x, tm_weight, tm_scales, meta)
-    torch.cuda.synchronize(qweight.device)
+    torch.accelerator.synchronize(qweight.device)
 
     dynamic = torch.empty((m, n), device=qweight.device, dtype=torch.float16)
     sm70_ops.fp8_gemm_sm70_out_meta(dynamic, x, tm_weight, tm_scales, meta)
-    torch.cuda.synchronize(qweight.device)
+    torch.accelerator.synchronize(qweight.device)
 
     os.environ["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = "0"
     fixed_after = torch.empty((m, n), device=qweight.device, dtype=torch.float16)
     sm70_ops.fp8_gemm_sm70_out_meta(
         fixed_after, x, tm_weight, tm_scales, meta)
-    torch.cuda.synchronize(qweight.device)
+    torch.accelerator.synchronize(qweight.device)
 
     diff_dynamic = (fixed.float() - dynamic.float()).abs()
     diff_warm = (fixed.float() - warm.float()).abs()
@@ -168,8 +169,7 @@ def main() -> int:
     if not hasattr(torch.ops._C, "fp8_gemm_sm70_out_meta"):
         raise RuntimeError("Missing _C::fp8_gemm_sm70_out_meta.")
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    set_random_seed(args.seed)
 
     weight_map, layers = _candidate_layers(args.model)
     selected = _select_layers(layers, set(args.layer_ids), args.max_layers)

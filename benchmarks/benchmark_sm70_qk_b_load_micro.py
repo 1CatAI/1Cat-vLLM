@@ -19,6 +19,8 @@ from typing import Any
 import torch
 from torch.utils.cpp_extension import load
 
+from vllm.utils.torch_utils import set_random_seed
+
 PATHS = ("native", "direct", "shuffle")
 K_BLOCK_M = 16
 K_BLOCK_N = 128
@@ -349,7 +351,7 @@ def main() -> int:
     clock_before_mhz = _verify_clock(args)
     extension = _load_extension()
 
-    torch.manual_seed(args.seed)
+    set_random_seed(args.seed)
     query = torch.empty(
         (args.panels, K_BLOCK_M, K_HEAD_DIM),
         device=device,
@@ -377,11 +379,11 @@ def main() -> int:
     for _ in range(args.warmup):
         for path in PATHS:
             launchers[path]()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     for path in PATHS:
         launchers[path]()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     if args.profile_only:
         return 0
 

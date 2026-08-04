@@ -63,7 +63,7 @@ def main() -> int:
             matrix_b_col_storage
         )
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     elements = words.cpu().view(torch.float16).to(torch.int32).reshape(32, 16)
     mapping = elements.tolist()
     counts = Counter(value for lane in mapping for value in lane)

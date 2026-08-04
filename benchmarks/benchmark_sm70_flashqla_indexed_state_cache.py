@@ -18,12 +18,13 @@ import torch
 from flash_qla.ops.gated_delta_rule.chunk import (
     chunk_gated_delta_rule_fwd_sm70_tilelang,
 )
+from vllm.utils.torch_utils import set_random_seed
 
 
 def _bench_ms(fn, warmup: int, repeat: int) -> float:
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -66,8 +67,8 @@ def main() -> None:
         raise ValueError("--state-index must be inside --state-slots")
 
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
-    torch.manual_seed(1234)
+    torch.accelerator.set_device_index(device)
+    set_random_seed(1234)
     dtype = torch.float16
     scale = args.dim**-0.5
 
@@ -146,7 +147,7 @@ def main() -> None:
     indexed_cache.copy_(base_state_cache)
     gather_result = gather_writeback_call()
     indexed_result = indexed_call()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     correctness = {
         "out": _diff(gather_result, indexed_result),
@@ -164,7 +165,7 @@ def main() -> None:
     indexed_cache.copy_(base_state_cache)
     gather_ms = _bench_ms(gather_writeback_call, args.warmup, args.repeat)
     indexed_ms = _bench_ms(indexed_call, args.warmup, args.repeat)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     result = {
         "shape": {

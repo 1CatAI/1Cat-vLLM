@@ -99,7 +99,7 @@ def main() -> None:
     graph = None
     if use_cuda_graph:
         run()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run()
@@ -112,7 +112,7 @@ def main() -> None:
 
     for _ in range(args.warmup):
         replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
