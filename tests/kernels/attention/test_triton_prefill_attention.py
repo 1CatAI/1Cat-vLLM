@@ -6,9 +6,33 @@ import torch
 import torch.nn.functional as F
 
 from vllm.platforms import current_platform
-from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+from vllm.v1.attention.ops.triton_prefill_attention import (
+    context_attention_fwd,
+    get_block_size,
+)
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_get_block_size_uses_sm70_safe_tile_for_large_head_dim(monkeypatch):
+    """Keep SM70/75 prefill below the 96 KiB shared-memory limit."""
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "has_device_capability", lambda capability: capability < 80
+    )
+
+    assert get_block_size(torch.float16, head_dim=128) == 64
+    assert get_block_size(torch.float16, head_dim=256) == 32
+    assert get_block_size(torch.bfloat16, head_dim=512) == 32
+
+
+def test_get_block_size_preserves_sm80_large_head_dim_tile(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "has_device_capability", lambda capability: capability <= 80
+    )
+
+    assert get_block_size(torch.float16, head_dim=256) == 128
 
 
 def ref_masked_attention(
