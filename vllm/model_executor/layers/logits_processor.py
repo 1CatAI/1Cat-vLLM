@@ -40,7 +40,7 @@ def _cuda_sync_breakdown_ms(tensor: torch.Tensor) -> tuple[float, float]:
     torch.cuda.current_stream(tensor.device).synchronize()
     current_stream_ms = (time.perf_counter() - t0) * 1000.0
     t0 = time.perf_counter()
-    torch.cuda.synchronize(tensor.device)
+    torch.accelerator.synchronize(tensor.device)
     device_extra_ms = (time.perf_counter() - t0) * 1000.0
     return current_stream_ms, device_extra_ms
 
@@ -128,7 +128,9 @@ def _write_top_token_margin_record(record: dict[str, object]) -> None:
     if not out_dir:
         return
     os.makedirs(out_dir, exist_ok=True)
-    device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    device = (
+        torch.accelerator.current_device_index() if torch.cuda.is_available() else "cpu"
+    )
     path = os.path.join(
         out_dir,
         f"top_token_margin_pid{os.getpid()}_cuda{device}.jsonl",
@@ -167,7 +169,7 @@ def _maybe_sync_top1_all_gather(module: torch.nn.Module,
     if mode == "d2h":
         _ = local_pair.detach().cpu()
     elif mode == "device":
-        torch.cuda.synchronize(local_pair.device)
+        torch.accelerator.synchronize(local_pair.device)
     else:
         torch.cuda.current_stream(local_pair.device).synchronize()
 
@@ -689,7 +691,7 @@ class LogitsProcessor(PluggableLayer):
             )
         _write_top_token_margin_record(
             {
-                "device": int(torch.cuda.current_device())
+                "device": int(torch.accelerator.current_device_index())
                 if torch.cuda.is_available()
                 else None,
                 "decode_step": step,
