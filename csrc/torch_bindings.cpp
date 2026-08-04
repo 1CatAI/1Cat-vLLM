@@ -165,13 +165,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor? qzeros_or_none, bool inplace) -> Tensor");
   // conditionally compiled so impl registrations are in source file
 
-#ifdef ENABLE_SM70_TURBOMIND
+  #ifdef ENABLE_SM70_TURBOMIND
   ops.def("silu_and_mul_interleaved(Tensor! result, Tensor input) -> ()");
-  ops.impl("silu_and_mul_interleaved", torch::kCUDA,
-           &silu_and_mul_interleaved);
+  ops.impl("silu_and_mul_interleaved", torch::kCUDA, &silu_and_mul_interleaved);
 
   ops.def(
-      "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor _zeros, "
+      "awq_sm70_prepare(Tensor _kernel, Tensor _scaling_factors, Tensor "
+      "_zeros, "
       "int group_size, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
 
@@ -242,34 +242,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "nvfp4_gemv_sm70_raw_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors, Tensor(b!) partials, "
       "int group_size, int split_k) -> ()");
-  ops.impl("nvfp4_gemv_sm70_raw_out", torch::kCUDA,
-           &nvfp4_gemv_sm70_raw_out);
+  ops.impl("nvfp4_gemv_sm70_raw_out", torch::kCUDA, &nvfp4_gemv_sm70_raw_out);
 
   ops.def(
       "nvfp4_gemv_sm70_warp_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors, int group_size) -> ()");
-  ops.impl("nvfp4_gemv_sm70_warp_out", torch::kCUDA,
-           &nvfp4_gemv_sm70_warp_out);
+  ops.impl("nvfp4_gemv_sm70_warp_out", torch::kCUDA, &nvfp4_gemv_sm70_warp_out);
 
   ops.def(
       "nvfp4_gemv_sm70_h2_out(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors, Tensor(b!) partials, "
       "int group_size, int split_k) -> ()");
-  ops.impl("nvfp4_gemv_sm70_h2_out", torch::kCUDA,
-           &nvfp4_gemv_sm70_h2_out);
+  ops.impl("nvfp4_gemv_sm70_h2_out", torch::kCUDA, &nvfp4_gemv_sm70_h2_out);
 
   ops.def(
       "fp8_gemm_sm70_out_auto(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors) -> ()");
-  ops.impl("fp8_gemm_sm70_out_auto", torch::kCUDA,
-           &fp8_gemm_sm70_out_auto);
+  ops.impl("fp8_gemm_sm70_out_auto", torch::kCUDA, &fp8_gemm_sm70_out_auto);
 
   ops.def(
       "fp8_gemm_sm70_out_meta(Tensor(a!) out, Tensor _in_feats, "
       "Tensor _kernel, Tensor _scaling_factors, Tensor _meta, "
       "bool gated_silu) -> ()");
-  ops.impl("fp8_gemm_sm70_out_meta", torch::kCUDA,
-           &fp8_gemm_sm70_out_meta);
+  ops.impl("fp8_gemm_sm70_out_meta", torch::kCUDA, &fp8_gemm_sm70_out_meta);
 
   ops.def(
       "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
@@ -557,7 +552,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool exact_per_route) -> ()");
   ops.impl("fp8_moe_single_token_sm70_out", torch::kCUDA,
            &fp8_moe_single_token_sm70_out);
-#endif
+  #endif
 
 #endif
 
