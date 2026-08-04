@@ -680,7 +680,7 @@ py==1.11.0
     # via pytest-forked
 py-spy==0.4.0
     # via ray
-pyarrow==23.0.0
+pyarrow==25.0.0
     # via
     #   datasets
     #   genai-perf
