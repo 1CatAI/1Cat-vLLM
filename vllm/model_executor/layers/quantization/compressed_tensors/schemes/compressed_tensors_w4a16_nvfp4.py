@@ -7,6 +7,10 @@ from torch.nn.parameter import Parameter
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.nvfp4 import NvFp4LinearLayerConfig
+from vllm.model_executor.kernels.linear.nvfp4.skinny import (
+    SkinnyNvFp4LinearKernel,
+)
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
@@ -93,12 +97,22 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
+        if sm70_tm.uses_skinny_nvfp4():
+            supported, reason = SkinnyNvFp4LinearKernel.is_supported()
+            if not supported:
+                raise RuntimeError(
+                    "VLLM_SM70_QUANT_BACKEND=skinny was requested, but the "
+                    f"backend is unavailable: {reason}."
+                )
+            self.skinny_kernel = SkinnyNvFp4LinearKernel(NvFp4LinearLayerConfig())
+            self.skinny_kernel.process_weights_after_loading(layer)
+            return
+
         if sm70_tm.should_prepare_turbomind(
             layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
         ):
             logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path "
-                "enabled."
+                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
             )
             sm70_tm.prepare_nvfp4_linear(layer)
             layer.weight = Parameter(
@@ -121,6 +135,8 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if hasattr(self, "skinny_kernel"):
+            return self.skinny_kernel.apply_weights(layer, x, bias)
         if sm70_tm.has_prepared_linear(layer):
             return sm70_tm.apply_prepared_linear(layer, x, bias)
         return apply_fp4_marlin_linear(

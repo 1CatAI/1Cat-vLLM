@@ -401,6 +401,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
       CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+
+    # The skinny NVFP4 kernels are a small-M overlay on the SM70 TurboMind
+    # dense backend. Keep them in the same _C extension and compile this
+    # source for Volta only; unsupported dtypes/shapes fall back to TurboMind.
+    set(VLLM_SM70_SKINNY_NVFP4_SRC
+        "csrc/quantization/skinny_nvfp4/skinny_nvfp4.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM70_SKINNY_NVFP4_SRC}"
+      CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+    set_property(
+      SOURCE "${VLLM_SM70_SKINNY_NVFP4_SRC}"
+      APPEND PROPERTY COMPILE_OPTIONS "--use_fast_math" "-lineinfo")
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS
+         "${VLLM_SM70_SKINNY_NVFP4_SRC}")
+
     set_source_files_properties(
       csrc/torch_bindings.cpp
       PROPERTIES COMPILE_DEFINITIONS ENABLE_SM70_TURBOMIND=1)

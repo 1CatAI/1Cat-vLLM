@@ -112,6 +112,9 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.nvfp4.skinny import (
+    SkinnyNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -830,6 +833,7 @@ _NVFP4_BACKEND_TO_KERNEL: dict[str, type[NvFp4LinearKernel]] = {
     "flashinfer-trtllm": FlashInferTrtllmNvFp4LinearKernel,
     "flashinfer-cudnn": FlashInferCudnnNvFp4LinearKernel,
     "emulation": EmulationNvFp4LinearKernel,
+    "skinny": SkinnyNvFp4LinearKernel,
 }
 
 
@@ -873,6 +877,14 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
                 reason,
             )
             force_kernel = EmulationNvFp4LinearKernel
+    elif envs.use_sm70_skinny_nvfp4():
+        if linear_backend != "auto":
+            logger.warning_once(
+                "VLLM_SM70_QUANT_BACKEND=skinny overrides "
+                "--linear-backend=%s for NVFP4 layers.",
+                linear_backend,
+            )
+        force_kernel = SkinnyNvFp4LinearKernel
     elif linear_backend == "auto":
         # Deprecated env-var overrides — only honoured when --linear-backend
         # is "auto". Deprecation warnings are emitted from vllm/envs.py.
@@ -1013,6 +1025,7 @@ __all__ = [
     "AiterPerTokenFp8ScaledMMLinearKernel",
     "NvFp4LinearKernel",
     "NvFp4LinearLayerConfig",
+    "SkinnyNvFp4LinearKernel",
     "AiterInt8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",

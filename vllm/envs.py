@@ -112,7 +112,7 @@ if TYPE_CHECKING:
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
-    VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind"] = "auto"
+    VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind", "skinny"] = "auto"
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
     VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
@@ -770,15 +770,16 @@ def env_with_choices(
     return _get_validated_env
 
 
-SM70_QUANT_BACKENDS = ("auto", "marlin", "turbomind")
-SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
+SM70_QUANT_BACKENDS = ("auto", "marlin", "turbomind", "skinny")
+SM70QuantBackend = Literal["auto", "marlin", "turbomind", "skinny"]
 
 
 def get_sm70_quant_backend() -> SM70QuantBackend:
     value = os.getenv("VLLM_SM70_QUANT_BACKEND", "auto").strip().lower()
     if value not in SM70_QUANT_BACKENDS:
         raise ValueError(
-            "VLLM_SM70_QUANT_BACKEND must be one of auto, marlin, turbomind; "
+            "VLLM_SM70_QUANT_BACKEND must be one of auto, marlin, "
+            "turbomind, skinny; "
             f"got {value!r}."
         )
     return cast(SM70QuantBackend, value)
@@ -788,13 +789,22 @@ def use_sm70_turbomind(default_enabled: bool) -> bool:
     backend = get_sm70_quant_backend()
     if backend == "marlin":
         return False
-    if backend == "turbomind":
+    if backend in ("turbomind", "skinny"):
         return True
     return bool(default_enabled)
 
 
 def force_sm70_marlin() -> bool:
     return get_sm70_quant_backend() == "marlin"
+
+
+def use_sm70_skinny_nvfp4() -> bool:
+    """Use the skinny small-M overlay for SM70 NVFP4 dense layers.
+
+    Other quantized formats continue to use TurboMind when the unified
+    backend is ``skinny``.
+    """
+    return get_sm70_quant_backend() == "skinny"
 
 
 def env_list_with_choices(
@@ -1470,7 +1480,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))
     ),
     # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
-    # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
+    # TurboMind for supported SM70 quant routes; "skinny" overlays the NVFP4
+    # dense small-M kernels while retaining TurboMind for all fallbacks and
+    # other formats. Only "marlin" forces Marlin.
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit

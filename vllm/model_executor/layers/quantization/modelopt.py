@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -1050,7 +1051,10 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        # The opt-in skinny backend consumes ModelOpt NVFP4 as W4A16 and has
+        # an exact-SM70 implementation. Other ModelOpt NVFP4 backends retain
+        # their upstream minimum.
+        return 70 if envs.use_sm70_skinny_nvfp4() else 75
 
     @classmethod
     def override_quantization_method(
@@ -1261,12 +1265,14 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         # backend == "marlin"; we don't set that since we pin the kernel
         # below, but we keep the attribute for shape parity.
         self.marlin_input_dtype = None
-        # Direct-instantiate the Marlin NVFP4 adapter rather than going through
-        # init_nvfp4_linear_kernel(): the latter's priority list returns a
-        # cutlass W4A4 kernel as first-pick on this hardware, which would
-        # silently try to quantize activations (we have no input_scale). For
-        # W4A16 there is exactly one valid kernel, so we pin it.
-        self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        # W4A16 normally pins Marlin so the generic NVFP4 selector cannot pick
+        # an activation-quantizing W4A4 kernel. The explicit SM70 skinny mode
+        # is also weight-only and keeps TurboMind as its fallback, so it is the
+        # one safe exception.
+        if envs.use_sm70_skinny_nvfp4():
+            self.kernel = init_nvfp4_linear_kernel()
+        else:
+            self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
 
     def create_weights(
         self,

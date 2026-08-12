@@ -15,7 +15,7 @@ COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
 STATE_ATTR = "_sm70_turbomind_linear"
-SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
+SM70QuantBackend = Literal["auto", "marlin", "turbomind", "skinny"]
 
 
 @dataclass
@@ -39,6 +39,10 @@ def use_turbomind(default_enabled: bool) -> bool:
 
 def forces_marlin() -> bool:
     return envs.force_sm70_marlin()
+
+
+def uses_skinny_nvfp4() -> bool:
+    return envs.use_sm70_skinny_nvfp4()
 
 
 def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
@@ -153,6 +157,13 @@ def _store_state(
 
 def has_prepared_linear(layer: torch.nn.Module) -> bool:
     return getattr(layer, STATE_ATTR, None) is not None
+
+
+def get_prepared_linear_state(layer: torch.nn.Module) -> SM70TurboMindLinearState:
+    state = getattr(layer, STATE_ATTR, None)
+    if state is None:
+        raise RuntimeError("SM70 TurboMind linear state has not been prepared.")
+    return state
 
 
 def prepare_gptq_linear(

@@ -25,10 +25,7 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
 def _explicit_nvfp4_emulation_requested() -> bool:
-    if (
-        envs.VLLM_USE_NVFP4_CT_EMULATIONS
-        or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation"
-    ):
+    if envs.VLLM_USE_NVFP4_CT_EMULATIONS or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation":
         return True
 
     from vllm.config import get_current_vllm_config_or_none
@@ -147,6 +144,14 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.input_global_scale * layer.weight_global_scale, requires_grad=False
         )
 
+        # Volta cannot execute the checkpoint's W4A4 path natively. The
+        # opt-in skinny backend consumes the same weights as W4A16, just like
+        # the existing TurboMind SM70 fallback, but preserves the native bytes
+        # for its small-M streaming kernels.
+        if sm70_tm.uses_skinny_nvfp4():
+            self._fallback_kernel().process_weights_after_loading(layer)
+            return
+
         if sm70_tm.should_prepare_turbomind(
             layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
         ):
@@ -180,6 +185,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if hasattr(layer, "skinny_codes"):
+            return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)
         if sm70_tm.has_prepared_linear(layer):
             return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)
