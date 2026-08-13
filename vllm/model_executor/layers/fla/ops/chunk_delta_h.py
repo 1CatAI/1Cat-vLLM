@@ -16,6 +16,10 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
+from .sm70_chunk_delta_h import (
+    sm70_chunk_gated_delta_rule_fwd_h,
+    sm70_delta_h_tc_supported,
+)
 from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
@@ -394,6 +398,34 @@ def chunk_gated_delta_rule_fwd_h(
         if chunk_offsets is None:
             chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
+
+    # SM70 (Volta) tensor-core path (patches/0100): Triton emits no HMMA on sm_70, so the
+    # served varlen K=V=128/BT=64 configuration is routed to a hand-written mma.sync
+    # kernel. The gate is strict — any other configuration (and any JIT-load failure)
+    # falls through to the Triton kernel below unchanged.
+    if sm70_delta_h_tc_supported(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        chunk_size=BT,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        use_exp2=use_exp2,
+    ):
+        return sm70_chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
+            num_chunks=NT,
+        )
 
     h = k.new_empty(B, NT, H, V, K)
     final_state = (

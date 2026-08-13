@@ -1229,6 +1229,9 @@ package_data = {
         "model_executor/layers/quantization/utils/configs/*.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
+        # SM70 tensor-core GDN chunk-state kernel, JIT-compiled at runtime
+        # (patches/0100; same delivery mechanism as flash_qla's csrc)
+        "model_executor/layers/fla/ops/csrc/*.cu",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
