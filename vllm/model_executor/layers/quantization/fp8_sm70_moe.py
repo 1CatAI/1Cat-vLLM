@@ -539,6 +539,10 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                # patches/0029: representative per-expert M (host-side, no sync).
+                sm70_ops.moe_per_expert_dispatch_m(
+                    ref_permuted_input.size(0), layer.sm70_num_experts
+                ),
             )
         elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
             sm70_ops.fp8_moe_gemm_sm70_out(
@@ -579,6 +583,10 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                # patches/0029: representative per-expert M (host-side, no sync).
+                sm70_ops.moe_per_expert_dispatch_m(
+                    ref_intermediate.size(0), layer.sm70_num_experts
+                ),
             )
         elif route_plan.w2 == Sm70MoeStageRoute.BATCHED:
             sm70_ops.fp8_moe_gemm_sm70_out(
@@ -1240,6 +1248,10 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                # patches/0029: representative per-expert M (host-side, no sync).
+                sm70_ops.moe_per_expert_dispatch_m(
+                    buffers["permuted_input"].size(0), layer.sm70_num_experts
+                ),
             )
         elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
             sm70_ops.fp8_moe_gemm_sm70_out(
@@ -1289,6 +1301,10 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                # patches/0029: representative per-expert M (host-side, no sync).
+                sm70_ops.moe_per_expert_dispatch_m(
+                    buffers["intermediate"].size(0), layer.sm70_num_experts
+                ),
             )
         elif route_plan.w2 == Sm70MoeStageRoute.BATCHED:
             sm70_ops.fp8_moe_gemm_sm70_out(

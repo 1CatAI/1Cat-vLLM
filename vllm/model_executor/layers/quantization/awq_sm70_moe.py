@@ -1316,6 +1316,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                # patches/0029: size the tile for the representative per-expert M
+                # (host-side, from the sorted-buffer shape; no device sync).
+                sm70_ops.moe_per_expert_dispatch_m(
+                    buffers["permuted_input"].size(0), layer.sm70_num_experts
+                ),
             )
             buffers["gate_up"] = _dump_awq_moe_buffer(
                 layer, buffers["gate_up"], "w13_batched_out"
@@ -1480,6 +1485,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                # patches/0029: representative per-expert M (host-side, no sync).
+                sm70_ops.moe_per_expert_dispatch_m(
+                    buffers["intermediate"].size(0), layer.sm70_num_experts
+                ),
             )
             buffers["sorted_output"] = _dump_awq_moe_buffer(
                 layer, buffers["sorted_output"], "w2_batched_out"

@@ -193,6 +193,14 @@ struct Operation {
     QuantDesc      quant_b;
     int            batch_dim;
     int            dispatch_num_override;
+    // issues/0027 / patches/0029: representative per-expert M for grouped MoE
+    // tile selection. 0 = disabled (the tile is sized from the full desc.m as
+    // before). When > 0, the dispatch context is built with this M so the tile
+    // heuristic sizes for the per-expert row count, not the grouped total. The
+    // value is computed HOST-SIDE (from the sorted-buffer shape, before graph
+    // capture) and passed in; it is NEVER derived from a device tensor read, so
+    // it introduces no device->host sync on the captured decode path.
+    int            dispatch_m_override;
     int            active_group_count;
     void*          reserved;
     void*          tile_allreduce;

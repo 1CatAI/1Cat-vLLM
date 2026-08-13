@@ -354,7 +354,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_gemm_sm70_per_expert_dispatch_out("
       "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
       "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
-      "int k, int n, int group_size, bool gated_silu) -> ()");
+      "int k, int n, int group_size, bool gated_silu, "
+      "int dispatch_m_override = 0) -> ()");
   ops.impl("awq_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
            &awq_moe_gemm_sm70_per_expert_dispatch_out);
 
@@ -461,7 +462,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "fp8_moe_gemm_sm70_per_expert_dispatch_out("
       "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
       "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
-      "int k, int n, int group_size, bool gated_silu) -> ()");
+      "int k, int n, int group_size, bool gated_silu, "
+      "int dispatch_m_override = 0) -> ()");
   ops.impl("fp8_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
            &fp8_moe_gemm_sm70_per_expert_dispatch_out);
 

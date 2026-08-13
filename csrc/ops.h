@@ -315,7 +315,8 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(torch::Tensor out,
                                                int64_t k,
                                                int64_t n,
                                                int64_t group_size,
-                                               bool gated_silu);
+                                               bool gated_silu,
+                                               int64_t dispatch_m_override = 0);
 
 void awq_moe_dense_stage_sm70_out(torch::Tensor out,
                                   torch::Tensor input,
@@ -476,7 +477,8 @@ void fp8_moe_gemm_sm70_per_expert_dispatch_out(torch::Tensor out,
                                                int64_t k,
                                                int64_t n,
                                                int64_t group_size,
-                                               bool gated_silu);
+                                               bool gated_silu,
+                                               int64_t dispatch_m_override = 0);
 
 void fp8_moe_dense_stage_sm70_out(torch::Tensor out,
                                   torch::Tensor input,

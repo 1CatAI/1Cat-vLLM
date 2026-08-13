@@ -995,6 +995,40 @@ def awq_moe_gemm_sm70_out(
     )
 
 
+def moe_per_expert_dispatch_m(total_slots: int, num_experts: int) -> int:
+    """Representative per-expert M for grouped MoE tile selection (patches/0029).
+
+    The served grouped MoE GEMM sizes its CTA tile from the dispatch desc's M.
+    On the per-expert-dispatch (num_override=1) path that M is ``total_slots``
+    (every expert's rows combined), so the tile heuristic picks a big-M tile
+    while each expert actually computes only ~``total_slots/num_experts`` rows --
+    a gross M over-size at the decode operating point (issues/0027 measured the
+    correction is worth 1.66-2.66x per MoE GEMM at B=64/128).
+
+    This returns a representative per-expert row count derived PURELY from
+    host-side metadata -- the sorted-buffer length (a tensor shape, not a value)
+    and the expert count. It performs no device read, so the result is a
+    compile-time constant per captured CUDA graph and adds no device->host sync
+    on the decode path (the refuted first patches/0029 attempt computed the max
+    per-expert count via ``expert_offsets.max().item()`` inside the graph-captured
+    region and threw ``cudaErrorStreamCaptureInvalidated`` -- the engine could not
+    boot). The tile is therefore FROZEN at capture time; whether a frozen
+    representative-M tile beats the total_slots-sized tile in *delivered* tok/s is
+    the open question the delivered A/B settles (patches/0029 R14).
+
+    Choice of estimate (balanced routing): rows/expert ~= total_slots/num_experts.
+    When total_slots < num_experts only ~total_slots experts are active with ~1
+    row each, which the floor of 1 captures. The result never exceeds
+    total_slots, so -- the heuristic being non-decreasing in M over the observed
+    range -- the selected tile is never LARGER than today's default pick; i.e.
+    the override cannot over-size relative to current behaviour. Returns 0
+    (override disabled, pre-patch behaviour) for degenerate inputs.
+    """
+    if num_experts <= 0 or total_slots <= 0:
+        return 0
+    return max(1, total_slots // num_experts)
+
+
 def awq_moe_gemm_sm70_per_expert_dispatch_out(
     out: torch.Tensor,
     sorted_input: torch.Tensor,
@@ -1006,7 +1040,13 @@ def awq_moe_gemm_sm70_per_expert_dispatch_out(
     n: int,
     group_size: int,
     gated_silu: bool = False,
+    dispatch_m_override: int = 0,
 ) -> None:
+    # patches/0029: dispatch_m_override is the representative per-expert row count,
+    # computed host-side from the sorted-buffer shape BEFORE CUDA-graph capture
+    # (see moe_per_expert_dispatch_m in this module). 0 = keep the pre-patch
+    # total_slots-sized tile. It is a plain int, so it bakes into the captured
+    # graph as a constant and adds no device->host sync on the decode path.
     _op("awq_moe_gemm_sm70_per_expert_dispatch_out")(
         out,
         sorted_input,
@@ -1018,6 +1058,7 @@ def awq_moe_gemm_sm70_per_expert_dispatch_out(
         n,
         group_size,
         gated_silu,
+        dispatch_m_override,
     )
 
 
@@ -1035,6 +1076,7 @@ if hasattr(torch.ops._C, "awq_moe_gemm_sm70_out"):
         n: int,
         group_size: int,
         gated_silu: bool,
+        dispatch_m_override: int = 0,
     ) -> None:
         return None
 
@@ -1611,6 +1653,7 @@ def fp8_moe_gemm_sm70_out(
         n,
         group_size,
         gated_silu,
+        dispatch_m_override,
     )
 
 
@@ -1625,7 +1668,10 @@ def fp8_moe_gemm_sm70_per_expert_dispatch_out(
     n: int,
     group_size: int,
     gated_silu: bool = False,
+    dispatch_m_override: int = 0,
 ) -> None:
+    # patches/0029: see the AWQ twin above. Host-computed representative
+    # per-expert M (from the sorted-buffer shape, before capture); 0 disables.
     _op("fp8_moe_gemm_sm70_per_expert_dispatch_out")(
         out,
         sorted_input,
@@ -1654,6 +1700,7 @@ if hasattr(torch.ops._C, "fp8_moe_gemm_sm70_out"):
         n: int,
         group_size: int,
         gated_silu: bool,
+        dispatch_m_override: int = 0,
     ) -> None:
         return None
 

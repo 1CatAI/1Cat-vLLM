@@ -5210,7 +5210,7 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu);
+    bool gated_silu, int64_t dispatch_m_override = 0);
 
 void awq_moe_gemm_sm70_out_impl(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
@@ -5218,7 +5218,7 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
     torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce);
+    bool weighted_reduce, int64_t dispatch_m_override);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -5981,7 +5981,8 @@ void awq_moe_single_token_sm70_out(
     awq_moe_gemm_sm70_out_impl(sorted_output, intermediate, expert_offsets,
                                dst_w2_ptrs_w_rows, dst_w2_ptrs_s_rows, top_k,
                                w2_k, w2_n, group_size, false, torch::Tensor(),
-                               true, out, sorted_weights, true);
+                               true, out, sorted_weights, true,
+                               /*dispatch_m_override=*/0);
     return;
   }
   awq_moe_gemm_sm70_per_expert_dispatch_out(
@@ -6028,7 +6029,7 @@ void awq_moe_gemm_sm70_out_impl(
     bool per_expert_dispatch = false,
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
-    bool weighted_reduce = false) {
+    bool weighted_reduce = false, int64_t dispatch_m_override = 0) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "awq_moe_gemm_sm70: input must be CUDA float16.");
@@ -6208,6 +6209,17 @@ void awq_moe_gemm_sm70_out_impl(
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
   op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
+  // issues/0027 / patches/0029 (capture-safe redesign): size the dispatch tile
+  // for a representative per-expert row count passed from Python, NOT total_slots.
+  // The value is computed host-side (max(1, total_slots // num_experts)) from the
+  // sorted-buffer shape BEFORE graph capture, so there is no device->host sync
+  // here (the refuted first .patch read expert_offsets via .item(), which threw
+  // cudaErrorStreamCaptureInvalidated during CUDA-graph capture). 0 disables the
+  // override and preserves the pre-patch big-M tile behaviour exactly.
+  op.dispatch_m_override =
+      (per_expert_dispatch && dispatch_m_override > 0)
+          ? static_cast<int>(dispatch_m_override)
+          : 0;
 
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
@@ -6238,10 +6250,11 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu) {
+    bool gated_silu, int64_t dispatch_m_override) {
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
-                             gated_silu, torch::Tensor(), true);
+                             gated_silu, torch::Tensor(), true, torch::Tensor(),
+                             torch::Tensor(), false, dispatch_m_override);
 }
 
 torch::Tensor awq_moe_gemm_sm70(torch::Tensor sorted_input,
@@ -6811,7 +6824,7 @@ void fp8_moe_gemm_sm70_out_impl(
     torch::Tensor b_group_indices = torch::Tensor(),
     bool per_expert_dispatch = false, int64_t dispatch_num_experts = -1,
     torch::Tensor active_group_indices = torch::Tensor(),
-    int64_t active_group_count = -1) {
+    int64_t active_group_count = -1, int64_t dispatch_m_override = 0) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "fp8_moe_gemm_sm70: input must be CUDA float16.");
@@ -7029,6 +7042,14 @@ void fp8_moe_gemm_sm70_out_impl(
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
   op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
+  // issues/0027 / patches/0029 (capture-safe redesign): identical M-over-size fix
+  // for the FP8 MoE arm. dispatch_m_override is the host-computed representative
+  // per-expert row count (from Python, before capture) -> no device read here.
+  // See the AWQ MoE site above for rationale and the graph-capture history.
+  op.dispatch_m_override =
+      (per_expert_dispatch && dispatch_m_override > 0)
+          ? static_cast<int>(dispatch_m_override)
+          : 0;
   op.active_group_count =
       use_active_group_indices ? static_cast<int>(active_group_count) : 0;
 
@@ -7060,11 +7081,12 @@ void fp8_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu) {
+    bool gated_silu, int64_t dispatch_m_override) {
   fp8_moe_gemm_sm70_out_impl(
       out, sorted_input, expert_offsets, strided_ptrs_w, strided_ptrs_s,
       num_experts, k, n, group_size, gated_silu, torch::Tensor(),
-      torch::Tensor(), false, -1, -1, torch::Tensor(), torch::Tensor(), true);
+      torch::Tensor(), false, -1, -1, torch::Tensor(), torch::Tensor(), true,
+      -1, torch::Tensor(), -1, dispatch_m_override);
 }
 
 void fp8_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,

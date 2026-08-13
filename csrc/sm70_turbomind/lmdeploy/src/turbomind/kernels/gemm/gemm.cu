@@ -655,13 +655,34 @@ int Gemm::Run(const Operation&    operation,
 
     std::optional<Context> dispatch_context_storage;
     Context*               dispatch_context = &context;
-    if (operation.dispatch_num_override > 0 && operation.dispatch_num_override != context.desc().num) {
+    const bool want_num_override =
+        operation.dispatch_num_override > 0 && operation.dispatch_num_override != context.desc().num;
+    // issues/0027 / patches/0029: for a grouped MoE launch the num_override path
+    // rewrites only desc.num, leaving desc.m = total_slots, so Context::Filter
+    // (context.cu:134, keys on desc.m) sizes the CTA tile for the grouped total
+    // while each expert computes only its own rows -> a gross M over-size. When
+    // dispatch_m_override is set, also rewrite the dispatch M to the representative
+    // per-expert row count so the heuristic sizes the small tile the work needs.
+    // dispatch_m_override is a host int (computed from the sorted-buffer shape in
+    // Python before capture); this block runs no device read and is capture-safe.
+    const bool want_m_override =
+        operation.dispatch_m_override > 0 && operation.dispatch_m_override != context.desc().m;
+    if (want_num_override || want_m_override) {
         MatrixLayout dispatch_Adesc = Adesc;
         MatrixLayout dispatch_Bdesc = Bdesc;
         MatrixLayout dispatch_Ddesc = Ddesc;
-        dispatch_Adesc.num          = operation.dispatch_num_override;
-        dispatch_Bdesc.num          = operation.dispatch_num_override;
-        dispatch_Ddesc.num          = operation.dispatch_num_override;
+        if (want_num_override) {
+            dispatch_Adesc.num = operation.dispatch_num_override;
+            dispatch_Bdesc.num = operation.dispatch_num_override;
+            dispatch_Ddesc.num = operation.dispatch_num_override;
+        }
+        if (want_m_override) {
+            // A and D are row-major with rows = M (context.cu get_gemm_desc:
+            // m0 = Adesc.rows, m1 = Ddesc.rows, and the two must agree). B holds
+            // the weights (rows = K) and is left untouched.
+            dispatch_Adesc.rows = operation.dispatch_m_override;
+            dispatch_Ddesc.rows = operation.dispatch_m_override;
+        }
         dispatch_context_storage.emplace(*impl_->props_);
         if (dispatch_context_storage->Init(
                 operation, dispatch_Adesc, Udesc, dispatch_Bdesc, Vdesc, Cdesc, dispatch_Ddesc)) {
