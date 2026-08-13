@@ -389,6 +389,12 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
+    # patch 0006: Ai is now allocated with torch.empty_like (memset eliminated), so this
+    # kernel must write EVERY element of the [BT, BT] block. The downstream
+    # recompute_w_u_fwd consumer loads the full [64, 64] block and feeds it to an unmasked
+    # tl.dot; (I + A)^-1 is lower triangular, so the 6 upper 16x16 sub-blocks
+    # (12/13/14/23/24/34) are literal zeros — store them explicitly here.
+    b_Ai_zero = tl.zeros([16, 16], dtype=tl.float32)
     if not USE_TMA:
         p_Ai_11 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
@@ -419,6 +425,54 @@ def merge_16x16_to_64x64_inverse_kernel(
         )
         p_Ai_43 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
+        )
+        p_Ai_12 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
+        )
+        p_Ai_13 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 32), (16, 16), (1, 0)
+        )
+        p_Ai_14 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT, 48), (16, 16), (1, 0)
+        )
+        p_Ai_23 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 32), (16, 16), (1, 0)
+        )
+        p_Ai_24 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 48), (16, 16), (1, 0)
+        )
+        p_Ai_34 = tl.make_block_ptr(
+            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 48), (16, 16), (1, 0)
+        )
+        tl.store(
+            p_Ai_12,
+            b_Ai_zero.to(p_Ai_12.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Ai_13,
+            b_Ai_zero.to(p_Ai_13.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Ai_14,
+            b_Ai_zero.to(p_Ai_14.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Ai_23,
+            b_Ai_zero.to(p_Ai_23.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Ai_24,
+            b_Ai_zero.to(p_Ai_24.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
+        )
+        tl.store(
+            p_Ai_34,
+            b_Ai_zero.to(p_Ai_34.dtype.element_ty, fp_downcast_rounding="rtne"),
+            boundary_check=(0, 1),
         )
         tl.store(
             p_Ai_11,
@@ -501,6 +555,24 @@ def merge_16x16_to_64x64_inverse_kernel(
         desc_o.store(
             [i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne")
         )
+        desc_o.store(
+            [i_t * BT + 0, 16], b_Ai_zero.to(desc_o.dtype, fp_downcast_rounding="rtne")
+        )
+        desc_o.store(
+            [i_t * BT + 0, 32], b_Ai_zero.to(desc_o.dtype, fp_downcast_rounding="rtne")
+        )
+        desc_o.store(
+            [i_t * BT + 0, 48], b_Ai_zero.to(desc_o.dtype, fp_downcast_rounding="rtne")
+        )
+        desc_o.store(
+            [i_t * BT + 16, 32], b_Ai_zero.to(desc_o.dtype, fp_downcast_rounding="rtne")
+        )
+        desc_o.store(
+            [i_t * BT + 16, 48], b_Ai_zero.to(desc_o.dtype, fp_downcast_rounding="rtne")
+        )
+        desc_o.store(
+            [i_t * BT + 32, 48], b_Ai_zero.to(desc_o.dtype, fp_downcast_rounding="rtne")
+        )
 
 
 @input_guard
@@ -536,7 +608,17 @@ def solve_tril(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
-    Ai = torch.zeros_like(A, dtype=output_dtype)
+    # patch 0006: for the BT=64 path (the only one GDN/KDA exercise, FLA_CHUNK_SIZE=64),
+    # the inversion kernel now stores literal zeros into the 6 upper 16x16 sub-blocks it
+    # previously left to the memset, so it writes EVERY element of Ai. That lets us drop
+    # the zeros_like full-buffer memset (one device-bandwidth write + one launch per GDN
+    # layer per prefill step) in favour of empty_like. The BT=16/32 paths are left byte
+    # for byte unchanged (dead code here, and not worth perturbing their tensor-core
+    # schedule): they keep the memset.
+    if BT == 64:
+        Ai = torch.empty_like(A, dtype=output_dtype)
+    else:
+        Ai = torch.zeros_like(A, dtype=output_dtype)
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
