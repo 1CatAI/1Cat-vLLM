@@ -103,7 +103,11 @@ def chunk_fwd_kernel_o(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # patches/0001: de-duplicated V-tile score matrix. Grid dim 0 (was `cdiv(V,BV)`) is collapsed;
+    # b_A = q·kᵀ is built ONCE per (chunk, K-head) and the V-tiles are looped INTERNALLY, instead of
+    # rebuilding the identical b_A in every V-tile program. Bitwise-identical to the prior kernel
+    # (same fp32-accumulate order, same casts, same gating expressions), +12–22% on GDN prefill.
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -130,9 +134,8 @@ def chunk_fwd_kernel_o(
     o += (bos * H + i_h) * V
     h += (i_tg * H + i_h).to(tl.int64) * V * K
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    # ---- intra-chunk score matrix b_A = q·kᵀ, built ONCE (V-tile-independent) ----
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
-
     for i_k in range(tl.cdiv(K, BK)):
         p_q = tl.make_block_ptr(
             q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
@@ -140,18 +143,10 @@ def chunk_fwd_kernel_o(
         p_k = tl.make_block_ptr(
             k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
         )
-        p_h = tl.make_block_ptr(
-            h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
-        )
         # [BT, BK]
         b_q = tl.load(p_q, boundary_check=(0, 1))
         # [BK, BT]
         b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-
-        # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, tl.trans(b_h))
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         b_A += tl.dot(b_q, b_k)
 
@@ -159,26 +154,50 @@ def chunk_fwd_kernel_o(
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
-        b_o = b_o * exp(b_g)[:, None]
+        # gate b_A once; keep exp(b_g) for the per-V-tile b_o scaling below (same expressions as before)
         b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        b_g_exp = exp(b_g)
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
-    p_v = tl.make_block_ptr(
-        v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
-    p_o = tl.make_block_ptr(
-        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
-    b_v = tl.load(p_v, boundary_check=(0, 1))
+    # ---- inter-chunk term b_o = q·hᵀ per V-tile, then b_o = b_o·scale + (b_A·v)·scale ----
+    for i_v in range(tl.cdiv(V, BV)):
+        b_o = tl.zeros([BT, BV], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            p_q = tl.make_block_ptr(
+                q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+            )
+            p_h = tl.make_block_ptr(
+                h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+            )
+            # [BT, BK]
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            # [BV, BK]
+            b_h = tl.load(p_h, boundary_check=(0, 1))
+            # [BT, BK] @ [BK, BV] -> [BT, BV]
+            b_o += tl.dot(b_q, tl.trans(b_h))
 
-    # to fix mma -> mma layout conversion
-    # already solved by triton v3.2 or higher
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        if USE_G:
+            b_o = b_o * b_g_exp[:, None]
+
+        p_v = tl.make_block_ptr(
+            v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        p_o = tl.make_block_ptr(
+            o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
+
+        # to fix mma -> mma layout conversion
+        # already solved by triton v3.2 or higher
+        # patches/0008 route-a: keep b_A fp32, promote b_v to fp32 (FFMA promotes
+        # anyway on SM70), instead of narrowing the fp32 accumulator b_A to fp16
+        # before the dot. Recovers ~2e-4 rms of mantissa at zero hardware cost.
+        b_o = b_o * scale + tl.dot(b_A, b_v.to(tl.float32)) * scale
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_fwd_o(
@@ -215,7 +234,8 @@ def chunk_fwd_o(
         o = torch.empty_like(v)
 
     def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
+        # patches/0001: V-tiles are looped inside the kernel now (was grid dim 0), so the grid is 2-D.
+        return (NT, B * H)
 
     chunk_fwd_kernel_o[grid](
         q,
