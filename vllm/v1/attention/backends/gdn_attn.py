@@ -1632,20 +1632,27 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             else:
                 gpu_device = query_start_loc.device
                 # Only prefill batches use FLA chunk ops.
-                # Pre-compute on CPU and async-copy to GPU to avoid
-                # GPU→CPU sync (.tolist()) in prepare_chunk_indices.
+                # chunk_offsets is cheap host arithmetic (vectorised cumsum); build it on CPU and
+                # async-copy to GPU. chunk_indices is then built in ONE fused Triton launch that
+                # reuses that on-device chunk_offsets vector — replacing prepare_chunk_indices'
+                # per-sequence Python loop + torch.cat + its own H2D copy (host cost that scales
+                # with the number of sequences). NT comes from the CPU chunk_offsets, so there is
+                # no GPU→CPU sync. Output is bit-identical to the previous construction.
                 from vllm.model_executor.layers.fla.ops.index import (
-                    prepare_chunk_indices,
+                    prepare_chunk_indices_fused,
                     prepare_chunk_offsets,
                 )
 
                 assert non_spec_query_start_loc_cpu is not None
-                chunk_indices = prepare_chunk_indices(
+                chunk_offsets_cpu = prepare_chunk_offsets(
                     non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-                ).to(device=gpu_device, non_blocking=True)
-                chunk_offsets = prepare_chunk_offsets(
-                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-                ).to(device=gpu_device, non_blocking=True)
+                )
+                chunk_offsets = chunk_offsets_cpu.to(
+                    device=gpu_device, non_blocking=True
+                )
+                chunk_indices = prepare_chunk_indices_fused(
+                    chunk_offsets_cpu, chunk_offsets
+                )
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
