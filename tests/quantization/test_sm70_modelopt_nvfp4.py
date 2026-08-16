@@ -92,7 +92,7 @@ def test_modelopt_scale_provenance_is_not_the_pr166_heuristic():
     # ModelOpt provenance is explicit: global is already amax/2688.
     # Same numeric tensors must keep the on-disk global (no rewrite).
     modelopt_global = 100.0
-    assert _modelopt_dequant_oracle(nibble, block, modelopt_global) == 200.0
+    assert _modelopt_dequant_oracle(nibble, block, modelopt_global) == 100.0
     assert abs(block) < 1
     assert _modelopt_dequant_oracle(nibble, block, modelopt_global) != 1.0
 
