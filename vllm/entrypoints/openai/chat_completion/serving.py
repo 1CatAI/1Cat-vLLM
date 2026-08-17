@@ -15,6 +15,7 @@ import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.envs import VLLM_QWEN3X_TOOL_FIX
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
@@ -66,7 +67,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput, RequestOutput, STREAM_KEEPALIVE
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
@@ -189,7 +190,7 @@ class OpenAIServingChat(OpenAIServing):
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
     ) -> dict[str, Any]:
-        return (
+        kwargs = (
             request.build_chat_params(
                 self.chat_template,
                 self.chat_template_content_format,
@@ -197,6 +198,14 @@ class OpenAIServingChat(OpenAIServing):
             .with_defaults(self.default_chat_template_kwargs)
             .chat_template_kwargs
         )
+        # opt23 §11.35: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser
+        # 路由对齐（模板 _tool_format 感知 tool_call_format，默认 xml）。
+        # fix=0/1/4 不注入：fix=1 双格式模型自主、fix=0 原始兜底、fix=4 伪流式。
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            kwargs = {**kwargs, "tool_call_format": "json"}
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            kwargs = {**kwargs, "tool_call_format": "xml"}
+        return kwargs
 
     async def render_chat_request(
         self,
@@ -212,6 +221,21 @@ class OpenAIServingChat(OpenAIServing):
             A tuple of (conversation, engine_inputs) on success,
             or an ErrorResponse on failure.
         """
+        # opt23 §11.35: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser
+        # 路由对齐（模板 _tool_format 感知 tool_call_format，默认 xml）。
+        # 注入必须落在 request.chat_template_kwargs（模板渲染 preprocess_chat
+        # 读取此处）；_effective_chat_template_kwargs 仅供 reasoning_parser。
+        # fix=0/1/4 不注入：fix=1 双格式模型自主、fix=0 原始兜底、fix=4 伪流式。
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "tool_call_format": "json",
+            }
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "tool_call_format": "xml",
+            }
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -246,6 +270,10 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        # opt23 §11.35: 降级路径已整体拆除——前端要流式就是流式、要非流式
+        # 就是非流式，后端零干预（fix=0/1/2/3/4 全部真流式，parser 修复
+        # 兜底 JSON/XML 解析；旧 _json_degraded/分块播放器/250ms 逻辑淘汰）。
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -381,7 +409,7 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-        return await self.chat_completion_full_generator(
+        response = await self.chat_completion_full_generator(
             request,
             result_generator,
             request_id,
@@ -391,6 +419,8 @@ class OpenAIServingChat(OpenAIServing):
             request_metadata,
             reasoning_parser,
         )
+        return response
+
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
@@ -412,6 +442,7 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        last_server_send_time = time.time()
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -497,6 +528,14 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                # opt22: ignore engine keepalive (15s), handle server keepalive (120s)
+                if res is STREAM_KEEPALIVE:
+                    now = time.time()
+                    if now - last_server_send_time >= 120:
+                        yield ": keepalive\n\n"
+                        last_server_send_time = now
+                    continue
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -865,6 +904,16 @@ class OpenAIServingChat(OpenAIServing):
                                 expected_call = args
                             else:
                                 expected_call = json.dumps(args, ensure_ascii=False)
+                            # opt23: 非流式解析可能已解码转义（真实换行），
+                            # 转回与流式增量一致的转义形式，保证 remaining
+                            # 计算正确（否则 replace 失败补发全部参数、真实
+                            # 换行泄漏 → 前端 JSON 非法 → 工具执行失败）。
+                            if hasattr(tool_parser, "_escape_raw_control_chars"):
+                                expected_call = (
+                                    tool_parser._escape_raw_control_chars(
+                                        expected_call
+                                    )
+                                )
 
                             # get what we've streamed so far for arguments
                             # for the current tool
@@ -874,6 +923,15 @@ class OpenAIServingChat(OpenAIServing):
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(actual_call, "", 1)
+                            import os as _os
+                            if _os.environ.get("VLLM_OPT23_DEBUG_LOG"):
+                                with open("/tmp/log/vllm-tool-log.txt", "a") as _tf:
+                                    _tf.write(
+                                        "opt23 serving remaining_delta: "
+                                        "expected_call=%s actual_call=%s "
+                                        "remaining=%s index=%s\n" % (
+                                            expected_call[:200], actual_call[:200],
+                                            remaining_call[:200], index))
                             # set that as a delta message
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index
@@ -939,6 +997,7 @@ class OpenAIServingChat(OpenAIServing):
 
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
+                    last_server_send_time = time.time()
 
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
