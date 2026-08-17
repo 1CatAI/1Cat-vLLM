@@ -15,6 +15,7 @@ import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.envs import VLLM_QWEN3X_TOOL_FIX
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
@@ -189,7 +190,7 @@ class OpenAIServingChat(OpenAIServing):
     def _effective_chat_template_kwargs(
         self, request: ChatCompletionRequest
     ) -> dict[str, Any]:
-        return (
+        kwargs = (
             request.build_chat_params(
                 self.chat_template,
                 self.chat_template_content_format,
@@ -197,6 +198,14 @@ class OpenAIServingChat(OpenAIServing):
             .with_defaults(self.default_chat_template_kwargs)
             .chat_template_kwargs
         )
+        # opt23 §11.35: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser
+        # 路由对齐（模板 _tool_format 感知 tool_call_format，默认 xml）。
+        # fix=0/1/4 不注入：fix=1 双格式模型自主、fix=0 原始兜底、fix=4 伪流式。
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            kwargs = {**kwargs, "tool_call_format": "json"}
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            kwargs = {**kwargs, "tool_call_format": "xml"}
+        return kwargs
 
     async def render_chat_request(
         self,
@@ -212,6 +221,21 @@ class OpenAIServingChat(OpenAIServing):
             A tuple of (conversation, engine_inputs) on success,
             or an ErrorResponse on failure.
         """
+        # opt23 §11.35: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser
+        # 路由对齐（模板 _tool_format 感知 tool_call_format，默认 xml）。
+        # 注入必须落在 request.chat_template_kwargs（模板渲染 preprocess_chat
+        # 读取此处）；_effective_chat_template_kwargs 仅供 reasoning_parser。
+        # fix=0/1/4 不注入：fix=1 双格式模型自主、fix=0 原始兜底、fix=4 伪流式。
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "tool_call_format": "json",
+            }
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "tool_call_format": "xml",
+            }
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -246,6 +270,10 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        # opt23 §11.35: 降级路径已整体拆除——前端要流式就是流式、要非流式
+        # 就是非流式，后端零干预（fix=0/1/2/3/4 全部真流式，parser 修复
+        # 兜底 JSON/XML 解析；旧 _json_degraded/分块播放器/250ms 逻辑淘汰）。
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -381,7 +409,7 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-        return await self.chat_completion_full_generator(
+        response = await self.chat_completion_full_generator(
             request,
             result_generator,
             request_id,
@@ -391,6 +419,8 @@ class OpenAIServingChat(OpenAIServing):
             request_metadata,
             reasoning_parser,
         )
+        return response
+
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
@@ -874,6 +904,16 @@ class OpenAIServingChat(OpenAIServing):
                                 expected_call = args
                             else:
                                 expected_call = json.dumps(args, ensure_ascii=False)
+                            # opt23: 非流式解析可能已解码转义（真实换行），
+                            # 转回与流式增量一致的转义形式，保证 remaining
+                            # 计算正确（否则 replace 失败补发全部参数、真实
+                            # 换行泄漏 → 前端 JSON 非法 → 工具执行失败）。
+                            if hasattr(tool_parser, "_escape_raw_control_chars"):
+                                expected_call = (
+                                    tool_parser._escape_raw_control_chars(
+                                        expected_call
+                                    )
+                                )
 
                             # get what we've streamed so far for arguments
                             # for the current tool

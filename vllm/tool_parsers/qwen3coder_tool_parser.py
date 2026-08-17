@@ -21,7 +21,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.envs import (
     VLLM_ENFORCE_STRICT_TOOL_CALLING,
-    VLLM_QWEN3CODER_STREAMING_FIX,
+    VLLM_QWEN3X_TOOL_FIX,
 )
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
@@ -67,6 +67,16 @@ class Qwen3CoderToolParser(ToolParser):
     _STREAMING_TOOLS: frozenset = frozenset({"Write", "Edit"})
 
     @property
+    def _fix_force_json(self) -> bool:
+        """opt23 §11.22: fix=2 强制 JSON 真流式增量路由（XML 输出也最终按 JSON 输出）。"""
+        return VLLM_QWEN3X_TOOL_FIX == 2
+
+    @property
+    def _fix_force_xml(self) -> bool:
+        """opt23 §11.22: fix=3/4 强制 XML 路由（JSON 输出也走 XML 解析）。"""
+        return VLLM_QWEN3X_TOOL_FIX in (3, 4)
+
+    @property
     def _is_streaming_tool(self) -> bool:
         """Streaming optimizations apply to =1,2,5 for Write/Edit tools.
 
@@ -74,7 +84,8 @@ class Qwen3CoderToolParser(ToolParser):
         paths for tools with long string content params that benefit
         from incremental display.
         """
-        return (VLLM_QWEN3CODER_STREAMING_FIX in (1, 2, 5)
+        return (VLLM_QWEN3X_TOOL_FIX in (1, 2, 4, 5)
+                and not self._json_tool_active
                 and self.current_function_name in self._STREAMING_TOOLS)
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
@@ -169,6 +180,10 @@ class Qwen3CoderToolParser(ToolParser):
         self._json_tool_active: bool = False
         # opt23 =3 JSON path: end position of processed tool call for skip
         self._json_processed_end: int = 0
+        # opt23 §11.42 (v122 框架迁入): resolved tool-call format
+        # ('xml'|'json', or None when unconfigured → auto-detect);
+        # config-first via request.chat_template_kwargs.tool_call_format.
+        self._tool_format: str | None = None
         # opt23 =2 XML path: incomplete param saved from parsing loop
         self._stream_partial_name: str | None = None
         self._stream_partial_value: str | None = None
@@ -300,6 +315,39 @@ class Qwen3CoderToolParser(ToolParser):
             i += 1
         return ''.join(result)
 
+    @staticmethod
+    def _escape_raw_control_chars(s: str) -> str:
+        """模型可能把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
+        字符串值，导致 JSON 非法（Write content 参数丢失根因）。仅在
+        字符串值内部把控制字符转义为 JSON 合法序列（\\n → \\\\n）。"""
+        out = []
+        i = 0
+        n = len(s)
+        in_str = False
+        _esc_map = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+        while i < n:
+            c = s[i]
+            if c == "\\":
+                out.append(c)
+                if i + 1 < n:
+                    out.append(s[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if c == '"':
+                in_str = not in_str
+                out.append(c)
+                i += 1
+                continue
+            if in_str and ord(c) < 0x20:
+                out.append(_esc_map.get(c, "\\u%04x" % ord(c)))
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
     def _handle_json_tool_streaming(
         self, current_text: str, delta_text: str
     ) -> DeltaMessage | None:
@@ -402,10 +450,20 @@ class Qwen3CoderToolParser(ToolParser):
         else:
             current_args = current_text[_val_start:]
 
+        # opt23: 模型把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
+        # 字符串值时 → 字符串值内转义为 JSON 合法序列，否则参数提取
+        # 非法/截断（Write content 丢失、工具调用参数不完整根因）。
+        current_args = self._escape_raw_control_chars(current_args)
+
         # --- diff against previously streamed ---
         idx = self.current_tool_index
         prev = self.streamed_args_for_tool[idx] if idx < len(self.streamed_args_for_tool) else ""
-        delta = self._compute_json_diff(current_args, prev)
+        # opt23 §11.29: 对齐主线 hermes `_compute_args_diff`（前缀截取增量）。
+        # 主线用 `args[len(prev):]`（信任流式累积，current 是 prev 的超集），
+        # 替代本地 `_compute_json_diff`（find_common_prefix 手工 diff）。
+        if len(current_args) <= len(prev):
+            return None
+        delta = current_args[len(prev):]
         if not delta:
             return None
 
@@ -432,14 +490,11 @@ class Qwen3CoderToolParser(ToolParser):
                 idx, current_args[:200],
                 self.prev_tool_call_arr)
 
-        # When the delta continues a JSON string value, replace
-        # display escape sequences (\\n, \\t, \\r) with literal
-        # characters so the frontend renders line breaks / tabs
-        # during streaming instead of showing raw escape sequences.
-        if self._is_inside_json_string(prev):
-            display_delta = self._unescape_display_chars(delta)
-        else:
-            display_delta = delta
+        # opt23: 之前为前端显示打字机效果把转义序列（\n \t \r）反转义为
+        # 真实控制字符——但前端累积拼接后 JSON 非法（真实换行在字符串值
+        # 内），工具执行 InputValidationError（Write content 参数失败
+        # 根因）。直接发射转义版增量（字面 \n），前端拼接即可 json.parse。
+        display_delta = delta
 
         return DeltaMessage(
             tool_calls=[
@@ -466,7 +521,7 @@ class Qwen3CoderToolParser(ToolParser):
         3. DIFF — ``find_common_prefix(prev_xml, current_xml)``
         4. EMIT — return XML continuation delta
 
-        Activated when ``VLLM_QWEN3CODER_STREAMING_FIX`` is 1 or 2 and
+        Activated when ``VLLM_QWEN3X_TOOL_FIX`` is 1 or 2 and
         the model is generating XML-format tool calls.
         """
 
@@ -791,7 +846,7 @@ class Qwen3CoderToolParser(ToolParser):
         string value has no closing ``"``) so that each diff is a valid
         JSON continuation that can be safely accumulated by the client.
 
-        Activated when ``VLLM_QWEN3CODER_STREAMING_FIX == 4`` (=4 互转, 待设计).
+        Activated when ``VLLM_QWEN3X_TOOL_FIX == 4`` (=4 互转, 待设计).
         """
         partial_name = None
         partial_value = None
@@ -992,13 +1047,105 @@ class Qwen3CoderToolParser(ToolParser):
             return pending_and_delta[: -len(current_prefix)]
         return pending_and_delta
 
+    def _extract_tool_calls_json(self, model_output: str) -> list[ToolCall]:
+        """opt23 fix=2: 提取 JSON 格式工具调用（<tool_call>{...}</tool_call> 或裸 JSON）。"""
+        raw_calls: list[dict] = []
+        for _m in re.finditer(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+            model_output,
+            re.DOTALL,
+        ):
+            try:
+                raw_calls.append(json.loads(_m.group(1)))
+            except Exception:
+                pass
+        if not raw_calls:
+            try:
+                _start = model_output.find("{")
+                if _start != -1:
+                    _d = json.loads(model_output[_start:])
+                    if isinstance(_d, dict) and (
+                        "name" in _d or "arguments" in _d
+                    ):
+                        raw_calls.append(_d)
+            except Exception:
+                pass
+        tcs: list[ToolCall] = []
+        for _d in raw_calls:
+            _name = _d.get("name")
+            _args = _d.get("arguments")
+            if _name is None:
+                continue
+            if not isinstance(_args, str):
+                _args = json.dumps(_args, ensure_ascii=False)
+            tcs.append(
+                ToolCall(
+                    type="function",
+                    function=FunctionCall(name=str(_name), arguments=_args),
+                )
+            )
+        return tcs
+
+    @staticmethod
+    def _detect_tool_format(text: str) -> str:
+        """Auto-detect tool-call format from generated text."""
+        if text.find("<function=") != -1:
+            return "xml"
+        if '"name"' in text and '"arguments"' in text:
+            return "json"
+        return "xml"
+
+    @staticmethod
+    def _detect_tool_format_if_present(text: str) -> str | None:
+        """Detect an explicit tool-call format; None when absent."""
+        if text.find("<function=") != -1:
+            return "xml"
+        if '"name"' in text and '"arguments"' in text:
+            return "json"
+        return None
+
+    def _resolve_tool_format(
+        self,
+        request: ChatCompletionRequest,
+        text: str = "",
+    ) -> str | None:
+        """Resolve the client-selected tool-call format (config-first)."""
+        kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        cfg = kwargs.get("tool_call_format")
+        if cfg in ("xml", "json"):
+            return cfg
+        if not text:
+            return None
+        return self._detect_tool_format(text)
+
     def extract_tool_calls(
         self,
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        # opt23 §11.42 (v122 框架迁入): config-first 格式解析——serving 按
+        # fix 注入 request.chat_template_kwargs.tool_call_format（fix=2→json、
+        # fix=3→xml）优先；无配置则按输出形态检测（_detect_tool_format）。
+        _fmt = self._resolve_tool_format(request, model_output)
+
         # Quick check to avoid unnecessary processing
-        if self.tool_call_prefix not in model_output:
+        if _fmt == "json" or (_fmt is None and self.tool_call_prefix not in model_output):
+            # opt23 §11.22: 所有 fix 均 fallback JSON 提取（模型输出
+            # <tool_call>{"name"...}</tool_call> 或裸 JSON 时保证解析成功）
+            json_tcs = self._extract_tool_calls_json(model_output)
+            if json_tcs:
+                self.prev_tool_call_arr = [
+                    {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                    for tc in json_tcs
+                ]
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=json_tcs,
+                    content=None,
+                )
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
@@ -1100,8 +1247,8 @@ class Qwen3CoderToolParser(ToolParser):
                 self.is_tool_call_started = False
                 # Clear active flag so Section 3 can re-detect or release
                 # subsequent content, and Section 4 won't re-enter handler
-                # for an already-processed tool call.
-                self._json_tool_active = False
+                # for an already-processed tool call. fix=2 时保持 JSON 激活。
+                self._json_tool_active = self._fix_force_json
                 # opt23: reset partial streaming state
                 self._partial_emit_offset = 0
                 self._partial_param_start = -1
@@ -1145,6 +1292,22 @@ class Qwen3CoderToolParser(ToolParser):
 
         # Handle normal content before tool calls
         if not self.is_tool_call_started:
+            # opt23 fix=2: 强制 JSON 路由——<tool_call> 标记（模板 json 分支
+            # 引导模型输出 <tool_call> 包裹 JSON）或 JSON 特征（"name"/
+            # "arguments"）出现即激活。不能只等 "name" 特征：模型输出
+            # <tool_call>\n{"name":...} 时 <tool_call> 先到达，XML 检测会
+            # 抢先激活（expat 解析 JSON 失败吞掉工具调用）。无条件强制
+            # 则会吞纯文本正文（think 后无正文根因）。<function= 表示
+            # 模型实际输出 XML，不在此激活（走 XML 解析路径）。
+            if self._fix_force_json:
+                _json_name = current_text.find('"name"')
+                _json_args = current_text.find('"arguments"')
+                if (current_text.find(self.tool_call_start_token) != -1
+                        or (_json_name != -1 and _json_args != -1
+                            and _json_name < _json_args)):
+                    self._json_tool_active = True
+                    self.is_tool_call_started = True
+                    return None
             # opt23 Path C: detect JSON-format tool calls before falling
             # into XML detection.  JSON format looks like:
             #   {"name": "Write", "arguments": {...}}
@@ -1158,7 +1321,6 @@ class Qwen3CoderToolParser(ToolParser):
             if (_json_name != -1
                     and _json_args != -1
                     and _json_name < _json_args
-                    and current_text.find(self.tool_call_start_token) == -1
                     and current_text.find(self.tool_call_prefix) == -1):
                 self._json_tool_active = True
                 self.is_tool_call_started = True
@@ -1206,6 +1368,19 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
+        # opt23 §11.27: JSON 激活时用 safe-prefix diff 增量发射（fix=1/2 的
+        # JSON 真流式——复刻 vLLM 主线 PR #45413 的 _compute_arg_delta）。
+        # 退休时认为「JSON format does not occur in practice」，但前端 JSON
+        # 指令会让模型输出 JSON——恢复接入，前端要流式 json 就提供增量。
+        if self._json_tool_active:
+            _json_delta = self._handle_json_tool_streaming(current_text, delta_text)
+            if _json_delta is not None:
+                return _json_delta
+            # opt23 fix=2: JSON 路由激活后不得落入 original incremental
+            # path——双路径竞争输出导致增量不一致（original path 未转义
+            # 真实控制字符/解码 \n，Write content 参数非法根因）。
+            return None
+
         # v1.2.2+: =1, =2, =3, =5 all use the original incremental path
         # (json_fragments loop + _is_streaming_tool enhancements for
         # Write/Edit).  The JSON-diff and XML-diff handlers are retired
@@ -1213,11 +1388,11 @@ class Qwen3CoderToolParser(ToolParser):
         # CC-HAHA SSE truncation for long-content tool calls.
         # Qwen3Coder's structural tag is always XML, so JSON format
         # does not occur in practice regardless of client format.
-        if VLLM_QWEN3CODER_STREAMING_FIX != 0:
+        if VLLM_QWEN3X_TOOL_FIX != 0:
             _log(
                 "opt23 original path: fix=%s json_closed=%s func=%s "
                 "delta_len=%d",
-                VLLM_QWEN3CODER_STREAMING_FIX,
+                VLLM_QWEN3X_TOOL_FIX,
                 self.json_closed, self.current_function_name,
                 len(delta_text))
 
@@ -1338,7 +1513,7 @@ class Qwen3CoderToolParser(ToolParser):
             # the same tool_text.  Gated by env var — this is a streaming
             # artifact detection heuristic.
             _func_positions: list = []
-            if VLLM_QWEN3CODER_STREAMING_FIX:
+            if VLLM_QWEN3X_TOOL_FIX:
                 _known_names = {t.function.name for t in (self.tools or [])
                                 if getattr(t, 'function', None)
                                 and getattr(t.function, 'name', None)}
@@ -1472,7 +1647,17 @@ class Qwen3CoderToolParser(ToolParser):
                     if len(json_fragment) > emitted_total:
                         json_fragment = json_fragment[emitted_total:]
                     else:
-                        json_fragment = ""
+                        # opt23 §11.40: partial 发射可能比完整参数长——
+                        # XML 参数值以换行包裹（<parameter=x>\n值\n</parameter>），
+                        # partial 发射保留尾部格式换行而完整参数 trim 掉，
+                        # 导致 emitted_total > len(json_fragment)。此时内容
+                        # 已全部发射，缺失的只是闭合引号——补发最后一个
+                        # 字符（闭合 "），否则前端拼接 JSON 非法
+                        # （Edit old_string 未闭合根因）。
+                        json_fragment = (
+                            json_fragment[-1:]
+                            if json_fragment.endswith('"') else ""
+                        )
                     self._partial_emitted = ""
                     self._partial_prefix = ""
                     if not json_fragment:
@@ -1489,7 +1674,7 @@ class Qwen3CoderToolParser(ToolParser):
             # This bypasses the json_fragments + partial streaming paths
             # entirely, producing only valid JSON continuation deltas.
             # Only for =4 (双格式互转, 待设计), =3 is pure JSON no conversion.
-            if (VLLM_QWEN3CODER_STREAMING_FIX == 4
+            if (VLLM_QWEN3X_TOOL_FIX == 4
                     and self.current_function_name in self._STREAMING_TOOLS):
                 _ph3 = self._emit_xml_json_diff(
                     tool_text, param_starts, tool_start_idx, current_text,
