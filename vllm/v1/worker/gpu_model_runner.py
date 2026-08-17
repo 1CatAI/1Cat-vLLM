@@ -182,7 +182,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import GREEDY_TEMPERATURE, RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.ddtree_parent_metadata import (
@@ -1059,6 +1059,33 @@ class DDTreeMambaCopyRecord(TypedDict):
     dst_block_idx: int
     src_block_id: int
     dst_block_id: int
+
+
+def _non_greedy_rows_carry_drafts(
+    sampling_metadata: SamplingMetadata,
+    spec_decode_metadata: SpecDecodeMetadata,
+) -> bool:
+    """Whether any non-greedy request in this verify step carries draft tokens.
+
+    Draft tokens are proposed one step ahead with the *previous* batch's
+    sampling metadata. When that batch was all-greedy the proposer takes the
+    argmax fast path and legitimately returns no draft probabilities. If a
+    sampled (non-greedy) request joins the batch on the next step it has zero
+    draft tokens at that step, so no probability rows are needed for it, and
+    the greedy rows are verified by argmax without probabilities. Only a
+    non-greedy row that actually carries draft tokens needs ``draft_probs``;
+    that is the case the missing-probability guard must reject.
+    """
+    num_draft_tokens = spec_decode_metadata.num_draft_tokens
+    if not any(num_draft_tokens):
+        return False
+    temperature = sampling_metadata.temperature
+    if temperature is None:
+        return False
+    # Exceptional path only (probabilistic MTP, mixed batch, no probs), so the
+    # small device-to-host copy here does not sit on the steady-state step.
+    is_greedy = (temperature[: len(num_draft_tokens)] == GREEDY_TEMPERATURE).tolist()
+    return any(n > 0 and not greedy for n, greedy in zip(num_draft_tokens, is_greedy))
 
 
 class GPUModelRunner(
@@ -7299,6 +7326,7 @@ class GPUModelRunner(
             and self.speculative_config.draft_sample_method == "probabilistic"
             and not sampling_metadata.all_greedy
             and draft_probs is None
+            and _non_greedy_rows_carry_drafts(sampling_metadata, spec_decode_metadata)
         ):
             raise RuntimeError(
                 "MTP probabilistic draft sampling requires draft probability "
