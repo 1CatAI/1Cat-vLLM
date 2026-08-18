@@ -1,7 +1,7 @@
 From 91ceff5f2ac59921e156b7bf1ba4b2aa8f89036e Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 17:01:12 +0800
-Subject: [PATCH 1/8] =?UTF-8?q?feat(opt21+25):=20v1.3.0=20=E9=87=8D?=
+Subject: [PATCH 1/9] =?UTF-8?q?feat(opt21+25):=20v1.3.0=20=E9=87=8D?=
  =?UTF-8?q?=E6=94=BE=20opt21=20=E5=9F=BA=E7=A1=80=E9=A1=B9=20+=20opt25=20A?=
  =?UTF-8?q?nthropic=20=E5=8D=8F=E8=AE=AE?=
 MIME-Version: 1.0
@@ -432,7 +432,7 @@ index 419e151..deb4765 100644
 From 6d16aa0494eb7871d222cf06a4f8b467b3262989 Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 17:23:35 +0800
-Subject: [PATCH 2/8] =?UTF-8?q?feat(opt22):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
+Subject: [PATCH 2/9] =?UTF-8?q?feat(opt22):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
  =?UTF-8?q?=E5=8F=8C=E6=A0=BC=E5=BC=8F=E5=B7=A5=E5=85=B7=E8=B0=83=E7=94=A8?=
  =?UTF-8?q?=EF=BC=88fix=20=E4=BD=93=E7=B3=BB=EF=BC=89?=
 MIME-Version: 1.0
@@ -2502,7 +2502,7 @@ index d5b87ea..fea8633 100644
 From 470f8cb912f6b24b548265e006be1b7351b020f9 Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 17:42:00 +0800
-Subject: [PATCH 3/8] =?UTF-8?q?feat(opt24):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
+Subject: [PATCH 3/9] =?UTF-8?q?feat(opt24):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
  =?UTF-8?q?=20Drafter=20=E4=B8=8A=E4=B8=8B=E6=96=87=E5=AF=B9=E9=BD=90?=
  =?UTF-8?q?=EF=BC=88=E5=8E=9F=20opt26=EF=BC=89?=
 MIME-Version: 1.0
@@ -2556,7 +2556,7 @@ index 45eedb0..499255f 100644
 From c0161e3fb00f1959bf32dc9ccac32154ba784f35 Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 18:03:48 +0800
-Subject: [PATCH 4/8] =?UTF-8?q?feat(opt23):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
+Subject: [PATCH 4/9] =?UTF-8?q?feat(opt23):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
  =?UTF-8?q?=E5=B9=B6=E5=8F=91=E4=BC=98=E5=8C=96=EF=BC=88DDTree=20=E5=B0=81?=
  =?UTF-8?q?=E9=A1=B6=20+=2065/35=20budget=20+=20GPU-LRU=20=E5=A4=9A?=
  =?UTF-8?q?=E5=B9=B6=E5=8F=91=EF=BC=89?=
@@ -2839,7 +2839,7 @@ index e6dbb57..b527a49 100644
 From 65945fac173d8045f0a2562226e1518012fce1f3 Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 18:42:19 +0800
-Subject: [PATCH 5/8] =?UTF-8?q?feat(mtp3):=20=E8=A7=A3=E9=99=A4=20Dynamic?=
+Subject: [PATCH 5/9] =?UTF-8?q?feat(mtp3):=20=E8=A7=A3=E9=99=A4=20Dynamic?=
  =?UTF-8?q?=20fused=20proposal=20MTP4=20=E7=A1=AC=E9=99=90=E5=88=B6?=
  =?UTF-8?q?=EF=BC=8C=E6=94=AF=E6=8C=81=20MTP3?=
 MIME-Version: 1.0
@@ -2883,7 +2883,7 @@ index 8f8e4a8..77e6087 100644
 From 0124dad56fa1252b607e0aa7d5e691240557c1d1 Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 19:35:34 +0800
-Subject: [PATCH 6/8] =?UTF-8?q?feat(opt21):=20KV=20=E7=BC=93=E5=AD=98?=
+Subject: [PATCH 6/9] =?UTF-8?q?feat(opt21):=20KV=20=E7=BC=93=E5=AD=98?=
  =?UTF-8?q?=E6=97=B6=E9=99=90=E4=BC=98=E5=8C=96=EF=BC=88Warm=20Block=20?=
  =?UTF-8?q?=E6=97=B6=E9=97=B4=E5=80=92=E6=8E=92=E5=9B=9E=E6=94=B6=EF=BC=89?=
 MIME-Version: 1.0
@@ -3160,7 +3160,7 @@ index 513e4bf..c817882 100644
 From 042b658efde0974517fcefffbda4a91f13e14bd1 Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 21:37:34 +0800
-Subject: [PATCH 7/8] =?UTF-8?q?feat(opt21):=20anthropic=20=E7=AB=AF?=
+Subject: [PATCH 7/9] =?UTF-8?q?feat(opt21):=20anthropic=20=E7=AB=AF?=
  =?UTF-8?q?=E7=82=B9=20usage=20=E8=A1=A5=20cache=5Fread=5Finput=5Ftokens?=
  =?UTF-8?q?=EF=BC=88=E7=9C=9F=E5=AE=9E=E7=BC=93=E5=AD=98=E5=91=BD=E4=B8=AD?=
  =?UTF-8?q?=E6=95=B0=E6=8D=AE=EF=BC=89?=
@@ -3227,7 +3227,7 @@ index f0379af..8d3571c 100644
 From 7c53ee0f7156d04311c39bd93511a8dea0868e5e Mon Sep 17 00:00:00 2001
 From: Zeaxion <zeaxion@zeaxion-UB24>
 Date: Tue, 18 Aug 2026 22:22:40 +0800
-Subject: [PATCH 8/8] =?UTF-8?q?feat(opt23):=20MTP=20=E5=AE=8C=E6=95=B4?=
+Subject: [PATCH 8/9] =?UTF-8?q?feat(opt23):=20MTP=20=E5=AE=8C=E6=95=B4?=
  =?UTF-8?q?=E6=94=AF=E6=8C=81=EF=BC=880/1/2/3/4=EF=BC=89+=20fused=20?=
  =?UTF-8?q?=E9=99=8D=E7=BA=A7=20+=20NTK=20=E9=BB=98=E8=AE=A4=20+=20fix=20?=
  =?UTF-8?q?=E9=BB=98=E8=AE=A4?=
@@ -3554,6 +3554,125 @@ index 77e6087..21e333b 100644
              )
          if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
              raise RuntimeError("Dynamic fused proposal SM70 ops are not built.")
+-- 
+2.43.0
+
+
+From c084f80ad5780325d550f130945cf25f4e83e3ac Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Wed, 19 Aug 2026 01:29:36 +0800
+Subject: [PATCH 9/9] =?UTF-8?q?fix(opt24+23):=20NTK=20=E9=95=BF=E4=B8=8A?=
+ =?UTF-8?q?=E4=B8=8B=E6=96=87=EF=BC=88>262K=EF=BC=89MTP=20=E6=8A=95?=
+ =?UTF-8?q?=E6=9C=BA=E5=B4=A9=E6=BA=83=E4=BF=AE=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+场景: max_model_len=368640 + NTK yarn 缩放默认启用后，上下文超过
+max_position_embeddings(262144) 时引擎崩溃
+RuntimeError: Speculative decode scheduled draft input slots, but the
+worker draft tokens are list instead of a tensor.
+
+根因:
+1. v130 _maybe_override_draft_max_model_len 用 min(draft, target) 保持
+   draft_model_config.max_model_len=262144 -> worker effective_drafter_
+   max_model_len=262144；上下文 >262K 触发 Skipping speculative drafts
+2. scheduler 该步仍调度 draft slots，worker scatter 时 _draft_token_ids
+   是 list 而非 tensor -> raise -> EngineCore 崩溃
+
+修复:
+- config/speculative.py (opt24): Drafter 对齐补 max_model_len 扩展
+  （对齐 target_model_config.max_model_len=368640，用 target_len 而非
+  self.max_model_len——MTP 同模型场景 self.max_model_len 为 None）+ None 防护
+- v1/worker/gpu_model_runner.py (opt23): worker 容错——_draft_token_ids
+  非 tensor 时跳过 scatter 而非 raise
+
+验证:
+- 280K tokens 上下文请求成功（280010, 162s）——修复前 266K 即崩溃
+- Skipping: 16次 -> 0次；EngineDeadError: 0
+---
+ config/speculative.py         | 32 ++++++++++++++++++++++++++++----
+ v1/worker/gpu_model_runner.py | 13 +++++++------
+ 2 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/config/speculative.py b/config/speculative.py
+index 8e63454..367a41e 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -915,21 +915,45 @@ class SpeculativeConfig:
+                 # opt24 (opt26): Auto-extend drafter max_position_embeddings
+                 # to match target model max_model_len.
+                 hf_config = self.draft_model_config.hf_config
++                target_len = self.target_model_config.max_model_len
+                 if hf_config is not None:
+                     for pos_attr in ("max_position_embeddings", "max_position"):
+                         current_pos = getattr(hf_config, pos_attr, None)
+                         if (current_pos is not None
+-                                and current_pos < self.max_model_len):
+-                            setattr(hf_config, pos_attr, self.max_model_len)
++                                and target_len is not None
++                                and current_pos < target_len):
++                            setattr(hf_config, pos_attr, target_len)
+                             logger.info_once(
+                                 "Extended Drafter %s from %d to %d "
+                                 "to match target model max_model_len=%d.",
+                                 pos_attr,
+                                 current_pos,
+-                                self.max_model_len,
+-                                self.max_model_len,
++                                target_len,
++                                target_len,
+                             )
+ 
++                # opt24: also extend draft_model_config.max_model_len so the
++                # worker's effective_drafter_max_model_len tracks the target
++                # model. v130 keeps min(draft, target) = max_position_embeddings
++                # (262144), which forces "Skipping speculative drafts" once the
++                # context exceeds 262K; the scheduler still schedules draft
++                # slots on that step and the worker raises
++                # "draft tokens are list instead of a tensor" — engine crash
++                # (NTK long-context > 262K scenario).
++                if (
++                    self.draft_model_config.max_model_len is not None
++                    and target_len is not None
++                    and self.draft_model_config.max_model_len < target_len
++                ):
++                    self.draft_model_config.max_model_len = target_len
++                    logger.info_once(
++                        "Extended Drafter max_model_len from %d to %d "
++                        "to match target model max_model_len=%d.",
++                        self.draft_model_config.max_model_len,
++                        target_len,
++                        target_len,
++                    )
++
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index b527a49..92c23b3 100644
+--- a/v1/worker/gpu_model_runner.py
++++ b/v1/worker/gpu_model_runner.py
+@@ -4580,12 +4580,13 @@ class GPUModelRunner(
+             )
+ 
+         if not isinstance(self._draft_token_ids, torch.Tensor):
+-            raise RuntimeError(
+-                "Speculative decode scheduled draft input slots, but the "
+-                f"worker draft tokens are {type(self._draft_token_ids).__name__} "
+-                "instead of a tensor. The scheduler must trim invalid draft "
+-                "slots before target verification."
+-            )
++            # opt24: the drafter context limit was reached
++            # ("Skipping speculative drafts" path sets per-request empty
++            # lists). The scheduler may still carry draft slots from the
++            # previous step; scatter would crash on a non-tensor. Skip the
++            # scatter — the empty draft was already synced to the CPU, so the
++            # scheduler trims invalid slots on the next step.
++            return
+ 
+         draft_tokens_index_tensor = torch.tensor(
+             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
 -- 
 2.43.0
 

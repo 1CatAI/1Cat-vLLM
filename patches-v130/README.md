@@ -28,7 +28,8 @@ git apply <patches>/08-opt21-25-all.patch
 | 05 | `opt21-kvwarm.patch` | **opt21 KV 缓存时限优化**（Warm Block 时间倒排回收，原 opt22 独立设计重新纳入）——1 文件（block_pool.py） | `0124dad` |
 | 06 | `opt21-ntk-default.patch` | **opt21 NTK 默认启用**（Auto Dynamic NTK 去掉 VLLM_ALLOW_LONG_MAX_MODEL_LEN 条件——默认启用，524288 硬拒绝保留）——1 文件 | `7c53ee0` 部分 |
 | 07 | `opt21-cache-read.patch` | **opt21 anthropic cache_read_input_tokens 填充**（usage 3 处补真实缓存命中数据）——1 文件 | `042b658` |
-| 08 | `opt21-25-all.patch` | **整体补丁**（01-07 全部） | `0634460..HEAD` |
+| 09 | `opt24-ntk-longctx-fix.patch` | **opt24 NTK 长上下文（>262K）MTP 投机崩溃修复**（Drafter max_model_len 对齐 target + worker 容错——修复 v130 min 逻辑导致 262K 上下文崩溃）——2 文件 | `c084f80` |
+| 08 | `opt21-25-all.patch` | **整体补丁**（01-07 + 09 全部） | `0634460..HEAD` |
 
 ## MTP 档位支持（opt23）
 
