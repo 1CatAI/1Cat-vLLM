@@ -8,6 +8,7 @@ purposes.
 
 import argparse
 import json
+import os
 import ssl
 from collections.abc import Sequence
 from dataclasses import field
@@ -393,6 +394,16 @@ def validate_parsed_serve_args(args: argparse.Namespace):
 
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
+
+    # opt22: enabling a qwen3 tool-call parser implies the dual-format fix=1
+    # by default — unless the user explicitly set VLLM_QWEN3X_TOOL_FIX (or the
+    # legacy VLLM_QWEN3CODER_STREAMING_FIX) in the environment.
+    if args.tool_call_parser in ("qwen3_coder", "qwen3_xml"):
+        if (
+            os.environ.get("VLLM_QWEN3X_TOOL_FIX") is None
+            and os.environ.get("VLLM_QWEN3CODER_STREAMING_FIX") is None
+        ):
+            os.environ["VLLM_QWEN3X_TOOL_FIX"] = "1"
 
     # Enable auto tool needs a tool call parser to be valid
     if args.enable_auto_tool_choice and not args.tool_call_parser:

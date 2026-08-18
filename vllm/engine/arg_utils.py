@@ -1718,6 +1718,11 @@ class EngineArgs:
         if self.speculative_config is None:
             return None
 
+        # opt23: num_speculative_tokens=0 disables speculative decoding.
+        if self.speculative_config.get("num_speculative_tokens") == 0:
+            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
+            return None
+
         if "enforce_eager" not in self.speculative_config:
             self.speculative_config["enforce_eager"] = False
             logger.info_once(
@@ -1778,6 +1783,10 @@ class EngineArgs:
             profile_updates.append("mamba_cache_mode=align")
 
         if self.speculative_config is None:
+            # opt23: --spec-tokens 0 explicitly disables MTP — skip auto-MTP.
+            if self.spec_tokens is not None and self.spec_tokens <= 0:
+                logger.info("--spec-tokens=%d, skipping auto-MTP.", self.spec_tokens)
+                return
             enable_auto_mtp = (
                 envs.VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS
                 or envs.VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS

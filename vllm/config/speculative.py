@@ -84,7 +84,7 @@ class SpeculativeConfig:
     enforce_eager: bool | None = None
     """Override the default enforce_eager from model_config"""
     # General speculative decoding control
-    num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
+    num_speculative_tokens: int = Field(default=None, ge=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
     number in the draft model config if present, otherwise, it is required."""
     model: str | None = None
@@ -569,6 +569,15 @@ class SpeculativeConfig:
         return hf_config
 
     def __post_init__(self):
+        # opt23: MTP=0 disables speculative decoding (equivalent to not
+        # passing a speculative config at all).
+        if self.num_speculative_tokens is not None and self.num_speculative_tokens == 0:
+            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
+            self.method = None
+            self.model = None
+            self.num_speculative_tokens = None
+            return self
+
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight
@@ -598,6 +607,25 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        # MTP safety detection: if the model has no MTP layers, disable speculation
+        if self.method == "mtp" and self.target_model_config is not None:
+            hf_config = self.target_model_config.hf_text_config
+            n_predict = getattr(hf_config, "n_predict", 0) or 0
+            mtp_layers = getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
+            nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+            if n_predict <= 0 and mtp_layers <= 0 and nextn_layers <= 0:
+                logger.warning(
+                    "Model does not have MTP layers "
+                    "(n_predict=%s, mtp_num_hidden_layers=%s, "
+                    "num_nextn_predict_layers=%s). "
+                    "Disabling speculative decoding.",
+                    n_predict, mtp_layers, nextn_layers,
+                )
+                self.method = None
+                self.model = None
+                self.num_speculative_tokens = None
+                return self
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
@@ -884,6 +912,48 @@ class SpeculativeConfig:
                     )
                 )
 
+                # opt24 (opt26): Auto-extend drafter max_position_embeddings
+                # to match target model max_model_len.
+                hf_config = self.draft_model_config.hf_config
+                target_len = self.target_model_config.max_model_len
+                if hf_config is not None:
+                    for pos_attr in ("max_position_embeddings", "max_position"):
+                        current_pos = getattr(hf_config, pos_attr, None)
+                        if (current_pos is not None
+                                and target_len is not None
+                                and current_pos < target_len):
+                            setattr(hf_config, pos_attr, target_len)
+                            logger.info_once(
+                                "Extended Drafter %s from %d to %d "
+                                "to match target model max_model_len=%d.",
+                                pos_attr,
+                                current_pos,
+                                target_len,
+                                target_len,
+                            )
+
+                # opt24: also extend draft_model_config.max_model_len so the
+                # worker's effective_drafter_max_model_len tracks the target
+                # model. v130 keeps min(draft, target) = max_position_embeddings
+                # (262144), which forces "Skipping speculative drafts" once the
+                # context exceeds 262K; the scheduler still schedules draft
+                # slots on that step and the worker raises
+                # "draft tokens are list instead of a tensor" — engine crash
+                # (NTK long-context > 262K scenario).
+                if (
+                    self.draft_model_config.max_model_len is not None
+                    and target_len is not None
+                    and self.draft_model_config.max_model_len < target_len
+                ):
+                    self.draft_model_config.max_model_len = target_len
+                    logger.info_once(
+                        "Extended Drafter max_model_len from %d to %d "
+                        "to match target model max_model_len=%d.",
+                        self.draft_model_config.max_model_len,
+                        target_len,
+                        target_len,
+                    )
+
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config, self.draft_tensor_parallel_size
@@ -1057,6 +1127,8 @@ class SpeculativeConfig:
 
     @model_validator(mode="after")
     def _verify_args(self) -> Self:
+        if self.method is None and self.model is None:
+            return self
         if self.tensor_parallel_size is not None:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
@@ -1070,7 +1142,7 @@ class SpeculativeConfig:
                 "n_predict parameter."
             )
 
-        if self.num_speculative_tokens <= 0:
+        if self.num_speculative_tokens < 0:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
