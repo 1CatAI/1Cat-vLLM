@@ -604,7 +604,7 @@ pandas==2.2.3
     #   fastparquet
     #   genai-perf
     #   statsmodels
-pathspec==0.12.1
+pathspec==1.1.1
     # via black
 pathvalidate==3.2.1
     # via pytablewriter
