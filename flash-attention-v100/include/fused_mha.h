@@ -48,7 +48,9 @@ at::Tensor flash_attention_decode_paged(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right
+    const int window_size_right,
+    const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window
 );
 
 at::Tensor flash_attention_decode_paged_xqa(
@@ -148,7 +150,9 @@ at::Tensor flash_attention_prefill_paged(
     const float v_scale,
     const bool is_causal,
     const int window_size_left,
-    const int window_size_right
+    const int window_size_right,
+    const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window
 );
 
 std::vector<at::Tensor>

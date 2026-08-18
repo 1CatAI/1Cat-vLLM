@@ -161,6 +161,7 @@ class WhisperModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             model_specific_attn_metadata=whisper_attn_metadata,
             for_cudagraph_capture=for_capture,
+            prefix_anchor_lens=input_batch.prefix_anchor_lens,
         )
         return attn_metadata
 

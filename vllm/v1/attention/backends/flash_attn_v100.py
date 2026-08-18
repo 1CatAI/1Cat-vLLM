@@ -44,6 +44,8 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     max_model_len: int
     flash_v100_cudagraph_capture: bool
     flash_v100_contig_dense_cache: dict[tuple[int, int, int, int, int], int]
+    prefix_anchor_lens: torch.Tensor | None = None
+    decode_sliding_window: int | None = None
     flash_v100_decode_max_seq_len_hint: int | None
     flash_v100_decode_workspace_seq_capacity_hint: int | None
     flash_v100_static_decode_seq_hint: int | None
@@ -2468,6 +2470,16 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         self._draft_block_table: torch.Tensor | None = None
         self._draft_seq_lens: torch.Tensor | None = None
+        # Prefix-anchored SWA: persistent per-request prompt-length buffer so
+        # the device address stays stable across steps.
+        self.decode_sliding_window = self.vllm_config.model_config.decode_sliding_window
+        self.persistent_prefix_anchor_lens: torch.Tensor | None = None
+        if self.decode_sliding_window is not None:
+            self.persistent_prefix_anchor_lens = torch.empty(
+                self.vllm_config.scheduler_config.max_num_seqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
         self._draft_query_start_loc: torch.Tensor | None = None
         self._flash_draft_buffer_shape: tuple[int, int] | None = None
         self._smallq_decode_block_table: torch.Tensor | None = None
@@ -3174,6 +3186,17 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
+        prefix_anchor_lens = common_attn_metadata.prefix_anchor_lens
+        if self.decode_sliding_window is not None and prefix_anchor_lens is not None:
+            assert self.persistent_prefix_anchor_lens is not None
+            anchor_reqs = common_attn_metadata.num_reqs
+            prefix_anchor_lens = prefix_anchor_lens.to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+            persistent_anchor_lens = self.persistent_prefix_anchor_lens[:anchor_reqs]
+            persistent_anchor_lens.copy_(prefix_anchor_lens[:anchor_reqs])
+            attn_metadata.prefix_anchor_lens = persistent_anchor_lens
+            attn_metadata.decode_sliding_window = self.decode_sliding_window
         flash_metadata = _as_flash_v100_metadata(attn_metadata)
         flash_metadata.seq_lens_cpu = capture_seq_lens_cpu
 
@@ -3413,10 +3436,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "workspace_seq_capacity_hint",
                 "active_num_partitions",
                 "partition_size_hint",
+                "anchor_lens",
+                "anchored_window",
             )
             if self.flash_attn_decode_paged is not None
             and _callable_accepts_keyword(self.flash_attn_decode_paged, name)
         }
+        self._flash_prefill_paged_supports_anchor = (
+            self.flash_attn_prefill_paged is not None
+            and _callable_accepts_keyword(
+                self.flash_attn_prefill_paged, "anchor_lens"
+            )
+        )
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
             os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
@@ -4108,6 +4139,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         workspace_seq_capacity_hint: int | None = None,
         active_num_partitions: int | None = None,
         partition_size_hint: int | None = None,
+        anchor_lens: torch.Tensor | None = None,
+        anchored_window: int = 0,
     ) -> None:
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
@@ -4123,6 +4156,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "FLASH_ATTN_V100 decode op does not support sliding-window "
                 "attention with this extension build."
             )
+        if anchor_lens is not None and anchored_window > 0:
+            if "anchor_lens" not in self._flash_decode_paged_kwargs:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 decode op does not support the anchored "
+                    "decode-window mask with this extension build; rebuild "
+                    "flash_attn_v100."
+                )
+            kwargs["anchor_lens"] = anchor_lens
+            kwargs["anchored_window"] = anchored_window
         optional_kwargs = {
             "max_seq_len_hint": max_seq_len_hint,
             "workspace_seq_capacity_hint": workspace_seq_capacity_hint,
@@ -4288,6 +4330,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         _record_route("prefill_smallq_decode_scalar")
 
+    def _anchored_swa_params(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> tuple[torch.Tensor | None, int]:
+        """Anchored decode-window mask parameters, when active.
+
+        Returns ``(prefix_anchor_lens, decode_sliding_window)`` when the model
+        is configured with a prefix-anchored sliding window over generated
+        tokens and the metadata carries per-request prompt lengths; otherwise
+        ``(None, 0)``.
+        """
+        window = getattr(attn_metadata, "decode_sliding_window", None)
+        anchor_lens = getattr(attn_metadata, "prefix_anchor_lens", None)
+        if window is None or int(window) <= 0 or anchor_lens is None:
+            return None, 0
+        return anchor_lens, int(window)
+
     def _small_query_decode_enabled(
         self,
         attn_metadata: TritonAttentionMetadata,
@@ -4297,6 +4356,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             or not self.use_flash_v100_decode
             or self.smallq_decode_max_query_len <= 0
         ):
+            return False
+        # Anchored decode-window mask: the small-query re-expansion path does
+        # not carry per-row anchor lengths; use the masked paged prefill
+        # kernel instead.
+        if self._anchored_swa_params(attn_metadata)[0] is not None:
             return False
 
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
@@ -4716,10 +4780,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output_block_scale,
             )
 
+        # Anchored decode-window mask: only the scalar paged decode route and
+        # the direct paged prefill route carry the masked kernel; diagnostic
+        # decode bridges are bypassed while the mask is active.
+        anchored_swa_active = (
+            self._anchored_swa_params(attn_metadata)[0] is not None
+        )
         if (
             self.use_decode_paged_prefill
             and self.use_flash_v100_prefill_paged
             and not is_capturing
+            and not anchored_swa_active
         ):
             _log_fp8_kv_cache_route(
                 "decode", self.kv_cache_dtype, "decode_as_paged_prefill"
@@ -4749,7 +4820,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _record_route("decode_paged_prefill")
             return result
-        if self.use_decode_dense_cache and not is_capturing:
+        if (
+            self.use_decode_dense_cache
+            and not is_capturing
+            and not anchored_swa_active
+        ):
             _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "dense_cache_bridge")
             _sm70_profile_trace(
                 "forward branch=decode_dense_cache layer=%s",
@@ -4778,7 +4853,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _record_route("decode_dense_cache")
             return result
-        if self.use_decode_dense_reference and not is_capturing:
+        if (
+            self.use_decode_dense_reference
+            and not is_capturing
+            and not anchored_swa_active
+        ):
             _log_fp8_kv_cache_route(
                 "decode", self.kv_cache_dtype, "dense_reference_bridge"
             )
@@ -5321,6 +5400,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> torch.Tensor:
         """Decode path using Flash V100 directly over paged KV cache."""
         window_size = self._flash_v100_window_size(causal=True)
+        anchor_lens, anchored_window = self._anchored_swa_params(attn_metadata)
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
         out_view = output[:num_actual_tokens]
@@ -5360,6 +5440,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 or (q_per_kv != 4 and _decode_fp8_xqa_allowed(attn_metadata, query))
             )
             and window_size == (-1, -1)
+            # Anchored decode-window mask: only the scalar paged decode kernel
+            # carries the masked instantiation.
+            and anchor_lens is None
         ):
             _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "xqa_paged")
             _trace_decode_active(
@@ -5448,6 +5531,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "flash_v100_decode_active_num_partitions",
                 None,
             ),
+            anchor_lens=anchor_lens,
+            anchored_window=anchored_window,
         )
         _record_route("decode_scalar_paged")
         return output
@@ -6316,6 +6401,22 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_compare, _logged_prefill_smallq_decode
         causal = getattr(attn_metadata, "causal", True)
         window_size = self._flash_v100_window_size(causal)
+        anchor_lens, anchored_window = self._anchored_swa_params(attn_metadata)
+        if anchor_lens is not None:
+            # Fail closed: with the anchored decode-window mask active the
+            # KV cache manager evicts gap blocks, so running any unmasked
+            # prefill route would silently produce wrong output.
+            if not self.use_flash_v100_prefill_paged:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 anchored decode-window mask requires "
+                    "the paged prefill kernel; it is disabled or unavailable."
+                )
+            if not self._flash_prefill_paged_supports_anchor:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 prefill op does not support the "
+                    "anchored decode-window mask with this extension build; "
+                    "rebuild flash_attn_v100."
+                )
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
         out_view = output[:num_actual_tokens]
@@ -6351,6 +6452,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             attn_metadata,
             query_start_loc,
         ):
+            if anchor_lens is not None:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 anchored decode-window mask does not "
+                    "support ddtree drafting metadata."
+                )
             return self._flash_v100_ddtree_small_query_prefill_dense(
                 layer,
                 query,
@@ -6366,6 +6472,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if (
             causal
+            and anchor_lens is None
             and self.use_flash_v100_decode
             and self.smallq_decode_max_query_len > 0
             and max_query_len <= self.smallq_decode_max_query_len
@@ -6405,6 +6512,36 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 q_len = end - start
                 seq_len = int(seq_lens[i].item())
                 q_seq = query[start:end].unsqueeze(0)
+                if anchor_lens is not None:
+                    # Anchored decode-window mask: single masked paged
+                    # prefill route; every unmasked fast path is bypassed.
+                    _record_route("prefill_prefix_paged_anchored")
+                    out_seq = self._run_prefill_paged_call(
+                        route="prefill_prefix_paged_anchored",
+                        q_len=q_len,
+                        seq_len=seq_len,
+                        heads_q=query.shape[1],
+                        heads_kv=num_kv_heads,
+                        head_dim=head_dim,
+                        block_size=block_size,
+                        fn=lambda q_seq=q_seq, i=i: self.flash_attn_prefill_paged(  # type: ignore[misc]
+                            q_seq,
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table[i : i + 1],
+                            attn_metadata.seq_lens[i : i + 1],
+                            softmax_scale=self.scale,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            k_scale=float(layer._k_scale_float),
+                            v_scale=float(layer._v_scale_float),
+                            causal=causal,
+                            window_size=window_size,
+                            anchor_lens=anchor_lens[i : i + 1],
+                            anchored_window=anchored_window,
+                        ),
+                    )
+                    out_view[start:end].copy_(out_seq.squeeze(0))
+                    continue
                 bfla_block_mask = None
                 use_bfla = self._should_use_prefill_bfla(
                     q_len=q_len,

@@ -897,6 +897,8 @@ def flash_attn_decode_paged(
     workspace_seq_capacity_hint: int | None = None,
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
+    anchor_lens: torch.Tensor | None = None,
+    anchored_window: int = 0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -905,9 +907,12 @@ def flash_attn_decode_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
+    anchor_lens = maybe_contiguous(anchor_lens)
     window_size_left, window_size_right = window_size
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+    if anchored_window > 0 and anchor_lens is None:
+        raise ValueError("anchored_window requires anchor_lens")
     batch_capacity = q.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
@@ -960,6 +965,8 @@ def flash_attn_decode_paged(
         float(v_scale),
         int(window_size_left),
         int(window_size_right),
+        anchor_lens,
+        int(anchored_window),
     )
 
 
@@ -1232,6 +1239,8 @@ def flash_attn_prefill_paged(
     v_scale: float = 1.0,
     causal: bool = True,
     window_size: tuple = (-1, -1),
+    anchor_lens: torch.Tensor | None = None,
+    anchored_window: int = 0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1241,9 +1250,12 @@ def flash_attn_prefill_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
+    anchor_lens = maybe_contiguous(anchor_lens)
     window_size_left, window_size_right = window_size
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
+    if anchored_window > 0 and anchor_lens is None:
+        raise ValueError("anchored_window requires anchor_lens")
 
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
@@ -1262,6 +1274,8 @@ def flash_attn_prefill_paged(
         causal,
         int(window_size_left),
         int(window_size_right),
+        anchor_lens,
+        int(anchored_window),
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
@@ -1433,6 +1447,8 @@ def flash_attn_prefill_paged_bhmd(
         causal,
         int(window_size_left),
         int(window_size_right),
+        None,
+        0,
     )
 
 

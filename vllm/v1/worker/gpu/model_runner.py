@@ -203,6 +203,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        # Prefix-anchored SWA: persistent GPU buffer for per-request prompt
+        # lengths (stable device address across steps).
+        self.prefix_anchor_lens_buffer: torch.Tensor | None = None
+        if self.model_config.decode_sliding_window is not None:
+            self.prefix_anchor_lens_buffer = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
 
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
@@ -878,6 +885,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+
+        prefix_anchor_lens = None
+        if self.prefix_anchor_lens_buffer is not None:
+            prefix_anchor_lens = self.prefix_anchor_lens_buffer[:num_reqs_padded]
+            prefix_anchor_lens[:num_reqs] = self.req_states.prompt_len.gpu[
+                idx_mapping[:num_reqs]
+            ]
+            if num_reqs_padded > num_reqs:
+                prefix_anchor_lens[num_reqs:].zero_()
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -903,6 +920,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+            prefix_anchor_lens=prefix_anchor_lens,
         )
 
     def prepare_attn(

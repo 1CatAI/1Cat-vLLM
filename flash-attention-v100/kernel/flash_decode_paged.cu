@@ -663,7 +663,7 @@ __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
 }
 
 template <int D, int PARTITION_SIZE, int KV_DTYPE,
-          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool ANCHORED_SWA = false>
 __global__ void flash_attention_decode_partition_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
     const void* __restrict__ v_cache, __half* __restrict__ tmp_out,
@@ -681,7 +681,12 @@ __global__ void flash_attention_decode_partition_kernel(
     const int64_t v_head_stride, const float softmax_scale, const float k_scale,
     const float v_scale, const int window_size_left,
     const int window_size_right, const int route_seq_len_begin,
-    const int route_seq_len_end, const int route_seq_len_final) {
+    const int route_seq_len_end, const int route_seq_len_final,
+    const int* __restrict__ anchor_lens, const int anchored_window) {
+  // The anchored decode-window mask variant is only generated for the fp16-KV
+  // configuration; every other instantiation keeps its original code path.
+  static_assert(!ANCHORED_SWA || KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16,
+                "ANCHORED_SWA requires an fp16 KV cache");
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int partition_idx = blockIdx.z;
@@ -718,6 +723,17 @@ __global__ void flash_attention_decode_partition_kernel(
                              : seq_len - 1;
   const int part_start = max(start_token_idx, min_token_idx);
   const int part_end = min(start_token_idx + PARTITION_SIZE, max_token_idx + 1);
+
+  // Anchored decode window: keys below the per-request prompt length stay
+  // globally visible; later (generated) keys must fall inside the sliding
+  // window over generated positions. Keys inside [gap_lo, gap_hi) are masked.
+  int gap_lo = seq_len;
+  int gap_hi = seq_len;
+  if constexpr (ANCHORED_SWA) {
+    const int anchor_len = anchor_lens[batch_idx];
+    gap_lo = anchor_len;
+    gap_hi = max(anchor_len, query_pos - anchored_window + 1);
+  }
   const int q_per_kv = num_heads_q / num_heads_kv;
   const int kv_head_idx = head_idx / q_per_kv;
   const int lane = threadIdx.x % kWarpSize;
@@ -777,9 +793,21 @@ __global__ void flash_attention_decode_partition_kernel(
 
     float score = dot_qk_cache<D, KV_DTYPE>(q_shared, k_cache, k_index, lane);
     if (lane == 0) {
-      score *= score_scale;
-      scores_shared[token_local] = score;
-      local_max = fmaxf(local_max, score);
+      if constexpr (ANCHORED_SWA) {
+        const int token_idx = part_start + token_local;
+        if (token_idx >= gap_lo && token_idx < gap_hi) {
+          // Masked gap key: never contributes (nulled gap blocks included).
+          scores_shared[token_local] = -1.0e30f;
+        } else {
+          score *= score_scale;
+          scores_shared[token_local] = score;
+          local_max = fmaxf(local_max, score);
+        }
+      } else {
+        score *= score_scale;
+        scores_shared[token_local] = score;
+        local_max = fmaxf(local_max, score);
+      }
     }
   }
 
@@ -787,6 +815,14 @@ __global__ void flash_attention_decode_partition_kernel(
 
   float local_sum = 0.f;
   for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
+    if constexpr (ANCHORED_SWA) {
+      const int token_idx = part_start + i;
+      if (token_idx >= gap_lo && token_idx < gap_hi) {
+        // Exact zero weight for masked keys (no reliance on expf underflow).
+        scores_shared[i] = 0.f;
+        continue;
+      }
+    }
     const float p = __expf(scores_shared[i] - part_max);
     scores_shared[i] = p;
     local_sum += p;
@@ -2045,7 +2081,8 @@ void launch_flash_attention_decode_paged(
     const int window_size_left, const int window_size_right,
     cudaStream_t stream, const int route_seq_len_begin = 0,
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
-    const bool launch_reduce = true) {
+    const bool launch_reduce = true, const int* anchor_lens = nullptr,
+    const int anchored_window = 0) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
@@ -2059,22 +2096,41 @@ void launch_flash_attention_decode_paged(
   const size_t reduce_shared_mem =
       static_cast<size_t>(2 * max_num_partitions) * sizeof(float);
 
-  flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE,
-                                          SEQ_LEN_ROUTE>
-      <<<partition_grid, block, 0, stream>>>(
-          reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
-          k_cache.data_ptr(), v_cache.data_ptr(),
-          reinterpret_cast<__half*>(tmp_out.data_ptr<at::Half>()),
-          max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
-          block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
-          active_num_partitions.data_ptr<int>(), batch_size, max_num_blocks,
-          max_num_partitions, num_heads_q, num_heads_kv, block_size,
-          q.stride(0), q.stride(1), tmp_out.stride(0), tmp_out.stride(1),
-          tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
-          k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-          v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-          softmax_scale, k_scale, v_scale, window_size_left, window_size_right,
-          route_seq_len_begin, route_seq_len_end, route_seq_len_final);
+  const bool use_anchored = anchor_lens != nullptr && anchored_window > 0;
+  // Second kernel version: the anchored decode-window mask is a separate
+  // template instantiation, generated only for the fp16-KV configuration;
+  // the non-anchored instantiations stay untouched.
+  const auto launch_partition = [&](auto anchored_tag) {
+    constexpr bool kAnchored = decltype(anchored_tag)::value;
+    flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE,
+                                            SEQ_LEN_ROUTE, kAnchored>
+        <<<partition_grid, block, 0, stream>>>(
+            reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+            k_cache.data_ptr(), v_cache.data_ptr(),
+            reinterpret_cast<__half*>(tmp_out.data_ptr<at::Half>()),
+            max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
+            block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+            active_num_partitions.data_ptr<int>(), batch_size, max_num_blocks,
+            max_num_partitions, num_heads_q, num_heads_kv, block_size,
+            q.stride(0), q.stride(1), tmp_out.stride(0), tmp_out.stride(1),
+            tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+            softmax_scale, k_scale, v_scale, window_size_left,
+            window_size_right, route_seq_len_begin, route_seq_len_end,
+            route_seq_len_final, anchor_lens, anchored_window);
+  };
+  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
+    if (use_anchored) {
+      launch_partition(std::true_type{});
+    } else {
+      launch_partition(std::false_type{});
+    }
+  } else {
+    TORCH_CHECK(!use_anchored,
+                "anchored decode window requires an fp16 KV cache");
+    launch_partition(std::false_type{});
+  }
 
   if (!launch_reduce) {
     return;
@@ -2388,7 +2444,9 @@ at::Tensor flash_attention_decode_paged(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right,
+    const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k/v cache must be on CUDA");
@@ -2474,6 +2532,23 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
               "window sizes must be >= -1");
 
+  const bool use_anchored = anchor_lens.has_value() && anchored_window > 0;
+  const int* anchor_lens_ptr = nullptr;
+  if (use_anchored) {
+    const at::Tensor& anchors = anchor_lens.value();
+    TORCH_CHECK(anchors.is_cuda(), "anchor_lens must be on CUDA");
+    TORCH_CHECK(anchors.dtype() == torch::kInt32, "anchor_lens must be int32");
+    TORCH_CHECK(anchors.dim() == 1 && anchors.size(0) >= batch_size,
+                "anchor_lens must have shape [B]");
+    TORCH_CHECK(anchors.stride(0) == 1, "anchor_lens must be contiguous");
+    TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16,
+                "anchored decode window requires an fp16 KV cache");
+    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
+                "anchored decode window cannot be combined with "
+                "sliding-window attention");
+    anchor_lens_ptr = anchors.data_ptr<int>();
+  }
+
   at::Tensor out = out_.has_value() ? out_.value() : torch::empty_like(q);
   TORCH_CHECK(out.is_cuda(), "out must be on CUDA");
   TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
@@ -2487,7 +2562,8 @@ at::Tensor flash_attention_decode_paged(
   launch_flash_attention_decode_paged<HDIM, PARTITION, KV_DTYPE_CODE>(       \
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,  \
       exp_sums, active_num_partitions, softmax_scale, launch_num_partitions, \
-      k_scale, v_scale, window_size_left, window_size_right, stream)
+      k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0,   \
+      0, true, anchor_lens_ptr, static_cast<int>(anchored_window))
 
 #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                 \
   do {                                                                      \

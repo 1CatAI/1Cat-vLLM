@@ -416,6 +416,14 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    prefix_anchor_lens: torch.Tensor | None = None
+    """(batch_size,) per-request prefix length (prompt token count) for
+    prefix-anchored sliding-window attention. Tokens with logical index below
+    this stay globally visible; later (generated) tokens additionally see a
+    fixed sliding window. None disables the mechanism. The attention backend
+    copies this into its own persistent buffer and reads the window size from
+    ``model_config.decode_sliding_window``."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -523,6 +531,7 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
+            prefix_anchor_lens=maybe_slice_reqs(self.prefix_anchor_lens),
         )
 
 

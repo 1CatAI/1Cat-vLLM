@@ -58,3 +58,7 @@ class ModelArchitectureConfig:
 
     derived_max_model_len_and_key: tuple[float, str | None]
     """Derived maximum model length and key from the hf config."""
+
+    decode_sliding_window: int | None = None
+    """Prefix-anchored sliding-window size applied to generated tokens
+    (the prompt/prefix stays globally attended). None disables it."""
