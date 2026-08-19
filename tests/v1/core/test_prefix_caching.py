@@ -1009,6 +1009,98 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+def test_mamba_align_offload_handoff_tracks_relocated_mtp_boundary():
+    """Expose the committed state block, not its stale logical position.
+
+    A large second prefill chunk relocates the four MTP scratch blocks. The
+    first scratch block moves from logical position 1 to position 5 and becomes
+    the state after token 24. An append-only connector mirror would still see
+    that physical block at position 1 and could save the token-24 state under
+    the token-8 key.
+    """
+    block_size = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=4,
+                ),
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    request = make_request("0", [0] * 24, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
+
+    assert (
+        manager.allocate_slots(
+            request,
+            num_new_tokens=4,
+            num_new_computed_tokens=num_computed_tokens,
+            new_computed_blocks=computed_blocks,
+        )
+        is not None
+    )
+    mamba_manager = manager.coordinator.single_type_managers[1]
+    mamba_blocks = mamba_manager.req_to_blocks[request.request_id]
+    first_boundary_block_id = mamba_blocks[0].block_id
+    first_scratch_block = mamba_blocks[1]
+
+    assert manager.take_boundary_state_offloads() == {
+        request.request_id: [(1, first_boundary_block_id, 4)]
+    }
+
+    request.num_computed_tokens = 4
+    assert manager.allocate_slots(request, num_new_tokens=20) is not None
+    mamba_blocks = mamba_manager.req_to_blocks[request.request_id]
+
+    assert mamba_blocks[1].is_null
+    assert mamba_blocks[5] is first_scratch_block
+    assert manager.take_boundary_state_offloads() == {
+        request.request_id: [(1, first_scratch_block.block_id, 24)]
+    }
+    assert manager.take_boundary_state_offloads() == {}
+
+    manager.free(request)
+
+    # A request freed before the scheduler drains its offer must not leave a
+    # block ID that can be recycled and later misidentified as its boundary.
+    freed_request = make_request("freed", [1] * 4, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(freed_request)
+    assert (
+        manager.allocate_slots(
+            freed_request,
+            num_new_tokens=4,
+            num_new_computed_tokens=num_computed_tokens,
+            new_computed_blocks=computed_blocks,
+        )
+        is not None
+    )
+    manager.free(freed_request)
+    assert manager.take_boundary_state_offloads() == {}
+
+
 def test_prefill_plp():
     """Test prefill with APC and some prompt logprobs (plp) requests.
 

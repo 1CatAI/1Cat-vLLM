@@ -68,6 +68,14 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         self.new_block_ids: list[int] = []
 
+        # Mamba ``align`` block tables are sparse and mutable: committed
+        # boundary states can be followed by speculative scratch blocks that
+        # are relocated in place. A connector therefore cannot recover an
+        # exact boundary-state source from an append-only block-ID mirror.
+        self._pending_boundary_state_offloads: list[
+            tuple[str, int, KVCacheBlock, int]
+        ] = []
+
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
         # is finished.
@@ -81,6 +89,18 @@ class SingleTypeKVCacheManager(ABC):
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
+
+    def take_pending_boundary_state_offloads(
+        self,
+    ) -> list[tuple[str, int, KVCacheBlock, int]]:
+        """Drain exact Mamba ``align`` boundary-state handoffs.
+
+        Entries are ``(request_id, group_id, block, boundary_tokens)``.
+        Non-Mamba managers leave the list empty.
+        """
+        pending = self._pending_boundary_state_offloads
+        self._pending_boundary_state_offloads = []
+        return pending
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -1095,6 +1115,14 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            # A hand-off is valid only while its source still belongs to this
+            # request. Drop offers that have not reached the connector before
+            # returning the request's blocks to the pool.
+            self._pending_boundary_state_offloads = [
+                entry
+                for entry in self._pending_boundary_state_offloads
+                if entry[0] != request_id
+            ]
         super().free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -1115,13 +1143,22 @@ class MambaManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if num_cached_blocks_after > num_cached_blocks_before:
-            for block in self.req_to_blocks[request.request_id][
-                num_cached_blocks_before:num_cached_blocks_after
-            ]:
+            blocks = self.req_to_blocks[request.request_id]
+            for block_idx in range(num_cached_blocks_before, num_cached_blocks_after):
+                block = blocks[block_idx]
                 if block.is_null:
                     continue
                 assert block.block_hash is not None
                 self.cached_blocks_this_step.add(block.block_hash)
+                if self.mamba_cache_mode == "align":
+                    self._pending_boundary_state_offloads.append(
+                        (
+                            request.request_id,
+                            self.kv_cache_group_id,
+                            block,
+                            (block_idx + 1) * self.block_size,
+                        )
+                    )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()

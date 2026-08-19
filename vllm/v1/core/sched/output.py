@@ -246,6 +246,11 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # Exact Mamba ``align`` boundary-state sources offered to a KV connector:
+    # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
+    # Scheduler-local; cleared after connector metadata is built.
+    boundary_state_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

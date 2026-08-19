@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,15 +14,21 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.distributed.kv_events import BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    GroupOffloadConfig,
     OffloadingConnectorScheduler,
+    RequestOffloadState,
+    SchedulerOffloadConfig,
 )
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
     OffloadingEvent,
     OffloadingManager,
     OffloadPolicy,
@@ -804,6 +811,182 @@ def test_request_level_policy_stores_all_blocks(request_runner, async_scheduling
 # ---------------------------------------------------------------------------
 # Tests for the per-job-store-completion design and fence invariants.
 # ---------------------------------------------------------------------------
+
+
+def _make_exact_boundary_scheduler() -> OffloadingConnectorScheduler:
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.config = SchedulerOffloadConfig(
+        kv_group_configs=(
+            GroupOffloadConfig(
+                group_idx=0,
+                gpu_block_size=16,
+                offloaded_block_size=16,
+                hash_block_size_factor=4,
+                sliding_window_size_in_blocks=None,
+            ),
+            GroupOffloadConfig(
+                group_idx=1,
+                gpu_block_size=16,
+                offloaded_block_size=16,
+                hash_block_size_factor=4,
+                sliding_window_size_in_blocks=1,
+                requires_exact_boundary_source=True,
+            ),
+        ),
+        block_size_factor=1,
+        num_workers=1,
+        offload_prompt_only=False,
+    )
+    scheduler.manager = MagicMock(spec=OffloadingManager)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(4)]
+    request.num_computed_tokens = 0
+    request.num_prompt_tokens = 16
+    request.num_tokens = 16
+    request.is_finished.return_value = False
+    req_context = ReqContext(req_id=request.request_id)
+    req_status = RequestOffloadState(
+        config=scheduler.config,
+        req=request,
+        req_context=req_context,
+        offloading_context=RequestOffloadingContext(),
+    )
+    req_status.update_offload_keys()
+    req_status.group_states[0].block_ids[:] = [11]
+    # This is the connector's stale append-only view of the Mamba table.
+    req_status.group_states[1].block_ids[:] = [21]
+
+    scheduler._req_status = {request.request_id: req_status}
+    scheduler._current_batch_load_jobs = {}
+    scheduler._current_batch_jobs_to_flush = set()
+    scheduler._blocks_being_loaded = set()
+    scheduler._job_counter = 0
+    scheduler._stale_job_threshold = 0
+    scheduler._jobs = {}
+    scheduler._block_id_to_pending_jobs = {}
+    return scheduler
+
+
+def test_mamba_align_group_requires_exact_boundary_source():
+    block_size = 16
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba"],
+                MambaSpec(
+                    block_size=block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    spec = SimpleNamespace(
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(world_size=4)),
+        kv_cache_config=kv_cache_config,
+        gpu_block_size=(block_size, block_size),
+        block_size_factor=1,
+        hash_block_size=block_size,
+        offload_prompt_only=False,
+    )
+
+    config = SchedulerOffloadConfig.from_spec(spec)
+
+    assert not config.kv_group_configs[0].requires_exact_boundary_source
+    assert config.kv_group_configs[1].requires_exact_boundary_source
+
+
+def _empty_store_output(**overrides):
+    output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        num_scheduled_tokens={},
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        boundary_state_offloads=None,
+    )
+    for name, value in overrides.items():
+        setattr(output, name, value)
+    return output
+
+
+def test_mamba_boundary_store_uses_exact_source_not_positional_mirror():
+    scheduler = _make_exact_boundary_scheduler()
+    output = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+
+    jobs = scheduler._build_boundary_state_store_jobs(output)
+
+    assert len(jobs) == 1
+    [job_id] = jobs
+    src_spec, _ = jobs[job_id].transfer_spec
+    assert isinstance(src_spec, GPULoadStoreSpec)
+    assert src_spec.block_ids.tolist() == [99]
+    assert src_spec.block_ids.tolist() != [21]
+    assert src_spec.group_sizes == [0, 1]
+    assert src_spec.block_indices == [0, 0]
+    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
+
+
+def test_normal_store_excludes_positional_mamba_align_source():
+    scheduler = _make_exact_boundary_scheduler()
+    output = _empty_store_output(
+        scheduled_new_reqs=[SimpleNamespace(req_id="req", block_ids=None)],
+        num_scheduled_tokens={"req": 16},
+    )
+
+    jobs = scheduler._build_store_jobs(output)
+
+    assert len(jobs) == 1
+    [job] = jobs.values()
+    src_spec, _ = job.transfer_spec
+    assert isinstance(src_spec, GPULoadStoreSpec)
+    assert src_spec.block_ids.tolist() == [11]
+    assert src_spec.group_sizes == [1, 0]
+    assert 21 not in src_spec.block_ids
+
+
+def test_mamba_boundary_store_flushes_before_source_block_reuse():
+    scheduler = _make_exact_boundary_scheduler()
+    first = _empty_store_output(
+        num_scheduled_tokens={"req": 16},
+        boundary_state_offloads={"req": [(1, 99, 16)]},
+    )
+    first_meta = scheduler.build_connector_meta(first)
+    [job_id] = first_meta.store_jobs
+
+    second = _empty_store_output(
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req"],
+            new_block_ids=[([12], [99])],
+            resumed_req_ids=set(),
+        ),
+        num_scheduled_tokens={"req": 0},
+    )
+    second_meta = scheduler.build_connector_meta(second)
+
+    assert second_meta.jobs_to_flush == {job_id}
 
 
 def test_pending_job_cleanup_deduplicates_block_ids():

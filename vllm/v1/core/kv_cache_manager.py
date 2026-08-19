@@ -589,6 +589,28 @@ class KVCacheManager:
             ids.extend(mgr.take_new_block_ids())
         return ids
 
+    def take_boundary_state_offloads(
+        self,
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain exact Mamba ``align`` state blocks for KV connectors.
+
+        Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``.
+        These scheduler-local handoffs avoid reconstructing mutable Mamba block
+        tables from a connector's append-only block-ID mirror.
+        """
+        offloads: dict[str, list[tuple[int, int, int]]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            for (
+                request_id,
+                group_id,
+                block,
+                boundary_tokens,
+            ) in mgr.take_pending_boundary_state_offloads():
+                offloads.setdefault(request_id, []).append(
+                    (group_id, block.block_id, boundary_tokens)
+                )
+        return offloads
+
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()
