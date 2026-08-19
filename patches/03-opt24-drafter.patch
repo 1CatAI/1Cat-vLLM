@@ -1,0 +1,53 @@
+From 470f8cb912f6b24b548265e006be1b7351b020f9 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 17:42:00 +0800
+Subject: [PATCH] =?UTF-8?q?feat(opt24):=20v1.3.0=20=E9=87=8D=E6=94=BE=20Dr?=
+ =?UTF-8?q?after=20=E4=B8=8A=E4=B8=8B=E6=96=87=E5=AF=B9=E9=BD=90=EF=BC=88?=
+ =?UTF-8?q?=E5=8E=9F=20opt26=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- config/speculative.py: Auto-extend drafter max_position_embeddings/max_position
+  对齐 target max_model_len（插入 _maybe_override_draft_max_model_len 之后）
+
+已确认 v1.3.0 内置（无需重放）:
+- opt24 4.1 cudagraph MTP 尺寸自动化（config/vllm.py _sm70_nomtp_cudagraph_capture_sizes
+  + MTP 专用 [1,2,4,8,9,18] + smallq_env 自动设置，与 v122 等价）
+- opt21 B1 Auto Dynamic NTK / B2 MTP 安全检测（上一阶段已重放）
+---
+ config/speculative.py | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/config/speculative.py b/config/speculative.py
+index 45eedb0..499255f 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -903,6 +903,24 @@ class SpeculativeConfig:
+                     )
+                 )
+ 
++                # opt24 (opt26): Auto-extend drafter max_position_embeddings
++                # to match target model max_model_len.
++                hf_config = self.draft_model_config.hf_config
++                if hf_config is not None:
++                    for pos_attr in ("max_position_embeddings", "max_position"):
++                        current_pos = getattr(hf_config, pos_attr, None)
++                        if (current_pos is not None
++                                and current_pos < self.max_model_len):
++                            setattr(hf_config, pos_attr, self.max_model_len)
++                            logger.info_once(
++                                "Extended Drafter %s from %d to %d "
++                                "to match target model max_model_len=%d.",
++                                pos_attr,
++                                current_pos,
++                                self.max_model_len,
++                                self.max_model_len,
++                            )
++
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+-- 
+2.43.0
+
