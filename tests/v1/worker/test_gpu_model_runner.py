@@ -795,6 +795,237 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     assert torch.equal(passed_draft_probs, expected_draft_probs)
 
 
+@pytest.mark.skip_global_cleanup
+def test_sync_mamba_accepted_token_state_tracks_request_ownership():
+    runner = object.__new__(GPUModelRunner)
+    move_state = object()
+    resumed_state = object()
+    replaced_old_state = object()
+    replaced_new_state = object()
+    runner._mamba_accepted_token_state_rows = {
+        "old": (0, object()),
+        "resumed": (1, resumed_state),
+        "move": (2, move_state),
+        "same-id": (3, replaced_old_state),
+    }
+    runner.num_accepted_tokens = SimpleNamespace(
+        np=np.array([5, 3, 4, 5, 0], dtype=np.int32)
+    )
+    runner.spec_state_slot_selectors = SimpleNamespace(
+        np=np.array([5, 4, 2, 5, 0], dtype=np.int32)
+    )
+    runner.input_batch = SimpleNamespace(
+        req_ids=["new", "move", "resumed", "same-id"],
+        num_accepted_tokens_cpu=np.full(5, 9, dtype=np.int32),
+        spec_num_accepted_tokens_cpu=np.full(5, 9, dtype=np.int32),
+    )
+    runner.requests = {
+        "new": object(),
+        "move": move_state,
+        "resumed": resumed_state,
+        "same-id": replaced_new_state,
+    }
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids={"resumed"}),
+    )
+
+    GPUModelRunner._sync_mamba_accepted_token_state(
+        runner, scheduler_output, num_reqs=4
+    )
+
+    # Only the continuing request keeps its prior accepted-token state. A new
+    # request, a resumed request, and a replacement using the same request ID
+    # all start with zero speculative bias (the encoded value 1).
+    expected_counts = np.array([1, 4, 1, 1], dtype=np.int32)
+    expected_selectors = np.array([1, 2, 1, 1], dtype=np.int32)
+    np.testing.assert_array_equal(runner.num_accepted_tokens.np[:4], expected_counts)
+    np.testing.assert_array_equal(
+        runner.spec_state_slot_selectors.np[:4], expected_selectors
+    )
+    np.testing.assert_array_equal(
+        runner.input_batch.num_accepted_tokens_cpu[:4], expected_counts
+    )
+    np.testing.assert_array_equal(
+        runner.input_batch.spec_num_accepted_tokens_cpu[:4], expected_selectors
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_mamba_align_postprocess_uses_runner_owned_d2h_buffers(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    req_state = object()
+    runner.speculative_config = object()
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+    runner.num_accepted_tokens = SimpleNamespace(
+        cpu=torch.zeros(1, dtype=torch.int32),
+        gpu=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.spec_state_slot_selectors = SimpleNamespace(
+        cpu=torch.zeros(1, dtype=torch.int32),
+        gpu=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.input_batch = SimpleNamespace(
+        req_ids=["req"],
+        num_accepted_tokens_cpu_tensor=torch.full((1,), 9, dtype=torch.int32),
+        spec_num_accepted_tokens_cpu_tensor=torch.full((1,), 9, dtype=torch.int32),
+    )
+    runner.requests = {"req": req_state}
+    runner._get_mamba_bufs = Mock(
+        return_value=SimpleNamespace(postprocess_align=object())
+    )
+    runner.kv_cache_config = object()
+    runner.compilation_config = SimpleNamespace(static_forward_context=object())
+    runner.model = SimpleNamespace(get_mamba_state_copy_func=Mock(return_value=()))
+    runner.mamba_state_idx = {}
+    runner.num_accepted_tokens_event = Mock()
+    postprocess = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_MAMBA_ALIGN_CPU_POSTPROCESS",
+        False,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "stage_postprocess_inputs_to_gpu",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "postprocess_mamba_align_gpu",
+        postprocess,
+    )
+
+    GPUModelRunner._update_states_after_model_execute(
+        runner,
+        output_token_ids=torch.tensor([[10, 11, -1]], dtype=torch.int32),
+        scheduler_output=SimpleNamespace(scheduled_ddtree_payloads={}),
+    )
+
+    kwargs = postprocess.call_args.kwargs
+    assert kwargs["num_accepted_tokens_cpu_tensor"] is runner.num_accepted_tokens.cpu
+    assert (
+        kwargs["spec_num_accepted_tokens_cpu_tensor"]
+        is runner.spec_state_slot_selectors.cpu
+    )
+    assert (
+        kwargs["num_accepted_tokens_cpu_tensor"]
+        is not runner.input_batch.num_accepted_tokens_cpu_tensor
+    )
+    assert (
+        kwargs["spec_num_accepted_tokens_cpu_tensor"]
+        is not runner.input_batch.spec_num_accepted_tokens_cpu_tensor
+    )
+    # The GPU path must not leave any asynchronous DMA targeting mutable
+    # InputBatch rows; both accepted-state arrays are remapped only after the
+    # event is synchronized in _prepare_inputs().
+    assert torch.equal(
+        runner.input_batch.num_accepted_tokens_cpu_tensor,
+        torch.full((1,), 9, dtype=torch.int32),
+    )
+    assert torch.equal(
+        runner.input_batch.spec_num_accepted_tokens_cpu_tensor,
+        torch.full((1,), 9, dtype=torch.int32),
+    )
+
+
+@pytest.mark.skip_global_cleanup
+def test_mamba_align_cpu_postprocess_mirrors_runner_owned_snapshot(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    req_state = object()
+    runner.speculative_config = object()
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+    runner.num_accepted_tokens = SimpleNamespace(
+        cpu=torch.zeros(1, dtype=torch.int32),
+        gpu=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.spec_state_slot_selectors = SimpleNamespace(
+        cpu=torch.zeros(1, dtype=torch.int32),
+        gpu=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.input_batch = SimpleNamespace(
+        req_ids=["req"],
+        num_accepted_tokens_cpu_tensor=torch.zeros(1, dtype=torch.int32),
+        spec_num_accepted_tokens_cpu_tensor=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.requests = {"req": req_state}
+    runner._get_mamba_bufs = Mock(return_value=SimpleNamespace(preprocess=object()))
+    runner.kv_cache_config = object()
+    runner.compilation_config = SimpleNamespace(static_forward_context=object())
+    runner.model = SimpleNamespace(get_mamba_state_copy_func=Mock(return_value=()))
+    runner.mamba_state_idx = {}
+    runner.num_accepted_tokens_event = Mock()
+
+    def cpu_postprocess(*args, **kwargs):
+        runner.input_batch.num_accepted_tokens_cpu_tensor.fill_(3)
+        runner.input_batch.spec_num_accepted_tokens_cpu_tensor.fill_(2)
+
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_MAMBA_ALIGN_CPU_POSTPROCESS",
+        True,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "postprocess_mamba",
+        cpu_postprocess,
+    )
+
+    GPUModelRunner._update_states_after_model_execute(
+        runner,
+        output_token_ids=torch.tensor([[10, 11, -1]], dtype=torch.int32),
+        scheduler_output=SimpleNamespace(scheduled_ddtree_payloads={}),
+    )
+
+    assert runner.num_accepted_tokens.cpu.tolist() == [3]
+    assert runner.spec_state_slot_selectors.cpu.tolist() == [2]
+
+
+@pytest.mark.skip_global_cleanup
+def test_mamba_all_mode_uses_runner_owned_d2h_buffers(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    req_state = object()
+    runner.speculative_config = object()
+    runner.model_config = SimpleNamespace(is_hybrid=True)
+    runner.cache_config = SimpleNamespace(mamba_cache_mode="all")
+    runner.num_spec_tokens = 4
+    runner.num_accepted_tokens = SimpleNamespace(
+        cpu=torch.zeros(1, dtype=torch.int32),
+        gpu=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.spec_state_slot_selectors = SimpleNamespace(
+        cpu=torch.zeros(1, dtype=torch.int32),
+        gpu=torch.zeros(1, dtype=torch.int32),
+    )
+    runner.input_batch = SimpleNamespace(
+        req_ids=["req"],
+        num_accepted_tokens_cpu_tensor=torch.full((1,), 9, dtype=torch.int32),
+        spec_num_accepted_tokens_cpu_tensor=torch.full((1,), 9, dtype=torch.int32),
+    )
+    runner.requests = {"req": req_state}
+    runner.kv_cache_config = object()
+    runner.mamba_state_idx = {}
+    runner.num_accepted_tokens_event = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module.mamba_utils,
+        "postprocess_mamba_all",
+        Mock(),
+    )
+
+    GPUModelRunner._update_states_after_model_execute(
+        runner,
+        output_token_ids=torch.tensor([[10, 11, -1]], dtype=torch.int32),
+        scheduler_output=SimpleNamespace(scheduled_ddtree_payloads={}),
+    )
+
+    assert runner.num_accepted_tokens.cpu.tolist() == [2]
+    assert runner.spec_state_slot_selectors.cpu.tolist() == [2]
+    assert runner.input_batch.num_accepted_tokens_cpu_tensor.tolist() == [9]
+    assert runner.input_batch.spec_num_accepted_tokens_cpu_tensor.tolist() == [9]
+
+
 def test_init_kv_cache_with_kv_sharing_invalid_target_layer_order(default_vllm_config):
     torch.set_default_dtype(torch.float16)
     layer_0 = "model.layers.0.self_attn.attn"

@@ -23,6 +23,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -39,6 +40,46 @@ from vllm.v1.structured_output import StructuredOutputManager
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    "num_computed_tokens,expected_attention_ids",
+    [
+        (0, []),
+        (1, [10]),
+        (16, [10]),
+        (17, [10, 11]),
+        (64, [10, 11, 12, 13]),
+    ],
+)
+def test_block_ids_for_computed_tokens_exclude_attention_lookahead(
+    num_computed_tokens: int,
+    expected_attention_ids: list[int],
+):
+    """Only attention blocks beyond the computed-token frontier are clipped.
+
+    Non-attention state groups retain their allocator-defined block table.
+    """
+    manager = object.__new__(KVCacheManager)
+    attention_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    manager.kv_cache_config = Mock(
+        kv_cache_groups=[
+            Mock(kv_cache_spec=attention_spec),
+            Mock(kv_cache_spec=object()),
+        ]
+    )
+    manager.get_block_ids = Mock(return_value=([10, 11, 12, 13], [20, 21, 22]))
+
+    block_ids = manager.get_block_ids_for_computed_tokens(
+        "request", num_computed_tokens
+    )
+
+    assert block_ids == (expected_attention_ids, [20, 21, 22])
 
 
 def test_add_requests():

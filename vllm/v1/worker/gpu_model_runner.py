@@ -1808,6 +1808,12 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Row ownership for the runner-owned accepted-token D2H snapshots.
+        # Keep the request object as well as its ID so abort-and-resubmit with
+        # the same ID is still treated as a new request.
+        self._mamba_accepted_token_state_rows: dict[
+            str, tuple[int, CachedRequestState]
+        ] = {}
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -2589,6 +2595,10 @@ class GPUModelRunner(
         # Count only the contiguous accepted prefix. Values after the first -1
         # are rejected/padding slots and may contain stale token ids.
         num_reqs = output_token_ids.size(0)
+        self._mamba_accepted_token_state_rows = {
+            req_id: (i, self.requests[req_id])
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs])
+        }
         profile_count_t0 = time.perf_counter() if profile_enabled else 0.0
         sidecar_values = None
         if (
@@ -2715,19 +2725,16 @@ class GPUModelRunner(
                         else None
                     ),
                 )
+                # CPU postprocess updates InputBatch in place. Mirror its final
+                # values into the runner-owned snapshot used by the next step.
+                self.num_accepted_tokens.cpu[:num_reqs].copy_(
+                    self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs]
+                )
+                self.spec_state_slot_selectors.cpu[:num_reqs].copy_(
+                    self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_reqs]
+                )
             else:
                 profile_mamba_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-                if spec_state_slot_selectors_cpu is not None:
-                    self.input_batch.spec_num_accepted_tokens_cpu_tensor[
-                        :num_reqs
-                    ].copy_(spec_state_slot_selectors_cpu)
-                else:
-                    self.input_batch.spec_num_accepted_tokens_cpu_tensor[
-                        :num_reqs
-                    ].copy_(
-                        self.spec_state_slot_selectors.gpu[:num_reqs],
-                        non_blocking=True,
-                    )
                 assert mamba_bufs.postprocess_align is not None
                 mamba_utils.stage_postprocess_inputs_to_gpu(
                     mamba_bufs.postprocess_align,
@@ -2749,11 +2756,9 @@ class GPUModelRunner(
                     num_reqs=num_reqs,
                     num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                     spec_state_slot_selectors_gpu=(self.spec_state_slot_selectors.gpu),
-                    num_accepted_tokens_cpu_tensor=(
-                        self.input_batch.num_accepted_tokens_cpu_tensor
-                    ),
+                    num_accepted_tokens_cpu_tensor=self.num_accepted_tokens.cpu,
                     spec_num_accepted_tokens_cpu_tensor=(
-                        self.input_batch.spec_num_accepted_tokens_cpu_tensor
+                        self.spec_state_slot_selectors.cpu
                     ),
                     input_batch=self.input_batch,
                     kv_cache_config=self.kv_cache_config,
@@ -2786,10 +2791,10 @@ class GPUModelRunner(
                     spec_state_slot_selectors_cpu
                 )
             else:
-                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                self.num_accepted_tokens.cpu[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                 )
-                self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                self.spec_state_slot_selectors.cpu[:num_reqs].copy_(
                     self.spec_state_slot_selectors.gpu[:num_reqs],
                     non_blocking=True,
                 )
@@ -4658,6 +4663,45 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _sync_mamba_accepted_token_state(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> None:
+        """Remap the previous step's accepted-token state by request.
+
+        The GPU postprocess copies into runner-owned CPU buffers. InputBatch
+        rows can be removed, reused, or condensed before this synchronization,
+        so row-for-row writeback is not safe even with synchronous scheduling.
+        """
+        previous_counts = self.num_accepted_tokens.np.copy()
+        previous_selectors = self.spec_state_slot_selectors.np.copy()
+        previous_rows = self._mamba_accepted_token_state_rows
+        reset_req_ids = set(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+        reset_req_ids.update(
+            req_data.req_id for req_data in scheduler_output.scheduled_new_reqs
+        )
+
+        current_counts = self.num_accepted_tokens.np[:num_reqs]
+        current_selectors = self.spec_state_slot_selectors.np[:num_reqs]
+        for current_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            previous = previous_rows.get(req_id)
+            if (
+                previous is not None
+                and req_id not in reset_req_ids
+                and self.requests.get(req_id) is previous[1]
+            ):
+                previous_idx = previous[0]
+                current_counts[current_idx] = previous_counts[previous_idx]
+                current_selectors[current_idx] = previous_selectors[previous_idx]
+            else:
+                # A new/restored request has no accepted speculative prefix.
+                current_counts[current_idx] = 1
+                current_selectors[current_idx] = 1
+
+        self.input_batch.num_accepted_tokens_cpu[:num_reqs] = current_counts
+        self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs] = current_selectors
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4869,32 +4913,7 @@ class GPUModelRunner(
                 self.num_accepted_tokens_event,
                 "GPUModelRunner.num_accepted_tokens_event.synchronize",
             )
-            # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
-                prev_idx = self.prev_positions.np[:num_reqs]
-                new_mask = prev_idx < 0
-                prev_idx_or_zero = np.where(new_mask, 0, prev_idx)
-                align_counts = self.input_batch.num_accepted_tokens_cpu[
-                    prev_idx_or_zero
-                ].copy()
-                align_counts[new_mask] = 1
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = align_counts
-                spec_counts = self.input_batch.spec_num_accepted_tokens_cpu[
-                    prev_idx_or_zero
-                ]
-                spec_counts = spec_counts.copy()
-                spec_counts[new_mask] = 1
-                self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs] = spec_counts
-                self.num_accepted_tokens.np[:num_reqs] = align_counts
-                self.spec_state_slot_selectors.np[:num_reqs] = spec_counts
-            else:
-                # Non-async mode: use values directly
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
-                self.spec_state_slot_selectors.np[:num_reqs] = (
-                    self.input_batch.spec_num_accepted_tokens_cpu[:num_reqs]
-                )
+            self._sync_mamba_accepted_token_state(scheduler_output, num_reqs)
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.spec_state_slot_selectors.np[num_reqs:].fill(1)
             self._copy_buffer_to_gpu(self.num_accepted_tokens)

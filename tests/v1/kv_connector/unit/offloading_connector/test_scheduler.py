@@ -806,6 +806,16 @@ def test_request_level_policy_stores_all_blocks(request_runner, async_scheduling
 # ---------------------------------------------------------------------------
 
 
+def test_pending_job_cleanup_deduplicates_block_ids():
+    """MTP lookahead may alias a physical block within one completed job."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._block_id_to_pending_jobs = {7: {42}}
+
+    scheduler._remove_pending_job(42, [7, 7])
+
+    assert scheduler._block_id_to_pending_jobs == {}
+
+
 def test_loads_do_not_populate_fence_index(request_runner):
     """Loads don't populate _block_id_to_pending_jobs (protected by
     delay_free_blocks while in flight)."""
@@ -960,8 +970,8 @@ def test_max_offload_tokens_validation(request_runner, async_scheduling: bool):
             token_ids=[0] * offloaded_block_size * 3,
             kv_transfer_params={"max_offload_tokens": max_offload_tokens},
         )
-        r.manager.prepare_store.side_effect = (
-            lambda keys, req_context: generate_store_output(keys)
+        r.manager.prepare_store.side_effect = lambda keys, req_context: (
+            generate_store_output(keys)
         )
 
     # With sync scheduling, the connector flushes completed stores when the
@@ -1059,8 +1069,8 @@ def test_offload_prompt_only(request_runner, async_scheduling: bool):
         extra_config_overrides={"offload_prompt_only": True},
     )
 
-    runner.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     runner.new_request(token_ids=[0] * offloaded_block_size * num_prompt_blocks)

@@ -331,7 +331,10 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
-        for bid in block_ids or ():
+        # Registration is idempotent because each block maps to a set of job IDs.
+        # MTP lookahead may report the same physical block ID more than once, so
+        # completion must use the same set semantics instead of removing twice.
+        for bid in set(block_ids or ()):
             pending = self._block_id_to_pending_jobs[bid]
             pending.remove(job_id)
             if not pending:
