@@ -718,6 +718,27 @@ class DeepseekV4Attention(nn.Module):
         rope_parameters["mscale_all_dim"] = 0  # Disable mscale
         rope_parameters["is_deepseek_v4"] = True
         rope_parameters["rope_dim"] = self.rope_head_dim
+        if self.compress_ratio <= 1:
+            # The sliding-window-only layers get base rope_theta above, but the
+            # reference also turns YaRN itself off for them: it passes
+            # original_seq_len=0, and precompute_freqs_cis then skips the
+            # correction range entirely (inference/model.py:481-486, :227).
+            # Swapping only theta leaves the interpolation on, which shifts the
+            # low-frequency pairs by up to ~2 degrees across the 128-token
+            # window. factor=1 makes the interpolation an exact identity
+            # (inv_freq_interpolation == inv_freq_extrapolation) and mscale
+            # collapses to 1.0, so this is plain rope without swapping the
+            # class -- DeepseekV4ScalingRotaryEmbedding still rotates the last
+            # rotary_dim and keeps the cache in fp32, which the fused kernels
+            # require. Copy first: the dict is config.rope_parameters itself
+            # and every later layer reads it back.
+            rope_parameters = dict(rope_parameters)
+            rope_parameters["factor"] = 1
+            # Cache length is original_max_position * factor, so it has to
+            # carry the full position range now that factor is 1.
+            rope_parameters["original_max_position_embeddings"] = (
+                self.max_position_embeddings
+            )
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
