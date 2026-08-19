@@ -104,6 +104,16 @@ def test_kv_connector_rejects_expandable_segments(monkeypatch, kv_connector):
         _build_config(kv_connector=kv_connector)
 
 
+def test_native_offloading_allows_expandable_segments(monkeypatch):
+    """Native CPU offload resolves GPU virtual addresses for each CUDA copy
+    and explicitly opts into the VMM-safe transfer contract."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    cfg = _build_config(kv_connector="OffloadingConnector")
+
+    assert cfg._connector_supports_vmm_safe_transfers()
+
+
 def test_kv_connector_allows_expandable_segments_with_sleep_mode(monkeypatch):
     """Sleep mode routes KV allocations through CuMemAllocator's pool, which
     auto-disables expandable_segments (see #40812)."""

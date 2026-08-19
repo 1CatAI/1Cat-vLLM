@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
     SupportsHMA,
+    SupportsVmmSafeTransfers,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -43,7 +44,15 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 
-class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransfers):
+    """Native CPU KV offload connector.
+
+    Transfers resolve the current tensor virtual address for every operation
+    and use CUDA memcpy. The connector does not register or export GPU KV
+    memory through RDMA, GDS, or CUDA IPC, so it is safe under CUDA VMM
+    remapping.
+    """
+
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         return True

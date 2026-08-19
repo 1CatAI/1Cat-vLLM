@@ -826,8 +826,8 @@ class VllmConfig:
         # producing RDMA failures like IBV_WC_REM_ACCESS_ERR /
         # NIXL_ERR_REMOTE_DISCONNECT at the first inter-node KV transfer.
         # We can't enumerate every in-tree and out-of-tree connector that
-        # pins memory, so we conservatively reject the combination whenever
-        # any KV connector is configured.
+        # pins memory, so we conservatively reject the combination unless the
+        # connector explicitly opts into the VMM-safe transfer contract.
         #
         # CuMem allocator is exempt: CuMemAllocator.use_memory_pool toggles
         # expandable_segments off around its pool (see #40812), so the KV
@@ -838,6 +838,14 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+            return
+        if self._connector_supports_vmm_safe_transfers():
+            logger.warning_once(
+                "Allowing KV connector %s with "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True because "
+                "it implements SupportsVmmSafeTransfers.",
+                self.kv_transfer_config.kv_connector,
+            )
             return
 
         raise ValueError(
@@ -852,6 +860,25 @@ class VllmConfig:
             "routes KV allocations through CuMemAllocator's pool, where "
             "expandable_segments is automatically disabled)."
         )
+
+    def _connector_supports_vmm_safe_transfers(self) -> bool:
+        """Resolve the connector and check its explicit VMM-safety marker."""
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+        from vllm.distributed.kv_transfer.kv_connector.v1 import (
+            supports_vmm_safe_transfers,
+        )
+
+        kv_transfer_config = self.kv_transfer_config
+        if kv_transfer_config is None:
+            return False
+
+        try:
+            connector_cls = KVConnectorFactory.get_connector_class(kv_transfer_config)
+            return supports_vmm_safe_transfers(connector_cls)
+        except (ValueError, AttributeError, ImportError, TypeError):
+            return False
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

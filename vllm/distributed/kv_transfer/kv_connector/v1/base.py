@@ -121,6 +121,21 @@ def supports_hma(connector: Any) -> bool:
         return isinstance(connector, SupportsHMA)
 
 
+class SupportsVmmSafeTransfers(ABC):  # noqa: B024
+    """Marker for connectors safe under CUDA VMM remapping.
+
+    Implement this marker only when every KV transfer dereferences GPU
+    virtual addresses at transfer time (for example, cuMemcpy/cudaMemcpy),
+    and the connector never registers KV device memory with RDMA, GDS,
+    CUDA IPC, or another mechanism that depends on stable physical pages.
+    """
+
+
+def supports_vmm_safe_transfers(connector_cls: type) -> bool:
+    """Return whether a connector class explicitly declares VMM safety."""
+    return issubclass(connector_cls, SupportsVmmSafeTransfers)
+
+
 class KVConnectorRole(enum.Enum):
     # Connector running in the scheduler process
     SCHEDULER = 0
