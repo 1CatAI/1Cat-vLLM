@@ -237,7 +237,13 @@ def _fake_qwen_hybrid_model_config():
     )
 
 
-def _apply_sm70_defaults(monkeypatch, *, env=None, speculative_config=None):
+def _apply_sm70_defaults(
+    monkeypatch,
+    *,
+    env=None,
+    speculative_config=None,
+    enable_prefix_caching=None,
+):
     for key in (
         "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS",
         "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS",
@@ -249,7 +255,11 @@ def _apply_sm70_defaults(monkeypatch, *, env=None, speculative_config=None):
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("vllm.engine.arg_utils.current_platform", _FakeSM70Platform())
 
-    args = EngineArgs(model="dummy", tensor_parallel_size=4)
+    args = EngineArgs(
+        model="dummy",
+        tensor_parallel_size=4,
+        enable_prefix_caching=enable_prefix_caching,
+    )
     args.speculative_config = speculative_config
     args._maybe_apply_sm70_mtp_defaults(
         UsageContext.OPENAI_API_SERVER,
@@ -337,6 +347,32 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
     assert args.max_num_seqs == 4
+
+
+def test_sm70_explicit_dflash_uses_greedy_without_unsupported_prefix_cache(
+    monkeypatch,
+):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+    )
+
+    assert args.speculative_config == {
+        "method": "dflash",
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "greedy",
+    }
+    assert args.enable_prefix_caching is False
+    assert args.mamba_cache_mode == "none"
+
+
+def test_sm70_explicit_dflash_rejects_hybrid_prefix_cache(monkeypatch):
+    with pytest.raises(ValueError, match="align-mode prefix cache"):
+        _apply_sm70_defaults(
+            monkeypatch,
+            speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+            enable_prefix_caching=True,
+        )
 
 
 @pytest.mark.parametrize(

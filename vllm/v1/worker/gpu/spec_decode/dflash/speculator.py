@@ -105,6 +105,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The draft's attention differs from the target's in causality.
         return replace(
             self.vllm_config,
+            model_config=self.draft_model_config,
             attention_config=replace(
                 self.vllm_config.attention_config,
                 use_non_causal=self.requires_non_causal,

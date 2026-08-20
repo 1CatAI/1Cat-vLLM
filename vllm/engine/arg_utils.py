@@ -1765,10 +1765,31 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
+        explicit_spec_method = (
+            self.speculative_config.get("method")
+            if isinstance(self.speculative_config, dict)
+            else None
+        )
 
         if is_server and self.enable_prefix_caching is None and has_linear_attention:
-            self.enable_prefix_caching = True
-            profile_updates.append("enable_prefix_caching=True")
+            # Qwen3.5/3.8 exposes only align-mode prefix caching, while MRV2
+            # does not yet implement align-state preprocessing. Keep the
+            # recommended DFlash server configuration bootable and require an
+            # explicit future opt-in once that dependency is backported.
+            self.enable_prefix_caching = explicit_spec_method != "dflash"
+            profile_updates.append(
+                f"enable_prefix_caching={self.enable_prefix_caching}"
+            )
+        if (
+            explicit_spec_method == "dflash"
+            and self.enable_prefix_caching
+            and has_linear_attention
+        ):
+            raise ValueError(
+                "MRV2 DFlash does not yet support Qwen hybrid align-mode prefix "
+                "cache preprocessing. Set enable_prefix_caching=False; target-prefix "
+                "hits with draft-KV rebuild require a later dependency backport."
+            )
         if (
             self.enable_prefix_caching
             and has_linear_attention
@@ -1814,13 +1835,10 @@ class EngineArgs:
             return
 
         if "draft_sample_method" not in self.speculative_config:
-            # For SM70 native MTP, official Qwen sampling is non-greedy
-            # (temperature=1.0/top_p=0.95/top_k=20). Probabilistic draft
-            # sampling provides draft_probs for standard rejection sampling and
-            # is the validated high-acceptance path. Greedy requests still take
-            # the argmax fast path inside the proposer when sampling metadata is
-            # all-greedy, so this default does not penalize deterministic runs.
-            draft_sample_method = "probabilistic"
+            # Native MTP keeps its validated probabilistic default. DFlash2's
+            # published/default performance lane is greedy; probabilistic
+            # drafting remains available when explicitly requested.
+            draft_sample_method = "probabilistic" if spec_method == "mtp" else "greedy"
             self.speculative_config["draft_sample_method"] = draft_sample_method
             profile_updates.append(
                 f"speculative_config.draft_sample_method={draft_sample_method}"
