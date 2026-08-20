@@ -222,10 +222,11 @@ def apply_decode_sliding_window_constraints(
     """Enforce prefix-anchored sliding-window attention constraints.
 
     Only the FLASH_ATTN_V100 kernels (masked template instantiations)
-    apply the anchored decode-window mask, so any other backend would silently skip the mask while the KV
-    cache manager evicts gap blocks. And a decode token's KV under that mask
-    is not a pure causal function of the prefix, so it must never be reused
-    across requests via prefix caching.
+    apply the anchored decode-window mask, so any other backend would
+    silently skip the mask while the KV cache manager evicts gap blocks.
+    And a decode token's KV under that mask is not a pure causal function
+    of the prefix, so it must never be reused across requests via prefix
+    caching.
     """
     if getattr(model_config, "decode_sliding_window", None) is None:
         return

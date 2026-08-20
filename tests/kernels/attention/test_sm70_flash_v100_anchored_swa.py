@@ -10,11 +10,14 @@ Requires a CUDA device and the flash_attn_v100 extension built with the
 anchored kernel arguments; skipped otherwise.
 """
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 import torch
 
 cuda_available = torch.cuda.is_available()
-flash_ops = None
+flash_ops: tuple[Callable[..., Any], Callable[..., Any]] | None = None
 if cuda_available:
     try:
         from flash_attn_v100 import (
@@ -30,6 +33,11 @@ pytestmark = pytest.mark.skipif(
     not cuda_available or flash_ops is None,
     reason="requires CUDA and the flash_attn_v100 extension",
 )
+
+
+def _require_flash_ops() -> tuple[Callable[..., Any], Callable[..., Any]]:
+    assert flash_ops is not None
+    return flash_ops
 
 
 def _anchored_mask(
@@ -79,9 +87,9 @@ def _build_paged_kv(
         num_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=dtype
     )
     v_cache = torch.randn_like(k_cache)
-    block_table = torch.arange(
-        num_blocks, dtype=torch.int32, device=device
-    ).unsqueeze(0)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
     k_lin = k_cache.reshape(-1, num_kv_heads, head_dim)[:kv_len]
     v_lin = v_cache.reshape(-1, num_kv_heads, head_dim)[:kv_len]
     return k_cache, v_cache, block_table, k_lin, v_lin
@@ -111,8 +119,9 @@ def test_decode_paged_anchored_matches_reference(
     seq_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
     anchor_lens = torch.tensor([anchor], dtype=torch.int32, device=device)
 
+    decode_paged, _ = _require_flash_ops()
     out = torch.empty_like(q)
-    flash_ops[0](
+    decode_paged(
         q,
         k_cache,
         v_cache,
@@ -128,9 +137,7 @@ def test_decode_paged_anchored_matches_reference(
     mask = _anchored_mask(q_pos, kv_len, anchor, window, device)
     assert not mask[0].all(), "test must exercise a non-trivial gap"
     ref = _ref_attention(q[0].unsqueeze(0), k_lin, v_lin, mask, scale)
-    torch.testing.assert_close(
-        out[0].float(), ref[0], atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(out[0].float(), ref[0], atol=2e-2, rtol=2e-2)
 
 
 def test_decode_paged_anchored_off_path_unchanged():
@@ -147,8 +154,9 @@ def test_decode_paged_anchored_off_path_unchanged():
     q = torch.randn(1, num_heads, head_dim, device=device, dtype=dtype)
     seq_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
 
+    decode_paged, _ = _require_flash_ops()
     out = torch.empty_like(q)
-    flash_ops[0](
+    decode_paged(
         q, k_cache, v_cache, block_table, seq_lens, softmax_scale=scale, out=out
     )
     q_pos = torch.tensor([kv_len - 1], device=device)
@@ -183,7 +191,8 @@ def test_prefill_paged_anchored_matches_reference(
     seq_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
     anchor_lens = torch.tensor([anchor], dtype=torch.int32, device=device)
 
-    out = flash_ops[1](
+    _, prefill_paged = _require_flash_ops()
+    out = prefill_paged(
         q,
         k_cache,
         v_cache,
@@ -199,6 +208,4 @@ def test_prefill_paged_anchored_matches_reference(
     q_pos = torch.arange(kv_len - q_len, kv_len, device=device)
     mask = _anchored_mask(q_pos, kv_len, anchor, window, device)
     ref = _ref_attention(q[0], k_lin, v_lin, mask, scale)
-    torch.testing.assert_close(
-        out[0].float(), ref.float(), atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(out[0].float(), ref.float(), atol=2e-2, rtol=2e-2)

@@ -3186,6 +3186,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
+        flash_metadata = _as_flash_v100_metadata(attn_metadata)
         prefix_anchor_lens = common_attn_metadata.prefix_anchor_lens
         if self.decode_sliding_window is not None and prefix_anchor_lens is not None:
             assert self.persistent_prefix_anchor_lens is not None
@@ -3195,9 +3196,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             )
             persistent_anchor_lens = self.persistent_prefix_anchor_lens[:anchor_reqs]
             persistent_anchor_lens.copy_(prefix_anchor_lens[:anchor_reqs])
-            attn_metadata.prefix_anchor_lens = persistent_anchor_lens
-            attn_metadata.decode_sliding_window = self.decode_sliding_window
-        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+            flash_metadata.prefix_anchor_lens = persistent_anchor_lens
+            flash_metadata.decode_sliding_window = self.decode_sliding_window
         flash_metadata.seq_lens_cpu = capture_seq_lens_cpu
 
         # The Triton builder shortens capture seq_lens to 1 so full graph
@@ -3444,9 +3444,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         }
         self._flash_prefill_paged_supports_anchor = (
             self.flash_attn_prefill_paged is not None
-            and _callable_accepts_keyword(
-                self.flash_attn_prefill_paged, "anchor_lens"
-            )
+            and _callable_accepts_keyword(self.flash_attn_prefill_paged, "anchor_lens")
         )
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
@@ -4783,9 +4781,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # Anchored decode-window mask: only the scalar paged decode route and
         # the direct paged prefill route carry the masked kernel; diagnostic
         # decode bridges are bypassed while the mask is active.
-        anchored_swa_active = (
-            self._anchored_swa_params(attn_metadata)[0] is not None
-        )
+        anchored_swa_active = self._anchored_swa_params(attn_metadata)[0] is not None
         if (
             self.use_decode_paged_prefill
             and self.use_flash_v100_prefill_paged
@@ -4820,11 +4816,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _record_route("decode_paged_prefill")
             return result
-        if (
-            self.use_decode_dense_cache
-            and not is_capturing
-            and not anchored_swa_active
-        ):
+        if self.use_decode_dense_cache and not is_capturing and not anchored_swa_active:
             _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "dense_cache_bridge")
             _sm70_profile_trace(
                 "forward branch=decode_dense_cache layer=%s",

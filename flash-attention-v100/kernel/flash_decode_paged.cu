@@ -2444,8 +2444,7 @@ at::Tensor flash_attention_decode_paged(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right,
-    const std::optional<at::Tensor>& anchor_lens,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
     const int64_t anchored_window) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
@@ -2558,12 +2557,12 @@ at::Tensor flash_attention_decode_paged(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   c10::cuda::CUDAGuard device_guard(q.device());
 
-#define LAUNCH_TYPED(HDIM, PARTITION, KV_DTYPE_CODE)                         \
-  launch_flash_attention_decode_paged<HDIM, PARTITION, KV_DTYPE_CODE>(       \
-      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,  \
-      exp_sums, active_num_partitions, softmax_scale, launch_num_partitions, \
-      k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0,   \
-      0, true, anchor_lens_ptr, static_cast<int>(anchored_window))
+#define LAUNCH_TYPED(HDIM, PARTITION, KV_DTYPE_CODE)                          \
+  launch_flash_attention_decode_paged<HDIM, PARTITION, KV_DTYPE_CODE>(        \
+      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
+      exp_sums, active_num_partitions, softmax_scale, launch_num_partitions,  \
+      k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0, 0, \
+      true, anchor_lens_ptr, static_cast<int>(anchored_window))
 
 #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                 \
   do {                                                                      \
