@@ -254,6 +254,9 @@ def _apply_sm70_defaults(
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("vllm.engine.arg_utils.current_platform", _FakeSM70Platform())
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.get_model_path", lambda model, revision: model
+    )
 
     args = EngineArgs(
         model="dummy",
@@ -349,9 +352,7 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     assert args.max_num_seqs == 4
 
 
-def test_sm70_explicit_dflash_uses_greedy_without_unsupported_prefix_cache(
-    monkeypatch,
-):
+def test_sm70_explicit_dflash_uses_greedy_with_align_prefix_cache(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,
         speculative_config={"method": "dflash", "num_speculative_tokens": 7},
@@ -362,17 +363,19 @@ def test_sm70_explicit_dflash_uses_greedy_without_unsupported_prefix_cache(
         "num_speculative_tokens": 7,
         "draft_sample_method": "greedy",
     }
-    assert args.enable_prefix_caching is False
-    assert args.mamba_cache_mode == "none"
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
 
 
-def test_sm70_explicit_dflash_rejects_hybrid_prefix_cache(monkeypatch):
-    with pytest.raises(ValueError, match="align-mode prefix cache"):
-        _apply_sm70_defaults(
-            monkeypatch,
-            speculative_config={"method": "dflash", "num_speculative_tokens": 7},
-            enable_prefix_caching=True,
-        )
+def test_sm70_explicit_dflash_accepts_explicit_hybrid_prefix_cache(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+        enable_prefix_caching=True,
+    )
+
+    assert args.enable_prefix_caching is True
+    assert args.mamba_cache_mode == "align"
 
 
 @pytest.mark.parametrize(

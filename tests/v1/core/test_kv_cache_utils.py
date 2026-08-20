@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -180,6 +181,37 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
+    """Aligned Mamba keeps fine-grained hashes after page-size unification."""
+    kv_cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attention"], new_kv_cache_spec(block_size=16)),
+            KVCacheGroupSpec(
+                ["mamba"],
+                new_mamba_spec(block_size=1648, mamba_cache_mode="align"),
+            ),
+        ],
+    )
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=16,
+            enable_prefix_caching=True,
+            hash_block_size=None,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        kv_transfer_config=None,
+    )
+
+    assert kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config, vllm_config
+    ) == (1648, 16)
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

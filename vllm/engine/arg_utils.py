@@ -1765,30 +1765,10 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
-        explicit_spec_method = (
-            self.speculative_config.get("method")
-            if isinstance(self.speculative_config, dict)
-            else None
-        )
-
         if is_server and self.enable_prefix_caching is None and has_linear_attention:
-            # Qwen3.5/3.8 exposes only align-mode prefix caching, while MRV2
-            # does not yet implement align-state preprocessing. Keep the
-            # recommended DFlash server configuration bootable and require an
-            # explicit future opt-in once that dependency is backported.
-            self.enable_prefix_caching = explicit_spec_method != "dflash"
+            self.enable_prefix_caching = True
             profile_updates.append(
                 f"enable_prefix_caching={self.enable_prefix_caching}"
-            )
-        if (
-            explicit_spec_method == "dflash"
-            and self.enable_prefix_caching
-            and has_linear_attention
-        ):
-            raise ValueError(
-                "MRV2 DFlash does not yet support Qwen hybrid align-mode prefix "
-                "cache preprocessing. Set enable_prefix_caching=False; target-prefix "
-                "hits with draft-KV rebuild require a later dependency backport."
             )
         if (
             self.enable_prefix_caching

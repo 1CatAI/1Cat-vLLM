@@ -1019,7 +1019,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.total_len.gpu,
         )
 
-        self.model_state.postprocess_state(input_batch, num_sampled)
+        self.model_state.postprocess_state(
+            input_batch,
+            num_sampled,
+            self.req_states.num_computed_tokens.gpu,
+        )
 
     @torch.inference_mode()
     def execute_model(
@@ -1075,6 +1079,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            # Hybrid Mamba align-mode prefix caching migrates recurrent state
+            # across block boundaries before attention metadata consumes it.
+            self.model_state.preprocess_state(
+                input_batch,
+                block_tables,
+                self.kv_cache_config,
+                self.req_states.num_computed_tokens.gpu,
+            )
 
             if self.lora_config:
                 # Activate LoRA adapters.
