@@ -389,7 +389,7 @@ def build_attn_metadata(
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
-    causal: bool | Mapping[int, bool] = True,
+    causal: bool | torch.Tensor | Mapping[int, bool] = True,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -402,7 +402,12 @@ def build_attn_metadata(
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
-        group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
+        # Hybrid drafters can assign different causality to each KV group.
+        # A Mapping must be resolved here; passing the dict itself into the
+        # backend metadata makes it truthy and silently selects causal kernels.
+        group_causal = (
+            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
+        )
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)

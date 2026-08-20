@@ -1043,8 +1043,23 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
+            replace_args = {"block_size": new_block_size}
+            # A padded page does not grow when only block_size changes. This
+            # happens for hybrid Mamba targets when a higher-precision draft
+            # cache has a larger page than the target cache. Keep the logical
+            # block-size adjustment and grow the physical padding with it.
+            if (
+                isinstance(layer_spec, MambaSpec)
+                or getattr(layer_spec, "page_size_padded", None) is not None
+            ):
+                replace_args["page_size_padded"] = max_page_size
+            new_spec = replace(layer_spec, **replace_args)
+            assert new_spec.page_size_bytes == max_page_size, (
+                f"Failed to unify KV page for {layer_name}: "
+                f"spec={layer_spec!r}, old_page={layer_page_size}, "
+                f"target_page={max_page_size}, replacement={replace_args!r}, "
+                f"new_page={new_spec.page_size_bytes}"
+            )
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 

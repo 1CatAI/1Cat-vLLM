@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand64
+from vllm.triton_utils import tl, tldevice, triton
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
 
 
 @triton.jit
@@ -243,7 +243,7 @@ def _rejection_kernel(
 
                 if SYNTHETIC_MODE:
                     pos = tl.load(pos_ptr + logit_idx)
-                    u = tl_rand64(seed, pos, includes_zero=False)
+                    u = tl_rand32(seed, pos, includes_zero=False)
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
                 else:
@@ -267,7 +267,7 @@ def _rejection_kernel(
                 )
                 target_log_prob = target_logit - target_lse
                 pos = tl.load(pos_ptr + logit_idx)
-                u = tl_rand64(seed, pos, includes_zero=False)
+                u = tl_rand32(seed, pos, includes_zero=False)
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(
                         draft_logits_ptr
@@ -388,7 +388,7 @@ def _resample_kernel(
         ratio = tl.exp(draft_log_probs - target_log_probs)
         residual_logits = tl.where(
             ratio < 1.0,
-            target_log_probs + tl.log(1 - ratio),
+            target_log_probs + tldevice.log1p(-ratio),
             float("-inf"),
         ).to(tl.float32)
     else:

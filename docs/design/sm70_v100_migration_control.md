@@ -42,8 +42,88 @@ Goal:
   DFlash input-preparation test passes on V100 after supplying the KV-group
   initialization contract used in production. Two unrelated DDTree metadata
   assertions fail identically on the frozen base and are recorded as pre-existing.
-- No speed or acceptance claim is made until DFlash2 eager correctness, graph
-  equivalence, and same-stack dense-selector baselines pass.
+- Draft PR #253 is the PR2 review scope on
+  `codex/v100-dflash2-sm70-20260820-044011`, based only on PR1. Its worktree is
+  `/home/ymzx/桌面/1cat-vllm/worktrees/v100-dflash2-sm70-20260820-044011`.
+
+### PR2 DFlash2 correctness evidence, 2026-08-20
+
+- Checkpoint contract is frozen at
+  `incoai/Qwen3.8-27B-DFlash2@dedf8df68adfb1afeaf7b7480c0a0243108177b4`.
+  The retained local `model.safetensors` SHA256 is
+  `67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c`.
+  Its architecture is `DFlash2DraftModel`, selector K is 16, block size is 8,
+  attention is non-causal with sliding window 2048, and checkpoint layer IDs
+  `[5,19,33,47,61]` map to target hidden boundaries `[6,20,34,48,62]`.
+- The dependency closure now contains the official grouped convolution,
+  selector codebooks, TP-aware candidate top-K, DFlash2 MRV2 walk/cache, FP32
+  proposal scores, rejection `log1p`, and a separate selector compile-cache
+  tag. FlashInfer top-K is capability-gated and is never called on SM70.
+- The SM70-only numeric adaptation keeps FP32 residual state, explicit BF16
+  round-to-nearest-even points, scaled FP16 attention and gate-up projections,
+  and per-row power-of-two SwiGLU transport. The seventh selector slot uses a
+  separate Volta tail kernel; other architectures retain the upstream walk.
+- Flash-V100 graph capture now binds DFlash's K+1 non-causal query directly to
+  persistent paged-prefix metadata. The causal small-query decode branch is
+  unavailable to a non-causal draft. Target E5M2 and draft FP16 KV pages are
+  unified without truncating hybrid Mamba physical padding.
+- Single-request eager and CUDA Graph runs produced the exact same 16 token IDs,
+  hash `6de4c3f326c76ecc1b31b8026501ddf22f73a34b53b2fc46c622dee6b4a2d995`,
+  candidate lattice, acceptance trace, and draft KV. The graph artifact is
+  `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr2/dflash2-graph-greedy16-fixed.json`;
+  the matched eager artifact is `dflash2-eager-noncausal-fixed16.json`.
+- Matched batch-2 eager/graph runs generated 96 and 61 tokens with identical
+  hashes and all acceptance counters. CUDA Graph batch-4 generated mixed
+  lengths 64/61/64/64 without OOB, stale-buffer, NaN, or replay corruption;
+  each result matched the corresponding eager prefix. Retained artifacts are
+  `dflash2-{eager,graph}-gsm8k-mixed-b2-2x96-greedy.json` and
+  `dflash2-graph-gsm8k-mixed-b4-4x64-greedy.json` under the PR2 cache directory.
+- On four fixed GSM8K prompts with the Qwen3.8 xhigh chat template and official
+  target sampling, greedy drafting emitted 421 tokens with mean accepted length
+  4.1068 and per-position acceptance
+  `[.8544,.6505,.4854,.4175,.3301,.2233,.1456]`. Probabilistic drafting emitted
+  452 tokens with mean 4.2407. These short V100/FP8 results are correctness and
+  sampling diagnostics, not a like-for-like replacement for the published
+  H200/BF16 acceptance figures.
+- The fixed 32-to-16 graph diagnostic reported 80.11 steady decode tok/s versus
+  18.72 eager with exact token/acceptance equality. The matched batch-2 run was
+  116.67 tok/s graph versus 43.53 eager. These are short diagnostic shapes and
+  are not a target-only or dense-selector paired performance gate.
+- DFlash1 remains on the official MRV2 speculator for the local 9B, 27B, and
+  35B-A3B checkpoints. A real 9B-AWQ/FP16-draft eager smoke produced eight
+  tokens, hash `2a205303e4c2b54b62d7562643abcaa425952d7dbcf3f3c1a4b6a4e3e3634be9`,
+  accepted length 3.5, and confirmed Flash-V100 routing. The artifact is
+  `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr2/dflash1-9b-awq-mrv2-eager-route.json`.
+- Existing MTP was not replaced. A real Qwen3.8 TP4 MTP4 probabilistic smoke
+  confirmed native MTP, local argmax, Flash-V100, and E5M2 routes; it emitted 32
+  tokens with accepted length 4.25 and per-position acceptance
+  `[1.0,1.0,.75,.5]`. The artifact is
+  `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr2/dflash2-mtp4-qwen38-regression-eager.json`.
+- Focused results: DFlash2/config/SM70 CPU matrix `107 passed, 1 skipped`;
+  DFlash MRV2 config `7 passed`; V100 rejection sampling `14 passed`; V100
+  probabilistic selector score-cache `1 passed`; Ruff passed on every changed
+  Python file. The DDTree targeted matrix remains `71 passed, 1 failed`, with
+  the one shared-storage assertion reproduced identically on PR1. Three stale
+  MTP step-index helper failures also reproduce on PR1; their 19 unaffected
+  cases pass. Four Eagle tests that require the gated Llama-3.1 config stop at
+  Hugging Face 401 on both PR1 and PR2; the local DFlash/Eagle compatibility
+  test itself passes.
+- Qwen3.8 exposes only hybrid `align` prefix caching, while the current MRV2
+  runner has no align-state preprocessing. SM70 server defaults therefore set
+  prefix caching off for explicit DFlash, and an explicit DFlash+hybrid-prefix
+  request now fails early with a precise error. Target-prefix hit plus draft-KV
+  rebuild remains an open PR2 dependency; no cross-request prefix claim is made.
+- Numeric classification for the DFlash non-causal paged attention route is
+  still `B-pending`, not silently accepted. Aligned DFlash shapes at sequence
+  lengths 8/69/512/2048 show semantic-boundary paged-vs-dense maxima
+  `0/2.44e-4/1.22e-4/6.10e-5`, all below the FP16 `2e-3` bound and not growing
+  with length. Scaling V by 256 reproduces raw differences up to 0.0625, which
+  become at most 2.44e-4 after the model's required `/256` range restoration.
+  The retained evidence is
+  `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr2/dflash2-noncausal-paged-attention-exactness.json`.
+  Same-tile basis probes do not yet reduce every key to exact zero, so the
+  mechanical reduction-order proof remains open and PR3 default enablement is
+  blocked on it.
 
 Main implementation priority:
 
