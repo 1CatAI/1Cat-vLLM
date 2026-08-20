@@ -56,10 +56,21 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def preprocess_state(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        """Hook for model-specific state movement before a real forward."""
+        return None
+
     def postprocess_state(
         self,
         input_batch: InputBatch,
         num_sampled: torch.Tensor,
+        num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         return None
 

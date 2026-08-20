@@ -15,8 +15,44 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec, MambaSpec
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def _reserved_block_count(
+    num_tokens: int,
+    kv_cache_spec: KVCacheSpec,
+    *,
+    num_lookahead_tokens: int,
+    max_model_len: int,
+    max_encoder_len: int,
+) -> int:
+    """Match the scheduler's block reservation in hand-built warmup batches."""
+    if isinstance(kv_cache_spec, CrossAttentionSpec):
+        return cdiv(max_encoder_len, kv_cache_spec.block_size)
+    num_speculative_blocks = 0
+    if isinstance(kv_cache_spec, MambaSpec):
+        num_speculative_blocks = kv_cache_spec.num_speculative_blocks
+        if kv_cache_spec.mamba_cache_mode == "align":
+            return cdiv(num_tokens, kv_cache_spec.block_size) + num_speculative_blocks
+    num_tokens = min(num_tokens + num_lookahead_tokens, max_model_len)
+    return cdiv(num_tokens, kv_cache_spec.block_size) + num_speculative_blocks
+
+
+def _warmup_block_counter(
+    model_runner: GPUModelRunner,
+) -> Callable[[int, KVCacheSpec], int]:
+    def block_count(num_tokens: int, kv_cache_spec: KVCacheSpec) -> int:
+        return _reserved_block_count(
+            num_tokens,
+            kv_cache_spec,
+            num_lookahead_tokens=model_runner.vllm_config.num_lookahead_tokens,
+            max_model_len=model_runner.max_model_len,
+            max_encoder_len=getattr(model_runner.model_state, "max_encoder_len", 0),
+        )
+
+    return block_count
 
 
 @torch.inference_mode()
@@ -46,9 +82,10 @@ def warmup_kernels(
     num_kv_cache_groups = len(kv_cache_groups)
 
     # Compute per-request block counts for each KV cache group.
-    group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
-    prefill_block_counts = [cdiv(prompt_len, bs) for bs in group_block_sizes]
-    decode_block_counts = [cdiv(decode_len, bs) for bs in group_block_sizes]
+    block_count = _warmup_block_counter(model_runner)
+    kv_cache_specs = [group.kv_cache_spec for group in kv_cache_groups]
+    prefill_block_counts = [block_count(prompt_len, spec) for spec in kv_cache_specs]
+    decode_block_counts = [block_count(decode_len, spec) for spec in kv_cache_specs]
     decode_block_deltas = [
         d - p for d, p in zip(decode_block_counts, prefill_block_counts)
     ]

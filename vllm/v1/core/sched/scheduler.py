@@ -247,25 +247,10 @@ class Scheduler(SchedulerInterface):
         )
 
         self.use_eagle = False
-        self.num_spec_tokens = self.num_lookahead_tokens = 0
-        if speculative_config:
-            self.num_spec_tokens = speculative_config.num_speculative_tokens
-            if speculative_config.use_eagle():
-                self.use_eagle = True
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.uses_draft_model():
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.use_dflash_family():
-                # DFlash requires an extra lookahead slot since it uses in-fill-style
-                # decoding instead of standard next-token sampling, so it has a query
-                # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = (
-                    speculative_config.num_speculative_state_tokens() + 1
-                )
-            if speculative_config.use_dspark():
-                # The anchor itself is the first prediction position, with no
-                # separate bonus query, so DSpark needs exactly N slots.
-                self.num_lookahead_tokens = self.num_spec_tokens
+        self.num_spec_tokens = vllm_config.num_speculative_tokens
+        self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        if speculative_config and speculative_config.use_eagle_kv_cache():
+            self.use_eagle = True
 
         # Create the KV cache manager.
         if hash_block_size is None:

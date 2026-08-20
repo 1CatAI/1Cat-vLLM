@@ -521,6 +521,19 @@ class VllmConfig:
         return 0
 
     @property
+    def num_lookahead_tokens(self) -> int:
+        """KV positions reserved beyond the target model's scheduled query."""
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return 0
+        if speculative_config.use_dflash_family():
+            # DFlash has one anchor query plus the checkpoint-owned draft state.
+            return speculative_config.num_speculative_state_tokens() + 1
+        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
+            return self.num_speculative_tokens
+        return 0
+
+    @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         is_mrv2_dflash = (
@@ -2469,13 +2482,6 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
 
-        if (
-            model_config is not None
-            and model_config.has_inner_state
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            unsupported.append("hybrid/mamba models with align cache mode")
-
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallelism")
 
@@ -2618,10 +2624,6 @@ class VllmConfig:
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
-            )
-            # TODO: support align mamba cache mode for model runner v2
-            assert not envs.VLLM_USE_V2_MODEL_RUNNER, (
-                "Model Runner V2 has not yet supported mamba_cache_mode='align'. "
             )
 
     @model_validator(mode="after")

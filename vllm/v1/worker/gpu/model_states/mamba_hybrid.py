@@ -9,14 +9,28 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    get_conv_copy_spec,
+    is_conv_state_dim_first,
+)
+from vllm.triton_utils import triton
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.mamba_align import (
+    preprocess_mamba_align_fused_kernel,
+    run_mamba_align_postprocess,
+    run_mamba_align_precopy,
+)
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -64,8 +78,126 @@ class MambaHybridModelState(DefaultModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
+        self.cache_config = vllm_config.cache_config
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        if self._align_mode:
+            self._mamba_state_idx_gpu = torch.full(
+                (self.max_num_reqs,), -2, dtype=torch.int32, device=self.device
+            )
+            self._mamba_src_col_gpu = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+            )
+            self._mamba_token_bias_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
+            self._mamba_group_ids: list[int] = []
+            self._mamba_spec: MambaSpec | None = None
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        # A recycled request slot may contain the previous request's accepted
+        # count. The neutral value is required in both align and non-align mode.
+        self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self._align_mode:
+            # Delay state-column seeding until preprocess_state has the
+            # resolved MambaSpec block size. -2 is distinct from -1 (fresh
+            # request with no computed state).
+            self._mamba_state_idx_gpu[req_index].fill_(-2)
+
+    def _get_mamba_group_info(
+        self, kv_cache_config: KVCacheConfig
+    ) -> tuple[list[int], MambaSpec]:
+        if self._mamba_spec is None:
+            group_ids: list[int] = []
+            specs: list[MambaSpec] = []
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+                if isinstance(group.kv_cache_spec, MambaSpec):
+                    group_ids.append(group_id)
+                    specs.append(group.kv_cache_spec)
+            assert specs, "no mamba layers in the model"
+            assert all(specs[0] == spec for spec in specs)
+            self._mamba_group_ids = group_ids
+            self._mamba_spec = specs[0]
+        return self._mamba_group_ids, self._mamba_spec
+
+    def _ensure_align_ctx(
+        self,
+        kv_cache_config: KVCacheConfig,
+        mamba_group_ids: list[int],
+        block_tables: tuple[torch.Tensor, ...],
+    ) -> MambaSpecDecodeGPUContext:
+        if self._mamba_ctx is None:
+            copy_funcs = self.model.get_mamba_state_copy_func()
+            # This V100 closure intentionally retains the tree's default SD
+            # layout. The official DS-row extension is unrelated to Qwen3.8's
+            # configured path and would expand the DDTree-sensitive closure.
+            if get_conv_copy_spec in copy_funcs and is_conv_state_dim_first():
+                raise ValueError(
+                    "MRV2 align prefix caching with speculative decoding requires "
+                    "the default SD Mamba conv-state layout on this V100 path."
+                )
+            self._mamba_ctx = MambaSpecDecodeGPUContext.create(
+                max_num_reqs=self.max_num_reqs,
+                kv_cache_config=kv_cache_config,
+                num_state_types=len(copy_funcs),
+                device=self.device,
+                make_buffer=lambda n, dtype: CpuGpuBuffer(
+                    n,
+                    dtype=dtype,
+                    device=self.device,
+                    pin_memory=is_pin_memory_available(),
+                ),
+            )
+        ctx = self._mamba_ctx
+        if not ctx.is_initialized:
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            ctx.initialize_from_forward_context(
+                kv_cache_config,
+                forward_context,
+                self.model.get_mamba_state_copy_func(),
+                [block_tables[group_id] for group_id in mamba_group_ids],
+            )
+        return ctx
+
+    def preprocess_state(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        kv_cache_config: KVCacheConfig,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        """Move align-mode recurrent state before a real MRV2 forward."""
+        if not self._align_mode or input_batch.num_reqs == 0:
+            return
+        mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
+
+        block = 256
+        preprocess_mamba_align_fused_kernel[
+            (triton.cdiv(input_batch.num_reqs, block),)
+        ](
+            input_batch.idx_mapping,
+            self._mamba_state_idx_gpu,
+            num_computed_tokens,
+            input_batch.query_start_loc,
+            self.num_accepted_tokens_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_token_bias_gpu,
+            input_batch.num_reqs,
+            BLOCK_SIZE=block,
+            MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+        )
+        run_mamba_align_precopy(
+            ctx,
+            input_batch.num_reqs,
+            self._mamba_state_idx_gpu,
+            self._mamba_src_col_gpu,
+            self._mamba_token_bias_gpu,
+            input_batch.idx_mapping,
         )
 
     def prepare_attn(
@@ -142,9 +274,24 @@ class MambaHybridModelState(DefaultModelState):
         self,
         input_batch: InputBatch,
         num_sampled: torch.Tensor,
+        num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
         self.num_accepted_tokens_gpu[input_batch.idx_mapping] = torch.clamp(
             num_sampled, min=1
         )
+        if (
+            self._align_mode
+            and num_computed_tokens is not None
+            and self._mamba_ctx is not None
+            and input_batch.num_reqs > 0
+        ):
+            run_mamba_align_postprocess(
+                self._mamba_ctx,
+                input_batch.num_reqs,
+                self.num_accepted_tokens_gpu,
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                input_batch.idx_mapping,
+            )

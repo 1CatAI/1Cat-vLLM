@@ -99,31 +99,62 @@ Goal:
   tokens with accepted length 4.25 and per-position acceptance
   `[1.0,1.0,.75,.5]`. The artifact is
   `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr2/dflash2-mtp4-qwen38-regression-eager.json`.
-- Focused results: DFlash2/config/SM70 CPU matrix `107 passed, 1 skipped`;
-  DFlash MRV2 config `7 passed`; V100 rejection sampling `14 passed`; V100
-  probabilistic selector score-cache `1 passed`; Ruff passed on every changed
-  Python file. The DDTree targeted matrix remains `71 passed, 1 failed`, with
+- Final changed-path gate: SM70 arguments plus KV layout, DFlash2/MRV2 routing,
+  and warmup reservation total `113 passed, 1 skipped` on CPU; the dedicated
+  V100 Mamba align kernels add `5 passed`. The new warmup matrix covers MRV2
+  DFlash K+1, DDTree tree-budget lookahead, unchanged Eagle/MTP/DSpark values,
+  and align/non-align Mamba speculative tails. Earlier V100 rejection sampling
+  remains `14 passed` and probabilistic selector score-cache `1 passed`; Ruff
+  passes every changed Python file. The DDTree targeted matrix remains
+  `71 passed, 1 failed`, with
   the one shared-storage assertion reproduced identically on PR1. Three stale
   MTP step-index helper failures also reproduce on PR1; their 19 unaffected
   cases pass. Four Eagle tests that require the gated Llama-3.1 config stop at
   Hugging Face 401 on both PR1 and PR2; the local DFlash/Eagle compatibility
   test itself passes.
-- Qwen3.8 exposes only hybrid `align` prefix caching, while the current MRV2
-  runner has no align-state preprocessing. SM70 server defaults therefore set
-  prefix caching off for explicit DFlash, and an explicit DFlash+hybrid-prefix
-  request now fails early with a precise error. Target-prefix hit plus draft-KV
-  rebuild remains an open PR2 dependency; no cross-request prefix claim is made.
+- MRV2 now implements the upstream hybrid Mamba `align` state migration on the
+  GPU without changing the V1 DDTree state-selection path. The new-request
+  state column is seeded from the resolved `MambaSpec.block_size`, not the
+  smaller global cache block size; this is required when E5M2 target pages and
+  FP16 DFlash pages share a hybrid pool. Upstream hash-layout fix #51180 is also
+  included so aligned Mamba groups retain the finest divisible hash unit.
+- Prefix correctness is accepted for the real Qwen3.8-27B-FP8 TP4 route. With
+  the resolved target Full/Mamba block size 3296 and draft SWA block size 1648,
+  a 3505-token prompt produced a 3296-token hit on the second request. Eager
+  kept the exact 16-token hash `a2c583fc17c7...`, accepted length 6.6667, and
+  per-position counts `[3,3,3,2,2,2,2]`; TTFT changed from 1.117s to 0.303s.
+  CUDA Graph kept the same token and acceptance trace with TTFT
+  1.119s to 0.174s. Artifacts are `dflash2-prefix-tp4-{eager,graph}-4k.json`
+  under the PR2 cache directory.
+- A paired target-only TP4 probe hit 3136 tokens with exact output and TTFT
+  1.010s to 0.167s (`qwen38-prefix-tp4-target-only-eager-4k.json`). This
+  separates target Mamba-state restoration from DFlash proposal correctness.
+  No separate cross-request draft-prefix index or persistence layer was added;
+  the accepted same-process path uses the existing unified hybrid block cache,
+  while an ordinary miss rebuilds draft context KV during DFlash proposal.
 - Numeric classification for the DFlash non-causal paged attention route is
-  still `B-pending`, not silently accepted. Aligned DFlash shapes at sequence
-  lengths 8/69/512/2048 show semantic-boundary paged-vs-dense maxima
+  `B-accept`, with its layout component separately passing Type A. Aligned
+  DFlash shapes at sequence lengths 8/69/512/2048 show semantic-boundary
+  paged-vs-dense maxima
   `0/2.44e-4/1.22e-4/6.10e-5`, all below the FP16 `2e-3` bound and not growing
   with length. Scaling V by 256 reproduces raw differences up to 0.0625, which
   become at most 2.44e-4 after the model's required `/256` range restoration.
+  Reversing every physical KV page and applying the matching block-table
+  permutation is bitwise exact for every shape, proving page addressing,
+  layout, mask, and KV-source alignment. The bounded cross-kernel residual is
+  mechanically explained by the source arithmetic: for D != 256, dense
+  Flash-V100 scales QK by `log2(e)` and evaluates `exp2f`, whereas paged
+  Flash-V100 retains natural-log scores and evaluates `expf`. These are
+  mathematically equivalent reductions with different FP16 rounding. The
+  release extension was built from paged-kernel source SHA256
+  `9be6b237fcd1c89653c26460054c1c25edd6e7d8f9685f7b9f4b83a2f1ba5e58`,
+  identical to the integration source; an older independently built extension
+  produced the same case-by-case results.
   The retained evidence is
   `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr2/dflash2-noncausal-paged-attention-exactness.json`.
-  Same-tile basis probes do not yet reduce every key to exact zero, so the
-  mechanical reduction-order proof remains open and PR3 default enablement is
-  blocked on it.
+  Together with exact eager/graph model tokens, candidates, acceptance trace,
+  and draft KV, the attention numeric gate no longer blocks PR3. This does not
+  relax the separate fused-selector performance and exact-token gates.
 
 Main implementation priority:
 

@@ -611,12 +611,12 @@ def resolve_kv_cache_block_sizes(
     if not (cache_config.enable_prefix_caching or connector_enabled):
         return scheduler_block_size, scheduler_block_size
 
-    # Mamba groups with block_size != cache_config.block_size
-    # (mamba_cache_mode != "align") break divisibility; back off to the
-    # scheduler block size.
+    # Mamba groups outside align mode break divisibility; back off to the
+    # scheduler block size. Read the mode from the resolved group spec because
+    # its block size may have been updated independently of cache_config.
     if any(
         isinstance(g.kv_cache_spec, MambaSpec)
-        and g.kv_cache_spec.block_size != cache_config.block_size
+        and g.kv_cache_spec.mamba_cache_mode != "align"
         for g in groups
     ):
         return scheduler_block_size, scheduler_block_size

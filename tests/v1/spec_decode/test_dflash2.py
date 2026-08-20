@@ -11,6 +11,7 @@ import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
+from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
     DFLASH_SM70_WIDE_OUTPUT_SCALE,
@@ -221,6 +222,24 @@ def test_dflash1_architecture_stays_on_official_mrv2_speculator(monkeypatch):
         )
     )
     assert isinstance(init_speculator(config, torch.device("cpu")), DFlashSpeculator)
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("dflash", False),
+        ("dflash_ddtree", True),
+        ("eagle3", True),
+        ("mtp", True),
+    ],
+)
+def test_only_mrv2_dflash_skips_eagle_prefix_block_drop(method, expected):
+    config = SimpleNamespace(
+        method=method,
+        use_eagle=lambda: True,
+        use_dflash=lambda: method == "dflash",
+    )
+    assert SpeculativeConfig.use_eagle_kv_cache(config) is expected
 
 
 @pytest.mark.parametrize("method", ["eagle3", "mtp"])
