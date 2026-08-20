@@ -45,6 +45,11 @@ Goal:
 - Draft PR #253 is the PR2 review scope on
   `codex/v100-dflash2-sm70-20260820-044011`, based only on PR1. Its worktree is
   `/home/ymzx/桌面/1cat-vllm/worktrees/v100-dflash2-sm70-20260820-044011`.
+- PR3 starts from accepted PR2 commit `9fd338965d` on
+  `codex/v100-dflash2-sm70-selector-20260820-180634`. Its isolated worktree is
+  `/home/ymzx/桌面/1cat-vllm/worktrees/v100-dflash2-sm70-selector-20260820-180634`;
+  the scope is limited to the gated SM70 dense-FP16 selector fusion and its
+  paired correctness/performance evidence.
 
 ### PR2 DFlash2 correctness evidence, 2026-08-20
 
