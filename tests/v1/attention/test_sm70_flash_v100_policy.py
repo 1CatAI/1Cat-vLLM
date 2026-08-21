@@ -1296,6 +1296,27 @@ def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(
     assert _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs) == expected
 
 
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [
+        (1, [5]),
+        (2, [5, 10]),
+        (4, [5, 10, 20]),
+        (6, [5, 10, 20, 30]),
+        (12, [5, 10, 20, 30, 40, 60]),
+        (16, [5, 10, 20, 30, 40, 60, 80]),
+        (32, [5, 10, 20, 30, 40, 60, 80]),
+    ],
+)
+def test_sm70_mtp_cudagraph_capture_sizes_cover_production_concurrency(
+    max_num_seqs: int,
+    expected: list[int],
+):
+    from vllm.config.vllm import _sm70_mtp_cudagraph_capture_sizes
+
+    assert _sm70_mtp_cudagraph_capture_sizes(max_num_seqs, 5) == expected
+
+
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(
     monkeypatch,
     local_flash_v100_model,

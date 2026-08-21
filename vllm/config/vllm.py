@@ -68,6 +68,7 @@ logger = init_logger(__name__)
 
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
+_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
@@ -77,6 +78,19 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     }
     capture_sizes.update((1, 2, max_graph_reqs))
     return sorted(capture_sizes)
+
+
+def _sm70_mtp_cudagraph_capture_sizes(
+    max_num_seqs: int,
+    decode_query_len: int,
+) -> list[int]:
+    """Return exact SM70 MTP verifier token shapes for production requests."""
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
+    request_sizes = {
+        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
+    }
+    request_sizes.add(max_graph_reqs)
+    return [decode_query_len * size for size in sorted(request_sizes)]
 
 
 class OptimizationLevel(IntEnum):
@@ -1341,11 +1355,6 @@ class VllmConfig:
                         self.speculative_config is not None
                         and self.speculative_config.num_speculative_tokens
                     ):
-                        cudagraph_capture_sizes = (
-                            [1, 2, 4, 8, 9, 18]
-                            if self.parallel_config.tensor_parallel_size >= 4
-                            else [1, 2, 4, 8, 9]
-                        )
                         decode_query_len = (
                             self.speculative_config.num_speculative_state_tokens() + 1
                         )
@@ -1363,26 +1372,47 @@ class VllmConfig:
                                 smallq_env,
                                 decode_query_len,
                             )
-                        max_graph_reqs = (
-                            4 if self.parallel_config.tensor_parallel_size >= 4 else 1
-                        )
-                        max_graph_reqs = min(
-                            max(int(self.scheduler_config.max_num_seqs), 1),
-                            max_graph_reqs,
-                        )
-                        cudagraph_capture_sizes = sorted(
-                            set(cudagraph_capture_sizes)
-                            | {
-                                decode_query_len * num_reqs
-                                for num_reqs in range(1, max_graph_reqs + 1)
-                            }
-                        )
-                        logger.info_once(
-                            "Using SM70 speculative verifier cudagraph shapes "
-                            "%sx1..%s for Flash-V100 compile graph.",
-                            decode_query_len,
-                            max_graph_reqs,
-                        )
+                        if (
+                            envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
+                            and self.speculative_config.method == "mtp"
+                        ):
+                            cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
+                                self.scheduler_config.max_num_seqs,
+                                decode_query_len,
+                            )
+                            logger.info_once(
+                                "Using split SM70 MTP verifier cudagraph token "
+                                "shapes %s for Flash-V100 compile graph.",
+                                tuple(cudagraph_capture_sizes),
+                            )
+                        else:
+                            cudagraph_capture_sizes = (
+                                [1, 2, 4, 8, 9, 18]
+                                if self.parallel_config.tensor_parallel_size >= 4
+                                else [1, 2, 4, 8, 9]
+                            )
+                            max_graph_reqs = (
+                                4
+                                if self.parallel_config.tensor_parallel_size >= 4
+                                else 1
+                            )
+                            max_graph_reqs = min(
+                                max(int(self.scheduler_config.max_num_seqs), 1),
+                                max_graph_reqs,
+                            )
+                            cudagraph_capture_sizes = sorted(
+                                set(cudagraph_capture_sizes)
+                                | {
+                                    decode_query_len * num_reqs
+                                    for num_reqs in range(1, max_graph_reqs + 1)
+                                }
+                            )
+                            logger.info_once(
+                                "Using SM70 speculative verifier cudagraph shapes "
+                                "%sx1..%s for Flash-V100 compile graph.",
+                                decode_query_len,
+                                max_graph_reqs,
+                            )
                     elif cudagraph_capture_sizes != [1, 2]:
                         logger.info_once(
                             "Using SM70 no-MTP decode cudagraph request shapes %s.",
