@@ -93,7 +93,11 @@ from vllm.config.parallel import (
 )
 from vllm.config.scheduler import SchedulerPolicy
 from vllm.config.utils import get_field
-from vllm.config.vllm import OptimizationLevel, PerformanceMode
+from vllm.config.vllm import (
+    OptimizationLevel,
+    PerformanceMode,
+    _sm70_mtp_cudagraph_capture_sizes,
+)
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
@@ -1860,11 +1864,6 @@ class EngineArgs:
             and self.compilation_config.cudagraph_capture_sizes is None
             and self.compilation_config.max_cudagraph_capture_size is None
         ):
-            cudagraph_capture_sizes = (
-                [1, 2, 4, 8, 9, 18]
-                if self.tensor_parallel_size >= 4
-                else [1, 2, 4, 8, 9]
-            )
             num_speculative_tokens = int(
                 self.speculative_config.get("num_speculative_tokens") or 0
             )
@@ -1881,9 +1880,22 @@ class EngineArgs:
                 num_speculative_state_tokens = max(
                     num_speculative_tokens, ddtree_budget
                 )
-            if num_speculative_state_tokens > 0:
-                decode_query_len = num_speculative_state_tokens + 1
-                max_num_seqs = max(int(self.max_num_seqs or 1), 1)
+            decode_query_len = num_speculative_state_tokens + 1
+            max_num_seqs = max(int(self.max_num_seqs or 1), 1)
+            if envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
+                cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
+                    max_num_seqs,
+                    decode_query_len,
+                )
+                profile_updates.append(
+                    f"mtp_split_verifier_cudagraph_shapes={cudagraph_capture_sizes}"
+                )
+            else:
+                cudagraph_capture_sizes = (
+                    [1, 2, 4, 8, 9, 18]
+                    if self.tensor_parallel_size >= 4
+                    else [1, 2, 4, 8, 9]
+                )
                 cudagraph_capture_sizes = sorted(
                     set(cudagraph_capture_sizes)
                     | {

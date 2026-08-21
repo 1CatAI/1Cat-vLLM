@@ -237,6 +237,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DECODE_EVENT_TRACE_EVERY: int = 16
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
+    VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = True
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE: str | None = None
@@ -2004,6 +2005,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_PROFILE": lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))),
     "VLLM_SM70_MTP_PROFILE_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
+    ),
+    "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "1"))
     ),
     "VLLM_SM70_MTP_CONTEXT_BUCKETS": lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
     "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
