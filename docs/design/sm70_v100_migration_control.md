@@ -161,6 +161,63 @@ Goal:
   and draft KV, the attention numeric gate no longer blocks PR3. This does not
   relax the separate fused-selector performance and exact-token gates.
 
+### PR3 SM70 selector-fusion disposition, 2026-08-21
+
+- Draft PR #254 reuses the existing TurboMind dense-FP16 LM-head kernel and
+  remains default-off behind `VLLM_SM70_DFLASH2_FUSED_SELECTOR`. The checkpoint
+  selector contract is unchanged: local top-20 candidates are reduced to the
+  checkpoint-owned global top-16, and the official seven-token draft block is
+  unchanged.
+- The original top-20 epilogue assigned one row to each of four warps although
+  its CTA has `M=8`. The fixed epilogue assigns rows round-robin, covering the
+  seventh DFlash2 row and M=8 tail. A graph-safe operator variant accepts
+  persistent FP32 value and INT64 token partial workspaces; the allocation-owning
+  legacy entry remains available for non-graph callers.
+- Equal FP16 logits exposed a second exactness issue: the fused kernel's
+  deterministic token-ID tie break did not reproduce `torch.topk`'s dense-shard
+  ordering. The accepted eager experiment scatters the fused top-20 into a
+  persistent shard-shaped FP16 buffer and runs local dense-order top-16 before
+  exchanging only 16 values and token IDs per TP rank. This restores exact
+  ordered IDs and values, not merely the same candidate set.
+- The current-source SM70 extension SHA256 is
+  `077ca806e8fad6b452dbe59cd0da336ff88c9341386c8480bbbe009b8029c7b2`.
+  Persistent-workspace tests cover M=1/4/5/7/8, TP4 vocab offsets and padding,
+  equal-score ordering, and CUDA Graph replay. The M-shape set passed three
+  consecutive runs after the test stopped exercising the allocation-owning
+  legacy entry.
+- The real Qwen3.8 TP4 selector microbenchmark used M=7, local N=62080, K=5120,
+  FP16 hidden/weight, local top-16 and TP global top-16. Ordered IDs and FP16
+  values were exact with maximum difference zero. The dense
+  `torch.mm + local16 + TP global16` mean was 1.1585 ms; the production-shaped
+  fused path was 1.2254 ms, a 5.78% regression. Evidence is
+  `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr3/sm70-top20-workspace-dense-order-m7-tp4.json`.
+- The final dedicated DFlash2 suite passes `30 passed, 11 skipped` without a
+  visible GPU and `41 passed` on V100. Ruff passes all eight changed Python
+  files, the rebuilt SM70 extension links successfully, and `git diff --check`
+  is clean.
+- Earlier direct-top20 graph results that appeared much faster are rejected.
+  The dense 256-token artifact had hash `6477ffd9...` and accepted length
+  2.2768, while the direct fused artifact had hash `1f7f1cdf...` and accepted
+  length 3.3462. The speed change therefore measured a different sampling and
+  acceptance trajectory, not an optimization of the same computation.
+- Preparing the duplicate LM-head layout also raised model memory by about
+  1.19 GiB per rank (10.23 versus 9.04 GiB in the final compiled-graph runs),
+  directly reducing long-context KV capacity. The fused selector is therefore
+  eager-only. Under the accepted Flash-V100 compiled CUDA Graph policy, an
+  explicit request is normalized to zero before workers fork; no duplicate
+  layout is prepared and startup prints the fallback decision.
+- A paired post-rebuild TP4 graph check compared selector-off with a requested
+  selector that was normalized before worker startup. Both emitted the exact
+  same 32 token IDs, hash `471733c0...`, accepted-token count 13, mean accepted
+  length 1.6842, and per-position acceptance vector. Artifacts are
+  `dflash2-pr3-dense-rebuilt-graph-1k-32-r1.json` and
+  `dflash2-pr3-selector-normalized-graph-1k-32-r1.json` in the PR3 cache.
+- Decision: keep the selector default off and keep the official draft-token
+  default at seven. Because the required M=7 micro gate is already negative,
+  the 32K/128K confidence-interval sweep and 3/5/7 default scan are intentionally
+  not run. A future graph-capable fusion must first beat dense M=7 without
+  duplicate-weight capacity loss and then re-enter the full long-context gate.
+
 Main implementation priority:
 
 1. Add a decoupled SM70 TurboMind backend for AWQ and FP8 base GEMM.

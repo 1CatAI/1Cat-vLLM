@@ -872,6 +872,47 @@ if hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
         return None
 
 
+def sm70_f16_lm_head_top20_tc_workspace_out(
+    values_out: torch.Tensor,
+    indices_out: torch.Tensor,
+    partial_values_out: torch.Tensor,
+    partial_indices_out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    k_ld: int,
+    vocab_start_index: int,
+    num_vocab_padding: int,
+) -> None:
+    _op("sm70_f16_lm_head_top20_tc_workspace_out")(
+        values_out,
+        indices_out,
+        partial_values_out,
+        partial_indices_out,
+        input,
+        weight,
+        k_ld,
+        vocab_start_index,
+        num_vocab_padding,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_workspace_out"):
+
+    @register_fake("_C::sm70_f16_lm_head_top20_tc_workspace_out")
+    def _sm70_f16_lm_head_top20_tc_workspace_out_fake(
+        values_out: torch.Tensor,
+        indices_out: torch.Tensor,
+        partial_values_out: torch.Tensor,
+        partial_indices_out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        k_ld: int,
+        vocab_start_index: int,
+        num_vocab_padding: int,
+    ) -> None:
+        return None
+
+
 def sm70_merge_tail_top20_pack_out(
     pairs_out: torch.Tensor,
     base_values: torch.Tensor,

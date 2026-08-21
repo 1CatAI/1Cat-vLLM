@@ -30,7 +30,13 @@ def _module_file(module_name: str) -> str | None:
     module = sys.modules.get(module_name)
     if module is not None:
         return getattr(module, "__file__", None)
-    spec = importlib.util.find_spec(module_name)
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (AttributeError, ImportError, ValueError):
+        # Optional extension parents can raise while find_spec imports them.
+        # Diagnostics must report an unavailable extension, not discard an
+        # otherwise successful benchmark at result-serialization time.
+        return None
     return spec.origin if spec is not None else None
 
 
@@ -1261,6 +1267,12 @@ def _sm70_sampling_policy() -> dict[str, Any]:
     greedy_trace = _env_bool("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", False)
     lm_head_top1 = _env_bool("VLLM_SM70_LM_HEAD_TOP1", not flash_0dot3_compile)
     lm_head_top1_tc = _env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+    dflash2_fused_selector_requested = _env_bool(
+        "VLLM_SM70_DFLASH2_FUSED_SELECTOR", False
+    )
+    dflash2_fused_selector = (
+        dflash2_fused_selector_requested and not flash_0dot3_compile
+    )
     custom_top1_ar = _env_bool("VLLM_SM70_TOP1_CUSTOM_AR", False)
     full_lm_head = _env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
     dense_f16 = _env_bool("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", False)
@@ -1277,6 +1289,10 @@ def _sm70_sampling_policy() -> dict[str, Any]:
         "lm_head_top1_effective": lm_head_top1,
         "VLLM_SM70_LM_HEAD_TOP1_TC": os.environ.get("VLLM_SM70_LM_HEAD_TOP1_TC"),
         "lm_head_top1_tc_effective": lm_head_top1_tc,
+        "VLLM_SM70_DFLASH2_FUSED_SELECTOR": os.environ.get(
+            "VLLM_SM70_DFLASH2_FUSED_SELECTOR"
+        ),
+        "dflash2_fused_selector_effective": dflash2_fused_selector,
         "VLLM_SM70_TOP1_CUSTOM_AR": os.environ.get("VLLM_SM70_TOP1_CUSTOM_AR"),
         "top1_custom_ar_effective": custom_top1_ar,
         "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH": os.environ.get(

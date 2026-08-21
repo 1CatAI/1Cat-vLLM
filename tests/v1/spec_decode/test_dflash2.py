@@ -12,6 +12,10 @@ import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    _maybe_sm70_dflash2_lm_head_top20,
+)
 from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
     DFLASH_SM70_WIDE_OUTPUT_SCALE,
@@ -23,7 +27,11 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     _dflash_layer_causal,
 )
-from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
+from vllm.model_executor.models.qwen3_dflash2 import (
+    DFlash2Qwen3ForCausalLM,
+    _grouped_conv,
+    _score_edges,
+)
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
@@ -324,6 +332,407 @@ def test_flashinfer_topk_is_capability_gated_on_sm70(monkeypatch):
     monkeypatch.setattr(dflash2_model, "has_flashinfer", lambda: True)
     assert dflash2_model._flashinfer_topk() is None
     dflash2_model._flashinfer_topk.cache_clear()
+
+
+def test_compute_candidates_trims_fused_local_top20_to_checkpoint_top16(monkeypatch):
+    quant_method = UnquantizedEmbeddingMethod()
+    dense_apply = Mock(side_effect=AssertionError("dense logits must not run"))
+    monkeypatch.setattr(quant_method, "apply", dense_apply)
+    values = torch.arange(40, dtype=torch.float32).reshape(2, 20)
+    ids = torch.arange(100, 140, dtype=torch.int64).reshape(2, 20)
+    lm_head = SimpleNamespace(
+        quant_method=quant_method,
+        maybe_get_sm70_dflash2_top20=lambda hidden, selector_k: (values, ids),
+    )
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16)),
+        output_multiplier=1.0,
+        final_logit_softcapping=None,
+    )
+    monkeypatch.setattr(
+        dflash2_model, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    actual_ids, actual_values = DFlash2Qwen3ForCausalLM.compute_candidates(
+        model, torch.empty((2, 8))
+    )
+
+    expected_values, positions = torch.topk(values, 16, dim=-1)
+    assert torch.equal(actual_ids, ids.gather(-1, positions))
+    assert torch.equal(actual_values, expected_values)
+    dense_apply.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows", [1, 4, 5, 7, 8])
+def test_sm70_fused_lm_head_top20_matches_tp4_global_top16(rows: int):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("the fused selector is SM70-only")
+    if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_workspace_out"):
+        pytest.skip("the SM70 TurboMind top-20 op is not built")
+
+    from vllm import _sm70_ops
+
+    torch.manual_seed(44)
+    device = torch.device("cuda")
+    hidden_size, tp_size, local_vocab = 64, 4, 256
+    selector_k, local_k, final_padding = 16, 20, 3
+    hidden = torch.zeros(rows, hidden_size, dtype=torch.float16, device=device)
+    hidden[torch.arange(rows), torch.arange(rows)] = 1
+    weight = 0.01 * torch.randn(
+        tp_size * local_vocab, hidden_size, dtype=torch.float16, device=device
+    )
+    valid_vocab = tp_size * local_vocab - final_padding
+    for row in range(rows):
+        controlled_ids = (
+            torch.arange(selector_k, device=device) * 61 + row * 7
+        ) % valid_vocab
+        weight[controlled_ids, row] = torch.linspace(
+            64, 49, selector_k, dtype=torch.float16, device=device
+        )
+        weight[controlled_ids[9], row] = weight[controlled_ids[8], row]
+    dense_logits = torch.mm(hidden, weight.t())
+    dense_logits[:, -final_padding:] = -float("inf")
+    reference_local_values = []
+    reference_local_ids = []
+    for rank in range(tp_size):
+        values, ids = torch.topk(
+            dense_logits[:, rank * local_vocab : (rank + 1) * local_vocab],
+            selector_k,
+            dim=-1,
+        )
+        reference_local_values.append(values)
+        reference_local_ids.append(ids + rank * local_vocab)
+    reference_candidates = torch.cat(reference_local_values, dim=-1)
+    reference_values, reference_positions = torch.topk(
+        reference_candidates, selector_k, dim=-1
+    )
+    reference_ids = torch.cat(reference_local_ids, dim=-1).gather(
+        -1, reference_positions
+    )
+
+    local_values = []
+    local_ids = []
+    prepared_weights = []
+    for rank in range(tp_size):
+        local_weight = weight[
+            rank * local_vocab : (rank + 1) * local_vocab
+        ].contiguous()
+        prepared_weight, prepared_meta = _sm70_ops.sm70_f16_prepare(local_weight)
+        # Keep source and prepared tensors alive so the test cannot recycle a
+        # TensorImpl address through the process-wide prepared-weight cache.
+        prepared_weights.append((local_weight, prepared_weight))
+        values = torch.empty((rows, local_k), dtype=torch.float32, device=device)
+        ids = torch.empty((rows, local_k), dtype=torch.int64, device=device)
+        partial_values = torch.empty(
+            (rows, 1, local_k), dtype=torch.float32, device=device
+        )
+        partial_ids = torch.empty((rows, 1, local_k), dtype=torch.int64, device=device)
+        _sm70_ops.sm70_f16_lm_head_top20_tc_workspace_out(
+            values,
+            ids,
+            partial_values,
+            partial_ids,
+            hidden,
+            prepared_weight,
+            int(prepared_meta[0].item()),
+            rank * local_vocab,
+            final_padding if rank == tp_size - 1 else 0,
+        )
+        sparse_logits = torch.full(
+            (rows, local_vocab),
+            -float("inf"),
+            dtype=torch.float16,
+            device=device,
+        )
+        sparse_logits.scatter_(
+            1,
+            ids - rank * local_vocab,
+            values.to(torch.float16),
+        )
+        values, local_positions = torch.topk(sparse_logits, selector_k, dim=-1)
+        local_values.append(values)
+        local_ids.append(local_positions + rank * local_vocab)
+
+    gathered_values = torch.cat(local_values, dim=-1)
+    gathered_ids = torch.cat(local_ids, dim=-1)
+    actual_values, positions = torch.topk(gathered_values, selector_k, dim=-1)
+    actual_ids = gathered_ids.gather(-1, positions)
+    torch.accelerator.synchronize()
+
+    assert torch.equal(actual_ids, reference_ids)
+    assert torch.equal(actual_values, reference_values)
+    assert int(actual_ids.max()) < tp_size * local_vocab - final_padding
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm70_fused_top20_restores_dense_topk_tie_order(monkeypatch):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("the fused selector is SM70-only")
+    if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_workspace_out"):
+        pytest.skip("the SM70 TurboMind top-20 op is not built")
+
+    device = torch.device("cuda")
+    rows, hidden_size, local_vocab = 2, 16, 32
+    vocab_start = 96
+    candidate_ids = torch.tensor(
+        [
+            list(range(vocab_start + 19, vocab_start - 1, -1)),
+            list(range(vocab_start + 3, vocab_start + 23)),
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    candidate_values = torch.tensor(
+        [
+            [20, 19, 18, 17, 16, 15, 14, 13, 12, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2],
+            [
+                30,
+                29,
+                28,
+                27,
+                26,
+                25,
+                24,
+                23,
+                22,
+                21,
+                20,
+                19,
+                18,
+                17,
+                16,
+                16,
+                15,
+                14,
+                13,
+                12,
+            ],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    layer = SimpleNamespace(
+        weight=torch.empty(
+            (local_vocab, hidden_size), dtype=torch.float16, device=device
+        ),
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=vocab_start,
+            num_org_vocab_padding=0,
+        ),
+        _sm70_f16_prepared=True,
+        _sm70_f16_tm_weight=torch.empty(
+            (local_vocab, hidden_size), dtype=torch.float16, device=device
+        ),
+        _sm70_f16_k_ld=hidden_size,
+        _sm70_dflash2_top20_values=torch.empty(
+            (8, 20), dtype=torch.float32, device=device
+        ),
+        _sm70_dflash2_top20_ids=torch.empty((8, 20), dtype=torch.int64, device=device),
+        _sm70_dflash2_top20_values_fp16=torch.empty(
+            (8, 20), dtype=torch.float16, device=device
+        ),
+        _sm70_dflash2_sparse_logits=torch.empty(
+            (8, local_vocab), dtype=torch.float16, device=device
+        ),
+        _sm70_dflash2_local_values=torch.empty(
+            (8, 16), dtype=torch.float16, device=device
+        ),
+        _sm70_dflash2_local_ids=torch.empty((8, 16), dtype=torch.int64, device=device),
+        _sm70_dflash2_partial_values=torch.empty(
+            (8, 1, 20), dtype=torch.float32, device=device
+        ),
+        _sm70_dflash2_partial_ids=torch.empty(
+            (8, 1, 20), dtype=torch.int64, device=device
+        ),
+    )
+
+    def fake_top20(values_out, ids_out, *_args):
+        values_out.copy_(candidate_values)
+        ids_out.copy_(candidate_ids)
+
+    from vllm.model_executor.layers import vocab_parallel_embedding
+
+    monkeypatch.setattr(
+        vocab_parallel_embedding.envs,
+        "VLLM_SM70_DFLASH2_FUSED_SELECTOR",
+        True,
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding.sm70_ops,
+        "sm70_f16_lm_head_top20_tc_workspace_out",
+        fake_top20,
+    )
+
+    hidden = torch.zeros((rows, hidden_size), dtype=torch.float16, device=device)
+    actual_values, actual_ids = _maybe_sm70_dflash2_lm_head_top20(layer, hidden, 16)
+    dense_sparse = torch.full(
+        (rows, local_vocab),
+        -float("inf"),
+        dtype=torch.float16,
+        device=device,
+    )
+    dense_sparse.scatter_(
+        1,
+        candidate_ids - vocab_start,
+        candidate_values.to(torch.float16),
+    )
+    expected_values, expected_ids = torch.topk(dense_sparse, 16, dim=-1)
+    expected_ids += vocab_start
+
+    assert torch.equal(actual_values, expected_values)
+    assert torch.equal(actual_ids, expected_ids)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm70_fused_top20_workspace_is_cudagraph_stable(monkeypatch):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("the fused selector is SM70-only")
+    if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_workspace_out"):
+        pytest.skip("the graph-safe SM70 TurboMind top-20 op is not built")
+
+    from vllm import _sm70_ops
+    from vllm.model_executor.layers import vocab_parallel_embedding
+
+    torch.manual_seed(45)
+    device = torch.device("cuda")
+    rows, hidden_size, local_vocab, selector_k = 7, 64, 256, 16
+    vocab_start = 512
+    weight = torch.randn(local_vocab, hidden_size, dtype=torch.float16, device=device)
+    prepared_weight, prepared_meta = _sm70_ops.sm70_f16_prepare(weight)
+    layer = SimpleNamespace(
+        weight=weight,
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=vocab_start,
+            num_org_vocab_padding=0,
+        ),
+        _sm70_f16_prepared=True,
+        _sm70_f16_tm_weight=prepared_weight,
+        _sm70_f16_k_ld=int(prepared_meta[0].item()),
+        _sm70_dflash2_top20_values=torch.empty(
+            (8, 20), dtype=torch.float32, device=device
+        ),
+        _sm70_dflash2_top20_ids=torch.empty((8, 20), dtype=torch.int64, device=device),
+        _sm70_dflash2_top20_values_fp16=torch.empty(
+            (8, 20), dtype=torch.float16, device=device
+        ),
+        _sm70_dflash2_sparse_logits=torch.empty(
+            (8, local_vocab), dtype=torch.float16, device=device
+        ),
+        _sm70_dflash2_local_values=torch.empty(
+            (8, selector_k), dtype=torch.float16, device=device
+        ),
+        _sm70_dflash2_local_ids=torch.empty(
+            (8, selector_k), dtype=torch.int64, device=device
+        ),
+        _sm70_dflash2_partial_values=torch.empty(
+            (8, 1, 20), dtype=torch.float32, device=device
+        ),
+        _sm70_dflash2_partial_ids=torch.empty(
+            (8, 1, 20), dtype=torch.int64, device=device
+        ),
+    )
+    monkeypatch.setattr(
+        vocab_parallel_embedding.envs,
+        "VLLM_SM70_DFLASH2_FUSED_SELECTOR",
+        True,
+    )
+    static_hidden = torch.randn(rows, hidden_size, dtype=torch.float16, device=device)
+
+    values = layer._sm70_dflash2_top20_values[:rows]
+    ids = layer._sm70_dflash2_top20_ids[:rows]
+    values_fp16 = layer._sm70_dflash2_top20_values_fp16[:rows]
+    sparse_logits = layer._sm70_dflash2_sparse_logits[:rows]
+    local_values = layer._sm70_dflash2_local_values[:rows]
+    local_ids = layer._sm70_dflash2_local_ids[:rows]
+
+    def run_workspace_selector() -> None:
+        _sm70_ops.sm70_f16_lm_head_top20_tc_workspace_out(
+            values,
+            ids,
+            layer._sm70_dflash2_partial_values,
+            layer._sm70_dflash2_partial_ids,
+            static_hidden,
+            prepared_weight,
+            layer._sm70_f16_k_ld,
+            vocab_start,
+            0,
+        )
+        values_fp16.copy_(values)
+        ids.sub_(vocab_start)
+        sparse_logits.fill_(-float("inf"))
+        sparse_logits.scatter_(1, ids, values_fp16)
+        torch.topk(
+            sparse_logits,
+            selector_k,
+            dim=-1,
+            sorted=True,
+            out=(local_values, local_ids),
+        )
+        local_ids.add_(vocab_start)
+
+    # Warm all kernels before capture, then replay with different inputs. The
+    # output must follow the replay input rather than capture-time workspace.
+    run_workspace_selector()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_workspace_selector()
+
+    replay_hidden = torch.randn_like(static_hidden)
+    static_hidden.copy_(replay_hidden)
+    graph.replay()
+    torch.accelerator.synchronize()
+    dense_logits = torch.mm(replay_hidden, weight.t())
+    expected_values, expected_ids = torch.topk(dense_logits, selector_k, dim=-1)
+    expected_ids += vocab_start
+
+    assert torch.equal(local_values, expected_values)
+    assert torch.equal(local_ids, expected_ids)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compiling", [False, True])
+def test_sm70_fused_selector_falls_back_for_compiled_or_cudagraph(
+    monkeypatch, compiling
+):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("the fused selector is SM70-only")
+
+    from vllm.model_executor.layers import vocab_parallel_embedding
+
+    monkeypatch.setattr(
+        vocab_parallel_embedding.envs,
+        "VLLM_SM70_DFLASH2_FUSED_SELECTOR",
+        True,
+    )
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: not compiling
+    )
+    layer = SimpleNamespace(_sm70_f16_prepared=True)
+    hidden = torch.empty((7, 16), dtype=torch.float16, device="cuda")
+
+    assert _maybe_sm70_dflash2_lm_head_top20(layer, hidden, 16) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm70_fused_selector_is_not_prepared_for_flash_v100_compiled_graph(
+    monkeypatch,
+):
+    from vllm.model_executor.layers import vocab_parallel_embedding
+
+    monkeypatch.setattr(
+        vocab_parallel_embedding.envs,
+        "VLLM_SM70_DFLASH2_FUSED_SELECTOR",
+        True,
+    )
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
+    layer = SimpleNamespace(_sm70_f16_prepared=True)
+    hidden = torch.empty((7, 16), dtype=torch.float16, device="cuda")
+
+    assert _maybe_sm70_dflash2_lm_head_top20(layer, hidden, 16) is None
 
 
 @pytest.mark.parametrize(
