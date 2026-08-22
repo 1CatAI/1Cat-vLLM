@@ -421,6 +421,60 @@ Goal:
   trace lacks supported replay NVTX ranges and is therefore not fed through the
   generic per-token parser; control and candidate will be recaptured with the
   same replay markers rather than manufacturing a partial comparison.
+- A stricter re-audit of the retained endpoint JSONs intersects the long-output
+  requests by `dataset_index` and requires both implementations to emit at
+  least 512 tokens. Across those 11 matched requests, vLLM uses 40.7194 ms per
+  verification round (`decode_time / num_drafts`) and SGLang uses at most
+  26.7101 ms (`request_elapsed_seconds / spec_verify_ct`), leaving a gap of at
+  least 14.0093 ms. The SGLang field includes prefill and is therefore an upper
+  bound on its decode-round cost. The earlier 40.7148/26.8166 ms values use the
+  independently selected 13/14-request long-output subsets and remain useful
+  aggregate references, but they are not a strictly paired endpoint statistic.
+- Re-parsing the existing node traces by complete round and taking the slowest
+  TP rank for every interval gives the following diagnostic wall table. These
+  values include graph-node tracing overhead and must not replace the endpoint
+  numbers above.
+
+  | traced phase | vLLM mean / p50 / p90 / p99 (ms) | SGLang mean / p50 / p90 / p99 (ms) | vLLM / SGLang launches per rank |
+  | --- | --- | --- | ---: |
+  | draft Graph | 4.065 / 4.028 / 4.073 / 4.088 | 3.961 / 3.928 / 4.123 / 4.193 | 185 / 158 |
+  | draft to target | 18.382 / 17.660 / 21.258 / 22.690 | 3.517 / 3.423 / 3.660 / 4.066 | 431 / 30 |
+  | target Graph | 24.835 / 24.880 / 24.943 / 24.995 | 19.723 / 19.600 / 19.939 / 20.526 | 2612 / 1130 |
+  | target to next draft | 2.791 / 2.793 / 2.806 / 2.809 | 4.216 / 4.188 / 4.332 / 4.402 | 63 / 125 |
+  | complete traced round | 49.860 / 49.145 / 52.410 / 54.266 | 31.212 / 31.038 / 31.905 / 31.906 | n/a |
+
+  Per-phase critical-rank means are diagnostic and are not strictly additive;
+  the complete-round row is measured directly from draft-Graph start to the
+  next draft-Graph start.
+- The 431-kernel vLLM draft-to-target interval now has an exact launch
+  accounting. Repeated GDN state-contract compaction and its generic
+  indexing/copy/scan helpers consume 423 launches and about 1.276 ms of
+  rank-average GPU service; block-table, slot, RoPE, and input mapping consume
+  seven launches and about 0.044 ms; the final TP4 reduce/synchronization is one
+  launch and averages about 0.598 ms. That reduce is primarily a rank-skew wait
+  at this boundary (0.128 ms p50, 1.339 ms p90, 6.241 ms p99), not a stable
+  0.598 ms compute kernel. SGLang reaches the target with 30 launches and about
+  0.115 ms GPU service. This makes removal of the ten repeated group contracts
+  the first optimization, before tuning the boundary collective itself.
+- Inside the target Graph, both implementations spend essentially the same
+  time in 256 target FP8 GEMMs (10.850 versus 10.570 ms of rank-average GPU
+  service). vLLM's excess is concentrated in 1,422 generic vectorized,
+  unrolled, and elementwise copy nodes (4.621 ms) versus SGLang's 211 nodes
+  (0.667 ms), plus the TP reduction path (2.350 ms on vLLM's slowest rank versus
+  1.603 ms on SGLang's slowest rank). Attention and KV-cache service are close.
+  SGLang includes roughly 0.979 ms of target LM-head GEMM and 0.129 ms of TP
+  all-gather inside its target Graph, whereas vLLM launches the corresponding
+  work after the graph; semantic comparisons must retain this boundary
+  difference.
+- With the repaired corpus-wide pooled acceptance length of 4.5644, the
+  current 40.7148 ms round cost corresponds to about 112 emitted tokens/s
+  before request-level residuals. A 32 ms round is only an intermediate gate
+  (about 143 tokens/s), and SGLang parity near 26.8 ms is about 170 tokens/s at
+  the same pooled acceptance. Reaching the requested 200 tokens/s without
+  relying on a higher acceptance length requires approximately 22.82 ms per
+  round. The optimization sequence is therefore persistent/fused GDN metadata,
+  removal of target-Graph copy/state fan-out, then the TP4 reduction path;
+  proposal/selector work is not on the critical gap.
 - SGLang PR #26520's final-state recomputation path is not selected for this
   B1 lane. Its own acceptance-aligned result is 2.5% lower throughput than the
   cached-state control. vLLM already writes speculative intermediate states to
