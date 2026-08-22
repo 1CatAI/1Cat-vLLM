@@ -369,7 +369,7 @@ def main() -> int:
             "torch_cuda": torch.version.cuda,
             "cuda_device_count": torch.accelerator.device_count(),
             "device_capabilities": [
-                list(torch.cuda.get_device_capability(index))
+                list(torch.accelerator.get_device_capability(index))
                 for index in range(torch.accelerator.device_count())
             ],
             "c_extension": str(c_extension),
