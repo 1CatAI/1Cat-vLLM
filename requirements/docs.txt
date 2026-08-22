@@ -6,7 +6,7 @@ babel==2.18.0
     # via
     #   mkdocs-git-revision-date-localized-plugin
     #   mkdocs-material
-backrefs==7.0
+backrefs==8.0
     # via mkdocs-material
 bracex==2.6
     # via wcmatch
@@ -167,6 +167,7 @@ smmap==5.0.3
     # via gitdb
 typing-extensions==4.15.0
     # via
+    #   mkdocstrings-python
     #   pydantic
     #   pydantic-core
     #   typing-inspection
