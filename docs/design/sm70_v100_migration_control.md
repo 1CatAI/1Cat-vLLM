@@ -218,6 +218,60 @@ Goal:
   not run. A future graph-capable fusion must first beat dense M=7 without
   duplicate-weight capacity loss and then re-enter the full long-context gate.
 
+### DFlash acceptance root-cause repair, 2026-08-22
+
+- A same-machine 64-prompt GSM8K audit held the FP8 target, E5M2 target KV,
+  FP16/auto draft KV, TP4, official probabilistic sampling, seven draft tokens,
+  Flash-V100, CUDA Graph, prompt order, and single-request sequencing fixed.
+  Before the repair, vLLM averaged 4.5395 completion tokens per verification
+  step versus 5.2489 for `haohervchb/sglang-V100`; the paired prompt delta was
+  0.7094 with a 95% interval of [0.5882, 0.8306]. This excludes target FP8 as
+  the explanation for the acceptance gap.
+- The MRV2 backport copied the grouped DFlash K-normalization call from upstream:
+  input `[L, num_ctx, num_kv_heads, head_dim]` with weights `[L, head_dim]`.
+  It omitted upstream dependency commit `02a1f23711`, whose stable RMSNorm
+  kernel uses the outer layer index to select each weight row. The local kernel
+  still treated every weight as one-dimensional and silently applied row zero
+  to all five draft layers. Checkpoint rows are not interchangeable: layers
+  1-4 differ from layer zero by 0.468-0.621 mean absolute weight and
+  0.383-0.443 relative L2.
+- SGLang-V100 is unaffected because both paths preserve layer ownership: its
+  sequential fallback calls each layer's `k_norm`, and its fused Triton
+  materializer indexes `layer_id * k_norm_weight_stride_layer`. This is the
+  implementation difference that explains why SGLang acceptance was normal.
+- Commit `c53b7974fb` restores the exact missing dependency semantics while
+  retaining the local SM70 RMSNorm additions. One-dimensional weights keep
+  stride zero; two-dimensional weights require `[input.size(0), hidden]` and
+  select the row from the outermost input dimension. Invalid rank and shape are
+  rejected instead of silently producing the wrong draft KV.
+- The V100 kernel regression passes 13/13 cases for FP16, BF16, and FP32,
+  3D/4D inputs, the real DFlash `[L, context, kv_heads, 128]` layout, a
+  non-power-of-two hidden size, and shape validation. Batched output is bitwise
+  identical to looping the original one-row RMSNorm. The repaired extension is
+  `7689e5e298be64a83c9f9743e08a073e857a5a4c89a79837396d05b37303d449`.
+- The final 64-prompt repaired run averages 5.3888 per request and 4.5644 pooled,
+  versus 4.5395/3.9725 before repair and 5.2489/4.3571 for SGLang-V100. The
+  repaired-minus-control paired delta is 0.8493 with a 95% interval of
+  [0.7226, 0.9760]; it wins 60 of 64 matched prompts. Repaired per-position
+  acceptance is `[85.833,70.569,57.920,46.887,38.032,31.342,25.861]%`, above
+  SGLang-V100 at every position and within 0.0712 of the public official 5.46
+  GSM8K mean.
+- Acceptance recovery raises same-route aggregate output throughput from
+  97.080 to 108.826 tok/s (+12.10%) and mean steady decode from 115.394 to
+  134.940 tok/s (+16.94%). The repaired vLLM path remains slower than the
+  separately measured SGLang-V100 aggregate 156.063 tok/s, so acceptance is
+  closed but the remaining execution-speed gap is a distinct optimization item.
+- Evidence is retained in
+  `/data/models/v100-dflash2-20260820/pr3/acceptance-rootcause/` as
+  `dflash2-probabilistic-graph-{zlabshuffle42,fixed-batchedrmsnorm-zlabshuffle42}-randomseed-first64-officialprompt-e5m2-o4096.json`;
+  the SGLang comparison is
+  `/data/models/v100-dflash2-20260820/sglang-audit/sglang-dflash2-graph-zlabshuffle42-randomseed-first64-officialprompt-e5m2-o4096.json`.
+  Earlier four-prompt and selector-pair acceptance values predate this repair
+  and remain route/equality diagnostics only; do not cite them as DFlash2
+  acceptance baselines. A BF16 target rerun is intentionally unnecessary
+  because the causal A/B kept the same FP8 target and changed only K-norm row
+  selection.
+
 Main implementation priority:
 
 1. Add a decoupled SM70 TurboMind backend for AWQ and FP8 base GEMM.
