@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     is_conv_state_dim_first,
@@ -37,6 +38,8 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -106,6 +109,10 @@ class MambaHybridModelState(DefaultModelState):
             and speculative_config.use_dflash()
             and "DFlash2DraftModel" in draft_architectures
         )
+        if self._use_dflash2_common_gdn_metadata:
+            logger.info_once(
+                "DFlash2 shared GDN batch metadata fast path enabled."
+            )
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.full(
