@@ -6431,13 +6431,15 @@ def qwen_gdn_attention_core_spec_commit(
             max_query_len=spec_state_indices_tensor.size(-1),
             validate_data=False,
         )
-        if self._can_use_dflash2_packed_gdn_verify(
-            mixed_qkv=mixed_qkv_spec,
-            a=a,
-            b=b,
-            core_attn_out=core_attn_out,
-            ssm_state=ssm_state,
-            attn_metadata=attn_metadata,
+        if isinstance(self, QwenGatedDeltaNetAttention) and (
+            self._can_use_dflash2_packed_gdn_verify(
+                mixed_qkv=mixed_qkv_spec,
+                a=a,
+                b=b,
+                core_attn_out=core_attn_out,
+                ssm_state=ssm_state,
+                attn_metadata=attn_metadata,
+            )
         ):
             self._forward_dflash2_packed_gdn_verify(
                 mixed_qkv=mixed_qkv_spec,
