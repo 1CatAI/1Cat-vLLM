@@ -69,7 +69,8 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right
+    const int window_size_right,
+    const int batch_context_max_seq_len
 );
 
 at::Tensor flash_attention_decode_paged_xqa_staged(

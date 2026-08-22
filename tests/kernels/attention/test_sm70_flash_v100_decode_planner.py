@@ -188,6 +188,54 @@ def test_static_decode_short_workspace_can_preserve_partition_boundaries(
     assert plan.workspace_num_partitions == 4
 
 
+@pytest.mark.parametrize(
+    ("max_seq_len", "workspace_seq_capacity", "routing_enabled", "expected_hint"),
+    (
+        (4096, 8191, True, 8191),
+        (16001, 262144, True, 262144),
+        (4096, 8191, False, 0),
+    ),
+)
+def test_xqa_batch_context_route_receives_graph_capacity(
+    monkeypatch,
+    max_seq_len,
+    workspace_seq_capacity,
+    routing_enabled,
+    expected_hint,
+) -> None:
+    _clear_decode_caches()
+    captured_hints: list[int] = []
+
+    def fake_xqa(*args):
+        captured_hints.append(args[-1])
+        return torch.empty_like(args[0])
+
+    monkeypatch.setattr(
+        flash_attn_v100.flash_attn_v100_cuda,
+        "decode_paged_xqa_fwd",
+        fake_xqa,
+    )
+    q = torch.empty((4, 6, 256), dtype=torch.float16)
+    k_cache = torch.empty((2048, 16, 1, 256), dtype=torch.uint8)
+    v_cache = torch.empty_like(k_cache)
+    block_table = torch.zeros((4, 2048), dtype=torch.int32)
+    seq_lens = torch.full((4,), max_seq_len, dtype=torch.int32)
+
+    flash_attn_v100.flash_attn_decode_paged_xqa(
+        q,
+        k_cache,
+        v_cache,
+        block_table,
+        seq_lens,
+        kv_cache_dtype="fp8_e5m2",
+        max_seq_len_hint=max_seq_len,
+        workspace_seq_capacity_hint=workspace_seq_capacity,
+        batch_context_routing=routing_enabled,
+    )
+
+    assert captured_hints == [expected_hint]
+
+
 @torch.inference_mode()
 def test_stale_active_num_partitions_does_not_truncate_decode(
     monkeypatch,

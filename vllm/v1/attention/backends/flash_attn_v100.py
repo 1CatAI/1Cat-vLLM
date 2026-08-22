@@ -43,6 +43,7 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
     causal: bool
     max_model_len: int
     flash_v100_cudagraph_capture: bool
+    flash_v100_batch_context_routing: bool
     flash_v100_contig_dense_cache: dict[tuple[int, int, int, int, int], int]
     flash_v100_decode_max_seq_len_hint: int | None
     flash_v100_decode_workspace_seq_capacity_hint: int | None
@@ -2461,10 +2462,30 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         spec_config = getattr(self.vllm_config, "speculative_config", None)
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        model_config = self.vllm_config.model_config
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
+        num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
+        head_dim = getattr(hf_text_config, "head_dim", None)
+        batch_context_shape_supported = (
+            isinstance(num_attention_heads, int)
+            and isinstance(num_key_value_heads, int)
+            and num_key_value_heads > 0
+            and num_attention_heads == 6 * num_key_value_heads
+            and head_dim == 256
+        )
         self._is_speculative_draft_model = (
             spec_config is not None
             and getattr(spec_config, "draft_model_config", None)
             is self.vllm_config.model_config
+        )
+        self._batch_context_routing_enabled = (
+            envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING
+            and envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is None
+            and spec_config is None
+            and getattr(cache_config, "cache_dtype", None) == "fp8_e5m2"
+            and batch_context_shape_supported
         )
         self._draft_block_table: torch.Tensor | None = None
         self._draft_seq_lens: torch.Tensor | None = None
@@ -2504,6 +2525,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         flash_metadata.causal = common_attn_metadata.causal
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
+        flash_metadata.flash_v100_batch_context_routing = (
+            self._batch_context_routing_enabled
+        )
 
     def _attach_ddtree_metadata(
         self,
@@ -5408,6 +5432,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     None,
                 ),
                 partition_size_hint=partition_size_hint,
+                batch_context_routing=bool(
+                    getattr(
+                        attn_metadata,
+                        "flash_v100_batch_context_routing",
+                        False,
+                    )
+                ),
             )
             _record_route("decode_xqa_paged")
             return output

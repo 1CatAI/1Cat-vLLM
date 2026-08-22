@@ -239,6 +239,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
+    VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE: str | None = None
     VLLM_SM70_REJECTION_PROFILE: bool = False
     VLLM_SM70_REJECTION_PROFILE_INTERVAL: int = 20
@@ -344,6 +345,10 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE: bool = True
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS: int = 8
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE: bool = False
+    VLLM_FLASH_V100_XQA_G6_DUAL_CTA: bool = False
+    VLLM_FLASH_V100_XQA_SPLIT_REDUCE: bool = False
+    VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING: bool = True
+    VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE: bool = False
     VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA: bool = True
     VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE: bool = True
     VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN: int = 61633
@@ -2009,6 +2014,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
         "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
     ),
+    "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
+        "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
+    ),
     "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE": lambda: os.getenv(
         "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE"
     ),
@@ -2326,6 +2334,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))
+    ),
+    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))
+    ),
+    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))
+    ),
+    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))
+    ),
+    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE", "0"))
     ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))

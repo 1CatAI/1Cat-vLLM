@@ -4,6 +4,7 @@
 #include <mma.h>
 #include <torch/extension.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <string>
 #include <type_traits>
@@ -265,6 +266,102 @@ int xqa_g6_p1024_sawtooth_p1024_final_seq_len() {
 bool xqa_split_reduce_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE");
   return value != nullptr && value[0] == '1';
+}
+
+enum class XQABatchContextRoute : int {
+  kDisabled = -1,
+  kBaseline = 0,
+  kDualCta = 1,
+  kDualCtaSplit = 2,
+};
+
+bool xqa_batch_context_routing_enabled() {
+  const char* value = std::getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING");
+  return value == nullptr || value[0] != '0';
+}
+
+bool xqa_batch_context_routing_trace_enabled() {
+  const char* value =
+      std::getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE");
+  return value != nullptr && value[0] == '1';
+}
+
+XQABatchContextRoute select_xqa_batch_context_route(const int batch_size,
+                                                    const int max_seq_len,
+                                                    const int partition_size) {
+  if (!xqa_batch_context_routing_enabled() || batch_size < 4 ||
+      max_seq_len <= 0) {
+    return XQABatchContextRoute::kDisabled;
+  }
+  if (batch_size <= 4) {
+    if (max_seq_len <= 8191) {
+      return XQABatchContextRoute::kBaseline;
+    }
+    if (max_seq_len <= 12287) {
+      return XQABatchContextRoute::kDualCta;
+    }
+    return partition_size == 1024 ? XQABatchContextRoute::kBaseline
+                                  : XQABatchContextRoute::kDualCtaSplit;
+  }
+  if (batch_size <= 8) {
+    if (max_seq_len <= 4095) {
+      return XQABatchContextRoute::kBaseline;
+    }
+    return max_seq_len <= 12287 ? XQABatchContextRoute::kDualCta
+                                : XQABatchContextRoute::kDualCtaSplit;
+  }
+  if (batch_size <= 12) {
+    if (max_seq_len <= 2047) {
+      return XQABatchContextRoute::kBaseline;
+    }
+    return max_seq_len <= 16000 ? XQABatchContextRoute::kDualCta
+                                : XQABatchContextRoute::kDualCtaSplit;
+  }
+  return max_seq_len <= 12287 ? XQABatchContextRoute::kBaseline
+                              : XQABatchContextRoute::kDualCta;
+}
+
+const char* xqa_batch_context_route_name(const XQABatchContextRoute route) {
+  switch (route) {
+    case XQABatchContextRoute::kBaseline:
+      return "baseline";
+    case XQABatchContextRoute::kDualCta:
+      return "dual_cta";
+    case XQABatchContextRoute::kDualCtaSplit:
+      return "dual_cta_split";
+    default:
+      return "disabled";
+  }
+}
+
+void trace_xqa_batch_context_route(const int batch_size, const int max_seq_len,
+                                   const int partition_size,
+                                   const int block_size,
+                                   const XQABatchContextRoute route) {
+  if (!xqa_batch_context_routing_trace_enabled() ||
+      route == XQABatchContextRoute::kDisabled) {
+    return;
+  }
+  const int batch_class = batch_size <= 4    ? 0
+                          : batch_size <= 8  ? 1
+                          : batch_size <= 12 ? 2
+                                             : 3;
+  const int context_class = max_seq_len <= 4095    ? 0
+                            : max_seq_len <= 8191  ? 1
+                            : max_seq_len <= 12287 ? 2
+                            : max_seq_len <= 16000 ? 3
+                                                   : 4;
+  const unsigned long long bit =
+      1ULL << (batch_class * 15 + context_class * 3 + static_cast<int>(route));
+  static std::atomic<unsigned long long> traced_routes{0};
+  const unsigned long long previous =
+      traced_routes.fetch_or(bit, std::memory_order_relaxed);
+  if ((previous & bit) == 0) {
+    TORCH_WARN("Flash-V100 XQA batch/context route active: batch=", batch_size,
+               ", max_seq_len=", max_seq_len,
+               ", partition_size=", partition_size, ", block_size=", block_size,
+               ", route=", xqa_batch_context_route_name(route));
+  }
 }
 
 int xqa_block16_layout_mode() {
@@ -2563,7 +2660,7 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right, const int batch_context_max_seq_len) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k_cache and v_cache must be on CUDA");
@@ -2702,6 +2799,20 @@ at::Tensor flash_attention_decode_paged_xqa(
       kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 &&
       !decode_partition_size_overridden() && xqa_e5m2_g6_dual_cta_enabled() &&
       xqa_e5m2_g6_split_reduce_enabled();
+  const bool batch_context_page_supported =
+      k_cache.size(1) == 16 ||
+      (k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0);
+  const bool use_e5m2_g6_batch_context_route =
+      batch_context_max_seq_len > 0 && q.size(0) >= 4 && q_per_kv == 6 &&
+      batch_context_page_supported && k_cache.size(2) == 1 &&
+      k_cache.scalar_type() == at::kByte &&
+      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 &&
+      !decode_partition_size_overridden();
+  const XQABatchContextRoute batch_context_route =
+      use_e5m2_g6_batch_context_route
+          ? select_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
+                                           partition_size)
+          : XQABatchContextRoute::kDisabled;
   const int e5m2_g6_dual_cta_seq_len =
       use_e5m2_g6_dual_cta
           ? at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount *
@@ -2732,10 +2843,13 @@ at::Tensor flash_attention_decode_paged_xqa(
   const bool use_g6_dual_cta =
       use_g6_p1024_auto || use_g6_p1024_sawtooth || use_mtp5_dual_cta ||
       use_e5m2_g6_dual_cta ||
+      batch_context_route == XQABatchContextRoute::kDualCta ||
+      batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
       (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
-  const bool use_split_reduce = use_g6_p1024_auto || use_g6_p1024_sawtooth ||
-                                use_e5m2_g6_dual_cta ||
-                                (use_g6_dual_cta && xqa_split_reduce_enabled());
+  const bool use_split_reduce =
+      use_g6_p1024_auto || use_g6_p1024_sawtooth || use_e5m2_g6_dual_cta ||
+      batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
+      (use_g6_dual_cta && xqa_split_reduce_enabled());
   const bool supports_block16_index = use_g6_dual_cta && k_cache.size(1) == 16;
   const bool supports_block16_contiguous_layout =
       supports_block16_index && k_cache.size(2) == 1 &&
@@ -2762,6 +2876,9 @@ at::Tensor flash_attention_decode_paged_xqa(
         k_cache.stride(0), ",", k_cache.stride(1), ",", k_cache.stride(2), ",",
         k_cache.stride(3), "]");
   }
+  trace_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
+                                partition_size, k_cache.size(1),
+                                batch_context_route);
   static bool traced_block16_layout = false;
   if (xqa_block16_layout_trace_enabled() && block16_layout_mode != 0 &&
       !traced_block16_layout) {
