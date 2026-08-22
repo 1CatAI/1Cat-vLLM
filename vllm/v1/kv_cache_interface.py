@@ -404,6 +404,47 @@ class HiddenStateCacheSpec(MLAAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class PrefixAnchoredSWASpec(FullAttentionSpec):
+    """KV cache spec for prefix-anchored sliding-window attention.
+
+    Prefill (prompt/prefix) tokens are always globally visible.
+    Only the last ``decode_sliding_window`` generated tokens are kept in the
+    KV cache; gap blocks (between the prefill tail and the current decode
+    window) are evicted during each decode step to bound per-request memory
+    at O(prefix_blocks + window_blocks).
+    """
+
+    decode_sliding_window: int
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, PrefixAnchoredSWASpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be "
+            "PrefixAnchoredSWASpec."
+        )
+        windows = {spec.decode_sliding_window for spec in specs}
+        assert len(windows) == 1, (
+            "All prefix-anchored SWA layers must share the same "
+            f"decode_sliding_window, got {windows}"
+        )
+        # Delegate common field merging to the parent, then reattach the
+        # decode window.
+        base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
+        return cls(
+            block_size=base.block_size,
+            num_kv_heads=base.num_kv_heads,
+            head_size=base.head_size,
+            head_size_v=base.head_size_v,
+            dtype=base.dtype,
+            kv_quant_mode=base.kv_quant_mode,
+            page_size_padded=base.page_size_padded,
+            sliding_window=base.sliding_window,
+            attention_chunk_size=base.attention_chunk_size,
+            decode_sliding_window=windows.pop(),
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
     attention_chunk_size: int
 

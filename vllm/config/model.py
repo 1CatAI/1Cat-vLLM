@@ -1280,6 +1280,14 @@ class ModelConfig:
     def is_mm_prefix_lm(self) -> bool:
         return self.model_arch_config.is_mm_prefix_lm
 
+    @property
+    def decode_sliding_window(self) -> int | None:
+        """Prefix-anchored sliding-window size over generated tokens.
+
+        The prompt/prefix stays globally attended; ``None`` disables it.
+        """
+        return self.model_arch_config.decode_sliding_window
+
     def get_head_size(self) -> int:
         return self.model_arch_config.head_size
 

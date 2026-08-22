@@ -216,6 +216,47 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
 
 
+def apply_decode_sliding_window_constraints(
+    model_config, attention_config, cache_config
+) -> None:
+    """Enforce prefix-anchored sliding-window attention constraints.
+
+    Only the FLASH_ATTN_V100 kernels (masked template instantiations)
+    apply the anchored decode-window mask, so any other backend would
+    silently skip the mask while the KV cache manager evicts gap blocks.
+    And a decode token's KV under that mask is not a pure causal function
+    of the prefix, so it must never be reused across requests via prefix
+    caching.
+    """
+    if getattr(model_config, "decode_sliding_window", None) is None:
+        return
+
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    supported_backends = (AttentionBackendEnum.FLASH_ATTN_V100,)
+    backend = attention_config.backend
+    if backend is None:
+        attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
+        logger.info(
+            "Prefix-anchored sliding-window attention: auto-selecting the "
+            "FLASH_ATTN_V100 backend (SM70-native kernels with the "
+            "anchored decode-window mask)."
+        )
+    elif backend not in supported_backends:
+        raise ValueError(
+            "decode_sliding_window (prefix-anchored sliding-window "
+            f"attention) is not supported by attention backend "
+            f"{backend.name}; it requires FLASH_ATTN_V100. "
+            "Use one of those backends or unset decode_sliding_window."
+        )
+    if cache_config.enable_prefix_caching:
+        cache_config.enable_prefix_caching = False
+        logger.info(
+            "Prefix-anchored sliding-window attention: disabling prefix "
+            "caching (windowed decode KV is not reusable across requests)."
+        )
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -923,6 +964,11 @@ class VllmConfig:
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
+
+        if self.model_config is not None:
+            apply_decode_sliding_window_constraints(
+                self.model_config, self.attention_config, self.cache_config
+            )
 
         if (
             self.mamba_config.enable_stochastic_rounding
@@ -1715,6 +1761,23 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.FULL_DECODE_ONLY
                     )
+
+            # Prefix-anchored sliding-window attention: full-graph capture
+            # bakes attention metadata that carries no per-request anchor
+            # lengths, so the anchored decode-window mask cannot run inside a
+            # full cudagraph. Piecewise graphs keep attention outside capture.
+            if (
+                self.model_config is not None
+                and self.model_config.decode_sliding_window is not None
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                logger.info(
+                    "Prefix-anchored sliding-window attention does not "
+                    "support full cudagraphs. Overriding cudagraph_mode "
+                    "from %s to PIECEWISE.",
+                    self.compilation_config.cudagraph_mode.name,
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
             # Check if KV connector requires PIECEWISE mode for CUDA graphs
             if (

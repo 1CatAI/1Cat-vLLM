@@ -428,6 +428,13 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
                     f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
                 )
 
+        # Prefix-anchored SWA: the language model reads
+        # ``decode_sliding_window`` from its own (text) config, so propagate
+        # the top-level setting before building it.
+        decode_sliding_window = getattr(config, "decode_sliding_window", None)
+        if decode_sliding_window is not None:
+            self.text_config.decode_sliding_window = decode_sliding_window
+
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
                 vllm_config=vllm_config,

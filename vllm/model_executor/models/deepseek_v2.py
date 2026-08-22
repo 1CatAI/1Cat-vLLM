@@ -45,7 +45,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention import Attention, PrefixAnchoredSWAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -172,15 +172,33 @@ class DeepseekAttention(nn.Module):
             max_position=max_position_embeddings,
             rope_parameters=config.rope_parameters,
         )
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
+        # Prefix-anchored sliding-window attention: enabled when the model's
+        # HF config carries ``decode_sliding_window`` (validated on the
+        # DeepSeek-OCR family). Off by default; plain attention otherwise.
+        decode_sliding_window = getattr(
+            vllm_config.model_config.hf_config, "decode_sliding_window", None
         )
+        if decode_sliding_window is not None:
+            self.attn = PrefixAnchoredSWAAttention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+                decode_sliding_window=decode_sliding_window,
+            )
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.attn",
+            )
 
     def forward(
         self,

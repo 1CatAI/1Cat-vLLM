@@ -389,6 +389,7 @@ def build_attn_metadata(
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
+    prefix_anchor_lens: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -421,6 +422,7 @@ def build_attn_metadata(
             causal=True,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
+            prefix_anchor_lens=prefix_anchor_lens,
             **common_attn_metadata_extra_kwargs,
         )
 

@@ -275,6 +275,12 @@ class ModelArchConfigConvertorBase:
             return False
         return self.hf_config.model_type in MM_PREFIX_LM_MODELS
 
+    def decode_sliding_window(self) -> int | None:
+        value = getattr(self.hf_config, "decode_sliding_window", None)
+        if value is None:
+            return None
+        return int(value)
+
     def derive_max_model_len_and_key(self) -> tuple[float, str | None]:
         derived_max_model_len = float("inf")
         possible_keys = [
@@ -326,6 +332,7 @@ class ModelArchConfigConvertorBase:
             is_deepseek_mla=self.is_deepseek_mla(),
             is_mm_prefix_lm=self.is_mm_prefix_lm(),
             derived_max_model_len_and_key=self.derive_max_model_len_and_key(),
+            decode_sliding_window=self.decode_sliding_window(),
         )
 
         return model_arch_config
