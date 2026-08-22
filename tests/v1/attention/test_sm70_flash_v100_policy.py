@@ -1723,6 +1723,98 @@ def test_flash_v100_fp8_xqa_graph_capture_uses_static_context_hint(
     assert mod._decode_fp8_xqa_allowed(metadata, torch.empty(1)) is expected
 
 
+@pytest.mark.parametrize(
+    ("routing_enabled", "expected_route"), ((True, "xqa"), (False, "scalar"))
+)
+def test_flash_v100_fp8_xqa_batch_context_graph_routing(
+    monkeypatch,
+    routing_enabled,
+    expected_route,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append(("xqa", kwargs.get("batch_context_routing", False)))
+        kwargs["out"].fill_(1)
+
+    def hit_scalar(*args, **kwargs):
+        calls.append(("scalar", False))
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        block_table=torch.zeros((4, 256), dtype=torch.int32),
+        seq_lens=torch.full((4,), 4095, dtype=torch.int32),
+        flash_v100_cudagraph_capture=True,
+        flash_v100_batch_context_routing=routing_enabled,
+        flash_v100_decode_max_seq_len_hint=4095,
+        flash_v100_decode_workspace_seq_capacity_hint=4095,
+        flash_v100_decode_active_num_partitions=torch.tensor([16], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((4, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 2, 16, 1, 256), dtype=torch.uint8)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == [(expected_route, routing_enabled and expected_route == "xqa")]
+    assert torch.all(output == 1)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "context_capacity", "routing_enabled", "expected"),
+    (
+        (16, 12287, True, 1024),
+        (16, 12288, True, None),
+        (12, 2047, True, None),
+        (16, 12287, False, None),
+    ),
+)
+def test_flash_v100_batch_context_b16_preserves_p1024_reduction(
+    monkeypatch,
+    batch_size,
+    context_capacity,
+    routing_enabled,
+    expected,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _batch_context_partition_size_hint,
+    )
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+    query = torch.empty((batch_size, 6, 256), dtype=torch.float16)
+    metadata = SimpleNamespace(
+        flash_v100_batch_context_routing=routing_enabled,
+        flash_v100_decode_max_seq_len_hint=context_capacity,
+        flash_v100_decode_workspace_seq_capacity_hint=context_capacity,
+    )
+
+    assert _batch_context_partition_size_hint(query, metadata) == expected
+
+
 def test_flash_v100_mtp5_dual_cta_partition_policy(monkeypatch):
     from vllm.v1.attention.backends import flash_attn_v100 as mod
 

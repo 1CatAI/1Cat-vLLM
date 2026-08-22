@@ -987,6 +987,7 @@ def flash_attn_decode_paged_xqa(
     workspace_seq_capacity_hint: int | None = None,
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
+    batch_context_routing: bool = False,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -1074,6 +1075,15 @@ def flash_attn_decode_paged_xqa(
             int(window_size_right),
         )
 
+    batch_context_max_seq_len = 0
+    if batch_context_routing:
+        batch_context_max_seq_len = max(
+            int(max_seq_len_hint or 0),
+            int(workspace_seq_capacity_hint or 0),
+        )
+        if batch_context_max_seq_len <= 0:
+            batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
+
     return flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
         k_cache,
@@ -1093,6 +1103,7 @@ def flash_attn_decode_paged_xqa(
         float(v_scale),
         int(window_size_left),
         int(window_size_right),
+        int(batch_context_max_seq_len),
     )
 
 

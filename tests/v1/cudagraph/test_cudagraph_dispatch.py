@@ -422,6 +422,8 @@ class TestCudagraphDispatcher:
             patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
             mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = False
+            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -452,6 +454,108 @@ class TestCudagraphDispatcher:
         )
         assert mode == CUDAGraphMode.FULL
         assert desc == BatchDescriptor(num_tokens=1, num_reqs=1, uniform=True)
+
+    @pytest.mark.parametrize(
+        ("num_tokens", "context_len", "expected_bucket"),
+        (
+            (4, 8191, 8191),
+            (4, 8192, 12287),
+            (4, 12288, None),
+            (8, 4095, 4095),
+            (8, 4096, 12287),
+            (8, 12288, None),
+            (16, 1024, 12287),
+            (16, 12287, 12287),
+            (16, 12288, None),
+            (16, 16001, None),
+        ),
+    )
+    def test_fp8_e5m2_batch_context_graph_routing_on_sm70(
+        self,
+        monkeypatch,
+        num_tokens,
+        context_len,
+        expected_bucket,
+    ):
+        monkeypatch.delenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", raising=False)
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=16)
+        config.cache_config.cache_dtype = "fp8_e5m2"
+        config.attention_config.backend = None
+        config.model_config.max_model_len = 262144
+        config.model_config.hf_text_config.num_attention_heads = 24
+        config.model_config.hf_text_config.num_key_value_heads = 4
+        config.model_config.hf_text_config.head_dim = 256
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
+        ):
+            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
+            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=num_tokens,
+            uniform_decode=True,
+            attention_context_len=context_len,
+        )
+
+        assert dispatcher.sm70_fp8_kv_batch_context_routing
+        assert mode == CUDAGraphMode.FULL
+        assert desc == BatchDescriptor(
+            num_tokens=num_tokens,
+            num_reqs=num_tokens,
+            uniform=True,
+            attention_context_bucket=expected_bucket,
+        )
+
+    def test_fp8_e5m2_batch_context_graph_routing_rollback(self, monkeypatch):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=16)
+        config.cache_config.cache_dtype = "fp8_e5m2"
+        config.model_config.max_model_len = 262144
+        config.model_config.hf_text_config.num_attention_heads = 24
+        config.model_config.hf_text_config.num_key_value_heads = 4
+        config.model_config.hf_text_config.head_dim = 256
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
+        ):
+            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
+            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = False
+            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        mode, desc = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            attention_context_len=4096,
+        )
+
+        assert not dispatcher.sm70_fp8_kv_batch_context_routing
+        assert mode == CUDAGraphMode.FULL
+        assert desc == BatchDescriptor(num_tokens=8, num_reqs=8, uniform=True)
 
     @pytest.mark.parametrize("cache_dtype", ("auto", "fp8_e4m3"))
     def test_fp8_e5m2_decode_context_bucket_does_not_match_other_cache_dtypes(

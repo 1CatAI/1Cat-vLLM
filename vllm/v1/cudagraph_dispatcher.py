@@ -14,6 +14,12 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
+_SM70_FP8_KV_BATCH_CONTEXT_BUCKETS = {
+    4: (8191, 12287),
+    8: (4095, 12287),
+    16: (12287,),
+}
+
 
 def _get_sm70_context_buckets(env_name: str) -> tuple[int, ...]:
     """Parse optional one-request attention graph context buckets."""
@@ -79,25 +85,23 @@ def _get_sm70_dsv4_decode_context_buckets(
     return (bucket,)
 
 
-def _get_sm70_fp8_kv_decode_context_buckets(
+def _is_sm70_fp8_kv_decode_shape(
     vllm_config: VllmConfig,
-) -> tuple[int, ...]:
-    """Select a scalar-only short graph for the SM70 E5M2 D256 route."""
-    env_name = "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
-    if env_name in os.environ:
-        return _get_sm70_context_buckets(env_name)
+    *,
+    q_per_kv_values: tuple[int, ...],
+) -> bool:
     if vllm_config.speculative_config is not None:
-        return ()
+        return False
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
     ):
-        return ()
+        return False
     if not envs.VLLM_SM70_FLASH_ATTN_V100:
-        return ()
+        return False
 
     cache_config = getattr(vllm_config, "cache_config", None)
     if getattr(cache_config, "cache_dtype", None) != "fp8_e5m2":
-        return ()
+        return False
 
     attention_config = getattr(vllm_config, "attention_config", None)
     attention_backend = getattr(attention_config, "backend", None)
@@ -106,24 +110,38 @@ def _get_sm70_fp8_kv_decode_context_buckets(
         "FLASH_ATTN_V100",
         "FLASHINFER_SM70",
     ):
-        return ()
+        return False
 
     model_config = vllm_config.model_config
     hf_text_config = getattr(model_config, "hf_text_config", None)
     num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
     num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
     head_dim = getattr(hf_text_config, "head_dim", None)
-    if not (
+    return bool(
         isinstance(num_attention_heads, int)
         and isinstance(num_key_value_heads, int)
         and num_key_value_heads > 0
         and num_attention_heads % num_key_value_heads == 0
-        and num_attention_heads // num_key_value_heads in (6, 8)
+        and num_attention_heads // num_key_value_heads in q_per_kv_values
         and head_dim == 256
+    )
+
+
+def _get_sm70_fp8_kv_decode_context_buckets(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...]:
+    """Select a scalar-only B1 graph for the SM70 E5M2 D256 route."""
+    env_name = "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
+    if env_name in os.environ:
+        return _get_sm70_context_buckets(env_name)
+    if not _is_sm70_fp8_kv_decode_shape(
+        vllm_config,
+        q_per_kv_values=(6, 8),
     ):
         return ()
 
     bucket = 8192
+    model_config = vllm_config.model_config
     max_model_len = getattr(model_config, "max_model_len", None)
     if not isinstance(max_model_len, int) or max_model_len <= bucket:
         return ()
@@ -136,6 +154,20 @@ def _get_sm70_fp8_kv_decode_context_buckets(
         env_name,
     )
     return (bucket,)
+
+
+def _sm70_fp8_kv_batch_context_routing_enabled(
+    vllm_config: VllmConfig,
+) -> bool:
+    if (
+        not envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING
+        or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is not None
+    ):
+        return False
+    return _is_sm70_fp8_kv_decode_shape(
+        vllm_config,
+        q_per_kv_values=(6,),
+    )
 
 
 class CudagraphDispatcher:
@@ -173,6 +205,9 @@ class CudagraphDispatcher:
         )
         self.sm70_fp8_kv_decode_context_buckets = (
             _get_sm70_fp8_kv_decode_context_buckets(vllm_config)
+        )
+        self.sm70_fp8_kv_batch_context_routing = (
+            _sm70_fp8_kv_batch_context_routing_enabled(vllm_config)
         )
         self._logged_sm70_context_bucket = False
 
@@ -310,25 +345,52 @@ class CudagraphDispatcher:
     def _active_context_buckets(self) -> tuple[int, ...]:
         if self.uniform_decode_query_len > 1:
             return self.sm70_mtp_context_buckets
-        return tuple(
-            sorted(
-                set(self.sm70_dsv4_decode_context_buckets)
-                | set(self.sm70_fp8_kv_decode_context_buckets)
-            )
+        buckets = set(self.sm70_dsv4_decode_context_buckets) | set(
+            self.sm70_fp8_kv_decode_context_buckets
         )
+        if self.sm70_fp8_kv_batch_context_routing:
+            for context_buckets in _SM70_FP8_KV_BATCH_CONTEXT_BUCKETS.values():
+                buckets.update(context_buckets)
+        return tuple(sorted(buckets))
+
+    def _context_buckets_for_descriptor(
+        self,
+        batch_descriptor: BatchDescriptor,
+    ) -> tuple[int, ...]:
+        if not batch_descriptor.uniform or batch_descriptor.num_reqs is None:
+            return ()
+
+        if self.uniform_decode_query_len > 1:
+            if batch_descriptor.num_tokens == self.uniform_decode_query_len:
+                return self.sm70_mtp_context_buckets
+            return ()
+
+        buckets: set[int] = set()
+        if batch_descriptor.num_tokens == 1:
+            buckets.update(self.sm70_dsv4_decode_context_buckets)
+            buckets.update(self.sm70_fp8_kv_decode_context_buckets)
+
+        if (
+            self.sm70_fp8_kv_batch_context_routing
+            and batch_descriptor.num_tokens == batch_descriptor.num_reqs
+        ):
+            batch_size = batch_descriptor.num_reqs
+            context_buckets = _SM70_FP8_KV_BATCH_CONTEXT_BUCKETS.get(batch_size)
+            if context_buckets is not None:
+                max_model_len = self.vllm_config.model_config.max_model_len
+                buckets.update(
+                    bucket for bucket in context_buckets if bucket < max_model_len
+                )
+        return tuple(sorted(buckets))
 
     @property
     def has_attention_context_buckets(self) -> bool:
         return bool(self._active_context_buckets())
 
     def _add_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
-        """Add bounded graphs only for a single uniform-decode request."""
-        context_buckets = self._active_context_buckets()
-        if (
-            not context_buckets
-            or not batch_descriptor.uniform
-            or batch_descriptor.num_tokens != self.uniform_decode_query_len
-        ):
+        """Add bounded graphs required by this exact decode descriptor."""
+        context_buckets = self._context_buckets_for_descriptor(batch_descriptor)
+        if not context_buckets:
             return
 
         for bucket in context_buckets:
@@ -343,13 +405,11 @@ class CudagraphDispatcher:
         attention_context_len: int | None,
     ) -> BatchDescriptor:
         """Return a bounded graph key only when its capacity is sufficient."""
-        context_buckets = self._active_context_buckets()
+        context_buckets = self._context_buckets_for_descriptor(batch_descriptor)
         if (
             attention_context_len is None
             or attention_context_len <= 0
             or not context_buckets
-            or not batch_descriptor.uniform
-            or batch_descriptor.num_tokens != self.uniform_decode_query_len
         ):
             return batch_descriptor
 
