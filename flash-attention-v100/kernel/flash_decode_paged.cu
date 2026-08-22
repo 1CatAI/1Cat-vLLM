@@ -346,9 +346,15 @@ void trace_xqa_batch_context_route(const int batch_size, const int max_seq_len,
                           : batch_size <= 8  ? 1
                           : batch_size <= 12 ? 2
                                              : 3;
-  const unsigned int bit = 1U << (batch_class * 3 + static_cast<int>(route));
-  static std::atomic<unsigned int> traced_routes{0};
-  const unsigned int previous =
+  const int context_class = max_seq_len <= 4095    ? 0
+                            : max_seq_len <= 8191  ? 1
+                            : max_seq_len <= 12287 ? 2
+                            : max_seq_len <= 16000 ? 3
+                                                   : 4;
+  const unsigned long long bit =
+      1ULL << (batch_class * 15 + context_class * 3 + static_cast<int>(route));
+  static std::atomic<unsigned long long> traced_routes{0};
+  const unsigned long long previous =
       traced_routes.fetch_or(bit, std::memory_order_relaxed);
   if ((previous & bit) == 0) {
     TORCH_WARN("Flash-V100 XQA batch/context route active: batch=", batch_size,
