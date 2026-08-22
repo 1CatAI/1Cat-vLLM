@@ -590,6 +590,15 @@ def _sm70_qwen_gdn_spec_method(vllm_config: object) -> str | None:
     return getattr(spec_config, "method", None)
 
 
+def _is_dflash2_spec_config(vllm_config: object) -> bool:
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is None or getattr(spec_config, "method", None) != "dflash":
+        return False
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    architectures = getattr(draft_model_config, "architectures", None) or []
+    return "DFlash2DraftModel" in architectures
+
+
 def _sm70_qwen_gdn_full_forward_enabled(
     layer_name: LayerNameType,
     *,
@@ -2201,6 +2210,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_sm70_fused_sigmoid_mixed_qkv = (
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV
         )
+        self.enable_sm70_dflash2_fused_gdn_verify = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+        )
         self.compare_sm70_fused_sigmoid_mixed_qkv = (
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE
         )
@@ -2287,6 +2301,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.enable_flashqla_decode:
             logger.info_once(
                 "SM70 FlashQLA GDN decode route enabled.",
+                scope="local",
+            )
+        if self.enable_sm70_dflash2_fused_gdn_verify:
+            logger.info_once(
+                "SM70 DFlash2 packed GDN target-verification route enabled.",
                 scope="local",
             )
         if envs.is_set("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING"):
@@ -4813,6 +4832,85 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache=kv_cache,
         )
 
+    def _can_use_dflash2_packed_gdn_verify(
+        self,
+        *,
+        mixed_qkv: torch.Tensor | None,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        ssm_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> bool:
+        return bool(
+            self.enable_sm70_dflash2_fused_gdn_verify
+            and mixed_qkv is not None
+            and attn_metadata.spec_sequence_masks is not None
+            and attn_metadata.num_spec_decodes > 0
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.ddtree_parent_ids is None
+            and attn_metadata.spec_query_start_loc is not None
+            and attn_metadata.spec_state_indices_tensor is not None
+            and attn_metadata.spec_state_slot_selectors is not None
+            and mixed_qkv.is_cuda
+            and mixed_qkv.dtype == torch.float16
+            and a.dtype == torch.float16
+            and b.dtype == torch.float16
+            # Qwen3.8's official target contract keeps the recurrent state in
+            # FP32; an explicit FP16 cache override is also supported.
+            and ssm_state.dtype in (torch.float16, torch.float32)
+            and mixed_qkv.is_contiguous()
+            and a.is_contiguous()
+            and b.is_contiguous()
+            and core_attn_out.is_contiguous()
+        )
+
+    def _forward_dflash2_packed_gdn_verify(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        ssm_state: torch.Tensor,
+        spec_query_start_loc: torch.Tensor,
+        spec_state_indices_tensor: torch.Tensor,
+        spec_state_slot_selectors: torch.Tensor,
+        num_spec_decodes: int,
+    ) -> torch.Tensor:
+        num_tokens = mixed_qkv.shape[0]
+        out = core_attn_out[:num_tokens].unsqueeze(1)
+        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
+            A_log=self.A_log,
+            a=a,
+            b=b,
+            dt_bias=self.dt_bias,
+            mixed_qkv=mixed_qkv,
+            num_q_heads=self.num_k_heads // self.tp_size,
+            num_v_heads=self.num_v_heads // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            scale=self.head_k_dim**-0.5,
+            initial_state=ssm_state,
+            out=out,
+            cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
+            ssm_state_indices=spec_state_indices_tensor[:num_spec_decodes],
+            num_accepted_tokens=spec_state_slot_selectors[:num_spec_decodes],
+            use_qk_l2norm_in_kernel=True,
+            # Keep gating materialization and launch geometry bitwise aligned
+            # with the current verifier. This stage removes packed-QKV
+            # rearrangement and the final output copy without changing the
+            # target recurrence. Fully fused gating stays separately testable.
+            precomputed_g=g,
+            precomputed_beta=beta,
+            quantize_state_each_step=False,
+            match_recurrent_schedule=True,
+            match_recurrent_numerics=True,
+        )
+        return out.transpose(0, 1)
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -5165,7 +5263,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_non_spec_tokens] = core_attn_out_non_spec.squeeze(0)
             return
 
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        use_dflash2_packed_gdn_verify = self._can_use_dflash2_packed_gdn_verify(
+            mixed_qkv=mixed_qkv_spec,
+            a=a,
+            b=b,
+            core_attn_out=core_attn_out,
+            ssm_state=ssm_state,
+            attn_metadata=attn_metadata,
+        )
+        if use_dflash2_packed_gdn_verify:
+            query_spec, key_spec, value_spec = None, None, None
+        else:
+            query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         prefill_l2norm_in_kernel = False
         use_original_flashqla_prefill = _sm70_flashqla_original_prefill_enabled()
         prefill_gate_is_exp = False
@@ -5280,7 +5389,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 assert spec_token_indx is not None
                 a_spec = a.index_select(0, spec_token_indx)
                 b_spec = b.index_select(0, spec_token_indx)
-            if ddtree_tree_gdn_pure_spec:
+            if use_dflash2_packed_gdn_verify:
+                assert mixed_qkv_spec is not None
+                assert spec_query_start_loc is not None
+                assert spec_state_indices_tensor is not None
+                assert spec_state_slot_selectors is not None
+                core_attn_out_spec = self._forward_dflash2_packed_gdn_verify(
+                    mixed_qkv=mixed_qkv_spec,
+                    a=a_spec,
+                    b=b_spec,
+                    core_attn_out=core_attn_out,
+                    ssm_state=ssm_state,
+                    spec_query_start_loc=spec_query_start_loc,
+                    spec_state_indices_tensor=spec_state_indices_tensor,
+                    spec_state_slot_selectors=spec_state_slot_selectors,
+                    num_spec_decodes=attn_metadata.num_spec_decodes,
+                )
+                last_recurrent_state = ssm_state
+                _log_runtime_route_once(
+                    "SM70 DFlash2 packed GDN target-verification route hit."
+                )
+            elif ddtree_tree_gdn_pure_spec:
                 assert mixed_qkv_spec is not None
                 assert spec_query_start_loc is not None
                 assert spec_state_indices_tensor is not None
@@ -5313,6 +5442,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 last_recurrent_state = ssm_state
             else:
+                assert query_spec is not None
+                assert key_spec is not None
+                assert value_spec is not None
                 g_spec, beta_spec = fused_gdn_gating(
                     self.A_log, a_spec, b_spec, self.dt_bias
                 )
@@ -5515,7 +5647,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if not use_dflash2_packed_gdn_verify:
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec is not None and not (
             attn_metadata.num_prefills > 0
             and spec_sequence_masks is None
@@ -6298,6 +6431,32 @@ def qwen_gdn_attention_core_spec_commit(
             max_query_len=spec_state_indices_tensor.size(-1),
             validate_data=False,
         )
+        if self._can_use_dflash2_packed_gdn_verify(
+            mixed_qkv=mixed_qkv_spec,
+            a=a,
+            b=b,
+            core_attn_out=core_attn_out,
+            ssm_state=ssm_state,
+            attn_metadata=attn_metadata,
+        ):
+            self._forward_dflash2_packed_gdn_verify(
+                mixed_qkv=mixed_qkv_spec,
+                a=a,
+                b=b,
+                core_attn_out=core_attn_out,
+                ssm_state=ssm_state,
+                spec_query_start_loc=spec_query_start_loc,
+                spec_state_indices_tensor=spec_state_indices_tensor,
+                spec_state_slot_selectors=spec_state_slot_selectors,
+                num_spec_decodes=attn_metadata.num_spec_decodes,
+            )
+            _log_runtime_route_once(
+                "SM70 DFlash2 packed GDN target-verification route hit."
+            )
+            _sm70_dump_gdn_core_tensor(
+                "core_out", layer_name, core_attn_out, metadata_source
+            )
+            return core_attn_out
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         g_spec, beta_spec = fused_gdn_gating(
             self.A_log,

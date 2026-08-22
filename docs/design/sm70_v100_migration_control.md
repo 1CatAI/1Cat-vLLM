@@ -358,6 +358,77 @@ Goal:
   SGLang report is
   `/data/models/v100-dflash2-20260820/sglang-audit/perf-rootcause/sglang-dflash2-single1-step20-v2.{qdstrm,nsys-rep,sqlite}`.
 
+### PR257 shared-metadata and packed-GDN checkpoint, 2026-08-22
+
+- Draft PR #257 is isolated on
+  `codex/v100-dflash2-gdn-metadata-20260822-122723`; it is stacked on PR #254
+  and changes only the MRV2 DFlash2 target-verification path. Eagle, MTP,
+  DFlash1, and `dflash_ddtree` retain their existing dispatch. Both candidate
+  leaves remain default-off while the TP4 profile and statistical-quality
+  gates are pending.
+- The first leaf adapts vLLM PR #52297 at fixed head
+  `5f4c9678d1bb791ffb3ad23a9ae4129db9eb299d`: request classification, token
+  indices, and query offsets are computed once per batch, while cache-group
+  state block IDs remain group-owned. A same-hash/AAL 64-token Graph B1 probe
+  improved steady decode from 84.79 to 91.10 tok/s and decode time from 0.7430
+  to 0.6915 s. The eager candidate regressed, so this evidence supports only
+  the production Graph route. An eight-request probabilistic probe changed the
+  aggregate acceptance trajectory and is not accepted as a compute-only speed
+  comparison.
+- This port does not yet remove the dominant state-contract fan-out. Each of
+  ten padded GDN cache groups still performs group-specific block-table work
+  plus repeated boolean compaction for accepted-state metadata. The next
+  metadata step must be judged by the measured draft-to-target interval and
+  kernel count, not by the upstream H200 claim alone. Upstream reports its
+  builder moving from about 900 to 300 microseconds and B1 throughput +61%; the
+  V100 result remains an independent gate.
+- A second DFlash2-only leaf removes packed-QKV rearrangement and the final GDN
+  output copy while preserving the existing split gating materialization. The
+  first implementation used `q * rsqrt(sum(q^2)+eps)` where the accepted
+  recurrent verifier uses `q / sqrt(sum(q^2)+eps)`. Although mathematically
+  equivalent, that changed at most one FP16 ULP in the operator test and moved
+  a fixed-seed probabilistic decision at output token 111. This explains why
+  the earlier fully fused and packed candidates followed the same alternate
+  trajectory.
+- The repaired packed kernel now explicitly selects the recurrent verifier's
+  launch geometry and arithmetic order, including `/sqrt` normalization and
+  the same decay exponential helper. Gating remains precomputed in its original
+  dtype. On a physical V100, all eight production-shape parity cases
+  (`Hq=4`, `Hv=12`, `K=V=128` per TP4 rank; B1/B2; draft 3/7; FP16/FP32
+  recurrent state) are bitwise equal for both output and persistent state. The
+  per-step low-precision state reload case also passes, and the complete shared
+  fused-sigmoid/recurrent file reports 27/27 passing tests.
+- Before the arithmetic repair, the fully fused greedy one-request diagnostic
+  kept the exact token hash and acceptance length while improving steady decode
+  99.15 to 103.45 tok/s (+4.34%) and decode time 1.2809 to 1.2277 s (-4.16%).
+  That number is retained only as evidence that this kernel family can reduce
+  work; it is not the accepted result for the repaired packed leaf. The repaired
+  leaf still needs a matched unprofiled B1 run and a control/candidate Nsight
+  pair before default enablement.
+- The statistical quality gate is broader than greedy identity. Greedy hashes
+  remain a sensitive diagnostic, while default enablement also requires bounded
+  fixed-text logprob/perplexity change and no regression on fixed subsets of
+  GSM8K, MATH-500, HumanEval, and MBPP. The retained datasets and SHA256 values
+  are `GSM8K 3730d312...`, `MATH-500 35dc4108...`,
+  `HumanEval 2f2871a1...`, `MBPP e9e9efa2...`, and WikiText-2 validation
+  `204929b7...`; all live under
+  `/data/models/v100-dflash2-20260820/datasets/` and are not repository assets.
+- The next Nsight pair must preserve TP4, Flash-V100, target E5M2 KV, draft
+  FP16 KV, block eight, single-request Graph execution, and the fixed request.
+  It will report draft Graph, draft-to-target metadata/input preparation,
+  target verifier Graph, rejection/target-to-draft, full round time, Graph node
+  count, rank-critical GPU service, and TP GPU-sum service. The existing control
+  trace lacks supported replay NVTX ranges and is therefore not fed through the
+  generic per-token parser; control and candidate will be recaptured with the
+  same replay markers rather than manufacturing a partial comparison.
+- SGLang PR #26520's final-state recomputation path is not selected for this
+  B1 lane. Its own acceptance-aligned result is 2.5% lower throughput than the
+  cached-state control. vLLM already writes speculative intermediate states to
+  state-pool slots, so the nearer-term path is shared/persistent metadata and a
+  numerically equivalent verifier kernel. ReplaySSM remains a later high-batch
+  research lane, not a substitute for the current single-request verification
+  cost gate.
+
 Main implementation priority:
 
 1. Add a decoupled SM70 TurboMind backend for AWQ and FP8 base GEMM.
