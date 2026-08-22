@@ -27,6 +27,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.worker.gpu.attn_utils import CommonGDNSpecMetadata
 
 logger = init_logger(__name__)
 
@@ -1183,6 +1184,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_state_slot_selectors: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         spec_sequence_masks_cpu: torch.Tensor | None = None,
+        common_gdn_metadata: CommonGDNSpecMetadata | None = None,
         current_state_block_ids: torch.Tensor | None = None,
         ddtree_parent_ids: torch.Tensor | None = None,
         ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
@@ -1227,6 +1229,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         is_mamba_cache_all = self.vllm_config.cache_config.mamba_cache_mode == "all"
 
         num_reqs = query_start_loc_cpu.numel() - 1
+        if common_gdn_metadata is not None:
+            if ddtree_parent_ids is not None or current_state_block_ids is not None:
+                raise ValueError(
+                    "Common MRV2 GDN metadata cannot be used with DDTree state"
+                )
+            spec_sequence_masks_cpu = common_gdn_metadata.spec_sequence_masks_cpu
         if spec_sequence_masks_cpu is not None:
             assert spec_sequence_masks_cpu.dtype == torch.bool
             assert spec_sequence_masks_cpu.ndim == 1
@@ -1263,6 +1271,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if not self.use_spec_decode:
             spec_sequence_masks = None
             num_spec_decodes = 0
+        elif common_gdn_metadata is not None:
+            spec_sequence_masks = common_gdn_metadata.spec_sequence_masks
+            num_spec_decodes = common_gdn_metadata.num_spec_decodes
         else:
             if spec_sequence_masks_cpu is None:
                 if num_decode_draft_tokens_cpu is None:
@@ -1473,9 +1484,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             else:
                 # query_start_loc may be padded for CUDA graph replay. The CPU
                 # metadata is authoritative for the live request count here.
-                query_lens = query_lens_cpu.to(
-                    query_start_loc.device, non_blocking=True
-                )
+                query_lens = None
+                if common_gdn_metadata is None:
+                    query_lens = query_lens_cpu.to(
+                        query_start_loc.device, non_blocking=True
+                    )
                 profile_state_contract_t0 = (
                     time.perf_counter() if metadata_profile else 0.0
                 )
@@ -1495,113 +1508,143 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         time.perf_counter() - profile_state_contract_t0
                     ) * 1000.0
 
-                if envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING:
-                    # 0.0.3 kept ordinary query_len==1 rows on the decode path even
-                    # when another row was running speculative verification. This
-                    # is an A/B guard for MTP-only recurrent-state corruption.
-                    num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
-                    num_prefills = (
-                        non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
+                if common_gdn_metadata is not None:
+                    num_prefills = common_gdn_metadata.num_prefills
+                    num_prefill_tokens = common_gdn_metadata.num_prefill_tokens
+                    num_decodes = common_gdn_metadata.num_decodes
+                    num_decode_tokens = common_gdn_metadata.num_decode_tokens
+                    num_spec_decode_tokens = common_gdn_metadata.num_spec_decode_tokens
+                    spec_token_indx = common_gdn_metadata.spec_token_indx
+                    non_spec_token_indx = common_gdn_metadata.non_spec_token_indx
+                    spec_query_start_loc = common_gdn_metadata.spec_query_start_loc
+                    non_spec_query_start_loc = (
+                        common_gdn_metadata.non_spec_query_start_loc
                     )
-                    num_decode_tokens = num_decodes
-                    num_prefill_tokens = (
-                        non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+                    non_spec_query_start_loc_cpu = (
+                        common_gdn_metadata.non_spec_query_start_loc_cpu
                     )
-                else:
-                    # When active spec decodes are present, route non-spec requests
-                    # through the prefill path so mixed batches keep separate GDN
-                    # state metadata for spec and non-spec tokens.
-                    num_decodes = 0
-                    num_prefills = non_spec_query_lens_cpu.size(0) - num_zero_len
-                    num_decode_tokens = 0
-                    num_prefill_tokens = non_spec_query_lens_cpu.sum().item()
-                num_spec_decode_tokens = (
-                    query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
-                )
-
-                if num_prefills == 0 and num_decodes == 0:
-                    spec_token_size = min(
-                        num_spec_decodes * (self.num_spec_state_tokens + 1),
-                        query_start_loc_cpu[-1].item(),
-                    )
-                    spec_token_indx = torch.arange(
-                        spec_token_size,
-                        dtype=torch.int32,
-                        device=query_start_loc.device,
-                    )
-                    non_spec_token_indx = torch.empty(
-                        0, dtype=torch.int32, device=query_start_loc.device
-                    )
-                    spec_state_indices_tensor = state_contract.spec_state_indices_tensor
-                    if for_cudagraph_capture:
-                        spec_state_indices_tensor = torch.full_like(
-                            spec_state_indices_tensor, PAD_SLOT_ID
-                        )
-                    non_spec_state_indices_tensor = None
-                    # Padded sequences are always at the back, so the first
-                    # num_spec_decodes + 1 entries of query_start_loc already
-                    # contain the correct cumulative token counts.
-                    spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
-                    non_spec_query_start_loc = None
-                    non_spec_query_start_loc_cpu = None
-                else:
-                    spec_token_masks = torch.repeat_interleave(
-                        spec_sequence_masks,
-                        query_lens,
-                        output_size=query_start_loc_cpu[-1].item(),
-                    )
-                    index = torch.argsort(spec_token_masks, stable=True)
-                    num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-                    non_spec_token_indx = index[:num_non_spec_tokens]
-                    spec_token_indx = index[num_non_spec_tokens:]
-
                     spec_state_indices_tensor = state_contract.spec_state_indices_tensor
                     non_spec_state_indices_tensor = (
-                        state_contract.non_spec_state_indices_tensor
+                        None
+                        if num_prefills == 0 and num_decodes == 0
+                        else state_contract.non_spec_state_indices_tensor
                     )
-                    if for_cudagraph_capture:
-                        spec_state_indices_tensor = torch.full_like(
-                            spec_state_indices_tensor, PAD_SLOT_ID
+                else:
+                    if envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING:
+                        # 0.0.3 kept ordinary query_len==1 rows on the decode
+                        # path even when another row was running speculative
+                        # verification.
+                        num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+                        num_prefills = (
+                            non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
                         )
-                        non_spec_state_indices_tensor = torch.full_like(
-                            non_spec_state_indices_tensor, PAD_SLOT_ID
+                        num_decode_tokens = num_decodes
+                        num_prefill_tokens = (
+                            non_spec_query_lens_cpu.sum().item() - num_decode_tokens
                         )
+                    else:
+                        # Mixed non-spec rows use the prefill path so their GDN
+                        # state metadata stays separate from verification rows.
+                        num_decodes = 0
+                        num_prefills = non_spec_query_lens_cpu.size(0) - num_zero_len
+                        num_decode_tokens = 0
+                        num_prefill_tokens = non_spec_query_lens_cpu.sum().item()
+                    num_spec_decode_tokens = (
+                        query_lens_cpu.sum().item()
+                        - num_prefill_tokens
+                        - num_decode_tokens
+                    )
 
-                    spec_query_start_loc = torch.zeros(
-                        num_spec_decodes + 1,
-                        dtype=torch.int32,
-                        device=query_start_loc.device,
-                    )
-                    torch.cumsum(
-                        query_lens[spec_sequence_masks],
-                        dim=0,
-                        out=spec_query_start_loc[1:],
-                    )
-                    non_spec_query_start_loc = torch.zeros(
-                        query_lens.size(0) - num_spec_decodes + 1,
-                        dtype=torch.int32,
-                        device=query_start_loc.device,
-                    )
-                    torch.cumsum(
-                        query_lens[~spec_sequence_masks],
-                        dim=0,
-                        out=non_spec_query_start_loc[1:],
-                    )
-                    non_spec_query_start_loc_cpu = torch.zeros(
-                        query_lens_cpu.size(0) - num_spec_decodes + 1,
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-                    torch.cumsum(
-                        query_lens_cpu[~spec_sequence_masks_cpu],
-                        dim=0,
-                        out=non_spec_query_start_loc_cpu[1:],
-                    )
+                    if num_prefills == 0 and num_decodes == 0:
+                        spec_token_size = min(
+                            num_spec_decodes * (self.num_spec_state_tokens + 1),
+                            query_start_loc_cpu[-1].item(),
+                        )
+                        spec_token_indx = torch.arange(
+                            spec_token_size,
+                            dtype=torch.int32,
+                            device=query_start_loc.device,
+                        )
+                        non_spec_token_indx = torch.empty(
+                            0,
+                            dtype=torch.int32,
+                            device=query_start_loc.device,
+                        )
+                        spec_state_indices_tensor = (
+                            state_contract.spec_state_indices_tensor
+                        )
+                        non_spec_state_indices_tensor = None
+                        # Padded sequences are always at the back.
+                        spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+                        non_spec_query_start_loc = None
+                        non_spec_query_start_loc_cpu = None
+                    else:
+                        assert query_lens is not None
+                        spec_token_masks = torch.repeat_interleave(
+                            spec_sequence_masks,
+                            query_lens,
+                            output_size=query_start_loc_cpu[-1].item(),
+                        )
+                        index = torch.argsort(spec_token_masks, stable=True)
+                        num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
+                        non_spec_token_indx = index[:num_non_spec_tokens]
+                        spec_token_indx = index[num_non_spec_tokens:]
+
+                        spec_state_indices_tensor = (
+                            state_contract.spec_state_indices_tensor
+                        )
+                        non_spec_state_indices_tensor = (
+                            state_contract.non_spec_state_indices_tensor
+                        )
+                        if for_cudagraph_capture:
+                            spec_state_indices_tensor = torch.full_like(
+                                spec_state_indices_tensor, PAD_SLOT_ID
+                            )
+                            non_spec_state_indices_tensor = torch.full_like(
+                                non_spec_state_indices_tensor, PAD_SLOT_ID
+                            )
+
+                        spec_query_start_loc = torch.zeros(
+                            num_spec_decodes + 1,
+                            dtype=torch.int32,
+                            device=query_start_loc.device,
+                        )
+                        torch.cumsum(
+                            query_lens[spec_sequence_masks],
+                            dim=0,
+                            out=spec_query_start_loc[1:],
+                        )
+                        non_spec_query_start_loc = torch.zeros(
+                            query_lens.size(0) - num_spec_decodes + 1,
+                            dtype=torch.int32,
+                            device=query_start_loc.device,
+                        )
+                        torch.cumsum(
+                            query_lens[~spec_sequence_masks],
+                            dim=0,
+                            out=non_spec_query_start_loc[1:],
+                        )
+                        non_spec_query_start_loc_cpu = torch.zeros(
+                            query_lens_cpu.size(0) - num_spec_decodes + 1,
+                            dtype=torch.int32,
+                            device="cpu",
+                        )
+                        torch.cumsum(
+                            query_lens_cpu[~spec_sequence_masks_cpu],
+                            dim=0,
+                            out=non_spec_query_start_loc_cpu[1:],
+                        )
 
                 num_accepted_tokens = state_contract.num_accepted_tokens
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
-            assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+            if common_gdn_metadata is None:
+                assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+            else:
+                assert (
+                    common_gdn_metadata.num_spec_decode_tokens
+                    == num_spec_decode_tokens
+                )
             assert spec_state_indices_tensor is not None
             assert spec_state_indices_tensor.shape[0] == num_spec_decodes
 

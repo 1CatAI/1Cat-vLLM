@@ -372,6 +372,159 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+@dataclass(frozen=True)
+class CommonGDNSpecMetadata:
+    """Batch-level GDN speculative metadata shared by every cache group."""
+
+    num_prefills: int
+    num_prefill_tokens: int
+    num_decodes: int
+    num_decode_tokens: int
+    num_spec_decodes: int
+    num_spec_decode_tokens: int
+    spec_query_start_loc: torch.Tensor
+    non_spec_query_start_loc: torch.Tensor | None
+    non_spec_query_start_loc_cpu: torch.Tensor | None
+    spec_sequence_masks_cpu: torch.Tensor
+    spec_sequence_masks: torch.Tensor
+    spec_token_indx: torch.Tensor
+    non_spec_token_indx: torch.Tensor
+
+
+def compute_common_gdn_attn_metadata(
+    *,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_spec_state_tokens: int,
+    legacy_mixed_decode_routing: bool,
+) -> CommonGDNSpecMetadata | None:
+    """Compute GDN speculative batch metadata once instead of per group.
+
+    State block IDs remain group-specific and are deliberately excluded. This
+    is the dependency boundary needed to share request classification, token
+    indices, and query offsets without changing recurrent-state ownership.
+    """
+    if num_spec_state_tokens <= 0 or num_decode_draft_tokens_cpu is None:
+        return None
+
+    num_reqs = query_start_loc_cpu.numel() - 1
+    if num_decode_draft_tokens_cpu.ndim != 1:
+        raise ValueError("num_decode_draft_tokens_cpu must be one-dimensional")
+    if num_decode_draft_tokens_cpu.numel() != num_reqs:
+        raise ValueError("num_decode_draft_tokens_cpu must align with query_start_loc")
+
+    spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+    num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+    if num_spec_decodes == 0:
+        return None
+    num_spec_draft_tokens = int(
+        num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+    )
+    if num_spec_draft_tokens == 0:
+        return None
+
+    spec_sequence_masks = spec_sequence_masks_cpu.to(
+        query_start_loc.device, non_blocking=True
+    )
+    query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
+    num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
+
+    if legacy_mixed_decode_routing:
+        num_decodes = int((non_spec_query_lens_cpu == 1).sum().item())
+        num_prefills = non_spec_query_lens_cpu.numel() - num_decodes - num_zero_len
+        num_decode_tokens = num_decodes
+        num_prefill_tokens = (
+            int(non_spec_query_lens_cpu.sum().item()) - num_decode_tokens
+        )
+    else:
+        num_decodes = 0
+        num_prefills = non_spec_query_lens_cpu.numel() - num_zero_len
+        num_decode_tokens = 0
+        num_prefill_tokens = int(non_spec_query_lens_cpu.sum().item())
+
+    num_spec_decode_tokens = (
+        int(query_lens_cpu.sum().item()) - num_prefill_tokens - num_decode_tokens
+    )
+    if num_prefills == 0 and num_decodes == 0:
+        spec_token_size = min(
+            num_spec_decodes * (num_spec_state_tokens + 1),
+            int(query_start_loc_cpu[-1].item()),
+        )
+        spec_token_indx = torch.arange(
+            spec_token_size,
+            dtype=torch.int32,
+            device=query_start_loc.device,
+        )
+        non_spec_token_indx = torch.empty(
+            0,
+            dtype=torch.int32,
+            device=query_start_loc.device,
+        )
+        spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+        non_spec_query_start_loc = None
+        non_spec_query_start_loc_cpu = None
+    else:
+        query_lens = query_lens_cpu.to(query_start_loc.device, non_blocking=True)
+        spec_token_masks = torch.repeat_interleave(
+            spec_sequence_masks,
+            query_lens,
+            output_size=int(query_start_loc_cpu[-1].item()),
+        )
+        index = torch.argsort(spec_token_masks, stable=True)
+        num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
+        non_spec_token_indx = index[:num_non_spec_tokens]
+        spec_token_indx = index[num_non_spec_tokens:]
+
+        spec_query_start_loc = torch.zeros(
+            num_spec_decodes + 1,
+            dtype=torch.int32,
+            device=query_start_loc.device,
+        )
+        torch.cumsum(
+            query_lens[spec_sequence_masks],
+            dim=0,
+            out=spec_query_start_loc[1:],
+        )
+        non_spec_query_start_loc = torch.zeros(
+            query_lens.numel() - num_spec_decodes + 1,
+            dtype=torch.int32,
+            device=query_start_loc.device,
+        )
+        torch.cumsum(
+            query_lens[~spec_sequence_masks],
+            dim=0,
+            out=non_spec_query_start_loc[1:],
+        )
+        non_spec_query_start_loc_cpu = torch.zeros(
+            query_lens_cpu.numel() - num_spec_decodes + 1,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        torch.cumsum(
+            query_lens_cpu[~spec_sequence_masks_cpu],
+            dim=0,
+            out=non_spec_query_start_loc_cpu[1:],
+        )
+
+    return CommonGDNSpecMetadata(
+        num_prefills=num_prefills,
+        num_prefill_tokens=num_prefill_tokens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        num_spec_decodes=num_spec_decodes,
+        num_spec_decode_tokens=num_spec_decode_tokens,
+        spec_query_start_loc=spec_query_start_loc,
+        non_spec_query_start_loc=non_spec_query_start_loc,
+        non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+        spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+        spec_sequence_masks=spec_sequence_masks,
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=non_spec_token_indx,
+    )
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,

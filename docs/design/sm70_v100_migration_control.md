@@ -358,6 +358,131 @@ Goal:
   SGLang report is
   `/data/models/v100-dflash2-20260820/sglang-audit/perf-rootcause/sglang-dflash2-single1-step20-v2.{qdstrm,nsys-rep,sqlite}`.
 
+### PR257 shared-metadata and packed-GDN checkpoint, 2026-08-22
+
+- Draft PR #257 is isolated on
+  `codex/v100-dflash2-gdn-metadata-20260822-122723`; it is stacked on PR #254
+  and changes only the MRV2 DFlash2 target-verification path. Eagle, MTP,
+  DFlash1, and `dflash_ddtree` retain their existing dispatch. Both candidate
+  leaves remain default-off while the TP4 profile and statistical-quality
+  gates are pending.
+- The first leaf adapts vLLM PR #52297 at fixed head
+  `5f4c9678d1bb791ffb3ad23a9ae4129db9eb299d`: request classification, token
+  indices, and query offsets are computed once per batch, while cache-group
+  state block IDs remain group-owned. A same-hash/AAL 64-token Graph B1 probe
+  improved steady decode from 84.79 to 91.10 tok/s and decode time from 0.7430
+  to 0.6915 s. The eager candidate regressed, so this evidence supports only
+  the production Graph route. An eight-request probabilistic probe changed the
+  aggregate acceptance trajectory and is not accepted as a compute-only speed
+  comparison.
+- This port does not yet remove the dominant state-contract fan-out. Each of
+  ten padded GDN cache groups still performs group-specific block-table work
+  plus repeated boolean compaction for accepted-state metadata. The next
+  metadata step must be judged by the measured draft-to-target interval and
+  kernel count, not by the upstream H200 claim alone. Upstream reports its
+  builder moving from about 900 to 300 microseconds and B1 throughput +61%; the
+  V100 result remains an independent gate.
+- A second DFlash2-only leaf removes packed-QKV rearrangement and the final GDN
+  output copy while preserving the existing split gating materialization. The
+  first implementation used `q * rsqrt(sum(q^2)+eps)` where the accepted
+  recurrent verifier uses `q / sqrt(sum(q^2)+eps)`. Although mathematically
+  equivalent, that changed at most one FP16 ULP in the operator test and moved
+  a fixed-seed probabilistic decision at output token 111. This explains why
+  the earlier fully fused and packed candidates followed the same alternate
+  trajectory.
+- The repaired packed kernel now explicitly selects the recurrent verifier's
+  launch geometry and arithmetic order, including `/sqrt` normalization and
+  the same decay exponential helper. Gating remains precomputed in its original
+  dtype. On a physical V100, all eight production-shape parity cases
+  (`Hq=4`, `Hv=12`, `K=V=128` per TP4 rank; B1/B2; draft 3/7; FP16/FP32
+  recurrent state) are bitwise equal for both output and persistent state. The
+  per-step low-precision state reload case also passes, and the complete shared
+  fused-sigmoid/recurrent file reports 27/27 passing tests.
+- Before the arithmetic repair, the fully fused greedy one-request diagnostic
+  kept the exact token hash and acceptance length while improving steady decode
+  99.15 to 103.45 tok/s (+4.34%) and decode time 1.2809 to 1.2277 s (-4.16%).
+  That number is retained only as evidence that this kernel family can reduce
+  work; it is not the accepted result for the repaired packed leaf. The repaired
+  leaf still needs a matched unprofiled B1 run and a control/candidate Nsight
+  pair before default enablement.
+- The statistical quality gate is broader than greedy identity. Greedy hashes
+  remain a sensitive diagnostic, while default enablement also requires bounded
+  fixed-text logprob/perplexity change and no regression on fixed subsets of
+  GSM8K, MATH-500, HumanEval, and MBPP. The retained datasets and SHA256 values
+  are `GSM8K 3730d312...`, `MATH-500 35dc4108...`,
+  `HumanEval 2f2871a1...`, `MBPP e9e9efa2...`, and WikiText-2 validation
+  `204929b7...`; all live under
+  `/data/models/v100-dflash2-20260820/datasets/` and are not repository assets.
+- The next Nsight pair must preserve TP4, Flash-V100, target E5M2 KV, draft
+  FP16 KV, block eight, single-request Graph execution, and the fixed request.
+  It will report draft Graph, draft-to-target metadata/input preparation,
+  target verifier Graph, rejection/target-to-draft, full round time, Graph node
+  count, rank-critical GPU service, and TP GPU-sum service. The existing control
+  trace lacks supported replay NVTX ranges and is therefore not fed through the
+  generic per-token parser; control and candidate will be recaptured with the
+  same replay markers rather than manufacturing a partial comparison.
+- A stricter re-audit of the retained endpoint JSONs intersects the long-output
+  requests by `dataset_index` and requires both implementations to emit at
+  least 512 tokens. Across those 11 matched requests, vLLM uses 40.7194 ms per
+  verification round (`decode_time / num_drafts`) and SGLang uses at most
+  26.7101 ms (`request_elapsed_seconds / spec_verify_ct`), leaving a gap of at
+  least 14.0093 ms. The SGLang field includes prefill and is therefore an upper
+  bound on its decode-round cost. The earlier 40.7148/26.8166 ms values use the
+  independently selected 13/14-request long-output subsets and remain useful
+  aggregate references, but they are not a strictly paired endpoint statistic.
+- Re-parsing the existing node traces by complete round and taking the slowest
+  TP rank for every interval gives the following diagnostic wall table. These
+  values include graph-node tracing overhead and must not replace the endpoint
+  numbers above.
+
+  | traced phase | vLLM mean / p50 / p90 / p99 (ms) | SGLang mean / p50 / p90 / p99 (ms) | vLLM / SGLang launches per rank |
+  | --- | --- | --- | ---: |
+  | draft Graph | 4.065 / 4.028 / 4.073 / 4.088 | 3.961 / 3.928 / 4.123 / 4.193 | 185 / 158 |
+  | draft to target | 18.382 / 17.660 / 21.258 / 22.690 | 3.517 / 3.423 / 3.660 / 4.066 | 431 / 30 |
+  | target Graph | 24.835 / 24.880 / 24.943 / 24.995 | 19.723 / 19.600 / 19.939 / 20.526 | 2612 / 1130 |
+  | target to next draft | 2.791 / 2.793 / 2.806 / 2.809 | 4.216 / 4.188 / 4.332 / 4.402 | 63 / 125 |
+  | complete traced round | 49.860 / 49.145 / 52.410 / 54.266 | 31.212 / 31.038 / 31.905 / 31.906 | n/a |
+
+  Per-phase critical-rank means are diagnostic and are not strictly additive;
+  the complete-round row is measured directly from draft-Graph start to the
+  next draft-Graph start.
+- The 431-kernel vLLM draft-to-target interval now has an exact launch
+  accounting. Repeated GDN state-contract compaction and its generic
+  indexing/copy/scan helpers consume 423 launches and about 1.276 ms of
+  rank-average GPU service; block-table, slot, RoPE, and input mapping consume
+  seven launches and about 0.044 ms; the final TP4 reduce/synchronization is one
+  launch and averages about 0.598 ms. That reduce is primarily a rank-skew wait
+  at this boundary (0.128 ms p50, 1.339 ms p90, 6.241 ms p99), not a stable
+  0.598 ms compute kernel. SGLang reaches the target with 30 launches and about
+  0.115 ms GPU service. This makes removal of the ten repeated group contracts
+  the first optimization, before tuning the boundary collective itself.
+- Inside the target Graph, both implementations spend essentially the same
+  time in 256 target FP8 GEMMs (10.850 versus 10.570 ms of rank-average GPU
+  service). vLLM's excess is concentrated in 1,422 generic vectorized,
+  unrolled, and elementwise copy nodes (4.621 ms) versus SGLang's 211 nodes
+  (0.667 ms), plus the TP reduction path (2.350 ms on vLLM's slowest rank versus
+  1.603 ms on SGLang's slowest rank). Attention and KV-cache service are close.
+  SGLang includes roughly 0.979 ms of target LM-head GEMM and 0.129 ms of TP
+  all-gather inside its target Graph, whereas vLLM launches the corresponding
+  work after the graph; semantic comparisons must retain this boundary
+  difference.
+- With the repaired corpus-wide pooled acceptance length of 4.5644, the
+  current 40.7148 ms round cost corresponds to about 112 emitted tokens/s
+  before request-level residuals. A 32 ms round is only an intermediate gate
+  (about 143 tokens/s), and SGLang parity near 26.8 ms is about 170 tokens/s at
+  the same pooled acceptance. Reaching the requested 200 tokens/s without
+  relying on a higher acceptance length requires approximately 22.82 ms per
+  round. The optimization sequence is therefore persistent/fused GDN metadata,
+  removal of target-Graph copy/state fan-out, then the TP4 reduction path;
+  proposal/selector work is not on the critical gap.
+- SGLang PR #26520's final-state recomputation path is not selected for this
+  B1 lane. Its own acceptance-aligned result is 2.5% lower throughput than the
+  cached-state control. vLLM already writes speculative intermediate states to
+  state-pool slots, so the nearer-term path is shared/persistent metadata and a
+  numerically equivalent verifier kernel. ReplaySSM remains a later high-batch
+  research lane, not a substitute for the current single-request verification
+  cost gate.
+
 Main implementation priority:
 
 1. Add a decoupled SM70 TurboMind backend for AWQ and FP8 base GEMM.

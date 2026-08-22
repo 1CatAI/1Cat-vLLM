@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.gdn_attn import (
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.attn_utils import compute_common_gdn_attn_metadata
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
@@ -212,18 +213,71 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    use_common_metadata: bool = False,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
-        kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
+        num_decode_draft_tokens_cpu = torch.tensor(
             num_decode_draft_tokens, dtype=torch.int32, device="cpu"
         )
-        kwargs["num_accepted_tokens"] = torch.ones(
+        num_accepted_tokens = torch.ones(
             batch_spec.batch_size, dtype=torch.int32, device=DEVICE
         )
+        kwargs["num_decode_draft_tokens_cpu"] = num_decode_draft_tokens_cpu
+        kwargs["num_accepted_tokens"] = num_accepted_tokens
+        if use_common_metadata:
+            kwargs["common_gdn_metadata"] = compute_common_gdn_attn_metadata(
+                num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+                query_start_loc=common.query_start_loc,
+                query_start_loc_cpu=common.query_start_loc_cpu,
+                num_spec_state_tokens=builder.num_spec_state_tokens,
+                legacy_mixed_decode_routing=(
+                    qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                ),
+            )
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+
+
+def _assert_gdn_metadata_equal(
+    actual: GDNAttentionMetadata,
+    expected: GDNAttentionMetadata,
+) -> None:
+    scalar_fields = (
+        "num_prefills",
+        "num_prefill_tokens",
+        "num_decodes",
+        "num_decode_tokens",
+        "num_spec_decodes",
+        "num_spec_decode_tokens",
+        "num_actual_tokens",
+    )
+    for field in scalar_fields:
+        assert getattr(actual, field) == getattr(expected, field), field
+
+    tensor_fields = (
+        "has_initial_state",
+        "spec_query_start_loc",
+        "non_spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "non_spec_token_indx",
+        "num_accepted_tokens",
+        "spec_state_slot_selectors",
+        "chunk_indices",
+        "chunk_offsets",
+        "batch_ptr",
+        "token_chunk_offset_ptr",
+    )
+    for field in tensor_fields:
+        actual_tensor = getattr(actual, field)
+        expected_tensor = getattr(expected, field)
+        assert (actual_tensor is None) == (expected_tensor is None), field
+        if actual_tensor is not None:
+            assert torch.equal(actual_tensor, expected_tensor), field
 
 
 def _effective_spec_initial_state_slots(
@@ -258,6 +312,51 @@ def test_gdn_build_classification(
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        case
+        for case in GDN_BUILD_TEST_CASES.values()
+        if case.num_decode_draft_tokens is not None
+    ],
+    ids=[
+        name
+        for name, case in GDN_BUILD_TEST_CASES.items()
+        if case.num_decode_draft_tokens is not None
+    ],
+)
+def test_common_gdn_metadata_matches_per_group_builder(
+    test_case: GDNBuildTestCase,
+    local_gdn_model: str,
+):
+    generic_builder = _create_gdn_builder(
+        local_gdn_model, test_case.num_speculative_tokens
+    )
+    common_builder = _create_gdn_builder(
+        local_gdn_model, test_case.num_speculative_tokens
+    )
+    batch = BatchSpec(
+        seq_lens=test_case.seq_lens,
+        query_lens=test_case.query_lens,
+    )
+
+    torch.manual_seed(0)
+    expected = _build(
+        generic_builder,
+        batch,
+        test_case.num_decode_draft_tokens,
+    )
+    torch.manual_seed(0)
+    actual = _build(
+        common_builder,
+        batch,
+        test_case.num_decode_draft_tokens,
+        use_common_metadata=True,
+    )
+
+    _assert_gdn_metadata_equal(actual, expected)
 
 
 def test_mixed_decode_stays_decode_fastpath(local_gdn_model):
@@ -335,6 +434,58 @@ def test_full_cuda_graph_spec_replay_tail_uses_pad_slot(local_gdn_model):
         [PAD_SLOT_ID] * 3,
         [PAD_SLOT_ID] * 3,
     ]
+
+
+def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
+    generic_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    common_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    batch = BatchSpec(seq_lens=[4097], query_lens=[3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        block_table_tensor=torch.tensor(
+            [[10, 11, 12, 13, 14]],
+            dtype=torch.int32,
+            device=DEVICE,
+        ),
+        num_actual_tokens=4,
+    )
+    num_accepted_tokens = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+    num_decode_draft_tokens_cpu = torch.tensor(
+        [2], dtype=torch.int32, device="cpu"
+    )
+
+    expected = generic_builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=common_builder.num_spec_state_tokens,
+        legacy_mixed_decode_routing=(
+            qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+        ),
+    )
+    assert common_metadata is not None
+    actual = common_builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+
+    _assert_gdn_metadata_equal(actual, expected)
 
 
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):

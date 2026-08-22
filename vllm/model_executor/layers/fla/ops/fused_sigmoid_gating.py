@@ -13,6 +13,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from .op import exp
+
 
 def _parse_positive_int_env(name: str) -> int | None:
     value = os.getenv(name)
@@ -83,6 +85,37 @@ def _select_fused_sigmoid_schedule(
     return BV, num_warps, num_stages
 
 
+def _select_fused_sigmoid_launch(
+    V: int,
+    N: int,
+    HV: int,
+    T: int,
+    device: torch.device,
+    *,
+    match_recurrent_schedule: bool,
+) -> tuple[int, int, int]:
+    if not _use_sm70_fused_sigmoid_schedule(device):
+        return min(triton.next_power_of_2(V), 32), 4, 3
+    if not match_recurrent_schedule:
+        return _select_fused_sigmoid_schedule(V, N, HV, device)
+
+    # The unfused verifier uses this launch geometry. Keeping it for the first
+    # fused rollout removes schedule-induced reduction-order changes from the
+    # correctness comparison; schedule tuning is a separate performance gate.
+    from .fused_recurrent import (
+        _select_sm70_bv,
+        _select_sm70_num_stages,
+        _select_sm70_num_warps,
+    )
+
+    BV = _select_sm70_bv(V, N, HV, device)
+    return (
+        BV,
+        _select_sm70_num_warps(BV, N, HV),
+        _select_sm70_num_stages(T),
+    )
+
+
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -140,6 +173,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_DDTREE: tl.constexpr,
     IS_KDA: tl.constexpr,
     MIXED_QKV: tl.constexpr,
+    PRECOMPUTED_GATING: tl.constexpr,
+    QUANTIZE_BETA: tl.constexpr,
+    QUANTIZE_STATE_EACH_STEP: tl.constexpr,
+    MATCH_RECURRENT_NUMERICS: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -237,25 +274,44 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_b = tl.load(p_b).to(tl.float32)
+        if PRECOMPUTED_GATING:
+            b_g = tl.load(p_a).to(tl.float32)
+            b_beta = tl.load(p_b).to(tl.float32)
+        else:
+            b_b = tl.load(p_b).to(tl.float32)
 
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
-        softplus_x = tl.where(
-            beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-        )
-        b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
+            # If the model is loaded in fp16, without the .float() here, A
+            # might be -inf.
+            x = tl.load(p_a).to(tl.float32) + tl.load(p_dt_bias).to(tl.float32)
+            softplus_x = tl.where(
+                beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+            )
+            b_g = -tl.exp(tl.load(p_A_log).to(tl.float32)) * softplus_x
 
-        # compute beta_output = sigmoid(b)
-        b_beta = tl.sigmoid(b_b.to(tl.float32))
+            # compute beta_output = sigmoid(b)
+            b_beta = tl.sigmoid(b_b.to(tl.float32))
+            if QUANTIZE_BETA:
+                # The split GDN verifier materializes beta in b.dtype before
+                # the recurrent kernel consumes it. Preserve that boundary.
+                b_beta = b_beta.to(p_b.dtype.element_ty).to(tl.float32)
 
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q * (tl.rsqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k * (tl.rsqrt(tl.sum(b_k * b_k) + 1e-6))
+            if MATCH_RECURRENT_NUMERICS:
+                # Preserve the split recurrent verifier's operation order.
+                # Multiplication by rsqrt is mathematically equivalent but can
+                # move a probabilistic rejection decision by one FP16 ULP.
+                b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+                b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            else:
+                b_q = b_q * (tl.rsqrt(tl.sum(b_q * b_q) + 1e-6))
+                b_k = b_k * (tl.rsqrt(tl.sum(b_k * b_k) + 1e-6))
         b_q = b_q * scale
         # [BV, BK]
         if not IS_KDA:
-            b_h *= tl.exp(b_g)
+            if MATCH_RECURRENT_NUMERICS:
+                b_h *= exp(b_g)
+            else:
+                b_h *= tl.exp(b_g)
         else:
             b_h *= tl.exp(b_g[None, :])
         # [BV]
@@ -277,10 +333,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+                if QUANTIZE_STATE_EACH_STEP:
+                    # Target verification handles several linear tokens in one
+                    # invocation. Reloading the just-persisted state reproduces
+                    # the low-precision store/load boundary of repeated decode.
+                    b_h = tl.load(p_ht, mask=mask_h, other=0).to(tl.float32)
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
             p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            if QUANTIZE_STATE_EACH_STEP:
+                b_h = tl.load(p_ht, mask=mask_h, other=0).to(tl.float32)
 
         if MIXED_QKV:
             p_q += QKV_STRIDE
@@ -410,6 +473,10 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
         MIXED_QKV=False,
+        PRECOMPUTED_GATING=False,
+        QUANTIZE_BETA=False,
+        QUANTIZE_STATE_EACH_STEP=False,
+        MATCH_RECURRENT_NUMERICS=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -541,6 +608,10 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=False,
         MIXED_QKV=True,
+        PRECOMPUTED_GATING=False,
+        QUANTIZE_BETA=False,
+        QUANTIZE_STATE_EACH_STEP=False,
+        MATCH_RECURRENT_NUMERICS=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -564,9 +635,21 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    quantize_beta: bool = False,
+    quantize_state_each_step: bool = False,
+    match_recurrent_schedule: bool = False,
+    match_recurrent_numerics: bool = False,
+    precomputed_g: torch.Tensor | None = None,
+    precomputed_beta: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mixed-QKV fused update that writes into a caller-provided decode output."""
+    """Mixed-QKV update that writes into a caller-provided output buffer.
+
+    ``precomputed_g`` and ``precomputed_beta`` retain the split verifier's
+    exact gating materialization while still removing the packed-QKV rearrange.
+    Omitting both computes gating inside the recurrent kernel.
+    """
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
     if not mixed_qkv.is_contiguous():
@@ -575,6 +658,10 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         raise ValueError("cu_seqlens is required for mixed_qkv_out.")
     if ssm_state_indices is None:
         raise ValueError("ssm_state_indices is required for mixed_qkv_out.")
+    if (precomputed_g is None) != (precomputed_beta is None):
+        raise ValueError(
+            "precomputed_g and precomputed_beta must be provided together."
+        )
 
     T = mixed_qkv.shape[0]
     N = cu_seqlens.numel() - 1
@@ -597,6 +684,28 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     else:
         assert scale > 0, "scale must be positive"
 
+    use_precomputed_gating = precomputed_g is not None
+    if use_precomputed_gating:
+        assert precomputed_g is not None
+        assert precomputed_beta is not None
+        if precomputed_g.numel() != T * HV:
+            raise ValueError(
+                f"precomputed_g must contain {T * HV} values, "
+                f"got {precomputed_g.numel()}."
+            )
+        if precomputed_beta.numel() != T * HV:
+            raise ValueError(
+                f"precomputed_beta must contain {T * HV} values, "
+                f"got {precomputed_beta.numel()}."
+            )
+        if quantize_beta:
+            raise ValueError("precomputed_beta is already materialized in its dtype.")
+        kernel_a = precomputed_g.contiguous().view(T, HV)
+        kernel_b = precomputed_beta.contiguous().view(T, HV)
+    else:
+        kernel_a = a.contiguous()
+        kernel_b = b.contiguous()
+
     assert initial_state is not None
     final_state = initial_state
     stride_init_state_token = initial_state.stride(0)
@@ -608,18 +717,21 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
     BK = triton.next_power_of_2(K)
-    BV, num_warps, num_stages = (
-        _select_fused_sigmoid_schedule(V, N, HV, mixed_qkv.device)
-        if _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
-        else (min(triton.next_power_of_2(V), 32), 4, 3)
+    BV, num_warps, num_stages = _select_fused_sigmoid_launch(
+        V,
+        N,
+        HV,
+        T,
+        mixed_qkv.device,
+        match_recurrent_schedule=match_recurrent_schedule,
     )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 
     fused_sigmoid_gating_delta_rule_update_kernel[(NK, NV, N * HV)](
         A_log=A_log,
-        a=a.contiguous(),
-        b=b.contiguous(),
+        a=kernel_a,
+        b=kernel_b,
         dt_bias=dt_bias,
         beta=beta,
         threshold=threshold,
@@ -632,7 +744,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
+        num_accepted_tokens=num_accepted_tokens,
         ddtree_parent_ids=None,
         scale=scale,
         N=N,
@@ -658,6 +770,10 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=False,
         MIXED_QKV=True,
+        PRECOMPUTED_GATING=use_precomputed_gating,
+        QUANTIZE_BETA=quantize_beta,
+        QUANTIZE_STATE_EACH_STEP=quantize_state_each_step,
+        MATCH_RECURRENT_NUMERICS=match_recurrent_numerics,
         num_warps=num_warps,
         num_stages=num_stages,
     )
