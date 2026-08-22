@@ -73,7 +73,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 base,
                 cache_config=replace(base.cache_config, cache_dtype="auto"),
             )
-        return base
+        return replace(
+            base,
+            attention_config=replace(
+                base.attention_config,
+                use_non_causal=not self.dflash_causal,
+            ),
+        )
 
     def __init__(
         self,
@@ -341,17 +347,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
             "dflash_prepare_next_token",
             "dflash_prepare_inputs",
             "dflash_expand_inputs",
-        )
-
-    @override
-    def _create_draft_vllm_config(self) -> VllmConfig:
-        base = super()._create_draft_vllm_config()
-        return replace(
-            base,
-            attention_config=replace(
-                base.attention_config,
-                use_non_causal=not self.dflash_causal,
-            ),
         )
 
     @override

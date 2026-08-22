@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,9 @@ import torch
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.v1.spec_decode.dflash import DFlashProposer
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -97,3 +101,80 @@ def test_ddtree_topk_adapter_uses_official_logits_processor() -> None:
 
 def test_draft_kv_dtype_is_public_and_defaults_to_inherit() -> None:
     assert SpeculativeConfig.kv_cache_dtype is None
+
+
+def test_ddtree_draft_config_combines_sm70_kv_and_non_causal(monkeypatch) -> None:
+    @dataclass(frozen=True)
+    class CacheConfig:
+        cache_dtype: str
+
+    @dataclass(frozen=True)
+    class AttentionConfig:
+        use_non_causal: bool
+
+    @dataclass(frozen=True)
+    class DraftConfig:
+        cache_config: CacheConfig
+        attention_config: AttentionConfig
+
+    base = DraftConfig(
+        cache_config=CacheConfig(cache_dtype="fp8_e5m2"),
+        attention_config=AttentionConfig(use_non_causal=False),
+    )
+    proposer = object.__new__(DFlashProposer)
+    proposer.speculative_config = SimpleNamespace(kv_cache_dtype=None)
+    proposer.dflash_causal = False
+
+    monkeypatch.setattr(
+        SpecDecodeBaseProposer,
+        "_create_draft_vllm_config",
+        lambda _self: base,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.dflash.current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability=lambda capability: capability == 70,
+        ),
+    )
+
+    draft = DFlashProposer._create_draft_vllm_config(proposer)
+
+    assert draft.cache_config.cache_dtype == "auto"
+    assert draft.attention_config.use_non_causal is True
+
+
+def test_draft_attention_metadata_resolves_causal_per_kv_group() -> None:
+    class Builder:
+        def build(self, common_prefix_len, common_attn_metadata, **_kwargs):
+            assert common_prefix_len == 0
+            return common_attn_metadata
+
+    class Group:
+        def __init__(self, layer_name: str):
+            self.layer_names = [layer_name]
+            self.builder = Builder()
+
+        def get_metadata_builder(self, _index: int):
+            return self.builder
+
+    attn_metadata = build_attn_metadata(
+        attn_groups=[[Group("layer.0")], [Group("layer.1")]],
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        max_seq_len=1,
+        block_tables=[
+            torch.zeros((1, 1), dtype=torch.int32),
+            torch.zeros((1, 1), dtype=torch.int32),
+        ],
+        slot_mappings=torch.zeros((2, 1), dtype=torch.int64),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
+        causal={0: False, 1: True},
+    )
+
+    assert attn_metadata["layer.0"].causal is False
+    assert attn_metadata["layer.1"].causal is True
