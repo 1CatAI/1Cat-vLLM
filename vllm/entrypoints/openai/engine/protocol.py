@@ -90,6 +90,8 @@ class ModelCard(OpenAIBaseModel):
     root: str | None = None
     parent: str | None = None
     max_model_len: int | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
     permission: list[ModelPermission] = Field(default_factory=list)
 
 

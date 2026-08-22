@@ -4585,12 +4585,13 @@ class GPUModelRunner(
             )
 
         if not isinstance(self._draft_token_ids, torch.Tensor):
-            raise RuntimeError(
-                "Speculative decode scheduled draft input slots, but the "
-                f"worker draft tokens are {type(self._draft_token_ids).__name__} "
-                "instead of a tensor. The scheduler must trim invalid draft "
-                "slots before target verification."
-            )
+            # opt24: the drafter context limit was reached
+            # ("Skipping speculative drafts" path sets per-request empty
+            # lists). The scheduler may still carry draft slots from the
+            # previous step; scatter would crash on a non-tensor. Skip the
+            # scatter — the empty draft was already synced to the CPU, so the
+            # scheduler trims invalid slots on the next step.
+            return
 
         draft_tokens_index_tensor = torch.tensor(
             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
@@ -6830,7 +6831,39 @@ class GPUModelRunner(
         if self.dynamic_draft_vocab_prefill_topk == 0:
             return None
         if self.input_batch.num_reqs != 1:
-            return None
+            if not envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
+                return None
+            # opt23: multi-concurrent GPU-LRU — traverse all prefilling
+            # requests, union their top-k candidates into shared tail
+            all_candidate_ids = []
+            consumed_ids = []
+            for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                num_computed = int(
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                )
+                num_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
+                if num_computed >= num_prompt:
+                    continue  # not prefilling
+                candidate_ids = self._dynamic_draft_vocab_prefill_bootstrap.maybe_prepare_candidates(
+                    req_id,
+                    logits,
+                    topk=self.dynamic_draft_vocab_prefill_topk,
+                    num_computed_tokens=num_computed,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens.get(
+                        req_id, 0
+                    ),
+                    num_prompt_tokens=num_prompt,
+                    spec_decode_active=spec_decode_metadata is not None,
+                )
+                if candidate_ids is not None:
+                    all_candidate_ids.append(candidate_ids)
+                    consumed_ids.append(req_id)
+            if not all_candidate_ids:
+                return None
+            if len(all_candidate_ids) == 1:
+                return consumed_ids[0], all_candidate_ids[0]
+            union = torch.unique(torch.cat(all_candidate_ids))
+            return ",".join(consumed_ids), union
 
         request_id = self.input_batch.req_ids[0]
         request_index = self.input_batch.req_id_to_index[request_id]
@@ -6877,10 +6910,15 @@ class GPUModelRunner(
 
         request_id, candidate_ids = bootstrap
         update_dynamic_draft_vocab(candidate_ids, sampled_token_ids)
-        self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(request_id)
+        # opt23: handle multi-concurrent (comma-separated request IDs)
+        for rid in request_id.split(","):
+            self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(rid)
+        num_reqs = request_id.count(",") + 1
         logger.info(
-            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: topk=%d.",
+            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: "
+            "topk=%d reqs=%d.",
             self.dynamic_draft_vocab_prefill_topk,
+            num_reqs,
         )
 
     def _sample(

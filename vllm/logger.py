@@ -291,6 +291,51 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
     return partial(_trace_calls, log_path, root_dir)
 
 
+class _StartupLogHandler(logging.Handler):
+    """Intercept vLLM logger messages and write to a startup log file,
+    until the "Application startup complete" marker is seen."""
+
+    _log_file = "/tmp/log/vllm-starting-log.txt"
+    _installed = False
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with open(self._log_file, "a") as f:
+                f.write(msg + "\n")
+            if "Application startup complete" in msg:
+                self._remove()
+        except Exception:
+            self.handleError(record)
+
+    def _remove(self) -> None:
+        root_logger = logging.getLogger("vllm")
+        root_logger.removeHandler(self)
+        _StartupLogHandler._installed = False
+
+    @staticmethod
+    def install() -> None:
+        if _StartupLogHandler._installed:
+            return
+        handler = _StartupLogHandler()
+        root_logger = logging.getLogger("vllm")
+        root_logger.addHandler(handler)
+        _StartupLogHandler._installed = True
+
+    @staticmethod
+    def truncate() -> None:
+        try:
+            os.makedirs(os.path.dirname(_StartupLogHandler._log_file), exist_ok=True)
+            with open(_StartupLogHandler._log_file, "w"):
+                pass
+        except Exception:
+            pass
+
+
 def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     """
     Enable tracing of every function call in code under `root_dir`.

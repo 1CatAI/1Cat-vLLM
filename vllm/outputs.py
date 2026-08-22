@@ -198,6 +198,11 @@ STREAM_FINISHED = RequestOutput(
     finished=True,
 )
 
+STREAM_KEEPALIVE = RequestOutput(
+    request_id="", prompt=None, prompt_token_ids=None,
+    prompt_logprobs=None, outputs=[], finished=False,
+)
+
 _O = TypeVar("_O", default=PoolingOutput)
 
 

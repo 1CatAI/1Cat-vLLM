@@ -1,0 +1,118 @@
+From c084f80ad5780325d550f130945cf25f4e83e3ac Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Wed, 19 Aug 2026 01:29:36 +0800
+Subject: [PATCH] =?UTF-8?q?fix(opt24+23):=20NTK=20=E9=95=BF=E4=B8=8A?=
+ =?UTF-8?q?=E4=B8=8B=E6=96=87=EF=BC=88>262K=EF=BC=89MTP=20=E6=8A=95?=
+ =?UTF-8?q?=E6=9C=BA=E5=B4=A9=E6=BA=83=E4=BF=AE=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+场景: max_model_len=368640 + NTK yarn 缩放默认启用后，上下文超过
+max_position_embeddings(262144) 时引擎崩溃
+RuntimeError: Speculative decode scheduled draft input slots, but the
+worker draft tokens are list instead of a tensor.
+
+根因:
+1. v130 _maybe_override_draft_max_model_len 用 min(draft, target) 保持
+   draft_model_config.max_model_len=262144 -> worker effective_drafter_
+   max_model_len=262144；上下文 >262K 触发 Skipping speculative drafts
+2. scheduler 该步仍调度 draft slots，worker scatter 时 _draft_token_ids
+   是 list 而非 tensor -> raise -> EngineCore 崩溃
+
+修复:
+- config/speculative.py (opt24): Drafter 对齐补 max_model_len 扩展
+  （对齐 target_model_config.max_model_len=368640，用 target_len 而非
+  self.max_model_len——MTP 同模型场景 self.max_model_len 为 None）+ None 防护
+- v1/worker/gpu_model_runner.py (opt23): worker 容错——_draft_token_ids
+  非 tensor 时跳过 scatter 而非 raise
+
+验证:
+- 280K tokens 上下文请求成功（280010, 162s）——修复前 266K 即崩溃
+- Skipping: 16次 -> 0次；EngineDeadError: 0
+---
+ config/speculative.py         | 32 ++++++++++++++++++++++++++++----
+ v1/worker/gpu_model_runner.py | 13 +++++++------
+ 2 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/config/speculative.py b/config/speculative.py
+index 8e63454..367a41e 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -915,21 +915,45 @@ class SpeculativeConfig:
+                 # opt24 (opt26): Auto-extend drafter max_position_embeddings
+                 # to match target model max_model_len.
+                 hf_config = self.draft_model_config.hf_config
++                target_len = self.target_model_config.max_model_len
+                 if hf_config is not None:
+                     for pos_attr in ("max_position_embeddings", "max_position"):
+                         current_pos = getattr(hf_config, pos_attr, None)
+                         if (current_pos is not None
+-                                and current_pos < self.max_model_len):
+-                            setattr(hf_config, pos_attr, self.max_model_len)
++                                and target_len is not None
++                                and current_pos < target_len):
++                            setattr(hf_config, pos_attr, target_len)
+                             logger.info_once(
+                                 "Extended Drafter %s from %d to %d "
+                                 "to match target model max_model_len=%d.",
+                                 pos_attr,
+                                 current_pos,
+-                                self.max_model_len,
+-                                self.max_model_len,
++                                target_len,
++                                target_len,
+                             )
+ 
++                # opt24: also extend draft_model_config.max_model_len so the
++                # worker's effective_drafter_max_model_len tracks the target
++                # model. v130 keeps min(draft, target) = max_position_embeddings
++                # (262144), which forces "Skipping speculative drafts" once the
++                # context exceeds 262K; the scheduler still schedules draft
++                # slots on that step and the worker raises
++                # "draft tokens are list instead of a tensor" — engine crash
++                # (NTK long-context > 262K scenario).
++                if (
++                    self.draft_model_config.max_model_len is not None
++                    and target_len is not None
++                    and self.draft_model_config.max_model_len < target_len
++                ):
++                    self.draft_model_config.max_model_len = target_len
++                    logger.info_once(
++                        "Extended Drafter max_model_len from %d to %d "
++                        "to match target model max_model_len=%d.",
++                        self.draft_model_config.max_model_len,
++                        target_len,
++                        target_len,
++                    )
++
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index b527a49..92c23b3 100644
+--- a/v1/worker/gpu_model_runner.py
++++ b/v1/worker/gpu_model_runner.py
+@@ -4580,12 +4580,13 @@ class GPUModelRunner(
+             )
+ 
+         if not isinstance(self._draft_token_ids, torch.Tensor):
+-            raise RuntimeError(
+-                "Speculative decode scheduled draft input slots, but the "
+-                f"worker draft tokens are {type(self._draft_token_ids).__name__} "
+-                "instead of a tensor. The scheduler must trim invalid draft "
+-                "slots before target verification."
+-            )
++            # opt24: the drafter context limit was reached
++            # ("Skipping speculative drafts" path sets per-request empty
++            # lists). The scheduler may still carry draft slots from the
++            # previous step; scatter would crash on a non-tensor. Skip the
++            # scatter — the empty draft was already synced to the CPU, so the
++            # scheduler trims invalid slots on the next step.
++            return
+ 
+         draft_tokens_index_tensor = torch.tensor(
+             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+-- 
+2.43.0
+

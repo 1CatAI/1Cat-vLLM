@@ -5,7 +5,7 @@
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -27,6 +27,12 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 router = APIRouter()
+
+
+@router.head("/v1/messages")
+@router.head("/v1/messages/count_tokens")
+async def handle_anthropic_head():
+    return Response(status_code=200)
 
 
 def messages(request: Request) -> AnthropicServingMessages:

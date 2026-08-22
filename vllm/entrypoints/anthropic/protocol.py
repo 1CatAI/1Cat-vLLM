@@ -219,8 +219,8 @@ class AnthropicMessagesResponse(BaseModel):
     )
 
     def model_post_init(self, __context):
-        if not self.id:
-            self.id = f"msg_{int(time.time() * 1000)}"
+        from vllm.utils import random_uuid
+        self.id = f"msg_{random_uuid()}"
 
 
 class AnthropicContextManagement(BaseModel):
