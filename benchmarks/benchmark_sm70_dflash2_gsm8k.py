@@ -81,6 +81,11 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Sampling seed for every request; use -1 for server-style random seeds.",
     )
+    parser.add_argument(
+        "--cuda-profiler-capture",
+        action="store_true",
+        help="Wrap the measured generation in cudaProfilerStart/Stop for nsys.",
+    )
     return parser.parse_args()
 
 
@@ -245,6 +250,8 @@ def main() -> int:
         "seed": args.seed,
         "speculative_config": speculative_config,
     }
+    if args.cuda_profiler_capture:
+        engine_kwargs["profiler_config"] = {"profiler": "cuda"}
 
     load_started = time.perf_counter()
     llm = LLM(**engine_kwargs)
@@ -270,6 +277,8 @@ def main() -> int:
         skip_special_tokens=False,
     )
     spec_before = _spec_metrics_snapshot(llm)
+    if args.cuda_profiler_capture:
+        llm.start_profile()
     started = time.perf_counter()
     if args.sequential:
         outputs = []
@@ -285,6 +294,8 @@ def main() -> int:
         outputs = llm.generate(prompts, sampling, use_tqdm=False)
         request_spec_metrics = [None] * len(outputs)
     elapsed_seconds = time.perf_counter() - started
+    if args.cuda_profiler_capture:
+        llm.stop_profile()
     spec_after = _spec_metrics_snapshot(llm)
 
     cases = []
@@ -369,7 +380,7 @@ def main() -> int:
             "torch_cuda": torch.version.cuda,
             "cuda_device_count": torch.accelerator.device_count(),
             "device_capabilities": [
-                list(torch.accelerator.get_device_capability(index))
+                list(torch.cuda.get_device_capability(index))
                 for index in range(torch.accelerator.device_count())
             ],
             "c_extension": str(c_extension),
