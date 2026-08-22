@@ -60,10 +60,13 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
+    """Resolve explicit causality before falling back to legacy layer defaults."""
+    is_causal = getattr(config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
-        return override
+        return bool(override)
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
@@ -288,11 +291,16 @@ class DFlashQwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
+        output_input_scale = getattr(self, "output_input_scale", 1.0)
+        if output_input_scale != 1.0:
+            attn_output = attn_output / output_input_scale
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class DFlashQwen3DecoderLayer(nn.Module):
+    attention_cls = DFlashQwen3Attention
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -327,7 +335,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # collapses with no error raised.
         is_neox_style = getattr(config, "is_neox_style", True)
 
-        self.self_attn = DFlashQwen3Attention(
+        self.self_attn = self.attention_cls(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -381,6 +389,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
+    decoder_layer_cls = DFlashQwen3DecoderLayer
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
             "midlayer.": "layers.0.",
@@ -434,7 +444,7 @@ class DFlashQwen3Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DFlashQwen3DecoderLayer(
+                self.decoder_layer_cls(
                     current_vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -548,13 +558,7 @@ class DFlashQwen3Model(nn.Module):
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # --- Fused KV projection (one GEMM for all layers) ---
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states,
-            context_states,
-            self._hidden_norm_weight,
-            self._rms_norm_eps,
-        )
+        normed_context_states = self._normalize_context_states(context_states)
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
@@ -569,6 +573,16 @@ class DFlashQwen3Model(nn.Module):
         all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
         all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
         return all_k, all_v
+
+    def _normalize_context_states(self, context_states: torch.Tensor) -> torch.Tensor:
+        normed_context_states = torch.empty_like(context_states)
+        ops.rms_norm(
+            normed_context_states,
+            context_states,
+            self._hidden_norm_weight,
+            self._rms_norm_eps,
+        )
+        return normed_context_states
 
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
@@ -740,6 +754,8 @@ class DFlashQwen3Model(nn.Module):
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    model_cls = DFlashQwen3Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -749,7 +765,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = DFlashQwen3Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
@@ -861,6 +877,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
+        # SM70 target models may expose auxiliary residual streams in FP32
+        # while the BF16-trained draft weights are transported as FP16. The
+        # loaded projection weight is the authoritative runtime dtype.
+        runtime_dtype = self.model.fc.weight.dtype
+        if hidden_states.dtype != runtime_dtype:
+            hidden_states = hidden_states.to(runtime_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)

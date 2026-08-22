@@ -611,12 +611,12 @@ def resolve_kv_cache_block_sizes(
     if not (cache_config.enable_prefix_caching or connector_enabled):
         return scheduler_block_size, scheduler_block_size
 
-    # Mamba groups with block_size != cache_config.block_size
-    # (mamba_cache_mode != "align") break divisibility; back off to the
-    # scheduler block size.
+    # Mamba groups outside align mode break divisibility; back off to the
+    # scheduler block size. Read the mode from the resolved group spec because
+    # its block size may have been updated independently of cache_config.
     if any(
         isinstance(g.kv_cache_spec, MambaSpec)
-        and g.kv_cache_spec.block_size != cache_config.block_size
+        and g.kv_cache_spec.mamba_cache_mode != "align"
         for g in groups
     ):
         return scheduler_block_size, scheduler_block_size
@@ -1043,8 +1043,23 @@ def unify_kv_cache_spec_page_size(
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
+            replace_args = {"block_size": new_block_size}
+            # A padded page does not grow when only block_size changes. This
+            # happens for hybrid Mamba targets when a higher-precision draft
+            # cache has a larger page than the target cache. Keep the logical
+            # block-size adjustment and grow the physical padding with it.
+            if (
+                isinstance(layer_spec, MambaSpec)
+                or getattr(layer_spec, "page_size_padded", None) is not None
+            ):
+                replace_args["page_size_padded"] = max_page_size
+            new_spec = replace(layer_spec, **replace_args)
+            assert new_spec.page_size_bytes == max_page_size, (
+                f"Failed to unify KV page for {layer_name}: "
+                f"spec={layer_spec!r}, old_page={layer_page_size}, "
+                f"target_page={max_page_size}, replacement={replace_args!r}, "
+                f"new_page={new_spec.page_size_bytes}"
+            )
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 

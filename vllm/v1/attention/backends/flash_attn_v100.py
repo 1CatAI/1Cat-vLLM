@@ -785,7 +785,12 @@ def _get_flash_ops():
                 _flash_attn_prefill_paged_splitkv = flash_attn_prefill_paged_splitkv
             except ImportError:
                 _flash_attn_prefill_paged_splitkv = None
-        except ImportError:
+        except ImportError as exc:
+            logger.warning_once(
+                "Flash-V100 Python operators could not be imported (%s: %s).",
+                type(exc).__name__,
+                exc,
+            )
             _flash_attn_func = None
             _flash_attn_bhmd_func = None
             _flash_attn_decode_paged = None
@@ -2466,6 +2471,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             and getattr(spec_config, "draft_model_config", None)
             is self.vllm_config.model_config
         )
+        self._is_dflash_draft_model = self._is_speculative_draft_model and (
+            getattr(spec_config, "method", None) == "dflash"
+        )
         self._draft_block_table: torch.Tensor | None = None
         self._draft_seq_lens: torch.Tensor | None = None
         self._draft_query_start_loc: torch.Tensor | None = None
@@ -3203,12 +3211,13 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 workspace_seq_capacity_cap=workspace_seq_capacity_cap,
                 partition_size_hint=partition_size_hint,
             )
-        else:
+        if max_query_len == 1 or self._is_dflash_draft_model:
             # PIECEWISE graph replay captures the q=1 decode kernel arguments
             # during metadata warmup. Runtime drafting updates the persistent
-            # draft metadata buffers in build_for_drafting(), so capture must
-            # bind the graph to the same buffers instead of transient dummy
-            # capture tensors.
+            # draft metadata buffers, so capture must bind the graph to the
+            # same buffers instead of transient dummy capture tensors. DFlash
+            # parallel drafting has q=K+1; its non-causal paged-prefill graph
+            # consumes the same dynamic block table and sequence lengths.
             self._stabilize_draft_graph_metadata(
                 attn_metadata,
                 common_attn_metadata,
@@ -3252,13 +3261,14 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             and getattr(attn_metadata, "max_query_len", 1) > 1
             and bool(torch.any(ddtree_num_tree_tokens_cpu[:num_reqs] > 0).item())
         )
-        if (
+        if self._flash_draft_buffer_shape is not None and (
             getattr(attn_metadata, "max_query_len", 1) == 1
-            and self._flash_draft_buffer_shape is not None
+            or self._is_dflash_draft_model
         ):
             # FULL graph capture binds q=1 decode to these persistent buffers.
-            # Refresh them on every runtime decode step so replay sees the
-            # current request's block table and sequence metadata.
+            # DFlash binds its q=K+1 paged-prefill graph to the same buffers.
+            # Refresh them on every runtime step so replay sees the current
+            # request's block table and sequence metadata.
             self._stabilize_draft_graph_metadata(
                 attn_metadata,
                 common_attn_metadata,
@@ -4357,7 +4367,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "Flash op is unavailable or the attention features/KV cache dtype "
                 "are unsupported. Select TRITON_ATTN for a full Triton route, or "
                 "set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
-                "diagnostic fallback."
+                "diagnostic fallback. "
+                f"Details: layer={layer_info.get('layer_name')!r}, "
+                f"flash_ops_available={self.use_flash_v100}, "
+                f"attn_type={self.attn_type!r}, "
+                f"has_alibi={self.alibi_slopes is not None}, "
+                f"logits_soft_cap={self.logits_soft_cap!r}, "
+                f"has_sinks={self.sinks is not None}, "
+                f"kv_cache_dtype={self.kv_cache_dtype!r}."
             )
             if not (self.allow_triton_fallback or is_dflash_draft_attn):
                 raise RuntimeError(message)
@@ -4488,6 +4505,26 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 # look like no-prefix prefill, while replayed MTP verification
                 # is a uniform small-query decode over an existing KV prefix.
                 # Capture the same small-query kernel branch that replay needs.
+                is_dflash_non_causal = bool(
+                    getattr(layer, "is_dflash_draft_attn", False)
+                ) and not bool(getattr(attn_metadata, "causal", True))
+                if is_dflash_non_causal:
+                    # DFlash pre-inserts target context K/V before replay. Its
+                    # dummy capture has seq_len == query_len and would
+                    # otherwise freeze the no-prefix dense branch into the
+                    # graph. Bind directly to the non-causal paged-prefix
+                    # kernel; runtime updates its persistent sequence and
+                    # block-table buffers before every replay.
+                    _record_route("prefill_capture_dflash_noncausal_paged")
+                    return self._flash_v100_prefill_with_prefix(
+                        layer,
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata,
+                        output,
+                    )
                 smallq_decode = self._small_query_decode_enabled(attn_metadata)
                 if smallq_decode:
                     if _draft_graph_debug_enabled():

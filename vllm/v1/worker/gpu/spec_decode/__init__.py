@@ -13,10 +13,11 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         if draft_config is None:
             raise ValueError("method='dflash' requires a draft model config")
         if "DFlash2DraftModel" in (draft_config.architectures or []):
-            raise ValueError(
-                "DFlash2 requires the MRV2 DFlash2 speculator, which is not "
-                "available in this base backport stage."
+            from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+                DFlash2Speculator,
             )
+
+            return DFlash2Speculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
         return DFlashSpeculator(vllm_config, device)

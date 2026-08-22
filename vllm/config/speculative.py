@@ -1183,6 +1183,15 @@ class SpeculativeConfig:
             or self.use_dspark()
         )
 
+    def use_eagle_kv_cache(self) -> bool:
+        """Whether prefix hits need Eagle's final target-block recompute."""
+        # MRV2 DFlash caches its projected draft context KV alongside the
+        # target KV. It only needs target hidden states for the uncached suffix,
+        # so dropping an additional target block is both unnecessary and can
+        # eliminate all prefix hits when hybrid page unification makes blocks
+        # large. Keep DDTree and DSpark on their established V1 semantics.
+        return self.use_eagle() and not self.use_dflash()
+
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 

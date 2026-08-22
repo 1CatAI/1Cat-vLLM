@@ -1765,10 +1765,11 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
-
         if is_server and self.enable_prefix_caching is None and has_linear_attention:
             self.enable_prefix_caching = True
-            profile_updates.append("enable_prefix_caching=True")
+            profile_updates.append(
+                f"enable_prefix_caching={self.enable_prefix_caching}"
+            )
         if (
             self.enable_prefix_caching
             and has_linear_attention
@@ -1814,13 +1815,10 @@ class EngineArgs:
             return
 
         if "draft_sample_method" not in self.speculative_config:
-            # For SM70 native MTP, official Qwen sampling is non-greedy
-            # (temperature=1.0/top_p=0.95/top_k=20). Probabilistic draft
-            # sampling provides draft_probs for standard rejection sampling and
-            # is the validated high-acceptance path. Greedy requests still take
-            # the argmax fast path inside the proposer when sampling metadata is
-            # all-greedy, so this default does not penalize deterministic runs.
-            draft_sample_method = "probabilistic"
+            # Native MTP keeps its validated probabilistic default. DFlash2's
+            # published/default performance lane is greedy; probabilistic
+            # drafting remains available when explicitly requested.
+            draft_sample_method = "probabilistic" if spec_method == "mtp" else "greedy"
             self.speculative_config["draft_sample_method"] = draft_sample_method
             profile_updates.append(
                 f"speculative_config.draft_sample_method={draft_sample_method}"
