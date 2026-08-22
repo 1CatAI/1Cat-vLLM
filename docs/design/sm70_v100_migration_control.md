@@ -272,6 +272,92 @@ Goal:
   because the causal A/B kept the same FP8 target and changed only K-norm row
   selection.
 
+### DFlash2 single-request execution-cost root cause, 2026-08-22
+
+- The repaired 64-prompt single-request runs close acceptance but not execution
+  cost. For requests with at least 512 completion tokens, the round-weighted
+  vLLM decode cost is 40.7148 ms/verification versus 26.8166 ms for the same
+  SGLang-V100 target, draft, TP4, E5M2-KV, block-8, sampling, prompt order, and
+  CUDA-Graph route. The 13.8982 ms gap is not caused by acceptance: vLLM's
+  per-request mean is 5.3888 versus SGLang's 5.2489.
+- Matched CUDA-Graph node traces show that the one-pass DFlash2 proposal is not
+  the bottleneck. The vLLM and SGLang draft-model-plus-selector graphs take
+  3.976 and 3.915 ms respectively under tracing. Their dense draft LM head,
+  five-layer draft forward, non-causal attention, selector top-K, and selector
+  walk therefore have effectively the same cost on this route.
+- The raw traced round decomposition is:
+  - vLLM: draft graph 3.976 ms; draft-to-target transition 18.148 ms with 431
+    eager kernels; target graph 24.845 ms; target-to-next-draft transition
+    2.786 ms with 63 eager kernels.
+  - SGLang: draft graph 3.915 ms; draft-to-target transition 3.386 ms with 30
+    eager kernels; target graph 19.622 ms; target-to-next-draft transition
+    4.164 ms with 125 eager kernels.
+  - These traced wall times include launch-tracing overhead and must not replace
+    the unprofiled 40.7148/26.8166 ms round results. They are valid for
+    composition. SGLang captures its target LM head and TP all-gather inside the
+    target graph (about 1.11 ms combined), while vLLM executes those after its
+    target graph, so raw graph boundaries are not a perfectly semantic split.
+- The dominant pre-verification gap is a hybrid-KV metadata amplification. The
+  target has 48 GDN and 16 full-attention layers, while the draft has five
+  layers. vLLM's unified grouping therefore creates ten padded GDN groups and
+  four padded full-attention groups. GDN metadata does not support cached
+  block-table updates, so `build_gdn_spec_decode_state_contract` repeats five
+  boolean-index selections for every GDN group. The trace contains exactly 50
+  each of CUB reduce, compact-init, and select kernels per round, plus 281 other
+  metadata/input kernels: 431 launches and 18.148 ms of traced wall time for
+  only 2.452 ms of GPU service. SGLang keeps one persistent linear-attention
+  metadata object shared by all GDN layers; its corresponding transition has
+  30 kernels and 0.117 ms of GPU service.
+- SGLang also has a genuinely cheaper verifier graph: 1,130 nodes and 19.095 ms
+  GPU service versus vLLM's 2,612 nodes and 23.547 ms. Dense target FP8 GEMM is
+  already equal (10.798 versus 10.877 ms), and full-attention service is close,
+  so neither TurboMind GEMM nor Flash-V100 attention is the first DFlash2
+  target. The main graph differences are:
+  - vLLM executes 1,422 generic vectorized/unrolled/elementwise nodes totaling
+    about 4.625 ms; SGLang executes 211 such nodes totaling about 0.677 ms.
+  - vLLM custom all-reduce costs about 2.350 ms per target graph versus 1.113 ms
+    for SGLang's one-stage push kernel.
+  - SGLang fuses sigmoid-gating computation, recurrent verification, and
+    intermediate-state writes. After rejection sampling, two all-layer fused
+    gather/scatter kernels commit the accepted SSM and convolution state. Its
+    target-to-draft interval also uses fused target-hidden-to-draft KV
+    materialization.
+- Three narrow attempts to remove the repeated vLLM work were rejected and
+  fully reverted: reusing the DDTree one-kernel updater, reusing only its
+  pure-spec state path, and bypassing only the state-contract boolean
+  selections. All visible metadata regressions passed (34 focused tests), but
+  every shortcut changed the fixed-seed token trace at token 12, from the
+  235-token/40-round control to a 309-token/57-round trajectory. This proves
+  that deleting the allocations/indexing before establishing explicit graph
+  buffer ownership is unsafe. The current evidence is consistent with a hidden
+  padding, alias, scratch-lifetime, or stream-order dependency; that precise
+  mechanism remains an inference rather than a proven field mismatch.
+- Implementation decision and gates:
+  1. Add a DFlash-only persistent GDN verify metadata/state object. Every live
+     and padded field is overwritten each epoch, and a debug shadow path compares
+     it with the existing generic builder before graph replay.
+  2. Replace the ten repeated state contracts with one DFlash-specific fused
+     metadata kernel that writes shared structural metadata plus group-specific
+     state block IDs. Do not route Eagle, MTP, or DDTree through it.
+  3. Port SGLang's fused target-verify GDN and two all-layer state-commit
+     kernels, including the per-step FP16 store/reload boundary needed for
+     recurrent-state numerical equivalence.
+  4. Then port/capture fused target-hidden-to-draft KV materialization and tune
+     the one-stage TP4 all-reduce. Sparse rejection-sampling work is secondary.
+  5. Keep selector fusion default-off: the measured proposal graphs are already
+     equal, and the duplicate-layout fused selector remains slower and larger.
+  The first performance gate is an unprofiled round cost at or below 32 ms with
+  the fixed-seed token hash unchanged; the follow-up target is 28-29 ms before
+  claiming parity with SGLang's 26.8166 ms reference. Greedy tokens and accept
+  trajectories must be exact; probabilistic acceptance may differ by at most
+  0.05 on the fixed corpus, with batch 1/2/4 mixed-length graph replay and
+  poisoned padding/state buffers included.
+- Evidence is retained in
+  `/data/models/v100-dflash2-20260820/pr3/perf-rootcause/` as the vLLM baseline,
+  graph-node report, SQLite export, and rejected A/B JSON files. The matching
+  SGLang report is
+  `/data/models/v100-dflash2-20260820/sglang-audit/perf-rootcause/sglang-dflash2-single1-step20-v2.{qdstrm,nsys-rep,sqlite}`.
+
 Main implementation priority:
 
 1. Add a decoupled SM70 TurboMind backend for AWQ and FP8 base GEMM.
