@@ -300,7 +300,7 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
             common_gdn_metadata=common_gdn_metadata,
         )
-        return build_attn_metadata(
+        attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
@@ -316,6 +316,16 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
         )
+        if common_gdn_metadata is not None:
+            # The legacy per-group builder fenced here through a GPU ``.item()``
+            # assertion. Keep one batch-level fence after every group's state
+            # contract and graph-buffer copy instead of removing the ordering
+            # edge or paying it once per GDN cache group.
+            assert (
+                common_gdn_metadata.spec_query_start_loc[-1].item()
+                == common_gdn_metadata.num_spec_decode_tokens
+            )
+        return attn_metadata
 
     def postprocess_state(
         self,
