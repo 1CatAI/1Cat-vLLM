@@ -421,6 +421,88 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         return None
 
 
+def fp8_qpn8_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool = False,
+) -> None:
+    """Run the experimental SM70 QPN8 FP8 GEMM into ``out``.
+
+    This benchmark-only entry point is intentionally not selected by model
+    dispatch. ``codes`` and ``group_scales`` use the QPN8 packed layout.
+    """
+    _op("fp8_qpn8_gemm_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gemm_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gemm_sm70_out")
+    def _fp8_qpn8_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        fast_decoder: bool,
+        prefetch_codes: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_gated_pair_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool = False,
+) -> None:
+    """Run the single-kernel paired-tile QPN8 gated SiLU experiment."""
+    _op("fp8_qpn8_gated_pair_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gated_pair_sm70_out")
+    def _fp8_qpn8_gated_pair_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        fast_decoder: bool,
+        prefetch_codes: bool,
+    ) -> None:
+        return None
+
+
 def fp8_gemm_sm70_prefill_dispatch_out(
     out: torch.Tensor,
     dense_weight_ptr: int,
