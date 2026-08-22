@@ -44,9 +44,19 @@ def _sm70_env_bool(name: str, default: bool) -> bool:
 
 
 def _sm70_lm_head_top1_default() -> bool:
-    return not _sm70_env_bool(
-        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False
-    )
+    return not _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False)
+
+
+def _sm70_dflash2_fused_selector_enabled() -> bool:
+    requested = envs.VLLM_SM70_DFLASH2_FUSED_SELECTOR
+    if requested and _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False):
+        logger.warning_once(
+            "SM70 DFlash2 fused selector is eager-only; Flash-V100 compiled "
+            "CUDA Graph mode keeps the exact dense selector and does not "
+            "prepare the duplicate LM-head layout."
+        )
+        return False
+    return requested
 
 
 def _trace_sm70_lm_head_skip(reason: str) -> None:
@@ -65,6 +75,7 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+        or _sm70_dflash2_fused_selector_enabled()
     ):
         _trace_sm70_lm_head_skip("disabled")
         return False
@@ -103,7 +114,39 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     layer._sm70_f16_tm_weight = prepared[0]
     layer._sm70_f16_k_ld = int(prepared[1][0].item())
     layer._sm70_f16_prepared = True
-    if envs.VLLM_SM70_ENABLE_LM_HEAD_FASTPATH:
+    if _sm70_dflash2_fused_selector_enabled():
+        device = layer.weight.device
+        valid_vocab = layer.weight.shape[0] - layer.shard_indices.num_org_vocab_padding
+        num_vocab_tiles = (valid_vocab + 255) // 256
+        layer._sm70_dflash2_top20_values = torch.empty(
+            (8, 20), dtype=torch.float32, device=device
+        )
+        layer._sm70_dflash2_top20_ids = torch.empty(
+            (8, 20), dtype=torch.int64, device=device
+        )
+        layer._sm70_dflash2_top20_values_fp16 = torch.empty(
+            (8, 20), dtype=torch.float16, device=device
+        )
+        layer._sm70_dflash2_sparse_logits = torch.empty(
+            (8, layer.weight.shape[0]), dtype=torch.float16, device=device
+        )
+        layer._sm70_dflash2_local_values = torch.empty(
+            (8, 16), dtype=torch.float16, device=device
+        )
+        layer._sm70_dflash2_local_ids = torch.empty(
+            (8, 16), dtype=torch.int64, device=device
+        )
+        # The fused kernel's tile-local reductions must outlive CUDA Graph
+        # capture. Allocating them inside the C++ op leaves replay holding
+        # allocator addresses whose storage was released after capture.
+        layer._sm70_dflash2_partial_values = torch.empty(
+            (8, num_vocab_tiles, 20), dtype=torch.float32, device=device
+        )
+        layer._sm70_dflash2_partial_ids = torch.empty(
+            (8, num_vocab_tiles, 20), dtype=torch.int64, device=device
+        )
+        logger.info_once("SM70 DFlash2 fused selector layout prepared.")
+    elif envs.VLLM_SM70_ENABLE_LM_HEAD_FASTPATH:
         logger.info_once("SM70 dense fp16 fast path enabled for LM head.")
     else:
         logger.info_once("SM70 LM head top1 layout prepared.")
@@ -164,8 +207,7 @@ def _maybe_sm70_lm_head_top1(
         or hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out")
     ):
         logger.warning_once(
-            "SM70 LM head top1 requested, but no top1 op is available; "
-            "falling back."
+            "SM70 LM head top1 requested, but no top1 op is available; falling back."
         )
         return None
     if x.dtype != torch.float16 or not x.is_cuda:
@@ -193,9 +235,7 @@ def _maybe_sm70_lm_head_top1(
 
     values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
     indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
-    if lm_head_top1_tc and hasattr(
-        torch.ops._C, "sm70_f16_lm_head_top1_tc_out"
-    ):
+    if lm_head_top1_tc and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
         k_ld = getattr(layer, "_sm70_f16_k_ld", None)
         if tm_weight is not None and k_ld is not None:
@@ -216,9 +256,7 @@ def _maybe_sm70_lm_head_top1(
     if num_rows != 1:
         return None
 
-    if not lm_head_top1 or not hasattr(
-        torch.ops._C, "sm70_f16_lm_head_top1_out"
-    ):
+    if not lm_head_top1 or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
         return None
 
     sm70_ops.sm70_f16_lm_head_top1_out(
@@ -232,6 +270,90 @@ def _maybe_sm70_lm_head_top1(
     )
     logger.info_once("SM70 fused LM head top1 path enabled.")
     return values.reshape(*x.shape[:-1]), indices.reshape(*x.shape[:-1])
+
+
+def _maybe_sm70_dflash2_lm_head_top20(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    selector_k: int,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return dense-order shard-local top-16 DFlash2 candidates."""
+    if not _sm70_dflash2_fused_selector_enabled() or selector_k != 16:
+        return None
+    if bias is not None or not getattr(layer, "_sm70_f16_prepared", False):
+        return None
+    if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_workspace_out"):
+        logger.warning_once(
+            "SM70 DFlash2 fused selector requested, but its top-20 op is "
+            "unavailable; falling back to dense logits."
+        )
+        return None
+    if x.dtype != torch.float16 or not x.is_cuda:
+        return None
+    if torch.cuda.get_device_capability(x.device) != (7, 0):
+        return None
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+        logger.warning_once(
+            "SM70 DFlash2 fused selector is not accepted for compiled/CUDA "
+            "Graph replay; using the exact dense selector fallback."
+        )
+        return None
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    num_rows = x_2d.size(0)
+    if not 1 <= num_rows <= 8:
+        return None
+    weight = layer.weight
+    if weight.dtype != torch.float16 or not weight.is_cuda:
+        return None
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
+    k_ld = getattr(layer, "_sm70_f16_k_ld", None)
+    if tm_weight is None or k_ld is None:
+        return None
+
+    values = layer._sm70_dflash2_top20_values[:num_rows]
+    indices = layer._sm70_dflash2_top20_ids[:num_rows]
+    sm70_ops.sm70_f16_lm_head_top20_tc_workspace_out(
+        values,
+        indices,
+        layer._sm70_dflash2_partial_values,
+        layer._sm70_dflash2_partial_ids,
+        x_2d,
+        tm_weight,
+        int(k_ld),
+        layer.shard_indices.org_vocab_start_index,
+        layer.shard_indices.num_org_vocab_padding,
+    )
+
+    # torch.topk does not define a token-ID tie break. Recreate the dense
+    # shard shape with only the fused top-20 scores populated so its local
+    # top-16 ordering exactly matches the dense baseline for equal FP16 logits.
+    candidate_values = layer._sm70_dflash2_top20_values_fp16[:num_rows]
+    sparse_logits = layer._sm70_dflash2_sparse_logits[:num_rows]
+    local_values = layer._sm70_dflash2_local_values[:num_rows]
+    local_ids = layer._sm70_dflash2_local_ids[:num_rows]
+    candidate_values.copy_(values)
+    indices.sub_(layer.shard_indices.org_vocab_start_index)
+    sparse_logits.fill_(-float("inf"))
+    sparse_logits.scatter_(1, indices, candidate_values)
+    torch.topk(
+        sparse_logits,
+        k=selector_k,
+        dim=-1,
+        sorted=True,
+        out=(local_values, local_ids),
+    )
+    local_ids.add_(layer.shard_indices.org_vocab_start_index)
+    logger.info_once(
+        "SM70 DFlash2 fused FP16 LM-head local top-20 path enabled with "
+        "dense-order top-16 tie handling."
+    )
+    output_shape = (*x.shape[:-1], selector_k)
+    return local_values.reshape(output_shape), local_ids.reshape(output_shape)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -711,6 +833,14 @@ class VocabParallelEmbedding(PluggableLayer):
         bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         return _maybe_sm70_lm_head_top1(self, hidden_states, bias)
+
+    def maybe_get_sm70_dflash2_top20(
+        self,
+        hidden_states: torch.Tensor,
+        selector_k: int,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return _maybe_sm70_dflash2_lm_head_top20(self, hidden_states, selector_k, bias)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

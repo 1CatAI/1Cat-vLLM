@@ -317,6 +317,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &sm70_f16_lm_head_top20_tc_out);
 
   ops.def(
+      "sm70_f16_lm_head_top20_tc_workspace_out(Tensor(a!) values_out, "
+      "Tensor(b!) indices_out, Tensor(c!) partial_values_out, "
+      "Tensor(d!) partial_indices_out, Tensor _in_feats, Tensor _kernel, "
+      "int k_ld, int vocab_start_index, int num_vocab_padding) -> ()");
+  ops.impl("sm70_f16_lm_head_top20_tc_workspace_out", torch::kCUDA,
+           &sm70_f16_lm_head_top20_tc_workspace_out);
+
+  ops.def(
       "sm70_merge_tail_top20_pack_out(Tensor(a!) pairs_out, "
       "Tensor base_values, Tensor base_indices, Tensor base_token_id_map, "
       "Tensor tail_logits, Tensor tail_token_ids, int tail_row_start) -> ()");

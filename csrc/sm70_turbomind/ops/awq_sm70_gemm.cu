@@ -400,53 +400,57 @@ struct Top20Epilogue {
     }
     __syncthreads();
 
-    const int local_row = threadIdx.x / WARP_SIZE;
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
     const int lane = threadIdx.x % WARP_SIZE;
-    if (local_row >= extents.x) {
-      return;
-    }
-
     const int num_tiles_n = param.partials.stride;
-    const int global_row = tile_offset.x * TM + local_row;
-    const int partial_base = (global_row * num_tiles_n + tile_offset.y) * kTopK;
     const int tile_col_start = tile_offset.y * TN;
     auto* partial_values = reinterpret_cast<float*>(param.c.ptr);
     auto* partial_indices = reinterpret_cast<int64_t*>(param.partials.ptr);
 
-    PRAGMA_UNROLL
-    for (int rank = 0; rank < kTopK; ++rank) {
-      float best_val = -FLT_MAX;
-      int64_t best_idx = INT64_MAX;
-      int best_col = -1;
-      for (int col = lane; col < TN; col += WARP_SIZE) {
-        const float val = tile_values[local_row * TN + col];
-        const int64_t token =
-            static_cast<int64_t>(param.c.stride) + tile_col_start + col;
-        if (Better(val, token, best_val, best_idx)) {
-          best_val = val;
-          best_idx = token;
-          best_col = col;
+    // This kernel uses CTA_M=8 with four warps. Assign rows round-robin so the
+    // DFlash2 M=7 selector never leaves the final three rows unwritten.
+    for (int local_row = warp_id; local_row < extents.x;
+         local_row += num_warps) {
+      const int global_row = tile_offset.x * TM + local_row;
+      const int partial_base =
+          (global_row * num_tiles_n + tile_offset.y) * kTopK;
+
+      PRAGMA_UNROLL
+      for (int rank = 0; rank < kTopK; ++rank) {
+        float best_val = -FLT_MAX;
+        int64_t best_idx = INT64_MAX;
+        int best_col = -1;
+        for (int col = lane; col < TN; col += WARP_SIZE) {
+          const float val = tile_values[local_row * TN + col];
+          const int64_t token =
+              static_cast<int64_t>(param.c.stride) + tile_col_start + col;
+          if (Better(val, token, best_val, best_idx)) {
+            best_val = val;
+            best_idx = token;
+            best_col = col;
+          }
         }
-      }
-      for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        const float other_val = __shfl_down_sync(0xffffffff, best_val, offset);
-        const int64_t other_idx =
-            __shfl_down_sync(0xffffffff, best_idx, offset);
-        const int other_col = __shfl_down_sync(0xffffffff, best_col, offset);
-        if (Better(other_val, other_idx, best_val, best_idx)) {
-          best_val = other_val;
-          best_idx = other_idx;
-          best_col = other_col;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+          const float other_val = __shfl_down_sync(0xffffffff, best_val, offset);
+          const int64_t other_idx =
+              __shfl_down_sync(0xffffffff, best_idx, offset);
+          const int other_col = __shfl_down_sync(0xffffffff, best_col, offset);
+          if (Better(other_val, other_idx, best_val, best_idx)) {
+            best_val = other_val;
+            best_idx = other_idx;
+            best_col = other_col;
+          }
         }
-      }
-      if (lane == 0) {
-        partial_values[partial_base + rank] = best_val;
-        partial_indices[partial_base + rank] = best_idx;
-        if (best_col >= 0) {
-          tile_values[local_row * TN + best_col] = -FLT_MAX;
+        if (lane == 0) {
+          partial_values[partial_base + rank] = best_val;
+          partial_indices[partial_base + rank] = best_idx;
+          if (best_col >= 0) {
+            tile_values[local_row * TN + best_col] = -FLT_MAX;
+          }
         }
+        __syncwarp();
       }
-      __syncwarp();
     }
   }
 };
@@ -4357,12 +4361,11 @@ void sm70_f16_lm_head_top1_tc_out(torch::Tensor values_out,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
-                                   torch::Tensor indices_out,
-                                   torch::Tensor in_feats,
-                                   torch::Tensor tm_weight, int64_t k_ld,
-                                   int64_t vocab_start_index,
-                                   int64_t num_vocab_padding) {
+void sm70_f16_lm_head_top20_tc_workspace_out(
+    torch::Tensor values_out, torch::Tensor indices_out,
+    torch::Tensor partial_values_out, torch::Tensor partial_indices_out,
+    torch::Tensor in_feats, torch::Tensor tm_weight, int64_t k_ld,
+    int64_t vocab_start_index, int64_t num_vocab_padding) {
   constexpr int64_t max_m = 8;
   constexpr int top_k = 20;
   validate_f16_lm_head_top20_input(values_out, indices_out, in_feats, tm_weight,
@@ -4421,12 +4424,26 @@ void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
   constexpr int cta_n = 256;
   const int64_t valid_n = n - num_vocab_padding;
   const int64_t num_tiles_n = (valid_n + cta_n - 1) / cta_n;
-  auto partial_values = torch::empty(
-      {m, num_tiles_n, top_k},
-      torch::TensorOptions().dtype(torch::kFloat32).device(in_feats.device()));
-  auto partial_indices = torch::empty(
-      {m, num_tiles_n, top_k},
-      torch::TensorOptions().dtype(torch::kInt64).device(in_feats.device()));
+  TORCH_CHECK(partial_values_out.is_cuda() && partial_indices_out.is_cuda(),
+              "sm70_f16_lm_head_top20_tc_workspace_out: workspace must be "
+              "CUDA.");
+  TORCH_CHECK(partial_values_out.scalar_type() == torch::kFloat32 &&
+                  partial_indices_out.scalar_type() == torch::kInt64,
+              "sm70_f16_lm_head_top20_tc_workspace_out: invalid workspace "
+              "dtype.");
+  TORCH_CHECK(partial_values_out.dim() == 3 &&
+                  partial_values_out.size(0) >= m &&
+                  partial_values_out.size(1) == num_tiles_n &&
+                  partial_values_out.size(2) == top_k &&
+                  partial_indices_out.sizes() == partial_values_out.sizes(),
+              "sm70_f16_lm_head_top20_tc_workspace_out: workspace must be "
+              "[>=M, ceil(valid_vocab/256), 20].");
+  TORCH_CHECK(partial_values_out.is_contiguous() &&
+                  partial_indices_out.is_contiguous() &&
+                  partial_values_out.get_device() == in_feats.get_device() &&
+                  partial_indices_out.get_device() == in_feats.get_device(),
+              "sm70_f16_lm_head_top20_tc_workspace_out: workspace must be "
+              "contiguous and colocated with input.");
 
   using namespace turbomind::gemm;
   using C = sm70_s884::Config_F16_Top20<kColMajor, 0>;
@@ -4445,11 +4462,12 @@ void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
   TORCH_CHECK(vocab_start_index <= std::numeric_limits<int>::max(),
               "sm70_f16_lm_head_top20_tc_out: vocab start too large.");
   TORCH_CHECK(valid_n <= std::numeric_limits<int>::max(),
-              "sm70_f16_lm_head_top20_tc_out: vocab shard too large.");
+              "sm70_f16_lm_head_top20_tc_workspace_out: vocab shard too "
+              "large.");
   EpilogueParam epi_param{};
-  epi_param.c = {partial_values.data_ptr<float>(),
+  epi_param.c = {partial_values_out.data_ptr<float>(),
                  static_cast<int>(vocab_start_index), nullptr, nullptr};
-  epi_param.partials = {partial_indices.data_ptr<int64_t>(),
+  epi_param.partials = {partial_indices_out.data_ptr<int64_t>(),
                         static_cast<int>(num_tiles_n), nullptr, nullptr};
 
   constexpr int log_tile = 4;
@@ -4475,10 +4493,36 @@ void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
   sm70_f16_lm_head_top20_stage2_kernel<<<static_cast<unsigned int>(m),
                                          WARP_SIZE, 0, stream>>>(
       values_out.data_ptr<float>(), indices_out.data_ptr<int64_t>(),
-      partial_values.data_ptr<float>(), partial_indices.data_ptr<int64_t>(),
+      partial_values_out.data_ptr<float>(),
+      partial_indices_out.data_ptr<int64_t>(),
       static_cast<int>(m), static_cast<int>(num_candidates), vocab_start_index,
       static_cast<int>(valid_n));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
+                                   torch::Tensor indices_out,
+                                   torch::Tensor in_feats,
+                                   torch::Tensor tm_weight, int64_t k_ld,
+                                   int64_t vocab_start_index,
+                                   int64_t num_vocab_padding) {
+  constexpr int64_t max_m = 8;
+  constexpr int top_k = 20;
+  constexpr int cta_n = 256;
+  validate_f16_lm_head_top20_input(values_out, indices_out, in_feats, tm_weight,
+                                   k_ld, num_vocab_padding, max_m);
+  const int64_t m = in_feats.size(0);
+  const int64_t valid_n = tm_weight.size(0) - num_vocab_padding;
+  const int64_t num_tiles_n = (valid_n + cta_n - 1) / cta_n;
+  auto partial_values = torch::empty(
+      {m, num_tiles_n, top_k},
+      torch::TensorOptions().dtype(torch::kFloat32).device(in_feats.device()));
+  auto partial_indices = torch::empty(
+      {m, num_tiles_n, top_k},
+      torch::TensorOptions().dtype(torch::kInt64).device(in_feats.device()));
+  sm70_f16_lm_head_top20_tc_workspace_out(
+      values_out, indices_out, partial_values, partial_indices, in_feats,
+      tm_weight, k_ld, vocab_start_index, num_vocab_padding);
 }
 
 void sm70_merge_tail_top20_pack_out(torch::Tensor pairs_out,
@@ -4965,6 +5009,16 @@ void sm70_f16_lm_head_top1_tc_out(torch::Tensor values_out,
   vllm::awq_sm70::sm70_f16_lm_head_top1_tc_out(
       values_out, indices_out, _in_feats, _kernel, k_ld, vocab_start_index,
       num_vocab_padding);
+}
+
+void sm70_f16_lm_head_top20_tc_workspace_out(
+    torch::Tensor values_out, torch::Tensor indices_out,
+    torch::Tensor partial_values_out, torch::Tensor partial_indices_out,
+    torch::Tensor _in_feats, torch::Tensor _kernel, int64_t k_ld,
+    int64_t vocab_start_index, int64_t num_vocab_padding) {
+  vllm::awq_sm70::sm70_f16_lm_head_top20_tc_workspace_out(
+      values_out, indices_out, partial_values_out, partial_indices_out,
+      _in_feats, _kernel, k_ld, vocab_start_index, num_vocab_padding);
 }
 
 void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,

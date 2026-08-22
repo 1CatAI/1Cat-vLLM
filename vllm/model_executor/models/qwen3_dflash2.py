@@ -403,16 +403,26 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         selector = self.model.candidate_selector
-        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
-        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
-        values, ids = _topk(logits, selector.top_k)
-        ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+        local_candidates = self.lm_head.maybe_get_sm70_dflash2_top20(
+            hidden_states, selector.top_k
+        )
+        if local_candidates is None:
+            logits = self.lm_head.quant_method.apply(
+                self.lm_head, hidden_states, bias=None
+            )
+            num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+            if num_pad > 0:
+                logits[..., -num_pad:] = -float("inf")
+            values, ids = _topk(logits, selector.top_k)
+            ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+        else:
+            values, ids = local_candidates
 
         if get_tensor_model_parallel_world_size() > 1:
             values = tensor_model_parallel_all_gather(values, dim=-1)
             ids = tensor_model_parallel_all_gather(ids, dim=-1)
+
+        if values.shape[-1] > selector.top_k:
             values, selected = _topk(values, selector.top_k)
             ids = ids.gather(-1, selected)
 

@@ -45,6 +45,11 @@ Goal:
 - Draft PR #253 is the PR2 review scope on
   `codex/v100-dflash2-sm70-20260820-044011`, based only on PR1. Its worktree is
   `/home/ymzx/桌面/1cat-vllm/worktrees/v100-dflash2-sm70-20260820-044011`.
+- PR3 starts from accepted PR2 commit `9fd338965d` on
+  `codex/v100-dflash2-sm70-selector-20260820-180634`. Its isolated worktree is
+  `/home/ymzx/桌面/1cat-vllm/worktrees/v100-dflash2-sm70-selector-20260820-180634`;
+  the scope is limited to the gated SM70 dense-FP16 selector fusion and its
+  paired correctness/performance evidence.
 
 ### PR2 DFlash2 correctness evidence, 2026-08-20
 
@@ -155,6 +160,203 @@ Goal:
   Together with exact eager/graph model tokens, candidates, acceptance trace,
   and draft KV, the attention numeric gate no longer blocks PR3. This does not
   relax the separate fused-selector performance and exact-token gates.
+
+### PR3 SM70 selector-fusion disposition, 2026-08-21
+
+- Draft PR #254 reuses the existing TurboMind dense-FP16 LM-head kernel and
+  remains default-off behind `VLLM_SM70_DFLASH2_FUSED_SELECTOR`. The checkpoint
+  selector contract is unchanged: local top-20 candidates are reduced to the
+  checkpoint-owned global top-16, and the official seven-token draft block is
+  unchanged.
+- The original top-20 epilogue assigned one row to each of four warps although
+  its CTA has `M=8`. The fixed epilogue assigns rows round-robin, covering the
+  seventh DFlash2 row and M=8 tail. A graph-safe operator variant accepts
+  persistent FP32 value and INT64 token partial workspaces; the allocation-owning
+  legacy entry remains available for non-graph callers.
+- Equal FP16 logits exposed a second exactness issue: the fused kernel's
+  deterministic token-ID tie break did not reproduce `torch.topk`'s dense-shard
+  ordering. The accepted eager experiment scatters the fused top-20 into a
+  persistent shard-shaped FP16 buffer and runs local dense-order top-16 before
+  exchanging only 16 values and token IDs per TP rank. This restores exact
+  ordered IDs and values, not merely the same candidate set.
+- The current-source SM70 extension SHA256 is
+  `077ca806e8fad6b452dbe59cd0da336ff88c9341386c8480bbbe009b8029c7b2`.
+  Persistent-workspace tests cover M=1/4/5/7/8, TP4 vocab offsets and padding,
+  equal-score ordering, and CUDA Graph replay. The M-shape set passed three
+  consecutive runs after the test stopped exercising the allocation-owning
+  legacy entry.
+- The real Qwen3.8 TP4 selector microbenchmark used M=7, local N=62080, K=5120,
+  FP16 hidden/weight, local top-16 and TP global top-16. Ordered IDs and FP16
+  values were exact with maximum difference zero. The dense
+  `torch.mm + local16 + TP global16` mean was 1.1585 ms; the production-shaped
+  fused path was 1.2254 ms, a 5.78% regression. Evidence is
+  `/data/minimax-h3/task-cache/v100-dflash2-20260820/pr3/sm70-top20-workspace-dense-order-m7-tp4.json`.
+- The final dedicated DFlash2 suite passes `30 passed, 11 skipped` without a
+  visible GPU and `41 passed` on V100. Ruff passes all eight changed Python
+  files, the rebuilt SM70 extension links successfully, and `git diff --check`
+  is clean.
+- Earlier direct-top20 graph results that appeared much faster are rejected.
+  The dense 256-token artifact had hash `6477ffd9...` and accepted length
+  2.2768, while the direct fused artifact had hash `1f7f1cdf...` and accepted
+  length 3.3462. The speed change therefore measured a different sampling and
+  acceptance trajectory, not an optimization of the same computation.
+- Preparing the duplicate LM-head layout also raised model memory by about
+  1.19 GiB per rank (10.23 versus 9.04 GiB in the final compiled-graph runs),
+  directly reducing long-context KV capacity. The fused selector is therefore
+  eager-only. Under the accepted Flash-V100 compiled CUDA Graph policy, an
+  explicit request is normalized to zero before workers fork; no duplicate
+  layout is prepared and startup prints the fallback decision.
+- A paired post-rebuild TP4 graph check compared selector-off with a requested
+  selector that was normalized before worker startup. Both emitted the exact
+  same 32 token IDs, hash `471733c0...`, accepted-token count 13, mean accepted
+  length 1.6842, and per-position acceptance vector. Artifacts are
+  `dflash2-pr3-dense-rebuilt-graph-1k-32-r1.json` and
+  `dflash2-pr3-selector-normalized-graph-1k-32-r1.json` in the PR3 cache.
+- Decision: keep the selector default off and keep the official draft-token
+  default at seven. Because the required M=7 micro gate is already negative,
+  the 32K/128K confidence-interval sweep and 3/5/7 default scan are intentionally
+  not run. A future graph-capable fusion must first beat dense M=7 without
+  duplicate-weight capacity loss and then re-enter the full long-context gate.
+
+### DFlash acceptance root-cause repair, 2026-08-22
+
+- A same-machine 64-prompt GSM8K audit held the FP8 target, E5M2 target KV,
+  FP16/auto draft KV, TP4, official probabilistic sampling, seven draft tokens,
+  Flash-V100, CUDA Graph, prompt order, and single-request sequencing fixed.
+  Before the repair, vLLM averaged 4.5395 completion tokens per verification
+  step versus 5.2489 for `haohervchb/sglang-V100`; the paired prompt delta was
+  0.7094 with a 95% interval of [0.5882, 0.8306]. This excludes target FP8 as
+  the explanation for the acceptance gap.
+- The MRV2 backport copied the grouped DFlash K-normalization call from upstream:
+  input `[L, num_ctx, num_kv_heads, head_dim]` with weights `[L, head_dim]`.
+  It omitted upstream dependency commit `02a1f23711`, whose stable RMSNorm
+  kernel uses the outer layer index to select each weight row. The local kernel
+  still treated every weight as one-dimensional and silently applied row zero
+  to all five draft layers. Checkpoint rows are not interchangeable: layers
+  1-4 differ from layer zero by 0.468-0.621 mean absolute weight and
+  0.383-0.443 relative L2.
+- SGLang-V100 is unaffected because both paths preserve layer ownership: its
+  sequential fallback calls each layer's `k_norm`, and its fused Triton
+  materializer indexes `layer_id * k_norm_weight_stride_layer`. This is the
+  implementation difference that explains why SGLang acceptance was normal.
+- Commit `c53b7974fb` restores the exact missing dependency semantics while
+  retaining the local SM70 RMSNorm additions. One-dimensional weights keep
+  stride zero; two-dimensional weights require `[input.size(0), hidden]` and
+  select the row from the outermost input dimension. Invalid rank and shape are
+  rejected instead of silently producing the wrong draft KV.
+- The V100 kernel regression passes 13/13 cases for FP16, BF16, and FP32,
+  3D/4D inputs, the real DFlash `[L, context, kv_heads, 128]` layout, a
+  non-power-of-two hidden size, and shape validation. Batched output is bitwise
+  identical to looping the original one-row RMSNorm. The repaired extension is
+  `7689e5e298be64a83c9f9743e08a073e857a5a4c89a79837396d05b37303d449`.
+- The final 64-prompt repaired run averages 5.3888 per request and 4.5644 pooled,
+  versus 4.5395/3.9725 before repair and 5.2489/4.3571 for SGLang-V100. The
+  repaired-minus-control paired delta is 0.8493 with a 95% interval of
+  [0.7226, 0.9760]; it wins 60 of 64 matched prompts. Repaired per-position
+  acceptance is `[85.833,70.569,57.920,46.887,38.032,31.342,25.861]%`, above
+  SGLang-V100 at every position and within 0.0712 of the public official 5.46
+  GSM8K mean.
+- Acceptance recovery raises same-route aggregate output throughput from
+  97.080 to 108.826 tok/s (+12.10%) and mean steady decode from 115.394 to
+  134.940 tok/s (+16.94%). The repaired vLLM path remains slower than the
+  separately measured SGLang-V100 aggregate 156.063 tok/s, so acceptance is
+  closed but the remaining execution-speed gap is a distinct optimization item.
+- Evidence is retained in
+  `/data/models/v100-dflash2-20260820/pr3/acceptance-rootcause/` as
+  `dflash2-probabilistic-graph-{zlabshuffle42,fixed-batchedrmsnorm-zlabshuffle42}-randomseed-first64-officialprompt-e5m2-o4096.json`;
+  the SGLang comparison is
+  `/data/models/v100-dflash2-20260820/sglang-audit/sglang-dflash2-graph-zlabshuffle42-randomseed-first64-officialprompt-e5m2-o4096.json`.
+  Earlier four-prompt and selector-pair acceptance values predate this repair
+  and remain route/equality diagnostics only; do not cite them as DFlash2
+  acceptance baselines. A BF16 target rerun is intentionally unnecessary
+  because the causal A/B kept the same FP8 target and changed only K-norm row
+  selection.
+
+### DFlash2 single-request execution-cost root cause, 2026-08-22
+
+- The repaired 64-prompt single-request runs close acceptance but not execution
+  cost. For requests with at least 512 completion tokens, the round-weighted
+  vLLM decode cost is 40.7148 ms/verification versus 26.8166 ms for the same
+  SGLang-V100 target, draft, TP4, E5M2-KV, block-8, sampling, prompt order, and
+  CUDA-Graph route. The 13.8982 ms gap is not caused by acceptance: vLLM's
+  per-request mean is 5.3888 versus SGLang's 5.2489.
+- Matched CUDA-Graph node traces show that the one-pass DFlash2 proposal is not
+  the bottleneck. The vLLM and SGLang draft-model-plus-selector graphs take
+  3.976 and 3.915 ms respectively under tracing. Their dense draft LM head,
+  five-layer draft forward, non-causal attention, selector top-K, and selector
+  walk therefore have effectively the same cost on this route.
+- The raw traced round decomposition is:
+  - vLLM: draft graph 3.976 ms; draft-to-target transition 18.148 ms with 431
+    eager kernels; target graph 24.845 ms; target-to-next-draft transition
+    2.786 ms with 63 eager kernels.
+  - SGLang: draft graph 3.915 ms; draft-to-target transition 3.386 ms with 30
+    eager kernels; target graph 19.622 ms; target-to-next-draft transition
+    4.164 ms with 125 eager kernels.
+  - These traced wall times include launch-tracing overhead and must not replace
+    the unprofiled 40.7148/26.8166 ms round results. They are valid for
+    composition. SGLang captures its target LM head and TP all-gather inside the
+    target graph (about 1.11 ms combined), while vLLM executes those after its
+    target graph, so raw graph boundaries are not a perfectly semantic split.
+- The dominant pre-verification gap is a hybrid-KV metadata amplification. The
+  target has 48 GDN and 16 full-attention layers, while the draft has five
+  layers. vLLM's unified grouping therefore creates ten padded GDN groups and
+  four padded full-attention groups. GDN metadata does not support cached
+  block-table updates, so `build_gdn_spec_decode_state_contract` repeats five
+  boolean-index selections for every GDN group. The trace contains exactly 50
+  each of CUB reduce, compact-init, and select kernels per round, plus 281 other
+  metadata/input kernels: 431 launches and 18.148 ms of traced wall time for
+  only 2.452 ms of GPU service. SGLang keeps one persistent linear-attention
+  metadata object shared by all GDN layers; its corresponding transition has
+  30 kernels and 0.117 ms of GPU service.
+- SGLang also has a genuinely cheaper verifier graph: 1,130 nodes and 19.095 ms
+  GPU service versus vLLM's 2,612 nodes and 23.547 ms. Dense target FP8 GEMM is
+  already equal (10.798 versus 10.877 ms), and full-attention service is close,
+  so neither TurboMind GEMM nor Flash-V100 attention is the first DFlash2
+  target. The main graph differences are:
+  - vLLM executes 1,422 generic vectorized/unrolled/elementwise nodes totaling
+    about 4.625 ms; SGLang executes 211 such nodes totaling about 0.677 ms.
+  - vLLM custom all-reduce costs about 2.350 ms per target graph versus 1.113 ms
+    for SGLang's one-stage push kernel.
+  - SGLang fuses sigmoid-gating computation, recurrent verification, and
+    intermediate-state writes. After rejection sampling, two all-layer fused
+    gather/scatter kernels commit the accepted SSM and convolution state. Its
+    target-to-draft interval also uses fused target-hidden-to-draft KV
+    materialization.
+- Three narrow attempts to remove the repeated vLLM work were rejected and
+  fully reverted: reusing the DDTree one-kernel updater, reusing only its
+  pure-spec state path, and bypassing only the state-contract boolean
+  selections. All visible metadata regressions passed (34 focused tests), but
+  every shortcut changed the fixed-seed token trace at token 12, from the
+  235-token/40-round control to a 309-token/57-round trajectory. This proves
+  that deleting the allocations/indexing before establishing explicit graph
+  buffer ownership is unsafe. The current evidence is consistent with a hidden
+  padding, alias, scratch-lifetime, or stream-order dependency; that precise
+  mechanism remains an inference rather than a proven field mismatch.
+- Implementation decision and gates:
+  1. Add a DFlash-only persistent GDN verify metadata/state object. Every live
+     and padded field is overwritten each epoch, and a debug shadow path compares
+     it with the existing generic builder before graph replay.
+  2. Replace the ten repeated state contracts with one DFlash-specific fused
+     metadata kernel that writes shared structural metadata plus group-specific
+     state block IDs. Do not route Eagle, MTP, or DDTree through it.
+  3. Port SGLang's fused target-verify GDN and two all-layer state-commit
+     kernels, including the per-step FP16 store/reload boundary needed for
+     recurrent-state numerical equivalence.
+  4. Then port/capture fused target-hidden-to-draft KV materialization and tune
+     the one-stage TP4 all-reduce. Sparse rejection-sampling work is secondary.
+  5. Keep selector fusion default-off: the measured proposal graphs are already
+     equal, and the duplicate-layout fused selector remains slower and larger.
+  The first performance gate is an unprofiled round cost at or below 32 ms with
+  the fixed-seed token hash unchanged; the follow-up target is 28-29 ms before
+  claiming parity with SGLang's 26.8166 ms reference. Greedy tokens and accept
+  trajectories must be exact; probabilistic acceptance may differ by at most
+  0.05 on the fixed corpus, with batch 1/2/4 mixed-length graph replay and
+  poisoned padding/state buffers included.
+- Evidence is retained in
+  `/data/models/v100-dflash2-20260820/pr3/perf-rootcause/` as the vLLM baseline,
+  graph-node report, SQLite export, and rejected A/B JSON files. The matching
+  SGLang report is
+  `/data/models/v100-dflash2-20260820/sglang-audit/perf-rootcause/sglang-dflash2-single1-step20-v2.{qdstrm,nsys-rep,sqlite}`.
 
 Main implementation priority:
 

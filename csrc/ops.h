@@ -261,6 +261,12 @@ void sm70_f16_lm_head_top20_tc_out(torch::Tensor values_out,
                                    int64_t vocab_start_index,
                                    int64_t num_vocab_padding);
 
+void sm70_f16_lm_head_top20_tc_workspace_out(
+    torch::Tensor values_out, torch::Tensor indices_out,
+    torch::Tensor partial_values_out, torch::Tensor partial_indices_out,
+    torch::Tensor _in_feats, torch::Tensor _kernel, int64_t k_ld,
+    int64_t vocab_start_index, int64_t num_vocab_padding);
+
 void sm70_merge_tail_top20_pack_out(torch::Tensor pairs_out,
                                     torch::Tensor base_values,
                                     torch::Tensor base_indices,

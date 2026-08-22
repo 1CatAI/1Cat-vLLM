@@ -1461,6 +1461,13 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity; "
                         "greedy decode keeps the local-logits top1 shortcut."
                     )
+                if envs.VLLM_SM70_DFLASH2_FUSED_SELECTOR:
+                    os.environ["VLLM_SM70_DFLASH2_FUSED_SELECTOR"] = "0"
+                    logger.warning_once(
+                        "VLLM_SM70_DFLASH2_FUSED_SELECTOR=1 is eager-only; "
+                        "normalizing it to 0 before SM70 Flash-V100 compiled "
+                        "CUDA Graph workers start."
+                    )
                 if "VLLM_USE_AOT_COMPILE" not in os.environ:
                     os.environ["VLLM_USE_AOT_COMPILE"] = "1"
                     logger.info_once(
