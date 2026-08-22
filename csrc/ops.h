@@ -174,6 +174,24 @@ void fp8_gemm_sm70_out(torch::Tensor out,
                        int64_t q_ld,
                        bool gated_silu);
 
+void fp8_qpn8_gemm_sm70_out(torch::Tensor out,
+                            torch::Tensor input,
+                            torch::Tensor codes,
+                            torch::Tensor group_scales,
+                            int64_t split_k,
+                            int64_t accumulator_chains,
+                            bool fast_decoder,
+                            bool prefetch_codes);
+
+void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out,
+                                  torch::Tensor input,
+                                  torch::Tensor codes,
+                                  torch::Tensor group_scales,
+                                  int64_t split_k,
+                                  int64_t accumulator_chains,
+                                  bool fast_decoder,
+                                  bool prefetch_codes);
+
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
