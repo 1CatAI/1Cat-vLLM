@@ -334,36 +334,6 @@ def _g6_aligned_page_partition_size_hint(
     return None
 
 
-def _batch_context_partition_size_hint(
-    query: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-) -> int | None:
-    if (
-        os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None
-        or not getattr(attn_metadata, "flash_v100_batch_context_routing", False)
-        or query.shape[0] < 13
-    ):
-        return None
-    max_seq_len_hint = int(
-        getattr(attn_metadata, "flash_v100_decode_max_seq_len_hint", 0) or 0
-    )
-    workspace_seq_capacity_hint = int(
-        getattr(
-            attn_metadata,
-            "flash_v100_decode_workspace_seq_capacity_hint",
-            0,
-        )
-        or 0
-    )
-    context_capacity = max(max_seq_len_hint, workspace_seq_capacity_hint)
-    # The bounded B16 graph preserves the rollback graph's p1024 reduction
-    # order while shrinking its launch envelope. Longer contexts use the
-    # unbounded p1024 dual-CTA graph.
-    if 0 < context_capacity <= 12287:
-        return 1024
-    return None
-
-
 def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
     if kv_cache_dtype in _logged_kv_dtype_contracts:
         return
@@ -472,12 +442,6 @@ def _decode_fp8_xqa_allowed(
     graph_capture = bool(
         getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
     ) or _is_cuda_graph_capturing(query)
-    if (
-        graph_capture
-        and getattr(attn_metadata, "flash_v100_batch_context_routing", False)
-        and query.shape[0] >= 4
-    ):
-        return True
     if graph_capture:
         hint_names = (
             "flash_v100_static_decode_seq_hint",
@@ -5436,11 +5400,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 value_cache,
                 self.kv_cache_dtype,
             )
-            if partition_size_hint is None:
-                partition_size_hint = _batch_context_partition_size_hint(
-                    query,
-                    attn_metadata,
-                )
             if partition_size_hint is not None:
                 _record_route(
                     f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"

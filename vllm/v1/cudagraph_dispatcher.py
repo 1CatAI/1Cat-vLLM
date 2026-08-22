@@ -15,9 +15,9 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _SM70_FP8_KV_BATCH_CONTEXT_BUCKETS = {
-    4: (8191, 12287),
-    8: (4095, 12287),
-    16: (12287,),
+    4: (16383,),
+    8: (16383,),
+    16: (16383,),
 }
 
 
