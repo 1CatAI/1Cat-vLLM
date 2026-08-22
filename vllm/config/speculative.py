@@ -886,7 +886,14 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        # The runner constructs the complete DSpark drafter on
+                        # the target model's final PP rank. It is local to that
+                        # stage rather than partitioned across target PP ranks.
+                        speculative_draft_pipeline_parallel_size=(
+                            1 if self.use_dspark() else None
+                        ),
                     )
                 )
         return self
@@ -1029,13 +1036,19 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        speculative_draft_pipeline_parallel_size: int | None = None,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
-        This is mostly a copy of the target parallel config, except the tp_size.
+        This is mostly a copy of the target parallel config, except the draft
+        tensor size and, for final-stage-local drafters, pipeline size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=(
+                target_parallel_config.pipeline_parallel_size
+                if speculative_draft_pipeline_parallel_size is None
+                else speculative_draft_pipeline_parallel_size
+            ),
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,

@@ -1,18 +1,68 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
+from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
 from vllm.models.deepseek_v4.nvidia.dspark import (
     DSparkDeepseekV4ForCausalLM,
     DSparkDeepseekV4Model,
     DSparkMarkovHead,
 )
+from vllm.platforms import current_platform
+from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.spec_decode.dspark import DSparkProposer
+
+
+@pytest.mark.parametrize(("pp_size", "tp_size"), [(2, 4), (4, 2)])
+def test_dspark_draft_is_local_to_last_pipeline_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pp_size: int,
+    tp_size: int,
+) -> None:
+    monkeypatch.setattr(current_platform, "device_count", lambda: 8)
+    DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        hidden_size=4096,
+        num_hidden_layers=43,
+        num_attention_heads=64,
+        num_key_value_heads=1,
+        vocab_size=129280,
+        num_nextn_predict_layers=1,
+        dspark_target_layer_ids=[40, 41, 42],
+        dspark_block_size=5,
+        dspark_noise_token_id=128799,
+        dspark_markov_rank=256,
+    ).save_pretrained(tmp_path)
+    target_model_config = ModelConfig(
+        model=str(tmp_path),
+        tokenizer=str(tmp_path),
+        runner="generate",
+        dtype=torch.float16,
+        max_model_len=2048,
+    )
+    target_parallel_config = ParallelConfig(
+        pipeline_parallel_size=pp_size,
+        tensor_parallel_size=tp_size,
+    )
+
+    speculative_config = SpeculativeConfig(
+        target_model_config=target_model_config,
+        target_parallel_config=target_parallel_config,
+        method="dspark",
+        num_speculative_tokens=7,
+    )
+
+    assert target_parallel_config.pipeline_parallel_size == pp_size
+    assert speculative_config.draft_parallel_config.pipeline_parallel_size == 1
+    assert speculative_config.draft_parallel_config.tensor_parallel_size == tp_size
+    assert speculative_config.draft_model_config.architectures == ["DSparkDraftModel"]
 
 
 def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
