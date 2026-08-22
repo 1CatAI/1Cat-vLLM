@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -20,7 +21,11 @@ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilde
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+from vllm.v1.worker.gpu.attn_utils import (
+    CommonGDNSpecMetadata,
+    build_attn_metadata,
+    compute_common_gdn_attn_metadata,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
     preprocess_mamba_align_fused_kernel,
@@ -39,6 +44,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    common_gdn_metadata: CommonGDNSpecMetadata | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -57,7 +63,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
         ):
             return {}
-        return {
+        kwargs = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -65,6 +71,9 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+            kwargs["common_gdn_metadata"] = self.common_gdn_metadata
+        return kwargs
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -81,6 +90,21 @@ class MambaHybridModelState(DefaultModelState):
         self.cache_config = vllm_config.cache_config
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        speculative_config = vllm_config.speculative_config
+        draft_model_config = (
+            speculative_config.draft_model_config
+            if speculative_config is not None
+            else None
+        )
+        draft_architectures: list[str] = []
+        if draft_model_config is not None:
+            draft_architectures = draft_model_config.architectures or []
+        self._use_dflash2_common_gdn_metadata = bool(
+            envs.VLLM_SM70_DFLASH2_VERIFY_FASTPATH
+            and speculative_config is not None
+            and speculative_config.use_dflash()
+            and "DFlash2DraftModel" in draft_architectures
         )
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         if self._align_mode:
@@ -228,6 +252,7 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
+        common_gdn_metadata = None
         if not for_capture:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
@@ -247,11 +272,26 @@ class MambaHybridModelState(DefaultModelState):
                     -1,
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+            if self._use_dflash2_common_gdn_metadata:
+                speculative_config = self.vllm_config.speculative_config
+                assert speculative_config is not None
+                common_gdn_metadata = compute_common_gdn_attn_metadata(
+                    num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+                    query_start_loc=input_batch.query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    num_spec_state_tokens=(
+                        speculative_config.num_speculative_state_tokens()
+                    ),
+                    legacy_mixed_decode_routing=(
+                        envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                    ),
+                )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            common_gdn_metadata=common_gdn_metadata,
         )
         return build_attn_metadata(
             attn_groups=attn_groups,
