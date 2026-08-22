@@ -297,7 +297,8 @@ __global__ void __launch_bounds__(kSm70GemmaLongPrefillThreads, 2)
 
 void rms_norm(torch::stable::Tensor& out,     // [..., hidden_size]
               torch::stable::Tensor& input,   // [..., hidden_size]
-              torch::stable::Tensor& weight,  // [hidden_size]
+              torch::stable::Tensor& weight,  // [hidden_size] or
+                                              // [num_groups, hidden_size]
               double epsilon) {
   STD_TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) {
