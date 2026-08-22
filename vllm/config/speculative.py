@@ -8,6 +8,7 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -52,7 +53,8 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
+DFlashModelTypes = Literal["dflash"]
+DFlashDDTreeModelTypes = Literal["dflash_ddtree"]
 DSparkModelTypes = Literal["dspark"]
 DDTreeBuildMode = Literal["best_first", "root_leaf", "spine_leaf"]
 EagleModelTypes = Literal[
@@ -61,6 +63,7 @@ EagleModelTypes = Literal[
     "extract_hidden_states",
     MTPModelTypes,
     DFlashModelTypes,
+    DFlashDDTreeModelTypes,
     DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
@@ -119,6 +122,10 @@ class SpeculativeConfig:
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
     backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
+    kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype for the draft model. When ``None``, the draft inherits
+    the target cache dtype, except for SM70 DFlash with a quantized target,
+    which is resolved to ``auto`` during draft model loading."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -307,7 +314,7 @@ class SpeculativeConfig:
                 "eagle3",
                 "extract_hidden_states",
             )
-            or self.use_dflash()
+            or self.use_dflash_family()
             or self.use_dspark()
         )
         factors.append(uses_aux_hidden_states)
@@ -748,7 +755,7 @@ class SpeculativeConfig:
                 # Automatically detect the method
                 if (
                     self.method in ("eagle", "eagle3")
-                    or self.use_dflash()
+                    or self.use_dflash_family()
                     or self.use_dspark()
                 ):
                     pass
@@ -788,7 +795,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3") or self.use_dflash():
+                if self.method in ("eagle", "eagle3") or self.use_dflash_family():
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -800,7 +807,9 @@ class SpeculativeConfig:
                     ):
                         pass
                     else:
-                        eagle_method = "dflash" if self.use_dflash() else self.method
+                        eagle_method = (
+                            "dflash" if self.use_dflash_family() else self.method
+                        )
                         eagle_config = EAGLEConfig(
                             self.draft_model_config.hf_config,
                             method=eagle_method,
@@ -815,7 +824,7 @@ class SpeculativeConfig:
                     draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
-                if self.use_dflash() or self.use_dspark():
+                if self.use_dflash_family() or self.use_dspark():
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1135,6 +1144,12 @@ class SpeculativeConfig:
         Calculate the maximum number of new slots that might be added to the batch
         when drafting.
         """
+        if self.use_dflash():
+            # MRV2 DFlash uses one bonus query followed by K mask queries. The
+            # scheduler already owns the target query slot, so K more slots
+            # must be available to the drafter.
+            return self.num_speculative_tokens
+
         slots_per_req = 0  # for serial non-draft-model methods, no change needed
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
@@ -1164,15 +1179,18 @@ class SpeculativeConfig:
     def use_eagle(self) -> bool:
         return (
             self.method in ("eagle", "eagle3", "mtp")
-            or self.use_dflash()
+            or self.use_dflash_family()
             or self.use_dspark()
         )
 
     def use_dflash(self) -> bool:
-        return self.method in get_args(DFlashModelTypes)
+        return self.method == "dflash"
 
     def use_dflash_ddtree(self) -> bool:
         return self.method == "dflash_ddtree"
+
+    def use_dflash_family(self) -> bool:
+        return self.use_dflash() or self.use_dflash_ddtree()
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"

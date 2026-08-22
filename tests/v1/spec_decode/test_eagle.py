@@ -63,7 +63,7 @@ def _create_proposer(
     elif method == "draft_model":
         target_model_dir = model_dir
         draft_model_dir = ar_draft_model_dir
-    elif method == "dflash":
+    elif method == "dflash_ddtree":
         target_model_dir = dflash_target_dir
         draft_model_dir = dflash_dir
     else:
@@ -73,7 +73,7 @@ def _create_proposer(
         model=target_model_dir,
         runner="generate",
         max_model_len=100,
-        trust_remote_code=(method == "dflash"),
+        trust_remote_code=(method == "dflash_ddtree"),
     )
 
     speculative_config = SpeculativeConfig(
@@ -105,7 +105,7 @@ def _create_proposer(
         attention_config=AttentionConfig(backend=attention_backend),
     )
 
-    if method == "dflash":
+    if method == "dflash_ddtree":
         proposer = DFlashProposer(vllm_config=vllm_config, device=device)
     elif "eagle" in method:
         proposer = EagleProposer(vllm_config=vllm_config, device=device)
@@ -1132,7 +1132,10 @@ def test_set_inputs_first_pass_dflash():
     device = torch.device(current_platform.device_type)
 
     num_speculative_tokens = 3
-    proposer = _create_proposer("dflash", num_speculative_tokens)
+    proposer = _create_proposer("dflash_ddtree", num_speculative_tokens)
+    # Production initialization assigns the draft KV cache group before this
+    # method runs. This isolated input-preparation test supplies that contract.
+    proposer.kv_cache_gid = 0
     mask_token_id = proposer.parallel_drafting_token_id
 
     # Setup batch with 3 requests

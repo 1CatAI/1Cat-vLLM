@@ -45,3 +45,18 @@ class DraftTokensHandler:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
+
+
+def get_parallel_drafting_token_id(hf_config) -> int:
+    """Resolve the mask token used by a parallel-drafting checkpoint."""
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    if "mask_token_id" in dflash_config:
+        return int(dflash_config["mask_token_id"])
+    if hasattr(hf_config, "pard_token"):
+        return int(hf_config.pard_token)
+    if hasattr(hf_config, "ptd_token_id"):
+        return int(hf_config.ptd_token_id)
+    raise ValueError(
+        "Model config must specify dflash_config.mask_token_id, pard_token, "
+        "or ptd_token_id for parallel drafting."
+    )

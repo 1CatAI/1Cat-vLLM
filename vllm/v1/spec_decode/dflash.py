@@ -55,6 +55,32 @@ def _ddtree_worker_profile_enabled() -> bool:
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
+    @override
+    def _create_draft_vllm_config(self) -> VllmConfig:
+        base = super()._create_draft_vllm_config()
+        if (
+            self.speculative_config.kv_cache_dtype is None
+            and str(base.cache_config.cache_dtype).startswith("fp8")
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info_once(
+                "Using FP16 draft KV cache for SM70 DFlash DDTree while the "
+                "target uses %s.",
+                base.cache_config.cache_dtype,
+            )
+            base = replace(
+                base,
+                cache_config=replace(base.cache_config, cache_dtype="auto"),
+            )
+        return replace(
+            base,
+            attention_config=replace(
+                base.attention_config,
+                use_non_causal=not self.dflash_causal,
+            ),
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -63,7 +89,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
     ):
         assert vllm_config.speculative_config is not None
         assert (
-            vllm_config.speculative_config.use_dflash()
+            vllm_config.speculative_config.use_dflash_ddtree()
             or vllm_config.speculative_config.use_dspark()
         )
         super().__init__(
@@ -321,17 +347,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
             "dflash_prepare_next_token",
             "dflash_prepare_inputs",
             "dflash_expand_inputs",
-        )
-
-    @override
-    def _create_draft_vllm_config(self) -> VllmConfig:
-        base = super()._create_draft_vllm_config()
-        return replace(
-            base,
-            attention_config=replace(
-                base.attention_config,
-                use_non_causal=not self.dflash_causal,
-            ),
         )
 
     @override

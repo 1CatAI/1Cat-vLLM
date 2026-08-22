@@ -24,6 +24,13 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
     return torch.equal(w, target.weight)
 
 
+def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
+    """Return the language-model head for plain and conditional targets."""
+    return getattr(target_language_model, "lm_head", None) or getattr(
+        target_model, "lm_head", None
+    )
+
+
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
 

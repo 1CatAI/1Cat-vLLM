@@ -24,6 +24,27 @@ Goal:
   sampling, and normal MoE architecture wherever possible.
 - Do not carry unsafe quality-regressing routes into the main path.
 
+## Active MRV2 DFlash2 campaign, 2026-08-20
+
+- Integration base: `onecat/main@7aede2cf010d92815c9d7bff25867b4fa009b6cb`.
+- Review chain starts at Draft PR #252 on
+  `codex/v100-dflash-mrv2-base-20260820-041115`.
+- Frozen sources: vLLM MRV2 DFlash base `9842d7014502`, vLLM DFlash2 PR
+  `66e5414c6d75`, SGLang `c14312a66420`, and sglang-V100 `5526ef1c6a82`.
+- Route contract: `method=dflash` is MRV2-only; the experimental V1 flat path
+  is removed. `method=dflash_ddtree` retains the existing V1 DDTree scheduler,
+  payload, verifier, and diagnostics through a narrow model compatibility
+  adapter. Existing Eagle and MTP implementations are not replaced.
+- Selector top-K is checkpoint-owned and fixed at 16 for Qwen3.8 DFlash2;
+  official bring-up uses seven draft tokens (block size eight). Target sampling
+  top-k 20 is a separate sampling parameter.
+- PR1 evidence so far: focused routing/config/DDTree tests pass, and the V1
+  DFlash input-preparation test passes on V100 after supplying the KV-group
+  initialization contract used in production. Two unrelated DDTree metadata
+  assertions fail identically on the frozen base and are recorded as pre-existing.
+- No speed or acceptance claim is made until DFlash2 eager correctness, graph
+  equivalence, and same-stack dense-selector baselines pass.
+
 Main implementation priority:
 
 1. Add a decoupled SM70 TurboMind backend for AWQ and FP8 base GEMM.

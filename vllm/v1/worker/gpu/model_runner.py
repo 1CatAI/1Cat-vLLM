@@ -99,6 +99,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -175,11 +176,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
-            if self.speculative_config.method == "eagle3":
-                # EAGLE3 may require auxiliary hidden states from target model outputs.
+            if self.speculative_config.method in ("eagle3", "dflash"):
+                # EAGLE3 and DFlash may require auxiliary target hidden states.
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
-                    raise ValueError("EAGLE3 with pipeline parallel is not supported.")
+                    raise ValueError(
+                        f"{self.speculative_config.method} with pipeline parallel "
+                        "is not supported."
+                    )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -424,11 +428,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
         )
-        if self.speculator is not None:
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
-
         check_attention_cp_compatibility(self.vllm_config)
-        if self.speculator is not None:
+        if isinstance(self.speculator, DraftModelSpeculator):
+            self.speculator.set_attn(
+                self.model_state,
+                self.kv_cache_config,
+                self.block_tables,
+                self.input_buffers,
+                self.attn_groups,
+            )
+            # DFlash sizes its graph mode from the selected draft attention
+            # backend, which is available only after set_attn().
+            self.speculator.init_cudagraph_manager(cudagraph_mode)
+        elif self.speculator is not None:
+            # Preserve the existing Eagle initialization order.
+            self.speculator.init_cudagraph_manager(cudagraph_mode)
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
@@ -650,7 +664,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
             if self.speculator is not None:
-                self.speculator.capture(captured_attn_states)
+                if isinstance(self.speculator, DraftModelSpeculator):
+                    self.speculator.capture()
+                else:
+                    self.speculator.capture(captured_attn_states)
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]

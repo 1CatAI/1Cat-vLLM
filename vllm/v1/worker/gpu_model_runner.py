@@ -1499,7 +1499,7 @@ class GPUModelRunner(
             elif self.speculative_config.use_dspark():
                 self.drafter = DSparkProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.use_dflash():
+            elif self.speculative_config.use_dflash_ddtree():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = (
                     self.drafter.eagle3_use_aux_hidden_state
@@ -9451,7 +9451,7 @@ class GPUModelRunner(
 
         elif (
             spec_config.use_eagle()
-            or spec_config.use_dflash()
+            or spec_config.use_dflash_ddtree()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
