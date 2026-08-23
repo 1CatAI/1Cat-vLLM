@@ -5,6 +5,7 @@ import os
 from contextlib import contextmanager
 from typing import cast
 
+import regex as re
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -29,6 +30,21 @@ except Exception:
 logger = init_logger(__name__)
 
 _SM70_TP8_HIERARCHICAL_ELEMENTS = 4096
+_EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
+    r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
+)
+
+
+def _get_effective_allocator_conf() -> str:
+    """Return the allocator config selected by PyTorch on CUDA.
+
+    PyTorch 2.10 prefers the legacy CUDA-specific variable whenever it is
+    present, even when its value is empty, and otherwise falls back to the
+    unified accelerator variable.
+    """
+    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+        return os.environ["PYTORCH_CUDA_ALLOC_CONF"]
+    return os.environ.get("PYTORCH_ALLOC_CONF", "")
 
 
 @contextmanager
@@ -36,27 +52,27 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool):
     """Keep CUDA-IPC graph buffers on cudaMalloc-backed allocations.
 
     ``cudaIpcGetMemHandle`` cannot export CUDA VMM allocations created when
-    ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` is active. Custom
-    all-reduce exports graph buffers through that legacy IPC API, so disable
-    expandable segments for the complete capture and registration window.
+    ``expandable_segments:True`` is active through either supported allocator
+    environment variable. Custom all-reduce exports graph buffers through that
+    legacy IPC API, so disable expandable segments for the complete capture
+    and registration window while preserving every other allocator option.
     """
-    allocator_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-    should_disable = (
-        active
-        and current_platform.is_cuda()
-        and "expandable_segments:True" in allocator_conf
+    allocator_conf = _get_effective_allocator_conf()
+    disabled_conf, replacements = _EXPANDABLE_SEGMENTS_TRUE_PATTERN.subn(
+        r"\1False", allocator_conf
     )
+    should_disable = active and current_platform.is_cuda() and replacements > 0
     if should_disable:
         logger.info_once(
             "Temporarily disabling expandable_segments during custom allreduce "
             "CUDA graph capture for CUDA IPC compatibility."
         )
-        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+        torch.cuda.memory._set_allocator_settings(disabled_conf)
     try:
         yield
     finally:
         if should_disable:
-            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+            torch.cuda.memory._set_allocator_settings(allocator_conf)
 
 
 def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
