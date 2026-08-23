@@ -2745,6 +2745,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     a_spec.index_select(0, path_token_idx),
                     b_spec.index_select(0, path_token_idx),
                     self.dt_bias,
+                    beta_dtype=torch.float32,
                 )
                 local_ssm_state = initial_ssm_state[req_row : req_row + 1].clone()
                 _, root_final_state = fused_recurrent_gated_delta_rule(
@@ -2841,6 +2842,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     a_spec.index_select(0, path_token_idx),
                     b_spec.index_select(0, path_token_idx),
                     self.dt_bias,
+                    beta_dtype=torch.float32,
                 )
                 local_ssm_state = initial_ssm_state[req_row : req_row + 1].clone()
                 _, path_final_state = fused_recurrent_gated_delta_rule(
@@ -3134,6 +3136,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_spec,
                 b_spec,
                 self.dt_bias,
+                beta_dtype=torch.float32,
             )
             core_attn_out_linear, _ = fused_recurrent_gated_delta_rule(
                 q=query_linear,
@@ -3249,6 +3252,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_spec.index_select(0, token_idx),
                 b_spec.index_select(0, token_idx),
                 self.dt_bias,
+                beta_dtype=torch.float32,
             )
             cu_seqlens = torch.arange(
                 input_state_idx.shape[0] + 1,
@@ -3336,6 +3340,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     a_spec.index_select(0, token_idx),
                     b_spec.index_select(0, token_idx),
                     self.dt_bias,
+                    beta_dtype=torch.float32,
                 )
                 cu_seqlens = torch.arange(
                     conv_state_indices.shape[0] + 1,
@@ -5314,7 +5319,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 last_recurrent_state = ssm_state
             else:
                 g_spec, beta_spec = fused_gdn_gating(
-                    self.A_log, a_spec, b_spec, self.dt_bias
+                    self.A_log,
+                    a_spec,
+                    b_spec,
+                    self.dt_bias,
+                    beta_dtype=torch.float32,
                 )
                 core_attn_out_spec, last_recurrent_state = (
                     fused_recurrent_gated_delta_rule(
@@ -6304,6 +6313,7 @@ def qwen_gdn_attention_core_spec_commit(
             a,
             b,
             self.dt_bias,
+            beta_dtype=torch.float32,
         )
         core_attn_out_spec, _ = fused_recurrent_gated_delta_rule(
             q=query_spec,
@@ -6984,18 +6994,25 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
+    *,
+    beta_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused computation of g and beta for Gated Delta Net.
     g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    beta_output = b.sigmoid()
+    beta_output = b.sigmoid(), materialized in beta_dtype when provided.
+
+    Speculative recurrent updates request FP32 beta to match the fused packed
+    decode transition. Other callers retain the historical b.dtype output.
     TODO maybe use torch.compile to replace this triton kernel
     """
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    if beta_dtype is None:
+        beta_dtype = b.dtype
+    beta_output = torch.empty(1, batch, num_heads, dtype=beta_dtype, device=b.device)
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,

@@ -468,9 +468,7 @@ def test_spec_state_slot_selector_can_differ_from_accepted_count(local_gdn_model
         common_prefix_len=0,
         common_attn_metadata=common,
         num_accepted_tokens=torch.tensor([2], dtype=torch.int32, device=DEVICE),
-        spec_state_slot_selectors=torch.tensor(
-            [4], dtype=torch.int32, device=DEVICE
-        ),
+        spec_state_slot_selectors=torch.tensor([4], dtype=torch.int32, device=DEVICE),
         num_decode_draft_tokens_cpu=torch.tensor([4], dtype=torch.int32, device="cpu"),
     )
 
@@ -749,9 +747,7 @@ def test_gdn_state_contract_debug_assert_rejects_pad_accepted_slot(
             spec_sequence_masks_cpu=torch.tensor(
                 [True], dtype=torch.bool, device="cpu"
             ),
-            num_accepted_tokens=torch.tensor(
-                [5], dtype=torch.int32, device=DEVICE
-            ),
+            num_accepted_tokens=torch.tensor([5], dtype=torch.int32, device=DEVICE),
             current_state_block_ids=None,
             is_mamba_cache_all=False,
         )
@@ -778,9 +774,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         num_spec_decodes=2,
         num_spec_decode_tokens=10,
         num_actual_tokens=10,
-        spec_query_start_loc=torch.tensor(
-            [0, 5, 10], dtype=torch.int32, device=DEVICE
-        ),
+        spec_query_start_loc=torch.tensor([0, 5, 10], dtype=torch.int32, device=DEVICE),
         spec_state_indices_tensor=torch.tensor(
             [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]],
             dtype=torch.int32,
@@ -821,7 +815,6 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     seen: dict[str, object] = {}
 
     class FakeLayer:
-
         def __init__(self) -> None:
             self.conv1d = torch.nn.Identity()
             self.conv1d.weight = torch.empty((8, 1, 1), device=DEVICE)
@@ -862,10 +855,11 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         seen["conv"] = True
         return x + 1
 
-    def fake_gating(a_log, a_tensor, b_tensor, dt_bias):
+    def fake_gating(a_log, a_tensor, b_tensor, dt_bias, *, beta_dtype=None):
         del a_log, dt_bias
         assert a_tensor is a
         assert b_tensor is b
+        assert beta_dtype is torch.float32
         seen["gating"] = True
         return a_tensor + 2, b_tensor + 3
 
@@ -1023,9 +1017,7 @@ def test_sm70_qwen_gdn_blocks_003_spec_core_only_for_deep_native_mtp(
     expected,
 ):
     monkeypatch.setenv("VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP", "1")
-    monkeypatch.delenv(
-        "VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP", raising=False
-    )
+    monkeypatch.delenv("VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP", raising=False)
     _clear_envs_cache()
 
     vllm_config = SimpleNamespace(
@@ -1036,9 +1028,7 @@ def test_sm70_qwen_gdn_blocks_003_spec_core_only_for_deep_native_mtp(
     )
 
     assert (
-        qwen_gdn._sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
-            vllm_config
-        )
+        qwen_gdn._sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config)
         is expected
     )
 
@@ -1057,9 +1047,7 @@ def test_sm70_qwen_gdn_003_spec_core_deep_mtp_override_is_diagnostic(
         )
     )
 
-    assert not qwen_gdn._sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
-        vllm_config
-    )
+    assert not qwen_gdn._sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config)
 
 
 def test_sm70_qwen_gdn_003_spec_core_route_has_priority(
