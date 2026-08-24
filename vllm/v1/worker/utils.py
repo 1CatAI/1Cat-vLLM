@@ -40,6 +40,7 @@ logger = init_logger(__name__)
 @triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
+    seg_block_strides_ptr,
     block_ids_ptr,
     n_blocks,
     N_SEGS: tl.constexpr,
@@ -55,6 +56,9 @@ def _zero_kv_blocks_kernel(
 
     seg_addrs_ptr holds absolute byte addresses (int64) for each segment,
     allowing segments to live in different CUDA allocations.
+    seg_block_strides_ptr holds the per-segment block-to-block stride in
+    elements, kept separate from the PAGE_SIZE_EL span each block zeros (they
+    differ for interleaved layouts, see init_meta).
 
     Programs are mapped as (block_index, seg_index, chunk_index).
     """
@@ -69,9 +73,11 @@ def _zero_kv_blocks_kernel(
     chunk_index = remainder % chunks
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     offset = (
-        block_id.to(tl.int64) * PAGE_SIZE_EL + chunk_index.to(tl.int64) * BLOCK_SIZE
+        block_id.to(tl.int64) * block_stride_el.to(tl.int64)
+        + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
@@ -88,7 +94,7 @@ class KVBlockZeroer:
     def __init__(self, device: torch.device, pin_memory: bool):
         self.device = device
         self.pin_memory = pin_memory
-        self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -197,6 +203,24 @@ class KVBlockZeroer:
             return
 
         blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+
+        # Per-block stride within a segment. Dense layouts space blocks
+        # page_size_el apart, but a block-major interleaved pool (kvcached's
+        # contiguous layout) packs the n_segs segments one cell apart, so its
+        # real stride is n_segs * page_size_el. Detect that from the segment
+        # spacing; page_size_el (dense) stays the safe default.
+        n_segs = len(seg_addrs)
+        cell_bytes = page_size_el * 4  # int32 elements -> bytes
+        addrs = sorted(seg_addrs)
+        interleaved = n_segs > 1 and all(
+            b - a == cell_bytes for a, b in zip(addrs, addrs[1:])
+        )
+        block_stride_el = page_size_el * n_segs if interleaved else page_size_el
+        # One stride per segment (uniform here), read by seg_index in-kernel.
+        seg_block_strides = torch.full(
+            (n_segs,), block_stride_el, dtype=torch.int64, device=self.device
+        )
+
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -206,16 +230,17 @@ class KVBlockZeroer:
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+            seg_block_strides,
             page_size_el,
             blk_size,
-            len(seg_addrs),
+            n_segs,
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
+        seg_addrs, seg_block_strides, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
@@ -234,6 +259,7 @@ class KVBlockZeroer:
         grid = (n_blocks * n_segs * (page_size_el // blk_size),)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
+            seg_block_strides,
             idx,
             n_blocks,
             N_SEGS=n_segs,
