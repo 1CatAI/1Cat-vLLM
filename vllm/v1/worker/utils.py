@@ -37,6 +37,44 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def _infer_segment_block_strides(
+    seg_addrs: list[int],
+    page_size_el: int,
+) -> list[int]:
+    """Infer logical block strides from block-major segment address runs.
+
+    Dense segments advance by one page. An interleaved pool exposes one segment
+    base per cell, exactly ``page_size_el * 4`` bytes apart, and advances to the
+    next logical block after every segment in that address run. Treat separate
+    runs independently so multiple pools do not disable one another.
+    """
+    if page_size_el <= 0:
+        raise ValueError(f"page_size_el must be positive, got {page_size_el}.")
+    if len(set(seg_addrs)) != len(seg_addrs):
+        raise ValueError("Segment addresses must be unique.")
+
+    block_strides = [page_size_el] * len(seg_addrs)
+    if len(seg_addrs) < 2:
+        return block_strides
+
+    cell_bytes = page_size_el * 4
+    ordered = sorted((addr, index) for index, addr in enumerate(seg_addrs))
+    run_start = 0
+    for run_end in range(1, len(ordered) + 1):
+        if (
+            run_end < len(ordered)
+            and ordered[run_end][0] - ordered[run_end - 1][0] == cell_bytes
+        ):
+            continue
+        run = ordered[run_start:run_end]
+        if len(run) > 1:
+            run_stride = page_size_el * len(run)
+            for _, original_index in run:
+                block_strides[original_index] = run_stride
+        run_start = run_end
+    return block_strides
+
+
 @triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
@@ -161,8 +199,7 @@ class KVBlockZeroer:
                         page_size_el = cur_page_el
                     else:
                         assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs "
-                            f"{cur_page_el}"
+                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
                         )
 
                     block_stride_bytes = cur_bytes
@@ -193,8 +230,7 @@ class KVBlockZeroer:
                         page_size_el = cur_page_el
                     else:
                         assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs "
-                            f"{cur_page_el}"
+                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
                         )
                     seg_addrs.append(dp)
 
@@ -204,21 +240,15 @@ class KVBlockZeroer:
 
         blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
 
-        # Per-block stride within a segment. Dense layouts space blocks
-        # page_size_el apart, but a block-major interleaved pool (kvcached's
-        # contiguous layout) packs the n_segs segments one cell apart, so its
-        # real stride is n_segs * page_size_el. Detect that from the segment
-        # spacing; page_size_el (dense) stays the safe default.
+        # Dense layouts space blocks page_size_el apart. Block-major
+        # interleaved pools expose segment starts one cell apart and advance by
+        # the number of segments in that contiguous address run. Infer each
+        # run separately because a process may own more than one KV pool.
         n_segs = len(seg_addrs)
-        cell_bytes = page_size_el * 4  # int32 elements -> bytes
-        addrs = sorted(seg_addrs)
-        interleaved = n_segs > 1 and all(
-            b - a == cell_bytes for a, b in zip(addrs, addrs[1:])
-        )
-        block_stride_el = page_size_el * n_segs if interleaved else page_size_el
-        # One stride per segment (uniform here), read by seg_index in-kernel.
-        seg_block_strides = torch.full(
-            (n_segs,), block_stride_el, dtype=torch.int64, device=self.device
+        seg_block_strides = torch.tensor(
+            _infer_segment_block_strides(seg_addrs, page_size_el),
+            dtype=torch.int64,
+            device=self.device,
         )
 
         self._id_cap = 8192
