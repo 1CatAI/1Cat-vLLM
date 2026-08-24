@@ -42788,3 +42788,31 @@ Interpretation:
   graph, cache, and concurrency contracts. The architecture-name check was
   removed; measured checkpoint details remain evidence only and never select
   an optimization route.
+
+## 2026-08-24 PR #276 cache-block reuse audit
+
+- The reported corruption root cause is valid: a reused full-attention cache
+  block can retain non-finite values in slots that its new owner has not yet
+  written, and arithmetic masking does not make `0 * NaN` finite. The MRV2
+  runner had omitted the cache-zero lifecycle hook already used by the legacy
+  runner.
+- MRV2 now initializes the shared `KVBlockZeroer` metadata and consumes the
+  scheduler's `new_block_ids_to_zero` before either attention or a zero-token
+  early return. Work is proportional to newly allocated blocks, uses the
+  cache-group/operator layout metadata, and introduces no per-step sequence
+  length readback or request-by-layer launch loop.
+- The PR's per-step tail walker and sampled-token vocabulary clamp are
+  rejected. The former performs device-to-host synchronization plus many
+  small zero launches on every step; the latter turns corrupted output into
+  an arbitrary boundary token and hides the producer. The proposed GDN PAD
+  replication and last-column gather clamp are also rejected: the align-mode
+  allocator already guarantees a live current block plus its speculative
+  scratch window, so those fallbacks would conceal a broken block-table
+  contract and repeat an unrelated state block.
+- Route selection and correctness depend only on allocation lifecycle,
+  cache-group layout, block IDs, tensor shape/dtype, and operator contracts.
+  No model, checkpoint, or architecture identity participates in the fix.
+- Focused validation covers MRV2 zeroer initialization and zero-before-return
+  ordering, dense and multi-pool interleaved zeroing, Mamba align allocation,
+  and the existing GDN state-window contracts. No full-model end-to-end run
+  was required for this source-level repair.
