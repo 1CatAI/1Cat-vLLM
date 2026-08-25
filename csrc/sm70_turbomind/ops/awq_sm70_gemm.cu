@@ -1128,6 +1128,11 @@ bool fp8_safe_fast_selector_enabled() {
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
+bool fp8_grouped_bmm_decode_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
 bool awq_reuse_imported_cache_enabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE");
   return raw != nullptr && std::atoi(raw) != 0;
@@ -1393,6 +1398,12 @@ turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream) {
+  if (fp8_grouped_bmm_decode_enabled() && total_tokens == 2 && n == 1024 &&
+      k == 4096 && num_experts == 2 && group_size == 128) {
+    // The matching dense WO-A projection uses the fixed launch spec selected
+    // in gemm.cu. Do not let measurement replace its accumulation tree.
+    return turbomind::gemm::DispatchPolicy::kDefault;
+  }
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
       TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled());

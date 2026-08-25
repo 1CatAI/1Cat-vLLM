@@ -727,6 +727,42 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_buffer("sm70_fp8_meta", first_meta, persistent=False)
                 layer.sm70_fp8_k_ld = int(first_meta[0].item())
                 layer.sm70_fp8_q_ld = int(first_meta[1].item())
+                if (
+                    envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
+                    and group_count == 2
+                    and rows_per_group == 1024
+                    and int(layer.weight.shape[1]) == 4096
+                    and hasattr(
+                        torch.ops._C,
+                        "fp8_moe_gemm_sm70_per_expert_dispatch_out",
+                    )
+                ):
+                    ptrs_w, ptrs_s = sm70_ops.awq_moe_build_strided_ptrs(
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        layer.sm70_fp8_k_ld,
+                        layer.sm70_fp8_q_ld,
+                        group_count,
+                    )
+                    layer.register_buffer(
+                        "sm70_fp8_bmm_grouped_ptrs_w", ptrs_w, persistent=False
+                    )
+                    layer.register_buffer(
+                        "sm70_fp8_bmm_grouped_ptrs_s", ptrs_s, persistent=False
+                    )
+                    layer.register_buffer(
+                        "sm70_fp8_bmm_grouped_offsets",
+                        torch.arange(
+                            group_count + 1,
+                            dtype=torch.int32,
+                            device=layer.weight.device,
+                        ),
+                        persistent=False,
+                    )
+                    layer.sm70_fp8_bmm_grouped_decode = True
+                    logger.info_once(
+                        "SM70 FP8 one-launch grouped-BMM decode path enabled."
+                    )
                 logger.info_once(
                     "SM70 FP8 TurboMind grouped-BMM path enabled for DeepSeek V4."
                 )
@@ -1025,17 +1061,34 @@ class Fp8LinearMethod(LinearMethodBase):
                     device=x.device,
                     dtype=x.dtype,
                 )
-                for group_idx in range(group_count):
-                    sm70_ops.fp8_gemm_sm70_out(
-                        out_by_group[group_idx],
-                        x_by_group[group_idx],
-                        layer.weight[group_idx],
-                        layer.weight_scale_inv[group_idx],
+                if (
+                    getattr(layer, "sm70_fp8_bmm_grouped_decode", False)
+                    and x_grouped.shape[0] == 1
+                ):
+                    sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
+                        out_by_group.reshape(group_count, output_size),
+                        x_by_group.reshape(group_count, x.shape[-1]),
+                        layer.sm70_fp8_bmm_grouped_offsets,
+                        layer.sm70_fp8_bmm_grouped_ptrs_w,
+                        layer.sm70_fp8_bmm_grouped_ptrs_s,
+                        group_count,
+                        x.shape[-1],
+                        output_size,
                         128,
-                        layer.sm70_fp8_k_ld,
-                        layer.sm70_fp8_q_ld,
                         False,
                     )
+                else:
+                    for group_idx in range(group_count):
+                        sm70_ops.fp8_gemm_sm70_out(
+                            out_by_group[group_idx],
+                            x_by_group[group_idx],
+                            layer.weight[group_idx],
+                            layer.weight_scale_inv[group_idx],
+                            128,
+                            layer.sm70_fp8_k_ld,
+                            layer.sm70_fp8_q_ld,
+                            False,
+                        )
                 out = out_by_group.transpose(0, 1).reshape(
                     *x.shape[:-2], group_count, output_size
                 )

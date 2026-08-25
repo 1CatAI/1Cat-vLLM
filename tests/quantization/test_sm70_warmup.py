@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.warmup import awq_sm70_warmup as warmup
 
 
@@ -74,6 +75,93 @@ def test_fp8_warmup_matches_grouped_bmm_runtime_slice(monkeypatch):
     assert all(call.group_size == 128 for call in calls)
     assert all(call.k_ld == 128 and call.q_ld == 64 for call in calls)
     assert all(not call.gated_silu for call in calls)
+
+
+def test_fp8_warmup_includes_one_launch_grouped_decode(monkeypatch):
+    layer = _grouped_fp8_layer()
+    layer.sm70_fp8_bmm_groups = 2
+    layer.sm70_fp8_bmm_grouped_decode = True
+    layer.weight = nn.Parameter(
+        torch.empty((2, 128, 64), dtype=torch.uint8), requires_grad=False
+    )
+    layer.weight_scale_inv = nn.Parameter(
+        torch.empty((2, 1, 64), dtype=torch.float16), requires_grad=False
+    )
+    layer.sm70_fp8_bmm_grouped_offsets = torch.arange(3, dtype=torch.int32)
+    layer.sm70_fp8_bmm_grouped_ptrs_w = torch.empty(2, dtype=torch.int64)
+    layer.sm70_fp8_bmm_grouped_ptrs_s = torch.empty(2, dtype=torch.int64)
+    dense_calls = []
+    grouped_calls = []
+    monkeypatch.setattr(torch.ops._C, "fp8_gemm_sm70_out_meta", object(), raising=False)
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_gemm_sm70_out",
+        lambda *args: dense_calls.append(args),
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_moe_gemm_sm70_per_expert_dispatch_out",
+        lambda *args: grouped_calls.append(args),
+    )
+
+    count = warmup._warmup_fp8_dense_layers([(layer, False)], [1, 4])
+
+    assert count == 3
+    assert len(dense_calls) == 2
+    assert len(grouped_calls) == 1
+    call = grouped_calls[0]
+    assert tuple(call[0].shape) == (2, 64)
+    assert tuple(call[1].shape) == (2, 128)
+    assert call[2] is layer.sm70_fp8_bmm_grouped_offsets
+    assert call[3] is layer.sm70_fp8_bmm_grouped_ptrs_w
+    assert call[4] is layer.sm70_fp8_bmm_grouped_ptrs_s
+    assert call[5:] == (2, 128, 64, 128, False)
+
+
+def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
+    layer = _grouped_fp8_layer()
+    layer.sm70_fp8_bmm_groups = 2
+    layer.sm70_fp8_bmm_grouped_decode = True
+    layer.sm70_fp8_bmm_grouped_offsets = torch.arange(3, dtype=torch.int32)
+    layer.sm70_fp8_bmm_grouped_ptrs_w = torch.empty(2, dtype=torch.int64)
+    layer.sm70_fp8_bmm_grouped_ptrs_s = torch.empty(2, dtype=torch.int64)
+    layer.output_size_per_partition = 128
+    calls = []
+
+    def grouped(out, x, *args):
+        calls.append((out, x, args))
+        out.copy_(torch.arange(out.numel(), dtype=out.dtype).reshape_as(out))
+
+    def fail_dense(*args):
+        raise AssertionError("dense fallback used")
+
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_moe_gemm_sm70_per_expert_dispatch_out",
+        grouped,
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_gemm_sm70_out",
+        fail_dense,
+    )
+    x = torch.empty((1, 2, 128), dtype=torch.float16)
+
+    out = object.__new__(Fp8LinearMethod).apply(layer, x)
+
+    assert tuple(out.shape) == (1, 2, 64)
+    assert len(calls) == 1
+    grouped_out, grouped_x, args = calls[0]
+    assert tuple(grouped_out.shape) == (2, 64)
+    assert tuple(grouped_x.shape) == (2, 128)
+    assert args[0] is layer.sm70_fp8_bmm_grouped_offsets
+    assert args[1] is layer.sm70_fp8_bmm_grouped_ptrs_w
+    assert args[2] is layer.sm70_fp8_bmm_grouped_ptrs_s
+    assert args[3:] == (2, 128, 64, 128, False)
+    torch.testing.assert_close(
+        out,
+        torch.arange(128, dtype=torch.float16).reshape(1, 2, 64),
+    )
 
 
 def test_fp8_warmup_supports_modelopt_turbomind_layout(monkeypatch):

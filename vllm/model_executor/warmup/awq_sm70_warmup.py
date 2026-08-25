@@ -523,6 +523,27 @@ def _warmup_fp8_dense_layers(
                 out, x, weight, scales, 128, k_ld, q_ld, gated_silu
             )
             calls += 1
+        if getattr(layer, "sm70_fp8_bmm_grouped_decode", False):
+            group_count = int(layer.sm70_fp8_bmm_groups)
+            grouped_x = torch.empty(
+                (group_count, k_dim), dtype=torch.float16, device=device
+            )
+            grouped_out = torch.empty(
+                (group_count, n_dim), dtype=torch.float16, device=device
+            )
+            sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
+                grouped_out,
+                grouped_x,
+                layer.sm70_fp8_bmm_grouped_offsets,
+                layer.sm70_fp8_bmm_grouped_ptrs_w,
+                layer.sm70_fp8_bmm_grouped_ptrs_s,
+                group_count,
+                k_dim,
+                n_dim,
+                128,
+                False,
+            )
+            calls += 1
     return calls
 
 

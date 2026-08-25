@@ -96,6 +96,11 @@ bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
   return !raw || std::atoi(raw) != 0;
 }
 
+bool Sm70Fp8GroupedBmmDecodeEnabled() {
+  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
+  return raw && std::atoi(raw) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
   int n;
   int k;
@@ -183,6 +188,13 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
       (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
        desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1")) {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 64, 256, 16, 1, 3, true, ""};
+  }
+  if (Sm70Fp8GroupedBmmDecodeEnabled() &&
+      desc_str == "sm70_f16_e4m3k128_f16_tnt_bbb_2x1024x4096_1") {
+    // Match the accepted dense 1x1024x4096 accumulation tree while launching
+    // both independent WO-A groups through one blocked descriptor.
+    return Sm70AwqTp2FastTarget{
+        desc.n, desc.k, 8, 128, 64, 7, 2, true, "c8x128_a1x1x64_01"};
   }
   const bool awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
   if (awq_fast_selector_enabled) {

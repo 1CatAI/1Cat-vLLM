@@ -43233,9 +43233,22 @@ Interpretation:
   Keep the route default-off and the PR Draft until the deterministic launch
   policy and pinned dataset gates close.
 - The next arithmetic target is the FP8 dense/WO-A launch family, which is the
-  largest trace category. Grouping two adjacent one-row projections is
-  bitwise exact when both use the default accumulation schedule and projects
-  about 2.5 ms/token of service reduction. Independently tuned flat/grouped
-  schedules differ by up to one FP16 ULP, so that fast route is rejected until
-  a shared deterministic accumulation contract passes full-token and dataset
-  quality gates.
+  largest trace category. Each of the 43 layers currently dispatches the two
+  one-row `(K=4096,N=1024)` groups separately. The opt-in replacement prepares
+  two persistent TurboMind pointer rows and dispatches both groups through one
+  blocked GEMM only for batch-one decode; all other shapes and token counts
+  retain the existing loop.
+- The accepted arithmetic contract fixes the grouped descriptor to the dense
+  `8x128x64`, split-K 7 schedule. An environment-injected selector screen and
+  a source-built rerun both pass eager and changing-input CUDA Graph checks for
+  exact-small, random-small, and model-like inputs with zero mismatches. The
+  final-source extension is
+  `/data/models/dsv4-pp2tp4-fp8-woa-build-lib-20260826-r1/vllm/_C.abi3.so`
+  with SHA256 `133724eb67e70e3b4ff098c5f32c00e3155cd7c5e8f7aeb6dff84934ac294e9e`.
+  Median isolated graph time changes from `74.943` to `22.450 us` per layer,
+  projecting `2.257 ms/token` of service reduction before model overlap. The
+  source result is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp8-woa-grouped-20260826-r6-source/`.
+  Independently tuned flat/grouped schedules differ by up to one FP16 ULP and
+  remain rejected. Full-model endpoint and pinned dataset gates are still
+  required before promotion, so this route stays default-off.
