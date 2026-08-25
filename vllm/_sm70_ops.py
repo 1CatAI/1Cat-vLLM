@@ -19,10 +19,14 @@ def _maybe_load_fp8_qpn8_library() -> None:
     path lets source experiments add only the QPN8 operators to an otherwise
     compatible installed build, including in spawned TP workers.
     """
-    if os.getenv("VLLM_SM70_FP8_QPN8", "0") != "1":
-        return
     library_path = os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY")
-    if library_path:
+    if library_path is None:
+        return
+    generic_override = os.getenv("VLLM_SM70_FP8_QPN8")
+    specific_override = os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4")
+    generic_enabled = generic_override == "1"
+    default_route_enabled = generic_override != "0" and specific_override != "0"
+    if generic_enabled or default_route_enabled:
         torch.ops.load_library(library_path)
 
 

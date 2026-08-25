@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
@@ -182,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
+    VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
@@ -1680,6 +1682,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Default-on QPN8 route for the validated serialized PP2 x TP4 contract.
+    # Admission additionally requires exact operator shapes/layouts, B1,
+    # no speculative decoding, no DBO, and no explicit ubatching. Set this to
+    # 0 (or the generic QPN8 flag to 0) to retain TurboMind everywhere.
+    "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
+    ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
@@ -1799,6 +1808,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
+    ),
+    # Skip PP metadata and TP reconstruction only for the exact, replicated
+    # SM70 B1 hidden-state schema validated by the worker on both stages.
+    "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER": lambda: bool(
+        int(os.getenv("VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER", "1"))
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")

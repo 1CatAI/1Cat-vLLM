@@ -43368,3 +43368,40 @@ Interpretation:
   after paying the full query cost cannot improve latency and can alter
   acceptance. The assistant remains explicit opt-in until matched evidence
   shows that full-query skips repay host lookup overhead for a workload.
+
+## 2026-08-26 PR #283 aggregate-quality acceptance
+
+- The numerical policy does not require greedy or token-stream identity.
+  Candidate outputs must remain finite, satisfy dtype-appropriate operator
+  error bounds, and preserve matched aggregate task quality. Per-example
+  regressions and improvements remain visible diagnostics rather than an
+  automatic identity gate.
+- The full serialized-FP8 QPN8 candidate improves the matched PP2 x TP4 B1
+  no-spec endpoint from 59.248 to 64.359 token/s (`+8.63%`) and reduces mean
+  TPOT from 16.878 to 15.538 ms. Its paired GSM8K-64 result remains 63/64 with
+  zero invalid answers: one baseline-correct answer regresses and one
+  baseline-wrong answer improves, so aggregate quality does not decline.
+- Operator checks remain finite with relative L2 at most `6.05e-4`, cosine at
+  least `0.9999997`, and maximum absolute difference at most `0.00390625` in
+  the recorded screen. All 365 audited block scales are finite, positive
+  powers of two and survive the layout scale transform exactly. These are
+  numerical bounds, not a claim of bitwise equivalence.
+- QPN8 is therefore default-on only for its validated engine contract: exact
+  SM70 block-FP8 operator roles/shapes/layouts, PP2 x TP4, one sequence, no
+  DBO or explicit ubatching, and no speculative decoding. Missing operators
+  or workspace allocation fall back to TurboMind. Either
+  `VLLM_SM70_FP8_QPN8=0` or `VLLM_SM70_FP8_QPN8_PP2_TP4=0` is an explicit
+  rollback. Admission never reads model name, checkpoint, `model_type`, or
+  architecture identity.
+- Metadata-free PP transfer is also default-on for its exact SM70 B1 schema:
+  PP2 x TP4, FP16 `[1,4,4096]` contiguous replicated hidden state, CUDA Graph,
+  no sequence parallelism, no DBO/ubatching/speculation, and one sequence.
+  Three matched endpoint runs improve QPN8 by about `0.22%` (`0.034 ms/token`)
+  without changing its output behavior. Non-admitted configurations use the
+  original metadata plus TP reconstruction path; an admitted-but-invalid
+  runtime tensor fails fast before communication. The rollback is
+  `VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER=0`.
+- The paired quality tools now pin dataset hashes and the complete evaluation
+  contract, validate artifact self-consistency, and gate aggregate HumanEval,
+  LongBench, GSM8K, and needle-retrieval quality. They report directional
+  sample flips but do not treat greedy identity as task quality.
