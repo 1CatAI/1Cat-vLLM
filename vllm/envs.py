@@ -1937,9 +1937,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
     ),
-    # Opt-in SGLang-style push collective for the exact FP16 [8, 5120]
-    # verifier shape on fully-connected SM70 TP4. The communicator allocates
-    # dedicated two-epoch push storage only when this gate is enabled.
+    # Opt-in SGLang-style push collective for the exact FP16 80-KiB verifier
+    # and 8-KiB decode payloads on fully-connected SM70 TP4. The communicator
+    # allocates dedicated two-epoch push storage only when this gate is enabled.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "0"))
     ),
