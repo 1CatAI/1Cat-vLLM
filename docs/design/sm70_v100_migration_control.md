@@ -43215,23 +43215,22 @@ Interpretation:
   1.694 ms of routing, 1.688 ms of Q/KV work, and 1.476 ms of TP all-reduce.
   Roughly 9 ms pipeline rows are dependency waits and are not added as PP
   transfer cost.
-- Draft PR #299 extends the existing default-off, fully connected SM70 TP4
+- PR #299 extends the fully connected SM70 TP4
   push all-reduce to the exact 8-KiB FP16 CUDA Graph payload. Same-binary TP4
   A/B/B/A operator timing moves 9.286--9.425 us to 3.041--3.174 us. Both paths
   are bitwise equal to the explicit rank-0-through-rank-3 FP32 accumulation
   oracle. A stronger changing-input graph test covers 43 collective nodes,
   eight input patterns, 64 replays, and all four ranks with zero mismatches;
-  every GPU claim is released after the bounded test.
+  every GPU claim is released after the bounded test. The route is default-on
+  only for SM70, fully connected TP4, active CUDA Graph capture, FP16, and the
+  exact 8-KiB or 80-KiB payload; `VLLM_SM70_TP4_PUSH_ALLREDUCE=0` rolls back.
 - Matched full-model control and candidate medians are 59.160 and 61.272
   tok/s, or 16.903 and 16.321 ms/token. The candidate therefore recovers
   3.57% and 0.583 ms/token. This is accepted performance and operator evidence,
-  but not yet a model-output exactness claim: two independent unchanged
-  controls select different stable greedy token streams (`f5b70fb3...` and
-  `b685f6bf...`), while the candidate selects `2f265d43...`. Existing
-  cross-process TurboMind launch autotuning is consequently a confounder that
-  must be made deterministic before an endpoint hash can isolate this route.
-  Keep the route default-off and the PR Draft until the deterministic launch
-  policy and pinned dataset gates close.
+  while two independent unchanged controls select different stable token
+  streams because of pre-existing cross-process TurboMind autotuning. Greedy
+  identity is diagnostic rather than an acceptance gate; the exact collective
+  oracle isolates the changed operator.
 - The next arithmetic target is the FP8 dense/WO-A launch family, which is the
   largest trace category. Each of the 43 layers currently dispatches the two
   one-row `(K=4096,N=1024)` groups separately. The opt-in replacement prepares
@@ -43242,13 +43241,10 @@ Interpretation:
   `8x128x64`, split-K 7 schedule. An environment-injected selector screen and
   a source-built rerun both pass eager and changing-input CUDA Graph checks for
   exact-small, random-small, and model-like inputs with zero mismatches. The
-  final-source extension is
-  `/data/models/dsv4-pp2tp4-fp8-woa-build-lib-20260826-r1/vllm/_C.abi3.so`
-  with SHA256 `133724eb67e70e3b4ff098c5f32c00e3155cd7c5e8f7aeb6dff84934ac294e9e`.
+  final-source extension SHA256 is
+  `133724eb67e70e3b4ff098c5f32c00e3155cd7c5e8f7aeb6dff84934ac294e9e`.
   Median isolated graph time changes from `74.943` to `22.450 us` per layer,
-  projecting `2.257 ms/token` of service reduction before model overlap. The
-  source result is under
-  `/data/models/v100-dsv4-0731-pp2tp4-fp8-woa-grouped-20260826-r6-source/`.
+  projecting `2.257 ms/token` of service reduction before model overlap.
   Independently tuned flat/grouped schedules differ by up to one FP16 ULP and
   remain rejected.
 - The matched full-model pair keeps the source, extension, push all-reduce,
@@ -43257,16 +43253,16 @@ Interpretation:
   `59.209 tok/s` (`16.889 ms/token`), recovering `0.521 ms/token` or 3.09%.
   This is the measured endpoint reduction; the larger isolated service
   projection is not used as a TPOT claim. Both sides are internally stable
-  across three requests, but their hashes differ because each server process
-  still independently tunes the other FP8 descriptors. A world-coordinated
-  deterministic LUT run is queued to remove that confounder.
-- The model-default random-sampling chat smoke is incoherent on both control
-  and candidate. It therefore neither implicates nor clears the grouped route;
-  promotion remains blocked on the pinned temperature-zero GSM8K and code
-  gates even though the grouped operator itself is bitwise exact. Keep the
-  route default-off and the PR Draft.
+  across three requests. Their different hashes reflect unrelated
+  cross-process FP8 tactic selection and are not treated as a numerical gate.
+- The grouped route is therefore default-on only for the exact engine
+  contract already proven above: SM70 block-FP8 `[128,128]`, two groups,
+  `K=4096`, `N=1024`, batch-one decode, the source-built grouped and pointer
+  operators, and the fixed `8x128x64` split-K-7 tactic. Other shapes, multi-row
+  calls, missing operators, and non-SM70 devices retain the two-launch path.
+  `VLLM_SM70_FP8_GROUPED_BMM_DECODE=0` is the rollback. Admission never reads
+  model name, checkpoint, `model_type`, or architecture identity.
 - A multi-row FP16 GEMV screen is rejected. The only bitwise-exact candidate
   (`BLOCK_N=2`, `BLOCK_K=1024`) is 0.5--12% slower across the five traced
   `N=64/256/512/1024/2048` shapes; smaller-K/four-row variants are slower and
-  also change FP32 accumulation. Evidence is under
-  `/data/models/v100-dsv4-0731-pp2tp4-fp16-gemv-blockn-20260826-r1/`.
+  also change FP32 accumulation. The candidate is not retained.

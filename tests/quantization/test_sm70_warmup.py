@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.warmup import awq_sm70_warmup as warmup
 
@@ -25,6 +26,14 @@ def _grouped_fp8_layer() -> nn.Module:
         torch.empty((3, 1, 64), dtype=torch.float32), requires_grad=False
     )
     return layer
+
+
+def test_fp8_grouped_bmm_decode_defaults_on_with_rollback(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", raising=False)
+    assert envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
+
+    monkeypatch.setenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "0")
+    assert not envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
 
 
 def test_fp8_warmup_discovers_grouped_bmm_by_per_group_shape():
@@ -162,6 +171,37 @@ def test_fp8_grouped_bmm_decode_uses_one_dispatch(monkeypatch):
         out,
         torch.arange(128, dtype=torch.float16).reshape(1, 2, 64),
     )
+
+
+def test_fp8_grouped_bmm_decode_retains_multirow_fallback(monkeypatch):
+    layer = _grouped_fp8_layer()
+    layer.sm70_fp8_bmm_groups = 2
+    layer.sm70_fp8_bmm_grouped_decode = True
+    layer.sm70_fp8_bmm_output_size = 64
+    dense_calls = []
+
+    def dense(out, x, *args):
+        dense_calls.append((tuple(out.shape), tuple(x.shape), args))
+        out.zero_()
+
+    def fail_grouped(*args):
+        raise AssertionError("grouped decode must remain batch-one only")
+
+    monkeypatch.setattr(warmup.sm70_ops, "fp8_gemm_sm70_out", dense)
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "fp8_moe_gemm_sm70_per_expert_dispatch_out",
+        fail_grouped,
+    )
+    x = torch.empty((2, 2, 128), dtype=torch.float16)
+
+    out = object.__new__(Fp8LinearMethod).apply(layer, x)
+
+    assert tuple(out.shape) == (2, 2, 64)
+    assert [call[:2] for call in dense_calls] == [
+        ((2, 64), (2, 128)),
+        ((2, 64), (2, 128)),
+    ]
 
 
 def test_fp8_warmup_supports_modelopt_turbomind_layout(monkeypatch):

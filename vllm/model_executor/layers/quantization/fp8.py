@@ -736,6 +736,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         torch.ops._C,
                         "fp8_moe_gemm_sm70_per_expert_dispatch_out",
                     )
+                    and hasattr(torch.ops._C, "awq_moe_build_strided_ptrs")
                 ):
                     ptrs_w, ptrs_s = sm70_ops.awq_moe_build_strided_ptrs(
                         layer.weight,

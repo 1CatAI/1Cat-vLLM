@@ -1130,7 +1130,7 @@ bool fp8_safe_fast_selector_enabled() {
 
 bool fp8_grouped_bmm_decode_enabled() {
   const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
-  return raw != nullptr && std::atoi(raw) != 0;
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool awq_reuse_imported_cache_enabled() {

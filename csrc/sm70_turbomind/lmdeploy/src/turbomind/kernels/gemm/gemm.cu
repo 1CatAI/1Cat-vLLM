@@ -98,7 +98,7 @@ bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
 
 bool Sm70Fp8GroupedBmmDecodeEnabled() {
   const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
-  return raw && std::atoi(raw) != 0;
+  return !raw || std::atoi(raw) != 0;
 }
 
 struct Sm70AwqTp2FastTarget {
