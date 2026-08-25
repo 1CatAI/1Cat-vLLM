@@ -43403,7 +43403,7 @@ Interpretation:
   oracle isolates the changed operator.
 - The next arithmetic target is the FP8 dense/WO-A launch family, which is the
   largest trace category. Each of the 43 layers currently dispatches the two
-  one-row `(K=4096,N=1024)` groups separately. The opt-in replacement prepares
+  one-row `(K=4096,N=1024)` groups separately. The replacement prepares
   two persistent TurboMind pointer rows and dispatches both groups through one
   blocked GEMM only for batch-one decode; all other shapes and token counts
   retain the existing loop.
