@@ -76,6 +76,18 @@ class BaseOffloader(ABC):
         """
         return
 
+    def wrap_module(
+        self, module: nn.Module, *, parameter_prefix: str = ""
+    ) -> nn.Module:
+        """Optionally offload one non-layer component.
+
+        Layer-prefetch backends intentionally inherit this no-op. UVA
+        overrides it so model components created outside ``make_layers`` can
+        participate without invoking a backend's multi-layer wrapper twice.
+        """
+        del parameter_prefix
+        return module
+
     def sync_prev_onload(self) -> None:  # noqa: B027
         """Sync previous onload operations. Override in subclasses."""
         pass

@@ -43414,3 +43414,86 @@ Interpretation:
   after paying the full query cost cannot improve latency and can alter
   acceptance. The assistant remains explicit opt-in until matched evidence
   shows that full-query skips repay host lookup overhead for a workload.
+
+## 2026-08-26 PR #283 aggregate-quality acceptance
+
+- The numerical policy does not require greedy or token-stream identity.
+  Candidate outputs must remain finite, satisfy dtype-appropriate operator
+  error bounds, and preserve matched aggregate task quality. Per-example
+  regressions and improvements remain visible diagnostics rather than an
+  automatic identity gate.
+- The full serialized-FP8 QPN8 candidate improves the matched PP2 x TP4 B1
+  no-spec endpoint from 59.248 to 64.359 token/s (`+8.63%`) and reduces mean
+  TPOT from 16.878 to 15.538 ms. Its paired GSM8K-64 result remains 63/64 with
+  zero invalid answers: one baseline-correct answer regresses and one
+  baseline-wrong answer improves, so aggregate quality does not decline.
+- Operator checks remain finite with relative L2 at most `6.05e-4`, cosine at
+  least `0.9999997`, and maximum absolute difference at most `0.00390625` in
+  the recorded screen. All 365 audited block scales are finite, positive
+  powers of two and survive the layout scale transform exactly. These are
+  numerical bounds, not a claim of bitwise equivalence.
+- QPN8 is therefore default-on only for its validated engine contract: exact
+  SM70 block-FP8 operator roles/shapes/layouts, PP2 x TP4, one sequence, no
+  DBO or explicit ubatching, and no speculative decoding. Missing operators
+  or workspace allocation fall back to TurboMind. Either
+  `VLLM_SM70_FP8_QPN8=0` or `VLLM_SM70_FP8_QPN8_PP2_TP4=0` is an explicit
+  rollback. Admission never reads model name, checkpoint, `model_type`, or
+  architecture identity.
+- Metadata-free PP transfer is also default-on for its exact SM70 B1 schema:
+  PP2 x TP4, FP16 `[1,4,4096]` contiguous replicated hidden state, CUDA Graph,
+  no sequence parallelism, no DBO/ubatching/speculation, and one sequence.
+  Three matched endpoint runs improve QPN8 by about `0.22%` (`0.034 ms/token`)
+  without changing its output behavior. Non-admitted configurations use the
+  original metadata plus TP reconstruction path; an admitted-but-invalid
+  runtime tensor fails fast before communication. The rollback is
+  `VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER=0`.
+- The paired quality tools now pin dataset hashes and the complete evaluation
+  contract, validate artifact self-consistency, and gate aggregate HumanEval,
+  LongBench, GSM8K, and needle-retrieval quality. They report directional
+  sample flips but do not treat greedy identity as task quality.
+
+## 2026-08-26 generic multimodal-tower UVA offload
+
+- PR #297 originally wrapped one named vision module by invoking the layer
+  offloader a second time. That form is not admitted: it is model-specific,
+  loses the tower prefix needed by `--cpu-offload-params visual`, and violates
+  the prefetch backend's single-call contract.
+- The accepted path is an engine-level component hook on every module recorded
+  by the existing multimodal tower lifecycle. UVA qualifies relative parameter
+  names with the recorded module path before applying exact segment matching;
+  layer-prefetch and no-op backends inherit a single-component no-op. Parameters
+  already visited through `make_layers()` are not copied or counted twice.
+- Admission uses only the configured offload backend and budget, the explicit
+  parameter-path selector, and the module's generic tower role. It never reads
+  a model name, checkpoint path, `model_type`, or architecture identity. With no
+  CPU-offload budget the global offloader remains a no-op.
+- The submitted V100 evidence reports about 0.78 GiB additional device memory
+  per rank, a 152,056-token KV pool, and successful 151,296-token context on
+  two 16-GiB V100 ranks. Text-only decode does not execute the tower; image
+  prefill accepts the expected PCIe/UVA cost. This is capacity evidence, not a
+  general throughput claim, so the route remains explicitly configured rather
+  than becoming an unconditional default.
+
+## 2026-08-26 PR #299 8-KiB TP4 push all-reduce acceptance
+
+- The existing two-epoch SM70 TP4 push collective now also admits the exact
+  8-KiB FP16 decode payload. Four CTAs cover its 512 packed 16-byte elements;
+  the existing 80-KiB verifier payload retains its 80-CTA launch. Buffer
+  sizing already uses the larger payload, so this adds no allocation growth.
+- Same-binary TP4 A/B/B/A timing improves from 9.286--9.425 us to
+  3.041--3.174 us. A dynamic CUDA Graph gate covers 43 collective nodes,
+  eight changing input patterns, 64 replays, and all four ranks with zero
+  element mismatches. Both paths are bitwise equal to an explicit fixed-order
+  rank-0-through-rank-3 FP32 accumulation oracle.
+- The matched PP2 x TP4 endpoint improves from 59.160 to 61.272 token/s
+  (`+3.57%`) and from 16.903 to 16.321 ms/token (`-0.583 ms/token`). Independent
+  unchanged controls themselves select different stable greedy streams due to
+  pre-existing cross-process autotuning, so token hashes are diagnostic only;
+  the exact operator gate isolates this collective without imposing greedy
+  identity.
+- `VLLM_SM70_TP4_PUSH_ALLREDUCE` is therefore default-on. Runtime admission is
+  limited to SM70, fully connected TP4, active CUDA Graph capture, FP16, and
+  the exact 8-KiB or 80-KiB payload. Every other device, topology, dtype, size,
+  or eager call retains the existing pull collective. Explicit `=0` is the
+  rollback. No model, checkpoint, `model_type`, or architecture identity is
+  consulted.

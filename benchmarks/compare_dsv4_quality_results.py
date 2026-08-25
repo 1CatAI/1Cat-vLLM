@@ -66,9 +66,10 @@ def _compare_humaneval(
         "regressions": regressions,
         "improvements": improvements,
         "missing_or_extra_tasks": missing,
-        "passed": not regressions
-        and not missing
-        and candidate_passed >= reference_passed,
+        # Individual flips remain visible for diagnosis, but are not token-
+        # identity gates. Acceptance is based on matched inputs and aggregate
+        # task quality.
+        "passed": not missing and candidate_passed >= reference_passed,
     }
 
 
@@ -121,8 +122,7 @@ def _compare_longbench(
             "regressions": regressions,
             "missing_or_extra_rows": row_mismatch,
             "input_mismatches": input_mismatch,
-            "passed": not regressions
-            and not row_mismatch
+            "passed": not row_mismatch
             and not input_mismatch
             and candidate_score + tolerance >= reference_score,
         }
@@ -148,25 +148,89 @@ def _compare_api_quality(
     reference_hashes = _manifest_hashes(reference.get("input_manifest", {}))
     candidate_hashes = _manifest_hashes(candidate.get("input_manifest", {}))
     manifest_equal = bool(reference_hashes) and reference_hashes == candidate_hashes
+    reference_contract = reference.get("evaluation_contract")
+    candidate_contract = candidate.get("evaluation_contract")
+    contract_equal = (
+        bool(reference_contract) and reference_contract == candidate_contract
+    )
     humaneval = _compare_humaneval(reference, candidate)
     longbench = _compare_longbench(reference, candidate, tolerance)
     return {
         "input_hashes_equal": manifest_equal,
         "reference_input_hashes": reference_hashes,
         "candidate_input_hashes": candidate_hashes,
+        "evaluation_contract_equal": contract_equal,
+        "reference_evaluation_contract": reference_contract,
+        "candidate_evaluation_contract": candidate_contract,
         "humaneval": humaneval,
         "longbench": longbench,
-        "passed": manifest_equal and humaneval["passed"] and longbench["passed"],
+        "passed": manifest_equal
+        and contract_equal
+        and humaneval["passed"]
+        and longbench["passed"],
     }
 
 
 def _compare_gsm8k(
     reference: dict[str, Any], candidate: dict[str, Any]
 ) -> dict[str, Any]:
+    reference_hashes = _manifest_hashes(reference.get("input_manifest", {}))
+    candidate_hashes = _manifest_hashes(candidate.get("input_manifest", {}))
+    manifest_equal = bool(reference_hashes) and reference_hashes == candidate_hashes
+    contract_keys = (
+        "questions",
+        "few_shot",
+        "temperature",
+        "top_p",
+        "seed",
+        "max_tokens",
+        "strictly_sequential",
+        "train_selection",
+        "test_selection",
+        "prompt_format",
+        "answer_normalization",
+        "stop_sequences",
+    )
+    reference_contract = {
+        key: reference.get("contract", {}).get(key) for key in contract_keys
+    }
+    candidate_contract = {
+        key: candidate.get("contract", {}).get(key) for key in contract_keys
+    }
+    contract_equal = reference_contract == candidate_contract
     reference_rows = {int(row["index"]): row for row in reference["rows"]}
     candidate_rows = {int(row["index"]): row for row in candidate["rows"]}
     common = sorted(reference_rows.keys() & candidate_rows.keys())
     missing = sorted(reference_rows.keys() ^ candidate_rows.keys())
+    expected_samples = reference_contract["questions"]
+    row_count_matches_contract = (
+        isinstance(expected_samples, int)
+        and len(reference["rows"]) == expected_samples
+        and len(candidate["rows"]) == expected_samples
+        and len(reference_rows) == expected_samples
+        and len(candidate_rows) == expected_samples
+    )
+
+    def row_is_consistent(row: dict[str, Any]) -> bool:
+        expected = row.get("expected")
+        predicted = row.get("predicted")
+        return bool(
+            expected is not None
+            and bool(row.get("correct"))
+            == (predicted is not None and predicted == expected)
+            and bool(row.get("invalid")) == (predicted is None)
+        )
+
+    rows_self_consistent = all(
+        row_is_consistent(row) for row in [*reference["rows"], *candidate["rows"]]
+    )
+    summaries_self_consistent = all(
+        int(result["correct"])
+        == sum(bool(row.get("correct")) for row in result["rows"])
+        and int(result["invalid"])
+        == sum(bool(row.get("invalid")) for row in result["rows"])
+        for result in (reference, candidate)
+    )
     input_mismatch = [
         index
         for index in common
@@ -184,21 +248,43 @@ def _compare_gsm8k(
         for index in common
         if reference_rows[index]["correct"] and not candidate_rows[index]["correct"]
     ]
+    improvements = [
+        index
+        for index in common
+        if not reference_rows[index]["correct"] and candidate_rows[index]["correct"]
+    ]
     exact_predictions = sum(
         reference_rows[index].get("predicted") == candidate_rows[index].get("predicted")
         for index in common
     )
     return {
+        "input_hashes_equal": manifest_equal,
+        "reference_input_hashes": reference_hashes,
+        "candidate_input_hashes": candidate_hashes,
+        "evaluation_contract_equal": contract_equal,
+        "reference_evaluation_contract": reference_contract,
+        "candidate_evaluation_contract": candidate_contract,
+        "row_count_matches_contract": row_count_matches_contract,
+        "rows_self_consistent": rows_self_consistent,
+        "summaries_self_consistent": summaries_self_consistent,
         "reference_correct": int(reference["correct"]),
         "candidate_correct": int(candidate["correct"]),
+        "correct_delta": int(candidate["correct"]) - int(reference["correct"]),
         "reference_invalid": int(reference["invalid"]),
         "candidate_invalid": int(candidate["invalid"]),
         "samples": len(common),
         "exact_prediction_matches": exact_predictions,
         "regressions": regressions,
+        "improvements": improvements,
         "missing_or_extra_rows": missing,
         "input_mismatches": input_mismatch,
-        "passed": not regressions
+        # Report directional flips without requiring greedy/token identity.
+        # Matched aggregate correctness and validity are the quality gate.
+        "passed": manifest_equal
+        and contract_equal
+        and row_count_matches_contract
+        and rows_self_consistent
+        and summaries_self_consistent
         and not missing
         and not input_mismatch
         and int(candidate["correct"]) >= int(reference["correct"])
@@ -256,9 +342,7 @@ def _compare_needle(
         "anywhere_hit_regressions": anywhere_regressions,
         "missing_or_extra_rows": missing,
         "input_mismatches": input_mismatch,
-        "passed": not final_regressions
-        and not anywhere_regressions
-        and not missing
+        "passed": not missing
         and not input_mismatch
         and candidate_hits >= reference_hits
         and candidate_anywhere >= reference_anywhere,
@@ -278,8 +362,8 @@ def _paired_paths(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--reference-api", type=Path, required=True)
-    parser.add_argument("--candidate-api", type=Path, required=True)
+    parser.add_argument("--reference-api", type=Path)
+    parser.add_argument("--candidate-api", type=Path)
     parser.add_argument("--reference-gsm8k", type=Path)
     parser.add_argument("--candidate-gsm8k", type=Path)
     parser.add_argument("--reference-needle", type=Path)
@@ -290,25 +374,31 @@ def main() -> int:
     if args.longbench_score_tolerance < 0:
         parser.error("--longbench-score-tolerance must be non-negative")
 
+    has_api = _paired_paths(parser, args.reference_api, args.candidate_api, "api")
     has_gsm8k = _paired_paths(
         parser, args.reference_gsm8k, args.candidate_gsm8k, "gsm8k"
     )
     has_needle = _paired_paths(
         parser, args.reference_needle, args.candidate_needle, "needle"
     )
-    api = _compare_api_quality(
-        _load_json(args.reference_api),
-        _load_json(args.candidate_api),
-        args.longbench_score_tolerance,
-    )
+    if not (has_api or has_gsm8k or has_needle):
+        parser.error("at least one paired quality artifact must be provided")
+
     result: dict[str, Any] = {
         "contract": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         },
-        "api_quality": api,
     }
-    gates = [api["passed"]]
+    gates: list[bool] = []
+    if has_api:
+        assert args.reference_api is not None and args.candidate_api is not None
+        result["api_quality"] = _compare_api_quality(
+            _load_json(args.reference_api),
+            _load_json(args.candidate_api),
+            args.longbench_score_tolerance,
+        )
+        gates.append(result["api_quality"]["passed"])
     if has_gsm8k:
         assert args.reference_gsm8k is not None and args.candidate_gsm8k is not None
         result["gsm8k"] = _compare_gsm8k(

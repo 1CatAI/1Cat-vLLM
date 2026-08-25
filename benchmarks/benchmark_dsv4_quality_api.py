@@ -582,6 +582,30 @@ def main() -> int:
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         },
+        "evaluation_contract": {
+            "version": "dsv4_api_quality_v1",
+            "strictly_sequential": True,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": 20260824,
+            "human_eval": {
+                "selection": "first_n",
+                "limit": args.humaneval_limit,
+                "endpoint": "chat_completions",
+                "enable_thinking": False,
+                "max_tokens": 768,
+                "execution": "landlock_seccomp_python_isolated_v1",
+            },
+            "longbench": {
+                "datasets": datasets,
+                "selection": "length_ge_8000_evenly_spaced_v1",
+                "limit_per_dataset": args.longbench_limit,
+                "max_input_tokens": args.longbench_max_input_tokens,
+                "truncation": "middle_first_half_last_half_v1",
+                "endpoint_policy": "official_no_chat_dataset_set_v1",
+                "max_output_tokens": "dataset2maxlen_sha256_manifest",
+            },
+        },
         "input_manifest": input_manifest,
         "human_eval": human_eval,
         "longbench": longbench,

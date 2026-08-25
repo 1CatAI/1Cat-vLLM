@@ -1223,6 +1223,68 @@ class GroupCoordinator:
 
         return handles
 
+    def isend_tensor_dict_static(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+        dst: int | None = None,
+    ) -> list[Handle]:
+        """Send tensors without metadata when both peers know the schema.
+
+        The receiver must provide the same ordered keys, shapes, dtypes, and
+        devices to :meth:`irecv_tensor_dict_static`. Callers must fall back to
+        :meth:`isend_tensor_dict` whenever that contract can change.
+        """
+        if self.world_size <= 1:
+            return []
+        if self.use_cpu_custom_send_recv:
+            raise RuntimeError("static tensor transfer requires a process group")
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        handles: list[Handle] = []
+        for tensor in tensor_dict.values():
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError("static tensor transfer only accepts tensors")
+            if tensor.numel() == 0:
+                continue
+            comm_group = self.cpu_group if tensor.is_cpu else self.device_group
+            handle = torch.distributed.isend(
+                tensor, dst=self.ranks[dst], group=comm_group
+            )
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            handles.append(handle)
+        return handles
+
+    def irecv_tensor_dict_static(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+        src: int | None = None,
+    ) -> list[Handle]:
+        """Receive metadata-free tensors into caller-owned buffers."""
+        if self.world_size <= 1:
+            return []
+        if self.use_cpu_custom_send_recv:
+            raise RuntimeError("static tensor transfer requires a process group")
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
+
+        handles: list[Handle] = []
+        for tensor in tensor_dict.values():
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError("static tensor transfer only accepts tensors")
+            if tensor.numel() == 0:
+                continue
+            comm_group = self.cpu_group if tensor.is_cpu else self.device_group
+            handles.append(
+                torch.distributed.irecv(tensor, src=self.ranks[src], group=comm_group)
+            )
+        return handles
+
     def recv_tensor_dict(
         self,
         src: int | None = None,

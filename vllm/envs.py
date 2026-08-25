@@ -163,6 +163,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_SAMPLER_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
@@ -182,6 +183,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
+    VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
@@ -204,7 +206,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
-    VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -1680,6 +1682,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Default-on QPN8 route for the validated serialized PP2 x TP4 contract.
+    # Admission additionally requires exact operator shapes/layouts, B1,
+    # no speculative decoding, no DBO, and no explicit ubatching. Set this to
+    # 0 (or the generic QPN8 flag to 0) to retain TurboMind everywhere.
+    "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
+    ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
     "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
@@ -1799,6 +1808,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
+    ),
+    # Skip PP metadata and TP reconstruction only for the exact, replicated
+    # SM70 B1 hidden-state schema validated by the worker on both stages.
+    "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER": lambda: bool(
+        int(os.getenv("VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER", "1"))
     ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
@@ -1938,11 +1952,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
     ),
-    # Opt-in SGLang-style push collective for the exact FP16 [8, 5120]
-    # verifier shape on fully-connected SM70 TP4. The communicator allocates
-    # dedicated two-epoch push storage only when this gate is enabled.
+    # Default-on SGLang-style push collective for the validated FP16 80-KiB
+    # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA
+    # Graphs. Other devices, topologies, sizes, and eager calls retain the
+    # ordinary pull path; explicit 0 is the rollback.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "0"))
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
