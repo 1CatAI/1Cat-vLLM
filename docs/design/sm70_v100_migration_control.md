@@ -43046,6 +43046,36 @@ Interpretation:
   The older public server's nominal cold result may have retained an identical
   prefix, so only the fresh-server numbers are treated as strict cold evidence.
 
+## 2026-08-25 Qwen3.8-27B NVFP4 DFlash2 17 ms campaign
+
+- This section is an active planning record, not evidence that a 17 ms result
+  or source optimization already exists. The document itself is safe to merge
+  while implementation and measurements remain pending.
+- The next isolated campaign starts from
+  `onecat/main@34403018d917054dd7765d5e820ad29c8d342348` and targets a stable
+  batch-one complete speculative round of at most `17.0 ms`. The frozen target
+  is the local mixed NVFP4/channel-FP8 Qwen3.8-27B checkpoint with BF16 LM
+  head, TP4 on V100 GPUs 0--3, E5M2 target KV, FP16 draft KV, seven draft
+  tokens, probabilistic sampling, and FULL target/draft CUDA Graphs.
+- The accepted PR #288 practical baseline is `18.465--18.603 ms`, so the
+  remaining measured gap is approximately `1.5--1.6 ms`. A current-source
+  no-diagnostic graph-node trace is required before choosing the next source
+  change. Historical DDTree index reuse, skipped verification, generic
+  auxiliary-stream overlap, variable K, and approximate reranking remain
+  rejected.
+- Development may use a 32K/512 minimal runtime only to localize kernels. The
+  promotion gate is the 256K/4096 configuration with prefix caching, Mamba
+  alignment, and tool/reasoning parsers enabled. Acceptance may not fall by
+  more than `0.05`; the existing scored datasets and PPL gates must not
+  regress. A separate 32K/128K/256K sweep protects long-context decay.
+- A retained speedup becomes default-on after the engine-contract admission,
+  rollback, numerical, official-sampling quality, and matched endpoint gates
+  pass. A valid reduction-order change need not be bitwise or greedy-token
+  identical, but it must remain finite, within a dtype-appropriate error
+  envelope, and non-regressing on acceptance and scored quality.
+- The full frozen contract, sequence, and pending Draft PR test record are in
+  `docs/design/sm70_dflash2_nvfp4_17ms.md`.
+
 ## 2026-08-25 Qwen3.8-27B NVFP4 long-context decode
 
 - The accepted candidate specializes only the SM70 E4M3 G6/D256 dual-CTA
