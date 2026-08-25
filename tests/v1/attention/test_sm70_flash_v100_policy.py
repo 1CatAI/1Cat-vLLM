@@ -976,9 +976,7 @@ def test_prefill_d256_gqa_architecture_oom_uses_dense_fallback(monkeypatch):
         "_get_sm70_d256_gqa_architecture_op",
         lambda: architecture_oom,
     )
-    monkeypatch.setattr(
-        flash_v100, "_warned_prefill_d256_gqa_architecture_oom", False
-    )
+    monkeypatch.setattr(flash_v100, "_warned_prefill_d256_gqa_architecture_oom", False)
 
     query = torch.zeros((1, 8000, 6, 256), dtype=torch.float16, device="cuda")
     key = torch.zeros((1, 40000, 1, 256), dtype=torch.float16, device="cuda")

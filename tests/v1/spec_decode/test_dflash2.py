@@ -48,6 +48,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+    _parse_alignment_steps,
     _supports_sparse_sampling_contract,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
@@ -260,10 +261,12 @@ def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch)
     allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", False)
+    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     assert speculator.draft_logits is allocated
     assert torch.isneginf(speculator.draft_logits).all()
     assert speculator.get_sparse_draft_logits() is None
+    assert speculator.get_selector_alignment_shadow() is None
 
 
 def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
@@ -277,6 +280,39 @@ def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
     assert candidate_ids.shape == (2, 7, 16)
     assert candidate_scores.shape == (2, 7, 16)
     assert candidate_scores.dtype is torch.float32
+
+
+def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatch):
+    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    _stub_base(monkeypatch, allocated)
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
+
+    speculator = DFlash2Speculator(None, torch.device("cpu"))
+    shadow = speculator.get_selector_alignment_shadow()
+
+    assert shadow is not None
+    candidate_ids, unary_logits, lattice_scores = shadow
+    assert candidate_ids.shape == (2, 7, 16)
+    assert unary_logits.shape == (2, 7, 16)
+    assert unary_logits.dtype is torch.float32
+    assert lattice_scores.shape == (2, 7, 16, 16)
+    assert lattice_scores.dtype is torch.float32
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("1,3-5", {1, 3, 4, 5}),
+        ("5-3", set()),
+        ("bad", set()),
+        ("-1", set()),
+    ],
+)
+def test_selector_alignment_step_filter(raw, expected):
+    assert _parse_alignment_steps(raw) == expected
 
 
 def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
