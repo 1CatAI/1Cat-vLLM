@@ -3,14 +3,19 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import DFlash2NgramAssist
+
+logger = init_logger(__name__)
 
 
 def _requires_sm70_tail(device: torch.device, num_steps: int) -> bool:
@@ -198,6 +203,64 @@ def _cache_draft_logits_kernel(
         tl.store(cached_score_ptr + cache_base + offsets, scores, mask=mask)
 
 
+@triton.jit
+def _apply_ngram_draft_kernel(
+    ngram_tokens_ptr,
+    ngram_lengths_ptr,
+    sample_req_state_ptr,
+    draft_tokens_ptr,
+    draft_tokens_stride,
+    cached_candidate_ptr,
+    cached_score_ptr,
+    cache_stride_0,
+    cache_stride_1,
+    draft_logits_ptr,
+    draft_logits_stride_0,
+    draft_logits_stride_1,
+    num_steps: tl.constexpr,
+    top_k: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    CACHE_DRAFT_LOGITS: tl.constexpr,
+    CACHE_SCORES: tl.constexpr,
+):
+    flat = tl.program_id(0)
+    batch_idx = flat // num_steps
+    step = flat % num_steps
+    req_state = tl.load(sample_req_state_ptr + flat)
+    valid = (req_state >= 0) & (tl.load(ngram_lengths_ptr + batch_idx) == num_steps)
+    token = tl.load(ngram_tokens_ptr + flat, mask=valid, other=0).to(tl.int64)
+    tl.store(
+        draft_tokens_ptr + batch_idx * draft_tokens_stride + step,
+        token,
+        mask=valid,
+    )
+
+    if CACHE_DRAFT_LOGITS:
+        offsets = tl.arange(0, BLOCK_K)
+        topk_mask = valid & (offsets < top_k)
+        cache_base = (
+            cached_candidate_ptr + req_state * cache_stride_0 + step * cache_stride_1
+        )
+        old_ids = tl.load(cache_base + offsets, mask=topk_mask, other=0)
+        logits_base = (
+            draft_logits_ptr
+            + req_state * draft_logits_stride_0
+            + step * draft_logits_stride_1
+        )
+        tl.store(logits_base + old_ids, -float("inf"), mask=topk_mask)
+
+        is_proposal = offsets == 0
+        new_ids = tl.where(is_proposal, token, 0)
+        new_scores = tl.where(is_proposal, 0.0, -float("inf"))
+        tl.store(cache_base + offsets, new_ids, mask=topk_mask)
+        if CACHE_SCORES:
+            score_base = (
+                cached_score_ptr + req_state * cache_stride_0 + step * cache_stride_1
+            )
+            tl.store(score_base + offsets, new_scores, mask=topk_mask)
+        tl.store(logits_base + token, 0.0, mask=valid)
+
+
 class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
 
@@ -256,6 +319,60 @@ class DFlash2Speculator(DFlashSpeculator):
             # The cache kernel writes only K columns; all other vocabulary
             # columns must remain impossible.
             self.draft_logits.fill_(-float("inf"))
+
+        self._ngram_assist: DFlash2NgramAssist | None = None
+        self._ngram_num_hits = 0
+        self._ngram_rounds = 0
+        self._ngram_skipped_rounds = 0
+        speculative_config = getattr(self, "speculative_config", None)
+        if speculative_config is not None and getattr(
+            speculative_config, "ngram_assist", False
+        ):
+            min_ngram = speculative_config.prompt_lookup_min
+            max_ngram = speculative_config.prompt_lookup_max
+            assert min_ngram is not None and max_ngram is not None
+            self._ngram_assist = DFlash2NgramAssist(
+                min_ngram=min_ngram,
+                max_ngram=max_ngram,
+                num_draft_tokens=self.num_speculative_steps,
+                max_model_len=self.max_model_len,
+            )
+            self._ngram_tokens_cpu_tensor = torch.zeros(
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._ngram_lengths_cpu_tensor = torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._ngram_tokens_cpu = self._ngram_tokens_cpu_tensor.numpy()
+            self._ngram_lengths_cpu = self._ngram_lengths_cpu_tensor.numpy()
+            self._ngram_tokens = torch.zeros(
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                dtype=torch.int64,
+                device=device,
+            )
+            self._ngram_lengths = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=device
+            )
+            logger.info(
+                "Enabled DFlash2 ngram assist with prompt lookup [%d, %d] "
+                "and draft width %d.",
+                min_ngram,
+                max_ngram,
+                self.num_speculative_steps,
+            )
+
+    @property
+    def requires_host_token_state(self) -> bool:
+        """Whether the runner must expose async samples and request history."""
+        return self._ngram_assist is not None
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # The selector walk and rejection sampler must consume identical scores.
@@ -357,6 +474,106 @@ class DFlash2Speculator(DFlashSpeculator):
             self._alignment_candidate_ids,
             self._alignment_unary_logits,
             self._alignment_lattice_scores,
+        )
+
+    def _prepare_ngram_assist(
+        self,
+        input_batch,
+        output_copy_event: torch.cuda.Event | None,
+        sampled_token_ids_cpu: np.ndarray | None,
+        num_sampled_tokens_cpu: np.ndarray | None,
+        all_token_ids_cpu: np.ndarray | None,
+    ) -> bool:
+        assist = self._ngram_assist
+        self._ngram_num_hits = 0
+        if (
+            assist is None
+            or input_batch.has_structured_output_reqs
+            or output_copy_event is None
+            or sampled_token_ids_cpu is None
+            or num_sampled_tokens_cpu is None
+            or all_token_ids_cpu is None
+        ):
+            return False
+
+        # The copy stream only depends on target sampling. The main stream can
+        # materialize DFlash context K/V while the host waits here, so lookup
+        # does not serialize the context projection.
+        output_copy_event.synchronize()
+        num_reqs = input_batch.num_reqs
+        num_draft_tokens = input_batch.num_draft_tokens_per_req
+        if num_draft_tokens is None:
+            num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
+        prior_lengths = (
+            input_batch.seq_lens_cpu_upper_bound[:num_reqs].numpy() - num_draft_tokens
+        )
+        eligible = (~input_batch.is_prefilling_np[:num_reqs]) & (
+            num_sampled_tokens_cpu[:num_reqs] > 0
+        )
+        full_hits = assist.propose(
+            all_token_ids_cpu,
+            input_batch.idx_mapping_np,
+            prior_lengths,
+            sampled_token_ids_cpu,
+            num_sampled_tokens_cpu,
+            eligible,
+            self._ngram_tokens_cpu,
+            self._ngram_lengths_cpu,
+        )
+        self._ngram_rounds += 1
+        skip_query = num_reqs > 0 and full_hits == num_reqs
+        self._ngram_num_hits = full_hits if skip_query else 0
+        if skip_query:
+            self._ngram_tokens[:num_reqs].copy_(
+                self._ngram_tokens_cpu_tensor[:num_reqs], non_blocking=True
+            )
+            self._ngram_lengths[:num_reqs].copy_(
+                self._ngram_lengths_cpu_tensor[:num_reqs], non_blocking=True
+            )
+
+        self._ngram_skipped_rounds += int(skip_query)
+        if (
+            envs.VLLM_DFLASH_PROFILE
+            and self._ngram_rounds % envs.VLLM_DFLASH_PROFILE_LOG_INTERVAL == 0
+        ):
+            eligible_count = max(assist.num_eligible, 1)
+            logger.info(
+                "DFLASH2_NGRAM_PROFILE rounds=%d eligible=%d full_hits=%d "
+                "hit_rate=%.4f skipped_query_rounds=%d lookup_avg_ms=%.4f",
+                self._ngram_rounds,
+                assist.num_eligible,
+                assist.num_full_hits,
+                assist.num_full_hits / eligible_count,
+                self._ngram_skipped_rounds,
+                assist.lookup_seconds * 1000.0 / self._ngram_rounds,
+            )
+        return skip_query
+
+    def _apply_ngram_assist(self, num_reqs: int) -> None:
+        if self._ngram_assist is None or self._ngram_num_hits == 0:
+            return
+        draft_logits = self.draft_logits
+        cached_scores = self._cached_candidate_scores
+        block_k = triton.next_power_of_2(self.selector_top_k)
+        _apply_ngram_draft_kernel[(num_reqs * self.num_speculative_steps,)](
+            self._ngram_tokens,
+            self._ngram_lengths,
+            self.sample_idx_mapping,
+            self.draft_tokens,
+            self.draft_tokens.stride(0),
+            self._cached_candidate_ids,
+            self._selector_scores if cached_scores is None else cached_scores,
+            self._cached_candidate_ids.stride(0),
+            self._cached_candidate_ids.stride(1),
+            self._selector_scores if draft_logits is None else draft_logits,
+            0 if draft_logits is None else draft_logits.stride(0),
+            0 if draft_logits is None else draft_logits.stride(1),
+            num_steps=self.num_speculative_steps,
+            top_k=self.selector_top_k,
+            BLOCK_K=block_k,
+            CACHE_DRAFT_LOGITS=draft_logits is not None,
+            CACHE_SCORES=cached_scores is not None,
+            num_warps=1,
         )
 
     def _generate_draft(

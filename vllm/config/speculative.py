@@ -158,6 +158,11 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
+    ngram_assist: bool = False
+    """Try prompt-ngram lookup before DFlash2 draft generation. Full-width
+    ngram hits skip the DFlash2 query and selector while preserving its
+    context-KV state. Only valid with ``method='dflash'`` and a DFlash2
+    selector capability."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -665,6 +670,22 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
+        if self.ngram_assist:
+            if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
+                self.prompt_lookup_min = 5
+                self.prompt_lookup_max = 5
+            elif self.prompt_lookup_min is None:
+                self.prompt_lookup_min = self.prompt_lookup_max
+            elif self.prompt_lookup_max is None:
+                self.prompt_lookup_max = self.prompt_lookup_min
+            assert self.prompt_lookup_min is not None
+            assert self.prompt_lookup_max is not None
+            if self.prompt_lookup_min > self.prompt_lookup_max:
+                raise ValueError(
+                    f"prompt_lookup_min={self.prompt_lookup_min} must "
+                    f"be <= prompt_lookup_max={self.prompt_lookup_max}"
+                )
+
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
@@ -741,8 +762,9 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
 
         else:
-            self.prompt_lookup_max = 0
-            self.prompt_lookup_min = 0
+            if not self.ngram_assist:
+                self.prompt_lookup_max = 0
+                self.prompt_lookup_min = 0
 
             if self.model is not None:
                 self.draft_model_config = ModelConfig(
@@ -1163,6 +1185,13 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+        if self.ngram_assist:
+            if not self.use_dflash():
+                raise ValueError("ngram_assist is only supported with method='dflash'.")
+            draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
+            dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+            if int(dflash_config.get("selector_top_k", 0) or 0) <= 0:
+                raise ValueError("ngram_assist requires DFlash2 selector capability.")
         if self.use_dflash_ddtree():
             if self.ddtree_budget is None:
                 self.ddtree_budget = self.num_speculative_tokens

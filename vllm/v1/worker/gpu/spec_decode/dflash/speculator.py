@@ -325,6 +325,20 @@ class DFlashSpeculator(DraftModelSpeculator):
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
+    def _prepare_ngram_assist(
+        self,
+        input_batch: InputBatch,
+        output_copy_event: torch.cuda.Event | None,
+        sampled_token_ids_cpu: np.ndarray | None,
+        num_sampled_tokens_cpu: np.ndarray | None,
+        all_token_ids_cpu: np.ndarray | None,
+    ) -> bool:
+        """Prepare an optional draftless proposal; return whether it is complete."""
+        return False
+
+    def _apply_ngram_assist(self, num_reqs: int) -> None:
+        """Override model proposals for ngram-hit rows, if configured."""
+
     @torch.inference_mode()
     def propose(
         self,
@@ -352,6 +366,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        output_copy_event: torch.cuda.Event | None = None,
+        sampled_token_ids_cpu: np.ndarray | None = None,
+        num_sampled_tokens_cpu: np.ndarray | None = None,
+        all_token_ids_cpu: np.ndarray | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -467,6 +485,16 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._context_only_prefill_logged = True
             return self.draft_tokens[:num_reqs]
 
+        if self._prepare_ngram_assist(
+            input_batch,
+            output_copy_event,
+            sampled_token_ids_cpu,
+            num_sampled_tokens_cpu,
+            all_token_ids_cpu,
+        ):
+            self._apply_ngram_assist(num_reqs)
+            return self.draft_tokens[:num_reqs]
+
         with record_function_or_nullcontext("dflash: query and selector"):
             # Every DFlash step has exactly num_query_per_req tokens, so we can
             # use FULL CUDA graphs.
@@ -510,6 +538,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+
+        self._apply_ngram_assist(num_reqs)
 
         return self.draft_tokens[:num_reqs]
 

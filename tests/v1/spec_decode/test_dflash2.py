@@ -1008,6 +1008,9 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._layer_group_idx = None
     speculator._context_only_prefill_logged = False
+    speculator._prepare_ngram_assist = Mock(
+        side_effect=AssertionError("ngram lookup must not run mid-prefill")
+    )
     speculator.model = SimpleNamespace(
         precompute_and_store_context_kv=Mock(),
     )
