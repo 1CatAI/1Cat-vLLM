@@ -132,23 +132,24 @@ _SM70_FP8_QPN8_EXTRA_SHAPES = {
     "qkv_proj": (5120, 3584),
 }
 _SM70_FP8_QPN8_PP2_TP4_CONFIGS = {
-    # Measured B1 winners: (K, N, fused gated-SiLU) maps to
-    # (split-K, accumulator chains, prefetch codes).
-    (4096, 1536, False): (32, 2, False),
-    (1024, 8192, False): (8, 2, False),
-    (2048, 4096, False): (16, 2, False),
-    (4096, 1024, False): (32, 2, False),
-    (4096, 1024, True): (16, 2, False),
-    (512, 4096, False): (16, 2, False),
+    # Accuracy-first real-weight schedules: (K, N, fused gated-SiLU) maps to
+    # (split-K, accumulator chains, prefetch codes). The shared-expert gate/up
+    # projection is deliberately absent after its four-pattern comparison
+    # matched only 53.5--60.9% of TurboMind FP16 elements.
+    (4096, 1536, False): (16, 1, True),
+    (1024, 8192, False): (4, 1, False),
+    (2048, 4096, False): (8, 2, False),
+    (4096, 1024, False): (16, 1, True),
+    (512, 4096, False): (4, 1, False),
 }
 _SM70_FP8_QPN8_PP2_TP4_SHAPES = {
-    # Operator role: accepted (layer TP size, K, N) tuples. The replicated
-    # indexer wq_b is deliberately excluded by TP size: its long-prefill work
-    # may overlap the main wq_b and cannot share one dense fallback workspace.
+    # Operator role: accepted (layer TP size, K, N) tuples. The shared-expert
+    # gate/up projection is excluded by numerical evidence. The replicated
+    # indexer wq_b is excluded by TP size: its long-prefill work may overlap
+    # the main wq_b and cannot share one dense fallback workspace.
     "fused_wqa_wkv": {(1, 4096, 1536)},
     "wq_b": {(4, 1024, 8192)},
     "wo_b": {(4, 2048, 4096)},
-    "gate_up_proj": {(4, 4096, 1024)},
     "down_proj": {(4, 512, 4096)},
 }
 _SM70_FP8_QPN8_PP2_TP4_WORKSPACE_ELEMENTS = max(
