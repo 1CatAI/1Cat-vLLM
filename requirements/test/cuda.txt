@@ -616,7 +616,7 @@ perceptron==0.1.4
     # via -r requirements/test/cuda.in
 perf-analyzer==0.1.0
     # via genai-perf
-pillow==10.4.0
+pillow==12.3.0
     # via
     #   genai-perf
     #   imagehash
