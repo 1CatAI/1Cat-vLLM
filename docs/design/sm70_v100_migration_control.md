@@ -43169,6 +43169,52 @@ Interpretation:
   envelope, and non-regressing on acceptance and scored quality.
 - The full frozen contract, sequence, and pending Draft PR test record are in
   `docs/design/sm70_dflash2_nvfp4_17ms.md`.
+- The acceptance audit found a runtime/source mismatch rather than an NVFP4
+  regression. Current FP8 and NVFP4 request-mean acceptance values are
+  `4.49887` and `4.53642` (request-mean completion tokens per round are
+  `4.49761` and `4.53214`), but both runs loaded stale stable-ABI RMSNorm SHA
+  `fe986a...9ba8c`. Its
+  batched-weight suite fails 10/13 cases and reproduces the old row-zero
+  DFlash K-norm defect; repaired SHA `7689e5...d449` passes 13/13. Target
+  QPN2/QPN8 and sparse-rejection ablations do not recover acceptance.
+- DFlash now performs a one-time nonzero bitwise capability check before using
+  grouped per-layer K normalization. A stale binary is made correctness-safe
+  through an explicit per-layer fallback and warning. The two new behavior
+  tests and the full CPU DFlash2 suite pass (`70 passed, 12 skipped`). The
+  draft-MLP QPN8 experiment is removed after exceeding the `-0.05` paired
+  acceptance gate.
+- The repaired-binary FP8 formal rerun closes at request/pooled acceptance
+  `5.37699/4.62217`, 61/64 GSM8K, and stable SHA `7689e5...d449`. Relative to
+  the repaired August 22 formal baseline, paired request delta is `-0.01180`
+  with bootstrap 95% interval `[-0.08421,0.06282]`; every pooled position is
+  higher. Relative to the stale current-source run, repair adds `0.87812`
+  request-mean tokens with 95% interval `[0.75099,1.00344]`. The concurrent
+  throughput is excluded from standalone speed evidence.
+- The matching repaired NVFP4 formal run closes at request/pooled acceptance
+  `5.39851/4.57051` and 59/64 GSM8K. Its request mean is `+0.02152` versus
+  current repaired FP8 (paired 95% interval `[-0.10021,0.14795]`), while its
+  longer 35,366-token trajectory explains the lower pooled value. Repair adds
+  `0.86209` over stale NVFP4 with interval `[0.74547,0.98007]` and improves 62
+  of 64 rows. Its GSM8K pass/fail set is exactly the same as the repaired
+  August 22 FP8 reference (59 pass, 5 fail).
+- The repaired 16K executable MBPP-32 pair passes the quality gate. Dataset
+  tests are no-DFlash `31/32` versus DFlash2 `32/32`; EvalPlus base is
+  `30/31` versus `31/31`, and plus is `27/31` versus `27/31`. The plus
+  discordance is one win per route with exact McNemar `p=1.0`; both runs stop
+  naturally on 31 rows and hit the 16K limit on one. A scorer extraction bug
+  that preferred reasoning-era example fences over valid unfenced final code
+  caused the initial DFlash syntax false negative. Final-answer-first
+  extraction is regression-checked, and both sides use the corrected scorer.
+- The selector-QPN8 candidate passes acceptance but not yet performance
+  promotion. Dense-to-QPN8 request/pooled acceptance is
+  `5.39851/4.57051 -> 5.43951/4.58679`; the paired request delta is
+  `+0.04101` with 95% interval `[-0.02309,0.10669]`, and GSM8K is
+  `59/64 -> 60/64`. A cross-physical-group run shows directional complete
+  round `19.083 -> 18.077 ms`, aggregate `218.58 -> 229.41 token/s`, and
+  steady decode `282.68 -> 300.12 token/s`, but it is not accepted as a speed
+  pair. The prepared rerank layout reduces available KV capacity from 529,616
+  to 459,817 tokens. An unrelated eight-GPU job blocked the same-group repeat,
+  so the route remains opt-in and default-off.
 
 ## 2026-08-25 Qwen3.8-27B NVFP4 long-context decode
 
