@@ -539,6 +539,14 @@ See [this page](generative_models.md) for more information on how to use generat
 
 These models primarily accept the [`LLM.generate`](./generative_models.md#llmgenerate) API. Chat/Instruct models additionally support the [`LLM.chat`](./generative_models.md#llmchat) API.
 
+!!! note "DeepSeek-OCR image resolution"
+    `DeepseekOCRForCausalLM` accepts explicit `mm_processor_kwargs` with
+    `image_mode` set to `tiny`, `small`, `base`, `large`, or `gundam`.
+    `min_crops` and `max_crops` may also be set with
+    `1 <= min_crops <= max_crops <= 9`. The default remains the existing
+    `gundam` processing contract; no mode is selected from a model or
+    checkpoint identity at runtime.
+
 | Architecture | Models | Inputs | Example HF Models | [LoRA](../features/lora.md) | [PP](../serving/parallelism_scaling.md) |
 | ------------ | ------ | ------ | ----------------- | -------------------- | ------------------------- |
 | `AriaForConditionalGeneration` | Aria | T + I<sup>+</sup> | `rhymes-ai/Aria` | | |
