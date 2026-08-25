@@ -74,13 +74,24 @@ def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
         "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS",
         "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION",
         "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
-        "VLLM_SM70_TP4_PUSH_ALLREDUCE",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
     envs.disable_envs_cache()
     try:
         assert not any(getattr(envs, name) for name in names)
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_sm70_tp4_push_allreduce_is_default_on_with_rollback(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+        monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
     finally:
         envs.disable_envs_cache()
 

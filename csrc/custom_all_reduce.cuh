@@ -69,12 +69,20 @@ constexpr uint16_t kSm70Tp4PushAllreduceSentinel = 0x7f7f;
 constexpr int kSm70Tp4PushAllreduceSentinelByte = 0x7f;
 constexpr size_t kSm70Tp4PushAllreduceBytes =
     8 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
     ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
     kSm70Tp4PushAllreduceSignalBytes + kSm70Tp4PushAllreduceEpochs *
                                            kSm70Tp4PushAllreduceWorldSize *
                                            kSm70Tp4PushAllreduceBytes;
+
+inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
+  if (bytes == kSm70Tp4PushAllreduceBytes) {
+    return kSm70Tp4PushAllreduceBlocks;
+  }
+  return bytes == kSm70Tp4PushAllreduce8KiBBytes ? 4 : 0;
+}
 
 inline int sm70_gemma_rms_norm_threads() {
   const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
@@ -1519,18 +1527,20 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
-      // The push protocol amortizes its peer polling across the verifier's
-      // captured 128-call chain. A lone eager call is materially faster on
-      // the ordinary registered-buffer pull path.
+      // The push protocol amortizes peer polling across captured collective
+      // chains. A lone eager call stays on the ordinary registered-buffer
+      // pull path.
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          bytes == kSm70Tp4PushAllreduceBytes &&
           custom_allreduce_current_device_is_sm70()) {
-        sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
-            <<<kSm70Tp4PushAllreduceBlocks, kSm70Tp4PushAllreduceThreads, 0,
-               stream>>>(sm70_tp4_push_buffers_, input, output, rank_, size);
-        return;
+        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
+        if (push_blocks > 0) {
+          sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
+              <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
+                  sm70_tp4_push_buffers_, input, output, rank_, size);
+          return;
+        }
       }
       if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
                                                   fully_connected_) &&

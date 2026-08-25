@@ -43405,3 +43405,27 @@ Interpretation:
   contract, validate artifact self-consistency, and gate aggregate HumanEval,
   LongBench, GSM8K, and needle-retrieval quality. They report directional
   sample flips but do not treat greedy identity as task quality.
+
+## 2026-08-26 PR #299 8-KiB TP4 push all-reduce acceptance
+
+- The existing two-epoch SM70 TP4 push collective now also admits the exact
+  8-KiB FP16 decode payload. Four CTAs cover its 512 packed 16-byte elements;
+  the existing 80-KiB verifier payload retains its 80-CTA launch. Buffer
+  sizing already uses the larger payload, so this adds no allocation growth.
+- Same-binary TP4 A/B/B/A timing improves from 9.286--9.425 us to
+  3.041--3.174 us. A dynamic CUDA Graph gate covers 43 collective nodes,
+  eight changing input patterns, 64 replays, and all four ranks with zero
+  element mismatches. Both paths are bitwise equal to an explicit fixed-order
+  rank-0-through-rank-3 FP32 accumulation oracle.
+- The matched PP2 x TP4 endpoint improves from 59.160 to 61.272 token/s
+  (`+3.57%`) and from 16.903 to 16.321 ms/token (`-0.583 ms/token`). Independent
+  unchanged controls themselves select different stable greedy streams due to
+  pre-existing cross-process autotuning, so token hashes are diagnostic only;
+  the exact operator gate isolates this collective without imposing greedy
+  identity.
+- `VLLM_SM70_TP4_PUSH_ALLREDUCE` is therefore default-on. Runtime admission is
+  limited to SM70, fully connected TP4, active CUDA Graph capture, FP16, and
+  the exact 8-KiB or 80-KiB payload. Every other device, topology, dtype, size,
+  or eager call retains the existing pull collective. Explicit `=0` is the
+  rollback. No model, checkpoint, `model_type`, or architecture identity is
+  consulted.
