@@ -43411,8 +43411,10 @@ Interpretation:
   `8x128x64`, split-K 7 schedule. An environment-injected selector screen and
   a source-built rerun both pass eager and changing-input CUDA Graph checks for
   exact-small, random-small, and model-like inputs with zero mismatches. The
-  final-source extension SHA256 is
+  measured source-built extension SHA256 is
   `133724eb67e70e3b4ff098c5f32c00e3155cd7c5e8f7aeb6dff84934ac294e9e`.
+  The merge audit changes the absent-environment default to the measured
+  explicit `=1` behavior; it does not change the selected tactic or kernel.
   Median isolated graph time changes from `74.943` to `22.450 us` per layer,
   projecting `2.257 ms/token` of service reduction before model overlap.
   Independently tuned flat/grouped schedules differ by up to one FP16 ULP and
