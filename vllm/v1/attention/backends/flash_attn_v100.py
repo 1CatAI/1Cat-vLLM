@@ -502,6 +502,8 @@ _flash_attn_prefill_paged_bfla = None
 _flash_attn_prefill_paged_splitkv = None
 _sm70_splitd_d256_ops = None
 _sm70_splitd_d256_ops_checked = False
+_sm70_d256_gqa_architecture_op = None
+_sm70_d256_gqa_architecture_op_checked = False
 _sm70_fa2_cu_seqlens_cache: dict[
     tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
@@ -515,6 +517,7 @@ _warned_decode_fallback = False
 _warned_decode_strict_fallback = False
 _warned_prefill_gather_oom = False
 _warned_prefill_dense_splitkv3_oom = False
+_warned_prefill_d256_gqa_architecture_oom = False
 _logged_prefill_flash = False
 _logged_prefill_prefix_flash = False
 _logged_prefill_prefix_contig_dense = False
@@ -527,6 +530,7 @@ _logged_prefill_smallq_grouped_verify = False
 _logged_prefill_smallq_grouped_verify_gate = False
 _logged_prefill_fa2_d256 = False
 _logged_prefill_dense_splitkv3 = False
+_logged_prefill_d256_gqa_architecture = False
 _logged_prefill_triton_safe = False
 _logged_decode_flash = False
 _logged_decode_dense_reference = False
@@ -1295,6 +1299,35 @@ def _get_sm70_splitd_d256_ops():
     return _sm70_splitd_d256_ops
 
 
+def _get_sm70_d256_gqa_architecture_op():
+    """Load the optional SM70 GQA long-prefill architecture operator."""
+    global _sm70_d256_gqa_architecture_op
+    global _sm70_d256_gqa_architecture_op_checked
+    if _sm70_d256_gqa_architecture_op_checked:
+        return _sm70_d256_gqa_architecture_op
+
+    _sm70_d256_gqa_architecture_op_checked = True
+    try:
+        # Importing the interface loads the vendored FA2 torch library.
+        from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+
+        _sm70_d256_gqa_architecture_op = getattr(
+            torch.ops._vllm_fa2_C,
+            "sm70_d256_gqa_architecture_fwd",
+            None,
+        )
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        _sm70_d256_gqa_architecture_op = None
+        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL:
+            logger.warning_once(
+                "SM70 D256 GQA architecture operator is unavailable "
+                "(%s: %s); using the exact dense prefill kernel.",
+                type(exc).__name__,
+                exc,
+            )
+    return _sm70_d256_gqa_architecture_op
+
+
 def _uniform_cu_seqlens(
     tensor: torch.Tensor,
     *,
@@ -1408,6 +1441,42 @@ def _should_use_prefill_dense_splitkv3(
     )
 
 
+def _should_use_prefill_d256_gqa_architecture(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    architecture_op: Callable[..., torch.Tensor] | None,
+) -> bool:
+    """Gate the measured Q8000/KV40K..128K/Hq6/Hkv1/D256 family."""
+    return (
+        envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+        and architecture_op is not None
+        and query.shape == (1, 8000, 6, 256)
+        and key.ndim == 4
+        and key.shape[0] == 1
+        and key.shape[2:] == (1, 256)
+        and value.shape == key.shape
+        and max_seqlen_q == 8000
+        and max_seqlen_k == key.shape[1]
+        and 40000 <= max_seqlen_k <= 128000
+        and max_seqlen_k % 8000 == 0
+        and query.dtype == torch.float16
+        and key.dtype == query.dtype
+        and value.dtype == query.dtype
+        and query.device == key.device
+        and query.device == value.device
+        and query.is_contiguous()
+        and key.is_contiguous()
+        and value.is_contiguous()
+        and abs(softmax_scale - 0.0625) <= 1.0e-8
+        and not _is_cuda_graph_capturing(query)
+    )
+
+
 def _try_sm70_fa2_d256_prefill(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1424,6 +1493,9 @@ def _try_sm70_fa2_d256_prefill(
     seqused_k: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
+    global _logged_prefill_d256_gqa_architecture
+    global _warned_prefill_d256_gqa_architecture_oom
+
     int32_max = torch.iinfo(torch.int32).max
     if not envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
         return None
@@ -1524,7 +1596,47 @@ def _try_sm70_fa2_d256_prefill(
             )
             if splitd_eligible:
                 splitd_out = out if out is not None else torch.empty_like(query)
-                if _should_use_prefill_dense_splitkv3(
+                architecture_op = (
+                    _get_sm70_d256_gqa_architecture_op()
+                    if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+                    else None
+                )
+                if _should_use_prefill_d256_gqa_architecture(
+                    query,
+                    key,
+                    value,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    architecture_op=architecture_op,
+                ):
+                    assert architecture_op is not None
+                    try:
+                        splitd_result = architecture_op(
+                            query,
+                            key,
+                            value,
+                            splitd_out,
+                            softmax_scale,
+                            True,
+                        )
+                    except torch.OutOfMemoryError:
+                        if not _warned_prefill_d256_gqa_architecture_oom:
+                            logger.warning(
+                                "Insufficient memory for the default-on "
+                                "SM70 D256 GQA long-prefill architecture; "
+                                "falling back to the exact dense kernel."
+                            )
+                            _warned_prefill_d256_gqa_architecture_oom = True
+                    if splitd_result is not None:
+                        if not _logged_prefill_d256_gqa_architecture:
+                            logger.info(
+                                "FLASH_ATTN_V100 SM70 D256 GQA "
+                                "8K-by-40K..128K architecture route active."
+                            )
+                            _logged_prefill_d256_gqa_architecture = True
+                        _record_route("prefill_dense_d256_gqa_arch_long")
+                if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
                     max_seqlen_q=max_seqlen_q,

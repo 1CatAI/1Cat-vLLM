@@ -1420,6 +1420,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            requires_host_token_state = bool(
+                getattr(self.speculator, "requires_host_token_state", False)
+            )
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -1441,6 +1444,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                output_copy_event=(
+                    async_output.copy_event if requires_host_token_state else None
+                ),
+                sampled_token_ids_cpu=(
+                    async_output.sampled_token_ids
+                    if requires_host_token_state
+                    else None
+                ),
+                num_sampled_tokens_cpu=(
+                    async_output.num_sampled_tokens_np
+                    if requires_host_token_state
+                    else None
+                ),
+                all_token_ids_cpu=(
+                    self.req_states.all_token_ids.get_cpu_view().numpy()
+                    if requires_host_token_state
+                    else None
+                ),
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)

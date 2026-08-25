@@ -61,7 +61,30 @@ class UVAOffloader(BaseOffloader):
             )
         return modules
 
-    def _maybe_offload_to_cpu(self, module: nn.Module) -> nn.Module:
+    def wrap_module(
+        self, module: nn.Module, *, parameter_prefix: str = ""
+    ) -> nn.Module:
+        """Apply UVA offloading to one component with its qualified prefix."""
+        previous_offload_bytes = self.cpu_offload_bytes
+        module = self._maybe_offload_to_cpu(module, parameter_prefix=parameter_prefix)
+        if self.cpu_offload_bytes > previous_offload_bytes:
+            logger.info(
+                "Total CPU offloaded parameters: %s",
+                format_gib(self.cpu_offload_bytes),
+            )
+        return module
+
+    def _is_parameter_selected(self, name: str, parameter_prefix: str = "") -> bool:
+        if not self.cpu_offload_params:
+            return True
+        qualified_name = f"{parameter_prefix}.{name}" if parameter_prefix else name
+        return any(
+            f".{param}." in f".{qualified_name}." for param in self.cpu_offload_params
+        )
+
+    def _maybe_offload_to_cpu(
+        self, module: nn.Module, *, parameter_prefix: str = ""
+    ) -> nn.Module:
         """Offload module parameters to CPU using UVA if budget allows."""
         if (params := next(module.parameters(), None)) is None:
             return module
@@ -83,16 +106,17 @@ class UVAOffloader(BaseOffloader):
                 # one module might have some parameters offloaded and some not
                 break
 
-            if self.cpu_offload_params:
-                # Check if parameter belongs to the offloading set
-                # Add dots here to ensure we match full segments only
-                # e.g., "experts.w2_weight" matches "mlp.experts.w2_weight"
-                # but not "mlp.experts.w2_weight_scale"
-                should_offload = any(
-                    f".{param}." in f".{name}." for param in self.cpu_offload_params
-                )
-                if not should_offload:
-                    continue
+            # Add dots to require exact path-segment matches. A qualified
+            # prefix lets selectors such as ``visual`` target an entire tower
+            # even though ``module.named_parameters()`` returns relative names.
+            if not self._is_parameter_selected(name, parameter_prefix):
+                continue
+
+            # A component may contain layers already visited by make_layers().
+            # Do not copy or account for the same UVA parameter twice when the
+            # enclosing component is registered afterwards.
+            if getattr(p, "_vllm_is_uva_offloaded", False):
+                continue
 
             cpu_data = p.data.to(device="cpu")
             if self.pin_memory:

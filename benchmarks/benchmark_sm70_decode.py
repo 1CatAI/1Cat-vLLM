@@ -30,7 +30,13 @@ def _module_file(module_name: str) -> str | None:
     module = sys.modules.get(module_name)
     if module is not None:
         return getattr(module, "__file__", None)
-    spec = importlib.util.find_spec(module_name)
+    try:
+        spec = importlib.util.find_spec(module_name)
+    except (AttributeError, ImportError, ValueError):
+        # Optional extension parents can raise while find_spec imports them.
+        # Diagnostics must report an unavailable extension, not discard an
+        # otherwise successful benchmark at result-serialization time.
+        return None
     return spec.origin if spec is not None else None
 
 

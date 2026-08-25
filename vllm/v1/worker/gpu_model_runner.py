@@ -6465,9 +6465,14 @@ class GPUModelRunner(
                     local_len = num_tokens // tp
                     v = get_tp_group().all_gather(v[:local_len], dim=0)
 
-                self.intermediate_tensors[k][:num_tokens].copy_(
-                    v[:num_tokens], non_blocking=True
-                )
+                destination = self.intermediate_tensors[k][:num_tokens]
+                source = v[:num_tokens]
+                if (
+                    destination.data_ptr() != source.data_ptr()
+                    or destination.shape != source.shape
+                    or destination.stride() != source.stride()
+                ):
+                    destination.copy_(source, non_blocking=True)
 
         return IntermediateTensors(
             {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}

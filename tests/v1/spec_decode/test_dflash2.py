@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.logits_processor as logits_processor_module
+import vllm.model_executor.models.qwen3_dflash as dflash_model
 import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _is_dflash2_spec_config,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
     _sm70_dflash2_dense_order_topk,
     _sm70_dflash2_rerank_output_buffers,
@@ -37,6 +39,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
 )
 from vllm.model_executor.models.qwen3_dflash2 import (
+    DFlash2Qwen3ForCausalLM,
     DFlash2Qwen3Model,
     _grouped_conv,
     _score_edges,
@@ -48,6 +51,7 @@ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+    _parse_alignment_steps,
     _supports_sparse_sampling_contract,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
@@ -73,7 +77,6 @@ def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
         "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS",
         "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION",
         "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
-        "VLLM_SM70_TP4_PUSH_ALLREDUCE",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -84,11 +87,108 @@ def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_sm70_tp4_push_allreduce_is_default_on_with_rollback(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+        monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+    finally:
+        envs.disable_envs_cache()
+
+
 def _bare_dflash2_model() -> DFlash2Qwen3Model:
     model = DFlash2Qwen3Model.__new__(DFlash2Qwen3Model)
     torch.nn.Module.__init__(model)
     model.quant_config = None
     return model
+
+
+def _fake_rms_norm(
+    output: torch.Tensor,
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> None:
+    normalized = input_.float() * torch.rsqrt(
+        input_.float().pow(2).mean(dim=-1, keepdim=True) + epsilon
+    )
+    if weight.ndim == 2:
+        weight = weight.view(weight.shape[0], *([1] * (input_.ndim - 2)), -1)
+    output.copy_((normalized * weight.float()).to(output.dtype))
+
+
+def _bare_context_k_model() -> DFlashQwen3Model:
+    model = DFlashQwen3Model.__new__(DFlashQwen3Model)
+    torch.nn.Module.__init__(model)
+    model._rms_norm_eps = 1e-6
+    model._k_norm_weights = torch.tensor(
+        [
+            [1.0, 1.0, 1.0, 1.0],
+            [0.5, 1.5, 0.75, 1.25],
+            [1.5, 0.5, 1.25, 0.75],
+        ],
+        dtype=torch.float32,
+    )
+    model._batched_k_norm_runtime_verified = None
+    return model
+
+
+def test_context_k_norm_trusts_verified_batched_runtime(monkeypatch):
+    model = _bare_context_k_model()
+    all_k = torch.randn(3, 2, 1, 4)
+    calls = []
+
+    def grouped_runtime(output, input_, weight, epsilon):
+        calls.append(weight.ndim)
+        _fake_rms_norm(output, input_, weight, epsilon)
+
+    monkeypatch.setattr(dflash_model.ops, "rms_norm", grouped_runtime)
+    first = model._normalize_context_k(all_k)
+    assert model._batched_k_norm_runtime_verified is True
+    assert calls == [2, 1, 1, 1, 2]
+
+    calls.clear()
+    second = model._normalize_context_k(all_k)
+    assert calls == [2]
+    assert torch.equal(second, first)
+
+
+def test_context_k_norm_falls_back_for_stale_stable_binary(monkeypatch):
+    model = _bare_context_k_model()
+    # An all-zero profiling input would make the stale grouped output appear
+    # correct unless the capability probe uses its own nonzero fixture.
+    all_k = torch.zeros(3, 2, 1, 4)
+    calls = []
+
+    def stale_runtime(output, input_, weight, epsilon):
+        calls.append(weight.ndim)
+        # Historical stable-ABI binaries silently used row zero for a 2-D
+        # weight tensor. One-dimensional calls remained correct.
+        effective_weight = weight[0] if weight.ndim == 2 else weight
+        _fake_rms_norm(output, input_, effective_weight, epsilon)
+
+    monkeypatch.setattr(dflash_model.ops, "rms_norm", stale_runtime)
+    actual = model._normalize_context_k(all_k)
+    expected = torch.empty_like(all_k)
+    for layer_idx in range(all_k.shape[0]):
+        _fake_rms_norm(
+            expected[layer_idx],
+            all_k[layer_idx],
+            model._k_norm_weights[layer_idx],
+            model._rms_norm_eps,
+        )
+
+    assert model._batched_k_norm_runtime_verified is False
+    assert calls == [2, 1, 1, 1, 1, 1, 1]
+    assert torch.equal(actual, expected)
+
+    calls.clear()
+    repeated = model._normalize_context_k(all_k)
+    assert calls == [1, 1, 1]
+    assert torch.equal(repeated, expected)
 
 
 def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(monkeypatch):
@@ -260,10 +360,12 @@ def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch)
     allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", False)
+    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     assert speculator.draft_logits is allocated
     assert torch.isneginf(speculator.draft_logits).all()
     assert speculator.get_sparse_draft_logits() is None
+    assert speculator.get_selector_alignment_shadow() is None
 
 
 def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
@@ -277,6 +379,39 @@ def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
     assert candidate_ids.shape == (2, 7, 16)
     assert candidate_scores.shape == (2, 7, 16)
     assert candidate_scores.dtype is torch.float32
+
+
+def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatch):
+    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    _stub_base(monkeypatch, allocated)
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
+
+    speculator = DFlash2Speculator(None, torch.device("cpu"))
+    shadow = speculator.get_selector_alignment_shadow()
+
+    assert shadow is not None
+    candidate_ids, unary_logits, lattice_scores = shadow
+    assert candidate_ids.shape == (2, 7, 16)
+    assert unary_logits.shape == (2, 7, 16)
+    assert unary_logits.dtype is torch.float32
+    assert lattice_scores.shape == (2, 7, 16, 16)
+    assert lattice_scores.dtype is torch.float32
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("1,3-5", {1, 3, 4, 5}),
+        ("5-3", set()),
+        ("bad", set()),
+        ("-1", set()),
+    ],
+)
+def test_selector_alignment_step_filter(raw, expected):
+    assert _parse_alignment_steps(raw) == expected
 
 
 def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
@@ -688,6 +823,40 @@ def test_target_topk_uses_reranked_local_candidates_without_dense_logits(monkeyp
     dense_apply.assert_not_called()
 
 
+def test_draft_candidates_use_reranked_lm_head_without_dense_logits(monkeypatch):
+    dense_apply = Mock(side_effect=AssertionError("dense logits must not run"))
+    values = torch.linspace(4.0, -4.0, 16, dtype=torch.float16).reshape(1, 16)
+    ids = torch.arange(200, 216, dtype=torch.int64).reshape(1, 16)
+    candidate_path = Mock(return_value=(values, ids))
+    lm_head = SimpleNamespace(
+        quant_method=UnquantizedEmbeddingMethod(),
+        maybe_get_sm70_dflash2_top20=candidate_path,
+    )
+    lm_head.quant_method.apply = dense_apply
+    model = SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16))
+    dflash2 = SimpleNamespace(
+        lm_head=lm_head,
+        model=model,
+        output_multiplier=1.0,
+        final_logit_softcapping=None,
+    )
+    hidden_states = torch.empty((1, 8), dtype=torch.float16)
+    monkeypatch.setattr(
+        dflash2_model,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+
+    actual_ids, actual_values = DFlash2Qwen3ForCausalLM.compute_candidates(
+        dflash2, hidden_states
+    )
+
+    candidate_path.assert_called_once_with(hidden_states, 16)
+    dense_apply.assert_not_called()
+    assert torch.equal(actual_ids, ids)
+    assert torch.equal(actual_values, values.float())
+
+
 def test_lm_head_candidate_interface_falls_back_when_rerank_is_disabled(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_RERANK", False)
     layer = SimpleNamespace()
@@ -972,6 +1141,9 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._layer_group_idx = None
     speculator._context_only_prefill_logged = False
+    speculator._prepare_ngram_assist = Mock(
+        side_effect=AssertionError("ngram lookup must not run mid-prefill")
+    )
     speculator.model = SimpleNamespace(
         precompute_and_store_context_kv=Mock(),
     )
