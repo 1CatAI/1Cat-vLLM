@@ -43519,6 +43519,28 @@ Interpretation:
   contract, validate artifact self-consistency, and gate aggregate HumanEval,
   LongBench, GSM8K, and needle-retrieval quality. They report directional
   sample flips but do not treat greedy identity as task quality.
+- A post-merge real-weight accuracy audit replaces the PP2 x TP4 route's
+  fastest single-pattern schedules with four-pattern accuracy-first schedules.
+  Fused WQA/WKV, attention WQ-B/WO-B, grouped WO-A, and shared-expert down
+  retain at least `99.707%` exact FP16 elements and at most `1.444e-5`
+  relative L2 error against same-process TurboMind. Shared-expert gate/up
+  retains only `53.516%` exact elements with its fused activation and is
+  removed from the default QPN8 tensor contract; the replicated indexer WQ-B
+  remains excluded.
+- The latest-main production source gate covers M=1 and M=9, changing-input
+  CUDA Graph replay, FP32 and TurboMind references, grouped WO-A layout, and
+  both excluded roles. All five admitted projections pass, both excluded roles
+  remain on TurboMind, and the route reuses one 16-MiB workspace. Evidence is
+  under `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-source-gate-20260826-r2-main/`.
+  The isolated weighted projection is `6.067 -> 3.321 ms/token` of stage-sum
+  FP8 service; it is not an endpoint TPOT claim.
+- Withdraw the earlier causal attribution of a `63/64 -> 2/64` GSM8K result to
+  fused-WQA QPN8 alone. That recorded endpoint also pinned five static FP8
+  tactics and enabled grouped WO-A; the static-FP8-only endpoint reproduces
+  the same class of incoherent output. Those artifacts prove that the bundled
+  configuration fails, not which operator caused it. Keep the accuracy-first
+  schedule change unmerged until a clean matched pure-decode run and pinned
+  dataset gates close.
 
 ## 2026-08-26 generic multimodal-tower UVA offload
 
