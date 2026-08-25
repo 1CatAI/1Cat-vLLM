@@ -433,7 +433,7 @@ def test_mxfp4_sm70_active_expert_compaction_replays_dynamic_routes():
     )
 
 
-@pytest.mark.parametrize(("k", "n"), [(4096, 1024), (512, 4096)])
+@pytest.mark.parametrize(("k", "n"), [(4096, 512), (4096, 1024), (512, 4096)])
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires NVIDIA V100/SM70",
@@ -512,28 +512,35 @@ def test_mxfp4_sm70_tp4_compact_shapes_match_per_expert(
     torch.accelerator.synchronize()
     torch.testing.assert_close(actual, reference, rtol=0.0, atol=0.0)
 
-    if (k, n) == (4096, 1024):
+    if k == 4096:
         direct = torch.empty_like(actual)
+        legacy_direct = torch.empty_like(actual)
         direct_input = torch.empty_like(grouped_input)
         direct_offsets = torch.empty_like(offsets)
         inverse_indices = torch.empty(num_experts, dtype=torch.int32, device="cuda")
         direct_expert_ids = torch.empty_like(expert_ids)
-        torch.ops._C.mxfp4_moe_single_token_prepare_w13_sm70_out(
-            direct,
-            direct_input,
-            x,
-            expert_ids.view(1, num_experts),
-            ptrs_w,
-            ptrs_s,
-            direct_offsets,
-            inverse_indices,
-            direct_expert_ids,
-            k,
-            n,
-            group_size,
-            k,
-        )
+        for broadcast, output in ((False, legacy_direct), (True, direct)):
+            monkeypatch.setenv(
+                "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE",
+                "1" if broadcast else "0",
+            )
+            torch.ops._C.mxfp4_moe_single_token_prepare_w13_sm70_out(
+                output,
+                direct_input,
+                x,
+                expert_ids.view(1, num_experts),
+                ptrs_w,
+                ptrs_s,
+                direct_offsets,
+                inverse_indices,
+                direct_expert_ids,
+                k,
+                n,
+                group_size,
+                k,
+            )
         torch.accelerator.synchronize()
+        torch.testing.assert_close(legacy_direct, reference, rtol=0.0, atol=0.0)
         torch.testing.assert_close(direct, reference, rtol=0.0, atol=0.0)
 
 
