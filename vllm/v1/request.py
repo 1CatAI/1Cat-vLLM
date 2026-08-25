@@ -141,6 +141,11 @@ class Request:
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
+        # Tokens of steps whose output is not yet processed (async scheduling
+        # and PP run ahead of the GPU); `num_computed_tokens` counts them
+        # optimistically.
+        self.num_in_flight_tokens = 0
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt

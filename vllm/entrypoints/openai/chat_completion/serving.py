@@ -61,6 +61,12 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     get_streamable_parser_for_assistant,
     parse_chat_output,
 )
+from vllm.entrypoints.openai.serving_defaults import (
+    apply_repetition_detection_default,
+    get_model_serving_defaults,
+    merge_extra_args,
+    validate_required_logits_processors,
+)
 from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
@@ -151,6 +157,20 @@ class OpenAIServingChat(OpenAIServing):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.enable_force_include_usage = enable_force_include_usage
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+        # Per-model serving recipe (e.g. document-OCR models): fill sampling
+        # defaults the hub generation_config does not provide, and fail loudly
+        # at startup when a recipe-required logits processor is not loaded.
+        self.model_serving_defaults = get_model_serving_defaults(
+            getattr(self.model_config, "architectures", None)
+        )
+        if self.model_serving_defaults is not None:
+            for key, value in self.model_serving_defaults.sampling_defaults.items():
+                self.default_sampling_params.setdefault(key, value)
+            validate_required_logits_processors(
+                self.model_serving_defaults,
+                self.model_config.logits_processors,
+                self.model_config.model,
+            )
         mc = self.model_config
         self.override_max_tokens = (
             self.default_sampling_params.get("max_tokens")
@@ -279,6 +299,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
+        num_image_items = _count_request_image_items(request)
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
@@ -310,6 +331,32 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                if self.model_serving_defaults is not None:
+                    try:
+                        merged = merge_extra_args(
+                            self.model_serving_defaults,
+                            sampling_params.extra_args,
+                            num_image_items=num_image_items,
+                        )
+                    except ValueError as e:
+                        return self.create_error_response(str(e))
+                    sampling_params.extra_args = merged or None
+                    apply_repetition_detection_default(
+                        self.model_serving_defaults, sampling_params
+                    )
+
+                    # Multi-image sampling profile: apply only the fields the
+                    # request did not set itself (single-image defaults were
+                    # already folded into default_sampling_params at init).
+                    if num_image_items > 1:
+                        multi = (
+                            self.model_serving_defaults.sampling_defaults_multi_image
+                        )
+                        for key, value in (multi or {}).items():
+                            if getattr(request, key, None) is None and hasattr(
+                                sampling_params, key
+                            ):
+                                setattr(sampling_params, key, value)
 
             self._log_inputs(
                 sub_request_id,
@@ -1596,3 +1643,35 @@ class OpenAIServingChat(OpenAIServing):
                 )
             ]
         )
+
+
+def _count_request_image_items(request: ChatCompletionRequest) -> int:
+    """Number of image items in the request messages.
+
+    Selects the serving-defaults profile (single vs multi page); counting is
+    done on the raw messages so it is independent of prompt preprocessing.
+    """
+    count = 0
+    messages = getattr(request, "messages", None) or []
+    for message in messages:
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", None)
+        )
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            part_type = (
+                part.get("type")
+                if isinstance(part, dict)
+                else getattr(part, "type", None)
+            )
+            if part_type in (
+                "image_url",
+                "input_image",
+                "image_embeds",
+                "image_pil",
+            ):
+                count += 1
+    return count

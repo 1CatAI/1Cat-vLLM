@@ -11,18 +11,23 @@ from PIL import Image, ImageOps
 from transformers import BatchFeature, LlamaTokenizerFast
 from transformers.processing_utils import ProcessorMixin
 
-# TODO(Isotr0py): change modes for variants
-# see: https://github.com/deepseek-ai/DeepSeek-OCR/blob/8cf003d38821fa1b19c73da3bd1b0dc262ea8136/DeepSeek-OCR-master/DeepSeek-OCR-vllm/config.py#L1-L6
-# Tiny: base_size = 512, image_size = 512, crop_mode = False
-# Small: base_size = 640, image_size = 640, crop_mode = False
-# Base: base_size = 1024, image_size = 1024, crop_mode = False
-# Large: base_size = 1280, image_size = 1280, crop_mode = False
-# Gundam: base_size = 1024, image_size = 640, crop_mode = True
+# Official resolution modes, verbatim from the model's config.py:
+# https://github.com/deepseek-ai/DeepSeek-OCR/blob/8cf003d38821fa1b19c73da3bd1b0dc262ea8136/DeepSeek-OCR-master/DeepSeek-OCR-vllm/config.py#L1-L6
+# Selectable per request via the ``image_mode`` mm_processor_kwarg; the
+# default stays the Gundam configuration below (byte-compatible with the
+# previous hardcoded constants).
+RESOLUTION_MODES: dict[str, dict[str, object]] = {
+    "tiny": {"base_size": 512, "image_size": 512, "crop_mode": False},
+    "small": {"base_size": 640, "image_size": 640, "crop_mode": False},
+    "base": {"base_size": 1024, "image_size": 1024, "crop_mode": False},
+    "large": {"base_size": 1280, "image_size": 1280, "crop_mode": False},
+    "gundam": {"base_size": 1024, "image_size": 640, "crop_mode": True},
+}
+
 BASE_SIZE = 1024
 IMAGE_SIZE = 640
 CROP_MODE = True
 
-# TODO(Isotr0py): Expose as mm_kwargs
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
 
@@ -117,6 +122,53 @@ def dynamic_preprocess(
     return processed_images, target_aspect_ratio
 
 
+def count_image_tokens_for(
+    *,
+    image_width: int,
+    image_height: int,
+    base_size: int,
+    image_size: int,
+    cropping: bool,
+    min_crops: int = MIN_CROPS,
+    max_crops: int = MAX_CROPS,
+    strategy: str = "v1",
+    patch_size: int = 16,
+    downsample_ratio: int = 4,
+) -> int:
+    """Placeholder-token count mirroring ``tokenize_with_images``."""
+    if image_width <= image_size and image_height <= image_size:
+        crop_ratio = (1, 1)
+    elif cropping:
+        crop_ratio = count_tiles(
+            image_width,
+            image_height,
+            min_num=min_crops,
+            max_num=max_crops,
+            image_size=image_size,
+        )
+    else:
+        crop_ratio = (1, 1)
+    num_width_tiles, num_height_tiles = crop_ratio
+
+    num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
+    num_queries_base = math.ceil((base_size // patch_size) / downsample_ratio)
+
+    num_tokens_base = (
+        (num_queries_base * (num_queries_base + 1))
+        if strategy == "v1"
+        else num_queries_base * num_queries_base
+    )
+    total = num_tokens_base + 1
+    if num_width_tiles > 1 or num_height_tiles > 1:
+        num_tokens_per_row = (
+            num_queries * num_width_tiles + 1
+            if strategy == "v1"
+            else num_queries * num_width_tiles
+        )
+        total += num_tokens_per_row * (num_queries * num_height_tiles)
+    return total
+
+
 class ImageTransform:
     def __init__(
         self,
@@ -160,11 +212,51 @@ class DeepseekOCRProcessor(ProcessorMixin):
         ignore_id: int = -100,
         image_size: int = IMAGE_SIZE,
         base_size: int = BASE_SIZE,
+        crop_mode: bool = CROP_MODE,
+        image_mode: str | None = None,
+        min_crops: int = MIN_CROPS,
+        max_crops: int = MAX_CROPS,
+        disable_crop_for_multi_image: bool = False,
         strategy: Literal["v1", "v2"] = "v1",
         **kwargs,
     ):
+        if image_mode is not None:
+            # The named mode is authoritative over any individually passed
+            # base_size/image_size/crop_mode (the vLLM processing info always
+            # forwards the defaults, so a raise-on-conflict would never let a
+            # mode through).
+            try:
+                mode = RESOLUTION_MODES[image_mode]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown image_mode {image_mode!r}; valid modes: "
+                    f"{sorted(RESOLUTION_MODES)}"
+                ) from None
+            base_size = int(mode["base_size"])  # type: ignore[arg-type]
+            image_size = int(mode["image_size"])  # type: ignore[arg-type]
+            crop_mode = bool(mode["crop_mode"])
+        if not (
+            isinstance(min_crops, int)
+            and isinstance(max_crops, int)
+            and 1 <= min_crops <= max_crops
+        ):
+            raise ValueError(
+                f"Invalid crop bounds: min_crops={min_crops!r}, "
+                f"max_crops={max_crops!r} (need 1 <= min <= max)."
+            )
         self.image_size = image_size
         self.base_size = base_size
+        self.crop_mode = crop_mode
+        self.image_mode = image_mode
+        self.min_crops = min_crops
+        self.max_crops = max_crops
+        # Multi-image crop safeguard (derived checkpoints may raise
+        # max_crops; DeepSeek-OCR's max_crops=6 is safe for
+        # multi-image use, so this stays off by default). NOTE: when enabled,
+        # per-item processing depends on the sibling image count, so the
+        # multimodal processing cache must be disabled (the recipes already
+        # serve with mm_processor_cache_gb=0).
+        self.disable_crop_for_multi_image = disable_crop_for_multi_image
 
         # image token calculation strategy for
         # Deepseek-OCR and Deepseek-OCR-2
@@ -203,6 +295,40 @@ class DeepseekOCRProcessor(ProcessorMixin):
             **kwargs,
         )
 
+    def effective_cropping(self, num_images: int) -> bool:
+        """Whether cropping applies for a request with ``num_images`` images.
+
+        Mirrors the reference multi-image safeguard: when enabled, crop mode
+        is disabled as soon as more than one image is present.
+        """
+        if self.disable_crop_for_multi_image and num_images > 1:
+            return False
+        return self.crop_mode
+
+    def count_image_tokens(
+        self, *, image_width: int, image_height: int, num_images: int = 1
+    ) -> int:
+        """Number of <image> placeholder tokens for one image.
+
+        This mirrors ``tokenize_with_images`` exactly (same instance
+        parameters, same crop arithmetic, same multi-image safeguard) so the
+        prompt-update counting can never diverge from what processing
+        produces — a mismatch here is the "N multimodal tokens vs M
+        placeholders" crash class.
+        """
+        return count_image_tokens_for(
+            image_width=image_width,
+            image_height=image_height,
+            base_size=self.base_size,
+            image_size=self.image_size,
+            cropping=self.effective_cropping(num_images),
+            min_crops=self.min_crops,
+            max_crops=self.max_crops,
+            strategy=self.strategy,
+            patch_size=self.patch_size,
+            downsample_ratio=self.downsample_ratio,
+        )
+
     @property
     def bos_id(self):
         return self.tokenizer.bos_token_id
@@ -230,7 +356,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self,
         prompt: str,
         images: list[Image.Image],
-        crop_mode: bool = CROP_MODE,
+        crop_mode: bool | None = None,
     ):
         """
 
@@ -253,6 +379,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
         )
 
         sft_format = prompt
+        if crop_mode is None:
+            crop_mode = self.crop_mode
 
         (
             input_ids,
@@ -288,7 +416,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         *,
         prompt: str,
         images: list[Image.Image],
-        crop_mode: bool = CROP_MODE,
+        crop_mode: bool | None = None,
         **kwargs,
     ):
         prepare = self.process_one(
@@ -308,6 +436,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
         cropping: bool = True,
     ):
         """Tokenize text with <image> tags."""
+
+        if cropping and not self.effective_cropping(len(images)):
+            cropping = False
 
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
@@ -332,7 +463,10 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 crop_ratio = [1, 1]
             elif cropping:
                 images_crop_raw, crop_ratio = dynamic_preprocess(
-                    image, image_size=self.image_size
+                    image,
+                    min_num=self.min_crops,
+                    max_num=self.max_crops,
+                    image_size=self.image_size,
                 )
             else:
                 crop_ratio = [1, 1]

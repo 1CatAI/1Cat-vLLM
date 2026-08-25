@@ -298,6 +298,7 @@ def resolve_chat_template(
     path = get_chat_template_fallback_path(
         model_type=model_config.hf_config.model_type,
         tokenizer_name_or_path=tokenizer.name_or_path,
+        architectures=getattr(model_config, "architectures", None),
     )
     if path is not None:
         logger.info_once(

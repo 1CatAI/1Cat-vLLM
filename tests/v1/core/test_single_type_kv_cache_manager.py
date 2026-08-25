@@ -578,7 +578,7 @@ def test_prefix_anchored_swa_manager_registered():
     block_pool = BlockPool(num_gpu_blocks=100, enable_caching=False, hash_block_size=16)
     manager = get_manager_for_kv_cache_spec(
         spec,
-        max_num_batched_tokens=1024,
+        max_in_flight_tokens=1024,
         max_model_len=4096,
         block_pool=block_pool,
         enable_caching=False,

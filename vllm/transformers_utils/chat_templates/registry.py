@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TypeAlias
 
@@ -46,6 +46,34 @@ _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
     "siglip2": CHAT_TEMPLATES_DIR / "template_basic.jinja",
 }
 
+# Architecture-keyed fallbacks take precedence over model_type ones: some
+# checkpoints reuse another family's model_type while needing a different
+# prompt contract. DeepSeek-OCR reports model_type "deepseek_vl_v2", whose
+# fallback template inserts chat role markers ("<|User|>: ...") and would
+# silently change the OCR prompt relative to the offline recipe; the OCR
+# architecture must resolve the raw-concatenation OCR template instead.
+# Keyed by architecture so genuine DeepSeek-VL2 chat checkpoints (same
+# model_type, different architecture) keep their chat template.
+_ARCH_TO_CHAT_TEMPLATE_FALLBACK: dict[str, ChatTemplatePath] = {
+    "DeepseekOCRForCausalLM": CHAT_TEMPLATES_DIR / "template_deepseek_ocr.jinja",
+}
+
+
+def register_chat_template_fallback_path_for_arch(
+    architecture: str,
+    chat_template: ChatTemplatePath,
+) -> None:
+    """Register an architecture-keyed chat template fallback (plugins too)."""
+    if architecture in _ARCH_TO_CHAT_TEMPLATE_FALLBACK:
+        logger.warning(
+            "Architecture %s already has a chat template registered. "
+            "It will be overwritten by the new chat template %s.",
+            architecture,
+            chat_template,
+        )
+
+    _ARCH_TO_CHAT_TEMPLATE_FALLBACK[architecture] = chat_template
+
 
 def register_chat_template_fallback_path(
     model_type: str,
@@ -65,8 +93,15 @@ def register_chat_template_fallback_path(
 def get_chat_template_fallback_path(
     model_type: str,
     tokenizer_name_or_path: str,
+    architectures: Iterable[str] | None = None,
 ) -> Path | None:
-    chat_template = _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK.get(model_type)
+    chat_template: ChatTemplatePath | None = None
+    for arch in architectures or ():
+        chat_template = _ARCH_TO_CHAT_TEMPLATE_FALLBACK.get(arch)
+        if chat_template is not None:
+            break
+    if chat_template is None:
+        chat_template = _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK.get(model_type)
     if callable(chat_template):
         chat_template = chat_template(tokenizer_name_or_path)
 

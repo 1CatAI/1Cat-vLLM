@@ -601,6 +601,28 @@ class VllmConfig:
         return hash_str
 
     @property
+    def max_concurrent_batches(self) -> int:
+        # Scheduler-side upper bound mirroring the executors'
+        # `max_concurrent_batches` (multiproc: queue depth under async
+        # scheduling, else the PP pipeline depth).
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size <= 1 and self.scheduler_config.async_scheduling:
+            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+        return pp_size
+
+    @property
+    def max_in_flight_tokens(self) -> int:
+        # Upper bound on tokens that are scheduled but not yet settled (freed):
+        # every concurrent batch may hold up to a full `max_num_batched_tokens`.
+        # Recycling-aware KV cache specs (sliding-window, chunked-local,
+        # prefix-anchored SWA) reserve for this because out-of-window blocks
+        # are freed on the processed-token basis, so in-flight steps
+        # transiently keep their blocks.
+        return (
+            self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
+        )
+
+    @property
     def num_speculative_tokens(self) -> int:
         if (
             self.speculative_config is not None
