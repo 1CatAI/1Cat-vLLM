@@ -346,6 +346,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3: bool = True
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL: bool = False
+    VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -2452,6 +2453,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
             os.getenv(
                 "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL",
                 "0",
+            )
+        )
+    ),
+    "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL",
+                "1",
             )
         )
     ),

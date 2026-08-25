@@ -287,8 +287,135 @@ greedy identity fails. Keep Q8000 split-KV3 explicit and default-off until a
 fixed-text logprob/perplexity or dataset-level quality gate establishes that
 the classified Type-B reduction-order drift does not reduce model quality.
 
+## 2026-08-25 Q8000/KV40K..128K GQA-packed Attention Architecture
+
+This experiment freezes the final long-prefill call at causal FP16
+`Q=8000`, `KV=128000`, `Hq=6`, `Hkv=1`, and `D=256` on one
+V100-SXM2-32GB. Its metric is 6.094872576 useful causal TFLOPs divided by the
+complete Attention elapsed time. It is neither whole-model TOPS nor prompt
+tokens/s; the acceptance gate is at most 101.581 ms, or at least 60.0 useful
+causal TFLOP/s.
+
+Tile and barrier tuning of the fused BM64/BN32 kernel was already exhausted:
+the long-shape NCU record showed one CTA/SM, 12.5% occupancy, 62.14% of cycles
+without an eligible warp, and only 9.06% DRAM throughput. The replacement is a
+different scheduling and dataflow architecture:
+
+- split a fully visible 32K..120K prefix from the exact causal 8K tail;
+- pack all six GQA query heads into GEMM M=48,000;
+- run wide SM70 Tensor-Core QK GEMMs that emit FP16 scores plus row max/sum;
+- transform scores into normalized probabilities during the PV
+  global-to-shared load, avoiding a materialized probability matrix;
+- fold one reusable FP16 PV partial into a FP32 online prefix
+  numerator/max/sum state;
+- export max/sum from the accepted exact 8K tail and merge the two online
+  softmax states.
+
+The retained score block is BN8192. Final frozen-extension Torch A/B/A for the
+score-cache layout measures `140.00213 -> 100.76979 ms`, or
+`43.53414 -> 60.48313` useful causal TFLOP/s: 28.0227% lower latency and a
+1.38933x speedup. All 12,288,000 outputs are finite; max/mean absolute error
+is `2.2888e-4 / 2.5430e-5` and relative L2 is `6.8629e-3` versus the exact
+FP32-accumulator route. BN7168 reaches only 58.42057 TFLOP/s and BN8000 only
+59.92825 TFLOP/s, so neither is promoted or rounded into a pass.
+
+The same bounded workspace was then generalized across the twelve observed
+8K-chunk shapes. Each row is a strict A/B bracket against the active split-KV3
+control:
+
+| KV tokens | split-KV3 ms | architecture ms | latency change | useful TFLOP/s |
+|---:|---:|---:|---:|---:|
+| 40,000 | 38.41638 | 29.81530 | -22.3891% | 59.34862 |
+| 48,000 | 47.25811 | 36.38477 | -23.0084% | 59.44005 |
+| 56,000 | 56.53999 | 42.68715 | -24.5010% | 59.87584 |
+| 64,000 | 65.17897 | 49.14552 | -24.5991% | 60.00842 |
+| 72,000 | 74.00670 | 55.44960 | -25.0749% | 60.27745 |
+| 80,000 | 82.74432 | 61.77792 | -25.3388% | 60.46783 |
+| 88,000 | 91.98507 | 68.37111 | -25.6715% | 60.38797 |
+| 96,000 | 100.88397 | 74.72862 | -25.9262% | 60.51241 |
+| 104,000 | 109.80642 | 81.09448 | -26.1478% | 60.61108 |
+| 112,000 | 118.42901 | 87.71959 | -25.9307% | 60.51602 |
+| 120,000 | 127.35232 | 93.99757 | -26.1909% | 60.65749 |
+| 128,000 | 135.93617 | 100.34193 | -26.1845% | 60.74103 |
+
+All 147,456,000 candidate output elements are finite. Across the family, the
+worst max absolute difference is `5.0354e-4` and worst relative L2 is
+`6.8983e-3` versus the exact FP32-accumulator route. The three shortest points
+remain slightly below 60 because the 43-TFLOP/s exact causal tail is a larger
+fixed fraction, but they are still 1.288x..1.325x faster than split-KV3.
+
+The architecture trace is compute-dense rather than launch-starved: 49 timed
+kernels occupy 95.630493 ms of a 95.809850-ms GPU span, or 99.81%. Prefix QK
+accounts for 54.22% and prefix PV 39.74%; the exact tail is 4.89%. The next
+compute ceiling is therefore QK/PV instruction efficiency, not additional
+host launch fusion.
+
+Real-model integration exposed a separate memory contract. Retaining all
+partials or the entire workspace passes the operator gate but leaves too
+little memory for the following 80-MiB TP all-reduce. The final layout retains
+only the 750-MiB FP16 score matrix per device and packs about 100 MiB of other
+state into one transient byte slab. Before first use it requires enough
+driver-visible free memory for both allocations plus 128 MiB of downstream
+headroom; otherwise it raises a typed OOM before touching the caching allocator
+and falls back to the exact route.
+
+The route is default-on for its exact engine contract. The legacy
+`VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=0` setting is the
+rollback, and the route rejects CUDA graph capture. It admits only `Q=8000`,
+`KV=40000..128000` in 8000-token steps, `Hq=6/Hkv=1/D=256`, FP16, causal
+attention, and scale 1/16. The earlier
+endpoint-only `.875` TP4
+Qwen3.8-27B-FP8 control/candidate/control prefill times are
+`46.45658 / 45.47797 / 46.11195 s`. Relative to the `46.28426-s` bracketed
+control, the candidate lowers latency by 1.7421% and raises prompt throughput
+from 2831.89 to 2882.10 token/s (1.7729%). Every candidate rank logs 16
+architecture hits, with no architecture OOM/fallback, and all three runs emit
+the same 32 output token IDs and SHA256
+`df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+
+The endpoint-only `.88` run also succeeds at 45.53427-s prefill with the same
+hash and 16 hits/rank. Its memory profiler left enough headroom, so the route
+passed rather than exercising the fallback branch.
+
+The widened TP4 Qwen3.8-27B-FP8 gate brackets the candidate with `46.11195-s`
+and `46.09222-s` controls. Relative to their `46.10208-s` mean, the
+`41.51191-s` candidate lowers prefill latency by 9.9565% and raises prompt
+throughput from 2843.08 to 3157.46 token/s (11.0575%). Every rank logs exactly
+192 family-route hits with no architecture OOM/fallback. Both controls and the
+candidate emit the same 32 token IDs and SHA256
+`df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+
+The 2026-08-26 merge audit rebuilt the four-patch vendored FA2 stack from its
+locked clean baseline with CUDA 12.8 and `sm_70`. The production QK/PV kernels
+again compiled at 254/119 registers with zero spill. On the rebuilt extension,
+the 40K endpoint measured `39.29395 -> 30.27579 ms` (`1.29787x`) with all
+outputs finite, max/mean absolute difference `5.4932e-4 / 4.4392e-5`, and
+relative L2 `6.6098e-3`. The 128K endpoint measured
+`136.07628 -> 100.20284 ms` (`1.35801x`) with all outputs finite,
+max/mean absolute difference `2.2888e-4 / 2.5484e-5`, and relative L2
+`6.9166e-3`. Both points pass the FP16 merge envelope of max absolute error
+at most `1e-3` and relative L2 at most `1e-2`; greedy or bitwise identity is
+not required. The complete Flash-V100 policy suite passes 112 tests on a real
+V100, including a direct architecture-OOM-to-dense-fallback test.
+
 ## Artifacts
 
+- D256 GQA architecture artifacts are retained outside Git; their private
+  filesystem location is intentionally not committed.
+- Final operator A/B/A:
+  `results/torch-architecture-scorecache-final-v1-aba.json` under that task
+  root.
+- Shape-family operator A/B:
+  `results/torch-architecture-shapefamily-v1-aba.json` under that task root.
+- Shape-family TP4 model gate:
+  `results/tp4-128k-architecture-shapefamily-{candidate,control-after}-0875.json`,
+  bracketed with the endpoint gate's
+  `results/tp4-128k-architecture-scorecache-final-control-b-0875.json`.
+- Final TP4 `.875` model gate:
+  `results/tp4-128k-architecture-scorecache-final-{control-a,candidate,control-b}-0875.json`.
+- Final high-memory `.88` route-success run:
+  `results/tp4-128k-architecture-scorecache-final-preflight-fallback-088.json`;
+  despite the retained filename, the preflight passed and no fallback ran.
 - K-stage task root:
   `/data/minimax-h3/task-cache/qwen38-fp8-128k-flashattention-20260824`.
 - Final clean FA2 binary:

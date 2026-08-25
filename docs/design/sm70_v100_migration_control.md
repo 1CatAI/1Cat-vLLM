@@ -1896,6 +1896,100 @@ Source behavior:
 - Decode path reads vLLM paged KV cache directly.
 - Prefill has direct and fallback paths, including paged KV gather fallback.
 
+D256 8K-by-40K..128K GQA architecture checkpoint, 2026-08-25:
+
+- Frozen single-rank shape is causal FP16 Q/K/V, `Q=8000`, `KV=128000`,
+  `Hq=6`, `Hkv=1`, `D=256` on one V100-SXM2-32GB. The metric is useful
+  causal Attention FLOPs divided by complete Attention elapsed time; it is not
+  model TOPS or prompt throughput.
+- The architecture separates a fully visible 32K..120K prefix from the causal
+  8K tail. Six GQA heads are packed into GEMM M=48,000. QK writes FP16 logits and
+  row statistics; PV normalizes logits during its global-to-shared operand
+  transform. One reusable FP16 block partial is folded into a FP32 online
+  prefix numerator/state before the next block. The exact causal-tail kernel
+  exports max/sum state and a final kernel merges prefix and tail.
+- The final BN8192 score-cache layout retains only the 750-MiB FP16 score
+  matrix per device. All other approximately 100 MiB of state is packed into
+  one transient aligned byte slab. A per-device event and mutex serialize
+  score reuse across streams. Before its first allocation, the route requires
+  driver-visible free memory for both workspaces plus 128 MiB of downstream
+  headroom; failure raises a typed OOM without touching the caching allocator
+  or launching a kernel, so the Python path can fall back safely.
+- The final frozen-extension Torch A/B/A measured the existing exact operator
+  at `140.00213 ms / 43.53414 TFLOP/s` and the complete architecture at
+  `100.76979 ms / 60.48313 TFLOP/s`: `28.0227%` lower latency and `1.38933x`
+  speedup. All 12,288,000 outputs are finite; versus the exact operator,
+  max absolute difference is `2.2888e-4`, mean absolute difference
+  `2.5430e-5`, and relative L2 `6.8629e-3`. Peak allocated memory is
+  `1.11960 GiB`.
+- The generalized operator admits all twelve observed `Q=8000` chunk shapes,
+  `KV=40000..128000` in 8000-token steps. Strict per-length A/B measured
+  `59.34862..60.74103` useful causal TFLOP/s. Against the active split-KV3
+  control, every point is faster: latency is `22.3891%..26.1909%` lower and
+  speedup is `1.28848x..1.35485x`. All 147,456,000 candidate elements are
+  finite; the worst max absolute difference is `5.0354e-4` and worst relative
+  L2 is `6.8983e-3` versus the exact FP32-accumulator route.
+- Smaller score blocks do not pass the target: BN7168 is
+  `104.32751 ms / 58.42057 TFLOP/s`; BN8000 is
+  `101.70283 ms / 59.92825 TFLOP/s` and must not be rounded to 60. BN8192 is
+  therefore retained while model KV reservation supplies downstream headroom.
+- QK and PV compile at 254 and 119 registers/thread with no spill, stack, or
+  local storage. The complete operator is loadable through `torch.ops`; the
+  initial namespace registration mismatch was caught by a static load test and
+  fixed before timing. Synchronous device-symbol updates were changed to
+  current-stream asynchronous copies so the integrated measurement includes no
+  artificial whole-device fence.
+- Integration is shape-family bounded and default-on. The legacy
+  `VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL=0` setting is the
+  rollback. It rejects CUDA-graph capture and falls back to the exact dense
+  kernel on workspace OOM.
+  The final external FA2 patch applies cleanly after the existing D256
+  pipeline, split-KV3, and K-ping-pong patches, and a fresh CUDA 12.8 / Torch
+  cu128 SM70 build passes its operator-schema load test. The full Flash-V100
+  policy file passes 112/112 tests on a real V100, including direct typed
+  architecture-OOM fallback to the exact dense route; Ruff and
+  `git diff --check` pass.
+- Early real-model memory tests at `gpu_memory_utilization=0.88` rejected the
+  fully persistent and pre-preflight score-cache layouts after their first
+  successful route call: the following 80-MiB PYNCCL all-reduce had only
+  62-74 MiB free. This is a downstream-headroom failure, not an Attention
+  compute failure.
+- The final matched `.875` TP4 Qwen3.8-27B-FP8
+  control/candidate/control prefill times are `46.45658 / 45.47797 /
+  46.11195 s`. Against the `46.28426-s` bracketed control, the candidate is
+  `1.7421%` lower latency and `1.01773x` faster (`2831.89 -> 2882.10`
+  prompt token/s). Every candidate rank logs 16 architecture hits and no
+  architecture OOM/fallback. All three runs produce the same 32 output token
+  IDs and SHA256
+  `df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+- A final `.88` run also completes in `45.53427 s`, with the same token hash
+  and 16 route hits/rank. Its profiler left enough headroom for the route, so
+  this validates high-memory route success rather than directly exercising
+  the preflight fallback branch.
+- The widened TP4 Qwen3.8-27B-FP8 gate uses a `46.11195-s` control before the
+  candidate and a `46.09222-s` control after it. Against their `46.10208-s`
+  mean, the `41.51191-s` candidate lowers prefill latency by `9.9565%` and
+  raises prompt throughput from `2843.08` to `3157.46` token/s (`11.0575%`).
+  Every rank logs exactly 192 family-route hits with no architecture OOM or
+  fallback. Both controls and the candidate emit the same 32 token IDs and
+  SHA256
+  `df4fee7f5f0126fe6b391fe77b4fc19667831de5ef55fd69c28c2f52a3d7086e`.
+  Token identity is route-health evidence rather than a promotion
+  requirement. The stronger numerical gate covers 147,456,000 finite output
+  elements with worst max absolute error `5.0354e-4` and relative L2
+  `6.8983e-3`, inside the accepted FP16 envelope of `1e-3` and `1e-2`.
+  Artifacts and the experiment ledger are retained outside Git; their private
+  filesystem location is intentionally not committed.
+- The 2026-08-26 merge audit replayed all four patches from the locked clean
+  vendored baseline and rebuilt `_vllm_fa2_C` with CUDA 12.8 for `sm_70`.
+  QK/PV again compiled at 254/119 registers with zero spill. Current-source
+  direct A/B measured `39.29395 -> 30.27579 ms` (`1.29787x`) at KV40K and
+  `136.07628 -> 100.20284 ms` (`1.35801x`) at KV128K. Both outputs were fully
+  finite. KV40K had max absolute error `5.4932e-4` and relative L2
+  `6.6098e-3`; KV128K had max absolute error `2.2888e-4` and relative L2
+  `6.9166e-3`. These pass the FP16 merge envelope without imposing greedy or
+  bitwise identity and justify keeping the validated shape route default-on.
+
 Latest target state:
 
 - No `FLASH_ATTN_V100` enum.
