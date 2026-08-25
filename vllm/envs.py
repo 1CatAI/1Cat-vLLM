@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
+    VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4: bool = True
     VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
@@ -1812,6 +1813,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
+    ),
+    "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "1"))
     ),
     # Skip PP metadata and TP reconstruction only for the exact, replicated
     # SM70 B1 hidden-state schema validated by the worker on both stages.

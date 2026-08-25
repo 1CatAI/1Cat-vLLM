@@ -141,6 +141,12 @@ def test_sm70_concurrency_tuning_envs(
     monkeypatch.setenv(name, "0")
     assert environment_variables[name]() is False
 
+    name = "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4"
+    monkeypatch.delenv(name, raising=False)
+    assert environment_variables[name]() is True
+    monkeypatch.setenv(name, "0")
+    assert environment_variables[name]() is False
+
     monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", raising=False)
     assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 128
     monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "640")
