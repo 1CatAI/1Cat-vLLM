@@ -228,6 +228,29 @@ class DFlash2Speculator(DFlashSpeculator):
         self._selector_path_state = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self._alignment_candidate_ids: torch.Tensor | None = None
+        self._alignment_unary_logits: torch.Tensor | None = None
+        self._alignment_lattice_scores: torch.Tensor | None = None
+        if (
+            envs.VLLM_SPEC_DUMP_ALIGNMENT
+            and envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION
+        ):
+            packed_shape = (
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                self.selector_top_k,
+            )
+            self._alignment_candidate_ids = torch.empty(
+                packed_shape, dtype=torch.int64, device=device
+            )
+            self._alignment_unary_logits = torch.empty(
+                packed_shape, dtype=torch.float32, device=device
+            )
+            self._alignment_lattice_scores = torch.empty(
+                (*packed_shape, self.selector_top_k),
+                dtype=torch.float32,
+                device=device,
+            )
         self._use_sm70_tail = _requires_sm70_tail(device, self.num_speculative_steps)
         if self.draft_logits is not None:
             # The cache kernel writes only K columns; all other vocabulary
@@ -322,6 +345,20 @@ class DFlash2Speculator(DFlashSpeculator):
             return None
         return self._cached_candidate_ids, self._cached_candidate_scores
 
+    def get_selector_alignment_shadow(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return packed selector tensors for an explicitly enabled diagnostic."""
+        if self._alignment_candidate_ids is None:
+            return None
+        assert self._alignment_unary_logits is not None
+        assert self._alignment_lattice_scores is not None
+        return (
+            self._alignment_candidate_ids,
+            self._alignment_unary_logits,
+            self._alignment_lattice_scores,
+        )
+
     def _generate_draft(
         self,
         num_reqs: int,
@@ -356,6 +393,12 @@ class DFlash2Speculator(DFlashSpeculator):
             hidden_states,
             anchor_token_ids,
         )
+        if self._alignment_candidate_ids is not None:
+            assert self._alignment_unary_logits is not None
+            assert self._alignment_lattice_scores is not None
+            self._alignment_candidate_ids[:num_reqs].copy_(candidate_ids)
+            self._alignment_unary_logits[:num_reqs].copy_(unary_logits)
+            self._alignment_lattice_scores[:num_reqs].copy_(scores)
         self._sample_path(candidate_ids, scores, num_reqs)
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)

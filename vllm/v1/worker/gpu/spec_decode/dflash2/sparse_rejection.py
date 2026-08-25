@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -26,6 +27,125 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _TARGET_TOP_K = 20
+_SELECTOR_ALIGNMENT_DUMP_COUNT = 0
+_SELECTOR_ALIGNMENT_STEP = 0
+
+
+def _parse_alignment_steps(raw_steps: str | None) -> set[int] | None:
+    if not raw_steps:
+        return None
+    steps: set[int] = set()
+    try:
+        for item in raw_steps.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start_text, end_text = item.split("-", 1)
+                start = int(start_text)
+                end = int(end_text)
+                if start < 0 or end < start:
+                    return set()
+                steps.update(range(start, end + 1))
+            else:
+                step = int(item)
+                if step < 0:
+                    return set()
+                steps.add(step)
+    except ValueError:
+        return set()
+    return steps
+
+
+def _safe_dump_tag(raw_tag: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw_tag)
+
+
+def _diagnostic_rank() -> int:
+    return int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
+
+
+def _maybe_dump_selector_alignment(
+    *,
+    speculator: DFlash2Speculator,
+    rejection_sampler: RejectionSampler,
+    input_batch: InputBatch,
+    target_topk_ids: torch.Tensor,
+    target_topk_logits: torch.Tensor,
+    draft_topk_ids: torch.Tensor,
+    draft_topk_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    pos: torch.Tensor,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+) -> None:
+    """Dump one exact B1 selector/target alignment record when requested."""
+    if not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        return
+    if _diagnostic_rank() != 0:
+        return
+
+    global _SELECTOR_ALIGNMENT_DUMP_COUNT, _SELECTOR_ALIGNMENT_STEP
+    _SELECTOR_ALIGNMENT_STEP += 1
+    if _SELECTOR_ALIGNMENT_DUMP_COUNT >= envs.VLLM_SPEC_DUMP_ALIGNMENT_LIMIT:
+        return
+    selected_steps = _parse_alignment_steps(envs.VLLM_SPEC_DUMP_ALIGNMENT_STEPS)
+    if selected_steps is not None and _SELECTOR_ALIGNMENT_STEP not in selected_steps:
+        return
+
+    shadow = speculator.get_selector_alignment_shadow()
+    if shadow is None:
+        return
+    shadow_ids, unary_logits, lattice_scores = shadow
+    req_state = int(input_batch.idx_mapping_np[0])
+    packed_row = 0
+    sampling_states = rejection_sampler.sampler.sampling_states
+
+    with torch.no_grad():
+        draft_sampled_cpu = draft_sampled.detach().cpu()
+        if bool(torch.all(draft_sampled_cpu == 0).item()):
+            return
+        payload = {
+            "format": "dflash2_selector_alignment_v1",
+            "rank": _diagnostic_rank(),
+            "step": _SELECTOR_ALIGNMENT_STEP,
+            "request_state": req_state,
+            "selector_top_k": speculator.selector_top_k,
+            "num_speculative_steps": speculator.num_speculative_steps,
+            "target_topk_ids": target_topk_ids.detach().cpu(),
+            "target_topk_logits": target_topk_logits.detach().float().cpu(),
+            "draft_candidate_ids": draft_topk_ids[req_state].detach().cpu(),
+            "draft_realized_logits": (
+                draft_topk_logits[req_state].detach().float().cpu()
+            ),
+            "selector_candidate_ids": shadow_ids[packed_row].detach().cpu(),
+            "selector_unary_logits": (unary_logits[packed_row].detach().float().cpu()),
+            "selector_lattice_scores": (
+                lattice_scores[packed_row].detach().float().cpu()
+            ),
+            "draft_sampled": draft_sampled_cpu,
+            "positions": pos.detach().cpu(),
+            "cu_num_logits": input_batch.cu_num_logits.detach().cpu(),
+            "idx_mapping": input_batch.idx_mapping.detach().cpu(),
+            "temperature": float(sampling_states.temperature.np[req_state]),
+            "top_p": float(sampling_states.top_p.np[req_state]),
+            "top_k": int(sampling_states.top_k.np[req_state]),
+            "sampled_token_ids": sampled.detach().cpu(),
+            "num_sampled": num_sampled.detach().cpu(),
+        }
+        _SELECTOR_ALIGNMENT_DUMP_COUNT += 1
+        dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
+        os.makedirs(dump_dir, exist_ok=True)
+        tag = _safe_dump_tag(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG", ""))
+        tag_part = f"{tag}_" if tag else ""
+        dump_path = os.path.join(
+            dump_dir,
+            f"spec_alignment_dflash2_selector_{tag_part}pid{os.getpid()}_"
+            f"step{_SELECTOR_ALIGNMENT_STEP:06d}_"
+            f"{_SELECTOR_ALIGNMENT_DUMP_COUNT}.pt",
+        )
+        torch.save(payload, dump_path)
+        logger.warning("Dumped DFlash2 selector alignment diagnostics to %s", dump_path)
 
 
 def _supports_sparse_sampling_contract(
@@ -118,6 +238,20 @@ def try_dflash2_sparse_target_rejection(
         rejection_sampler.num_speculative_steps,
         use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
     )
+    if envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        _maybe_dump_selector_alignment(
+            speculator=speculator,
+            rejection_sampler=rejection_sampler,
+            input_batch=input_batch,
+            target_topk_ids=target_topk_ids,
+            target_topk_logits=target_topk_logits,
+            draft_topk_ids=draft_topk_ids,
+            draft_topk_logits=draft_topk_logits,
+            draft_sampled=draft_sampled,
+            pos=pos,
+            sampled=sampled,
+            num_sampled=num_sampled,
+        )
     logger.info_once("Using SM70 DFlash2 compact target top-k rejection sampling.")
     return SamplerOutput(
         sampled_token_ids=sampled,
