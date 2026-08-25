@@ -101,6 +101,14 @@ def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
     kwargs = qk_dsplit.call_args.kwargs
     assert kwargs["partial_qk"].shape == (1, 8, 8, 8, 16)
     assert kwargs["partial_probs"].shape == (1, 8, 8, 16)
+    assert kwargs["stage1_block_h"] == 8
+
+
+def test_sm70_sparse_qk_dsplit_uses_one_tp4_head_group():
+    from vllm.models.deepseek_v4.sm70.sparse import _qk_dsplit_block_h
+
+    assert _qk_dsplit_block_h(16) == 16
+    assert _qk_dsplit_block_h(8) == 8
 
 
 def test_sm75_does_not_select_sm70_impl():
