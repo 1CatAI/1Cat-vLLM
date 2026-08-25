@@ -43200,3 +43200,42 @@ Interpretation:
   async-scheduler unit cases, and a simple CPU-offload store/load round trip.
   All changed-file pre-commit hooks pass. This is a cache lifetime correctness
   repair; no throughput claim is attached.
+
+## 2026-08-26 DeepSeek V4 PP2 TP4 no-DSpark decode recovery
+
+- The frozen endpoint contract is DeepSeek V4 Flash on eight V100-SXM2-32GB
+  GPUs, PP2 with TP4 ranks confined to GPUs 0--3 and 4--7, input 1024, output
+  cap 256, greedy sampling, no speculation/DSpark, E4M3 KV, sparse MLA, mHC,
+  TurboMind FP8/MXFP4 projections, and full CUDA Graph replay. Pure decode is
+  reported separately from prefill and TTFT; the target remains 100 tok/s.
+- The latest uninstrumented control reaches 59.160 tok/s, or 16.903 ms/token.
+  A 26-step Nsight Systems trace is perturbed to 18.939 ms/token but localizes
+  the per-stage service leaders to 6.434 ms of FP8 dense work, 2.647 ms of
+  MXFP4 MoE, 2.582 ms of FP16 GEMV, 1.714 ms of mHC, 1.695 ms of sparse MLA,
+  1.694 ms of routing, 1.688 ms of Q/KV work, and 1.476 ms of TP all-reduce.
+  Roughly 9 ms pipeline rows are dependency waits and are not added as PP
+  transfer cost.
+- Draft PR #299 extends the existing default-off, fully connected SM70 TP4
+  push all-reduce to the exact 8-KiB FP16 CUDA Graph payload. Same-binary TP4
+  A/B/B/A operator timing moves 9.286--9.425 us to 3.041--3.174 us. Both paths
+  are bitwise equal to the explicit rank-0-through-rank-3 FP32 accumulation
+  oracle. A stronger changing-input graph test covers 43 collective nodes,
+  eight input patterns, 64 replays, and all four ranks with zero mismatches;
+  every GPU claim is released after the bounded test.
+- Matched full-model control and candidate medians are 59.160 and 61.272
+  tok/s, or 16.903 and 16.321 ms/token. The candidate therefore recovers
+  3.57% and 0.583 ms/token. This is accepted performance and operator evidence,
+  but not yet a model-output exactness claim: two independent unchanged
+  controls select different stable greedy token streams (`f5b70fb3...` and
+  `b685f6bf...`), while the candidate selects `2f265d43...`. Existing
+  cross-process TurboMind launch autotuning is consequently a confounder that
+  must be made deterministic before an endpoint hash can isolate this route.
+  Keep the route default-off and the PR Draft until the deterministic launch
+  policy and pinned dataset gates close.
+- The next arithmetic target is the FP8 dense/WO-A launch family, which is the
+  largest trace category. Grouping two adjacent one-row projections is
+  bitwise exact when both use the default accumulation schedule and projects
+  about 2.5 ms/token of service reduction. Independently tuned flat/grouped
+  schedules differ by up to one FP16 ULP, so that fast route is rejected until
+  a shared deterministic accumulation contract passes full-token and dataset
+  quality gates.
