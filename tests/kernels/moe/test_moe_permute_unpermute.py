@@ -463,6 +463,7 @@ def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
     ]
     cases = [
         ("topk2_h256_contiguous", 2, 256, 0),
+        ("topk6_h4096_contiguous", 6, 4096, 0),
         ("topk8_h2048_contiguous", 8, 2048, 0),
         ("topk8_h7168_padded_stride", 8, 7168, 64),
     ]

@@ -43438,6 +43438,20 @@ Interpretation:
   (`BLOCK_N=2`, `BLOCK_K=1024`) is 0.5--12% slower across the five traced
   `N=64/256/512/1024/2048` shapes; smaller-K/four-row variants are slower and
   also change FP32 accumulation. The candidate is not retained.
+- The next MXFP4 B1 screen removes redundant route sorting without changing
+  model arithmetic. The six unique top-k IDs become the compact TurboMind
+  group IDs directly, fixed offsets remain `[0, 1, ..., 6]`, W13 reads the
+  single physical input row through the accepted broadcast contract, and W2
+  stays in original top-k order. The final weighted reduction therefore keeps
+  the same route-order FP32 FMA sequence without an inverse permutation.
+  Initial and changed-route CUDA Graph replays are bitwise at W13, clamped
+  SwiGLU, W2, and final output. Adding the exact top-k-6 `half2` reducer moves
+  the current direct-top6 pipeline from `54.414` to `46.519 us/layer`, a
+  `0.339 ms/token` 43-layer service projection. The reproducible JSON is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-direct-order-screen-20260826-r1/`.
+  This is an operator gate only;
+  the opt-in `VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE` route still requires a
+  matched PP2/TP4 endpoint and aggregate-quality gate.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 

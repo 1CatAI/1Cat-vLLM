@@ -343,6 +343,11 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         )
         if envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE:
             required_ops += ("mxfp4_moe_single_token_prepare_w13_sm70_out",)
+        if (
+            envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
+            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
+        ):
+            required_ops += ("awq_moe_single_token_weighted_reduce_out",)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing_ops:
             raise RuntimeError(
@@ -726,6 +731,49 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts
         )
+        direct_order = (
+            direct_top6
+            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+        )
+        if direct_order:
+            route_ids = topk_ids.view(-1)
+            route_offsets = buffers["compact_expert_offsets"]
+            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+                buffers["gate_up"],
+                x,
+                route_offsets,
+                route_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                layer.sm70_mxfp4_w13_k_dim,
+                layer.sm70_mxfp4_w13_n_dim,
+                layer.sm70_mxfp4_group_size,
+            )
+            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
+            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                route_offsets,
+                route_ids,
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                layer.sm70_mxfp4_w2_k_dim,
+                layer.sm70_mxfp4_w2_n_dim,
+                layer.sm70_mxfp4_group_size,
+            )
+            sm70_ops.awq_moe_single_token_weighted_reduce_out(
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["token_expert_indices"],
+                output,
+                _DEEPSEEK_V4_FLASH_TOP_K,
+                layer.sm70_mxfp4_hidden_size,
+            )
+            return output
         if direct_top6:
             sm70_ops.mxfp4_moe_single_token_prepare_w13_sm70_out(
                 buffers["gate_up"],

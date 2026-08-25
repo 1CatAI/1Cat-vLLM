@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -399,6 +400,7 @@ def benchmark_full_pipeline(
 
     generic = make_buffers()
     direct = make_buffers()
+    direct_order = make_buffers()
 
     def generic_call() -> None:
         generic["output"].zero_()
@@ -498,11 +500,61 @@ def benchmark_full_pipeline(
             direct["output"],
         )
 
+    def direct_order_call() -> None:
+        route_ids = topk_ids.view(-1)
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            direct_order["gate_up"],
+            x,
+            direct_order["compact_offsets"],
+            route_ids,
+            w13_ptrs_w,
+            w13_ptrs_s,
+            top_k,
+            4096,
+            512,
+            32,
+        )
+        torch.ops._C.silu_and_mul_with_clamp(
+            direct_order["intermediate"], direct_order["gate_up"], 10.0
+        )
+        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+            direct_order["sorted_output"],
+            direct_order["intermediate"],
+            direct_order["compact_offsets"],
+            route_ids,
+            w2_ptrs_w,
+            w2_ptrs_s,
+            top_k,
+            256,
+            4096,
+            32,
+        )
+        sm70_ops.awq_moe_single_token_weighted_reduce_out(
+            direct_order["sorted_output"],
+            topk_weights,
+            direct_order["token_expert_indices"],
+            direct_order["output"],
+            top_k,
+            4096,
+        )
+
     generic_call()
     direct_call()
+    direct_order_call()
     torch.accelerator.synchronize()
     initial_equal = torch.equal(generic["output"], direct["output"])
     initial_max_abs = float((generic["output"] - direct["output"]).abs().max().item())
+    direct_order_initial_equal = torch.equal(direct["output"], direct_order["output"])
+    direct_order_initial_max_abs = float(
+        (direct["output"] - direct_order["output"]).abs().max().item()
+    )
+    initial_sorted_src = torch.argsort(topk_ids.view(-1), stable=True)
+    direct_order_stage_parity = {
+        f"{name}_equal": torch.equal(
+            direct[name], direct_order[name].index_select(0, initial_sorted_src)
+        )
+        for name in ("gate_up", "intermediate", "sorted_output")
+    }
     stage_parity = {
         "gate_up_equal": torch.equal(generic["gate_up"], direct["gate_up"]),
         "gate_up_max_abs": float(
@@ -527,28 +579,52 @@ def benchmark_full_pipeline(
 
     generic_graph = _capture(generic_call)
     direct_graph = _capture(direct_call)
+    direct_order_graph = _capture(direct_order_call)
     generic_ms = _time_graph(generic_graph, repeats)
     direct_ms = _time_graph(direct_graph, repeats)
+    direct_order_ms = _time_graph(direct_order_graph, repeats)
 
     topk_ids.copy_(torch.tensor([route_b], dtype=torch.int32, device=device))
     generic_graph.replay()
     direct_graph.replay()
+    direct_order_graph.replay()
     torch.accelerator.synchronize()
     replay_equal = torch.equal(generic["output"], direct["output"])
     replay_max_abs = float((generic["output"] - direct["output"]).abs().max().item())
+    direct_order_replay_equal = torch.equal(direct["output"], direct_order["output"])
+    direct_order_replay_max_abs = float(
+        (direct["output"] - direct_order["output"]).abs().max().item()
+    )
 
     result = {
         "generic_graph_ms": generic_ms,
         "direct_graph_ms": direct_ms,
+        "direct_order_graph_ms": direct_order_ms,
         "speedup": generic_ms / direct_ms,
         "projected_savings_ms_per_token": (generic_ms - direct_ms) * 43,
+        "direct_order_speedup_vs_direct": direct_ms / direct_order_ms,
+        "direct_order_projected_savings_ms_per_token": (direct_ms - direct_order_ms)
+        * 43,
         "initial_bitwise_equal": initial_equal,
         "initial_max_abs": initial_max_abs,
         "dynamic_replay_bitwise_equal": replay_equal,
         "dynamic_replay_max_abs": replay_max_abs,
+        "direct_order_initial_bitwise_equal": direct_order_initial_equal,
+        "direct_order_initial_max_abs": direct_order_initial_max_abs,
+        "direct_order_dynamic_replay_bitwise_equal": direct_order_replay_equal,
+        "direct_order_dynamic_replay_max_abs": direct_order_replay_max_abs,
         "initial_stage_parity": stage_parity,
+        "direct_order_initial_sorted_stage_parity": direct_order_stage_parity,
     }
-    if not initial_equal or not replay_equal:
+    if not all(
+        (
+            initial_equal,
+            replay_equal,
+            direct_order_initial_equal,
+            direct_order_replay_equal,
+            *direct_order_stage_parity.values(),
+        )
+    ):
         raise RuntimeError(f"MXFP4 direct top-6 correctness gate failed: {result}")
     return result
 
@@ -1067,6 +1143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--input-scale", type=float, default=0.01)
     parser.add_argument("--full-pipeline", action="store_true")
+    parser.add_argument("--json-out", type=Path)
     parser.add_argument("--verifier-m8-pipeline", action="store_true")
     parser.add_argument(
         "--verifier-tokens",
@@ -1141,16 +1218,16 @@ def main() -> int:
             repeats=args.repeats,
             seed=args.seed,
         )
-        print(
-            json.dumps(
-                {
-                    "benchmark": "sm70_mxfp4_moe_direct_top6_pipeline",
-                    "device": torch.cuda.get_device_name(),
-                    "result": result,
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "benchmark": "sm70_mxfp4_moe_direct_top6_pipeline",
+            "device": torch.cuda.get_device_name(),
+            "result": result,
+        }
+        rendered = json.dumps(payload, indent=2)
+        if args.json_out is not None:
+            args.json_out.parent.mkdir(parents=True, exist_ok=True)
+            args.json_out.write_text(rendered + "\n", encoding="utf-8")
+        print(rendered)
         return 0
     if args.profile_active_once:
         if args.stage == "both":
