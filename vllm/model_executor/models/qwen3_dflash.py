@@ -518,6 +518,13 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+        # The grouped call below relies on the stable-ABI RMSNorm extension
+        # selecting one weight row per outer (layer) index. Older binaries
+        # silently accepted the 2-D tensor but applied row zero to every
+        # layer, which severely lowers DFlash acceptance without affecting
+        # target-only output quality. Verify the loaded binary once before
+        # trusting its grouped result.
+        self._batched_k_norm_runtime_verified: bool | None = None
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -597,17 +604,71 @@ class DFlashQwen3Model(nn.Module):
         )
         return normed_context_states
 
+    def _normalize_context_k_per_layer(self, all_k: torch.Tensor) -> torch.Tensor:
+        """Reference path that works with pre-batched-weight RMSNorm binaries."""
+        all_k_normed = torch.empty_like(all_k)
+        for layer_idx in range(all_k.shape[0]):
+            ops.rms_norm(
+                all_k_normed[layer_idx],
+                all_k[layer_idx],
+                self._k_norm_weights[layer_idx],
+                self._rms_norm_eps,
+            )
+        return all_k_normed
+
+    def _verify_batched_context_k_norm_runtime(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> bool:
+        """Check the loaded stable extension with nonzero per-layer inputs."""
+        num_layers, hidden_size = self._k_norm_weights.shape
+        probe = torch.ones(
+            (num_layers, 1, 1, hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        grouped = torch.empty_like(probe)
+        ops.rms_norm(
+            grouped,
+            probe,
+            self._k_norm_weights,
+            self._rms_norm_eps,
+        )
+        per_layer = self._normalize_context_k_per_layer(probe)
+        return torch.equal(grouped, per_layer)
+
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
-        all_k_normed = torch.empty_like(all_k)
+        runtime_verified = getattr(self, "_batched_k_norm_runtime_verified", None)
+        if runtime_verified is None:
+            # This one-time comparison is normally consumed by model profiling
+            # or warmup. Use synthetic nonzero inputs so an all-zero dummy run
+            # cannot falsely approve a stale binary. The equality check
+            # deliberately synchronizes once: silently using the wrong K
+            # weights is a much larger failure than a cold startup fence.
+            runtime_verified = self._verify_batched_context_k_norm_runtime(
+                all_k.dtype, all_k.device
+            )
+            self._batched_k_norm_runtime_verified = runtime_verified
+            if not runtime_verified:
+                logger.warning_once(
+                    "The loaded stable-ABI RMSNorm extension does not preserve "
+                    "DFlash per-layer batched weights. Falling back to the "
+                    "bitwise per-layer path; rebuild the vLLM stable extension "
+                    "to restore the grouped K-normalization fast path."
+                )
+
+        if not runtime_verified:
+            return self._normalize_context_k_per_layer(all_k)
+
+        grouped = torch.empty_like(all_k)
         ops.rms_norm(
-            all_k_normed,
+            grouped,
             all_k,
             self._k_norm_weights,
             self._rms_norm_eps,
         )
-        return all_k_normed
+        return grouped
 
     def precompute_and_store_context_kv(
         self,
