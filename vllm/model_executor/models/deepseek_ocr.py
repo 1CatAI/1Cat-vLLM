@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Deepseek-OCR model compatible with HuggingFace weights."""
 
-import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Annotated, Literal
 
@@ -53,7 +52,7 @@ from vllm.transformers_utils.processors.deepseek_ocr import (
     BASE_SIZE,
     CROP_MODE,
     DeepseekOCRProcessor,
-    count_tiles,
+    count_image_tokens_for,
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.sample.logits_processor import (
@@ -190,12 +189,15 @@ class DeepseekOCRProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(DeepseekVLV2Config)
 
     def get_hf_processor(self, **kwargs: object):
-        v1_processor_config = dict(
-            image_size=IMAGE_SIZE,
-            base_size=BASE_SIZE,
-            crop_mode=CROP_MODE,
-            strategy="v1",
-        )
+        v1_processor_config: dict[str, object] = dict(strategy="v1")
+        if "image_mode" not in kwargs:
+            # Only inject the constant trio when no named mode is requested;
+            # the processor treats ``image_mode`` as authoritative.
+            v1_processor_config.update(
+                image_size=IMAGE_SIZE,
+                base_size=BASE_SIZE,
+                crop_mode=CROP_MODE,
+            )
 
         return self.ctx.get_hf_processor(
             DeepseekOCRProcessor,
@@ -208,35 +210,13 @@ class DeepseekOCRProcessingInfo(BaseProcessingInfo):
     def get_num_image_tokens(
         self, *, image_width: int, image_height: int, cropping: bool = True
     ) -> int:
-        image_size = IMAGE_SIZE
-        base_size = BASE_SIZE
-        patch_size = 16
-        downsample_ratio = 4
-
-        if CROP_MODE:
-            if image_width <= 640 and image_height <= 640:
-                crop_ratio = [1, 1]
-            else:
-                # find the closest aspect ratio to the target
-                crop_ratio = count_tiles(
-                    image_width, image_height, image_size=IMAGE_SIZE
-                )
-
-            num_width_tiles, num_height_tiles = crop_ratio
-        else:
-            num_width_tiles = num_height_tiles = 1
-
-        h = w = math.ceil((base_size // patch_size) / downsample_ratio)
-
-        h2 = w2 = math.ceil((image_size // patch_size) / downsample_ratio)
-
-        global_views_tokens = h * (w + 1)
-        if num_width_tiles > 1 or num_height_tiles > 1:
-            local_views_tokens = (num_height_tiles * h2) * (num_width_tiles * w2 + 1)
-        else:
-            local_views_tokens = 0
-
-        return global_views_tokens + local_views_tokens + 1
+        return count_image_tokens_for(
+            image_width=image_width,
+            image_height=image_height,
+            base_size=BASE_SIZE,
+            image_size=IMAGE_SIZE,
+            cropping=cropping and CROP_MODE,
+        )
 
     def get_image_size_with_most_features(self) -> ImageSize:
         if IMAGE_SIZE == 1024 and BASE_SIZE == 1280:
@@ -334,10 +314,12 @@ class DeepseekOCRMultiModalProcessor(
             else:
                 size = images.get_image_size(item_idx)
 
-                num_image_tokens = self.info.get_num_image_tokens(
+                # Count with the SAME processor instance the request's
+                # mm kwargs construct (mode/crops) — the producer/counter
+                # pair must never diverge.
+                num_image_tokens = hf_processor.count_image_tokens(
                     image_width=size.width,
                     image_height=size.height,
-                    cropping=CROP_MODE,
                 )
             return [image_token_id] * num_image_tokens
 
