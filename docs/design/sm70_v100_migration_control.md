@@ -43205,7 +43205,7 @@ Interpretation:
 
 - The frozen endpoint contract is DeepSeek V4 Flash on eight V100-SXM2-32GB
   GPUs, PP2 with TP4 ranks confined to GPUs 0--3 and 4--7, input 1024, output
-  cap 256, greedy sampling, no speculation/DSpark, E4M3 KV, sparse MLA, mHC,
+  cap 256, model-default sampling, no speculation/DSpark, E5M2 KV, sparse MLA, mHC,
   TurboMind FP8/MXFP4 projections, and full CUDA Graph replay. Pure decode is
   reported separately from prefill and TTFT; the target remains 100 tok/s.
 - The latest uninstrumented control reaches 59.160 tok/s, or 16.903 ms/token.
@@ -43250,5 +43250,23 @@ Interpretation:
   source result is under
   `/data/models/v100-dsv4-0731-pp2tp4-fp8-woa-grouped-20260826-r6-source/`.
   Independently tuned flat/grouped schedules differ by up to one FP16 ULP and
-  remain rejected. Full-model endpoint and pinned dataset gates are still
-  required before promotion, so this route stays default-off.
+  remain rejected.
+- The matched full-model pair keeps the source, extension, push all-reduce,
+  topology, lengths, and cache contract fixed. The control median is
+  `57.436 tok/s` (`17.411 ms/token`) and the grouped candidate reaches
+  `59.209 tok/s` (`16.889 ms/token`), recovering `0.521 ms/token` or 3.09%.
+  This is the measured endpoint reduction; the larger isolated service
+  projection is not used as a TPOT claim. Both sides are internally stable
+  across three requests, but their hashes differ because each server process
+  still independently tunes the other FP8 descriptors. A world-coordinated
+  deterministic LUT run is queued to remove that confounder.
+- The model-default random-sampling chat smoke is incoherent on both control
+  and candidate. It therefore neither implicates nor clears the grouped route;
+  promotion remains blocked on the pinned temperature-zero GSM8K and code
+  gates even though the grouped operator itself is bitwise exact. Keep the
+  route default-off and the PR Draft.
+- A multi-row FP16 GEMV screen is rejected. The only bitwise-exact candidate
+  (`BLOCK_N=2`, `BLOCK_K=1024`) is 0.5--12% slower across the five traced
+  `N=64/256/512/1024/2048` shapes; smaller-K/four-row variants are slower and
+  also change FP32 accumulation. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp16-gemv-blockn-20260826-r1/`.
