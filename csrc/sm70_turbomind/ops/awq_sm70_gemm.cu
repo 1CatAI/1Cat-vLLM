@@ -1074,7 +1074,7 @@ bool mxfp4_tune_small_shapes_enabled() {
 
 bool mxfp4_moe_compact_grouped_decode_enabled() {
   const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE");
-  return raw != nullptr && std::atoi(raw) != 0;
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool mxfp4_moe_broadcast_input_decode_enabled() {
