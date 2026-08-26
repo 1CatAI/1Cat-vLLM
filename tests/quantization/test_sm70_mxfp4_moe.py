@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import (
 from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
     _compact_mxfp4_active_experts,
+    _select_mxfp4_direct_order_offsets,
     _select_mxfp4_stage_dispatch,
     validate_mxfp4_sm70_moe_contract,
     validate_mxfp4_sm70_moe_weight_layout,
@@ -208,6 +209,21 @@ def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
     assert offsets is buffers["compact_expert_offsets"]
     assert expert_ids is buffers["permuted_experts_id"]
     assert count == 6
+
+
+def test_mxfp4_sm70_direct_order_ignores_compacted_offsets():
+    buffers = {
+        # Reproduce M8 compaction state left before the B1 graph is captured.
+        "compact_expert_offsets": torch.tensor(
+            [0, 8, 9, 16, 24, 32, 48], dtype=torch.int32
+        ),
+        "slot_expert_offsets": torch.arange(7, dtype=torch.int32),
+    }
+
+    offsets = _select_mxfp4_direct_order_offsets(buffers)
+
+    assert offsets is buffers["slot_expert_offsets"]
+    torch.testing.assert_close(offsets, torch.arange(7, dtype=torch.int32))
 
 
 def test_mxfp4_sm70_b1_dispatch_rejects_incompatible_permute_fastpath(

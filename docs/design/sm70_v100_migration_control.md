@@ -43456,6 +43456,14 @@ Interpretation:
   token counts, expert mappings, top-k shapes, dtypes, and devices retain the
   existing path. This is operator performance evidence, not a full endpoint
   throughput claim.
+- The first matched endpoint reached `69.949 token/s`, but its quality gate
+  failed with incoherent output and is rejected as a speed baseline. M2--M8
+  warmup and verifier compaction can overwrite `compact_expert_offsets` before
+  the B1 graph is captured, while direct-order incorrectly assumed that buffer
+  still contained `[0, 1, ..., 6]`. Direct-order now reads the immutable
+  `slot_expert_offsets` buffer. This restores the proven one-row-per-route
+  contract without changing the kernel, route order, or default-on/rollback
+  policy; a poisoned-workspace regression covers the failure mode.
 - The exact TP4 QNorm/RoPE plus FP8-KV insertion route combines the existing
   16 Q-head programs and eight packed-KV writers into one graph node without
   changing their arithmetic. Across 64 changing-input CUDA Graph patterns,

@@ -185,6 +185,18 @@ def _select_mxfp4_stage_dispatch(
     return buffers["expert_offsets"], buffers["dense_expert_ids"], num_experts
 
 
+def _select_mxfp4_direct_order_offsets(
+    buffers: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Return immutable one-row offsets for B1 direct-order decode.
+
+    Active-expert compaction overwrites ``compact_expert_offsets`` during
+    M2--M8 warmup and verifier calls. Direct-order B1 has one row per route,
+    so it must use the separately maintained slot offsets instead.
+    """
+    return buffers["slot_expert_offsets"]
+
+
 def validate_mxfp4_sm70_moe_contract(
     *,
     global_num_experts: int,
@@ -739,7 +751,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         )
         if direct_order:
             route_ids = topk_ids.view(-1)
-            route_offsets = buffers["compact_expert_offsets"]
+            route_offsets = _select_mxfp4_direct_order_offsets(buffers)
             sm70_ops.mxfp4_moe_dense_stage_sm70_out(
                 buffers["gate_up"],
                 x,
