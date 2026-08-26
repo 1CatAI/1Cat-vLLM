@@ -18,8 +18,26 @@ if (( cpu_count < 20 )); then
 fi
 echo "Build parallelism: 20 compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
 
-apt-get update
-apt-get install -y --no-install-recommends \
+for source_file in \
+  /etc/apt/sources.list \
+  /etc/apt/sources.list.d/*.list \
+  /etc/apt/sources.list.d/*.sources; do
+  if [[ -f "${source_file}" ]]; then
+    sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+      -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+      "${source_file}"
+  fi
+done
+
+apt_options=(
+  -o Acquire::Retries=5
+  -o Acquire::http::Pipeline-Depth=0
+)
+
+apt-get "${apt_options[@]}" update
+
+build_packages=(
   build-essential \
   ca-certificates \
   cmake \
@@ -34,6 +52,25 @@ apt-get install -y --no-install-recommends \
   python3.12-dev \
   python3.12-venv \
   unzip
+)
+
+for attempt in 1 2 3; do
+  if apt-get "${apt_options[@]}" install \
+    --fix-missing \
+    -y \
+    --no-install-recommends \
+    "${build_packages[@]}"; then
+    break
+  fi
+  if (( attempt == 3 )); then
+    echo "apt package installation failed after ${attempt} attempts." >&2
+    exit 1
+  fi
+  echo "Retrying apt package installation (${attempt}/3)..." >&2
+  apt-get "${apt_options[@]}" update
+  sleep $((attempt * 5))
+done
+
 rm -rf /var/lib/apt/lists/*
 
 curl -LsSf https://astral.sh/uv/install.sh | sh
