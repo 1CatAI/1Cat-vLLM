@@ -43478,6 +43478,17 @@ Interpretation:
   `VLLM_SM70_DSV4_FP16_GEMV=1`; keep
   `VLLM_SM70_DSV4_FUSED_FP16_AUX_GEMV` opt-in until an endpoint trace and
   aggregate dataset gate pass.
+- Two smaller launch-shape candidates are rejected and their source changes
+  are not retained. Changing the M=1 mHC FP32 dot tile from N=2 to N=4 is
+  bitwise across 64 changing inputs, but a 43-layer, 64.5-MiB weight-streaming
+  graph moves only `0.162908` to `0.158266 ms/stage`, saving `0.004642 ms`.
+  Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mhc-tile4-screen-20260826-r1/`.
+  Likewise, reducing the M=1/E=256 sqrt-softplus router block from four warps
+  to one preserves initial, 64-pattern, and M=33 fallback hashes, but moves 40
+  layer calls only `0.274614` to `0.274186 ms/token`, saving `0.000428 ms`.
+  Evidence is
+  `/data/models/v100-dsv4-0731-pp2tp4-post-endpoint-screens-20260826-r1/results/topk_warp1.json`.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 
