@@ -490,6 +490,35 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_prescaled_out"):
         return None
 
 
+def fp8_gemm_sm70_prescaled_m1_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    qweight: torch.Tensor,
+    prescaled_factors: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+) -> None:
+    _op("fp8_gemm_sm70_prescaled_m1_out")(
+        out, input, qweight, prescaled_factors, group_size, k_ld, q_ld
+    )
+
+
+if hasattr(torch.ops._C, "fp8_gemm_sm70_prescaled_m1_out"):
+
+    @register_fake("_C::fp8_gemm_sm70_prescaled_m1_out")
+    def _fp8_gemm_sm70_prescaled_m1_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        qweight: torch.Tensor,
+        prescaled_factors: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+    ) -> None:
+        return None
+
+
 def fp8_qpn8_prepare_sm70(
     qweight: torch.Tensor,
     scales: torch.Tensor,

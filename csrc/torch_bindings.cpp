@@ -323,6 +323,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_gemm_sm70_prefill_prescaled_out", torch::kCUDA,
            &fp8_gemm_sm70_prefill_prescaled_out);
 
+  // A distinct schema is also a capability marker: older extensions expose
+  // only the 8K-prefill contract and must not receive the new M=1 shapes.
+  ops.def(
+      "fp8_gemm_sm70_prescaled_m1_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _prescaled_factors, int group_size, int k_ld, "
+      "int q_ld) -> ()");
+  ops.impl("fp8_gemm_sm70_prescaled_m1_out", torch::kCUDA,
+           &fp8_gemm_sm70_prescaled_m1_out);
+
   ops.def(
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
       "Tensor[]");

@@ -3512,15 +3512,13 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   if (exact_8k_prefill_prescaled) {
     const bool qwen38_prefill =
         m == 8000 && k == 5120 && (n == 4096 || n == 3584);
-    const bool dsv4_m1 =
-        m == 1 && ((n == 1536 && k == 4096) ||
-                   (n == 8192 && k == 1024) ||
-                   (n == 4096 && k == 2048) ||
-                   (n == 1024 && k == 4096) ||
+    const bool prescaled_m1 =
+        m == 1 && ((n == 1536 && k == 4096) || (n == 8192 && k == 1024) ||
+                   (n == 4096 && k == 2048) || (n == 1024 && k == 4096) ||
                    (n == 4096 && k == 512));
-    TORCH_CHECK(qwen38_prefill || dsv4_m1,
+    TORCH_CHECK(qwen38_prefill || prescaled_m1,
                 "fp8_gemm_sm70: pre-scaled block-FP8 requires an accepted "
-                "Qwen3.8 prefill or DeepSeek V4 M=1 shape.");
+                "8K prefill or M=1 tensor shape.");
     TORCH_CHECK(!gated_silu,
                 "fp8_gemm_sm70: pre-scaled path does not fuse gated SILU.");
   }
@@ -5575,6 +5573,17 @@ void fp8_gemm_sm70_prefill_prescaled_out(torch::Tensor out,
                                          torch::Tensor _prescaled_factors,
                                          int64_t group_size, int64_t k_ld,
                                          int64_t q_ld) {
+  vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel, _prescaled_factors,
+                                    group_size, k_ld, q_ld, false, true);
+}
+
+void fp8_gemm_sm70_prescaled_m1_out(torch::Tensor out, torch::Tensor _in_feats,
+                                    torch::Tensor _kernel,
+                                    torch::Tensor _prescaled_factors,
+                                    int64_t group_size, int64_t k_ld,
+                                    int64_t q_ld) {
+  TORCH_CHECK(_in_feats.dim() == 2 && _in_feats.size(0) == 1,
+              "fp8_gemm_sm70_prescaled_m1_out requires a rank-2 M=1 input.");
   vllm::awq_sm70::fp8_gemm_sm70_out(out, _in_feats, _kernel, _prescaled_factors,
                                     group_size, k_ld, q_ld, false, true);
 }

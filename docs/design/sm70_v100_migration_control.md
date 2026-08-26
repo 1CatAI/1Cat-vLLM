@@ -43679,7 +43679,7 @@ Interpretation:
   `mistral_common` (`NamedToolChoice` import); no service or end-to-end run is
   claimed.
 
-## 2026-08-26 DeepSeek V4 exact FP8 prescaled-decode screen
+## 2026-08-26 exact SM70 FP8 prescaled-M1 decode screen
 
 - The SM70 E4M3 transform normally applies the exact exponent-bias factor and
   the checkpoint block scale as two FP16 multiplies. DeepSeek V4 UE8M0 block
@@ -43697,7 +43697,11 @@ Interpretation:
 - Production admission is initially narrower than the operator screen: SM70,
   UE8M0 128x128 block scales, PP2 x TP4, one sequence, no DBO/ubatching or
   speculation, M=1, and the exact replicated K4096/N1536 fused-WQA/WKV role.
-  Prefill, gated activation, other shapes, and other scale formats retain the
-  original TurboMind transform. The route is opt-in through
-  `VLLM_SM70_DSV4_FP8_PRESCALED_DECODE=1` until matched full-model speed and
-  pinned dataset gates complete.
+  Model loading also requires the actual FP16 scales to remain finite and
+  bitwise reversible after the 256x exponent shift. Prefill, gated activation,
+  other shapes, other scale formats, missing operators, and unsupported scale
+  ranges retain the original TurboMind transform. The route is default-on for
+  the exact tensor/runtime contract; `VLLM_SM70_FP8_PRESCALED_M1_DECODE=0`
+  is the rollback. An explicit `=1` fails closed when its contract cannot be
+  honored. Admission never reads model name, checkpoint, `model_type`, or
+  architecture identity.

@@ -282,20 +282,20 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1536x4096_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 5, 1, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x8192x1024_1" ||
       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x2048_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 3, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1024x4096_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 7, 1, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x512_1") {
     return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 1, true,
-                                "sm70_fp8_pscale_dsv4_m1"};
+                                "sm70_fp8_pscale_m1"};
   }
   return std::nullopt;
 }

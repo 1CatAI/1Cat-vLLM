@@ -25,13 +25,14 @@ from vllm.model_executor.layers.quantization.fp8 import (
     _SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES,
     Fp8LinearMethod,
     _get_sm70_fp8_prefill_exact_dense_workspace,
-    _is_sm70_dsv4_fp8_prescaled_decode_layer,
     _is_sm70_fp8_exact_8k_prefill_layer,
     _is_sm70_fp8_prefill_exact_dense_layer,
+    _is_sm70_fp8_prescaled_m1_decode_layer,
     _is_sm70_fp8_qpn8_layer,
     _is_sm70_fp8_qpn8_runtime_contract,
     _sm70_fp8_prefill_dense_workspaces,
     _sm70_fp8_prefill_visible_dense_mm,
+    _try_sm70_fp8_prescaled_decode_scales,
 )
 
 
@@ -677,7 +678,7 @@ def test_fp8_prefill_prescaled_scales_only_reach_exact_8k_route(monkeypatch):
     assert calls[2][2] is normal_scales
 
 
-def test_dsv4_fp8_prescaled_decode_admission_is_exact():
+def test_fp8_prescaled_m1_decode_admission_is_exact():
     layer = SimpleNamespace(
         prefix="model.layers.2.attn.fused_wqa_wkv",
         tp_size=1,
@@ -686,18 +687,38 @@ def test_dsv4_fp8_prescaled_decode_admission_is_exact():
         output_size_per_partition=1536,
         weight=torch.empty((1536, 4096), device="meta"),
     )
-    assert _is_sm70_dsv4_fp8_prescaled_decode_layer(layer)
+    assert _is_sm70_fp8_prescaled_m1_decode_layer(layer)
 
     layer.tp_size = 4
-    assert not _is_sm70_dsv4_fp8_prescaled_decode_layer(layer)
+    assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
     layer.tp_size = 1
     layer.prefix = "model.layers.2.attn.indexer.fused_wqa_wkv"
-    assert _is_sm70_dsv4_fp8_prescaled_decode_layer(layer)
+    assert _is_sm70_fp8_prescaled_m1_decode_layer(layer)
     layer.prefix = "model.layers.2.attn.wq_b"
-    assert not _is_sm70_dsv4_fp8_prescaled_decode_layer(layer)
+    assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
 
 
-def test_dsv4_fp8_prescaled_decode_only_handles_m1(monkeypatch):
+def test_fp8_prescaled_m1_decode_scale_gate_is_reversible():
+    scales = torch.tensor([2**-12, 2**-11, 0.0], dtype=torch.float16)
+    prescaled = _try_sm70_fp8_prescaled_decode_scales(scales)
+    assert prescaled is not None
+    torch.testing.assert_close(prescaled, scales * 256, rtol=0, atol=0)
+
+    assert (
+        _try_sm70_fp8_prescaled_decode_scales(
+            torch.tensor([512.0], dtype=torch.float16)
+        )
+        is None
+    )
+    assert (
+        _try_sm70_fp8_prescaled_decode_scales(
+            torch.tensor([-(2**-12)], dtype=torch.float16)
+        )
+        is None
+    )
+
+
+def test_fp8_prescaled_m1_decode_only_handles_m1(monkeypatch):
     calls = []
 
     def fake_default(out, input, qweight, scales, *args):
@@ -714,7 +735,7 @@ def test_dsv4_fp8_prescaled_decode_only_handles_m1(monkeypatch):
     )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8.sm70_ops."
-        "fp8_gemm_sm70_prefill_prescaled_out",
+        "fp8_gemm_sm70_prescaled_m1_out",
         fake_prescaled,
     )
     normal_scales = torch.empty((1, 6), dtype=torch.float16)
@@ -731,12 +752,12 @@ def test_dsv4_fp8_prescaled_decode_only_handles_m1(monkeypatch):
     )
     method = SimpleNamespace()
 
-    monkeypatch.setenv("VLLM_SM70_DSV4_FP8_PRESCALED_DECODE", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
     envs.disable_envs_cache()
     try:
         Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
         Fp8LinearMethod.apply(method, layer, torch.empty((2, 4), dtype=torch.float16))
-        monkeypatch.setenv("VLLM_SM70_DSV4_FP8_PRESCALED_DECODE", "0")
+        monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "0")
         envs.disable_envs_cache()
         Fp8LinearMethod.apply(method, layer, torch.empty((1, 4), dtype=torch.float16))
     finally:
