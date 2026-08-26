@@ -1130,7 +1130,9 @@ bool fp8_0dot3_dense_selector_enabled() {
 
 bool fp8_safe_fast_selector_enabled() {
   const char* raw = std::getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR");
-  return raw != nullptr && std::atoi(raw) != 0;
+  // Keep the default kernel and split-K accumulation tree while allowing the
+  // measured lane to select scheduling-only parameters such as swizzle.
+  return raw == nullptr || std::atoi(raw) != 0;
 }
 
 bool fp8_grouped_bmm_decode_enabled() {

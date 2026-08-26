@@ -155,7 +155,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
-    VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
+    VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_GROUPED_BMM_DECODE: bool = True
     VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
@@ -1767,7 +1767,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "0"))
     ),
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
+        int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "1"))
     ),
     "VLLM_SM70_FP8_GROUPED_BMM_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "1"))
