@@ -179,13 +179,10 @@ jobs:
         run: bash tools/check_repo.sh
 
   build_self_hosted:
-    name: Build native wheel (primary)
+    name: Build native wheel (self-hosted)
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 340
-    container:
-      image: nvidia/cuda:12.8.2-devel-ubuntu24.04
-      options: --user 0
     env:
       GH_TOKEN: ${{ github.token }}
       PYTHON_VERSION: "3.12"
@@ -197,10 +194,14 @@ jobs:
       TORCH_CUDA_ARCH_LIST: "7.0"
       FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
       VLLM_BUILD_FLASH_ATTN_V100: "1"
+      MAX_JOBS: "20"
+      CMAKE_BUILD_PARALLEL_LEVEL: "20"
+      NVCC_THREADS: "1"
+      CARGO_BUILD_JOBS: "20"
       CMAKE_BUILD_TYPE: Release
 
     steps:
-      - name: Install build tools in the CUDA container
+      - name: Install build tools on the self-hosted runner
         shell: bash
         run: |
           set -euo pipefail
@@ -260,20 +261,15 @@ jobs:
           test -s vllm/vllm-rs
           chmod +x vllm/vllm-rs
 
-      - name: Resolve build parallelism
+      - name: Verify self-hosted build parallelism
         shell: bash
         run: |
           set -euo pipefail
           cpu_count="$(nproc)"
-          jobs="$cpu_count"
-          if (( jobs > 8 )); then
-            jobs=8
+          if (( cpu_count < 20 )); then
+            echo "::warning::Runner exposes ${cpu_count} CPUs; build is configured for 20 jobs."
           fi
-          echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
-          echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
-          echo "NVCC_THREADS=1" >> "$GITHUB_ENV"
-          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
-          echo "Build parallelism: ${jobs} compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
+          echo "Build parallelism: 20 compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
 
       - name: Install the pinned Rust toolchain
         if: env.RUST_CHANGED == 'true'
