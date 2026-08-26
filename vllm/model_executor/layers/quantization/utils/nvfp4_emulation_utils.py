@@ -21,6 +21,7 @@ kE2M1ToFloat_handle = SimpleNamespace(
     val=torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 )
 _TRITON_NVFP4_EMULATION_SUPPORTED: bool | None = None
+_TRITON_NVFP4_DEQUANTIZATION_SUPPORTED: bool | None = None
 
 
 def _supports_triton_nvfp4_emulation(device: torch.device | None = None) -> bool:
@@ -34,6 +35,27 @@ def _supports_triton_nvfp4_emulation(device: torch.device | None = None) -> bool
             and current_platform.has_device_capability(89)
         )
     return _TRITON_NVFP4_EMULATION_SUPPORTED
+
+
+def _supports_triton_nvfp4_dequantization(
+    device: torch.device | None = None,
+) -> bool:
+    """Return whether the weight-only Triton dequantizer can run.
+
+    The full quantize-dequantize emulation kernel needs the native
+    ``tl.float8e4nv`` type and therefore remains gated to SM89+.  Weight
+    dequantization can also run on older CUDA GPUs because its E4M3 scale
+    bytes are decoded with regular integer and float32 operations.
+    """
+    if device is not None and device.type != "cuda":
+        return False
+
+    global _TRITON_NVFP4_DEQUANTIZATION_SUPPORTED
+    if _TRITON_NVFP4_DEQUANTIZATION_SUPPORTED is None:
+        _TRITON_NVFP4_DEQUANTIZATION_SUPPORTED = _supports_triton_nvfp4_emulation(
+            device
+        ) or (current_platform.is_cuda() and current_platform.has_device_capability(70))
+    return _TRITON_NVFP4_DEQUANTIZATION_SUPPORTED
 
 
 def _quantize_e4m3fn_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -78,6 +100,21 @@ def _e2m1_inline(magnitude):
 
 
 @triton.jit
+def _e4m3fn_byte_to_float(raw):
+    """Decode E4M3FN bytes without using a native FP8 Triton type."""
+    raw_i32 = raw.to(tl.int32)
+    sign = tl.where((raw_i32 & 0x80) == 0, 1.0, -1.0)
+    exponent = (raw_i32 >> 3) & 0x0F
+    mantissa = raw_i32 & 0x07
+    mantissa_f32 = mantissa.to(tl.float32)
+    normal = (1.0 + mantissa_f32 * 0.125) * tl.exp2(exponent.to(tl.float32) - 7.0)
+    subnormal = mantissa_f32 * 0.001953125  # 2**-9
+    value = sign * tl.where(exponent == 0, subnormal, normal)
+    is_nan = (exponent == 0x0F) & (mantissa == 0x07)
+    return tl.where(is_nan, float("nan"), value)
+
+
+@triton.jit
 def _dequantize_nvfp4_kernel(
     fp4_ptr,
     scale_ptr,
@@ -88,6 +125,7 @@ def _dequantize_nvfp4_kernel(
     BLOCK_SIZE: tl.constexpr,
     has_batch_global_scale: tl.constexpr,
     TILE_BLOCKS: tl.constexpr,
+    NATIVE_FP8_SCALE_DECODE: tl.constexpr,
 ):
     """Triton kernel for NVFP4 dequantization (swizzle=False).
 
@@ -119,7 +157,10 @@ def _dequantize_nvfp4_kernel(
         mask=block_mask,
         other=0,
     )
-    scale_f32 = tl.cast(raw_scales, tl.float8e4nv, bitcast=True).to(tl.float32)
+    if NATIVE_FP8_SCALE_DECODE:
+        scale_f32 = tl.cast(raw_scales, tl.float8e4nv, bitcast=True).to(tl.float32)
+    else:
+        scale_f32 = _e4m3fn_byte_to_float(raw_scales)
     scale_values = (scale_f32 * global_scale)[:, None]
 
     # Load [TILE_BLOCKS, BLOCK_PACKED] packed bytes
@@ -345,6 +386,7 @@ def _triton_dequantize_nvfp4(
         block_size,
         is_3d,
         tile_blocks,
+        _supports_triton_nvfp4_emulation(tensor_fp4.device),
         num_warps=nw,
         num_stages=ns,
     )
@@ -406,7 +448,7 @@ def dequantize_to_dtype(
     # Two fp4 values are packed into one uint8.
     assert tensor_fp4.dtype == torch.uint8
 
-    if not swizzle and _supports_triton_nvfp4_emulation(tensor_fp4.device):
+    if not swizzle and _supports_triton_nvfp4_dequantization(tensor_fp4.device):
         return _triton_dequantize_nvfp4(
             tensor_fp4, tensor_sf, global_scale, dtype, block_size
         )

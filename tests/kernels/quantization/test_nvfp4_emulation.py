@@ -64,6 +64,65 @@ def test_nvfp4_sm70_e4m3_scale_fallback_matches_torch_float8(monkeypatch) -> Non
 
 
 @pytest.mark.skipif(
+    not (current_platform.is_cuda() and current_platform.has_device_capability(70)),
+    reason="SM70 NVFP4 weight dequantization requires CUDA SM70+.",
+)
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+def test_sm70_triton_weight_dequantization_matches_reference(
+    monkeypatch, output_dtype: torch.dtype
+) -> None:
+    """The integer E4M3 decoder must exactly match the PyTorch fallback."""
+    block_size = 16
+    raw_scales = torch.arange(256, dtype=torch.uint8)
+    rows = raw_scales.numel()
+    tensor_sf = raw_scales.reshape(rows, 1).view(torch.float8_e4m3fn).cuda()
+    tensor_fp4 = (
+        torch.arange(rows * (block_size // 2), dtype=torch.int32)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(rows, block_size // 2)
+        .cuda()
+    )
+    global_scale = torch.tensor(0.75, dtype=torch.float32, device="cuda")
+
+    monkeypatch.setattr(
+        nvfp4_emulation_utils, "_TRITON_NVFP4_EMULATION_SUPPORTED", False
+    )
+    monkeypatch.setattr(
+        nvfp4_emulation_utils,
+        "_TRITON_NVFP4_DEQUANTIZATION_SUPPORTED",
+        True,
+    )
+    actual = dequantize_to_dtype(
+        tensor_fp4,
+        tensor_sf,
+        global_scale,
+        output_dtype,
+        block_size,
+        swizzle=False,
+    )
+
+    with monkeypatch.context() as reference_patch:
+        reference_patch.setattr(
+            nvfp4_emulation_utils,
+            "_TRITON_NVFP4_DEQUANTIZATION_SUPPORTED",
+            False,
+        )
+        expected = dequantize_to_dtype(
+            tensor_fp4,
+            tensor_sf,
+            global_scale,
+            output_dtype,
+            block_size,
+            swizzle=False,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    finite_rows = (raw_scales & 0x7F) != 0x7F
+    assert torch.equal(actual[finite_rows], expected[finite_rows])
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
     reason="Triton NVFP4 kernel requires CUDA.",
 )
