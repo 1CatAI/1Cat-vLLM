@@ -43705,3 +43705,40 @@ Interpretation:
   is the rollback. An explicit `=1` fails closed when its contract cannot be
   honored. Admission never reads model name, checkpoint, `model_type`, or
   architecture identity.
+
+## 2026-08-26 DeepSeek V4 packed-FP13 GEMV screen
+
+- The fixed batch-one SM70 auxiliary/router GEMV reads FP16 parameters that
+  originate from BF16 checkpoint weights. Packing the upper 13 FP16 bits
+  stores 32 values in 13 uint32 words and reduces weight traffic by 18.75%.
+  A full checkpoint scan covered all 188 eligible tensors and 354,680,832
+  values. All 409,653 nonzero discarded tails were FP16 subnormals; no normal
+  value had a discarded bit and no nonfinite value was present. The worst
+  tensor-relative weight L2 is `3.19e-6`, with maximum absolute error
+  `4.18e-7`.
+- Offline SM70 compilation of the single-reduction kernel reports 29 registers,
+  17 global loads, 32 FFMA, eight shuffles, two barriers, and 227 static SASS
+  instructions. The exact source-BF13 variant uses 30 registers and 334
+  instructions; rounded BF12 uses 31 registers and 327 instructions. FP13 is
+  therefore the only retained packed-GEMV candidate for production screening.
+- The existing Nsight trace shows why the full 2.554-ms stage-sum GEMV service
+  must not be projected as endpoint savings. At a representative C4 layer the
+  default-stream FP8 projection takes 43.008 us while concurrent N2048/N512/N64
+  GEMVs take 37.600/25.120/22.496 us. The auxiliaries complete before the
+  downstream dependency. Any wall benefit comes from lower concurrent HBM
+  contention plus the default-stream router GEMV, so an exclusive-V100 overlap
+  screen and then a matched endpoint are required.
+- The production FP13 operator screen on real weights saves a call-count-weighted
+  `0.2074 ms/token` warm and `0.1998 ms/token` cold versus the FP16 operator.
+  An archived four-stream CUDA Graph screen at the source head was stable under
+  A/B/B/A ordering and saved `0.0550 ms` warm and `0.0310 ms` cold per C4 layer,
+  with 64/64 bitwise main-path results and maximum auxiliary relative L2
+  `4.03e-7`. That overlap result is directional after the mainline FP8 M=1 API
+  split and is not relabeled as a current-main endpoint result.
+- Production defaults on through `VLLM_SM70_DSV4_FP13_GEMV=1`; explicit `=0`
+  is the rollback. Admission checks SM70, CUDA device equality, dtype, shape,
+  layout, output contract, and the actual weight bits. It never reads a model
+  name or checkpoint identity, and an incompatible tensor retains FP16. Packing
+  occurs once after loading; capture and per-token execution perform no packing.
+  The retained buffers add 549.66 MiB without pipeline parallelism, or at most
+  282.34 MiB per rank for the audited PP2 partition.

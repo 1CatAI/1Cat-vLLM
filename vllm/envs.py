@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
+    VLLM_SM70_DSV4_FP13_GEMV: bool = True
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
     VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4: bool = True
     VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = True
@@ -1816,6 +1817,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))
+    ),
+    "VLLM_SM70_DSV4_FP13_GEMV": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "1"))
     ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))

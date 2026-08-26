@@ -369,6 +369,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if not current_platform.is_cuda_alike():
             return
 
+        if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
+            layer, "_sm70_dsv4_fp13_gemv", False
+        ):
+            from vllm.models.deepseek_v4.sm70.gemv import (
+                prepare_sm70_dsv4_fp13_gemv,
+            )
+
+            prepare_sm70_dsv4_fp13_gemv(layer)
+
         force_enable = getattr(layer, "_sm70_f16_force_enable", False)
         if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH and not force_enable:
             return

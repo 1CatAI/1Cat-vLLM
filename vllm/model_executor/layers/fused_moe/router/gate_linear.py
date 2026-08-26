@@ -57,6 +57,7 @@ class GateLinear(ReplicatedLinear):
             prefix=prefix,
         )
         self.out_dtype = out_dtype
+        self._sm70_dsv4_fp13_gemv = True
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
@@ -95,12 +96,19 @@ class GateLinear(ReplicatedLinear):
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         import vllm._custom_ops as ops
 
-        if envs.VLLM_SM70_DSV4_FP16_GEMV and self.out_dtype is not None:
+        if (
+            envs.VLLM_SM70_DSV4_FP16_GEMV or envs.VLLM_SM70_DSV4_FP13_GEMV
+        ) and self.out_dtype is not None:
             from vllm.models.deepseek_v4.sm70.gemv import (
                 maybe_sm70_dsv4_fp16_gemv,
             )
 
-            output = maybe_sm70_dsv4_fp16_gemv(x, self.weight, self.out_dtype)
+            output = maybe_sm70_dsv4_fp16_gemv(
+                x,
+                self.weight,
+                self.out_dtype,
+                getattr(self, "_sm70_dsv4_fp13_weight", None),
+            )
             if output is not None:
                 return output, None
 

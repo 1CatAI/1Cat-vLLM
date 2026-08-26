@@ -416,6 +416,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     hidden_states,
                     compressor.fused_wkv_wgate.weight,
                     torch.float32,
+                    getattr(
+                        compressor.fused_wkv_wgate,
+                        "_sm70_dsv4_fp13_weight",
+                        None,
+                    ),
                 )
                 if output is not None:
                     return output
@@ -435,6 +440,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     hidden_states,
                     indexer.weights_proj.weight,
                     hidden_states.dtype,
+                    getattr(
+                        indexer.weights_proj,
+                        "_sm70_dsv4_fp13_weight",
+                        None,
+                    ),
                 )
                 if output is not None:
                     return output
@@ -447,6 +457,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight,
                     torch.float32,
+                    getattr(
+                        indexer.compressor.fused_wkv_wgate,
+                        "_sm70_dsv4_fp13_weight",
+                        None,
+                    ),
                 )
                 if output is not None:
                     return output
@@ -851,6 +866,7 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
+        self.weights_proj._sm70_dsv4_fp13_gemv = True
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"

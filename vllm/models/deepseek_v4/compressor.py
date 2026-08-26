@@ -304,6 +304,7 @@ class DeepseekCompressor(nn.Module):
             disable_tp=True,
             prefix=f"{prefix}.fused_wkv_wgate",
         )
+        self.fused_wkv_wgate._sm70_dsv4_fp13_gemv = True
         self.norm = RMSNorm(self.head_dim, self.rms_norm_eps)
 
         self.state_cache = CompressorStateCache(
