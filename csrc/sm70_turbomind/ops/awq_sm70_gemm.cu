@@ -8301,10 +8301,10 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
   const bool broadcast_compact_decode_shape =
       input.size(0) == 1 && out.dim() == 2 && out.size(0) == num_experts &&
       num_experts == 6 && k == 4096 && (n == 512 || n == 1024);
-  TORCH_CHECK(out.dim() == 2 && out.size(1) == n &&
-                  (out.size(0) == input.size(0) ||
-                   broadcast_compact_decode_shape),
-              "mxfp4_moe_dense_stage_sm70_out: out shape mismatch.");
+  TORCH_CHECK(
+      out.dim() == 2 && out.size(1) == n &&
+          (out.size(0) == input.size(0) || broadcast_compact_decode_shape),
+      "mxfp4_moe_dense_stage_sm70_out: out shape mismatch.");
   TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
               "mxfp4_moe_dense_stage_sm70_out: expert_offsets too small.");
   TORCH_CHECK(dense_expert_ids.numel() >= num_experts,
@@ -8323,10 +8323,9 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
   if (broadcast_compact_decode_shape ||
       (vllm::awq_sm70::mxfp4_moe_compact_grouped_decode_enabled() &&
        compact_decode_shape)) {
-    mxfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
-                                 num_experts, k, n, group_size,
-                                 dense_expert_ids, true,
-                                 broadcast_compact_decode_shape);
+    mxfp4_moe_gemm_sm70_out_impl(
+        out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n,
+        group_size, dense_expert_ids, true, broadcast_compact_decode_shape);
     return;
   }
   const bool grouped_m8_shape =

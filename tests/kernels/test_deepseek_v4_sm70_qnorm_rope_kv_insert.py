@@ -152,7 +152,7 @@ def test_sm70_tp4_fused_qnorm_kv_insert_matches_legacy(
             eps=1e-6,
             block_size=block_size,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         return q, storage
 
     legacy_q, legacy_storage = run(False)

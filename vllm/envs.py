@@ -246,13 +246,13 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
-    VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
+    VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = True
     VLLM_SM70_MXFP4_MOE_GROUPED_M8: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
-    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
-    VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = False
+    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = True
+    VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = True
     VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE: bool = True
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
@@ -2177,7 +2177,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.
     "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "0"))
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "1"))
     ),
     # Experimental verifier-M8 grouped dispatch. This collapses the fixed 48
     # active-expert stage calls into one TurboMind grouped launch.
@@ -2203,14 +2203,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip the generic 256-expert sort/permute/unpermute pipeline for the
     # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
     "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "0"))
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "1"))
     ),
     # Keep the six B1 routes in their original top-k order. Compact W13/W2
     # then consume topk_ids directly, so no sort/inverse-permutation prepare
-    # kernel is needed. This stays independently gated until endpoint and
-    # quality acceptance are complete.
+    # kernel is needed. Exact shape/route checks remain in the caller and =0
+    # restores the stable-sort path.
     "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "0"))
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))
     ),
     "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))

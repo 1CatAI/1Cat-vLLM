@@ -232,7 +232,7 @@ def sm70_qnorm_rope_kv_fp8_insert(
             cos_sin_cache,
             cache_2d.stride(0),
             eps,
-            slot_mapping.shape[0],
+            num_tokens,
             num_heads=num_heads,
             cache_block_size=block_size,
             HEAD_DIM=_HEAD_DIM,
