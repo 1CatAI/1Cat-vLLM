@@ -201,43 +201,12 @@ jobs:
       CMAKE_BUILD_TYPE: Release
 
     steps:
-      - name: Verify preinstalled self-hosted build tools
+      - name: Verify host Docker access
         shell: bash
         run: |
           set -euo pipefail
-          required_tools=(
-            cmake
-            ninja
-            nvcc
-            gcc
-            g++
-            git
-            curl
-            jq
-            patchelf
-            pkg-config
-            unzip
-          )
-          missing_tools=()
-          for tool in "${required_tools[@]}"; do
-            if ! command -v "$tool" >/dev/null 2>&1; then
-              missing_tools+=("$tool")
-            fi
-          done
-          if ((${#missing_tools[@]})); then
-            printf 'Missing preinstalled self-hosted tools: %s\n' \
-              "${missing_tools[*]}" >&2
-            exit 1
-          fi
-          cpu_count="$(nproc)"
-          if (( cpu_count < 20 )); then
-            echo "Self-hosted runner exposes only ${cpu_count} CPUs; 20 are required." >&2
-            exit 1
-          fi
-          cmake --version | head -n 1
-          echo "Ninja version: $(ninja --version)"
-          nvcc --version | tail -n 1
-          echo "Verified ${cpu_count} CPUs and the complete CUDA build toolchain."
+          command -v docker
+          docker info >/dev/null
 
       - name: Check out the source commit
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
@@ -249,113 +218,47 @@ jobs:
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          cache-dependency-glob: |
-            requirements/**/*.txt
-            pyproject.toml
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Create build environment
-        shell: bash
-        run: uv venv --python "${PYTHON_VERSION}"
-
-      - name: Reuse Rust frontend from the latest release
-        if: env.RUST_CHANGED != 'true'
+      - name: Build native wheel in the CUDA container
+        env:
+          BUILD_IMAGE: nvidia/cuda:12.8.2-devel-ubuntu24.04
         shell: bash
         run: |
           set -euo pipefail
-          baseline_wheel="$RUNNER_TEMP/base-wheel.whl"
-          curl -fL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            "$BASE_WHEEL_URL" \
-            -o "$baseline_wheel"
-          unzip -p "$baseline_wheel" vllm/vllm-rs > vllm/vllm-rs
-          test -s vllm/vllm-rs
-          chmod +x vllm/vllm-rs
+          container_name="vllm-native-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
 
-      - name: Verify self-hosted build parallelism
-        shell: bash
-        run: |
-          set -euo pipefail
-          cpu_count="$(nproc)"
-          if (( cpu_count < 20 )); then
-            echo "::warning::Runner exposes ${cpu_count} CPUs; build is configured for 20 jobs."
-          fi
-          echo "Build parallelism: 20 compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
+          docker pull "$BUILD_IMAGE"
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
+          docker create \
+            --name "$container_name" \
+            --cpus 20 \
+            -e GH_TOKEN \
+            -e PYTHON_VERSION \
+            -e VLLM_VERSION_OVERRIDE \
+            -e VLLM_TARGET_DEVICE \
+            -e VLLM_REQUIRE_RUST_FRONTEND \
+            -e RUST_CHANGED \
+            -e BASE_WHEEL_URL \
+            -e TORCH_CUDA_ARCH_LIST \
+            -e FLASH_ATTN_V100_CUDA_ARCH_LIST \
+            -e VLLM_BUILD_FLASH_ATTN_V100 \
+            -e MAX_JOBS \
+            -e CMAKE_BUILD_PARALLEL_LEVEL \
+            -e NVCC_THREADS \
+            -e CARGO_BUILD_JOBS \
+            -e CMAKE_BUILD_TYPE \
+            -e RUNNER_TEMP=/tmp/runner-temp \
+            "$BUILD_IMAGE" \
+            bash -lc 'cd /workspace && exec bash tools/ci/build_native_wheel_in_docker.sh'
+          docker cp "$GITHUB_WORKSPACE/." "$container_name:/workspace"
+          docker start --attach "$container_name"
 
-      - name: Install the pinned Rust toolchain
-        if: env.RUST_CHANGED == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none
-          source "$HOME/.cargo/env"
-          rustup toolchain install 1.95.0 --profile minimal
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install build and runtime dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sed -E -i \
-            's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
-            requirements/cuda.txt
-          uv pip install --python .venv/bin/python \
-            -r requirements/build/cuda.txt \
-            -r requirements/cuda.txt \
-            --torch-backend=cu128
-
-      - name: Verify CUDA PyTorch installation
-        shell: bash
-        run: |
-          set -euo pipefail
-          .venv/bin/python - <<'PY'
-          import torch
-
-          if torch.version.cuda is None:
-              raise SystemExit("The resolved PyTorch package is CPU-only.")
-          print(f"PyTorch CUDA runtime: {torch.version.cuda}")
-          PY
-
-      - name: Build the complete native wheel
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf build dist vllm.egg-info
-          rm -rf .deps/*-build .deps/*-subbuild
-          .venv/bin/python setup.py bdist_wheel --dist-dir=dist
-
-          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
-          if [[ -z "$wheel_path" ]]; then
-            echo "The build produced no wheel." >&2
-            exit 1
-          fi
-          case "$(basename "$wheel_path")" in
-            *-cp312-cp312-linux_x86_64.whl) ;;
-            *)
-              echo "Unexpected wheel platform: $(basename "$wheel_path")" >&2
-              exit 1
-              ;;
-          esac
-
-          wheel_listing="$RUNNER_TEMP/wheel.listing"
-          unzip -l "$wheel_path" > "$wheel_listing"
-          grep -q "vllm/vllm-rs" "$wheel_listing"
-          grep -q "vllm/_C.abi3.so" "$wheel_listing"
-
-          metadata_name="$(awk '/\.dist-info\/METADATA$/ {print $4; exit}' "$wheel_listing")"
-          unzip -p "$wheel_path" "$metadata_name" > "$RUNNER_TEMP/wheel.metadata"
-          actual_version="$(sed -n 's/^Version: //p' "$RUNNER_TEMP/wheel.metadata" | sed -n '1p')"
-          if [[ "$actual_version" != "$VLLM_VERSION_OVERRIDE" ]]; then
-            echo "Wheel version mismatch: $actual_version != $VLLM_VERSION_OVERRIDE" >&2
-            exit 1
-          fi
-          echo "Validated $(basename "$wheel_path")"
+          rm -rf dist
+          mkdir -p dist
+          docker cp "$container_name:/workspace/dist/." "$GITHUB_WORKSPACE/dist/"
 
       - name: Upload the native wheel
         uses: actions/upload-artifact@v4
