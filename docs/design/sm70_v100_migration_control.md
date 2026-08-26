@@ -43498,6 +43498,17 @@ Interpretation:
   is warranted and the source change is not retained. The isolated candidate
   failure is under
   `/data/models/v100-dsv4-0731-pp2tp4-fp8-exponent-fold-screen-20260826-r6/`.
+- MXFP4 gated-SwiGLU epilogues remain rejected as endpoint priorities. The
+  real layer-0 TP4-rank-0 screen is bitwise at the activated intermediate and
+  W2 output for 64 changing inputs across scales `0.01/0.1/1/4`, but the full
+  W13-to-W2 pipeline saves only `0.978 us/layer`, or `0.042 ms/token` across
+  43 layers. The much larger isolated W13-plus-activation delta is contradicted
+  by the complete pipeline and is not used. A same-address paired variant
+  independently projects only `0.143 ms/token`. Neither source candidate is
+  retained. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-gated-silu-screen-20260826-r1/`
+  and
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-gated-epilogue-screen-20260826-r2/`.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 
