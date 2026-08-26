@@ -43932,3 +43932,23 @@ Interpretation:
   PR for this continuation use the private remote and the isolated branch
   `agent/private-v100-dsv4-pp2tp4-followup-20260826`; public upstream is
   fetch-only for this work.
+- The source-`22a25e877f` quality-safe stack now has a fresh 28-step steady
+  Nsight trace. Its output-token prefix is exactly equal to the pinned
+  uninstrumented request. Nsight injection expands the replay interval to
+  `15.410 ms`; the matched uninstrumented baseline remains `13.598 ms/token`
+  and `73.539 token/s`. Excluding PP dependency residency, stage-sum service
+  is led by FP8 dense `6.133 ms`, FP16 GEMV/compressor `2.328 ms`, MXFP4 MoE
+  `2.208 ms`, mHC `1.750 ms`, Q/KV work `1.122 ms`, sparse MLA `1.119 ms`,
+  routing/activation `1.003 ms`, and TP all-reduce `0.852 ms`. Evidence is
+  under
+  `/data/models/v100-dsv4-0731-pp2tp4-quality-safe-nsys-20260827-r2/`.
+- Packed FP13 is now quality-gated off by default, so the earlier reason for
+  shelving the exact C4 auxiliary fusion no longer applies. The private
+  candidate rejoins the real `N=2048/512/64`, `K=4096` FP16 weights and uses
+  the unchanged block-K-1024 FP32 FMA/reduction kernel in one `N=2624` launch.
+  It is mutually exclusive with FP13 and remains default-off. Prior real-V100
+  evidence has 64/64 bitwise main and auxiliary patterns and changes warm
+  overlap from `103.809` to `51.639 us/C4 layer`, and cold overlap from
+  `99.104` to `73.856 us/C4 layer`. Current-source operator, endpoint, and
+  per-sample dataset gates are pending, so none of that projected saving is
+  admitted into the `73.539 token/s` baseline yet.
