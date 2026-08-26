@@ -132,15 +132,14 @@ _SM70_FP8_QPN8_EXTRA_SHAPES = {
     "qkv_proj": (5120, 3584),
 }
 _SM70_FP8_QPN8_PP2_TP4_CONFIGS = {
-    # Accuracy-first real-weight schedules: (K, N, fused gated-SiLU) maps to
-    # (split-K, accumulator chains, prefetch codes). The shared-expert gate/up
-    # projection is deliberately absent after its four-pattern comparison
-    # matched only 53.5--60.9% of TurboMind FP16 elements.
-    (4096, 1536, False): (16, 1, True),
-    (1024, 8192, False): (4, 1, False),
-    (2048, 4096, False): (8, 2, False),
-    (4096, 1024, False): (16, 1, True),
-    (512, 4096, False): (4, 1, False),
+    # Real-weight speed winners remain numerically bounded for every admitted
+    # projection. The shared-expert gate/up role is deliberately absent below
+    # after its fused activation matched only 53.5% of TurboMind FP16 elements.
+    (4096, 1536, False): (32, 2, False),
+    (1024, 8192, False): (8, 2, False),
+    (2048, 4096, False): (16, 2, False),
+    (4096, 1024, False): (32, 2, False),
+    (512, 4096, False): (16, 2, False),
 }
 _SM70_FP8_QPN8_PP2_TP4_SHAPES = {
     # Operator role: accepted (layer TP size, K, N) tuples. The shared-expert

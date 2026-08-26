@@ -43519,28 +43519,48 @@ Interpretation:
   contract, validate artifact self-consistency, and gate aggregate HumanEval,
   LongBench, GSM8K, and needle-retrieval quality. They report directional
   sample flips but do not treat greedy identity as task quality.
-- A post-merge real-weight accuracy audit replaces the PP2 x TP4 route's
-  fastest single-pattern schedules with four-pattern accuracy-first schedules.
-  Fused WQA/WKV, attention WQ-B/WO-B, grouped WO-A, and shared-expert down
-  retain at least `99.707%` exact FP16 elements and at most `1.444e-5`
-  relative L2 error against same-process TurboMind. Shared-expert gate/up
-  retains only `53.516%` exact elements with its fused activation and is
-  removed from the default QPN8 tensor contract; the replicated indexer WQ-B
-  remains excluded.
-- The latest-main production source gate covers M=1 and M=9, changing-input
-  CUDA Graph replay, FP32 and TurboMind references, grouped WO-A layout, and
-  both excluded roles. All five admitted projections pass, both excluded roles
-  remain on TurboMind, and the route reuses one 16-MiB workspace. Evidence is
-  under `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-source-gate-20260826-r2-main/`.
-  The isolated weighted projection is `6.067 -> 3.321 ms/token` of stage-sum
-  FP8 service; it is not an endpoint TPOT claim.
+- A post-merge four-pattern, real-weight matrix separates a single numerical
+  outlier from five already-bounded fast schedules. Fused WQA/WKV, attention
+  WQ-B/WO-B, grouped WO-A, and shared-expert down retain at least `99.707%`
+  exact FP16 elements and at most `1.641e-5` relative L2 against same-process
+  TurboMind with their existing speed winners. Their accuracy-first schedules
+  are about 15--36% slower at the isolated operator while only reducing errors
+  that are already in the `1e-5` range, so the production route keeps the
+  speed winners. The matrix is under
+  `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-matrix-20260826-r1/`.
+- Shared-expert gate/up is the material outlier: its fused activation retains
+  only `53.516%` exact elements and reaches `5.989e-4` relative L2. It is the
+  only role removed from the default QPN8 tensor contract and now falls back
+  to TurboMind. The replicated indexer WQ-B remains excluded. This narrows an
+  existing hardware/topology/tensor route; it does not add a model-identity
+  admission rule or disable QPN8 globally.
+- The conservative all-accuracy source gate covers M=1 and M=9,
+  changing-input CUDA Graph replay, FP32 and TurboMind references, grouped
+  WO-A layout, both excluded roles, and one reused 16-MiB workspace. All five
+  admitted projections pass and both excluded roles remain on TurboMind.
+  Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-source-gate-20260826-r2-main/`.
+  Its isolated weighted projection is `6.067 -> 3.321 ms/token` of stage-sum
+  FP8 service; this is a conservative lower-speed variant, not an endpoint
+  TPOT claim for the retained speed-winner schedules.
 - Withdraw the earlier causal attribution of a `63/64 -> 2/64` GSM8K result to
   fused-WQA QPN8 alone. That recorded endpoint also pinned five static FP8
   tactics and enabled grouped WO-A; the static-FP8-only endpoint reproduces
   the same class of incoherent output. Those artifacts prove that the bundled
-  configuration fails, not which operator caused it. Keep the accuracy-first
-  schedule change unmerged until a clean matched pure-decode run and pinned
-  dataset gates close.
+  configuration fails, not which operator caused it.
+- Clean matched PP2 x TP4, B1, no-spec runs now close the conservative
+  all-accuracy variant. QPN8-off records a median `63.6434 tok/s` and
+  `15.71254 ms/token`; the all-accuracy candidate records `63.9120 tok/s` and
+  `15.64652 ms/token`, about `+0.42%` and `-0.066 ms/token`. The paired pinned
+  GSM8K64 run is `62/64` versus `61/64`, with zero invalid outputs and one
+  directional difference at item 37. That single sample remains visible, but
+  it is not a greedy-identity gate and does not show that choosing the lowest
+  operator error improves aggregate task quality. The accepted repair
+  therefore preserves every numerically bounded speed winner and falls back
+  only the demonstrated gate/up outlier. Full artifacts are under
+  `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-fullmodel-control-20260826-r1/`
+  and
+  `/data/models/v100-dsv4-0731-pp2tp4-qpn8-accuracy-fullmodel-candidate-20260826-r2/`.
 
 ## 2026-08-26 generic multimodal-tower UVA offload
 

@@ -52,10 +52,10 @@ def test_pp2_tp4_qpn8_is_default_on_with_explicit_rollback(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("layer", "gated_silu", "expected"),
     [
-        (_layer("fused_wqa_wkv", 1, 4096, 1536), False, (16, 1, True)),
-        (_layer("wq_b", 4, 1024, 8192), False, (4, 1, False)),
-        (_layer("wo_b", 4, 2048, 4096), False, (8, 2, False)),
-        (_layer("down_proj", 4, 512, 4096), False, (4, 1, False)),
+        (_layer("fused_wqa_wkv", 1, 4096, 1536), False, (32, 2, False)),
+        (_layer("wq_b", 4, 1024, 8192), False, (8, 2, False)),
+        (_layer("wo_b", 4, 2048, 4096), False, (16, 2, False)),
+        (_layer("down_proj", 4, 512, 4096), False, (16, 2, False)),
     ],
 )
 def test_pp2_tp4_qpn8_exact_operator_contracts(
@@ -125,16 +125,16 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
     layer = _layer("wo_a", 4, 4096, 2048)
     layer.is_bmm = True
     layer.bmm_batch_size = 2
-    assert fp8._sm70_fp8_qpn8_pp2_tp4_bmm_config(layer) == (16, 1, True)
+    assert fp8._sm70_fp8_qpn8_pp2_tp4_bmm_config(layer) == (32, 2, False)
 
     layer.sm70_fp8_turbomind = True
     layer.sm70_fp8_qpn8 = True
     layer.sm70_fp8_qpn8_bmm = True
     layer.sm70_fp8_bmm_groups = 2
     layer.sm70_fp8_bmm_output_size = 1024
-    layer.sm70_fp8_qpn8_split_k = 16
-    layer.sm70_fp8_qpn8_nacc = 1
-    layer.sm70_fp8_qpn8_prefetch = True
+    layer.sm70_fp8_qpn8_split_k = 32
+    layer.sm70_fp8_qpn8_nacc = 2
+    layer.sm70_fp8_qpn8_prefetch = False
     layer.sm70_fp8_prefill_exact_dense_workspace_ptr = 123
     layer.weight = torch.empty((2, 4096, 1024), device="meta")
     layer.weight_scale_inv = torch.empty((2, 256, 32), device="meta")
@@ -157,15 +157,15 @@ def test_pp2_tp4_qpn8_grouped_dispatches_caller_groups() -> None:
             (tuple(input_.shape), workspace_ptr, split_k, prefetch, gated_silu)
         )
         out.fill_(len(calls))
-        assert nacc == 1
+        assert nacc == 2
 
     x = torch.zeros((1, 2, 4096), dtype=torch.float16)
     with patch.object(fp8.sm70_ops, "fp8_qpn8_dispatch_sm70_out", fake_dispatch):
         out = fp8.Fp8LinearMethod.apply(None, layer, x)
 
     assert calls == [
-        ((1, 4096), 123, 16, True, False),
-        ((1, 4096), 123, 16, True, False),
+        ((1, 4096), 123, 32, False, False),
+        ((1, 4096), 123, 32, False, False),
     ]
     assert out.shape == (1, 2, 1024)
     torch.testing.assert_close(out[:, 0], torch.ones_like(out[:, 0]))
@@ -224,6 +224,6 @@ def test_pp2_tp4_qpn8_default_prepares_matching_layer(monkeypatch) -> None:
         envs.disable_envs_cache()
 
     assert layer.sm70_fp8_qpn8
-    assert layer.sm70_fp8_qpn8_split_k == 16
-    assert layer.sm70_fp8_qpn8_nacc == 1
-    assert layer.sm70_fp8_qpn8_prefetch
+    assert layer.sm70_fp8_qpn8_split_k == 32
+    assert layer.sm70_fp8_qpn8_nacc == 2
+    assert not layer.sm70_fp8_qpn8_prefetch
