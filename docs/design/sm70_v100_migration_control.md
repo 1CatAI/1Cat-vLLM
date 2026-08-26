@@ -43489,6 +43489,15 @@ Interpretation:
   layer calls only `0.274614` to `0.274186 ms/token`, saving `0.000428 ms`.
   Evidence is
   `/data/models/v100-dsv4-0731-pp2tp4-post-endpoint-screens-20260826-r1/results/topk_warp1.json`.
+- A separate FP8-E4M3 prescaled exponent-fold transform is also rejected; it
+  is unrelated to the accepted MXFP4-E2M1 fold. The rebuilt candidate has no
+  feasible kernel for the exact fused-WQA `M=1, N=1536, K=4096` descriptor,
+  both with ordinary selection and with the baseline
+  `8x128x64:5:1:1` tactic locked. Choosing a different tactic would abandon
+  the required reduction-order contract, so no further timing or dataset gate
+  is warranted and the source change is not retained. The isolated candidate
+  failure is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp8-exponent-fold-screen-20260826-r6/`.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 
