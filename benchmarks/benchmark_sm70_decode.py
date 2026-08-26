@@ -169,6 +169,7 @@ def _tracked_env() -> dict[str, str]:
         "VLLM_FLASH_",
         "FLASH_ATTN",
         "FLA_",
+        "PREFIX_",
         "CUDA_MODULE_LOADING",
         "TORCH_CUDA_ARCH_LIST",
         "TORCHINDUCTOR_",
