@@ -91,7 +91,7 @@ cffi==2.0.0
     # via
     #   cryptography
     #   soundfile
-chardet==7.6.0
+chardet==5.2.0
     # via mbstrdecoder
 charset-normalizer==3.4.0
     # via requests
@@ -488,6 +488,7 @@ numpy==2.2.6
     #   scikit-learn
     #   scipy
     #   segmentation-models-pytorch
+    #   sentence-transformers
     #   soxr
     #   statsmodels
     #   tensorizer
@@ -762,6 +763,8 @@ python-dateutil==2.9.0.post0
     #   typepy
 python-rapidjson==1.20
     # via tritonclient
+pytokens==0.4.1
+    # via black
 pytrec-eval-terrier==0.5.7
     # via mteb
 pytz==2024.2
@@ -986,6 +989,7 @@ tokenizers==0.22.2
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/cuda.in
+    #   sentence-transformers
     #   transformers
 tomli==2.2.1
     # via schemathesis
