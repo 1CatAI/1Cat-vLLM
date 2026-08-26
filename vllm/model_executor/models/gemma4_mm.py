@@ -102,6 +102,19 @@ def _get_max_soft_tokens(
     return None, False
 
 
+def _build_broadcast_additive_padding_mask(
+    padding_positions: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build an SDPA key-padding mask without materializing query rows."""
+    batch_size, num_patches = padding_positions.shape
+    return torch.zeros(
+        (batch_size, 1, 1, num_patches),
+        dtype=dtype,
+        device=padding_positions.device,
+    ).masked_fill_(padding_positions[:, None, None, :], float("-inf"))
+
+
 # ---------------------------------------------------------------------------
 # Input schema
 # ---------------------------------------------------------------------------
@@ -948,6 +961,7 @@ class Gemma4ForConditionalGeneration(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        model_config = vllm_config.model_config
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -955,9 +969,27 @@ class Gemma4ForConditionalGeneration(
         self.quant_config = quant_config
         self.multimodal_config = multimodal_config
 
+        # SM70 memory-efficient SDPA accepts fp16/fp32, but not bf16. Gemma4
+        # checkpoints can independently mark their HF towers as bf16 even when
+        # the vLLM model dtype is fp16, which otherwise forces quadratic math
+        # attention. Select the model dtype during construction so subsequent
+        # UVA tower registration and weight loading preserve their storage.
+        self._use_sm70_memory_efficient_mm_sdpa = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+            and model_config.dtype == torch.float16
+        )
+        tower_init_kwargs = (
+            {"dtype": model_config.dtype}
+            if self._use_sm70_memory_efficient_mm_sdpa
+            else {}
+        )
+
         # ---- Vision tower (shared by image and video) ----
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.vision_tower = AutoModel.from_config(config=config.vision_config)
+            self.vision_tower = AutoModel.from_config(
+                config=config.vision_config, **tower_init_kwargs
+            )
             self.embed_vision = Gemma4MultimodalEmbedder(
                 config.vision_config, config.text_config
             )
@@ -965,7 +997,9 @@ class Gemma4ForConditionalGeneration(
         # ---- Audio tower (variants with audio_config) ----
         if config.audio_config is not None:
             with self._mark_tower_model(vllm_config, "audio"):
-                self.audio_tower = AutoModel.from_config(config=config.audio_config)
+                self.audio_tower = AutoModel.from_config(
+                    config=config.audio_config, **tower_init_kwargs
+                )
                 # AutoModel.from_config does NOT call post_init(),
                 # which is needed to initialize buffers that are absent
                 # from the checkpoint (e.g. inv_timescales for relative
@@ -1194,9 +1228,16 @@ class Gemma4ForConditionalGeneration(
                 pad_tensor = (pp_tensor == -1).all(dim=-1)
 
                 inputs_embeds = vt.patch_embedder(pv_tensor, pp_tensor, pad_tensor)
+                attention_mask = (
+                    _build_broadcast_additive_padding_mask(
+                        pad_tensor, inputs_embeds.dtype
+                    )
+                    if self._use_sm70_memory_efficient_mm_sdpa
+                    else ~pad_tensor
+                )
                 encoder_outputs = vt.encoder(
                     inputs_embeds=inputs_embeds,
-                    attention_mask=~pad_tensor,
+                    attention_mask=attention_mask,
                     pixel_position_ids=pp_tensor,
                 )
                 hidden_states = encoder_outputs.last_hidden_state
@@ -1302,9 +1343,14 @@ class Gemma4ForConditionalGeneration(
             pad_chunk = padding_positions[i : i + max_batch_size]
 
             inputs_embeds = vt.patch_embedder(pv_chunk, pp_chunk, pad_chunk)
+            attention_mask = (
+                _build_broadcast_additive_padding_mask(pad_chunk, inputs_embeds.dtype)
+                if self._use_sm70_memory_efficient_mm_sdpa
+                else ~pad_chunk
+            )
             encoder_outputs = vt.encoder(
                 inputs_embeds=inputs_embeds,
-                attention_mask=~pad_chunk,
+                attention_mask=attention_mask,
                 pixel_position_ids=pp_chunk,
             )
             last_hidden_states_list.append(encoder_outputs.last_hidden_state)

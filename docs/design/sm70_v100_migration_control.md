@@ -43565,3 +43565,42 @@ Interpretation:
   or eager call retains the existing pull collective. Explicit `=0` is the
   rollback. No model, checkpoint, `model_type`, or architecture identity is
   consulted.
+
+## 2026-08-26 historical PR #104 Gemma4 tower-memory audit
+
+- Historical PR #104 is not replayed as a branch. Five of its six commits are
+  already superseded by newer main-line attention, compile-warmup, MTP, and
+  metadata paths. Its remaining Gemma4 multimodal memory fix is rebuilt from
+  `origin/main@1492e6985a741da09329127b4d4171882b70402b` on
+  `codex/v100-gemma4-sm70-mm-sdpa-20260826-013904`.
+- The old post-load `tower.to(dtype)` approach is incompatible with the
+  generic UVA tower offload merged in PR #297: it can replace the registered
+  UVA storage with a new device tensor. The current repair instead passes the
+  configured FP16 dtype to Transformers while constructing the vision/audio
+  towers, before tower registration and weight loading. This path is admitted
+  only on exact SM70 with a configured FP16 model dtype; other platforms and
+  dtypes keep their current construction and mask behavior.
+- Both the current image-bucket encoder and the newer video-frame encoder use
+  a broadcast additive key-padding mask of shape `[B,1,1,N]`. Transformers
+  5.5.3 returns this prepared 4D mask as-is, avoiding its normal expansion of
+  a 2D validity mask to `[B,1,N,N]`. The implementation constructs the mask
+  entirely on device and does not branch on a CUDA scalar.
+- On a Tesla V100-SXM2-32GB, forced memory-efficient SDPA accepts the FP16
+  broadcast mask and produces bitwise-identical output to the bool validity
+  mask in the focused probe (`max_abs=0`). The same forced backend rejects
+  BF16 on SM70 with `No available kernel`, confirming the dtype dispatch
+  defect rather than assuming it from model identity.
+- At the production failure shape `B=2,N=10080`, Transformers 5.5.3 expands
+  the 2D mask to 203,212,800 bool elements (about 194.2 MiB). The broadcast
+  form stores 20,160 FP16 elements (about 0.04 MiB), a 10,080x element-count
+  reduction. Seven warmed CUDA-event samples measure medians of 1.346 ms and
+  0.042 ms respectively; this is mask-construction evidence, not a full-model
+  throughput claim.
+- CPU SDPA probes under Transformers 5.5.3 also produce exact equality for
+  padded bool/additive masks and for an all-zero additive mask versus no mask.
+  A tiny Gemma4 vision tower confirms that `AutoModel.from_config(dtype=fp16)`
+  creates FP16 parameters before loading. Ruff, formatting, `diff --check`,
+  and compile checks pass. The repository pytest entrypoint is currently
+  blocked before collection by the environment's unrelated stale
+  `mistral_common` (`NamedToolChoice` import); no service or end-to-end run is
+  claimed.
