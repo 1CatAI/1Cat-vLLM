@@ -999,7 +999,7 @@ class SpeculativeConfig:
         if not has_arctic_inference():
             raise ImportError(
                 "Arctic Inference is required for suffix decoding. "
-                "Install via `pip install arctic-inference==0.1.1`."
+                "Install via `pip install arctic-inference==0.2.0`."
             )
         if self.num_speculative_tokens is None:
             # Suffix decoding decides the actual number of speculative tokens
