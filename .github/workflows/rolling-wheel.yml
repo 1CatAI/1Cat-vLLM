@@ -316,10 +316,10 @@ jobs:
     name: Build rolling wheel (official fallback)
     needs: [resolve, build_self_hosted]
     if: >-
-      always() &&
+      ${{ !cancelled() &&
       needs.resolve.result == 'success' &&
       needs.resolve.outputs.native_changed == 'false' &&
-      needs.build_self_hosted.result != 'success'
+      needs.build_self_hosted.result != 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -462,13 +462,13 @@ jobs:
     name: Publish rolling wheel
     needs: [resolve, build_self_hosted, build_official]
     if: >-
-      always() &&
+      ${{ !cancelled() &&
       needs.resolve.result == 'success' &&
       needs.resolve.outputs.native_changed == 'false' &&
       (
         needs.build_self_hosted.result == 'success' ||
         needs.build_official.result == 'success'
-      )
+      ) }}
     runs-on: ubuntu-24.04
     environment: actions
     timeout-minutes: 30

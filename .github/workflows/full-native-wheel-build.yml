@@ -179,9 +179,9 @@ jobs:
         run: bash tools/check_repo.sh
 
   build_self_hosted:
-    name: Build native wheel (self-hosted)
+    name: Build native wheel (primary)
     needs: prepare
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
       image: nvidia/cuda:12.8.2-devel-ubuntu24.04
@@ -347,9 +347,9 @@ jobs:
     name: Build native wheel (official fallback)
     needs: [prepare, build_self_hosted]
     if: >-
-      always() &&
+      ${{ !cancelled() &&
       needs.prepare.result == 'success' &&
-      needs.build_self_hosted.result != 'success'
+      needs.build_self_hosted.result != 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
@@ -527,11 +527,11 @@ jobs:
     name: Dispatch native wheel publish
     needs: [build_self_hosted, build_official]
     if: >-
-      always() &&
+      ${{ !cancelled() &&
       (
         needs.build_self_hosted.result == 'success' ||
         needs.build_official.result == 'success'
-      )
+      ) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
