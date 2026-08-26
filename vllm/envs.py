@@ -256,6 +256,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = True
+    VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE: bool = True
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
@@ -2229,6 +2230,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # restores the stable-sort path.
     "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))
+    ),
+    # Preserve the default kernel and split-K tree for the exact DSV4 B1
+    # TurboMind route while retaining dynamic swizzle selection.
+    "VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR", "1"))
     ),
     # Diagnostic route over the existing TurboMind E2M1/UE8M0 pack. It remains
     # default-off after the strict model-level quality comparison regressed.

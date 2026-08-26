@@ -826,7 +826,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
                 layer.sm70_mxfp4_hidden_size,
             )
             logger.info_once(
-                "Default SM70 MXFP4 QPN M1 route enabled for the exact "
+                "Diagnostic SM70 MXFP4 QPN M1 route enabled for the exact "
                 "TP4 six-route W13/W2 tensor contract."
             )
             return output

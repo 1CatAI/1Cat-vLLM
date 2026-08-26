@@ -43978,6 +43978,14 @@ Interpretation:
   default kernel and split-K accumulation tree are retained. Explicit `=0`
   remains the unsafe diagnostic rollback. Host tests pass (`56` environment
   tests and `17` SM70 warmup tests), and changed-file pre-commit passes.
+- MXFP4 TurboMind B1 had the same unguarded dynamic-tuning problem. PR 21 adds
+  `VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR=1` for only the exact six-route
+  W13 `M6/N1024/K4096` and W2 `M6/N4096/K512` descriptors. It preserves the
+  heuristic kernel and split-K tree while allowing measured swizzle. The first
+  queued matrix disables MXFP4 tuning entirely to establish the deterministic
+  arithmetic oracle with the already-built extension; the new safe selector
+  requires a rebuilt extension and a second exact-output/performance pair
+  before it can replace that oracle.
 - Two matched unsafe-dynamic startup traces are queued to record the exact
   kernel/split/swizzle chosen on all eight ranks. A subsequent strict matrix
   compares fixed FP8, safe FP8, safe FP8 plus the MXFP4-QPN diagnostic, and a

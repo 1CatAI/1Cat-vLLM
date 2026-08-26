@@ -1082,6 +1082,11 @@ bool mxfp4_moe_broadcast_input_decode_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool mxfp4_moe_b1_safe_selector_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
 bool mxfp4_moe_grouped_m8_enabled() {
   const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
   return raw != nullptr && std::atoi(raw) != 0;
@@ -1427,9 +1432,20 @@ turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
       mxfp4_moe_grouped_m8_fast_selector_enabled() && exact_grouped_m8) {
     return turbomind::gemm::DispatchPolicy::kMxfp4MoeGroupedM8Fast;
   }
-  return select_moe_dispatch_policy_impl(
+  auto policy = select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
       TuneKeyKind::kMxfp4Moe, mxfp4_tune_small_shapes_enabled());
+  const bool exact_dsv4_b1 =
+      total_tokens == 6 && num_experts == 6 && group_size == 32 &&
+      ((n == 1024 && k == 4096) || (n == 4096 && k == 512));
+  if (mxfp4_moe_b1_safe_selector_enabled() && exact_dsv4_b1 &&
+      (policy == turbomind::gemm::DispatchPolicy::kMeasure ||
+       policy == turbomind::gemm::DispatchPolicy::kReuse)) {
+    // Preserve the heuristic kernel and split-K accumulation tree. Dynamic
+    // measurement may still choose a scheduling-only swizzle.
+    return policy | turbomind::gemm::DispatchPolicy::kPreserveDefaultSplits;
+  }
+  return policy;
 }
 
 turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
