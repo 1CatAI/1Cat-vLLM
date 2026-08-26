@@ -206,8 +206,8 @@ jobs:
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          sudo -n apt-get update
+          sudo -n apt-get install -y --no-install-recommends \
             build-essential \
             ca-certificates \
             cmake \
