@@ -19,17 +19,7 @@ ALLOWED_FILES = {
     "vllm/platforms/",
     "vllm/device_allocator/",
     "vllm/distributed/weight_transfer/ipc_engine.py",
-    # Standalone SM70/DSpark probes intentionally exercise CUDA-only APIs.
-    # Keep the runtime package on torch.accelerator while admitting these
-    # hardware-specific benchmark and operator-test namespaces as baseline.
-    "benchmarks/benchmark_sm70_",
-    "benchmarks/kernels/benchmark_flash_v100_",
-    "benchmarks/kernels/benchmark_sm70_",
-    "benchmarks/kernels/benchmark_dspark_",
-    "benchmarks/kernels/benchmark_deepseek_v4_sm70_",
     "tests/distributed/test_packed_tensor.py",
-    "tests/kernels/test_sm70_",
-    "tests/kernels/quantization/test_sm70_",
 }
 
 

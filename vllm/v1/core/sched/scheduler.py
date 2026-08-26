@@ -247,10 +247,25 @@ class Scheduler(SchedulerInterface):
         )
 
         self.use_eagle = False
-        self.num_spec_tokens = vllm_config.num_speculative_tokens
-        self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
-        if speculative_config and speculative_config.use_eagle_kv_cache():
-            self.use_eagle = True
+        self.num_spec_tokens = self.num_lookahead_tokens = 0
+        if speculative_config:
+            self.num_spec_tokens = speculative_config.num_speculative_tokens
+            if speculative_config.use_eagle():
+                self.use_eagle = True
+                self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.uses_draft_model():
+                self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_dflash():
+                # DFlash requires an extra lookahead slot since it uses in-fill-style
+                # decoding instead of standard next-token sampling, so it has a query
+                # for the last sampled token plus queries for each draft token.
+                self.num_lookahead_tokens = (
+                    speculative_config.num_speculative_state_tokens() + 1
+                )
+            if speculative_config.use_dspark():
+                # The anchor itself is the first prediction position, with no
+                # separate bonus query, so DSpark needs exactly N slots.
+                self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -258,7 +273,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
             log_stats=self.log_stats,
@@ -400,6 +415,9 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
+        assert num_external_computed_tokens == 0, (
+            "External KV connector is not verified yet"
+        )
         num_computed_tokens = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
@@ -905,8 +923,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                # Skip block alignment when setting up async receive (no local work).
-                if self.need_mamba_block_aligned_split and not load_kv_async:
+                if self.need_mamba_block_aligned_split:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -1103,9 +1120,6 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
-        # A Mamba ``align`` table is not append-only. Drain exact committed
-        # boundary-state block IDs before the connector builds store jobs.
-        boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1124,9 +1138,6 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            boundary_state_offloads=(
-                boundary_state_offloads if self.connector is not None else None
-            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1136,9 +1147,6 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
-
-        # Exact source IDs are scheduler-side connector inputs only.
-        scheduler_output.boundary_state_offloads = None
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -1192,7 +1200,6 @@ class Scheduler(SchedulerInterface):
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
             request.num_computed_tokens += num_scheduled_token
-            request.num_in_flight_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
@@ -1577,12 +1584,10 @@ class Scheduler(SchedulerInterface):
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
-            request = self.requests.get(req_id)
-            if request is not None:
-                request.num_in_flight_tokens -= num_tokens_scheduled
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
+            request = self.requests.get(req_id)
             if request is None or request.is_finished():
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
@@ -2386,19 +2391,13 @@ class Scheduler(SchedulerInterface):
             return False, None
 
         # Free any out-of-window prefix blocks before we hand the block table to
-        # the connector, on the processed-token basis (see `allocate_slots`).
+        # the connector.
         self.kv_cache_manager.remove_skipped_blocks(
             request_id=request.request_id,
-            processed_computed_tokens=max(
-                0, request.num_computed_tokens - request.num_in_flight_tokens
-            ),
-            num_prompt_tokens=request.num_prompt_tokens,
+            total_computed_tokens=request.num_computed_tokens,
         )
 
-        block_ids = self.kv_cache_manager.get_block_ids_for_computed_tokens(
-            request_id=request.request_id,
-            num_computed_tokens=request.num_computed_tokens,
-        )
+        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
 
         if not isinstance(self.connector, SupportsHMA):
             # NOTE(Kuntai): We should deprecate this code path after we enforce

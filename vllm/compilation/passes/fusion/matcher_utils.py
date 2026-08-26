@@ -44,7 +44,8 @@ def get_op_overload(
 
 
 ROTARY_OP = get_op_overload(torch.ops._C, "rotary_embedding")
-FLASHINFER_ROTARY_OP = get_op_overload(torch.ops.vllm, "flashinfer_rotary_embedding")
+FLASHINFER_ROTARY_OP = get_op_overload(torch.ops.vllm,
+                                       "flashinfer_rotary_embedding")
 
 QUANT_OPS: dict[QuantKey, OpOverload] = {}
 

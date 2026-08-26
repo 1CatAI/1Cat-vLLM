@@ -45,9 +45,7 @@ def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
     return out or default_vals
 
 
-_use_sm70_kkt_schedule = (
-    os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1") == "1" and _is_sm70()
-)
+_use_sm70_kkt_schedule = os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1") == "1" and _is_sm70()
 _kkt_configs = (
     [
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)

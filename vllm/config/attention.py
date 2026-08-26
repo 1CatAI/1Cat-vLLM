@@ -3,7 +3,7 @@
 
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import field_validator
 
 from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
@@ -52,12 +52,6 @@ class AttentionConfig:
 
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""
-
-    prefix_anchored_decode_window: int | None = Field(default=None, gt=0, le=2**31 - 1)
-    """Bound generated-token KV to this sliding window while keeping the
-    request prefix globally visible. This is an explicit, model-agnostic
-    engine option. It is currently supported only by the SM70
-    ``FLASH_ATTN_V100`` fp16 causal path. ``None`` disables it."""
 
     flex_attn_block_m: int | None = None
     """Triton kernel BLOCK_M tile size for flex attention.

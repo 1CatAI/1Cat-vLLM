@@ -351,11 +351,11 @@ Required experiment:
 
 Primary source paths:
 
-- <https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelDispatcher.h>
-- <https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h>
-- <https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernel.h>
-- <https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/utility.h>
-- <https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin/weightOnlyGroupwiseQuantMatmulPlugin.cpp>
+- https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelDispatcher.h
+- https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernelLauncher.h
+- https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/kernel.h
+- https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/weightOnlyBatchedGemv/utility.h
+- https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin/weightOnlyGroupwiseQuantMatmulPlugin.cpp
 
 ### P1: SM90 Machete-style mixed-input WGMMA
 
@@ -401,7 +401,7 @@ must profile 1-SM, 2-SM, Stream-K, and exact-M GEMV tactics for each of the
 four real shapes.
 
 Source:
-<https://github.com/NVIDIA/cutlass/blob/main/examples/86_blackwell_mixed_dtype_gemm/86_blackwell_mixed_dtype.cu>
+https://github.com/NVIDIA/cutlass/blob/main/examples/86_blackwell_mixed_dtype_gemm/86_blackwell_mixed_dtype.cu
 
 **Native NVFP4/MXFP4.** Blackwell's `tcgen05.mma.blockscaled` consumes native
 block-scaled FP4 and accumulates through TMEM. CUTLASS documents 2x instruction
@@ -415,9 +415,9 @@ valid conversion.
 
 Sources:
 
-- <https://github.com/NVIDIA/cutlass/blob/main/examples/72_blackwell_narrow_precision_gemm/72a_blackwell_nvfp4_bf16_gemm.cu>
-- <https://github.com/NVIDIA/cutlass/blob/main/examples/91_fp4_gemv/91_fp4_gemv.cu>
-- <https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/llm_ptq/README.md>
+- https://github.com/NVIDIA/cutlass/blob/main/examples/72_blackwell_narrow_precision_gemm/72a_blackwell_nvfp4_bf16_gemm.cu
+- https://github.com/NVIDIA/cutlass/blob/main/examples/91_fp4_gemv/91_fp4_gemv.cu
+- https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/llm_ptq/README.md
 
 ### TurboMind SM90 ceiling
 
@@ -429,7 +429,7 @@ mainloop. Therefore, "enable TurboMind SM90" and "exploit Hopper's full mixed
 input path" are separate milestones.
 
 Source:
-<https://github.com/InternLM/lmdeploy/blob/main/src/turbomind/kernels/gemm/kernel/sm90_16816_4.cu>
+https://github.com/InternLM/lmdeploy/blob/main/src/turbomind/kernels/gemm/kernel/sm90_16816_4.cu
 
 ### Ranked benchmark order
 
@@ -538,11 +538,11 @@ or H100 target-forward baseline.
 
 ## Primary References
 
-- NVIDIA Ampere tuning guide: <https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html>
-- NVIDIA Hopper tuning guide: <https://docs.nvidia.com/cuda/archive/12.8.0/hopper-tuning-guide/index.html>
-- CUTLASS changelog and mixed-input GEMM support: <https://github.com/NVIDIA/cutlass/blob/main/CHANGELOG.md>
-- Upstream TurboMind architecture-specific GEMM registry: <https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm/kernel>
-- FlashInfer GDN decode/MTP API: <https://docs.flashinfer.ai/api/gdn_decode.html>
-- FlashInfer GDN SM90 implementation contract: <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_decode.py>
-- FlashInfer/TensorRT-LLM MTP attention API: <https://docs.flashinfer.ai/generated/flashinfer.decode.trtllm_batch_decode_with_kv_cache.html>
-- TensorRT-LLM quantization hardware matrix: <https://nvidia.github.io/TensorRT-LLM/latest/features/quantization.html>
+- NVIDIA Ampere tuning guide: https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
+- NVIDIA Hopper tuning guide: https://docs.nvidia.com/cuda/archive/12.8.0/hopper-tuning-guide/index.html
+- CUTLASS changelog and mixed-input GEMM support: https://github.com/NVIDIA/cutlass/blob/main/CHANGELOG.md
+- Upstream TurboMind architecture-specific GEMM registry: https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm/kernel
+- FlashInfer GDN decode/MTP API: https://docs.flashinfer.ai/api/gdn_decode.html
+- FlashInfer GDN SM90 implementation contract: https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_decode.py
+- FlashInfer/TensorRT-LLM MTP attention API: https://docs.flashinfer.ai/generated/flashinfer.decode.trtllm_batch_decode_with_kv_cache.html
+- TensorRT-LLM quantization hardware matrix: https://nvidia.github.io/TensorRT-LLM/latest/features/quantization.html

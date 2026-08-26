@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -482,10 +481,6 @@ class EagleSpeculator:
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
-        output_copy_event: torch.cuda.Event | None = None,
-        sampled_token_ids_cpu: np.ndarray | None = None,
-        num_sampled_tokens_cpu: np.ndarray | None = None,
-        all_token_ids_cpu: np.ndarray | None = None,
     ) -> torch.Tensor:
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs

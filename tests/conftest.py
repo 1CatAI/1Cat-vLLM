@@ -468,7 +468,7 @@ class HfRunner:
                 model_name,
                 revision=revision,
                 device=self.device,
-                model_kwargs=model_kwargs,
+                automodel_args=model_kwargs,
                 trust_remote_code=trust_remote_code,
             )
         else:

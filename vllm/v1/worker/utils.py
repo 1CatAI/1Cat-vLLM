@@ -37,48 +37,9 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
-def _infer_segment_block_strides(
-    seg_addrs: list[int],
-    page_size_el: int,
-) -> list[int]:
-    """Infer logical block strides from block-major segment address runs.
-
-    Dense segments advance by one page. An interleaved pool exposes one segment
-    base per cell, exactly ``page_size_el * 4`` bytes apart, and advances to the
-    next logical block after every segment in that address run. Treat separate
-    runs independently so multiple pools do not disable one another.
-    """
-    if page_size_el <= 0:
-        raise ValueError(f"page_size_el must be positive, got {page_size_el}.")
-    if len(set(seg_addrs)) != len(seg_addrs):
-        raise ValueError("Segment addresses must be unique.")
-
-    block_strides = [page_size_el] * len(seg_addrs)
-    if len(seg_addrs) < 2:
-        return block_strides
-
-    cell_bytes = page_size_el * 4
-    ordered = sorted((addr, index) for index, addr in enumerate(seg_addrs))
-    run_start = 0
-    for run_end in range(1, len(ordered) + 1):
-        if (
-            run_end < len(ordered)
-            and ordered[run_end][0] - ordered[run_end - 1][0] == cell_bytes
-        ):
-            continue
-        run = ordered[run_start:run_end]
-        if len(run) > 1:
-            run_stride = page_size_el * len(run)
-            for _, original_index in run:
-                block_strides[original_index] = run_stride
-        run_start = run_end
-    return block_strides
-
-
 @triton.jit(do_not_specialize=["n_blocks"])
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
-    seg_block_strides_ptr,
     block_ids_ptr,
     n_blocks,
     N_SEGS: tl.constexpr,
@@ -94,9 +55,6 @@ def _zero_kv_blocks_kernel(
 
     seg_addrs_ptr holds absolute byte addresses (int64) for each segment,
     allowing segments to live in different CUDA allocations.
-    seg_block_strides_ptr holds the per-segment block-to-block stride in
-    elements, kept separate from the PAGE_SIZE_EL span each block zeros (they
-    differ for interleaved layouts, see init_meta).
 
     Programs are mapped as (block_index, seg_index, chunk_index).
     """
@@ -111,11 +69,9 @@ def _zero_kv_blocks_kernel(
     chunk_index = remainder % chunks
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
-    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     offset = (
-        block_id.to(tl.int64) * block_stride_el.to(tl.int64)
-        + chunk_index.to(tl.int64) * BLOCK_SIZE
+        block_id.to(tl.int64) * PAGE_SIZE_EL + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
     tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
@@ -132,7 +88,7 @@ class KVBlockZeroer:
     def __init__(self, device: torch.device, pin_memory: bool):
         self.device = device
         self.pin_memory = pin_memory
-        self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
+        self._meta: tuple[torch.Tensor, int, int, int] | None = None
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -199,7 +155,8 @@ class KVBlockZeroer:
                         page_size_el = cur_page_el
                     else:
                         assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                            f"Non-uniform page sizes: {page_size_el} vs "
+                            f"{cur_page_el}"
                         )
 
                     block_stride_bytes = cur_bytes
@@ -230,7 +187,8 @@ class KVBlockZeroer:
                         page_size_el = cur_page_el
                     else:
                         assert page_size_el == cur_page_el, (
-                            f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                            f"Non-uniform page sizes: {page_size_el} vs "
+                            f"{cur_page_el}"
                         )
                     seg_addrs.append(dp)
 
@@ -239,18 +197,6 @@ class KVBlockZeroer:
             return
 
         blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
-
-        # Dense layouts space blocks page_size_el apart. Block-major
-        # interleaved pools expose segment starts one cell apart and advance by
-        # the number of segments in that contiguous address run. Infer each
-        # run separately because a process may own more than one KV pool.
-        n_segs = len(seg_addrs)
-        seg_block_strides = torch.tensor(
-            _infer_segment_block_strides(seg_addrs, page_size_el),
-            dtype=torch.int64,
-            device=self.device,
-        )
-
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -260,17 +206,16 @@ class KVBlockZeroer:
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            seg_block_strides,
             page_size_el,
             blk_size,
-            n_segs,
+            len(seg_addrs),
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, seg_block_strides, page_size_el, blk_size, n_segs = self._meta
+        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
@@ -289,7 +234,6 @@ class KVBlockZeroer:
         grid = (n_blocks * n_segs * (page_size_el // blk_size),)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
-            seg_block_strides,
             idx,
             n_blocks,
             N_SEGS=n_segs,

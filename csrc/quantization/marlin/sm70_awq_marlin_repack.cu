@@ -92,7 +92,8 @@ __global__ void awq_marlin_repack_kernel(
       constexpr int sh_stride = tile_n_ints;
       int4* sh_stage_ptr = sh + stage_size * pipe;
       uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
-      uint32_t packed_src = sh_stage_int_ptr[local_k * sh_stride + local_n_vec];
+      uint32_t packed_src =
+          sh_stage_int_ptr[local_k * sh_stride + local_n_vec];
 
       constexpr int undo_pack[8] = {0, 4, 1, 5, 2, 6, 3, 7};
       constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
@@ -113,8 +114,9 @@ __global__ void awq_marlin_repack_kernel(
       int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
       int const subtile = n_tile_id - cta_first_n_tile;
       int const local_word = local_k * 8 + local_n_vec;
-      int const cta_n_offset = cta_n_tile * cta_n_tiles * tile_size +
-                               local_word * cta_n_tiles + subtile;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
       out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
       return;
     }
@@ -153,8 +155,9 @@ __global__ void awq_marlin_repack_kernel(
       int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
       int const subtile = n_tile_id - cta_first_n_tile;
       int const local_word = local_k * 16 + local_n_word;
-      int const cta_n_offset = cta_n_tile * cta_n_tiles * tile_size +
-                               local_word * cta_n_tiles + subtile;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
       out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
       return;
     }
@@ -301,15 +304,16 @@ __global__ void awq_marlin_repack_kernel(
             b_q_weight_ptr, out_ptr, size_k, size_n);                      \
   } else
 
-#define CALL_FOR_CTA(CTA_N)                                                  \
-  do {                                                                       \
-    CALL_IF(4, false, CTA_N)                                                 \
-    CALL_IF(8, false, CTA_N)                                                 \
-    CALL_IF(4, true, CTA_N)                                                  \
-    CALL_IF(8, true, CTA_N) {                                                \
-      TORCH_CHECK(false, "Unsupported repack config: num_bits = ", num_bits, \
-                  ", is_a_8bit = ", is_a_8bit);                              \
-    }                                                                        \
+#define CALL_FOR_CTA(CTA_N)                                                \
+  do {                                                                     \
+    CALL_IF(4, false, CTA_N)                                               \
+    CALL_IF(8, false, CTA_N)                                               \
+    CALL_IF(4, true, CTA_N)                                                \
+    CALL_IF(8, true, CTA_N)                                                \
+    {                                                                      \
+      TORCH_CHECK(false, "Unsupported repack config: num_bits = ",         \
+                  num_bits, ", is_a_8bit = ", is_a_8bit);                 \
+    }                                                                      \
   } while (false)
 
 torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,

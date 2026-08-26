@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from contextlib import contextmanager
 from typing import cast
 
-import regex as re
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -30,49 +28,6 @@ except Exception:
 logger = init_logger(__name__)
 
 _SM70_TP8_HIERARCHICAL_ELEMENTS = 4096
-_EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
-    r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
-)
-
-
-def _get_effective_allocator_conf() -> str:
-    """Return the allocator config selected by PyTorch on CUDA.
-
-    PyTorch 2.10 prefers the legacy CUDA-specific variable whenever it is
-    present, even when its value is empty, and otherwise falls back to the
-    unified accelerator variable.
-    """
-    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
-        return os.environ["PYTORCH_CUDA_ALLOC_CONF"]
-    return os.environ.get("PYTORCH_ALLOC_CONF", "")
-
-
-@contextmanager
-def _disable_expandable_segments_for_cuda_ipc(active: bool):
-    """Keep CUDA-IPC graph buffers on cudaMalloc-backed allocations.
-
-    ``cudaIpcGetMemHandle`` cannot export CUDA VMM allocations created when
-    ``expandable_segments:True`` is active through either supported allocator
-    environment variable. Custom all-reduce exports graph buffers through that
-    legacy IPC API, so disable expandable segments for the complete capture
-    and registration window while preserving every other allocator option.
-    """
-    allocator_conf = _get_effective_allocator_conf()
-    disabled_conf, replacements = _EXPANDABLE_SEGMENTS_TRUE_PATTERN.subn(
-        r"\1False", allocator_conf
-    )
-    should_disable = active and current_platform.is_cuda() and replacements > 0
-    if should_disable:
-        logger.info_once(
-            "Temporarily disabling expandable_segments during custom allreduce "
-            "CUDA graph capture for CUDA IPC compatibility."
-        )
-        torch.cuda.memory._set_allocator_settings(disabled_conf)
-    try:
-        yield
-    finally:
-        if should_disable:
-            torch.cuda.memory._set_allocator_settings(allocator_conf)
 
 
 def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
@@ -113,7 +68,6 @@ class CustomAllreduce:
         device: int | str | torch.device,
         max_size=8192 * 1024,
         symm_mem_enabled=False,
-        long_prefill_fusion_enabled=False,
     ) -> None:
         """
         Args:
@@ -127,8 +81,6 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
-        self.long_prefill_output_ptrs: list[int] | None = None
-        self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -181,7 +133,6 @@ class CustomAllreduce:
         if (
             current_platform.is_cuda()
             and symm_mem_enabled
-            and not long_prefill_fusion_enabled
             and device_capability is not None
         ):
             device_capability_str = device_capability.as_version_str()
@@ -300,12 +251,6 @@ class CustomAllreduce:
             8 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
         self.max_size = max_size
-        # Provisioning the long-prefill fusion buffers must not widen ordinary
-        # custom-AR dispatch beyond its established 8-MiB policy. The fused
-        # predicate below uses the full allocation capacity explicitly.
-        self.dispatch_max_size = (
-            min(max_size, 8192 * 1024) if long_prefill_fusion_enabled else max_size
-        )
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
@@ -314,33 +259,6 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
-        if long_prefill_fusion_enabled:
-            self.long_prefill_output_ptrs = self.create_shared_buffer(
-                max_size,
-                group=group,
-            )
-            ops.register_buffer(self._ptr, self.long_prefill_output_ptrs)
-        if (
-            envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
-            and world_size == 4
-            and fully_connected
-            and current_platform.is_cuda()
-            and device_capability is not None
-            and device_capability.major == 7
-            and device_capability.minor == 0
-        ):
-            push_buffer_size = ops.sm70_tp4_push_allreduce_buffer_size()
-            self.sm70_tp4_push_buffer_ptrs = self.create_shared_buffer(
-                push_buffer_size,
-                group=group,
-            )
-            ops.register_sm70_tp4_push_allreduce_buffer(
-                self._ptr, self.sm70_tp4_push_buffer_ptrs
-            )
-            logger.info(
-                "SM70 TP4 SGLang-style push all-reduce enabled for the "
-                "FP16 80-KiB verifier and 8-KiB decode payloads."
-            )
 
     @contextmanager
     def capture(self):
@@ -349,14 +267,13 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
-        with _disable_expandable_segments_for_cuda_ipc(not self.disabled):
-            try:
-                self._IS_CAPTURING = True
-                yield
-            finally:
-                self._IS_CAPTURING = False
-                if not self.disabled:
-                    self.register_graph_buffers()
+        try:
+            self._IS_CAPTURING = True
+            yield
+        finally:
+            self._IS_CAPTURING = False
+            if not self.disabled:
+                self.register_graph_buffers()
 
     def register_graph_buffers(self):
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
@@ -394,7 +311,7 @@ class CustomAllreduce:
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
-            return inp_size < self.dispatch_max_size
+            return inp_size < self.max_size
         return False
 
     def all_reduce(
@@ -525,72 +442,6 @@ class CustomAllreduce:
             and inp.ndim == 2
             and 1 <= inp.shape[0] <= 64
             and inp.shape[1] == 5120
-            and residual.shape == inp.shape
-            and residual.dtype == torch.float32
-            and weight.ndim == 1
-            and weight.numel() == 5120
-            and weight.dtype in (torch.float16, torch.float32)
-            and inp.is_contiguous()
-            and residual.is_contiguous()
-            and weight.is_contiguous()
-            and inp.device == residual.device == weight.device
-        )
-
-    def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-        self,
-        inp: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-        *,
-        normalized_out: torch.Tensor | None = None,
-        residual_out: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Benchmark-only long-prefill fused RS + Gemma RMSNorm + AG."""
-        if not self.can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-            inp, residual, weight
-        ):
-            raise RuntimeError("SM70 TP4 long-prefill fused norm is unavailable")
-        assert self.long_prefill_output_ptrs is not None
-        if normalized_out is None:
-            normalized_out = torch.empty_like(inp)
-        if residual_out is None:
-            residual_out = torch.empty_like(residual, dtype=torch.float32)
-        graph_registered = (
-            self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
-        )
-        ops.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-            self._ptr,
-            inp,
-            residual,
-            weight,
-            normalized_out,
-            residual_out,
-            0 if graph_registered else self.buffer_ptrs[self.rank],
-            0 if graph_registered else self.long_prefill_output_ptrs[self.rank],
-            self.max_size,
-            epsilon,
-        )
-        return normalized_out, residual_out
-
-    def can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-        self,
-        inp: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-    ) -> bool:
-        return (
-            not self.disabled
-            and self.long_prefill_output_ptrs is not None
-            and self.world_size == 4
-            and self.fully_connected
-            and inp.is_cuda
-            and inp.dtype == torch.float16
-            and inp.ndim == 2
-            and inp.shape[0] % self.world_size == 0
-            and 1 <= inp.shape[0] // self.world_size <= 2048
-            and inp.shape[1] == 5120
-            and inp.numel() * inp.element_size() <= self.max_size
             and residual.shape == inp.shape
             and residual.dtype == torch.float32
             and weight.ndim == 1
@@ -867,15 +718,6 @@ class CustomAllreduce:
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
-            if self.long_prefill_output_ptrs is not None:
-                self.free_shared_buffer(
-                    self.long_prefill_output_ptrs,
-                    rank=self.rank,
-                )
-                self.long_prefill_output_ptrs = None
-            if self.sm70_tp4_push_buffer_ptrs is not None:
-                self.free_shared_buffer(self.sm70_tp4_push_buffer_ptrs, rank=self.rank)
-                self.sm70_tp4_push_buffer_ptrs = None
 
     def __del__(self):
         self.close()

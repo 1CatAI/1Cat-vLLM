@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Measure TP full-vocab versus compact top-k verifier-logit transport.
+"""Measure TP2 full-vocab versus compact top-k verifier-logit transport.
 
-Run on two or more identical GPUs without loading a model:
+Run on two identical GPUs without loading a model:
 
-  CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 \
+  CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
     benchmarks/benchmark_sm70_tp2_compact_verifier_logits.py \
     --json-out bench_results/.../tp2_compact_verifier_logits.json
 
@@ -93,8 +93,8 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size < 2:
-        raise ValueError(f"This benchmark requires TP>1, got world_size={world_size}.")
+    if world_size != 2:
+        raise ValueError(f"This benchmark is TP2-only, got world_size={world_size}.")
     if args.vocab_size % world_size:
         raise ValueError("--vocab-size must be divisible by TP size.")
     if args.top_k <= 0 or args.top_k > args.vocab_size // world_size:

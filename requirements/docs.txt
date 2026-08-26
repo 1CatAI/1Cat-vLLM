@@ -6,7 +6,7 @@ babel==2.18.0
     # via
     #   mkdocs-git-revision-date-localized-plugin
     #   mkdocs-material
-backrefs==8.0
+backrefs==7.0
     # via mkdocs-material
 bracex==2.6
     # via wcmatch
@@ -30,7 +30,7 @@ gitdb==4.0.12
     # via gitpython
 gitpython==3.1.50
     # via mkdocs-git-revision-date-localized-plugin
-griffelib==2.2.0
+griffelib==2.0.2
     # via mkdocstrings-python
 htmlmin2==0.1.13
     # via mkdocs-minify-plugin
@@ -109,7 +109,7 @@ msgspec==0.21.1
     # via -r requirements/docs.in
 natsort==8.4.0
     # via mkdocs-awesome-nav
-packaging==26.3
+packaging==26.2
     # via
     #   mkdocs
     #   properdocs
@@ -157,7 +157,7 @@ regex==2026.4.4
     # via -r requirements/docs.in
 requests==2.33.1
     # via mkdocs-material
-ruff==0.16.4
+ruff==0.15.12
     # via -r requirements/docs.in
 selectolax==0.4.8
     # via mkdocs-glightbox

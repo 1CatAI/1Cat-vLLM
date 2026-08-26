@@ -118,8 +118,10 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
         return info
 
     def touch(self, key: _K) -> None:
-        if key in self:
+        try:
             self._LRUCache__order.move_to_end(key)  # type: ignore
+        except KeyError:
+            self._LRUCache__order[key] = None  # type: ignore
 
     @overload
     def get(self, key: _K, /) -> _V | None: ...

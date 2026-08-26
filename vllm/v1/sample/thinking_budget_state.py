@@ -153,7 +153,9 @@ class ThinkingBudgetStateHolder:
                 # the suffix that is present; stripping the full spec length in
                 # the repeated layout drops one real output token.
                 spec_suffix_len = (
-                    max(0, spec_len - 1) if last_row_for_req is not None else spec_len
+                    max(0, spec_len - 1)
+                    if last_row_for_req is not None
+                    else spec_len
                 )
                 # Only strip draft suffix when there are spec tokens; ``[:-0]`` would
                 # clear the whole list (Python treats stop index 0 as "up to empty").
@@ -161,7 +163,9 @@ class ThinkingBudgetStateHolder:
                     spec_suffix_len > 0
                     and len(state["output_tok_ids"]) >= spec_suffix_len
                 ):
-                    state["output_tok_ids"] = state["output_tok_ids"][:-spec_suffix_len]
+                    state["output_tok_ids"] = state["output_tok_ids"][
+                        :-spec_suffix_len
+                    ]
             self._update_think_state(state)
 
     def apply_to_logits(

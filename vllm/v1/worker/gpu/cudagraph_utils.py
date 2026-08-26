@@ -34,36 +34,6 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
-    speculative_config = vllm_config.speculative_config
-    return bool(
-        envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
-        and speculative_config is not None
-        and speculative_config.method == "mtp"
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
-    )
-
-
-def _split_sm70_mtp_manager_capture_sizes(
-    vllm_config: VllmConfig,
-    decode_query_len: int,
-) -> list[int]:
-    capture_sizes = sorted(vllm_config.compilation_config.cudagraph_capture_sizes or [])
-    if decode_query_len != 1:
-        return capture_sizes
-
-    speculative_config = vllm_config.speculative_config
-    assert speculative_config is not None
-    verifier_query_len = speculative_config.num_speculative_state_tokens() + 1
-    return [
-        size // verifier_query_len
-        for size in capture_sizes
-        if size % verifier_query_len == 0
-        and size // verifier_query_len <= vllm_config.scheduler_config.max_num_seqs
-    ]
-
-
 class CapturedAttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
@@ -141,32 +111,15 @@ class CudaGraphManager:
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
-        if _use_split_sm70_mtp_cudagraphs(vllm_config):
-            self._capture_sizes = _split_sm70_mtp_manager_capture_sizes(
-                vllm_config,
-                decode_query_len,
-            )
-            logger.info_once(
-                "Using split SM70 MTP CUDA graph manager shapes: "
-                "decode_query_len=%d capture_sizes=%s shared_verifier_shapes=%s.",
-                decode_query_len,
-                tuple(self._capture_sizes),
-                tuple(self.compilation_config.cudagraph_capture_sizes or ()),
-            )
-        else:
-            # Legacy MRV1 behavior. The rollback path deliberately preserves
-            # the shared in-place normalization used before split managers.
-            self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
-                self.decode_query_len, self.tp_size
-            )
-            self._capture_sizes = list(
-                self.compilation_config.cudagraph_capture_sizes or []
-            )
+        # adjust the cudagraph sizes to be a multiple of the uniform decode query length
+        self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
+            self.decode_query_len, self.tp_size
+        )
         self._init_candidates()
 
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
-        capture_sizes = self._capture_sizes
+        capture_sizes = self.compilation_config.cudagraph_capture_sizes
         if not (self.cudagraph_mode and capture_sizes):
             return
 

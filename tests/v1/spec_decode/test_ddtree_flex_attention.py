@@ -29,11 +29,11 @@ def test_ddtree_logical_mask_hides_siblings() -> None:
     )
 
     assert mask.tolist() == [
-        True,  # history
-        True,  # history
-        True,  # root
-        True,  # parent node 1
-        True,  # self node 2
+        True,   # history
+        True,   # history
+        True,   # root
+        True,   # parent node 1
+        True,   # self node 2
         False,  # sibling node 3
         False,  # beyond tree
     ]

@@ -3032,32 +3032,6 @@ def sm70_tp4_all_reduce_gemma_rms_norm(
     )
 
 
-def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-    fa: int,
-    inp: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    normalized_out: torch.Tensor,
-    residual_out: torch.Tensor,
-    reg_input_buffer: int,
-    reg_output_buffer: int,
-    reg_buffer_sz_bytes: int,
-    epsilon: float,
-) -> None:
-    torch.ops._C_custom_ar.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-        fa,
-        inp,
-        residual,
-        weight,
-        normalized_out,
-        residual_out,
-        reg_input_buffer,
-        reg_output_buffer,
-        reg_buffer_sz_bytes,
-        epsilon,
-    )
-
-
 def all_reduce_sum2(
     fa: int,
     inp_a: torch.Tensor,
@@ -3149,16 +3123,8 @@ def meta_size() -> int:
     return torch.ops._C_custom_ar.meta_size()
 
 
-def sm70_tp4_push_allreduce_buffer_size() -> int:
-    return torch.ops._C_custom_ar.sm70_tp4_push_allreduce_buffer_size()
-
-
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
-
-
-def register_sm70_tp4_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
-    torch.ops._C_custom_ar.register_sm70_tp4_push_allreduce_buffer(fa, ipc_tensors)
 
 
 def get_graph_buffer_ipc_meta(fa: int) -> tuple[list[int], list[int]]:

@@ -151,9 +151,8 @@ def _cuda_graph_capture_active() -> bool:
         return False
 
 
-def _maybe_sync_top1_all_gather(
-    module: torch.nn.Module, local_pair: torch.Tensor
-) -> None:
+def _maybe_sync_top1_all_gather(module: torch.nn.Module,
+                                local_pair: torch.Tensor) -> None:
     raw_steps = envs.VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS
     if not raw_steps or not local_pair.is_cuda:
         return
@@ -257,8 +256,8 @@ class LogitsProcessor(PluggableLayer):
         pre_stream_sync_ms = 0.0
         pre_device_extra_sync_ms = 0.0
         if profile_enabled:
-            pre_stream_sync_ms, pre_device_extra_sync_ms = _cuda_sync_breakdown_ms(
-                hidden_states
+            pre_stream_sync_ms, pre_device_extra_sync_ms = (
+                _cuda_sync_breakdown_ms(hidden_states)
             )
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
 
@@ -316,7 +315,9 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = get_tensor_model_parallel_world_size()
 
-        local_top1 = lm_head.maybe_get_sm70_lm_head_top1(hidden_states, embedding_bias)
+        local_top1 = lm_head.maybe_get_sm70_lm_head_top1(
+            hidden_states, embedding_bias
+        )
         if local_top1 is None:
             logits = lm_head.quant_method.apply(
                 lm_head, hidden_states, bias=embedding_bias
@@ -395,12 +396,14 @@ class LogitsProcessor(PluggableLayer):
         pre_stream_sync_ms = 0.0
         pre_device_extra_sync_ms = 0.0
         if profile_enabled:
-            pre_stream_sync_ms, pre_device_extra_sync_ms = _cuda_sync_breakdown_ms(
-                hidden_states
+            pre_stream_sync_ms, pre_device_extra_sync_ms = (
+                _cuda_sync_breakdown_ms(hidden_states)
             )
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
         stage_start = _cuda_stage_start(profile_enabled)
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        logits = lm_head.quant_method.apply(
+            lm_head, hidden_states, bias=embedding_bias
+        )
         local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
         stage_start = _cuda_stage_start(profile_enabled)
@@ -527,66 +530,43 @@ class LogitsProcessor(PluggableLayer):
         pre_stream_sync_ms = 0.0
         pre_device_extra_sync_ms = 0.0
         if profile_enabled:
-            pre_stream_sync_ms, pre_device_extra_sync_ms = _cuda_sync_breakdown_ms(
-                hidden_states
+            pre_stream_sync_ms, pre_device_extra_sync_ms = (
+                _cuda_sync_breakdown_ms(hidden_states)
             )
         pre_sync_ms = pre_stream_sync_ms + pre_device_extra_sync_ms
 
         stage_start = _cuda_stage_start(profile_enabled)
-        local_candidates = lm_head.maybe_get_sm70_dflash2_top20(
-            hidden_states,
-            top_k,
-            embedding_bias,
+        logits = lm_head.quant_method.apply(
+            lm_head, hidden_states, bias=embedding_bias
         )
-        if local_candidates is None:
-            logits = lm_head.quant_method.apply(
-                lm_head, hidden_states, bias=embedding_bias
-            )
-            local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
-            stage_start = _cuda_stage_start(profile_enabled)
-            if self.soft_cap is not None:
-                logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-            if self.scale != 1.0:
-                logits = logits * self.scale
+        stage_start = _cuda_stage_start(profile_enabled)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
 
-            num_pad = lm_head.shard_indices.num_org_vocab_padding
-            if num_pad > 0:
-                logits[..., -num_pad:] = -float("inf")
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
 
-            logits_float = logits.float()
-            postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        logits_float = logits.float()
+        postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
-            local_k = min(top_k, logits_float.shape[-1])
-            stage_start = _cuda_stage_start(profile_enabled)
-            local_vals, local_indices = torch.topk(
-                logits_float,
-                k=local_k,
-                dim=-1,
-            )
-            local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
+        local_k = min(top_k, logits_float.shape[-1])
+        stage_start = _cuda_stage_start(profile_enabled)
+        local_vals, local_indices = torch.topk(
+            logits_float,
+            k=local_k,
+            dim=-1,
+        )
+        local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
-            stage_start = _cuda_stage_start(profile_enabled)
-            vocab_start = lm_head.shard_indices.org_vocab_start_index
-            local_global_indices = local_indices + vocab_start
-            local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
-            local_vocab_size = int(logits_float.shape[-1])
-        else:
-            local_vals, local_global_indices = local_candidates
-            local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)
-            stage_start = _cuda_stage_start(profile_enabled)
-            # Positive scale and tanh soft-capping are monotonic, so applying
-            # them after the exact local top-k preserves the dense ordering.
-            if self.soft_cap is not None:
-                local_vals = torch.tanh(local_vals / self.soft_cap) * self.soft_cap
-            if self.scale != 1.0:
-                local_vals = local_vals * self.scale
-            local_vals = local_vals.float()
-            postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
-            local_k = int(local_vals.shape[-1])
-            local_topk_ms = 0.0
-            local_indices_ms = 0.0
-            local_vocab_size = int(lm_head.weight.shape[0])
+        stage_start = _cuda_stage_start(profile_enabled)
+        vocab_start = lm_head.shard_indices.org_vocab_start_index
+        local_global_indices = local_indices + vocab_start
+        local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
         tp_size = get_tensor_model_parallel_world_size()
         gather_vals_ms = 0.0
@@ -635,7 +615,7 @@ class LogitsProcessor(PluggableLayer):
                 gather_indices_ms,
                 merge_topk_ms,
                 int(hidden_states.shape[0]),
-                local_vocab_size,
+                int(logits_float.shape[-1]),
                 top_k,
                 local_k,
                 tp_size,

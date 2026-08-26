@@ -164,8 +164,9 @@ __global__ void gptq_marlin_repack_kernel(
       int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
       int const subtile = n_tile_id - cta_first_n_tile;
       int const local_word = local_k * 8 + local_n_vec;
-      int const cta_n_offset = cta_n_tile * cta_n_tiles * tile_size +
-                               local_word * cta_n_tiles + subtile;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
       out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
       return;
     }
@@ -214,8 +215,9 @@ __global__ void gptq_marlin_repack_kernel(
       int const cta_first_n_tile = cta_n_tile * cta_n_tiles;
       int const subtile = n_tile_id - cta_first_n_tile;
       int const local_word = local_k * 16 + local_n_word;
-      int const cta_n_offset = cta_n_tile * cta_n_tiles * tile_size +
-                               local_word * cta_n_tiles + subtile;
+      int const cta_n_offset =
+          cta_n_tile * cta_n_tiles * tile_size +
+          local_word * cta_n_tiles + subtile;
       out_ptr[k_tile_id * n_tiles * tile_size + cta_n_offset] = res;
       return;
     }
@@ -379,17 +381,19 @@ __global__ void gptq_marlin_repack_kernel(
             b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n);             \
   } else
 
-#define CALL_FOR_CTA(CTA_N)                                                  \
-  do {                                                                       \
-    CALL_IF(4, false, false, CTA_N)                                          \
-    CALL_IF(4, true, false, CTA_N)                                           \
-    CALL_IF(8, false, false, CTA_N)                                          \
-    CALL_IF(8, true, false, CTA_N)                                           \
-    CALL_IF(4, false, true, CTA_N)                                           \
-    CALL_IF(8, false, true, CTA_N) {                                         \
-      TORCH_CHECK(false, "Unsupported repack config: num_bits = ", num_bits, \
-                  ", has_perm = ", has_perm, ", is_a_8bit = ", is_a_8bit);   \
-    }                                                                        \
+#define CALL_FOR_CTA(CTA_N)                                                 \
+  do {                                                                      \
+    CALL_IF(4, false, false, CTA_N)                                         \
+    CALL_IF(4, true, false, CTA_N)                                          \
+    CALL_IF(8, false, false, CTA_N)                                         \
+    CALL_IF(8, true, false, CTA_N)                                          \
+    CALL_IF(4, false, true, CTA_N)                                          \
+    CALL_IF(8, false, true, CTA_N)                                          \
+    {                                                                       \
+      TORCH_CHECK(false, "Unsupported repack config: num_bits = ",          \
+                  num_bits, ", has_perm = ", has_perm,                     \
+                  ", is_a_8bit = ", is_a_8bit);                            \
+    }                                                                       \
   } while (false)
 
 torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm,

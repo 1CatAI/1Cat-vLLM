@@ -51,19 +51,15 @@ def _make_input(
     elif pattern == "random_small":
         generator = torch.Generator(device="cuda")
         generator.manual_seed(seed + rank)
-        tensor = (torch.rand(size, device="cuda", generator=generator) - 0.5).to(dtype)
+        tensor = (torch.rand(size, device="cuda", generator=generator) - 0.5).to(
+            dtype
+        )
     elif pattern == "model_like":
         generator = torch.Generator(device="cuda")
         generator.manual_seed(seed + rank)
         tensor = (torch.randn(size, device="cuda", generator=generator) * 0.03).to(
             dtype
         )
-    elif pattern == "positive_zero":
-        tensor = torch.zeros(size, device="cuda", dtype=dtype)
-    elif pattern == "signed_zero":
-        tensor = torch.zeros(size, device="cuda", dtype=dtype)
-        if rank % 2:
-            tensor = -tensor
     else:
         raise ValueError(f"unsupported pattern: {pattern}")
     return tensor
@@ -136,13 +132,7 @@ def _reference_custom_order(
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> dict[str, Any]:
     diff = (out.float() - ref.float()).abs()
     mismatch = out != ref
-    bit_dtype = torch.int16 if out.element_size() == 2 else torch.int32
-    out_bits = out.view(bit_dtype)
-    ref_bits = ref.view(bit_dtype)
-    bit_mismatch = out_bits != ref_bits
-    negative_zero = -32768 if out.element_size() == 2 else -2147483648
     nonzero = int(mismatch.sum().item())
-    bitwise_nonzero = int(bit_mismatch.sum().item())
     first_mismatch: dict[str, Any] | None = None
     if nonzero:
         idx = int(torch.nonzero(mismatch, as_tuple=False)[0].item())
@@ -154,10 +144,6 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> dict[str, Any]:
         }
     return {
         "equal": bool(torch.equal(out, ref)),
-        "bitwise_equal": bitwise_nonzero == 0,
-        "bitwise_nonzero_count": bitwise_nonzero,
-        "out_negative_zero_count": int((out_bits == negative_zero).sum().item()),
-        "ref_negative_zero_count": int((ref_bits == negative_zero).sum().item()),
         "max_diff": float(diff.max().item()),
         "mean_diff": float(diff.mean().item()),
         "nonzero_count": nonzero,
@@ -306,15 +292,12 @@ def _make_gemma_rms_norm_inputs(
 
     shared_generator = torch.Generator(device="cuda")
     shared_generator.manual_seed(seed + 1009)
-    residual = (
-        torch.randn(
-            (tokens, _GEMMA_RMS_NORM_HIDDEN_SIZE),
-            device="cuda",
-            dtype=torch.float32,
-            generator=shared_generator,
-        )
-        * 0.03
-    )
+    residual = torch.randn(
+        (tokens, _GEMMA_RMS_NORM_HIDDEN_SIZE),
+        device="cuda",
+        dtype=torch.float32,
+        generator=shared_generator,
+    ) * 0.03
     residual = residual.to(residual_dtype)
     weight = (
         torch.randn(
@@ -587,11 +570,6 @@ def _check_graph_multi(
         for i in range(multi_count)
     ]
     refs = [_reference_all_reduce(inp) for inp in inputs]
-    num_bytes = size * torch.empty((), dtype=dtype).element_size()
-    algo = _custom_allreduce_algo(ca.world_size, ca.fully_connected, num_bytes)
-    custom_order_refs = [
-        _reference_custom_order(inp, algo, ca.world_size) for inp in inputs
-    ]
     graph_timing: dict[str, float] | None = None
     if timing_iterations:
         outputs, graph_timing = _time_custom_ar_graph(
@@ -600,9 +578,6 @@ def _check_graph_multi(
     else:
         outputs = _run_graph(ca, inputs, graph_replays)
     comparisons = [_compare(out, ref) for out, ref in zip(outputs, refs)]
-    custom_order_comparisons = [
-        _compare(out, ref) for out, ref in zip(outputs, custom_order_refs)
-    ]
     max_diff = max(item["max_diff"] for item in comparisons)
     nonzero_count = sum(item["nonzero_count"] for item in comparisons)
     first_bad = next(
@@ -616,27 +591,14 @@ def _check_graph_multi(
     return {
         "mode": "graph_multi",
         "size": size,
-        "bytes": num_bytes,
+        "bytes": size * torch.empty((), dtype=dtype).element_size(),
         "dtype": str(dtype).replace("torch.", ""),
         "pattern": pattern,
-        "custom_allreduce_algo": algo,
         "multi_count": multi_count,
         "all_equal": all(item["equal"] for item in comparisons),
         "max_diff": float(max_diff),
         "nonzero_count": int(nonzero_count),
         "first_bad": first_bad,
-        "custom_order_all_equal": all(
-            item["equal"] for item in custom_order_comparisons
-        ),
-        "custom_order_bitwise_all_equal": all(
-            item["bitwise_equal"] for item in custom_order_comparisons
-        ),
-        "custom_order_bitwise_nonzero_count": sum(
-            item["bitwise_nonzero_count"] for item in custom_order_comparisons
-        ),
-        "custom_order_max_diff": max(
-            item["max_diff"] for item in custom_order_comparisons
-        ),
         "graph_timing": graph_timing,
     }
 
@@ -873,11 +835,11 @@ def main() -> None:
                 if item["pattern"] not in require_exact_patterns:
                     continue
                 if item["mode"] == "graph_multi":
-                    equal = item["custom_order_bitwise_all_equal"]
+                    equal = item["all_equal"]
                     comparison = item
                 else:
-                    comparison = item["custom_order_comparison"]
-                    equal = comparison["bitwise_equal"]
+                    equal = item["comparison"]["equal"]
+                    comparison = item["comparison"]
                 if not equal:
                     required_failures.append(
                         {
@@ -895,11 +857,9 @@ def main() -> None:
             "custom_allreduce_disabled": False,
             "fully_connected": ca.fully_connected,
             "max_size_bytes": ca.max_size,
-            "sm70_tp4_push_buffer_registered": (
-                ca.sm70_tp4_push_buffer_ptrs is not None
+            "sm70_tp4_m5_ar_threads": os.environ.get(
+                "VLLM_SM70_TP4_M5_AR_THREADS"
             ),
-            "sm70_tp4_m5_ar_threads": os.environ.get("VLLM_SM70_TP4_M5_AR_THREADS"),
-            "sm70_tp4_push_allreduce": os.environ.get("VLLM_SM70_TP4_PUSH_ALLREDUCE"),
             "required_exact_patterns": sorted(require_exact_patterns),
             "required_exact_passed": not required_failures,
             "required_failures": required_failures[:16],

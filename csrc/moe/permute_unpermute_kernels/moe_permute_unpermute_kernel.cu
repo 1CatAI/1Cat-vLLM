@@ -93,12 +93,10 @@ bool singleTokenUnpermuteFastPathEnabled() {
 }
 
 template <typename T>
-__global__ void singleTokenMoePermuteKernel(T const* input, int const* topk_ids,
-                                            T* permuted_output,
-                                            int64_t* expert_first_token_offset,
-                                            int* inv_permuted_idx,
-                                            int* permuted_idx, int num_experts,
-                                            int topk, int64_t cols) {
+__global__ void singleTokenMoePermuteKernel(
+    T const* input, int const* topk_ids, T* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int num_experts, int topk, int64_t cols) {
   __shared__ int sorted_ids[kSingleTokenFastPathMaxTopK];
   __shared__ int sorted_src[kSingleTokenFastPathMaxTopK];
 
@@ -179,8 +177,8 @@ __global__ void singleTokenMoeUnpermuteKernel(
 
   auto const* expanded_rows_v =
       reinterpret_cast<InputElem const*>(expanded_permuted_rows);
-  auto* reduced_row_ptr_v =
-      reinterpret_cast<OutputElem*>(reduced_unpermuted_output);
+  auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(
+      reduced_unpermuted_output);
   int64_t const num_elems_in_col = cols / FINALIZE_ELEM_PER_THREAD;
 
   for (int64_t elem_index = threadIdx.x; elem_index < num_elems_in_col;
@@ -188,7 +186,7 @@ __global__ void singleTokenMoeUnpermuteKernel(
     ComputeElem thread_output;
     thread_output.fill(0);
 
-  #pragma unroll
+#pragma unroll
     for (int k_idx = 0; k_idx < kSingleTokenFastPathMaxTopK; ++k_idx) {
       if (k_idx >= topk) {
         break;
@@ -224,12 +222,11 @@ bool canUseSingleTokenMoePermuteFastPath(int64_t n_token, int64_t topk,
 }
 
 template <typename T>
-void singleTokenMoePermuteLauncher(T const* input, int const* topk_ids,
-                                   T* permuted_output,
-                                   int64_t* expert_first_token_offset,
-                                   int* inv_permuted_idx, int* permuted_idx,
-                                   int num_experts, int topk, int64_t cols,
-                                   cudaStream_t stream) {
+void singleTokenMoePermuteLauncher(
+    T const* input, int const* topk_ids, T* permuted_output,
+    int64_t* expert_first_token_offset, int* inv_permuted_idx,
+    int* permuted_idx, int num_experts, int topk, int64_t cols,
+    cudaStream_t stream) {
   constexpr int threads = 256;
   singleTokenMoePermuteKernel<T><<<1, threads, 0, stream>>>(
       input, topk_ids, permuted_output, expert_first_token_offset,

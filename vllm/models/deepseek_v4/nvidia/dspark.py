@@ -15,7 +15,6 @@ import regex as re
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -72,40 +71,8 @@ class DSparkMarkovHead(nn.Module):
         return self.markov_w2(markov_embed)
 
 
-class DSparkConfidenceHead(nn.Module):
-    """Replicated FP32 conditional-acceptance predictor."""
-
-    def __init__(self, input_size: int, prefix: str) -> None:
-        super().__init__()
-        # The checkpoint tensor is BF16, but the official implementation keeps
-        # this projection and its input in FP32 for calibration accuracy.
-        self.proj = ReplicatedLinear(
-            input_size,
-            1,
-            bias=False,
-            params_dtype=torch.float32,
-            quant_config=None,
-            return_bias=False,
-            prefix=maybe_prefix(prefix, "proj"),
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        markov_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        features = torch.cat((hidden_states.float(), markov_embeds.float()), dim=-1)
-        return self.proj(features).squeeze(-1)
-
-
 class DSparkDeepseekV4Model(nn.Module):
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-        use_confidence_head: bool = False,
-    ) -> None:
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -179,14 +146,6 @@ class DSparkDeepseekV4Model(nn.Module):
             config.vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
-        )
-        self.confidence_head = (
-            DSparkConfidenceHead(
-                config.hidden_size + config.dspark_markov_rank,
-                prefix=maybe_prefix(prefix, "confidence_head"),
-            )
-            if use_confidence_head
-            else None
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -304,16 +263,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        speculative_config = vllm_config.speculative_config
-        self._confidence_head_required = bool(
-            speculative_config.dspark_confidence_threshold > 0.0
-            or envs.VLLM_SPEC_DUMP_ALIGNMENT
-        )
-        self._confidence_head_loaded = False
         self.model = DSparkDeepseekV4Model(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-            use_confidence_head=self._confidence_head_required,
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
@@ -360,21 +311,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed)
 
-    def confidence_logits(
-        self,
-        hidden_states: torch.Tensor,
-        markov_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        if not self._confidence_head_loaded:
-            raise RuntimeError(
-                "DSpark confidence logits were requested, but the draft "
-                "checkpoint did not provide confidence_head.proj.weight."
-            )
-        confidence_head = self.model.confidence_head
-        if confidence_head is None:
-            raise RuntimeError("DSpark confidence head was not initialized.")
-        return confidence_head(hidden_states, markov_embeds)
-
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
@@ -415,11 +351,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         for checkpoint_name, loaded_weight in weights:
             name = self._remap_dspark_name(checkpoint_name)
             if name is None:
-                continue
-            # Ordinary serving does not instantiate the optional diagnostic /
-            # scheduler head, so ignore its checkpoint tensor without adding
-            # an unused parameter to the runtime model.
-            if name.startswith("model.confidence_head.") and name not in params_dict:
                 continue
             if name.endswith(".scale"):
                 suffix = (
@@ -485,13 +416,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
-        confidence_weight_name = "model.confidence_head.proj.weight"
-        self._confidence_head_loaded = confidence_weight_name in loaded_params
-        if self._confidence_head_required and not self._confidence_head_loaded:
-            raise ValueError(
-                "DSpark confidence collection requires the draft checkpoint "
-                f"parameter {confidence_weight_name!r}."
-            )
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
@@ -502,13 +426,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(match.group(1))
         rest = match.group(2)
+        if rest.startswith("confidence_head."):
+            return None
         head_prefixes = (
             "norm.",
             "hc_head_fn",
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
-            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes

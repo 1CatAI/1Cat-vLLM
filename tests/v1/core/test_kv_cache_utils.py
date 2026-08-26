@@ -3,7 +3,6 @@
 import hashlib
 import importlib
 from collections.abc import Callable
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -181,37 +180,6 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
-
-
-def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
-    """Aligned Mamba keeps fine-grained hashes after page-size unification."""
-    kv_cache_config = KVCacheConfig(
-        num_blocks=1,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(["attention"], new_kv_cache_spec(block_size=16)),
-            KVCacheGroupSpec(
-                ["mamba"],
-                new_mamba_spec(block_size=1648, mamba_cache_mode="align"),
-            ),
-        ],
-    )
-    vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            block_size=16,
-            enable_prefix_caching=True,
-            hash_block_size=None,
-        ),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-        ),
-        kv_transfer_config=None,
-    )
-
-    assert kv_cache_utils.resolve_kv_cache_block_sizes(
-        kv_cache_config, vllm_config
-    ) == (1648, 16)
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1394,8 +1362,6 @@ def test_get_max_concurrency_for_kv_cache_config():
         enable_chunked_prefill=True,
         max_model_len=model_config.max_model_len,
         is_encoder_decoder=model_config.is_encoder_decoder,
-        # Pin to sync: SWA per-request bounds grow with overlapping batches.
-        async_scheduling=False,
     )
 
     vllm_config = VllmConfig(
@@ -1930,60 +1896,6 @@ def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
         get_kv_cache_spec_kind(sink_full_attention_spec)
         == KVCacheSpecKind.SINK_FULL_ATTENTION
     )
-
-
-def test_deepseek_v4_tuple_width_minimizes_physical_pool_pages():
-    full_spec = MLAAttentionSpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.uint8,
-        cache_dtype_str="fp8_ds_mla",
-        compress_ratio=4,
-        alignment=576,
-        model_version="deepseek_v4",
-    )
-    swa_spec = SlidingWindowMLASpec(
-        block_size=64,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.uint8,
-        sliding_window=128,
-        cache_dtype_str="fp8_ds_mla",
-        alignment=576,
-        model_version="deepseek_v4",
-    )
-    grouped_specs = [
-        UniformTypeKVCacheSpecs(
-            block_size=256,
-            kv_cache_specs={f"full_{i}": full_spec for i in range(21)},
-        ),
-        UniformTypeKVCacheSpecs(
-            block_size=64,
-            kv_cache_specs={f"swa_{i}": swa_spec for i in range(46)},
-        ),
-    ]
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=1_048_576),
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-        ),
-    )
-
-    assert (
-        kv_cache_utils._select_deepseek_v4_tuple_width(
-            vllm_config,  # type: ignore[arg-type]
-            grouped_specs,
-        )
-        == 21
-    )
-    groups = kv_cache_utils._get_kv_cache_groups_uniform_groups(
-        vllm_config,  # type: ignore[arg-type]
-        grouped_specs,
-    )
-    assert [len(group.layer_names) for group in groups] == [21, 16, 15, 15]
 
 
 def test_get_kv_cache_spec_kind_unwraps_uniform_type_specs():

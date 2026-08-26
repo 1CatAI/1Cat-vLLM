@@ -55,40 +55,6 @@ kernel module and userspace NVML versions differ. Local validation is limited
 to static and CPU tests until reboot; GPU correctness and performance run on
 the remote V100 host after the PR is merged and freshly cloned.
 
-## PP Topology Follow-up (2026-08-22)
-
-The original bring-up named PP2 x TP4 as a required deployment candidate, but
-the retained full-model evidence covers TP8 only. This follow-up removes the
-configuration blocker on current `onecat/main` at
-`7aede2cf010d92815c9d7bff25867b4fa009b6cb`; the full runtime evidence gap
-remains explicit below.
-
-- The roughly 160 GB checkpoint cannot fit pure TP4 or pure PP4 on four
-  V100-32GB GPUs. The memory-feasible eight-GPU candidates are PP2 x TP4 and,
-  if four pipeline stages are required, PP4 x TP2.
-- The default 43-layer partitions are `22+21` for PP2 and `11+11+11+10` for
-  PP4. DSpark target layers 40-42 remain entirely on the final pipeline stage
-  in both layouts, matching the runner's final-stage-only drafter ownership.
-- PP intermediate tensors must retain the four mHC streams with shape
-  `[tokens, 4, 4096]`; collapsing them to a two-dimensional hidden state at a
-  stage boundary would change model semantics.
-- The first runtime gate is PP2 x TP4 with the same model, FP8 MLA KV, DSpark
-  N7, 1024/256 request, sampling, graph mode, and fast-stack flags as the
-  accepted TP8 reproduction. The TP8-only hierarchical all-reduce is disabled
-  for each TP4 group.
-
-The first current-main PP2 x TP4 attempt failed before worker launch. DSpark's
-draft config inherited target `pipeline_parallel_size=2`, so generic model
-validation required the final-stage-local `DSparkDraftModel` to implement
-`SupportsPP`. The runner intentionally constructs the complete drafter only on
-the final target PP rank; partitioning that three-layer draft again would not
-match its ownership model. The candidate therefore gives DSpark a draft-local
-PP size of one while retaining the target TP/PP topology and draft TP size. It
-also rejects a custom layer partition if any configured target layer falls
-outside the final target pipeline stage. Exact configuration regressions pass
-for PP2 x TP4 and PP4 x TP2. Post-fix runtime route, quality, speed, and cleanup
-evidence remain pending.
-
 ## Upstream Reuse
 
 Reuse these official implementations and semantics:

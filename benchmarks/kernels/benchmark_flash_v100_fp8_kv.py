@@ -43,7 +43,6 @@ PREFILL_VARIANTS = (
     "fp8_b1616_bridge",
 )
 DECODE_VARIANTS = (
-    "fp8_b16_scalar",
     "fp16_b784_xqa",
     "fp16_b784_scalar",
     "fp16_b1568_xqa",

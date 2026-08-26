@@ -14,7 +14,6 @@ GPTQ_GROUP_SIZES = (128,)
 COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
-NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS = 5120 * 8704
 STATE_ATTR = "_sm70_turbomind_linear"
 SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
 
@@ -27,15 +26,7 @@ class SM70TurboMindLinearState:
     k_ld: int
     q_ld: int
     output_size: int
-    op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4"]
-    gated_silu: bool = False
-    dense_weight_ptr: int = 0
-    global_scale: float = 0.0
-    use_scale_code: bool = False
-
-
-# States retain only data_ptr(), so this cache owns the bounded allocation.
-_nvfp4_qpn4_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+    op_kind: Literal["uint4", "mxfp4", "nvfp4"]
 
 
 def quant_backend() -> SM70QuantBackend:
@@ -70,13 +61,6 @@ def should_use_mxfp4_moe_turbomind() -> bool:
     """Select the native MXFP4 MoE path only on exact SM70."""
     return is_exact_sm70_cuda_platform() and use_turbomind(
         envs.VLLM_SM70_MXFP4_TURBOMIND
-    )
-
-
-def should_use_nvfp4_moe_turbomind() -> bool:
-    """Select the native NVFP4 MoE path only on exact SM70."""
-    return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_NVFP4_TURBOMIND
     )
 
 
@@ -150,27 +134,19 @@ def _store_state(
     layer: torch.nn.Module,
     weight: torch.Tensor,
     scales: torch.Tensor,
-    meta: torch.Tensor | None,
+    meta: torch.Tensor,
     group_size: int,
     output_size: int,
-    op_kind: Literal["uint4", "mxfp4", "nvfp4", "nvfp4_qpn4"],
-    gated_silu: bool = False,
-    dense_weight_ptr: int = 0,
-    global_scale: float = 0.0,
-    use_scale_code: bool = False,
+    op_kind: Literal["uint4", "mxfp4", "nvfp4"],
 ) -> None:
     state = SM70TurboMindLinearState(
         weight=weight,
         scales=scales,
         group_size=group_size,
-        k_ld=0 if meta is None else int(meta[0]),
-        q_ld=0 if meta is None else int(meta[1]),
+        k_ld=int(meta[0]),
+        q_ld=int(meta[1]),
         output_size=output_size,
         op_kind=op_kind,
-        gated_silu=gated_silu,
-        dense_weight_ptr=dense_weight_ptr,
-        global_scale=global_scale,
-        use_scale_code=use_scale_code,
     )
     setattr(layer, STATE_ATTR, state)
 
@@ -308,71 +284,6 @@ def prepare_nvfp4_linear(
         NVFP4_GROUP_SIZE,
         qweight.size(1),
         "nvfp4",
-        interleave_gated_silu,
-    )
-
-
-def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
-    device_index = weight.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
-    cache_key = (device_index, torch.float16)
-    workspace = _nvfp4_qpn4_dense_workspaces.get(cache_key)
-    if workspace is not None:
-        return workspace
-    try:
-        workspace = torch.empty(
-            (NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS,),
-            dtype=torch.float16,
-            device=weight.device,
-        )
-    except torch.OutOfMemoryError:
-        return None
-    _nvfp4_qpn4_dense_workspaces[cache_key] = workspace
-    return workspace
-
-
-def prepare_nvfp4_qpn4_linear(
-    layer: torch.nn.Module,
-    workspace: torch.Tensor,
-    gated_silu: bool,
-) -> None:
-    """Replace one accepted NVFP4 dense weight with memory-neutral QPN4."""
-    from vllm import _sm70_ops as sm70_ops
-
-    qweight = unpack_mxfp4_weight(layer.weight.data)
-    use_scale_code = gated_silu or envs.VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE
-    global_scale = 0.0
-    if use_scale_code:
-        global_scale = float(layer.weight_global_scale.detach().float().item())
-        raw_scale_codes = layer.weight_scale.data.t().contiguous()
-        packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_scale_code_sm70(
-            qweight, raw_scale_codes
-        )
-    else:
-        fp16_scales = (
-            (
-                layer.weight_scale.data.t().to(torch.float32)
-                * layer.weight_global_scale.to(torch.float32)
-            )
-            .to(torch.float16)
-            .contiguous()
-        )
-        packed_weight, packed_scales = sm70_ops.nvfp4_qpn4_prepare_sm70(
-            qweight, fp16_scales
-        )
-    _store_state(
-        layer,
-        packed_weight,
-        packed_scales,
-        None,
-        NVFP4_GROUP_SIZE,
-        qweight.size(1),
-        "nvfp4_qpn4",
-        gated_silu=gated_silu,
-        dense_weight_ptr=workspace.data_ptr(),
-        global_scale=global_scale,
-        use_scale_code=use_scale_code,
     )
 
 
@@ -421,88 +332,8 @@ def apply_prepared_linear(
             state.k_ld,
             state.q_ld,
         )
-    elif state.op_kind == "nvfp4_qpn4":
-        if reshaped_x.dtype != torch.float16:
-            raise RuntimeError(
-                f"SM70 NVFP4 QPN4 requires float16 activations, got {reshaped_x.dtype}."
-            )
-        if reshaped_x.stride(-1) != 1:
-            reshaped_x = reshaped_x.contiguous()
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
-            out,
-            state.dense_weight_ptr,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            False,
-        )
     else:
         raise AssertionError(f"unknown SM70 TurboMind op kind: {state.op_kind}")
-    if state.gated_silu and state.op_kind == "nvfp4":
-        out_features = state.output_size // 2
-        out = (
-            out.reshape(reshaped_x.shape[0], out_features, 2)
-            .transpose(1, 2)
-            .reshape(reshaped_x.shape[0], state.output_size)
-        )
     if bias is not None:
         out.add_(bias)
     return out.reshape(out_shape)
-
-
-def apply_prepared_fused_silu_and_mul(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-) -> torch.Tensor | None:
-    state = getattr(layer, STATE_ATTR, None)
-    if (
-        state is None
-        or state.op_kind not in ("nvfp4", "nvfp4_qpn4")
-        or not state.gated_silu
-    ):
-        return None
-    if x.dtype != torch.float16:
-        raise RuntimeError(
-            "SM70 TurboMind NVFP4 gated-SiLU requires float16 activations, "
-            f"got {x.dtype}."
-        )
-
-    reshaped_x = x.reshape(-1, x.shape[-1])
-    if reshaped_x.stride(-1) != 1:
-        reshaped_x = reshaped_x.contiguous()
-    out_features = state.output_size // 2
-    out = torch.empty(
-        (reshaped_x.shape[0], out_features),
-        dtype=x.dtype,
-        device=x.device,
-    )
-    if reshaped_x.shape[0] == 0:
-        return out.reshape(*x.shape[:-1], out_features)
-
-    from vllm import _sm70_ops as sm70_ops
-
-    if state.op_kind == "nvfp4_qpn4":
-        sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
-            out,
-            state.dense_weight_ptr,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.global_scale,
-            state.use_scale_code,
-            True,
-        )
-    else:
-        sm70_ops.nvfp4_gemm_sm70_out(
-            out,
-            reshaped_x,
-            state.weight,
-            state.scales,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
-            True,
-        )
-    return out.reshape(*x.shape[:-1], out_features)

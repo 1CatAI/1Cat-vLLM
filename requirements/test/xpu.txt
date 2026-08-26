@@ -8,7 +8,7 @@ accelerate==1.13.0
     # via -r requirements/test/xpu.in
 aiohappyeyeballs==2.6.1
     # via aiohttp
-aiohttp==3.14.3
+aiohttp==3.13.4
     # via
     #   -c requirements/common.txt
     #   fsspec
@@ -103,11 +103,11 @@ dpcpp-cpp-rt==2025.3.2
     #   torch
 evaluate==0.4.6
     # via lm-eval
-fastapi==0.141.1
+fastapi==0.135.2
     # via
     #   -c requirements/common.txt
     #   gpt-oss
-filelock==3.32.4
+filelock==3.25.2
     # via
     #   -c requirements/common.txt
     #   blobfile
@@ -244,7 +244,7 @@ lazy-loader==0.5
     #   scikit-image
 librosa==0.10.2.post1
     # via -r requirements/test/xpu.in
-llvmlite==0.49.0
+llvmlite==0.47.0
     # via numba
 lm-eval==0.4.11
     # via -r requirements/test/xpu.in
@@ -304,7 +304,7 @@ nltk==3.9.4
     # via rouge-score
 num2words==0.5.14
     # via -r requirements/test/xpu.in
-numba==0.67.0
+numba==0.65.0
     # via
     #   -c requirements/xpu.txt
     #   librosa
@@ -428,7 +428,7 @@ pycparser==3.0
     # via cffi
 pycryptodomex==3.23.0
     # via blobfile
-pydantic==2.13.4
+pydantic==2.12.5
     # via
     #   -c requirements/common.txt
     #   albumentations
@@ -438,7 +438,7 @@ pydantic==2.13.4
     #   mteb
     #   openai-harmony
     #   pydantic-extra-types
-pydantic-core==2.46.4
+pydantic-core==2.41.5
     # via pydantic
 pydantic-extra-types==2.11.1
     # via mistral-common
@@ -509,7 +509,7 @@ regex==2026.3.32
     #   sacrebleu
     #   tiktoken
     #   transformers
-requests==2.34.2
+requests==2.33.1
     # via
     #   -c requirements/common.txt
     #   datasets
@@ -537,7 +537,7 @@ rpds-py==0.30.0
     #   referencing
 sacrebleu==2.6.0
     # via lm-eval
-safetensors==0.8.0
+safetensors==0.7.0
     # via
     #   -c requirements/common.txt
     #   accelerate
@@ -634,7 +634,7 @@ threadpoolctl==3.6.0
     # via scikit-learn
 tifffile==2026.3.3
     # via scikit-image
-tiktoken==0.14.0
+tiktoken==0.12.0
     # via
     #   -c requirements/common.txt
     #   gpt-oss
@@ -668,7 +668,7 @@ tqdm==4.67.3
     #   pqdm
     #   sentence-transformers
     #   transformers
-transformers==5.15.1
+transformers==5.5.3
     # via
     #   -c requirements/common.txt
     #   sentence-transformers
@@ -683,10 +683,9 @@ typer==0.24.1
     # via
     #   huggingface-hub
     #   transformers
-typing-extensions==4.16.0
+typing-extensions==4.15.0
     # via
     #   -c requirements/common.txt
-    #   aiohttp
     #   aiosignal
     #   albumentations
     #   anyio

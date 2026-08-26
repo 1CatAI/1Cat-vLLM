@@ -35,14 +35,6 @@ from vllm.platforms import current_platform
 DEFAULT_VOCAB_PADDING_SIZE = 64
 logger = init_logger(__name__)
 
-_SM70_DFLASH2_QPN8_LM_HEAD_SHAPE = (62080, 5120)
-_SM70_DFLASH2_QPN8_MAX_ROWS = 8
-_SM70_DFLASH2_QPN8_CANDIDATES = 64
-_SM70_DFLASH2_QPN8_SPLIT_K = 8
-_SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS = 1
-_SM70_DFLASH2_RERANK_CTA_N = 128
-_SM70_DFLASH2_RERANK_SPLIT_K = 10
-
 
 def _sm70_env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -52,16 +44,8 @@ def _sm70_env_bool(name: str, default: bool) -> bool:
 
 
 def _sm70_lm_head_top1_default() -> bool:
-    return not _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False)
-
-
-def _sm70_dflash2_qpn8_rerank_enabled() -> bool:
-    return envs.VLLM_SM70_DFLASH2_QPN8_RERANK
-
-
-def _sm70_dflash2_qpn8_rerank_requested() -> bool:
-    return (
-        _sm70_dflash2_qpn8_rerank_enabled() or envs.VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW
+    return not _sm70_env_bool(
+        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False
     )
 
 
@@ -81,7 +65,6 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
-        or _sm70_dflash2_qpn8_rerank_requested()
     ):
         _trace_sm70_lm_head_skip("disabled")
         return False
@@ -111,229 +94,6 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
     return True
 
 
-def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
-    if not _sm70_dflash2_qpn8_rerank_requested():
-        return False
-    if tuple(layer.weight.shape) != _SM70_DFLASH2_QPN8_LM_HEAD_SHAPE:
-        logger.warning_once(
-            "SM70 DFlash2 QPN8 rerank requires LM-head shape %s; got %s. "
-            "Using the dense LM head.",
-            _SM70_DFLASH2_QPN8_LM_HEAD_SHAPE,
-            tuple(layer.weight.shape),
-        )
-        return False
-    if getattr(layer, "tp_size", 1) != 4:
-        logger.warning_once(
-            "SM70 DFlash2 QPN8 rerank requires TP4; using the dense LM head."
-        )
-        return False
-    if layer.shard_indices.num_org_vocab_padding != 0:
-        logger.warning_once(
-            "SM70 DFlash2 QPN8 rerank requires an unpadded local vocabulary; "
-            "using the dense LM head."
-        )
-        return False
-    required_ops = (
-        "fp8_qpn8_prepare_sm70",
-        "fp8_qpn8_gemm_sm70_out",
-        "sm70_f16_indexed_rerank_packed_out",
-        "sm70_f16_rerank_keys_out",
-        "sm70_f16_rerank_topk_out",
-    )
-    missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
-    if missing:
-        logger.warning_once(
-            "SM70 DFlash2 QPN8 rerank operators are unavailable (%s); using "
-            "the dense LM head.",
-            ", ".join(missing),
-        )
-        return False
-    return True
-
-
-@torch.inference_mode()
-def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
-    if not _is_sm70_dflash2_qpn8_rerank_eligible(layer):
-        return False
-
-    weight = layer.weight
-    rows, hidden = weight.shape
-    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
-    channel_scales = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
-    # Quantize in bounded row chunks so startup never materializes another
-    # full-size FP32 LM head.  The original FP16 parameter remains the oracle
-    # used by the exact candidate rerank.
-    chunk_rows = 4096
-    for begin in range(0, rows, chunk_rows):
-        end = min(begin + chunk_rows, rows)
-        weight_f32 = weight[begin:end].float()
-        scales = weight_f32.abs().amax(dim=1, keepdim=True).div_(448.0)
-        scales.clamp_(min=torch.finfo(torch.float32).tiny)
-        channel_scales[begin:end].copy_(scales)
-        qweight[begin:end].copy_(
-            weight_f32.div_(scales).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
-        )
-
-    codes, packed_scales = sm70_ops.fp8_qpn8_prepare_sm70(qweight, channel_scales)
-    del qweight, channel_scales, weight_f32, scales
-    torch.accelerator.empty_cache()
-
-    device = weight.device
-    max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
-    candidates = _SM70_DFLASH2_QPN8_CANDIDATES
-    layer.register_buffer("_sm70_dflash2_qpn8_codes", codes, persistent=False)
-    layer.register_buffer("_sm70_dflash2_qpn8_scales", packed_scales, persistent=False)
-    layer.register_buffer(
-        "_sm70_dflash2_qpn8_logits",
-        torch.empty((max_rows, rows), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_qpn8_values",
-        torch.empty((max_rows, candidates), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_qpn8_ids",
-        torch.empty((max_rows, candidates), dtype=torch.int64, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_logits",
-        torch.empty((max_rows, candidates), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    selected_rows = max_rows * candidates
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_selected_raw",
-        torch.empty((selected_rows, hidden), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_selected_packed",
-        torch.empty((selected_rows, hidden), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_expanded",
-        torch.empty((max_rows, selected_rows), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_partials",
-        torch.empty((max_rows, selected_rows), dtype=torch.float32, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_barriers",
-        torch.zeros(64, dtype=torch.int32, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_dense_logits",
-        torch.empty((max_rows, rows), dtype=torch.float16, device=device),
-        persistent=False,
-    )
-    layer.register_buffer(
-        "_sm70_dflash2_rerank_keys",
-        torch.empty((max_rows, candidates), dtype=torch.int64, device=device),
-        persistent=False,
-    )
-    # Keep distinct top-16 and top-20 outputs.  Slicing the columns of one
-    # [max_rows, 20] allocation for top-16 leaves a row stride of 20 and makes
-    # the result non-contiguous.  The TP all-gather requires contiguous inputs,
-    # and inserting a runtime contiguous() copy would add work to both graphs.
-    for selector_k in (16, 20):
-        layer.register_buffer(
-            f"_sm70_dflash2_rerank_values_{selector_k}",
-            torch.empty((max_rows, selector_k), dtype=torch.float16, device=device),
-            persistent=False,
-        )
-        layer.register_buffer(
-            f"_sm70_dflash2_rerank_positions_{selector_k}",
-            torch.empty((max_rows, selector_k), dtype=torch.int64, device=device),
-            persistent=False,
-        )
-        layer.register_buffer(
-            f"_sm70_dflash2_rerank_ids_{selector_k}",
-            torch.empty((max_rows, selector_k), dtype=torch.int64, device=device),
-            persistent=False,
-        )
-        layer.register_buffer(
-            f"_sm70_dflash2_rerank_key_values_{selector_k}",
-            torch.empty((max_rows, selector_k), dtype=torch.int64, device=device),
-            persistent=False,
-        )
-    layer._sm70_dflash2_qpn8_rerank_prepared = True
-    logger.info_once(
-        "SM70 DFlash2 QPN8 top-64 plus exact TurboMind FP16 rerank layout prepared."
-    )
-    return True
-
-
-def _sm70_dflash2_rerank_output_buffers(
-    layer: torch.nn.Module,
-    num_rows: int,
-    selector_k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select graph-stable, contiguous rerank outputs for top-16 or top-20."""
-    if selector_k == 16:
-        values = layer._sm70_dflash2_rerank_values_16[:num_rows]
-        positions = layer._sm70_dflash2_rerank_positions_16[:num_rows]
-        ids = layer._sm70_dflash2_rerank_ids_16[:num_rows]
-    elif selector_k == 20:
-        values = layer._sm70_dflash2_rerank_values_20[:num_rows]
-        positions = layer._sm70_dflash2_rerank_positions_20[:num_rows]
-        ids = layer._sm70_dflash2_rerank_ids_20[:num_rows]
-    else:
-        raise ValueError(f"Unsupported DFlash2 rerank top-k: {selector_k}")
-    return values, positions, ids
-
-
-def _sm70_dflash2_dense_order_topk(
-    sparse_logits: torch.Tensor,
-    candidate_ids: torch.Tensor,
-    candidate_logits: torch.Tensor,
-    values: torch.Tensor,
-    ids: torch.Tensor,
-    selector_k: int,
-    vocab_start_index: int,
-) -> None:
-    """Restore dense-vocabulary tie order after sparse candidate reranking."""
-    sparse_logits.fill_(-float("inf"))
-    sparse_logits.scatter_(1, candidate_ids, candidate_logits)
-    torch.topk(
-        sparse_logits,
-        selector_k,
-        dim=-1,
-        sorted=True,
-        out=(values, ids),
-    )
-    ids.add_(vocab_start_index)
-
-
-def _sm70_dflash2_candidate_order_topk(
-    candidate_ids: torch.Tensor,
-    candidate_logits: torch.Tensor,
-    values: torch.Tensor,
-    ids: torch.Tensor,
-    selector_k: int,
-    vocab_start_index: int,
-) -> None:
-    """Select exact values with original-vocabulary tie precedence."""
-    if values.size(1) != selector_k:
-        raise ValueError(
-            f"DFlash2 rerank output width {values.size(1)} != top-k {selector_k}"
-        )
-    sm70_ops.sm70_f16_rerank_topk_out(
-        values,
-        ids,
-        candidate_logits,
-        candidate_ids,
-        vocab_start_index,
-    )
-
-
 def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     if getattr(layer, "_sm70_f16_prepared", False):
         return True
@@ -343,9 +103,7 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
     layer._sm70_f16_tm_weight = prepared[0]
     layer._sm70_f16_k_ld = int(prepared[1][0].item())
     layer._sm70_f16_prepared = True
-    if _prepare_sm70_dflash2_qpn8_rerank(layer):
-        pass
-    elif envs.VLLM_SM70_ENABLE_LM_HEAD_FASTPATH:
+    if envs.VLLM_SM70_ENABLE_LM_HEAD_FASTPATH:
         logger.info_once("SM70 dense fp16 fast path enabled for LM head.")
     else:
         logger.info_once("SM70 LM head top1 layout prepared.")
@@ -406,7 +164,8 @@ def _maybe_sm70_lm_head_top1(
         or hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out")
     ):
         logger.warning_once(
-            "SM70 LM head top1 requested, but no top1 op is available; falling back."
+            "SM70 LM head top1 requested, but no top1 op is available; "
+            "falling back."
         )
         return None
     if x.dtype != torch.float16 or not x.is_cuda:
@@ -434,7 +193,9 @@ def _maybe_sm70_lm_head_top1(
 
     values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
     indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
-    if lm_head_top1_tc and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
+    if lm_head_top1_tc and hasattr(
+        torch.ops._C, "sm70_f16_lm_head_top1_tc_out"
+    ):
         tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
         k_ld = getattr(layer, "_sm70_f16_k_ld", None)
         if tm_weight is not None and k_ld is not None:
@@ -455,7 +216,9 @@ def _maybe_sm70_lm_head_top1(
     if num_rows != 1:
         return None
 
-    if not lm_head_top1 or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
+    if not lm_head_top1 or not hasattr(
+        torch.ops._C, "sm70_f16_lm_head_top1_out"
+    ):
         return None
 
     sm70_ops.sm70_f16_lm_head_top1_out(
@@ -469,146 +232,6 @@ def _maybe_sm70_lm_head_top1(
     )
     logger.info_once("SM70 fused LM head top1 path enabled.")
     return values.reshape(*x.shape[:-1]), indices.reshape(*x.shape[:-1])
-
-
-def _maybe_sm70_dflash2_qpn8_rerank(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    selector_k: int,
-    bias: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return shard-local top-k after QPN8 support search and FP16 rerank."""
-    if not _sm70_dflash2_qpn8_rerank_requested():
-        return None
-    if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
-        return None
-    if selector_k not in (16, 20) or bias is not None:
-        return None
-    if x.dtype != torch.float16 or not x.is_cuda:
-        return None
-    if torch.cuda.get_device_capability(x.device) != (7, 0):
-        return None
-
-    x_2d = x.reshape(-1, x.shape[-1])
-    num_rows = x_2d.size(0)
-    if not 1 <= num_rows <= _SM70_DFLASH2_QPN8_MAX_ROWS:
-        return None
-    if not x_2d.is_contiguous():
-        x_2d = x_2d.contiguous()
-
-    qpn8_logits = layer._sm70_dflash2_qpn8_logits[:num_rows]
-    qpn8_values = layer._sm70_dflash2_qpn8_values[:num_rows]
-    qpn8_ids = layer._sm70_dflash2_qpn8_ids[:num_rows]
-    sm70_ops.fp8_qpn8_gemm_sm70_out(
-        qpn8_logits,
-        x_2d,
-        layer._sm70_dflash2_qpn8_codes,
-        layer._sm70_dflash2_qpn8_scales,
-        _SM70_DFLASH2_QPN8_SPLIT_K,
-        _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS,
-        False,
-        False,
-    )
-    # The exact FP16 rerank is permutation-invariant over this approximate
-    # support, so skip the unnecessary 64-element result sort. This keeps the
-    # official PyTorch multiblock selector while avoiding its final bitonic
-    # kernel and leaves candidate quality unchanged.
-    torch.topk(
-        qpn8_logits,
-        _SM70_DFLASH2_QPN8_CANDIDATES,
-        dim=-1,
-        sorted=False,
-        out=(qpn8_values, qpn8_ids),
-    )
-
-    sm70_ops.sm70_f16_indexed_rerank_packed_out(
-        layer._sm70_dflash2_rerank_logits[:num_rows],
-        x_2d,
-        layer._sm70_f16_tm_weight,
-        qpn8_ids,
-        layer._sm70_dflash2_rerank_selected_packed,
-        layer._sm70_dflash2_rerank_expanded,
-        layer._sm70_dflash2_rerank_partials,
-        layer._sm70_dflash2_rerank_barriers,
-        _SM70_DFLASH2_RERANK_CTA_N,
-        _SM70_DFLASH2_RERANK_SPLIT_K,
-    )
-    rerank_logits = layer._sm70_dflash2_rerank_logits[:num_rows]
-    values, _positions, ids = _sm70_dflash2_rerank_output_buffers(
-        layer, num_rows, selector_k
-    )
-    if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
-        _sm70_dflash2_dense_order_topk(
-            layer._sm70_dflash2_rerank_dense_logits[:num_rows],
-            qpn8_ids,
-            rerank_logits,
-            values,
-            ids,
-            selector_k,
-            layer.shard_indices.org_vocab_start_index,
-        )
-    else:
-        _sm70_dflash2_candidate_order_topk(
-            qpn8_ids,
-            rerank_logits,
-            values,
-            ids,
-            selector_k,
-            layer.shard_indices.org_vocab_start_index,
-        )
-
-    if envs.VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW:
-        if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW is eager-only; disable "
-                "CUDA Graph/torch.compile for the real-hidden coverage audit."
-            )
-        dense_logits = layer.quant_method.apply(layer, x_2d, bias=None)
-        dense_values, dense_ids = torch.topk(
-            dense_logits,
-            selector_k,
-            dim=-1,
-            sorted=True,
-        )
-        support_matches = (dense_ids[:, :, None] == qpn8_ids[:, None, :]).any(dim=-1)
-        dense_global_ids = dense_ids + layer.shard_indices.org_vocab_start_index
-        rerank_matches = (dense_global_ids[:, :, None] == ids[:, None, :]).any(dim=-1)
-        call = int(getattr(layer, "_sm70_dflash2_qpn8_shadow_calls", 0)) + 1
-        layer._sm70_dflash2_qpn8_shadow_calls = call
-        logger.info(
-            "SM70_DFLASH2_QPN8_SHADOW call=%d rows=%d top_k=%d "
-            "support_missing=%d exact_set_rows=%d top1_match_rows=%d "
-            "ordered_value_max_abs=%.6g",
-            call,
-            num_rows,
-            selector_k,
-            int((~support_matches).sum().item()),
-            int(rerank_matches.all(dim=-1).sum().item()),
-            int((dense_global_ids[:, 0] == ids[:, 0]).sum().item()),
-            float((dense_values.float() - values.float()).abs().max().item()),
-        )
-        output_shape = (*x.shape[:-1], selector_k)
-        return dense_values.reshape(output_shape), dense_global_ids.reshape(
-            output_shape
-        )
-
-    logger.info_once(
-        "SM70 DFlash2 QPN8 top-64 plus exact packed TurboMind FP16 rerank "
-        "path enabled (dense_order=%s).",
-        envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER,
-    )
-    output_shape = (*x.shape[:-1], selector_k)
-    return values.reshape(output_shape), ids.reshape(output_shape)
-
-
-def _maybe_sm70_dflash2_lm_head_top20(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    selector_k: int,
-    bias: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return selector candidates from the opt-in QPN8 plus FP16 rerank."""
-    return _maybe_sm70_dflash2_qpn8_rerank(layer, x, selector_k, bias)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -1088,14 +711,6 @@ class VocabParallelEmbedding(PluggableLayer):
         bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         return _maybe_sm70_lm_head_top1(self, hidden_states, bias)
-
-    def maybe_get_sm70_dflash2_top20(
-        self,
-        hidden_states: torch.Tensor,
-        selector_k: int,
-        bias: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        return _maybe_sm70_dflash2_lm_head_top20(self, hidden_states, selector_k, bias)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

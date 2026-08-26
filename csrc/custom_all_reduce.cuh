@@ -51,38 +51,9 @@ inline hipPointer_attribute rangeStartAddrAttr =
 
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
 constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
-constexpr size_t kSm70Tp4MtpVerifierBytesPerRequest = 5 * 2048 * sizeof(half);
 constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
-constexpr int kSm70LongPrefillSignalBlocks =
-    sm70_tile_runtime::kMaxSignalBlocks;
-constexpr int kSm70LongPrefillMaxTokensPerRank = 2048;
-// DFlash2 verifies eight positions at once. These constants mirror SGLang's
-// two-epoch one-shot push collective while keeping its storage separate from
-// vLLM's pull-collective metadata and intermediate buffers.
-constexpr int kSm70Tp4PushAllreduceWorldSize = 4;
-constexpr int kSm70Tp4PushAllreduceBlocks = 80;
-constexpr int kSm70Tp4PushAllreduceThreads = 128;
-constexpr int kSm70Tp4PushAllreduceEpochs = 2;
-constexpr uint16_t kSm70Tp4PushAllreduceSentinel = 0x7f7f;
-constexpr int kSm70Tp4PushAllreduceSentinelByte = 0x7f;
-constexpr size_t kSm70Tp4PushAllreduceBytes =
-    8 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
-constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
-constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
-    ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
-    kSm70Tp4PushAllreduceSignalBytes + kSm70Tp4PushAllreduceEpochs *
-                                           kSm70Tp4PushAllreduceWorldSize *
-                                           kSm70Tp4PushAllreduceBytes;
-
-inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
-  if (bytes == kSm70Tp4PushAllreduceBytes) {
-    return kSm70Tp4PushAllreduceBlocks;
-  }
-  return bytes == kSm70Tp4PushAllreduce8KiBBytes ? 4 : 0;
-}
 
 inline int sm70_gemma_rms_norm_threads() {
   const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
@@ -91,20 +62,6 @@ inline int sm70_gemma_rms_norm_threads() {
   return threads == 256 || threads == 512 || threads == 1024
              ? threads
              : kSm70GemmaRmsNormThreads;
-}
-
-inline int sm70_tp4_long_fused_norm_threads() {
-  const char* raw = std::getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS");
-  if (raw == nullptr) return 512;
-  const int threads = std::atoi(raw);
-  return threads == 256 || threads == 512 || threads == 1024 ? threads : 512;
-}
-
-inline int sm70_tp4_long_fused_norm_blocks() {
-  const char* raw = std::getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS");
-  if (raw == nullptr) return 80;
-  const int blocks = std::atoi(raw);
-  return blocks >= 1 && blocks <= kSm70LongPrefillSignalBlocks ? blocks : 80;
 }
 
 inline bool custom_allreduce_current_device_is_sm70() {
@@ -129,7 +86,7 @@ inline bool custom_allreduce_current_device_is_sm70() {
 }
 
 inline bool sm70_tp8_hierarchical_custom_ar_enabled(int world_size,
-                                                    bool fully_connected) {
+                                                     bool fully_connected) {
   const char* raw = std::getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR");
   return raw != nullptr && std::atoi(raw) != 0 && world_size == 8 &&
          !fully_connected && custom_allreduce_current_device_is_sm70();
@@ -139,29 +96,14 @@ inline bool sm70_tp8_hierarchical_peer(int rank, int peer) {
   return rank / 4 == peer / 4 || rank + 4 == peer || peer + 4 == rank;
 }
 
-inline int custom_allreduce_block_limit(int default_limit, int world_size,
-                                        bool fully_connected, size_t bytes,
-                                        bool tune_sm70_tp4_mtp) {
+inline int custom_allreduce_block_limit(int default_limit,
+                                        int world_size,
+                                        size_t bytes) {
   const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
   if (raw == nullptr || raw[0] == '\0') {
     if (world_size == 2 && bytes <= kSm70Tp2SmallAllreduceBytes &&
         custom_allreduce_current_device_is_sm70()) {
       return 1;
-    }
-    const char* tune_raw = std::getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING");
-    const bool tuning_enabled =
-        tune_raw != nullptr && tune_raw[0] != '\0' && std::atoi(tune_raw) != 0;
-    if (tune_sm70_tp4_mtp && tuning_enabled &&
-        default_limit == defaultBlockLimit && world_size == 4 &&
-        fully_connected && custom_allreduce_current_device_is_sm70()) {
-      if (bytes == kSm70Tp4MtpVerifierBytesPerRequest) {
-        return 1;
-      }
-      if (bytes == 8 * kSm70Tp4MtpVerifierBytesPerRequest ||
-          bytes == 12 * kSm70Tp4MtpVerifierBytesPerRequest ||
-          bytes == 16 * kSm70Tp4MtpVerifierBytesPerRequest) {
-        return 8;
-      }
     }
     return default_limit;
   }
@@ -175,7 +117,8 @@ inline int custom_allreduce_block_limit(int default_limit, int world_size,
   return static_cast<int>(parsed);
 }
 
-inline int sm70_tp4_m5_allreduce_threads(int world_size, bool fully_connected,
+inline int sm70_tp4_m5_allreduce_threads(int world_size,
+                                         bool fully_connected,
                                          size_t bytes) {
   const char* raw = std::getenv("VLLM_SM70_TP4_M5_AR_THREADS");
   if (raw == nullptr || raw[0] == '\0') return 512;
@@ -194,15 +137,6 @@ inline int sm70_tp4_m5_allreduce_threads(int world_size, bool fully_connected,
     return 512;
   }
   return static_cast<int>(parsed);
-}
-
-inline bool sm70_tp4_small_allreduce_pack32(int world_size,
-                                            bool fully_connected,
-                                            size_t bytes) {
-  const char* raw = std::getenv("VLLM_SM70_TP4_SMALL_AR_PACK32");
-  return raw != nullptr && std::atoi(raw) != 0 && world_size == 4 &&
-         fully_connected && bytes == 5120 * sizeof(half) &&
-         custom_allreduce_current_device_is_sm70();
 }
 
 // Counter may overflow, but unsigned integer overflow is well-defined.
@@ -343,7 +277,8 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
 }
 
 static DINLINE void st_flag_sys_visible(FlagType* flag_addr, FlagType flag) {
-  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag),
+  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;"
+               ::"r"(flag),
                "l"(flag_addr)
                : "memory");
 }
@@ -357,47 +292,11 @@ static DINLINE FlagType ld_flag_sys_visible(FlagType* flag_addr) {
   return flag;
 }
 
-static DINLINE void membar_sys() { asm volatile("membar.sys;" ::: "memory"); }
-
-// The TP4 pack32 route waits with volatile peer loads, then executes one
-// system fence after the matching flag is visible. This preserves the input
-// visibility contract without putting a system fence in every poll iteration.
-template <int ngpus>
-DINLINE void sm70_pack32_barrier_at_start(const RankSignals& sg,
-                                          Signal* self_sg, int rank) {
-  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-  if (threadIdx.x < ngpus) {
-    const unsigned int peer = threadIdx.x;
-    auto peer_counter_ptr = &sg.signals[peer]->start[blockIdx.x][rank];
-    auto self_counter_ptr = &self_sg->start[blockIdx.x][peer];
-    st_flag_sys_visible(peer_counter_ptr, flag);
-    while (ld_flag_volatile(self_counter_ptr) != flag);
-    membar_sys();
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
-}
-
-template <int ngpus>
-DINLINE void sm70_pack32_barrier_at_end(const RankSignals& sg, Signal* self_sg,
-                                        int rank) {
-  __syncthreads();
-  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-  if (threadIdx.x < ngpus) {
-    const unsigned int peer = threadIdx.x;
-    auto peer_counter_ptr = &sg.signals[peer]->end[blockIdx.x][rank];
-    auto self_counter_ptr = &self_sg->end[blockIdx.x][peer];
-    st_flag_volatile(peer_counter_ptr, flag);
-    while (ld_flag_volatile(self_counter_ptr) != flag);
-  }
-  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
-}
-
 // This function is meant to be used as the first synchronization in the all
-// reduce kernel. Publish the peer flag after a system fence, poll it with a
-// volatile load, then execute one system fence after the matching value is
-// visible. The post-poll fence preserves input visibility without putting a
-// system fence in every spin-loop iteration.
+// reduce kernel. The all-reduce input is usually produced by kernels launched
+// immediately before this kernel on each rank. Use a system memory fence around
+// the peer-visible flag so faster upstream paths do not expose stale input to
+// peer ranks.
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
@@ -408,8 +307,7 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     // Write the expected counter value to peer and wait for correct value
     // from peer.
     st_flag_sys_visible(peer_counter_ptr, flag);
-    while (ld_flag_volatile(self_counter_ptr) != flag);
-    membar_sys();
+    while (ld_flag_sys_visible(self_counter_ptr) != flag);
   }
   __syncthreads();
   // use one thread to update flag
@@ -444,38 +342,6 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 }
 
 #else
-
-template <int ngpus>
-DINLINE void sm70_pack32_barrier_at_start(const RankSignals& sg,
-                                          Signal* self_sg, int rank) {
-  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-  if (threadIdx.x < ngpus) {
-    const unsigned int peer = threadIdx.x;
-    __scoped_atomic_store_n(&sg.signals[peer]->start[blockIdx.x][rank], flag,
-                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][peer],
-                                  __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
-}
-
-template <int ngpus>
-DINLINE void sm70_pack32_barrier_at_end(const RankSignals& sg, Signal* self_sg,
-                                        int rank) {
-  __syncthreads();
-  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
-  if (threadIdx.x < ngpus) {
-    const unsigned int peer = threadIdx.x;
-    __scoped_atomic_store_n(&sg.signals[peer]->end[blockIdx.x][rank], flag,
-                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-    while (__scoped_atomic_load_n(&self_sg->end[blockIdx.x][peer],
-                                  __ATOMIC_RELAXED,
-                                  __MEMORY_SCOPE_DEVICE) < flag);
-  }
-  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
-}
 
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
@@ -530,54 +396,6 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
-// Adapted from SGLang-V100's SM70-capable one-shot push collective at
-// haohervchb/sglang-V100@845b9fdf7a7e. SGLang uses positive zero as its empty
-// slot sentinel. This variant preinitializes slots with a reserved FP16 NaN
-// payload instead, preserving every finite payload bit, including signed zero.
-DINLINE void sm70_push_escape_sentinel(half& value) {
-  auto* bits = reinterpret_cast<uint16_t*>(&value);
-  if (*bits == kSm70Tp4PushAllreduceSentinel) *bits = 0x7e00u;
-}
-
-DINLINE bool sm70_push_is_sentinel(const half& value) {
-  const auto* bits = reinterpret_cast<const uint16_t*>(&value);
-  return *bits == kSm70Tp4PushAllreduceSentinel;
-}
-
-template <typename P>
-DINLINE void sm70_push_load_volatile_16b(P& value, const void* address,
-                                         int offset) {
-  static_assert(alignof(P) == 16 && sizeof(P) == 16);
-  const auto* source = reinterpret_cast<const P*>(address) + offset;
-  uint4 bits;
-  asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
-               : "l"(source));
-  value = *reinterpret_cast<const P*>(&bits);
-}
-
-template <typename P>
-DINLINE void sm70_push_store_volatile_16b(const P& value, void* address,
-                                          int offset) {
-  static_assert(alignof(P) == 16 && sizeof(P) == 16);
-  const uint4 bits = *reinterpret_cast<const uint4*>(&value);
-  auto* destination = reinterpret_cast<P*>(address) + offset;
-  asm volatile("st.volatile.global.v4.b32 [%4], {%0, %1, %2, %3};"
-               :
-               : "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w),
-                 "l"(destination));
-}
-
-template <typename P, int ngpus, typename A>
-DINLINE P sm70_push_reduce(P (&values)[ngpus]) {
-  A accumulator = upcast(values[0]);
-#pragma unroll
-  for (int rank = 1; rank < ngpus; ++rank) {
-    packed_assign_add(accumulator, upcast(values[rank]));
-  }
-  return downcast<P>(accumulator);
-}
-
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce_sum2(const P* ptrs_a[], const P* ptrs_b[], int idx) {
   P local = ptrs_a[0][idx];
@@ -610,113 +428,17 @@ __global__ void __launch_bounds__(512, 1)
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
 
-template <int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    sm70_cross_device_reduce_1stage_pack32(RankData* _dp, RankSignals sg,
-                                           Signal* self_sg,
-                                           half* __restrict__ result, int rank,
-                                           int size) {
-  using P = array_t<half, 16>;
-  using A = array_t<float, 16>;
-  auto dp = *_dp;
-  sm70_pack32_barrier_at_start<ngpus>(sg, self_sg, rank);
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
-       idx += gridDim.x * blockDim.x) {
-    reinterpret_cast<P*>(result)[idx] =
-        packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
-  }
-  sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
-}
-
-template <int ngpus>
-__global__ void __launch_bounds__(1024, 1)
-    sm70_cross_device_reduce_1stage_push(RankData push_buffers,
-                                         const half* __restrict__ input,
-                                         half* __restrict__ output, int rank,
-                                         int packed_size) {
-  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
-  using P = typename packed_t<half>::P;
-  using A = typename packed_t<half>::A;
-
-  auto* local_storage =
-      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
-  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
-  const uint32_t epoch = local_epochs[blockIdx.x];
-  constexpr int packed_stride = kSm70Tp4PushAllreduceBytes / sizeof(P);
-  const int epoch_offset = epoch * ngpus * packed_stride;
-  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (offset < packed_size) {
-    P value = reinterpret_cast<const P*>(input)[offset];
-#pragma unroll
-    for (int element = 0; element < P::size; ++element) {
-      sm70_push_escape_sentinel(value.data[element]);
-    }
-
-#pragma unroll
-    for (int destination_rank = 0; destination_rank < ngpus;
-         ++destination_rank) {
-      auto* destination_base = const_cast<char*>(
-          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
-      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
-                          (epoch_offset + rank * packed_stride) * sizeof(P);
-      sm70_push_store_volatile_16b(value, destination, offset);
-    }
-
-    P peer_values[ngpus];
-    while (true) {
-      bool has_empty_slot = false;
-#pragma unroll
-      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-        const void* source =
-            local_storage + kSm70Tp4PushAllreduceSignalBytes +
-            (epoch_offset + source_rank * packed_stride) * sizeof(P);
-        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
-#pragma unroll
-        for (int element = 0; element < P::size; ++element) {
-          has_empty_slot |=
-              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
-        }
-      }
-      if (!has_empty_slot) break;
-    }
-
-    reinterpret_cast<P*>(output)[offset] =
-        sm70_push_reduce<P, ngpus, A>(peer_values);
-
-    P empty;
-#pragma unroll
-    for (int element = 0; element < P::size; ++element) {
-      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
-          kSm70Tp4PushAllreduceSentinel;
-    }
-#pragma unroll
-    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
-                     (epoch_offset + source_rank * packed_stride) * sizeof(P);
-      sm70_push_store_volatile_16b(empty, source, offset);
-    }
-  }
-
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    local_epochs[blockIdx.x] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
-  }
-}
-
 // This prototype deliberately stays narrow: it mirrors the FP32 Gemma RMSNorm
 // reduction order for a [tokens, 5120] FP16 projection. Each CTA handles one
 // row, retains the normal all-reduce peer order, and applies only its local
 // residual after the peer reduction.
 template <int Threads, int ngpus, typename ResidualT, typename WeightT>
 __global__ void __launch_bounds__(Threads, 1)
-    sm70_peer_reduce_gemma_rms_norm(RankData* _dp, RankSignals sg,
-                                    Signal* self_sg,
-                                    const ResidualT* __restrict__ residual,
-                                    const WeightT* __restrict__ weight,
-                                    half* __restrict__ normalized_out,
-                                    float* __restrict__ residual_out, int rank,
-                                    float epsilon) {
+    sm70_peer_reduce_gemma_rms_norm(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        const ResidualT* __restrict__ residual,
+        const WeightT* __restrict__ weight, half* __restrict__ normalized_out,
+        float* __restrict__ residual_out, int rank, float epsilon) {
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;
   constexpr int kPackedWidth = P::size;
@@ -737,14 +459,15 @@ __global__ void __launch_bounds__(Threads, 1)
 
   for (int packed_idx = tid; packed_idx < packed_per_row;
        packed_idx += blockDim.x) {
-    const P reduced = packed_reduce<P, ngpus, A>(
-        (const P**)&dp.ptrs[0], row * packed_per_row + packed_idx);
+    const P reduced =
+        packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0],
+                                    row * packed_per_row + packed_idx);
     const int element_offset = row_offset + packed_idx * kPackedWidth;
 #pragma unroll
     for (int i = 0; i < kPackedWidth; ++i) {
-      const float value =
-          __half2float(reduced.data[i]) +
-          sm70_gemma_rms_norm_to_float(residual[element_offset + i]);
+      const float value = __half2float(reduced.data[i]) +
+                          sm70_gemma_rms_norm_to_float(
+                              residual[element_offset + i]);
       residual_values[packed_idx * kPackedWidth + i] = value;
       residual_out[element_offset + i] = value;
     }
@@ -780,140 +503,20 @@ __global__ void __launch_bounds__(Threads, 1)
       const int column = element_offset + i;
       const float gemma_weight =
           sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f;
-      normalized_out[row_offset + column] =
-          __float2half_rn(residual_values[column] * inverse_rms * gemma_weight);
+      normalized_out[row_offset + column] = __float2half_rn(
+          residual_values[column] * inverse_rms * gemma_weight);
     }
   }
 
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
 
-// Benchmark-only SM70 counterpart of NCCL's fused LSA RMSNorm example:
-// reduce-scatter token rows, apply the mixed-dtype Gemma RMSNorm locally, then
-// all-gather by writing the owned normalized rows into every peer output.
-// Each rank launches one CTA per owned token and therefore moves the same
-// asymptotic peer traffic as ring reduce-scatter + all-gather, without
-// materializing an intermediate all-reduce tensor.
-template <int Threads, int ngpus, typename ResidualT, typename WeightT>
-__global__ void __launch_bounds__(Threads, 1)
-    sm70_peer_reduce_scatter_gemma_rms_norm_all_gather(
-        RankData* _input_dp, RankData* _output_dp, RankSignals sg,
-        Signal* self_sg, const ResidualT* __restrict__ residual,
-        const WeightT* __restrict__ weight, float* __restrict__ residual_out,
-        int rank, int num_tokens, float epsilon) {
-  static_assert(ngpus == 4);
-  using H4 = array_t<half, 4>;
-  constexpr int kVarianceVectorWidth = 4;
-  constexpr int kVectorsPerRow =
-      kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
-  constexpr int kVectorsPerThread = (kVectorsPerRow + Threads - 1) / Threads;
-
-  __shared__ float inverse_rms;
-  // Preserve the accepted local GemmaNorm reduction topology. The valid-item
-  // count below limits participation to the threads in this launch.
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduce_store;
-
-  const int tokens_per_rank = num_tokens / ngpus;
-  const int tid = threadIdx.x;
-  auto input_dp = *_input_dp;
-  auto output_dp = *_output_dp;
-
-  barrier_at_start<ngpus>(sg, self_sg, rank);
-
-  for (int local_row = blockIdx.x; local_row < tokens_per_rank;
-       local_row += gridDim.x) {
-    const int row = rank * tokens_per_rank + local_row;
-    const int vector_row_offset = row * kVectorsPerRow;
-    float4 row_values[kVectorsPerThread];
-    float variance = 0.0f;
-#pragma unroll
-    for (int iter = 0; iter < kVectorsPerThread; ++iter) {
-      const int vector_idx = tid + iter * Threads;
-      if (vector_idx >= kVectorsPerRow) continue;
-      const int global_vector_idx = vector_row_offset + vector_idx;
-      H4 reduced =
-          reinterpret_cast<const H4*>(input_dp.ptrs[0])[global_vector_idx];
-#pragma unroll
-      for (int peer = 1; peer < ngpus; ++peer) {
-        const H4 peer_value =
-            reinterpret_cast<const H4*>(input_dp.ptrs[peer])[global_vector_idx];
-#pragma unroll
-        for (int i = 0; i < kVarianceVectorWidth; ++i) {
-          // NCCL's f16 Sum specialization uses __hadd/__hadd2 at every ring
-          // step. Preserve that FP16 rounding contract instead of accumulating
-          // all four inputs in FP32 and rounding only once.
-          reduced.data[i] = __hadd(reduced.data[i], peer_value.data[i]);
-        }
-      }
-      const float4 residual_value =
-          reinterpret_cast<const float4*>(residual)[global_vector_idx];
-      float4 value;
-      value.x = __half2float(reduced.data[0]) + residual_value.x;
-      value.y = __half2float(reduced.data[1]) + residual_value.y;
-      value.z = __half2float(reduced.data[2]) + residual_value.z;
-      value.w = __half2float(reduced.data[3]) + residual_value.w;
-      row_values[iter] = value;
-      // Keep the public [M, H] residual shape so the compiled model graph does
-      // not change shape.  Only this rank's persistent token shard is valid;
-      // the next fused boundary reads the same shard and ignores other rows.
-      reinterpret_cast<float4*>(residual_out)[global_vector_idx] = value;
-      // Match the accepted local GemmaNorm exactly: each thread accumulates
-      // vector indices tid, tid + Threads, ... in x/y/z/w order before CUB.
-      variance += value.x * value.x;
-      variance += value.y * value.y;
-      variance += value.z * value.z;
-      variance += value.w * value.w;
-    }
-    variance =
-        BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
-    if (tid == 0) {
-      inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
-    }
-    __syncthreads();
-
-    const float scale = inverse_rms;
-#pragma unroll
-    for (int iter = 0; iter < kVectorsPerThread; ++iter) {
-      const int vector_idx = tid + iter * Threads;
-      if (vector_idx >= kVectorsPerRow) continue;
-      const int column = vector_idx * kVarianceVectorWidth;
-      const float4 value = row_values[iter];
-      H4 normalized_pack;
-      normalized_pack.data[0] = __float2half_rn(
-          value.x * scale *
-          (sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f));
-      normalized_pack.data[1] = __float2half_rn(
-          value.y * scale *
-          (sm70_gemma_rms_norm_to_float(weight[column + 1]) + 1.0f));
-      normalized_pack.data[2] = __float2half_rn(
-          value.z * scale *
-          (sm70_gemma_rms_norm_to_float(weight[column + 2]) + 1.0f));
-      normalized_pack.data[3] = __float2half_rn(
-          value.w * scale *
-          (sm70_gemma_rms_norm_to_float(weight[column + 3]) + 1.0f));
-#pragma unroll
-      for (int peer = 0; peer < ngpus; ++peer) {
-        auto* peer_output =
-            reinterpret_cast<H4*>(const_cast<void*>(output_dp.ptrs[peer]));
-        peer_output[vector_row_offset + vector_idx] = normalized_pack;
-      }
-    }
-    // CUB's temporary storage is reused by the next persistent row.
-    __syncthreads();
-  }
-
-  // The normalized rows are written directly into peer IPC buffers.  Unlike
-  // an ordinary final all-reduce barrier, this barrier must publish those
-  // remote stores before a peer starts its local output copy.
-  barrier_at_end<ngpus>(sg, self_sg, rank);
-}
-
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) sm70_tile_runtime_reduce_kernel(
-    RankData* _dp, RankSignals sg, Signal* self_sg, const T* __restrict__ input,
-    T* __restrict__ staging, T* __restrict__ result, int rank, int packed_size,
-    int tile_packed_size, int tile_count, int compute_iters) {
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ staging,
+    T* __restrict__ result, int rank, int packed_size, int tile_packed_size,
+    int tile_count, int compute_iters) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
 
@@ -964,10 +567,11 @@ __global__ void __launch_bounds__(256, 1) sm70_tile_runtime_reduce_kernel(
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) sm70_tile_runtime_engine_kernel(
-    RankData* _dp, RankSignals sg, Signal* self_sg, const T* __restrict__ input,
-    T* __restrict__ staging, T* __restrict__ result, int rank, int packed_size,
-    int tile_packed_size, int tile_count, int producer_blocks,
-    int reducer_blocks, int compute_iters) {
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const T* __restrict__ input, T* __restrict__ staging,
+    T* __restrict__ result, int rank, int packed_size, int tile_packed_size,
+    int tile_count, int producer_blocks, int reducer_blocks,
+    int compute_iters) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
 
@@ -1030,11 +634,10 @@ __global__ void __launch_bounds__(256, 1) sm70_tile_runtime_engine_kernel(
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1)
-    sm70_tile_runtime_wait_reduce_kernel(RankData* _dp, RankSignals sg,
-                                         Signal* self_sg,
-                                         T* __restrict__ result, int rank,
-                                         int packed_size, int tile_packed_size,
-                                         int tile_count) {
+    sm70_tile_runtime_wait_reduce_kernel(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        T* __restrict__ result, int rank, int packed_size,
+        int tile_packed_size, int tile_count) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
 
@@ -1066,11 +669,9 @@ __global__ void __launch_bounds__(256, 1)
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_sum2_1stage(RankData* _dp_a, RankData* _dp_b,
-                                    RankSignals sg, Signal* self_sg,
-                                    T* __restrict__ result, int rank,
-                                    int size) {
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_sum2_1stage(
+    RankData* _dp_a, RankData* _dp_b, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int size) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   auto dp_a = *_dp_a;
@@ -1078,8 +679,9 @@ __global__ void __launch_bounds__(512, 1)
   barrier_at_start<ngpus>(sg, self_sg, rank);
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
        idx += gridDim.x * blockDim.x) {
-    ((P*)result)[idx] = packed_reduce_sum2<P, ngpus, A>(
-        (const P**)&dp_a.ptrs[0], (const P**)&dp_b.ptrs[0], idx);
+    ((P*)result)[idx] =
+        packed_reduce_sum2<P, ngpus, A>((const P**)&dp_a.ptrs[0],
+                                        (const P**)&dp_b.ptrs[0], idx);
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
@@ -1089,8 +691,9 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
-DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg, Signal* self_sg,
-                                         int rank, int signal_slot) {
+DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg,
+                                         Signal* self_sg, int rank,
+                                         int signal_slot) {
   const int tid = threadIdx.x;
   const int clique_base = rank < 4 ? 0 : 4;
   const FlagType flag = self_sg->_flag[0] + 1;
@@ -1104,10 +707,9 @@ DINLINE FlagType sm70_tp8_clique_barrier(const RankSignals& sg, Signal* self_sg,
   return flag;
 }
 
-static __global__ void __launch_bounds__(512, 1)
-    sm70_tp8_hierarchical_reduce(RankData* _dp, RankSignals sg, Signal* self_sg,
-                                 half* __restrict__ result, int rank,
-                                 int packed_size) {
+static __global__ void __launch_bounds__(512, 1) sm70_tp8_hierarchical_reduce(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    half* __restrict__ result, int rank, int packed_size) {
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;
 
@@ -1121,7 +723,8 @@ static __global__ void __launch_bounds__(512, 1)
   const int partial_slot = (self_sg->_flag[0] >> 1) & 1;
   const FlagType clique_flag =
       sm70_tp8_clique_barrier(sg, self_sg, rank, partial_slot);
-  A* const self_partial = get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
+  A* const self_partial =
+      get_tmp_buf<A>(self_sg) + partial_slot * packed_size;
   const A* const pair_partial =
       get_tmp_buf<A>(sg.signals[pair_rank]) + partial_slot * packed_size;
 
@@ -1144,9 +747,11 @@ static __global__ void __launch_bounds__(512, 1)
   const FlagType pair_flag = clique_flag + 1;
   if (tid < 4) {
     const int peer = clique_base + tid;
-    const int completion_slot = kSm70Tp8CompletionSignalSlotBase + partial_slot;
+    const int completion_slot =
+        kSm70Tp8CompletionSignalSlotBase + partial_slot;
     st_flag_volatile(&sg.signals[peer]->end[completion_slot][rank], pair_flag);
-    while (ld_flag_volatile(&self_sg->end[completion_slot][peer]) != pair_flag);
+    while (ld_flag_volatile(&self_sg->end[completion_slot][peer]) !=
+           pair_flag);
   } else if (tid == 4) {
     st_flag_release(&sg.signals[pair_rank]->end[partial_slot][rank], pair_flag);
     while (ld_flag_acquire(&self_sg->end[partial_slot][pair_rank]) !=
@@ -1209,11 +814,9 @@ __global__ void __launch_bounds__(512, 1)
 }
 
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_sum2_2stage(RankData* _dp_a, RankData* _dp_b,
-                                    RankSignals sg, Signal* self_sg,
-                                    T* __restrict__ result, int rank,
-                                    int size) {
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_sum2_2stage(
+    RankData* _dp_a, RankData* _dp_b, RankSignals sg, Signal* self_sg,
+    T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -1238,7 +841,8 @@ __global__ void __launch_bounds__(512, 1)
   // Stage 1 mirrors cross_device_reduce_2stage, but each rank first forms
   // its local input_a + input_b value before the cross-rank reduction.
   for (int idx = start + tid; idx < end; idx += stride) {
-    tmp_out[idx - start] = packed_reduce_sum2<P, ngpus, A>(ptrs_a, ptrs_b, idx);
+    tmp_out[idx - start] =
+        packed_reduce_sum2<P, ngpus, A>(ptrs_a, ptrs_b, idx);
   }
   barrier_at_end<ngpus>(sg, self_sg, rank);
 
@@ -1318,8 +922,6 @@ class CustomAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
-  RankData sm70_tp4_push_buffers_{};
-  bool sm70_tp4_push_buffers_registered_ = false;
 
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
@@ -1400,27 +1002,6 @@ class CustomAllreduce {
     buffers_[ptrs[rank_]] = d_data;
   }
 
-  void register_sm70_tp4_push_buffer(void** ptrs) {
-    if (world_size_ != kSm70Tp4PushAllreduceWorldSize || !fully_connected_ ||
-        !custom_allreduce_current_device_is_sm70()) {
-      throw std::runtime_error(
-          "SM70 push all-reduce requires fully-connected TP4 on SM70.");
-    }
-    for (int peer = 0; peer < world_size_; ++peer) {
-      if (ptrs[peer] == nullptr) {
-        throw std::runtime_error(
-            "SM70 push all-reduce received a null peer buffer.");
-      }
-      sm70_tp4_push_buffers_.ptrs[peer] = ptrs[peer];
-    }
-    auto* local_data =
-        static_cast<char*>(ptrs[rank_]) + kSm70Tp4PushAllreduceSignalBytes;
-    CUDACHECK(cudaMemset(
-        local_data, kSm70Tp4PushAllreduceSentinelByte,
-        kSm70Tp4PushAllreduceBufferBytes - kSm70Tp4PushAllreduceSignalBytes));
-    sm70_tp4_push_buffers_registered_ = true;
-  }
-
   RankData* rank_data_for_buffer(cudaStream_t stream, void* buffer,
                                  const char* op_name) {
     RankData* ptrs;
@@ -1432,10 +1013,11 @@ class CustomAllreduce {
     } else {
       auto it = buffers_.find(buffer);
       if (it == buffers_.end()) {
-        throw std::runtime_error(
-            std::string(op_name) + " buffer address " +
-            std::to_string(reinterpret_cast<uint64_t>(buffer)) +
-            " is not registered!");
+        throw std::runtime_error(std::string(op_name) +
+                                 " buffer address " +
+                                 std::to_string(
+                                     reinterpret_cast<uint64_t>(buffer)) +
+                                 " is not registered!");
       }
       ptrs = it->second;
     }
@@ -1495,8 +1077,7 @@ class CustomAllreduce {
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
                  int threads = 512, int block_limit = defaultBlockLimit) {
     block_limit = custom_allreduce_block_limit(
-        block_limit, world_size_, fully_connected_,
-        static_cast<size_t>(size) * sizeof(T), true);
+        block_limit, world_size_, static_cast<size_t>(size) * sizeof(T));
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -1527,21 +1108,6 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
-      // The push protocol amortizes peer polling across captured collective
-      // chains. A lone eager call stays on the ordinary registered-buffer
-      // pull path.
-      if (sm70_tp4_push_buffers_registered_ &&
-          status == cudaStreamCaptureStatusActive &&
-          world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
-        if (push_blocks > 0) {
-          sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
-              <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
-                  sm70_tp4_push_buffers_, input, output, rank_, size);
-          return;
-        }
-      }
       if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
                                                   fully_connected_) &&
           bytes == kSm70Tp8HierarchicalAllreduceBytes) {
@@ -1550,19 +1116,9 @@ class CustomAllreduce {
         return;
       }
     }
-    threads =
-        sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_, bytes);
+    threads = sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_,
+                                            bytes);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
-
-    if constexpr (std::is_same_v<T, half>) {
-      if (blocks == 1 && threads == 512 &&
-          sm70_tp4_small_allreduce_pack32(world_size_, fully_connected_,
-                                          bytes)) {
-        sm70_cross_device_reduce_1stage_pack32<4><<<1, 512, 0, stream>>>(
-            ptrs, sg_, self_sg_, output, rank_, bytes / 32);
-        return;
-      }
-    }
 
     // Check environment variable once
     const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
@@ -1624,11 +1180,11 @@ class CustomAllreduce {
 
   template <int ngpus, typename ResidualT, typename WeightT>
   void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
-                                     const ResidualT* residual,
-                                     const WeightT* weight,
-                                     half* normalized_out, float* residual_out,
-                                     int num_tokens, int hidden_size,
-                                     float epsilon) {
+                                      const ResidualT* residual,
+                                      const WeightT* weight,
+                                      half* normalized_out,
+                                      float* residual_out, int num_tokens,
+                                      int hidden_size, float epsilon) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -1642,18 +1198,18 @@ class CustomAllreduce {
     if (num_tokens <= 0 || num_tokens > kMaxTokens) {
       throw std::runtime_error(
           "SM70 Gemma RMSNorm prototype supports tokens in [1, " +
-          std::to_string(kMaxTokens) + "]. Got " + std::to_string(num_tokens) +
-          ".");
+          std::to_string(kMaxTokens) + "]. Got " +
+          std::to_string(num_tokens) + ".");
     }
 
-    RankData* ptrs = rank_data_for_buffer(stream, input,
-                                          "SM70 Gemma RMSNorm prototype input");
+    RankData* ptrs = rank_data_for_buffer(
+        stream, input, "SM70 Gemma RMSNorm prototype input");
     if constexpr (ngpus == 4) {
       // Keep the same 1024-thread CUB reduction topology as vLLM rms_norm.
       // packed_reduce preserves the cross_device_reduce_1stage<half, 4>
       // rank order before the FP32 residual add.
       sm70_peer_reduce_gemma_rms_norm<kSm70GemmaRmsNormThreads, ngpus,
-                                      ResidualT, WeightT>
+                                       ResidualT, WeightT>
           <<<num_tokens, kSm70GemmaRmsNormThreads, 0, stream>>>(
               ptrs, sg_, self_sg_, residual, weight, normalized_out,
               residual_out, rank_, epsilon);
@@ -1661,11 +1217,11 @@ class CustomAllreduce {
     }
 
     const int threads = sm70_gemma_rms_norm_threads();
-#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                          \
+#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                         \
   sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>     \
-      <<<num_tokens, THREADS, 0, stream>>>(ptrs, sg_, self_sg_, residual, \
-                                           weight, normalized_out,        \
-                                           residual_out, rank_, epsilon)
+      <<<num_tokens, THREADS, 0, stream>>>(                               \
+          ptrs, sg_, self_sg_, residual, weight, normalized_out,          \
+          residual_out, rank_, epsilon)
     switch (threads) {
       case 256:
         VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(256);
@@ -1680,63 +1236,12 @@ class CustomAllreduce {
 #undef VLLM_LAUNCH_SM70_GEMMA_RMS_NORM
   }
 
-  template <int ngpus, typename ResidualT, typename WeightT>
-  void sm70_reduce_scatter_gemma_rms_norm_all_gather(
-      cudaStream_t stream, half* input, half* shared_output,
-      const ResidualT* residual, const WeightT* weight, float* residual_out,
-      int num_tokens, int hidden_size, float epsilon) {
-    if (world_size_ != ngpus || !fully_connected_ ||
-        !custom_allreduce_current_device_is_sm70()) {
-      throw std::runtime_error(
-          "SM70 long-prefill fused norm requires fully connected TP" +
-          std::to_string(ngpus) + " on SM70.");
-    }
-    if (hidden_size != kSm70GemmaRmsNormHiddenSize || num_tokens <= 0 ||
-        num_tokens % ngpus != 0) {
-      throw std::runtime_error(
-          "SM70 long-prefill fused norm requires a TP-divisible [M, 5120] "
-          "input.");
-    }
-    const int tokens_per_rank = num_tokens / ngpus;
-    if (tokens_per_rank > kSm70LongPrefillMaxTokensPerRank) {
-      throw std::runtime_error(
-          "SM70 long-prefill fused norm exceeds the token-shard capacity.");
-    }
-
-    RankData* input_ptrs =
-        rank_data_for_buffer(stream, input, "long-prefill fused norm input");
-    RankData* output_ptrs = rank_data_for_buffer(
-        stream, shared_output, "long-prefill fused norm output");
-    const int threads = sm70_tp4_long_fused_norm_threads();
-    const int blocks =
-        std::min(tokens_per_rank, sm70_tp4_long_fused_norm_blocks());
-#define VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(THREADS)                          \
-  sm70_peer_reduce_scatter_gemma_rms_norm_all_gather<THREADS, ngpus,           \
-                                                     ResidualT, WeightT>       \
-      <<<blocks, THREADS, 0, stream>>>(input_ptrs, output_ptrs, sg_, self_sg_, \
-                                       residual, weight, residual_out, rank_,  \
-                                       num_tokens, epsilon)
-    switch (threads) {
-      case 256:
-        VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(256);
-        break;
-      case 1024:
-        VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(1024);
-        break;
-      default:
-        VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(512);
-        break;
-    }
-#undef VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM
-  }
-
   template <typename T>
   void allreduce_sum2(cudaStream_t stream, T* input_a, T* input_b, T* output,
                       int size, int threads = 512,
                       int block_limit = defaultBlockLimit) {
     block_limit = custom_allreduce_block_limit(
-        block_limit, world_size_, fully_connected_,
-        static_cast<size_t>(size) * sizeof(T), false);
+        block_limit, world_size_, static_cast<size_t>(size) * sizeof(T));
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -1788,28 +1293,29 @@ class CustomAllreduce {
       }
     }
 
-#define SUM2_KL(ngpus, name)                      \
-  name<T, ngpus><<<blocks, threads, 0, stream>>>( \
-      ptrs_a, ptrs_b, sg_, self_sg_, output, rank_, size);
-#define SUM2_CASE(ngpus)                                   \
-  case ngpus: {                                            \
-    if (force_1stage) {                                    \
-      SUM2_KL(ngpus, cross_device_reduce_sum2_1stage);     \
-    } else if (force_2stage) {                             \
-      SUM2_KL(ngpus, cross_device_reduce_sum2_2stage);     \
-    } else {                                               \
-      if (world_size_ == 2) {                              \
-        SUM2_KL(ngpus, cross_device_reduce_sum2_1stage);   \
-      } else if (fully_connected_) {                       \
-        if ((world_size_ <= 4 && bytes < 512 * 1024) ||    \
-            (world_size_ <= 8 && bytes < 256 * 1024)) {    \
+#define SUM2_KL(ngpus, name)                                                  \
+  name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs_a, ptrs_b, sg_,         \
+                                                 self_sg_, output, rank_,     \
+                                                 size);
+#define SUM2_CASE(ngpus)                              \
+  case ngpus: {                                      \
+    if (force_1stage) {                              \
+      SUM2_KL(ngpus, cross_device_reduce_sum2_1stage); \
+    } else if (force_2stage) {                       \
+      SUM2_KL(ngpus, cross_device_reduce_sum2_2stage); \
+    } else {                                         \
+      if (world_size_ == 2) {                        \
+        SUM2_KL(ngpus, cross_device_reduce_sum2_1stage); \
+      } else if (fully_connected_) {                 \
+        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
+            (world_size_ <= 8 && bytes < 256 * 1024)) { \
           SUM2_KL(ngpus, cross_device_reduce_sum2_1stage); \
-        } else {                                           \
+        } else {                                     \
           SUM2_KL(ngpus, cross_device_reduce_sum2_2stage); \
-        }                                                  \
-      }                                                    \
-    }                                                      \
-    break;                                                 \
+        }                                            \
+      }                                              \
+    }                                                \
+    break;                                           \
   }
 
     switch (world_size_) {
@@ -1849,12 +1355,12 @@ class CustomAllreduce {
 
     const int packed_size = size / pack;
     const int tile_packed_size = tile_numel / pack;
-    const int tile_count =
-        (packed_size + tile_packed_size - 1) / tile_packed_size;
+    const int tile_count = (packed_size + tile_packed_size - 1) / tile_packed_size;
     if (tile_count <= 0 || tile_count > kMaxBlocks) {
       throw std::runtime_error(
           "SM70 tile runtime prototype supports tile_count in [1, " +
-          std::to_string(kMaxBlocks) + "]. Got " + std::to_string(tile_count));
+          std::to_string(kMaxBlocks) + "]. Got " +
+          std::to_string(tile_count));
     }
 
     auto it = buffers_.find(staging);
@@ -1871,12 +1377,14 @@ class CustomAllreduce {
     blocks = std::max(1, std::min(blocks, tile_count));
     compute_iters = std::max(0, compute_iters);
 
-#define TILE_RUNTIME_CASE(ngpus)                                               \
-  case ngpus: {                                                                \
-    sm70_tile_runtime_reduce_kernel<T, ngpus><<<blocks, threads, 0, stream>>>( \
-        ptrs, sg_, self_sg_, input, staging, output, rank_, packed_size,       \
-        tile_packed_size, tile_count, compute_iters);                          \
-    break;                                                                     \
+#define TILE_RUNTIME_CASE(ngpus)                                             \
+  case ngpus: {                                                              \
+    sm70_tile_runtime_reduce_kernel<T, ngpus>                                \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, staging, \
+                                         output, rank_, packed_size,          \
+                                         tile_packed_size, tile_count,        \
+                                         compute_iters);                     \
+    break;                                                                   \
   }
 
     switch (world_size_) {
@@ -1916,7 +1424,8 @@ class CustomAllreduce {
     if (tile_count <= 0 || tile_count > kMaxBlocks) {
       throw std::runtime_error(
           "SM70 tile runtime engine supports tile_count in [1, " +
-          std::to_string(kMaxBlocks) + "]. Got " + std::to_string(tile_count));
+          std::to_string(kMaxBlocks) + "]. Got " +
+          std::to_string(tile_count));
     }
 
     auto it = buffers_.find(staging);
@@ -1938,13 +1447,15 @@ class CustomAllreduce {
     const int threads = 256;
     const int blocks = producer_blocks + reducer_blocks;
 
-#define TILE_RUNTIME_ENGINE_CASE(ngpus)                                        \
-  case ngpus: {                                                                \
-    sm70_tile_runtime_engine_kernel<T, ngpus><<<blocks, threads, 0, stream>>>( \
-        ptrs, sg_, self_sg_, input, staging, output, rank_, packed_size,       \
-        tile_packed_size, tile_count, producer_blocks, reducer_blocks,         \
-        compute_iters);                                                        \
-    break;                                                                     \
+#define TILE_RUNTIME_ENGINE_CASE(ngpus)                                      \
+  case ngpus: {                                                              \
+    sm70_tile_runtime_engine_kernel<T, ngpus>                                \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, input, staging, \
+                                         output, rank_, packed_size,          \
+                                         tile_packed_size, tile_count,        \
+                                         producer_blocks, reducer_blocks,     \
+                                         compute_iters);                     \
+    break;                                                                   \
   }
 
     switch (world_size_) {
@@ -1958,7 +1469,8 @@ class CustomAllreduce {
 
   template <typename T>
   void tile_runtime_wait_reduce(cudaStream_t stream, T* staging, T* output,
-                                int size, int tile_numel, int reducer_blocks) {
+                                int size, int tile_numel,
+                                int reducer_blocks) {
     if (world_size_ != 2) {
       throw std::runtime_error(
           "SM70 tile runtime wait-reduce currently supports only TP2.");
@@ -1982,7 +1494,8 @@ class CustomAllreduce {
     if (tile_count <= 0 || tile_count > kMaxBlocks) {
       throw std::runtime_error(
           "SM70 tile runtime wait-reduce supports tile_count in [1, " +
-          std::to_string(kMaxBlocks) + "]. Got " + std::to_string(tile_count));
+          std::to_string(kMaxBlocks) + "]. Got " +
+          std::to_string(tile_count));
     }
 
     RankData* ptrs;
@@ -2008,13 +1521,13 @@ class CustomAllreduce {
 
     constexpr int threads = 256;
 
-#define TILE_RUNTIME_WAIT_REDUCE_CASE(ngpus)                                   \
-  case ngpus: {                                                                \
-    sm70_tile_runtime_wait_reduce_kernel<T, ngpus>                             \
-        <<<reducer_blocks, threads, 0, stream>>>(                              \
-            ptrs, sg_, self_sg_, output, rank_, packed_size, tile_packed_size, \
-            tile_count);                                                       \
-    break;                                                                     \
+#define TILE_RUNTIME_WAIT_REDUCE_CASE(ngpus)                                 \
+  case ngpus: {                                                              \
+    sm70_tile_runtime_wait_reduce_kernel<T, ngpus>                           \
+        <<<reducer_blocks, threads, 0, stream>>>(                            \
+            ptrs, sg_, self_sg_, output, rank_, packed_size,                 \
+            tile_packed_size, tile_count);                                   \
+    break;                                                                   \
   }
 
     switch (world_size_) {
@@ -2043,11 +1556,11 @@ class CustomAllreduce {
       ptrs = it->second;
     }
 
-#define TOP1_CASE(ngpus)                                            \
-  case ngpus: {                                                     \
-    cross_device_top1_argmax<ngpus>                                 \
-        <<<1, 32, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_); \
-    break;                                                          \
+#define TOP1_CASE(ngpus)                                   \
+  case ngpus: {                                            \
+    cross_device_top1_argmax<ngpus><<<1, 32, 0, stream>>>( \
+        ptrs, sg_, self_sg_, output, rank_);               \
+    break;                                                 \
   }
 
     switch (world_size_) {

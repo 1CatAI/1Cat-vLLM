@@ -182,33 +182,6 @@ def sm70_tp2_all_reduce_gemma_rms_norm_fake(
     return torch.empty_like(tensor), torch.empty_like(residual, dtype=torch.float32)
 
 
-def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-    tensor: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-    group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    assert group_name in _groups, f"Group {group_name} is not found."
-    group = _groups[group_name]()
-    if group is None:
-        raise ValueError(f"Group {group_name} is destroyed.")
-    return group._sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather_out_place(
-        tensor, residual, weight, epsilon
-    )
-
-
-def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather_fake(
-    tensor: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    epsilon: float,
-    group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del weight, epsilon, group_name
-    return torch.empty_like(tensor), torch.empty_like(residual, dtype=torch.float32)
-
-
 def sm70_awq_mlp_down_tile_all_reduce(
     tensor: torch.Tensor, group_name: str
 ) -> torch.Tensor:
@@ -396,12 +369,6 @@ direct_register_custom_op(
     op_name="sm70_tp2_all_reduce_gemma_rms_norm",
     op_func=sm70_tp2_all_reduce_gemma_rms_norm,
     fake_impl=sm70_tp2_all_reduce_gemma_rms_norm_fake,
-)
-
-direct_register_custom_op(
-    op_name="sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather",
-    op_func=sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather,
-    fake_impl=sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather_fake,
 )
 
 direct_register_custom_op(
@@ -728,27 +695,9 @@ class GroupCoordinator:
             raise RuntimeError("Device communicator lacks SM70 fused AR RMSNorm")
         return fused_op(input_, residual, weight, epsilon)
 
-    def _sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather_out_place(
-        self,
-        input_: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.device_communicator is None:
-            raise ValueError("No device communicator found")
-        fused_op = getattr(
-            self.device_communicator,
-            "sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather",
-            None,
-        )
-        if fused_op is None:
-            raise RuntimeError(
-                "Device communicator lacks SM70 TP4 fused collective-norm"
-            )
-        return fused_op(input_, residual, weight, epsilon)
-
-    def sm70_awq_mlp_down_tile_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+    def sm70_awq_mlp_down_tile_all_reduce(
+        self, input_: torch.Tensor
+    ) -> torch.Tensor:
         if self.world_size == 1:
             return input_
 
@@ -1221,68 +1170,6 @@ class GroupCoordinator:
                 tensor.record_stream(torch.cuda.current_stream(tensor.device))
             handles.append(handle)
 
-        return handles
-
-    def isend_tensor_dict_static(
-        self,
-        tensor_dict: dict[str, torch.Tensor],
-        dst: int | None = None,
-    ) -> list[Handle]:
-        """Send tensors without metadata when both peers know the schema.
-
-        The receiver must provide the same ordered keys, shapes, dtypes, and
-        devices to :meth:`irecv_tensor_dict_static`. Callers must fall back to
-        :meth:`isend_tensor_dict` whenever that contract can change.
-        """
-        if self.world_size <= 1:
-            return []
-        if self.use_cpu_custom_send_recv:
-            raise RuntimeError("static tensor transfer requires a process group")
-
-        if dst is None:
-            dst = (self.rank_in_group + 1) % self.world_size
-        assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
-
-        handles: list[Handle] = []
-        for tensor in tensor_dict.values():
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError("static tensor transfer only accepts tensors")
-            if tensor.numel() == 0:
-                continue
-            comm_group = self.cpu_group if tensor.is_cpu else self.device_group
-            handle = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=comm_group
-            )
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
-        return handles
-
-    def irecv_tensor_dict_static(
-        self,
-        tensor_dict: dict[str, torch.Tensor],
-        src: int | None = None,
-    ) -> list[Handle]:
-        """Receive metadata-free tensors into caller-owned buffers."""
-        if self.world_size <= 1:
-            return []
-        if self.use_cpu_custom_send_recv:
-            raise RuntimeError("static tensor transfer requires a process group")
-
-        if src is None:
-            src = (self.rank_in_group - 1) % self.world_size
-        assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
-
-        handles: list[Handle] = []
-        for tensor in tensor_dict.values():
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError("static tensor transfer only accepts tensors")
-            if tensor.numel() == 0:
-                continue
-            comm_group = self.cpu_group if tensor.is_cpu else self.device_group
-            handles.append(
-                torch.distributed.irecv(tensor, src=self.ranks[src], group=comm_group)
-            )
         return handles
 
     def recv_tensor_dict(

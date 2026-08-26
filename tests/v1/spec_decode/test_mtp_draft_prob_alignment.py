@@ -4,10 +4,7 @@
 import pytest
 import torch
 
-from vllm.v1.spec_decode.draft_prob_alignment import (
-    get_aligned_draft_probs,
-    get_aligned_draft_scalar_values,
-)
+from vllm.v1.spec_decode.draft_prob_alignment import get_aligned_draft_probs
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 
@@ -116,29 +113,5 @@ def test_get_spec_decode_draft_probs_rejects_cached_token_mismatch():
             draft_probs=torch.zeros((1, 2, 4), dtype=torch.float32),
             draft_prob_req_ids=["a"],
             draft_prob_token_ids=torch.tensor([[1, 9]], dtype=torch.int32),
-            spec_decode_metadata=_metadata([[1, 2]]),
-        )
-
-
-def test_get_aligned_draft_scalar_values_binds_prefixes_by_req_id():
-    values = torch.tensor([[0.1, 0.2, 0.3], [1.1, 1.2, 1.3]])
-    actual = get_aligned_draft_scalar_values(
-        req_ids=["b", "a"],
-        values=values,
-        value_req_ids=["a", "b"],
-        value_token_ids=torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32),
-        spec_decode_metadata=_metadata([[20], [10, 11]]),
-    )
-
-    assert torch.equal(actual, torch.tensor([1.1, 0.1, 0.2]))
-
-
-def test_get_aligned_draft_scalar_values_rejects_token_mismatch():
-    with pytest.raises(RuntimeError, match="do not match verifier draft tokens"):
-        get_aligned_draft_scalar_values(
-            req_ids=["a"],
-            values=torch.tensor([[0.1, 0.2]]),
-            value_req_ids=["a"],
-            value_token_ids=[[1, 9]],
             spec_decode_metadata=_metadata([[1, 2]]),
         )

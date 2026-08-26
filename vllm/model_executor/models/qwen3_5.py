@@ -48,7 +48,6 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _resolve_qwen_gdn_kv_cache_args,
     _sm70_compile_graph_slice_dim,
     _sm70_dump_gdn_projection_tensor,
-    _sm70_gdn_qpn8_ba_dispatch_eligible,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -75,7 +74,6 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
-from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
     _encode_layer_name,
 )
@@ -118,98 +116,6 @@ from .utils import (
 
 logger = init_logger(__name__)
 
-
-@triton.jit
-def _sm70_qwen35_gdn_split_kernel(
-    mixed_qkvz,
-    mixed_ba,
-    output,
-    stride_qkvz_row: tl.int64,
-    stride_ba_row: tl.int64,
-    num_rows: tl.constexpr,
-    qkv_size: tl.constexpr,
-    z_size: tl.constexpr,
-    ba_size: tl.constexpr,
-    BLOCK_Z: tl.constexpr,
-    BLOCK_BA: tl.constexpr,
-):
-    row = tl.program_id(0)
-
-    z_cols = tl.arange(0, BLOCK_Z)
-    z_mask = z_cols < z_size
-    z = tl.load(
-        mixed_qkvz + row * stride_qkvz_row + qkv_size + z_cols,
-        mask=z_mask,
-    )
-    tl.store(output + row * z_size + z_cols, z, mask=z_mask)
-
-    ba_cols = tl.arange(0, BLOCK_BA)
-    ba_mask = ba_cols < ba_size
-    b = tl.load(mixed_ba + row * stride_ba_row + ba_cols, mask=ba_mask)
-    a = tl.load(
-        mixed_ba + row * stride_ba_row + ba_size + ba_cols,
-        mask=ba_mask,
-    )
-    z_numel = num_rows * z_size
-    ba_numel = num_rows * ba_size
-    tl.store(output + z_numel + row * ba_size + ba_cols, b, mask=ba_mask)
-    tl.store(
-        output + z_numel + ba_numel + row * ba_size + ba_cols,
-        a,
-        mask=ba_mask,
-    )
-
-
-def _sm70_materialize_qwen35_gdn_splits(
-    mixed_qkvz: torch.Tensor,
-    mixed_ba: torch.Tensor,
-    qkv_size: int,
-    z_size: int,
-    ba_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Materialize Qwen3.5 z/b/a tails with one bitwise copy kernel."""
-    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
-        raise ValueError("mixed_qkvz and mixed_ba must both be rank two")
-    if mixed_qkvz.shape[0] != mixed_ba.shape[0]:
-        raise ValueError("mixed_qkvz and mixed_ba row counts must match")
-    if mixed_qkvz.dtype != mixed_ba.dtype:
-        raise ValueError("mixed_qkvz and mixed_ba dtypes must match")
-    if mixed_qkvz.stride(1) != 1 or mixed_ba.stride(1) != 1:
-        raise ValueError("mixed_qkvz and mixed_ba must be contiguous by row")
-    if mixed_qkvz.shape[1] < qkv_size + z_size:
-        raise ValueError("mixed_qkvz is narrower than qkv_size + z_size")
-    if mixed_ba.shape[1] < 2 * ba_size:
-        raise ValueError("mixed_ba is narrower than 2 * ba_size")
-
-    num_rows = mixed_qkvz.shape[0]
-    z_numel = num_rows * z_size
-    ba_numel = num_rows * ba_size
-    packed = torch.empty(
-        z_numel + 2 * ba_numel,
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    _sm70_qwen35_gdn_split_kernel[(num_rows,)](
-        mixed_qkvz,
-        mixed_ba,
-        packed,
-        mixed_qkvz.stride(0),
-        mixed_ba.stride(0),
-        num_rows=num_rows,
-        qkv_size=qkv_size,
-        z_size=z_size,
-        ba_size=ba_size,
-        BLOCK_Z=triton.next_power_of_2(z_size),
-        BLOCK_BA=triton.next_power_of_2(ba_size),
-        num_warps=8,
-        num_stages=1,
-    )
-    z = packed[:z_numel].view(num_rows, z_size)
-    b = packed[z_numel : z_numel + ba_numel].view(num_rows, ba_size)
-    a = packed[z_numel + ba_numel :].view(num_rows, ba_size)
-    return z, b, a
-
-
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
     raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
     if raw is None:
@@ -240,63 +146,15 @@ def _uses_split_gdn_input_projections(
     raw_config = getattr(quant_config, "config", None)
     if isinstance(raw_config, dict):
         add_ignored_modules(raw_config.get("ignore"))
-    if any(
+    if not ignored_modules:
+        return False
+    return any(
         module_name == "linear_attn"
         or module_name.endswith(".linear_attn")
         or ("linear_attn.in_proj_a" in module_name)
         or ("linear_attn.in_proj_b" in module_name)
         for module_name in ignored_modules
-    ):
-        return True
-
-    # ModelOpt mixed checkpoints describe quantized modules positively in
-    # ``quantized_layers`` instead of listing the unquantized b/a projections
-    # in an ignore list. A fused qkv/z/b/a Linear would then allocate the b/a
-    # rows in the qkv/z quant format and leave their scale slots uninitialized.
-    # Compare algorithms per GDN layer and split whenever b/a is absent or
-    # differs from the quantized qkv/z group.
-    quantized_layers = getattr(quant_config, "quantized_layers", None)
-    if not isinstance(quantized_layers, dict):
-        return False
-
-    per_layer: dict[str, dict[str, str]] = {}
-    projection_names = {
-        "in_proj_qkv",
-        "in_proj_z",
-        "in_proj_b",
-        "in_proj_a",
-    }
-    marker = ".linear_attn."
-    for module_name, layer_info in quantized_layers.items():
-        if marker not in module_name or not isinstance(layer_info, dict):
-            continue
-        layer_prefix, projection_name = module_name.rsplit(marker, 1)
-        if projection_name not in projection_names:
-            continue
-        quant_algo = str(layer_info.get("quant_algo", "")).upper()
-        if quant_algo:
-            per_layer.setdefault(layer_prefix, {})[projection_name] = quant_algo
-
-    for projection_algos in per_layer.values():
-        qkvz_algos = {
-            projection_algos[name]
-            for name in ("in_proj_qkv", "in_proj_z")
-            if name in projection_algos
-        }
-        if not qkvz_algos:
-            continue
-        ba_algos = {
-            projection_algos[name]
-            for name in ("in_proj_b", "in_proj_a")
-            if name in projection_algos
-        }
-        has_ba_pair = all(
-            name in projection_algos for name in ("in_proj_b", "in_proj_a")
-        )
-        if not has_ba_pair or ba_algos != qkvz_algos:
-            return True
-
-    return False
+    )
 
 
 def _get_default_sm70_dense_force_suffixes(tp_size: int) -> set[str]:
@@ -390,7 +248,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor | None,
+        output: torch.Tensor,
     ):
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
@@ -402,52 +260,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             "gdn_hidden_states", layer_name, hidden_states
         )
 
-        if _sm70_gdn_qpn8_ba_dispatch_eligible(
-            self,
-            hidden_states,
-            layer_name,
-        ):
-            mixed_qkv = torch.empty(
-                (num_tokens, qkv_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            z = torch.empty(
-                (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            b = torch.empty(
-                (num_tokens, ba_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            a = torch.empty_like(b)
-            qkvz_staging = torch.empty(
-                (num_tokens, qkv_size + z_size),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            ba_staging = torch.empty(
-                (num_tokens, ba_size * 2),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            assert self.in_proj_ba is not None
-            torch.ops._C.fp8_qpn8_dispatch_ba_split_sm70_out(
-                mixed_qkv,
-                z,
-                b,
-                a,
-                qkvz_staging,
-                ba_staging,
-                int(self.in_proj_qkvz.sm70_fp8_prefill_exact_dense_workspace_ptr),
-                hidden_states,
-                self.in_proj_qkvz.weight,
-                self.in_proj_qkvz.weight_scale_inv,
-                self.in_proj_ba.weight,
-            )
-        elif self.use_split_input_projections:
+        if self.use_split_input_projections:
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
             assert self.in_proj_ba is not None
             ba, _ = self.in_proj_ba(hidden_states)
@@ -456,18 +269,9 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             )
             ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
             mixed_qkv = mixed_qkvz[..., :qkv_size]
-            if self.enable_sm70_dflash2_fused_gdn_split:
-                z, b, a = _sm70_materialize_qwen35_gdn_splits(
-                    mixed_qkvz,
-                    ba,
-                    qkv_size,
-                    z_size,
-                    ba_size,
-                )
-            else:
-                z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
-                b = ba[..., :ba_size]
-                a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+            z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+            b = ba[..., :ba_size]
+            a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
         else:
             mixed_qkvzba, _ = self.in_proj_qkvz(hidden_states)
             mixed_qkvzba = _sm70_dump_gdn_projection_tensor(
@@ -477,9 +281,15 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             ba_start = z_start + z_size
             a_start = ba_start + ba_size
             mixed_qkv = mixed_qkvzba[..., :qkv_size]
-            z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
-            b = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, ba_start, ba_size)
-            a = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, a_start, ba_size)
+            z = _sm70_compile_graph_slice_dim(
+                mixed_qkvzba, -1, z_start, z_size
+            )
+            b = _sm70_compile_graph_slice_dim(
+                mixed_qkvzba, -1, ba_start, ba_size
+            )
+            a = _sm70_compile_graph_slice_dim(
+                mixed_qkvzba, -1, a_start, ba_size
+            )
 
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
@@ -510,7 +320,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             conv_state_cache=conv_state_cache,
             ssm_state_cache=ssm_state_cache,
         )
-        return self._output_projection(core_attn_out, z, output, num_tokens)
+        self._output_projection(core_attn_out, z, output, num_tokens)
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):

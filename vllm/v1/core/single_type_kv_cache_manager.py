@@ -20,7 +20,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
-    PrefixAnchoredSWASpec,
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -69,14 +68,6 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         self.new_block_ids: list[int] = []
 
-        # Mamba ``align`` block tables are sparse and mutable: committed
-        # boundary states can be followed by speculative scratch blocks that
-        # are relocated in place. A connector therefore cannot recover an
-        # exact boundary-state source from an append-only block-ID mirror.
-        self._pending_boundary_state_offloads: list[
-            tuple[str, int, KVCacheBlock, int]
-        ] = []
-
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
         # is finished.
@@ -90,18 +81,6 @@ class SingleTypeKVCacheManager(ABC):
 
         self.kv_cache_group_id = kv_cache_group_id
         self._null_block = block_pool.null_block
-
-    def take_pending_boundary_state_offloads(
-        self,
-    ) -> list[tuple[str, int, KVCacheBlock, int]]:
-        """Drain exact Mamba ``align`` boundary-state handoffs.
-
-        Entries are ``(request_id, group_id, block, boundary_tokens)``.
-        Non-Mamba managers leave the list empty.
-        """
-        pending = self._pending_boundary_state_offloads
-        self._pending_boundary_state_offloads = []
-        return pending
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -446,41 +425,8 @@ class SingleTypeKVCacheManager(ABC):
 
         raise NotImplementedError
 
-    def _remove_blocks_in_range(
-        self,
-        request_id: str,
-        first_block: int,
-        last_block: int,
-    ) -> None:
-        """Free blocks in ``[first_block, last_block)`` and replace with null_block.
-
-        Iterates backward so newly-evictable tail blocks are reached even after
-        earlier blocks in the range were nulled in a prior call.
-        """
-        if request_id not in self.req_to_blocks:
-            return
-        if first_block >= last_block:
-            return
-        blocks = self.req_to_blocks[request_id]
-        last_block = min(last_block, len(blocks))
-
-        freed: list[KVCacheBlock] = []
-        for i in range(last_block - 1, first_block - 1, -1):
-            if blocks[i] == self._null_block:
-                # If the block is already a null block, the blocks before it
-                # should also have been set to null blocks by the previous calls
-                # to this function.
-                break
-            freed.append(blocks[i])
-            blocks[i] = self._null_block
-        if freed:
-            self.block_pool.free_blocks(freed)
-
     def remove_skipped_blocks(
-        self,
-        request_id: str,
-        processed_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
+        self, request_id: str, total_computed_tokens: int
     ) -> None:
         """
         Remove and free the blocks that are no longer needed for attention computation.
@@ -491,27 +437,36 @@ class SingleTypeKVCacheManager(ABC):
 
         Args:
             request_id: The request ID.
-            processed_computed_tokens: Computed-token prefix length covering
-                fully processed and committed tokens only (safe to free).
-            num_prompt_tokens: Optional prompt length for attention types (e.g.
-                prefix-anchored SWA) that evict a middle gap rather than a head
-                prefix. Ignored by the default implementation.
+            total_computed_tokens: The total number of computed tokens, including
+                local computed tokens and external computed tokens.
         """
-        del num_prompt_tokens
         # Remove the blocks that will be skipped during attention computation.
-        num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
         if num_skipped_tokens <= 0:
             # This indicates that ALL tokens are inside attention window.
             # Thus we do not need to free any blocks outside attention window.
             # A typical case is full attention that we never free any token
             # before the request is finished.
             return
+        blocks = self.req_to_blocks[request_id]
         num_skipped_blocks = num_skipped_tokens // self.block_size
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
         # (e.g., when the attention window moves into the external computed tokens
-        # range); `_remove_blocks_in_range` caps to the number of blocks that
-        # currently exist for this request.
-        self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+        # range), so we must cap to the number of blocks that currently exist for
+        # this request.
+        num_skipped_blocks = min(num_skipped_blocks, len(blocks))
+        removed_blocks: list[KVCacheBlock] = []
+        # Because the block starts from index 0, the num_skipped_block-th block
+        # corresponds to index num_skipped_blocks - 1.
+        for i in range(num_skipped_blocks - 1, -1, -1):
+            if blocks[i] == self._null_block:
+                # If the block is already a null block, the blocks before it
+                # should also have been set to null blocks by the previous calls
+                # to this function.
+                break
+            removed_blocks.append(blocks[i])
+            blocks[i] = self._null_block
+        self.block_pool.free_blocks(removed_blocks)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
@@ -590,53 +545,6 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
-
-
-class PrefixAnchoredSWAManager(FullAttentionManager):
-    """KV cache manager for prefix-anchored sliding-window attention.
-
-    When ``num_prompt_tokens`` is supplied to ``remove_skipped_blocks``, frees
-    gap blocks between the prefill tail and the current decode window.  This
-    bounds per-request KV memory at O(prefix_len + decode_sliding_window)
-    instead of growing linearly with decode length.
-    """
-
-    def __init__(self, kv_cache_spec: PrefixAnchoredSWASpec, **kwargs) -> None:
-        super().__init__(kv_cache_spec, **kwargs)
-        self.decode_sliding_window: int = kv_cache_spec.decode_sliding_window
-
-    def remove_skipped_blocks(
-        self,
-        request_id: str,
-        processed_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
-    ) -> None:
-        """Free gap blocks that are no longer needed for attention.
-
-        Gap = blocks entirely within
-            [ceil(prefix_len / block_size) * block_size,
-             max(prefix_len, processed_computed_tokens - decode_sliding_window))
-
-        Freed blocks are replaced with null_block in req_to_blocks so the
-        block_table handed to the attention backend stays valid (null_block
-        KV is all-zero; the backend mask marks gap positions as non-visible
-        so they never contribute to the output).
-        """
-        if num_prompt_tokens is None:
-            super().remove_skipped_blocks(
-                request_id, processed_computed_tokens, num_prompt_tokens
-            )
-            return
-
-        bs = self.block_size
-        # First block fully after the prefill boundary.
-        first_gap_block = cdiv(num_prompt_tokens, bs)
-        # Decode window start position; blocks before this are evictable.
-        window_start = max(
-            num_prompt_tokens, processed_computed_tokens - self.decode_sliding_window
-        )
-        last_gap_block = window_start // bs  # exclusive upper bound
-        self._remove_blocks_in_range(request_id, first_gap_block, last_gap_block)
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -1002,17 +910,17 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return computed_blocks
 
-    def remove_skipped_blocks(
-        self,
-        request_id: str,
-        processed_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
-    ) -> None:
+    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
-        super().remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
-        )
+        # NOTE (tdoublep) with async scheduling, the num_computed_tokens can contain
+        # draft tokens from the previous step that may or may not be rejected later.
+        # This can make us think we are further ahead in the sequence than we actually
+        # are, so let's assume that all tokens are rejected so we don't free blocks
+        # that we might actually need.
+        num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
+
+        super().remove_skipped_blocks(request_id, num_computed_tokens)
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
@@ -1025,7 +933,7 @@ class MambaManager(SingleTypeKVCacheManager):
             if (
                 last_state_block_idx is not None
                 and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
+                < cdiv(num_computed_tokens, self.block_size) - 1
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
@@ -1187,14 +1095,6 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
-            # A hand-off is valid only while its source still belongs to this
-            # request. Drop offers that have not reached the connector before
-            # returning the request's blocks to the pool.
-            self._pending_boundary_state_offloads = [
-                entry
-                for entry in self._pending_boundary_state_offloads
-                if entry[0] != request_id
-            ]
         super().free(request_id)
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
@@ -1215,22 +1115,13 @@ class MambaManager(SingleTypeKVCacheManager):
         super().cache_blocks(request, num_tokens, alignment_tokens=alignment_tokens)
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if num_cached_blocks_after > num_cached_blocks_before:
-            blocks = self.req_to_blocks[request.request_id]
-            for block_idx in range(num_cached_blocks_before, num_cached_blocks_after):
-                block = blocks[block_idx]
+            for block in self.req_to_blocks[request.request_id][
+                num_cached_blocks_before:num_cached_blocks_after
+            ]:
                 if block.is_null:
                     continue
                 assert block.block_hash is not None
                 self.cached_blocks_this_step.add(block.block_hash)
-                if self.mamba_cache_mode == "align":
-                    self._pending_boundary_state_offloads.append(
-                        (
-                            request.request_id,
-                            self.kv_cache_group_id,
-                            block,
-                            (block_idx + 1) * self.block_size,
-                        )
-                    )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()
@@ -1319,7 +1210,6 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     TQFullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     HiddenStateCacheSpec: FullAttentionManager,
-    PrefixAnchoredSWASpec: PrefixAnchoredSWAManager,
     SlidingWindowSpec: SlidingWindowManager,
     SlidingWindowMLASpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
@@ -1331,7 +1221,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
-    max_in_flight_tokens: int,
+    max_num_batched_tokens: int,
     max_model_len: int,
     **kwargs,
 ) -> SingleTypeKVCacheManager:
@@ -1342,7 +1232,7 @@ def get_manager_for_kv_cache_spec(
     if isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
         kwargs["max_admission_blocks_per_request"] = (
             kv_cache_spec.max_admission_blocks_per_request(
-                max_in_flight_tokens=max_in_flight_tokens,
+                max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
             )
         )

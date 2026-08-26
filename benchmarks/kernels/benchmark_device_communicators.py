@@ -49,10 +49,9 @@ logger = init_logger(__name__)
 # Default sequence lengths to benchmark
 DEFAULT_SEQUENCE_LENGTHS = [16, 64, 128, 512, 1024, 2048, 4096, 8192]
 
-# Defaults preserve the original benchmark contract. CLI overrides make it
-# possible to replay an exact model communication shape.
-DEFAULT_HIDDEN_SIZE = 8192
-DEFAULT_BENCHMARK_DTYPE = torch.bfloat16
+# Fixed hidden size and dtype for all benchmarks
+HIDDEN_SIZE = 8192
+BENCHMARK_DTYPE = torch.bfloat16
 
 # CUDA graph settings
 CUDA_GRAPH_CAPTURE_CYCLES = 10
@@ -68,20 +67,16 @@ class CommunicatorBenchmark:
         device: torch.device,
         cpu_group: ProcessGroup,
         sequence_lengths: list[int],
-        hidden_size: int,
-        dtype: torch.dtype,
     ):
         self.rank = rank
         self.world_size = world_size
         self.device = device
         self.cpu_group = cpu_group
-        self.hidden_size = hidden_size
-        self.dtype = dtype
 
         # Calculate max_size_override based on largest sequence length
         max_seq_len = max(sequence_lengths)
-        max_tensor_elements = max_seq_len * self.hidden_size
-        self.max_size_override = max_tensor_elements * self.dtype.itemsize + 1
+        max_tensor_elements = max_seq_len * HIDDEN_SIZE
+        self.max_size_override = max_tensor_elements * BENCHMARK_DTYPE.itemsize + 1
 
         # Initialize communicators
         self.custom_allreduce = None
@@ -342,10 +337,7 @@ class CommunicatorBenchmark:
         try:
             # Create test tensor (2D: sequence_length x hidden_size)
             tensor = torch.randn(
-                sequence_length,
-                self.hidden_size,
-                dtype=self.dtype,
-                device=self.device,
+                sequence_length, HIDDEN_SIZE, dtype=BENCHMARK_DTYPE, device=self.device
             )
             if not should_use_fn(tensor):
                 return None
@@ -413,17 +405,16 @@ def _calculate_speedup_info(comm_results: dict[str, float]) -> str:
 
 
 def print_results(
-    results: dict[str, dict[str, float]],
-    sequence_lengths: list[int],
-    world_size: int,
-    hidden_size: int,
-    dtype: torch.dtype,
+    results: dict[str, dict[str, float]], sequence_lengths: list[int], world_size: int
 ):
     """Print benchmark results in a formatted table."""
 
     print(f"\n{'=' * 130}")
     print("Device Communicator Benchmark Results")
-    print(f"World Size: {world_size}, Data Type: {dtype}, Hidden Size: {hidden_size}")
+    print(
+        f"World Size: {world_size}, Data Type: {BENCHMARK_DTYPE}, "
+        f"Hidden Size: {HIDDEN_SIZE}"
+    )
     print(f"{'=' * 130}")
 
     # Get all communicator names
@@ -445,15 +436,15 @@ def print_results(
     for seq_len in sequence_lengths:
         if seq_len in results:
             # Calculate tensor size in elements and bytes
-            tensor_elements = seq_len * hidden_size
-            tensor_bytes = tensor_elements * dtype.itemsize
+            tensor_elements = seq_len * HIDDEN_SIZE
+            tensor_bytes = tensor_elements * BENCHMARK_DTYPE.itemsize
 
             # Format tensor size (MB)
             tensor_size_mb = tensor_bytes / (1024 * 1024)
             tensor_size_str = f"{tensor_size_mb:.2f} MB"
 
             # Format tensor shape
-            tensor_shape = f"({seq_len}, {hidden_size})"
+            tensor_shape = f"({seq_len}, {HIDDEN_SIZE})"
 
             row = f"{tensor_shape:<20}{tensor_size_str:<15}"
             for comm in all_comms:
@@ -492,24 +483,9 @@ def main():
         "--num-trials", type=int, default=50, help="Number of benchmark trials"
     )
 
-    parser.add_argument(
-        "--hidden-size",
-        type=int,
-        default=DEFAULT_HIDDEN_SIZE,
-        help="Hidden dimension of the all-reduce tensor.",
-    )
-
-    parser.add_argument(
-        "--dtype",
-        choices=("float16", "bfloat16"),
-        default="bfloat16",
-        help="All-reduce tensor dtype.",
-    )
-
     parser.add_argument("--output-json", type=str, help="Output results to JSON file")
 
     args = parser.parse_args()
-    benchmark_dtype = getattr(torch, args.dtype)
 
     # Initialize distributed
     if not dist.is_initialized():
@@ -530,13 +506,7 @@ def main():
 
     # Initialize benchmark
     benchmark = CommunicatorBenchmark(
-        rank,
-        world_size,
-        device,
-        cpu_group,
-        args.sequence_lengths,
-        args.hidden_size,
-        benchmark_dtype,
+        rank, world_size, device, cpu_group, args.sequence_lengths
     )
 
     # Run benchmarks
@@ -548,7 +518,7 @@ def main():
                 "Benchmarking sequence length: %s (tensor shape: %s x %s)",
                 seq_len,
                 seq_len,
-                args.hidden_size,
+                HIDDEN_SIZE,
             )
 
         results = benchmark.benchmark_allreduce(
@@ -564,13 +534,7 @@ def main():
 
     # Print results (only rank 0)
     if rank == 0:
-        print_results(
-            all_results,
-            args.sequence_lengths,
-            world_size,
-            args.hidden_size,
-            benchmark_dtype,
-        )
+        print_results(all_results, args.sequence_lengths, world_size)
 
         # Save to JSON if requested
         if args.output_json:
@@ -584,8 +548,8 @@ def main():
 
             output_data = {
                 "world_size": world_size,
-                "dtype": str(benchmark_dtype),
-                "hidden_size": args.hidden_size,
+                "dtype": str(BENCHMARK_DTYPE),
+                "hidden_size": HIDDEN_SIZE,
                 "sequence_lengths": args.sequence_lengths,
                 "num_warmup": args.num_warmup,
                 "num_trials": args.num_trials,

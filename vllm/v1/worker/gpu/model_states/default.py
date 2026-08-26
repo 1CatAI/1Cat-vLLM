@@ -195,6 +195,5 @@ class DefaultModelState(ModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
             for_cudagraph_capture=for_capture,
-            prefix_anchor_lens=input_batch.prefix_anchor_lens,
         )
         return attn_metadata

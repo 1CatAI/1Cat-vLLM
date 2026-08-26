@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -101,11 +100,6 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 _SM70_FP8_PREFILL_DENSE_MIN_M = 3920
-_SM70_FP8_EXACT_8K_PREFILL_M = 8000
-_SM70_FP8_EXACT_8K_PREFILL_SHAPES = {
-    "in_proj_qkvz": (5120, 4096),
-    "qkv_proj": (5120, 3584),
-}
 _SM70_FP8_PREFILL_DENSE_SHAPES = {
     "gate_up_proj": (5120, 8704),
     "down_proj": (4352, 5120),
@@ -118,235 +112,18 @@ _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS = max(
 _SM70_FP8_PREFILL_DENSE_WORKSPACE_BYTES = (
     _SM70_FP8_PREFILL_DENSE_WORKSPACE_ELEMENTS * torch.float16.itemsize
 )
-_SM70_FP8_QPN8_CONFIGS = {
-    # (K, N, fused gated-SiLU): (split-K, accumulator chains, prefetch codes)
-    (4352, 5120, False): (16, 1, False),
-    (1536, 5120, False): (16, 1, False),
-    (5120, 4096, False): (16, 2, False),
-    (5120, 3584, False): (16, 2, False),
-    (5120, 8704, False): (16, 1, True),
-    (5120, 8704, True): (8, 2, True),
-}
-_SM70_FP8_QPN8_EXTRA_SHAPES = {
-    "in_proj_qkvz": (5120, 4096),
-    "qkv_proj": (5120, 3584),
-}
-_SM70_FP8_QPN8_PP2_TP4_CONFIGS = {
-    # Real-weight speed winners remain numerically bounded for every admitted
-    # projection. The shared-expert gate/up role is deliberately absent below
-    # after its fused activation matched only 53.5% of TurboMind FP16 elements.
-    (4096, 1536, False): (32, 2, False),
-    (1024, 8192, False): (8, 2, False),
-    (2048, 4096, False): (16, 2, False),
-    (4096, 1024, False): (32, 2, False),
-    (512, 4096, False): (16, 2, False),
-}
-_SM70_FP8_QPN8_PP2_TP4_SHAPES = {
-    # Operator role: accepted (layer TP size, K, N) tuples. The shared-expert
-    # gate/up projection is excluded by numerical evidence. The replicated
-    # indexer wq_b is excluded by TP size: its long-prefill work may overlap
-    # the main wq_b and cannot share one dense fallback workspace.
-    "fused_wqa_wkv": {(1, 4096, 1536)},
-    "wq_b": {(4, 1024, 8192)},
-    "wo_b": {(4, 2048, 4096)},
-    "down_proj": {(4, 512, 4096)},
-}
-_SM70_FP8_QPN8_PP2_TP4_WORKSPACE_ELEMENTS = max(
-    k * n for k, n, _ in _SM70_FP8_QPN8_PP2_TP4_CONFIGS
-)
-_SM70_FP8_QPN8_REQUIRED_OPS = (
-    "fp8_qpn8_prepare_sm70",
-    "fp8_qpn8_dequantize_sm70_out",
-    "fp8_qpn8_prefill_sm70_out",
-    "fp8_qpn8_dispatch_sm70_out",
-    "fp8_qpn8_gemm_sm70_out",
-    "fp8_qpn8_gated_pair_sm70_out",
-)
-_SM70_FP8_QPN8_MAX_NUM_SEQS = 8
 # Layers retain only data_ptr(), so this cache owns each allocation's lifetime.
 _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
-_sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
-
-
-def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
-    """Admit only the measured replicated fused WQA/WKV tensor contract."""
-    return bool(
-        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "fused_wqa_wkv"
-        and int(getattr(layer, "tp_size", 1)) == 1
-        and getattr(layer, "weight_block_size", None) == [128, 128]
-        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
-        and int(getattr(layer, "output_size_per_partition", 0)) == 1536
-        and tuple(layer.weight.shape) == (1536, 4096)
-    )
-
-
-def _is_sm70_fp8_prescaled_m1_decode_runtime_contract() -> bool:
-    """Require the measured PP2 x TP4 no-spec single-request decode lane."""
-    vllm_config = get_current_vllm_config()
-    parallel_config = vllm_config.parallel_config
-    scheduler_config = vllm_config.scheduler_config
-    return bool(
-        parallel_config.pipeline_parallel_size == 2
-        and parallel_config.tensor_parallel_size == 4
-        and scheduler_config.max_num_seqs == 1
-        and not getattr(parallel_config, "enable_dbo", False)
-        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
-        and getattr(vllm_config, "speculative_config", None) is None
-    )
-
-
-def _try_sm70_fp8_prescaled_decode_scales(
-    scales: torch.Tensor,
-) -> torch.Tensor | None:
-    """Prescale only when the FP16 exponent shift is finite and reversible."""
-    if scales.dtype != torch.float16 or not bool(torch.all(scales >= 0).item()):
-        return None
-    prescaled = scales.mul(256)
-    if not bool(torch.isfinite(prescaled).all().item()):
-        return None
-    if not torch.equal(prescaled.mul(1.0 / 256.0), scales):
-        return None
-    return prescaled
-
-
-def _is_sm70_fp8_exact_8k_prefill_layer(layer: torch.nn.Module) -> bool:
-    if getattr(layer, "tp_size", 1) != 4:
-        return False
-    if getattr(layer, "weight_block_size", None) != [128, 128]:
-        return False
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    expected = _SM70_FP8_EXACT_8K_PREFILL_SHAPES.get(suffix)
-    return expected is not None and tuple(layer.weight.shape) == expected
 
 
 def _is_sm70_fp8_prefill_exact_dense_layer(layer: torch.nn.Module) -> bool:
     if getattr(layer, "tp_size", 1) != 4:
         return False
-    if getattr(layer, "weight_block_size", None) != [128, 128]:
-        return False
     suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
     expected = _SM70_FP8_PREFILL_DENSE_SHAPES.get(suffix)
     if expected is None:
-        expected = _SM70_FP8_EXACT_8K_PREFILL_SHAPES.get(suffix)
-    if expected is None:
         return False
     return tuple(layer.weight.shape) == expected
-
-
-def _is_sm70_fp8_qpn8_layer(layer: torch.nn.Module) -> bool:
-    """Admit only shapes with an accepted bounded-workspace prefill route."""
-    if getattr(layer, "tp_size", 1) != 4:
-        return False
-    if getattr(layer, "weight_block_size", None) != [128, 128]:
-        return False
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    expected_kn = _SM70_FP8_PREFILL_DENSE_SHAPES.get(suffix)
-    if expected_kn is None:
-        expected_kn = _SM70_FP8_QPN8_EXTRA_SHAPES.get(suffix)
-    if expected_kn is None:
-        return False
-    # Checkpoint-native block-FP8 weights are [N, K]; the shared prefill
-    # workspace and QPN8 replacement parameter are [K, N].
-    if tuple(reversed(layer.weight.shape)) != expected_kn:
-        return False
-    expected_k, expected_n = expected_kn
-    return bool(
-        getattr(layer, "input_size_per_partition", 0) == expected_k
-        and getattr(layer, "output_size_per_partition", 0) == expected_n
-    )
-
-
-def _is_sm70_fp8_qpn8_runtime_contract() -> bool:
-    """Admit only the no-MTP M range with a measured native decode kernel."""
-    vllm_config = get_current_vllm_config()
-    scheduler_config = getattr(vllm_config, "scheduler_config", None)
-    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 1))
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if max_num_seqs > _SM70_FP8_QPN8_MAX_NUM_SEQS:
-        return False
-    if speculative_config is None:
-        return True
-    # Speculative workloads require an explicit operator opt-in; admission is
-    # still based only on bounded concurrency and the layer tensor contract.
-    return os.getenv("VLLM_SM70_FP8_QPN8") is not None
-
-
-def _sm70_fp8_qpn8_pp2_tp4_enabled() -> bool:
-    """Resolve the validated default while retaining explicit rollback."""
-    generic_override = os.getenv("VLLM_SM70_FP8_QPN8")
-    if generic_override is not None and not envs.VLLM_SM70_FP8_QPN8:
-        return False
-    specific_override = os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4")
-    if specific_override is not None:
-        return envs.VLLM_SM70_FP8_QPN8_PP2_TP4
-    if generic_override is not None:
-        return envs.VLLM_SM70_FP8_QPN8
-    return envs.VLLM_SM70_FP8_QPN8_PP2_TP4
-
-
-def _is_sm70_fp8_qpn8_pp2_tp4_runtime_contract() -> bool:
-    """Require the measured serialized PP2 x TP4 single-request route."""
-    vllm_config = get_current_vllm_config()
-    parallel_config = vllm_config.parallel_config
-    scheduler_config = vllm_config.scheduler_config
-    return bool(
-        parallel_config.pipeline_parallel_size == 2
-        and parallel_config.tensor_parallel_size == 4
-        and scheduler_config.max_num_seqs == 1
-        and not getattr(parallel_config, "enable_dbo", False)
-        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
-        and getattr(vllm_config, "speculative_config", None) is None
-    )
-
-
-def _sm70_fp8_qpn8_pp2_tp4_config(
-    layer: torch.nn.Module, *, gated_silu: bool
-) -> tuple[int, int, bool] | None:
-    """Select by operator/tensor contract, never model or checkpoint identity."""
-    if getattr(layer, "weight_block_size", None) != [128, 128]:
-        return None
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    accepted = _SM70_FP8_QPN8_PP2_TP4_SHAPES.get(suffix)
-    if accepted is None:
-        return None
-    k_dim = int(getattr(layer, "input_size_per_partition", 0))
-    n_dim = int(getattr(layer, "output_size_per_partition", 0))
-    layer_contract = (int(getattr(layer, "tp_size", 1)), k_dim, n_dim)
-    if layer_contract not in accepted:
-        return None
-    if tuple(reversed(layer.weight.shape)) != (k_dim, n_dim):
-        return None
-    if gated_silu:
-        output_partitions = getattr(layer, "output_partition_sizes", None)
-        if (
-            suffix != "gate_up_proj"
-            or not isinstance(output_partitions, list)
-            or output_partitions != [n_dim // 2, n_dim // 2]
-        ):
-            return None
-    return _SM70_FP8_QPN8_PP2_TP4_CONFIGS.get((k_dim, n_dim, gated_silu))
-
-
-def _sm70_fp8_qpn8_pp2_tp4_bmm_config(
-    layer: torch.nn.Module,
-) -> tuple[int, int, bool] | None:
-    if (
-        getattr(layer, "prefix", "").rsplit(".", 1)[-1] != "wo_a"
-        or getattr(layer, "weight_block_size", None) != [128, 128]
-        or int(getattr(layer, "tp_size", 1)) != 4
-        or int(getattr(layer, "bmm_batch_size", 0)) != 2
-        or int(getattr(layer, "input_size_per_partition", 0)) != 4096
-        or int(getattr(layer, "output_size_per_partition", 0)) != 2048
-        or tuple(layer.weight.shape) != (2048, 4096)
-    ):
-        return None
-    return _SM70_FP8_QPN8_PP2_TP4_CONFIGS[(4096, 1024, False)]
-
-
-def _missing_sm70_fp8_qpn8_ops() -> list[str]:
-    return [
-        name for name in _SM70_FP8_QPN8_REQUIRED_OPS if not hasattr(torch.ops._C, name)
-    ]
 
 
 def _get_sm70_fp8_prefill_exact_dense_workspace(
@@ -373,78 +150,6 @@ def _get_sm70_fp8_prefill_exact_dense_workspace(
         return None
     _sm70_fp8_prefill_dense_workspaces[cache_key] = workspace
     return workspace
-
-
-def _get_sm70_fp8_qpn8_pp2_tp4_workspace(
-    weight: torch.Tensor,
-) -> torch.Tensor | None:
-    """Allocate one bounded FP16 prefill fallback per device."""
-    device_index = weight.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
-    cache_key = (device_index, torch.float16)
-    workspace = _sm70_fp8_qpn8_pp2_tp4_workspaces.get(cache_key)
-    if workspace is not None:
-        return workspace
-    try:
-        workspace = torch.empty(
-            (_SM70_FP8_QPN8_PP2_TP4_WORKSPACE_ELEMENTS,),
-            dtype=torch.float16,
-            device=weight.device,
-        )
-    except torch.OutOfMemoryError:
-        logger.warning_once(
-            "Insufficient memory for the bounded SM70 PP2 x TP4 QPN8 "
-            "prefill workspace; retaining TurboMind FP8."
-        )
-        return None
-    _sm70_fp8_qpn8_pp2_tp4_workspaces[cache_key] = workspace
-    return workspace
-
-
-def _sm70_fp8_prefill_visible_dense_mm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scales: torch.Tensor,
-    dense_weight_ptr: int | None,
-    *,
-    gated_silu: bool,
-    min_prefill_m: int,
-) -> torch.Tensor | None:
-    """Expose the long-prefill dense MM to AsyncTP pattern matching.
-
-    This diagnostic route intentionally keeps the accepted dequantization and
-    FP16 MM arithmetic while moving ``aten.mm`` out of the opaque C++ wrapper.
-    """
-    if not envs.VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM:
-        return None
-    if dense_weight_ptr is None:
-        return None
-    if input.dtype != torch.float16 or input.shape[0] < min_prefill_m:
-        return None
-
-    device_index = input.device.index
-    if device_index is None:
-        device_index = torch.accelerator.current_device_index()
-    workspace = _sm70_fp8_prefill_dense_workspaces.get((device_index, torch.float16))
-    if workspace is None:
-        return None
-    if not torch.compiler.is_compiling() and workspace.data_ptr() != dense_weight_ptr:
-        return None
-
-    dense_weight = workspace.narrow(0, 0, weight.numel()).view(weight.shape)
-    sm70_ops.fp8_sm70_dequantize_out(dense_weight, weight, scales, 128)
-    dense_out = torch.mm(input, dense_weight)
-    if not gated_silu:
-        return dense_out
-
-    out = torch.empty(
-        (input.shape[0], dense_out.shape[1] // 2),
-        dtype=input.dtype,
-        device=input.device,
-    )
-    sm70_ops.silu_and_mul_interleaved(out, dense_out)
-    return out
 
 
 class Fp8Config(QuantizationConfig):
@@ -829,15 +534,6 @@ class Fp8LinearMethod(LinearMethodBase):
             if weight_scale_inv.dtype != torch.float32:
                 weight_scale_inv = weight_scale_inv.to(torch.float32)
             if getattr(layer, "is_bmm", False):
-                qpn8_bmm_config = (
-                    _sm70_fp8_qpn8_pp2_tp4_bmm_config(layer)
-                    if _sm70_fp8_qpn8_pp2_tp4_enabled()
-                    else None
-                )
-                qpn8_bmm_runtime = bool(
-                    qpn8_bmm_config is not None
-                    and _is_sm70_fp8_qpn8_pp2_tp4_runtime_contract()
-                )
                 group_count = int(getattr(layer, "bmm_batch_size", 0))
                 if group_count <= 0 or weight.shape[0] % group_count != 0:
                     raise RuntimeError(
@@ -860,73 +556,6 @@ class Fp8LinearMethod(LinearMethodBase):
                         f"weights: expected {expected_scale_rows}, got "
                         f"{weight_scale_inv.shape[0]}."
                     )
-
-                if qpn8_bmm_config is not None and not qpn8_bmm_runtime:
-                    logger.info_once(
-                        "Grouped SM70 QPN8 retains TurboMind outside the "
-                        "serialized PP2 x TP4 single-request contract."
-                    )
-                if qpn8_bmm_runtime:
-                    missing_ops = _missing_sm70_fp8_qpn8_ops()
-                    explicitly_enabled = (
-                        os.getenv("VLLM_SM70_FP8_QPN8") == "1"
-                        or os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4") == "1"
-                    )
-                    if missing_ops and explicitly_enabled:
-                        raise RuntimeError(
-                            "The explicitly enabled SM70 PP2 x TP4 QPN8 route "
-                            f"requires source-built operators; missing: {missing_ops}."
-                        )
-                    if missing_ops:
-                        logger.warning_once(
-                            "The default SM70 PP2 x TP4 QPN8 route is unavailable "
-                            "in the loaded vllm._C; retaining TurboMind FP8."
-                        )
-                    workspace = (
-                        None
-                        if missing_ops
-                        else _get_sm70_fp8_qpn8_pp2_tp4_workspace(weight)
-                    )
-                    if workspace is not None:
-                        qpn8_weights = []
-                        qpn8_scales = []
-                        for group_idx in range(group_count):
-                            row_start = group_idx * rows_per_group
-                            scale_start = group_idx * scale_rows_per_group
-                            qpn8_weight, qpn8_scale = sm70_ops.fp8_qpn8_prepare_sm70(
-                                weight[
-                                    row_start : row_start + rows_per_group
-                                ].contiguous(),
-                                weight_scale_inv[
-                                    scale_start : scale_start + scale_rows_per_group
-                                ].contiguous(),
-                            )
-                            qpn8_weights.append(qpn8_weight)
-                            qpn8_scales.append(qpn8_scale)
-                        replace_parameter(layer, "weight", torch.stack(qpn8_weights))
-                        replace_parameter(
-                            layer, "weight_scale_inv", torch.stack(qpn8_scales)
-                        )
-                        assert qpn8_bmm_config is not None
-                        split_k, nacc, prefetch = qpn8_bmm_config
-                        layer.input_scale = None
-                        layer.sm70_fp8_turbomind = True
-                        layer.sm70_fp8_qpn8 = True
-                        layer.sm70_fp8_qpn8_bmm = True
-                        layer.sm70_fp8_bmm = True
-                        layer.sm70_fp8_bmm_groups = group_count
-                        layer.sm70_fp8_bmm_output_size = rows_per_group
-                        layer.sm70_fp8_qpn8_split_k = split_k
-                        layer.sm70_fp8_qpn8_nacc = nacc
-                        layer.sm70_fp8_qpn8_prefetch = prefetch
-                        layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
-                            workspace.data_ptr()
-                        )
-                        logger.info_once(
-                            "Default SM70 grouped QPN8 enabled for the validated "
-                            "serialized PP2 x TP4 tensor contract."
-                        )
-                        return
 
                 prepared_weights = []
                 prepared_scales = []
@@ -967,182 +596,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_buffer("sm70_fp8_meta", first_meta, persistent=False)
                 layer.sm70_fp8_k_ld = int(first_meta[0].item())
                 layer.sm70_fp8_q_ld = int(first_meta[1].item())
-                if (
-                    envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
-                    and group_count == 2
-                    and rows_per_group == 1024
-                    and int(layer.weight.shape[1]) == 4096
-                    and hasattr(
-                        torch.ops._C,
-                        "fp8_moe_gemm_sm70_per_expert_dispatch_out",
-                    )
-                    and hasattr(torch.ops._C, "awq_moe_build_strided_ptrs")
-                ):
-                    ptrs_w, ptrs_s = sm70_ops.awq_moe_build_strided_ptrs(
-                        layer.weight,
-                        layer.weight_scale_inv,
-                        layer.sm70_fp8_k_ld,
-                        layer.sm70_fp8_q_ld,
-                        group_count,
-                    )
-                    layer.register_buffer(
-                        "sm70_fp8_bmm_grouped_ptrs_w", ptrs_w, persistent=False
-                    )
-                    layer.register_buffer(
-                        "sm70_fp8_bmm_grouped_ptrs_s", ptrs_s, persistent=False
-                    )
-                    layer.register_buffer(
-                        "sm70_fp8_bmm_grouped_offsets",
-                        torch.arange(
-                            group_count + 1,
-                            dtype=torch.int32,
-                            device=layer.weight.device,
-                        ),
-                        persistent=False,
-                    )
-                    layer.sm70_fp8_bmm_grouped_decode = True
-                    logger.info_once(
-                        "SM70 FP8 one-launch grouped-BMM decode path enabled."
-                    )
                 logger.info_once(
                     "SM70 FP8 TurboMind grouped-BMM path enabled for DeepSeek V4."
                 )
                 return
             is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
             use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
-            generic_qpn8_candidate = (
-                envs.VLLM_SM70_FP8_QPN8 and _is_sm70_fp8_qpn8_layer(layer)
-            )
-            pp2_tp4_qpn8_config = (
-                _sm70_fp8_qpn8_pp2_tp4_config(layer, gated_silu=False)
-                if _sm70_fp8_qpn8_pp2_tp4_enabled()
-                else None
-            )
-            pp2_tp4_qpn8_candidate = pp2_tp4_qpn8_config is not None
-            qpn8_candidate_layer = generic_qpn8_candidate or pp2_tp4_qpn8_candidate
-            qpn8_runtime = bool(
-                (
-                    pp2_tp4_qpn8_candidate
-                    and _is_sm70_fp8_qpn8_pp2_tp4_runtime_contract()
-                )
-                or (generic_qpn8_candidate and _is_sm70_fp8_qpn8_runtime_contract())
-            )
-            if qpn8_candidate_layer and not qpn8_runtime:
-                logger.info_once(
-                    "The SM70 FP8 QPN8 route retains TurboMind unless its "
-                    "bounded-concurrency runtime contract is explicit."
-                )
-            if qpn8_candidate_layer and qpn8_runtime:
-                pp2_tp4_gated_config = None
-                if pp2_tp4_qpn8_candidate and use_gated_silu:
-                    pp2_tp4_gated_config = _sm70_fp8_qpn8_pp2_tp4_config(
-                        layer, gated_silu=True
-                    )
-                    if pp2_tp4_gated_config is None:
-                        raise RuntimeError(
-                            "The SM70 PP2 x TP4 QPN8 gate/up layer violated "
-                            "its fused-SiLU tensor contract."
-                        )
-                missing_ops = _missing_sm70_fp8_qpn8_ops()
-                if missing_ops:
-                    explicitly_enabled = (
-                        os.getenv("VLLM_SM70_FP8_QPN8") == "1"
-                        or os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4") == "1"
-                    )
-                    if explicitly_enabled:
-                        raise RuntimeError(
-                            "The explicitly enabled SM70 QPN8 route requires "
-                            f"source-built operators; missing: {missing_ops}."
-                        )
-                    logger.warning_once(
-                        "The default SM70 FP8 QPN8 route is unavailable in "
-                        "the loaded vllm._C; retaining the TurboMind layout."
-                    )
-
-                if missing_ops:
-                    workspace = None
-                elif pp2_tp4_qpn8_candidate:
-                    workspace = _get_sm70_fp8_qpn8_pp2_tp4_workspace(weight)
-                else:
-                    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(weight)
-                if not missing_ops and workspace is not None:
-                    qpn8_codes, qpn8_scales = sm70_ops.fp8_qpn8_prepare_sm70(
-                        weight, weight_scale_inv
-                    )
-                    k_dim, n_dim = (int(dim) for dim in qpn8_codes.shape)
-                    if pp2_tp4_qpn8_candidate:
-                        assert pp2_tp4_qpn8_config is not None
-                        split_k, nacc, prefetch = pp2_tp4_qpn8_config
-                    else:
-                        split_k, nacc, prefetch = _SM70_FP8_QPN8_CONFIGS[
-                            (k_dim, n_dim, False)
-                        ]
-                    replace_parameter(layer, "weight", qpn8_codes)
-                    replace_parameter(layer, "weight_scale_inv", qpn8_scales)
-                    layer.input_scale = None
-                    layer.sm70_fp8_turbomind = True
-                    layer.sm70_fp8_qpn8 = True
-                    layer.sm70_fp8_qpn8_split_k = split_k
-                    layer.sm70_fp8_qpn8_nacc = nacc
-                    layer.sm70_fp8_qpn8_prefetch = prefetch
-                    layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
-                        workspace.data_ptr()
-                    )
-                    if use_gated_silu:
-                        if pp2_tp4_qpn8_candidate:
-                            assert pp2_tp4_gated_config is not None
-                            gated_split_k, gated_nacc, gated_prefetch = (
-                                pp2_tp4_gated_config
-                            )
-                        else:
-                            gated_split_k, gated_nacc, gated_prefetch = (
-                                _SM70_FP8_QPN8_CONFIGS[(k_dim, n_dim, True)]
-                            )
-                        layer.sm70_fp8_gated_silu = True
-                        layer.sm70_fp8_gated_silu_primary = True
-                        layer.sm70_fp8_qpn8_gated_split_k = gated_split_k
-                        layer.sm70_fp8_qpn8_gated_nacc = gated_nacc
-                        layer.sm70_fp8_qpn8_gated_prefetch = gated_prefetch
-                    if pp2_tp4_qpn8_candidate:
-                        logger.info_once(
-                            "Default SM70 QPN8 enabled for the validated "
-                            "serialized PP2 x TP4 operator contract."
-                        )
-                    else:
-                        logger.info_once(
-                            "Memory-neutral SM70 FP8 QPN8 path enabled for "
-                            "accepted TP4 block-FP8 operator shapes."
-                        )
-                    return
-                if not missing_ops:
-                    logger.warning_once(
-                        "Insufficient memory for the SM70 FP8 QPN8 prefill "
-                        "workspace; retaining the TurboMind layout."
-                    )
-
-            prescaled_decode_requested = envs.VLLM_SM70_FP8_PRESCALED_M1_DECODE
-            prescaled_decode_explicit = (
-                os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE") == "1"
-            )
-            prescaled_decode_layer = _is_sm70_fp8_prescaled_m1_decode_layer(layer)
-            prescaled_decode_runtime = bool(
-                prescaled_decode_layer
-                and _is_sm70_fp8_prescaled_m1_decode_runtime_contract()
-            )
-            if (
-                prescaled_decode_explicit
-                and prescaled_decode_layer
-                and not (self.is_scale_e8m0 and prescaled_decode_runtime)
-            ):
-                raise RuntimeError(
-                    "Explicit SM70 FP8 prescaled decode requires UE8M0 128x128 "
-                    "scales and the PP2 x TP4 no-spec single-request contract."
-                )
-            use_prescaled_m1_decode = bool(
-                prescaled_decode_requested
-                and self.is_scale_e8m0
-                and prescaled_decode_runtime
-            )
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight,
                 weight_scale_inv,
@@ -1170,65 +629,15 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
             layer.sm70_fp8_k_ld = int(meta[0].item())
             layer.sm70_fp8_q_ld = int(meta[1].item())
-            if use_prescaled_m1_decode:
-                has_prescaled_op = hasattr(
-                    torch.ops._C, "fp8_gemm_sm70_prescaled_m1_out"
-                )
-                prescaled_scales = (
-                    _try_sm70_fp8_prescaled_decode_scales(tm_scales)
-                    if has_prescaled_op
-                    else None
-                )
-                if prescaled_scales is None and prescaled_decode_explicit:
-                    raise RuntimeError(
-                        "Explicit SM70 FP8 prescaled decode requires the "
-                        "source-built operator and finite, reversible FP16 "
-                        "scales after the 256x exponent shift."
-                    )
-                if prescaled_scales is None:
-                    logger.warning_once(
-                        "SM70 FP8 prescaled decode is unavailable for the "
-                        "loaded extension or scale range; retaining the "
-                        "ordinary TurboMind transform."
-                    )
-                else:
-                    layer.register_buffer(
-                        "sm70_fp8_decode_prescaled_scales",
-                        prescaled_scales,
-                        persistent=False,
-                    )
-                    logger.info_once(
-                        "Exact SM70 fused-WQA/WKV prescaled decode path enabled."
-                    )
-            if (
-                envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
-                and envs.VLLM_SM70_FP8_PREFILL_PRESCALED
-                and hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_prescaled_out")
-                and _is_sm70_fp8_exact_8k_prefill_layer(layer)
-            ):
-                layer.register_buffer(
-                    "sm70_fp8_prefill_prescaled_scales",
-                    tm_scales.mul(256),
-                    persistent=False,
-                )
-                logger.info_once(
-                    "SM70 block-FP8 exact-8K pre-scaled projection path enabled."
-                )
             if (
                 envs.VLLM_SM70_FP8_PREFILL_EXACT_DENSE
                 and hasattr(torch.ops._C, "fp8_gemm_sm70_prefill_dispatch_out")
                 and _is_sm70_fp8_prefill_exact_dense_layer(layer)
             ):
-                is_exact_8k_projection = _is_sm70_fp8_exact_8k_prefill_layer(layer)
                 workspace = _get_sm70_fp8_prefill_exact_dense_workspace(tm_weight)
                 if workspace is not None:
                     layer.sm70_fp8_prefill_exact_dense_workspace_ptr = (
                         workspace.data_ptr()
-                    )
-                    layer.sm70_fp8_prefill_exact_dense_min_m = (
-                        _SM70_FP8_EXACT_8K_PREFILL_M
-                        if is_exact_8k_projection
-                        else _SM70_FP8_PREFILL_DENSE_MIN_M
                     )
                     logger.info_once(
                         "SM70 FP8 exact-dense prefill path enabled with a bounded "
@@ -1349,77 +758,6 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "sm70_fp8_turbomind", False):
-            if getattr(layer, "sm70_fp8_qpn8", False):
-                if x.dtype != torch.float16:
-                    raise RuntimeError(
-                        "SM70 FP8 QPN8 currently requires float16 activations, "
-                        f"got {x.dtype}."
-                    )
-                if getattr(layer, "sm70_fp8_qpn8_bmm", False):
-                    group_count = int(layer.sm70_fp8_bmm_groups)
-                    output_size = int(layer.sm70_fp8_bmm_output_size)
-                    if x.ndim < 2 or x.shape[-2] != group_count:
-                        raise RuntimeError(
-                            "SM70 grouped QPN8 input must end in [groups, K], got "
-                            f"{tuple(x.shape)} for groups={group_count}."
-                        )
-                    x_grouped = x.reshape(-1, group_count, x.shape[-1])
-                    x_by_group = x_grouped.transpose(0, 1).contiguous()
-                    out_by_group = torch.empty(
-                        (group_count, x_grouped.shape[0], output_size),
-                        device=x.device,
-                        dtype=x.dtype,
-                    )
-                    if x_grouped.shape[0] == 0:
-                        return out_by_group.transpose(0, 1).reshape(
-                            *x.shape[:-2], group_count, output_size
-                        )
-                    for group_idx in range(group_count):
-                        sm70_ops.fp8_qpn8_dispatch_sm70_out(
-                            out_by_group[group_idx],
-                            int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
-                            x_by_group[group_idx],
-                            layer.weight[group_idx],
-                            layer.weight_scale_inv[group_idx],
-                            int(layer.sm70_fp8_qpn8_split_k),
-                            int(layer.sm70_fp8_qpn8_nacc),
-                            bool(layer.sm70_fp8_qpn8_prefetch),
-                            False,
-                        )
-                    out = out_by_group.transpose(0, 1).reshape(
-                        *x.shape[:-2], group_count, output_size
-                    )
-                    if bias is not None:
-                        out.add_(bias.view(group_count, output_size))
-                    return out
-
-                out_shape = (*x.shape[:-1], layer.output_size_per_partition)
-                x_2d = x.reshape(-1, x.shape[-1])
-                if x_2d.stride(-1) != 1:
-                    x_2d = x_2d.contiguous()
-                out_2d = torch.empty(
-                    (x_2d.shape[0], layer.output_size_per_partition),
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-                if x_2d.shape[0] == 0:
-                    return out_2d.reshape(out_shape)
-                sm70_ops.fp8_qpn8_dispatch_sm70_out(
-                    out_2d,
-                    int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
-                    x_2d,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    int(layer.sm70_fp8_qpn8_split_k),
-                    int(layer.sm70_fp8_qpn8_nacc),
-                    bool(layer.sm70_fp8_qpn8_prefetch),
-                    False,
-                )
-                out = out_2d.reshape(out_shape)
-                if bias is not None:
-                    out.add_(bias)
-                return out
-
             if getattr(layer, "sm70_fp8_bmm", False):
                 group_count = int(layer.sm70_fp8_bmm_groups)
                 output_size = int(layer.sm70_fp8_bmm_output_size)
@@ -1435,34 +773,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     device=x.device,
                     dtype=x.dtype,
                 )
-                if (
-                    getattr(layer, "sm70_fp8_bmm_grouped_decode", False)
-                    and x_grouped.shape[0] == 1
-                ):
-                    sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                        out_by_group.reshape(group_count, output_size),
-                        x_by_group.reshape(group_count, x.shape[-1]),
-                        layer.sm70_fp8_bmm_grouped_offsets,
-                        layer.sm70_fp8_bmm_grouped_ptrs_w,
-                        layer.sm70_fp8_bmm_grouped_ptrs_s,
-                        group_count,
-                        x.shape[-1],
-                        output_size,
+                for group_idx in range(group_count):
+                    sm70_ops.fp8_gemm_sm70_out(
+                        out_by_group[group_idx],
+                        x_by_group[group_idx],
+                        layer.weight[group_idx],
+                        layer.weight_scale_inv[group_idx],
                         128,
+                        layer.sm70_fp8_k_ld,
+                        layer.sm70_fp8_q_ld,
                         False,
                     )
-                else:
-                    for group_idx in range(group_count):
-                        sm70_ops.fp8_gemm_sm70_out(
-                            out_by_group[group_idx],
-                            x_by_group[group_idx],
-                            layer.weight[group_idx],
-                            layer.weight_scale_inv[group_idx],
-                            128,
-                            layer.sm70_fp8_k_ld,
-                            layer.sm70_fp8_q_ld,
-                            False,
-                        )
                 out = out_by_group.transpose(0, 1).reshape(
                     *x.shape[:-2], group_count, output_size
                 )
@@ -1482,42 +803,7 @@ class Fp8LinearMethod(LinearMethodBase):
             prefill_workspace_ptr = getattr(
                 layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", None
             )
-            prefill_prescaled_scales = getattr(
-                layer, "sm70_fp8_prefill_prescaled_scales", None
-            )
-            decode_prescaled_scales = getattr(
-                layer, "sm70_fp8_decode_prescaled_scales", None
-            )
-            prefill_min_m = getattr(
-                layer,
-                "sm70_fp8_prefill_exact_dense_min_m",
-                _SM70_FP8_PREFILL_DENSE_MIN_M,
-            )
-            visible_dense_out = _sm70_fp8_prefill_visible_dense_mm(
-                x_2d,
-                layer.weight,
-                layer.weight_scale_inv,
-                prefill_workspace_ptr,
-                gated_silu=False,
-                min_prefill_m=prefill_min_m,
-            )
-            if (
-                decode_prescaled_scales is not None
-                and envs.VLLM_SM70_FP8_PRESCALED_M1_DECODE
-                and x_2d.shape[0] == 1
-            ):
-                sm70_ops.fp8_gemm_sm70_prescaled_m1_out(
-                    out_2d,
-                    x_2d,
-                    layer.weight,
-                    decode_prescaled_scales,
-                    128,
-                    layer.sm70_fp8_k_ld,
-                    layer.sm70_fp8_q_ld,
-                )
-            elif visible_dense_out is not None:
-                out_2d = visible_dense_out
-            elif prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
+            if prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
                 sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
                     out_2d,
                     prefill_workspace_ptr,
@@ -1528,22 +814,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.sm70_fp8_k_ld,
                     layer.sm70_fp8_q_ld,
                     False,
-                    prefill_min_m,
-                )
-            elif (
-                prefill_prescaled_scales is not None
-                and envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
-                and envs.VLLM_SM70_FP8_PREFILL_PRESCALED
-                and x_2d.shape[0] == _SM70_FP8_EXACT_8K_PREFILL_M
-            ):
-                sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
-                    out_2d,
-                    x_2d,
-                    layer.weight,
-                    prefill_prescaled_scales,
-                    128,
-                    layer.sm70_fp8_k_ld,
-                    layer.sm70_fp8_q_ld,
+                    _SM70_FP8_PREFILL_DENSE_MIN_M,
                 )
             else:
                 sm70_ops.fp8_gemm_sm70_out(
@@ -1618,36 +889,6 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
     ) -> torch.Tensor | None:
-        if getattr(layer, "sm70_fp8_qpn8", False):
-            if not getattr(layer, "sm70_fp8_gated_silu", False):
-                return None
-            if x.dtype != torch.float16:
-                raise RuntimeError(
-                    "SM70 FP8 QPN8 gated-SiLU requires float16 activations, "
-                    f"got {x.dtype}."
-                )
-            x_2d = x.reshape(-1, x.shape[-1])
-            if x_2d.stride(-1) != 1:
-                x_2d = x_2d.contiguous()
-            out_features = layer.output_size_per_partition // 2
-            out_2d = torch.empty(
-                (x_2d.shape[0], out_features), device=x.device, dtype=x.dtype
-            )
-            if x_2d.shape[0] == 0:
-                return out_2d.reshape(*x.shape[:-1], out_features)
-            sm70_ops.fp8_qpn8_dispatch_sm70_out(
-                out_2d,
-                int(layer.sm70_fp8_prefill_exact_dense_workspace_ptr),
-                x_2d,
-                layer.weight,
-                layer.weight_scale_inv,
-                int(layer.sm70_fp8_qpn8_gated_split_k),
-                int(layer.sm70_fp8_qpn8_gated_nacc),
-                bool(layer.sm70_fp8_qpn8_gated_prefetch),
-                True,
-            )
-            return out_2d.reshape(*x.shape[:-1], out_features)
-
         if not getattr(layer, "sm70_fp8_gated_silu", False):
             return None
         if not getattr(layer, "sm70_fp8_turbomind", False):
@@ -1676,25 +917,6 @@ class Fp8LinearMethod(LinearMethodBase):
             layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", None
         )
         if prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
-            visible_dense_out = _sm70_fp8_prefill_visible_dense_mm(
-                x_2d,
-                weight,
-                scales,
-                prefill_workspace_ptr,
-                gated_silu=True,
-                min_prefill_m=getattr(
-                    layer,
-                    "sm70_fp8_prefill_exact_dense_min_m",
-                    _SM70_FP8_PREFILL_DENSE_MIN_M,
-                ),
-            )
-            if visible_dense_out is not None:
-                return visible_dense_out.reshape(*x.shape[:-1], out_features)
-            min_prefill_m = getattr(
-                layer,
-                "sm70_fp8_prefill_exact_dense_min_m",
-                _SM70_FP8_PREFILL_DENSE_MIN_M,
-            )
             sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
                 out_2d,
                 prefill_workspace_ptr,
@@ -1705,7 +927,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 k_ld,
                 q_ld,
                 True,
-                min_prefill_m,
+                _SM70_FP8_PREFILL_DENSE_MIN_M,
             )
             return out_2d.reshape(*x.shape[:-1], out_features)
         sm70_ops.fp8_gemm_sm70_out(

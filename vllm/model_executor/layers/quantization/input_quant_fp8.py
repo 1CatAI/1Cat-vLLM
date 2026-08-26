@@ -227,7 +227,9 @@ class QuantFP8(CustomOp):
             else:
                 x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
 
-            scale = (x_max / self.fp8_max).clamp(min=self.fp8_min_scaling_factor)
+            scale = (x_max / self.fp8_max).clamp(
+                min=self.fp8_min_scaling_factor
+            )
         else:
             scale = prep_scale_for_group_broadcast(scale, x, self.group_shape)
 

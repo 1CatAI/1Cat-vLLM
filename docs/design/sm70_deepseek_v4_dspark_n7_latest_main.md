@@ -307,33 +307,6 @@ scoped greedy output remains byte-identical to control, and the quality prompt
 stops naturally after 76 coherent tokens. All task-owned services were stopped
 after validation.
 
-## M=8 Real-Expert Grouping Candidate
-
-The fixed 48 one-row grouped verifier still reloads the same expert weights
-when adjacent verifier rows select an overlapping expert. A default-off
-candidate compacts those rows into the real expert segments already produced
-on device, while retaining a fixed 48-entry graph contract. Empty tail groups
-remain device-visible zero-row entries, so the route adds no host readback.
-TurboMind keeps the single-group dispatch tactic but uses its ordinary
-device-offset scheduler for the variable row bounds.
-
-An exclusively owned V100 CUDA Graph gate covered mixed overlap, 48 distinct
-experts, and six hot experts. W13, activation, sorted W2 output, final output,
-and changed-route replay were bitwise identical to the admitted slot-grouped
-route in every case:
-
-| M=8 route distribution | Slot-grouped | Real-expert grouped | 43-layer projection |
-|---|---:|---:|---:|
-| Mixed, 34 unique experts | 0.42345 ms | 0.30437 ms | -5.120 ms |
-| 48 unique experts | 0.42407 ms | 0.43113 ms | +0.304 ms |
-| Six experts with eight rows each | 0.42183 ms | 0.15401 ms | -11.516 ms |
-
-The source gate released its GPU after completion. The route remains behind
-`VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS=1` until a synchronized TP8
-full-model profile proves that production routing overlap transfers the mixed
-microbenchmark saving and the paired acceptance/quality gates pass. Evidence
-is retained under `/data/models/dsv4-verifier-20ms-expert-grouped-m8-r2`.
-
 ## Experiment Log
 
 | Date | Source | Test | Result | Decision |
@@ -367,7 +340,6 @@ is retained under `/data/models/dsv4-verifier-20ms-expert-grouped-m8-r2`.
 | 2026-08-03 | candidate | Exact-selector seeds 4210-4219 | TPOT 31.282 -> 25.533 ms; emitted/chunk +4.0% | Accept speed and acceptance gates |
 | 2026-08-03 | candidate | Greedy equality and natural stop | 256-token SHA256 equal; coherent 71-token stop | Accept quality gate and enable by default |
 | 2026-08-03 | candidate | Scoped-policy full-model smoke | Target 32.426 ms; matched emitted/chunk -0.23%; greedy equal; natural stop | Accept final scoped selector |
-| 2026-08-24 | candidate | Real-expert-grouped M=8 CUDA Graph gate | Three route distributions bitwise; mixed projects -5.120 ms/43 layers; distinct-48 projects +0.304 ms | Admit only to matched TP8 profile and quality gate |
 
 ## Artifacts
 

@@ -15,7 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     TransferJob,
 )
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -73,10 +73,6 @@ class GroupOffloadConfig(NamedTuple):
     # than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_block_count: int | None = None
-    # Mamba ``align`` tables mutate existing logical positions. Such groups
-    # must be stored from exact core-provided boundary block IDs instead of the
-    # connector's append-only positional mirror.
-    requires_exact_boundary_source: bool = False
 
 
 def get_sliding_window_size_in_blocks(
@@ -92,24 +88,6 @@ def get_sliding_window_size_in_blocks(
 
     assert isinstance(kv_cache_spec, FullAttentionSpec)
     return None
-
-
-def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
-    """Scan all KV cache groups in *spec* and return the single mamba alignment
-    size, or None if no group requires mamba alignment.
-
-    For MambaSpec groups in "align" cache mode the hit window must be rounded
-    down to a multiple of the offloaded block size. Asserts that all such
-    groups agree on the same value.
-    """
-    mamba_align_size: int | None = None
-    for idx, gpu_block_size in enumerate(spec.gpu_block_size):
-        kv_spec = spec.kv_cache_config.kv_cache_groups[idx].kv_cache_spec
-        if isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align":
-            offload_block_size = gpu_block_size * spec.block_size_factor
-            assert mamba_align_size is None or mamba_align_size == offload_block_size
-            mamba_align_size = offload_block_size
-    return mamba_align_size
 
 
 class SchedulerOffloadConfig(NamedTuple):
@@ -155,12 +133,6 @@ class SchedulerOffloadConfig(NamedTuple):
                 return None
             return per_segment
 
-        def _requires_exact_boundary_source(group_idx: int) -> bool:
-            kv_spec = spec.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
-            return (
-                isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align"
-            )
-
         return cls(
             num_workers=spec.vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
@@ -180,9 +152,6 @@ class SchedulerOffloadConfig(NamedTuple):
                     ),
                     alignment_block_count=_alignment_block_count(
                         gpu_block_size * spec.block_size_factor, sw
-                    ),
-                    requires_exact_boundary_source=(
-                        _requires_exact_boundary_source(idx)
                     ),
                 )
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
@@ -313,7 +282,6 @@ class OffloadingConnectorScheduler:
         # used by _lookup
         self._sliding_window_groups: tuple[int, ...] = tuple(sliding_window_groups)
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
-        self._mamba_align_size: int | None = resolve_mamba_align_size(spec)
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -344,10 +312,7 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
-        # Registration is idempotent because each block maps to a set of job IDs.
-        # MTP lookahead may report the same physical block ID more than once, so
-        # completion must use the same set semantics instead of removing twice.
-        for bid in set(block_ids or ()):
+        for bid in block_ids or ():
             pending = self._block_id_to_pending_jobs[bid]
             pending.remove(job_id)
             if not pending:
@@ -433,11 +398,6 @@ class OffloadingConnectorScheduler:
             # for sliding window attention, we must reduce by 1 to make sure
             # we still have a hit after reduction
             max_hit_size_tokens -= 1
-            if self._mamba_align_size is not None:
-                # Constrain hit-window to the mamba block size.
-                max_hit_size_tokens = round_down(
-                    max_hit_size_tokens, self._mamba_align_size
-                )
         num_hit_tokens: int = 0
         defer_lookup = False
         lookup_groups = self._lookup_groups
@@ -767,8 +727,6 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
-                if group_config.requires_exact_boundary_source:
-                    continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
                 start_block_idx = group_state.next_stored_block_idx
                 if num_blocks <= start_block_idx:
@@ -837,10 +795,6 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
-                if group_config.requires_exact_boundary_source:
-                    group_sizes.append(0)
-                    block_indices.append(0)
-                    continue
                 is_sliding_window = (
                     group_config.sliding_window_size_in_blocks is not None
                 )
@@ -918,99 +872,6 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
-    def _build_boundary_state_store_jobs(
-        self,
-        scheduler_output: SchedulerOutput,
-    ) -> dict[int, TransferJob]:
-        """Build stores from exact committed Mamba boundary-state blocks."""
-        handoffs = scheduler_output.boundary_state_offloads
-        if not handoffs:
-            return {}
-
-        store_jobs: dict[int, TransferJob] = {}
-        num_groups = len(self.config.kv_group_configs)
-        for req_id, entries in handoffs.items():
-            req_status = self._req_status.get(req_id)
-            if req_status is None:
-                continue
-            req_status.update_offload_keys()
-            req = req_status.req
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            num_offloadable_tokens = min(
-                req.num_computed_tokens + num_scheduled_tokens,
-                req.num_tokens,
-            )
-            if req_status.max_offload_tokens is not None:
-                num_offloadable_tokens = min(
-                    num_offloadable_tokens, req_status.max_offload_tokens
-                )
-            if self.config.offload_prompt_only:
-                num_offloadable_tokens = min(
-                    num_offloadable_tokens, req.num_prompt_tokens
-                )
-
-            for group_idx, block_id, boundary_tokens in entries:
-                group_config = self.config.kv_group_configs[group_idx]
-                if not group_config.requires_exact_boundary_source:
-                    continue
-                if (
-                    block_id == 0
-                    or boundary_tokens > num_offloadable_tokens
-                    or boundary_tokens % group_config.offloaded_block_size != 0
-                ):
-                    continue
-
-                offload_block_idx = (
-                    boundary_tokens // group_config.offloaded_block_size - 1
-                )
-                group_state = req_status.group_states[group_idx]
-                if offload_block_idx >= len(group_state.offload_keys):
-                    continue
-                offload_key = group_state.offload_keys[offload_block_idx]
-                store_output = self.manager.prepare_store(
-                    [offload_key], req_status.req_context
-                )
-                if store_output is None:
-                    logger.warning(
-                        "Request %s: cannot store Mamba boundary at %d tokens",
-                        req_id,
-                        boundary_tokens,
-                    )
-                    continue
-                keys_to_store = set(store_output.keys_to_store)
-                if not keys_to_store:
-                    continue
-                assert keys_to_store == {offload_key}
-
-                job_id = self._generate_job_id()
-                req_status.transfer_jobs.add(job_id)
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
-                self._jobs[job_id] = TransferJobStatus(
-                    req_id=req_id,
-                    pending_count=self.config.num_workers,
-                    keys=keys_to_store,
-                    is_store=True,
-                    sliding_window_block_ids=[block_id],
-                )
-
-                group_sizes = [0] * num_groups
-                group_sizes[group_idx] = 1
-                block_indices = [0] * num_groups
-                block_indices[group_idx] = (
-                    boundary_tokens // group_config.gpu_block_size - 1
-                )
-                src_spec = GPULoadStoreSpec(
-                    [block_id],
-                    group_sizes=group_sizes,
-                    block_indices=block_indices,
-                )
-                store_jobs[job_id] = TransferJob(
-                    req_id=req_id,
-                    transfer_spec=(src_spec, store_output.store_spec),
-                )
-
-        return store_jobs
-
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1030,11 +891,9 @@ class OffloadingConnectorScheduler:
         ):
             self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
-        boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)
-        normal_store_jobs = self._build_store_jobs(scheduler_output)
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=boundary_store_jobs | normal_store_jobs,
+            store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
         self._current_batch_load_jobs = {}

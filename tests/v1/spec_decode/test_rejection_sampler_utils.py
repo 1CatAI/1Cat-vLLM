@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-    dflash2_sparse_topk_rejection_sample,
     rejection_sample,
 )
 
@@ -128,130 +127,6 @@ def _assert_distribution_match(
         f"df={df}, threshold={threshold:.1f}. "
         f"Output distribution does not match target distribution."
     )
-
-
-@pytest.mark.parametrize("num_speculative_steps", [3, 7])
-@pytest.mark.parametrize("top_p", [1.0, 0.95])
-def test_dflash2_sparse_topk_matches_dense_rejection(
-    num_speculative_steps: int,
-    top_p: float,
-):
-    """Compact p/q support must preserve the dense DFlash2 decision path."""
-    torch.manual_seed(20260823)
-    device = torch.device("cuda")
-    num_reqs = 4
-    target_top_k = 20
-    draft_top_k = 16
-    rows_per_req = num_speculative_steps + 1
-    num_logits = num_reqs * rows_per_req
-
-    # Unique logits avoid making the reference depend on unspecified top-k
-    # ordering for equal FP16 values. Adversarial tie behavior is a separate
-    # candidate-set policy gate rather than a rejection-kernel property.
-    target_topk_ids = torch.stack(
-        [
-            torch.randperm(VOCAB_SIZE, device=device)[:target_top_k]
-            for _ in range(num_logits)
-        ]
-    )
-    target_topk_logits = (
-        torch.randn(num_logits, target_top_k, device=device)
-        .sort(dim=-1, descending=True)
-        .values
-        + torch.arange(target_top_k, device=device).flip(0) * 1e-3
-    )
-    target_dense = torch.full(
-        (num_logits, VOCAB_SIZE),
-        -float("inf"),
-        dtype=torch.float32,
-        device=device,
-    )
-    target_dense.scatter_(1, target_topk_ids, target_topk_logits)
-
-    top_k_tensor = torch.full(
-        (num_logits,), target_top_k, dtype=torch.int32, device=device
-    )
-    top_p_rows = torch.full((num_logits,), top_p, dtype=torch.float32, device=device)
-    from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
-
-    processed_target = apply_top_k_top_p(target_dense.clone(), top_k_tensor, top_p_rows)
-
-    draft_topk_ids = torch.stack(
-        [
-            torch.stack(
-                [
-                    torch.randperm(VOCAB_SIZE, device=device)[:draft_top_k]
-                    for _ in range(num_speculative_steps)
-                ]
-            )
-            for _ in range(num_reqs)
-        ]
-    )
-    draft_topk_logits = torch.randn(
-        num_reqs,
-        num_speculative_steps,
-        draft_top_k,
-        dtype=torch.float32,
-        device=device,
-    )
-    draft_dense = torch.full(
-        (num_reqs, num_speculative_steps, VOCAB_SIZE),
-        -float("inf"),
-        dtype=torch.float32,
-        device=device,
-    )
-    draft_dense.scatter_(2, draft_topk_ids, draft_topk_logits)
-
-    draft_sampled_2d = torch.zeros(
-        num_reqs, rows_per_req, dtype=torch.int64, device=device
-    )
-    draft_sampled_2d[:, 1:] = draft_topk_ids[:, :, 0]
-    draft_sampled = draft_sampled_2d.reshape(-1)
-    cu_num_logits = (
-        torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * rows_per_req
-    )
-    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
-    expanded_idx_mapping = idx_mapping.repeat_interleave(rows_per_req)
-    expanded_local_pos = torch.arange(
-        rows_per_req, dtype=torch.int32, device=device
-    ).repeat(num_reqs)
-    pos = torch.arange(num_logits, dtype=torch.int64, device=device) + 8192
-    temperature = torch.ones(num_reqs, dtype=torch.float32, device=device)
-    top_p_per_req = torch.full((num_reqs,), top_p, dtype=torch.float32, device=device)
-    seeds = torch.arange(101, 101 + num_reqs, dtype=torch.int64, device=device)
-
-    dense_sampled, dense_num_sampled = rejection_sample(
-        processed_target,
-        draft_dense,
-        draft_sampled,
-        cu_num_logits,
-        pos,
-        idx_mapping,
-        expanded_idx_mapping,
-        expanded_local_pos,
-        temperature,
-        seeds,
-        num_speculative_steps,
-    )
-    sparse_sampled, sparse_num_sampled = dflash2_sparse_topk_rejection_sample(
-        target_topk_ids,
-        target_topk_logits,
-        draft_topk_ids,
-        draft_topk_logits,
-        draft_sampled,
-        cu_num_logits,
-        pos,
-        idx_mapping,
-        temperature,
-        top_p_per_req,
-        seeds,
-        num_speculative_steps,
-    )
-
-    assert torch.equal(sparse_num_sampled, dense_num_sampled)
-    steps = torch.arange(rows_per_req, device=device).unsqueeze(0)
-    valid = steps < dense_num_sampled.unsqueeze(1)
-    assert torch.equal(sparse_sampled[valid], dense_sampled[valid])
 
 
 @pytest.mark.parametrize(

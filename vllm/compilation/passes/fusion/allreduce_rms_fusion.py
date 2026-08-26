@@ -442,89 +442,6 @@ def _sm70_ar_gemma_rms_match(match: pm.Match) -> bool:
     return False
 
 
-def _sm70_tp4_fusion_diagnostic(graph: fx.Graph) -> str:
-    """Summarize real post-grad users when the fail-closed pattern misses."""
-    all_reduces: list[fx.Node] = []
-    direct_users: dict[str, int] = {}
-    for node in graph.nodes:
-        if node.target != _ALL_REDUCE_OP:
-            continue
-        value = node.meta.get("val")
-        if value is None or value.dim() != 2 or value.shape[-1] != 5120:
-            continue
-        all_reduces.append(node)
-        for user in node.users:
-            target = str(user.target)
-            direct_users[target] = direct_users.get(target, 0) + 1
-
-    traces: list[str] = []
-    for root in all_reduces:
-        queue: list[tuple[fx.Node, int]] = [(root, 0)]
-        seen = {root}
-        trace_nodes: list[tuple[fx.Node, int]] = []
-        while queue and len(trace_nodes) < 32:
-            node, depth = queue.pop(0)
-            trace_nodes.append((node, depth))
-            if depth == 10:
-                continue
-            for user in node.users:
-                if user not in seen:
-                    seen.add(user)
-                    queue.append((user, depth + 1))
-        targets = " ".join(str(node.target) for node, _ in trace_nodes)
-        if "mean" not in targets and "rsqrt" not in targets and "rms" not in targets:
-            continue
-        lines = []
-        for node, depth in trace_nodes:
-            value = node.meta.get("val")
-            shape = getattr(value, "shape", None)
-            dtype = getattr(value, "dtype", None)
-            lines.append(
-                f"{depth}:{node.name}:{node.target}:shape={shape}:dtype={dtype}:"
-                f"args={node.args}:kwargs={node.kwargs}"
-            )
-        traces.append("\n".join(lines))
-        if len(traces) == 4:
-            break
-
-    return (
-        f"all_reduce_f16_5120={len(all_reduces)}; "
-        f"direct_users={direct_users}; candidate_traces=\n" + "\n---\n".join(traces)
-    )
-
-
-def _sm70_tp4_expected_graph_matches(graph: fx.Graph) -> int:
-    """Count supported FP32-residual boundaries in one post-grad graph."""
-    count = 0
-    for node in graph.nodes:
-        if (
-            node.target
-            != torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm.default
-        ):
-            continue
-        reduced = node.args[0]
-        residual = node.args[1]
-        if not isinstance(reduced, fx.Node) or reduced.target != _ALL_REDUCE_OP:
-            continue
-        if not isinstance(residual, fx.Node):
-            continue
-        residual_value = residual.meta.get("val")
-        if residual_value is None or residual_value.dtype != torch.float32:
-            continue
-        input_node = reduced.args[0]
-        if not isinstance(input_node, fx.Node):
-            continue
-        value = input_node.meta.get("val")
-        if (
-            value is not None
-            and value.dtype == torch.float16
-            and value.dim() == 2
-            and value.shape[-1] == 5120
-        ):
-            count += 1
-    return count
-
-
 class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
     def __init__(
         self,
@@ -569,73 +486,6 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
             weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             return torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm(
-                input,
-                residual,
-                weight,
-                self.epsilon,
-                group_name=self.group_name,
-            )
-
-        pm.register_replacement(
-            pattern,
-            replacement,
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-            extra_check=_sm70_ar_gemma_rms_match,
-        )
-
-        first_return_only = lambda fn: lambda a, b, c: fn(a, b, c)[0]
-        pm.register_replacement(
-            first_return_only(pattern),  # type: ignore[no-untyped-call]
-            first_return_only(replacement),  # type: ignore[no-untyped-call]
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-            extra_check=_sm70_ar_gemma_rms_match,
-        )
-
-
-class Sm70Tp4LongPrefillFusedNormPattern(BasePattern):
-    """Fuse TP4 AR plus the accepted opaque mixed-dtype Gemma norm."""
-
-    def __init__(
-        self,
-        epsilon: float,
-        dtype: torch.dtype,
-        device: str | None,
-    ) -> None:
-        super().__init__(dtype, device)
-        self.epsilon = epsilon
-        self.group_name = get_tp_group().unique_name
-
-    def get_inputs(self) -> list[torch.Tensor]:
-        return [
-            self.empty_f32(5, 5120),
-            self.empty(5, 5120),
-            self.empty(5120),
-        ]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            residual: torch.Tensor,
-            input: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            reduced = tensor_model_parallel_all_reduce(input)
-            return torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm(
-                reduced,
-                residual,
-                weight,
-                self.epsilon,
-            )
-
-        def replacement(
-            residual: torch.Tensor,
-            input: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return torch.ops.vllm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
                 input,
                 residual,
                 weight,
@@ -1024,7 +874,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.hidden_dim = config.model_config.get_hidden_size()
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
-        self.rank = rank
         sm70_common = (
             self.hidden_dim == 5120
             and self.model_dtype == torch.float16
@@ -1033,20 +882,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.sm70_tp2_mode = (
             envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION and self.tp_size == 2 and sm70_common
         )
-        self.sm70_tp4_long_mode = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-            and self.tp_size == 4
-            and sm70_common
-            and config.parallel_config.pipeline_parallel_size == 1
-            and config.speculative_config is None
-        )
-        self.sm70_tp4_model_expected_patterns = (
-            2 * config.model_config.get_num_layers(config.parallel_config) - 1
-            if self.sm70_tp4_long_mode
-            else 0
-        )
-        self.sm70_tp4_total_matches = 0
-        self.sm70_mode = self.sm70_tp2_mode or self.sm70_tp4_long_mode
+        self.sm70_mode = self.sm70_tp2_mode
         if self.sm70_mode:
             device_comm = get_tp_group().device_communicator
             ca_comm = (
@@ -1057,25 +893,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
                     "SM70 TP%d allreduce-Gemma-RMS fusion requires active custom AR.",
                     self.tp_size,
                 )
-                return
-            if self.sm70_tp4_long_mode and ca_comm.long_prefill_output_ptrs is None:
-                logger.warning_once(
-                    "SM70 TP4 long-prefill collective-norm buffers are unavailable."
-                )
-                return
-            if self.sm70_tp4_long_mode and not hasattr(
-                torch.ops.vllm,
-                "sm70_gemma_long_prefill_fused_add_rms_norm",
-            ):
-                logger.warning_once(
-                    "SM70 long-prefill Gemma norm op is unavailable for TP4 fusion."
-                )
-                return
-            if self.sm70_tp4_long_mode and not hasattr(
-                torch.ops.vllm,
-                "sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather",
-            ):
-                logger.warning_once("SM70 TP4 fused collective-norm op is unavailable.")
                 return
             self.max_token_num = config.scheduler_config.max_num_batched_tokens
             self.register_sm70_patterns()
@@ -1151,14 +968,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
 
     @enable_fake_mode
     def register_sm70_patterns(self) -> None:
-        if self.sm70_tp4_long_mode:
-            Sm70Tp4LongPrefillFusedNormPattern(
-                1e-6,
-                self.model_dtype,
-                self.device,
-            ).register(self.patterns)
-            self.disabled = False
-            return
         for residual_dtype in (torch.float16, torch.float32):
             Sm70AllReduceGemmaRMSNormPattern(
                 1e-6,
@@ -1220,12 +1029,6 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         if self.disabled:
             logger.warning_once("AllReduce fusion pass is disabled.")
             return False
-        if getattr(self, "sm70_tp4_long_mode", False):
-            return bool(
-                compile_range.is_single_size()
-                and 8000 <= compile_range.start <= min(8192, self.max_token_num)
-                and compile_range.start % self.tp_size == 0
-            )
         return bool(compile_range.end <= self.max_token_num)
 
     @VllmInductorPass.time_and_log
@@ -1234,36 +1037,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             logger.debug("AllReduceFusionPass disabled")
             return
 
-        expected_graph_matches = (
-            _sm70_tp4_expected_graph_matches(graph) if self.sm70_tp4_long_mode else 0
-        )
         self.matched_count = self.patterns.apply(graph)
-        if self.sm70_tp4_long_mode and self.matched_count != expected_graph_matches:
-            if self.rank == 0:
-                logger.error(
-                    "SM70 TP4 fusion post-grad diagnostic:\n%s",
-                    _sm70_tp4_fusion_diagnostic(graph),
-                )
-            raise RuntimeError(
-                "SM70 TP4 long-prefill fused collective-norm requires a "
-                "complete residual chain in every piecewise graph: expected "
-                f"{expected_graph_matches} matches, got "
-                f"{self.matched_count}."
-            )
-        if self.sm70_tp4_long_mode:
-            self.sm70_tp4_total_matches += self.matched_count
-            if self.sm70_tp4_total_matches > self.sm70_tp4_model_expected_patterns:
-                raise RuntimeError(
-                    "SM70 TP4 long-prefill fused collective-norm exceeded the "
-                    "model residual-chain count: expected at most "
-                    f"{self.sm70_tp4_model_expected_patterns}, got "
-                    f"{self.sm70_tp4_total_matches}."
-                )
-            if self.sm70_tp4_total_matches == self.sm70_tp4_model_expected_patterns:
-                logger.info_once(
-                    "SM70 TP4 fused the complete %d-boundary model residual chain.",
-                    self.sm70_tp4_total_matches,
-                )
         logger.debug("Replaced %s patterns", self.matched_count)
         if getattr(self, "sm70_mode", False):
             logger.info(

@@ -192,7 +192,8 @@ class CUDAGraphWrapper:
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self.check_input_addresses = (
-            self.is_debugging_mode or envs.VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG
+            self.is_debugging_mode
+            or envs.VLLM_CUDAGRAPH_INPUT_ADDR_DEBUG
         )
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
 
@@ -210,7 +211,6 @@ class CUDAGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
-        self.semantic_variant_graph_pools: dict[int, Any] = {}
 
         CUDAGraphWrapper._all_instances.add(self)
 
@@ -264,20 +264,6 @@ class CUDAGraphWrapper:
 
     def clear_graphs(self) -> None:
         self.concrete_cudagraph_entries.clear()
-        self.semantic_variant_graph_pools.clear()
-
-    def _graph_pool_for_descriptor(self, batch_descriptor: BatchDescriptor) -> Any:
-        if batch_descriptor.graph_variant >= 0:
-            return self.graph_pool
-        # Negative variants are mutually exclusive semantic paths for an
-        # otherwise identical graph shape. They can replay in arbitrary order,
-        # so do not let a later capture reuse the default graph's intermediates.
-        graph_variant = batch_descriptor.graph_variant
-        if graph_variant not in self.semantic_variant_graph_pools:
-            self.semantic_variant_graph_pools[graph_variant] = (
-                current_platform.graph_pool_handle()
-            )
-        return self.semantic_variant_graph_pools[graph_variant]
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
         if not is_forward_context_available():
@@ -349,9 +335,8 @@ class CUDAGraphWrapper:
                         )
                     )
 
-                graph_pool = self._graph_pool_for_descriptor(entry.batch_descriptor)
-                if graph_pool is not None:
-                    set_graph_pool_id(graph_pool)
+                if self.graph_pool is not None:
+                    set_graph_pool_id(self.graph_pool)
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
 
@@ -362,7 +347,7 @@ class CUDAGraphWrapper:
                 # mind-exploding: carefully manage the reference and memory.
                 with torch.cuda.graph(
                     cudagraph,
-                    pool=graph_pool,
+                    pool=self.graph_pool,
                     stream=current_stream(),
                 ):
                     # `output` is managed by pytorch's cudagraph pool

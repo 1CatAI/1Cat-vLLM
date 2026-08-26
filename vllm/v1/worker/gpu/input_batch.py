@@ -84,14 +84,6 @@ class InputBatch:
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
 
-    # [num_reqs_after_padding] per-request prompt length for prefix-anchored
-    # sliding-window attention (optional).
-    prefix_anchor_lens: torch.Tensor | None = None
-    # CPU mask for requests whose scheduled chunk does not finish prefill.
-    # Model-specific runners may use this to omit work whose outputs cannot be
-    # consumed until a later chunk. None is equivalent to all False.
-    is_incomplete_prefilling_np: np.ndarray | None = None
-
     @classmethod
     def make_dummy(
         cls,

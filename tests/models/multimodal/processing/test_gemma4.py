@@ -10,7 +10,6 @@ from PIL import Image as PILImage
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
     Gemma4ImagePixelInputs,
-    _build_broadcast_additive_padding_mask,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -21,51 +20,6 @@ from ...utils import build_model_context
 
 # TODO: to be updated to "google/gemma-4-e2b-it" once the models are available
 GEMMA4_MODEL_ID = "google/gemma-4-E2B-it"
-
-
-def test_broadcast_additive_padding_mask_matches_bool_sdpa() -> None:
-    torch.manual_seed(0)
-    padding_positions = torch.tensor(
-        [[False, False, True, True], [False, False, False, True]]
-    )
-    additive_mask = _build_broadcast_additive_padding_mask(
-        padding_positions, torch.float32
-    )
-
-    assert additive_mask.shape == (2, 1, 1, 4)
-    assert additive_mask.dtype == torch.float32
-    assert torch.equal(additive_mask.isneginf(), padding_positions[:, None, None, :])
-
-    query = torch.randn(2, 2, 4, 8)
-    key = torch.randn(2, 2, 4, 8)
-    value = torch.randn(2, 2, 4, 8)
-    bool_mask = (~padding_positions)[:, None, None, :]
-
-    bool_output = torch.nn.functional.scaled_dot_product_attention(
-        query, key, value, attn_mask=bool_mask
-    )
-    additive_output = torch.nn.functional.scaled_dot_product_attention(
-        query, key, value, attn_mask=additive_mask
-    )
-    torch.testing.assert_close(additive_output, bool_output, rtol=0, atol=0)
-
-
-def test_broadcast_additive_padding_mask_without_padding_matches_none() -> None:
-    padding_positions = torch.zeros((1, 4), dtype=torch.bool)
-    additive_mask = _build_broadcast_additive_padding_mask(
-        padding_positions, torch.float32
-    )
-    query = torch.randn(1, 2, 4, 8)
-    key = torch.randn(1, 2, 4, 8)
-    value = torch.randn(1, 2, 4, 8)
-
-    unmasked_output = torch.nn.functional.scaled_dot_product_attention(
-        query, key, value
-    )
-    additive_output = torch.nn.functional.scaled_dot_product_attention(
-        query, key, value, attn_mask=additive_mask
-    )
-    torch.testing.assert_close(additive_output, unmasked_output, rtol=0, atol=0)
 
 
 def test_gemma4_image_schema_accepts_variable_patch_counts():

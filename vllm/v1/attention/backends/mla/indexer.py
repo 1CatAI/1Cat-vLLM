@@ -203,11 +203,6 @@ class DeepseekV32IndexerMetadata:
     # hacky way to access the data now, need to be in chunked meta
     seq_lens: torch.Tensor
     max_seq_len: int
-    # Decode seq_lens and the indexer KV cache use compressed positions for
-    # DeepSeek V4. Keep the matching host bound explicit: CUDA Graph capture
-    # needs a static logits width, but using the uncompressed attention bound
-    # launches 4x/128x too much work for C4/C128 layers.
-    compressed_max_seq_len: int
     slot_mapping: torch.Tensor
 
     # New for MLA (compared to FlashAttention)
@@ -632,9 +627,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         attn_metadata = DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
-            compressed_max_seq_len=max(
-                1, common_attn_metadata.max_seq_len // self.compress_ratio
-            ),
             slot_mapping=compressed_slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,

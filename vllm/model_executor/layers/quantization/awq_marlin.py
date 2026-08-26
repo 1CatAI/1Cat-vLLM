@@ -610,7 +610,9 @@ class AWQMarlinLinearMethod(LinearMethodBase):
                 torch.empty(0, dtype=tm_scales.dtype, device=tm_weight.device),
                 requires_grad=False,
             )
-            logger.info_once("SM70 AWQ TurboMind dense path enabled under AWQ Marlin.")
+            logger.info_once(
+                "SM70 AWQ TurboMind dense path enabled under AWQ Marlin."
+            )
             return
 
         # AWQ checkpoints use a non-standard packing order and pack qweight

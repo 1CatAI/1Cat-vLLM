@@ -4,19 +4,17 @@
 
 namespace vllm::sm70_tile_runtime {
 
-// Keep the default TileRT/all-reduce block limit unchanged.  The larger signal
-// capacity is reserved for long-prefill collective-fusion experiments that use
-// one cross-rank barrier per owned token.
+// Keep the default all-reduce block limit unchanged, but allow the
+// TileRT-style MLP down-proj path to publish one flag per TurboMind N tile.
 constexpr int kMaxBlocks = 64;
-constexpr int kMaxSignalBlocks = 512;
 constexpr int kMaxRanks = 8;
 
 using FlagType = uint32_t;
 
 struct Signal {
-  alignas(128) FlagType start[kMaxSignalBlocks][kMaxRanks];
-  alignas(128) FlagType end[kMaxSignalBlocks][kMaxRanks];
-  alignas(128) FlagType _flag[kMaxSignalBlocks];
+  alignas(128) FlagType start[kMaxBlocks][kMaxRanks];
+  alignas(128) FlagType end[kMaxBlocks][kMaxRanks];
+  alignas(128) FlagType _flag[kMaxBlocks];
 };
 
 struct __align__(16) RankData {
@@ -30,13 +28,14 @@ struct __align__(16) RankSignals {
 #if !defined(USE_ROCM)
 static __device__ __forceinline__ void store_flag_sys_visible(
     FlagType* flag_addr, FlagType flag) {
-  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag),
+  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;"
+               ::"r"(flag),
                "l"(flag_addr)
                : "memory");
 }
 
-static __device__ __forceinline__ FlagType
-load_flag_sys_visible(FlagType* flag_addr) {
+static __device__ __forceinline__ FlagType load_flag_sys_visible(
+    FlagType* flag_addr) {
   FlagType flag;
   asm volatile("ld.volatile.global.u32 %0, [%1]; membar.sys;"
                : "=r"(flag)

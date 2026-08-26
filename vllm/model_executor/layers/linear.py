@@ -64,9 +64,6 @@ def _maybe_sm70_dense_forward(
         return None
     if not hasattr(torch.ops._C, "sm70_f16_gemm"):
         return None
-    max_m = getattr(layer, "_sm70_f16_max_m", None)
-    if max_m is not None and x.numel() // x.shape[-1] > max_m:
-        return None
 
     if envs.VLLM_SM70_F16_DENSE_DEBUG or envs.VLLM_QWEN3_NEXT_SM70_TRACE:
         rows = x.numel() // x.shape[-1]
@@ -368,15 +365,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         if not current_platform.is_cuda_alike():
             return
-
-        if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
-            layer, "_sm70_dsv4_fp13_gemv", False
-        ):
-            from vllm.models.deepseek_v4.sm70.gemv import (
-                prepare_sm70_dsv4_fp13_gemv,
-            )
-
-            prepare_sm70_dsv4_fp13_gemv(layer)
 
         force_enable = getattr(layer, "_sm70_f16_force_enable", False)
         if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH and not force_enable:
@@ -1805,10 +1793,14 @@ class RowParallelLinear(LinearBase):
         if output is None:
             output_parallel = _maybe_sm70_dense_forward(self, input_parallel, bias_)
             if output_parallel is None:
-                output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias_
+                )
 
             if self.reduce_results and self.tp_size > 1:
-                output = _maybe_sm70_awq_mlp_down_tile_all_reduce(self, output_parallel)
+                output = _maybe_sm70_awq_mlp_down_tile_all_reduce(
+                    self, output_parallel
+                )
                 if output is None:
                     output = tensor_model_parallel_all_reduce(output_parallel)
             else:

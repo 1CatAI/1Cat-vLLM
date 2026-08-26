@@ -121,60 +121,6 @@ def test_precompiled_install_flags_are_orthogonal() -> None:
         assert environment_variables["VLLM_USE_PRECOMPILED_RUST"]() is False
 
 
-def test_sm70_concurrency_tuning_envs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    names = (
-        "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING",
-        "VLLM_SM70_TOPK_TOPP_8_WARPS",
-        "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
-    )
-    for name in names:
-        monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() is False
-        monkeypatch.setenv(name, "1")
-        assert environment_variables[name]() is True
-
-    name = "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS"
-    monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() is True
-    monkeypatch.setenv(name, "0")
-    assert environment_variables[name]() is False
-
-    name = "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4"
-    monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() is True
-    monkeypatch.setenv(name, "0")
-    assert environment_variables[name]() is False
-
-    name = "VLLM_SM70_FP8_PRESCALED_M1_DECODE"
-    monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() is True
-    monkeypatch.setenv(name, "0")
-    assert environment_variables[name]() is False
-
-    name = "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE"
-    monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() is True
-    monkeypatch.setenv(name, "0")
-    assert environment_variables[name]() is False
-
-    for name in (
-        "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE",
-        "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE",
-        "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE",
-    ):
-        monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() is True
-        monkeypatch.setenv(name, "0")
-        assert environment_variables[name]() is False
-
-    monkeypatch.delenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", raising=False)
-    assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 128
-    monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "640")
-    assert environment_variables["VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS"]() == 640
-
-
 def test_flash_v100_g6_sawtooth_pipeline_envs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -202,20 +148,6 @@ def test_flash_v100_g6_sawtooth_pipeline_envs(
         assert environment_variables[name]() == expected_int
         monkeypatch.setenv(name, str(expected_int + 1))
         assert environment_variables[name]() == expected_int + 1
-
-
-def test_flash_v100_e4m3_page800_fastpath_envs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    bool_defaults = {
-        "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": True,
-        "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": False,
-    }
-    for name, expected_bool in bool_defaults.items():
-        monkeypatch.delenv(name, raising=False)
-        assert environment_variables[name]() is expected_bool
-        monkeypatch.setenv(name, "0" if expected_bool else "1")
-        assert environment_variables[name]() is not expected_bool
 
 
 class TestEnvWithChoices:

@@ -306,9 +306,6 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     request.status = RequestStatus.RUNNING
     request.num_computed_tokens = request.num_tokens
     request.num_output_placeholders = 1
-    # This fixture calls update_from_output without schedule(); mirror the
-    # scheduled token that would normally be recorded by _update_after_schedule.
-    request.num_in_flight_tokens = 1
 
     scheduler.perf_metrics = None
     scheduler.connector = None

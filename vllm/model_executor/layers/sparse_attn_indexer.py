@@ -355,7 +355,7 @@ def sparse_attn_indexer(
                 padded_weights.reshape(num_padded_tokens, -1),
                 seq_lens,
                 decode_metadata.block_table,
-                attn_metadata_narrowed.compressed_max_seq_len,
+                attn_metadata_narrowed.max_seq_len,
             )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:
@@ -397,7 +397,7 @@ def sparse_attn_indexer(
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
-                logits.shape[1],
+                attn_metadata_narrowed.max_seq_len,
             )
         else:
             ops.top_k_per_row_decode(

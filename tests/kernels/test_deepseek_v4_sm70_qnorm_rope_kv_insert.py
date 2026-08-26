@@ -25,7 +25,10 @@ pytestmark = pytest.mark.skipif(
 def _make_cos_sin_cache(max_position: int, device: str) -> torch.Tensor:
     inv_freq = 1.0 / (
         10000.0
-        ** (torch.arange(0, ROPE_DIM, 2, dtype=torch.float32, device=device) / ROPE_DIM)
+        ** (
+            torch.arange(0, ROPE_DIM, 2, dtype=torch.float32, device=device)
+            / ROPE_DIM
+        )
     )
     positions = torch.arange(max_position, dtype=torch.float32, device=device)
     frequencies = torch.outer(positions, inv_freq)
@@ -117,45 +120,3 @@ def test_sm70_kv_rope_insert_is_repeatable_across_physical_blocks():
         torch.testing.assert_close(gathered, gathered_outputs[0], rtol=0, atol=0)
     for q_out in q_outputs[1:]:
         torch.testing.assert_close(q_out, q_outputs[0], rtol=0, atol=0)
-
-
-def test_sm70_tp4_fused_qnorm_kv_insert_matches_legacy(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    torch.manual_seed(20260826)
-    device = "cuda"
-    num_heads = 16
-    block_size = 256
-    block_stride = round_up(block_size * HEAD_BYTES, TOKEN_DATA_BYTES)
-    storage_shape = (3 * block_stride,)
-    q_input = torch.randn(1, num_heads, HEAD_DIM, dtype=torch.float16, device=device)
-    kv = torch.randn(1, HEAD_DIM, dtype=torch.float16, device=device)
-    positions = torch.tensor([1024], dtype=torch.int64, device=device)
-    slot_mapping = torch.tensor([block_size + 3], dtype=torch.int64, device=device)
-    cos_sin_cache = _make_cos_sin_cache(2048, device)
-
-    def run(enabled: bool) -> tuple[torch.Tensor, torch.Tensor]:
-        monkeypatch.setenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "1" if enabled else "0")
-        q = q_input.clone()
-        storage = torch.full(storage_shape, 0xA5, dtype=torch.uint8, device=device)
-        cache = storage.as_strided(
-            (3, block_size, HEAD_BYTES),
-            (block_stride, HEAD_BYTES, 1),
-        )
-        sm70_qnorm_rope_kv_fp8_insert(
-            q,
-            kv,
-            cache,
-            slot_mapping,
-            positions,
-            cos_sin_cache,
-            eps=1e-6,
-            block_size=block_size,
-        )
-        torch.accelerator.synchronize()
-        return q, storage
-
-    legacy_q, legacy_storage = run(False)
-    fused_q, fused_storage = run(True)
-    torch.testing.assert_close(fused_q, legacy_q, rtol=0, atol=0)
-    torch.testing.assert_close(fused_storage, legacy_storage, rtol=0, atol=0)

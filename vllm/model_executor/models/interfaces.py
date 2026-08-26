@@ -265,8 +265,6 @@ class SupportsMultiModal(Protocol):
         If `targets` is set, instead include descendants that are an instance
         of `targets`, even if they aren't direct children.
         """
-        from vllm.model_executor.offloader import get_offloader
-
         from .utils import StageMissingLayer, collect_children, no_init_weights
 
         if isinstance(modalities, str):
@@ -292,14 +290,6 @@ class SupportsMultiModal(Protocol):
                 yield
 
         self._tower_model_names = children_names
-        offloader = get_offloader()
-        for name in children_names:
-            if not name:
-                continue
-            tower = self.get_submodule(name)
-            wrapped = offloader.wrap_module(tower, parameter_prefix=name)
-            if wrapped is not tower:
-                self.set_submodule(name, wrapped)
 
     @contextmanager
     def _mark_composite_model(

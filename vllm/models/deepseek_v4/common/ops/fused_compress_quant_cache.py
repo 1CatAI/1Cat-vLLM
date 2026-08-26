@@ -30,148 +30,8 @@ from .fp8_software import fp32_to_fp8_e4m3fn_bits
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
-@triton.jit
-def _gather_compressor_window(
-    state_cache_ptr,
-    state_cache_stride0,
-    state_cache_stride1,
-    current_kv_ptr,
-    current_kv_stride,
-    current_score_ptr,
-    current_score_stride,
-    ape_ptr,
-    ape_stride,
-    block_table_ptr,
-    block_table_stride,
-    positions_ptr,
-    position,
-    token_idx,
-    req_idx,
-    block_size,
-    block,
-    mask,
-    HEAD_SIZE: tl.constexpr,
-    STATE_WIDTH: tl.constexpr,
-    COMPRESS_RATIO: tl.constexpr,
-    OVERLAP: tl.constexpr,
-    USE_PRIVATE_STATE: tl.constexpr,
-    USE_DENSE_PRIVATE_STATE: tl.constexpr,
-    RING_SIZE: tl.constexpr,
-    PRIVATE_HISTORY_SIZE: tl.constexpr,
-):
-    """Gather a compression window from paged state or current input + ring."""
-    tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
-    pos = position - (1 + OVERLAP) * COMPRESS_RATIO + 1 + tokens
-    mask_pos = pos >= 0
-    head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
-
-    if USE_DENSE_PRIVATE_STATE:
-        current_start = position - token_idx
-        dense_rows = pos - current_start + PRIVATE_HISTORY_SIZE
-        row_base = (
-            state_cache_ptr
-            + req_idx.to(tl.int64) * state_cache_stride0
-            + dense_rows.to(tl.int64) * state_cache_stride1
-            + head_offset
-        )
-        combined_mask = mask_pos[:, None] & mask[None, :]
-        score = tl.load(
-            row_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=combined_mask,
-            other=float("-inf"),
-        )
-        kv = tl.load(
-            row_base[:, None] + block[None, :],
-            mask=combined_mask,
-            other=0.0,
-        )
-        return kv, score
-
-    if USE_PRIVATE_STATE:
-        # This route is gated to one request with contiguous positions.
-        current_start = position - token_idx
-        current_idx = pos - current_start
-        from_current = mask_pos & (current_idx >= 0)
-        from_history = mask_pos & (current_idx < 0)
-        current_mask = from_current[:, None] & mask[None, :]
-        history_mask = from_history[:, None] & mask[None, :]
-        offsets = head_offset[:, None] + block[None, :]
-
-        current_kv = tl.load(
-            current_kv_ptr
-            + current_idx[:, None].to(tl.int64) * current_kv_stride
-            + offsets,
-            mask=current_mask,
-            other=0.0,
-        ).to(tl.float32)
-        current_score = tl.load(
-            current_score_ptr
-            + current_idx[:, None].to(tl.int64) * current_score_stride
-            + offsets,
-            mask=current_mask,
-            other=0.0,
-        ).to(tl.float32)
-        ape = tl.load(
-            ape_ptr
-            + (pos % COMPRESS_RATIO)[:, None].to(tl.int64) * ape_stride
-            + offsets,
-            mask=current_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        safe_pos = tl.maximum(pos, 0)
-        ring_base = (
-            state_cache_ptr
-            + req_idx.to(tl.int64) * state_cache_stride0
-            + (safe_pos % RING_SIZE).to(tl.int64) * state_cache_stride1
-            + head_offset
-        )
-        history_kv = tl.load(
-            ring_base[:, None] + block[None, :],
-            mask=history_mask,
-            other=0.0,
-        )
-        history_score = tl.load(
-            ring_base[:, None] + STATE_WIDTH + block[None, :],
-            mask=history_mask,
-            other=float("-inf"),
-        )
-        kv = tl.where(current_mask, current_kv, history_kv)
-        score = tl.where(current_mask, current_score + ape, history_score)
-        return kv, score
-
-    block_indices = pos // block_size
-    block_numbers = tl.load(
-        block_table_ptr + req_idx * block_table_stride + block_indices,
-        mask=mask_pos,
-        other=0,
-    )
-    block_offsets = pos % block_size
-    row_base = (
-        state_cache_ptr
-        + block_numbers.to(tl.int64) * state_cache_stride0
-        + block_offsets * state_cache_stride1
-        + head_offset
-    )
-    combined_mask = mask_pos[:, None] & mask[None, :]
-    score = tl.load(
-        row_base[:, None] + STATE_WIDTH + block[None, :],
-        mask=combined_mask,
-        other=float("-inf"),
-    )
-    kv = tl.load(
-        row_base[:, None] + block[None, :],
-        mask=combined_mask,
-        other=0.0,
-    )
-    return kv, score
-
-
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
-    current_kv: torch.Tensor,
-    current_score: torch.Tensor,
-    ape: torch.Tensor,
     num_actual: int,
     token_to_req_indices: torch.Tensor,
     positions: torch.Tensor,
@@ -193,10 +53,6 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
-    use_private_state: bool = False,
-    use_dense_private_state: bool = False,
-    ring_size: int = 1,
-    private_history_size: int = 1,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -235,12 +91,6 @@ def compress_norm_rope_store_triton(
         kv_cache,
         k_cache_metadata.slot_mapping,
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
-        current_kv,
-        current_kv.stride(0),
-        current_score,
-        current_score.stride(0),
-        ape,
-        ape.stride(0),
         # constexprs
         HEAD_SIZE=head_dim,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
@@ -256,10 +106,6 @@ def compress_norm_rope_store_triton(
         USE_SOFTWARE_FP8=(
             current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
         ),
-        USE_PRIVATE_STATE=use_private_state,
-        USE_DENSE_PRIVATE_STATE=use_dense_private_state,
-        RING_SIZE=ring_size,
-        PRIVATE_HISTORY_SIZE=private_history_size,
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -291,13 +137,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
-    # current chunk (private-state path)
-    current_kv_ptr,
-    current_kv_stride,
-    current_score_ptr,
-    current_score_stride,
-    ape_ptr,
-    ape_stride,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -311,10 +150,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     USE_SOFTWARE_FP8: tl.constexpr,
-    USE_PRIVATE_STATE: tl.constexpr,
-    USE_DENSE_PRIVATE_STATE: tl.constexpr,
-    RING_SIZE: tl.constexpr,
-    PRIVATE_HISTORY_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -337,39 +172,47 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
 
     # ── Gather state cache entries ────────────────────────────────────
+    start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    pos = start + tokens
+    mask_pos = pos >= 0
+
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
+    block_offsets = pos % block_size
+    head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
     block = tl.arange(0, TRITON_BLOCK_SIZE)
     mask = block < HEAD_SIZE
-    kv, score = _gather_compressor_window(
-        state_cache_ptr,
-        state_cache_stride0,
-        state_cache_stride1,
-        current_kv_ptr,
-        current_kv_stride,
-        current_score_ptr,
-        current_score_stride,
-        ape_ptr,
-        ape_stride,
-        block_table_ptr,
-        block_table_stride,
-        positions_ptr,
-        position,
-        token_idx,
-        req_idx,
-        block_size,
-        block,
-        mask,
-        HEAD_SIZE,
-        STATE_WIDTH,
-        COMPRESS_RATIO,
-        OVERLAP,
-        USE_PRIVATE_STATE,
-        USE_DENSE_PRIVATE_STATE,
-        RING_SIZE,
-        PRIVATE_HISTORY_SIZE,
+    block_numbers_i64 = block_numbers.to(tl.int64)
+
+    # Precomputed row base shared by score and kv loads
+    row_base = (
+        state_cache_ptr
+        + block_numbers_i64 * state_cache_stride0
+        + block_offsets * state_cache_stride1
+        + head_offset
     )
 
+    combined_mask = mask_pos[:, None] & mask[None, :]
+
     # ── Softmax + weighted sum ───────────────────────────────────────
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
+    )
     score = tl.softmax(score, dim=0)
+
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -488,13 +331,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
-    # current chunk (private-state path)
-    current_kv_ptr,
-    current_kv_stride,
-    current_score_ptr,
-    current_score_stride,
-    ape_ptr,
-    ape_stride,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -508,10 +344,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
     USE_SOFTWARE_FP8: tl.constexpr,
-    USE_PRIVATE_STATE: tl.constexpr,
-    USE_DENSE_PRIVATE_STATE: tl.constexpr,
-    RING_SIZE: tl.constexpr,
-    PRIVATE_HISTORY_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -538,37 +370,45 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
 
     # ── Gather state cache entries ────────────────────────────────────
+    start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    pos = start + tokens
+    mask_pos = pos >= 0
+
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
+    block_offsets = pos % block_size
+    head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
     block = tl.arange(0, TRITON_BLOCK_SIZE)
     mask = block < HEAD_SIZE
-    kv, score = _gather_compressor_window(
-        state_cache_ptr,
-        state_cache_stride0,
-        state_cache_stride1,
-        current_kv_ptr,
-        current_kv_stride,
-        current_score_ptr,
-        current_score_stride,
-        ape_ptr,
-        ape_stride,
-        block_table_ptr,
-        block_table_stride,
-        positions_ptr,
-        position,
-        token_idx,
-        req_idx,
-        block_size,
-        block,
-        mask,
-        HEAD_SIZE,
-        STATE_WIDTH,
-        COMPRESS_RATIO,
-        OVERLAP,
-        USE_PRIVATE_STATE,
-        USE_DENSE_PRIVATE_STATE,
-        RING_SIZE,
-        PRIVATE_HISTORY_SIZE,
+    block_numbers_i64 = block_numbers.to(tl.int64)
+
+    row_base = (
+        state_cache_ptr
+        + block_numbers_i64 * state_cache_stride0
+        + block_offsets * state_cache_stride1
+        + head_offset
+    )
+
+    combined_mask = mask_pos[:, None] & mask[None, :]
+
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
     )
     score = tl.softmax(score, dim=0)
+
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -672,13 +512,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
-    # current chunk (private-state path)
-    current_kv_ptr,
-    current_kv_stride,
-    current_score_ptr,
-    current_score_stride,
-    ape_ptr,
-    ape_stride,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -692,10 +525,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
     USE_SOFTWARE_FP8: tl.constexpr,
-    USE_PRIVATE_STATE: tl.constexpr,
-    USE_DENSE_PRIVATE_STATE: tl.constexpr,
-    RING_SIZE: tl.constexpr,
-    PRIVATE_HISTORY_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 
@@ -724,37 +553,45 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
 
     # ── Gather state cache entries ────────────────────────────────────
+    start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
+    tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
+    pos = start + tokens
+    mask_pos = pos >= 0
+
+    block_indices = pos // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=mask_pos,
+        other=0,
+    )
+    block_offsets = pos % block_size
+    head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
+
     block = tl.arange(0, TRITON_BLOCK_SIZE)
     mask = block < HEAD_SIZE
-    kv, score = _gather_compressor_window(
-        state_cache_ptr,
-        state_cache_stride0,
-        state_cache_stride1,
-        current_kv_ptr,
-        current_kv_stride,
-        current_score_ptr,
-        current_score_stride,
-        ape_ptr,
-        ape_stride,
-        block_table_ptr,
-        block_table_stride,
-        positions_ptr,
-        position,
-        token_idx,
-        req_idx,
-        block_size,
-        block,
-        mask,
-        HEAD_SIZE,
-        STATE_WIDTH,
-        COMPRESS_RATIO,
-        OVERLAP,
-        USE_PRIVATE_STATE,
-        USE_DENSE_PRIVATE_STATE,
-        RING_SIZE,
-        PRIVATE_HISTORY_SIZE,
+    block_numbers_i64 = block_numbers.to(tl.int64)
+
+    row_base = (
+        state_cache_ptr
+        + block_numbers_i64 * state_cache_stride0
+        + block_offsets * state_cache_stride1
+        + head_offset
+    )
+
+    combined_mask = mask_pos[:, None] & mask[None, :]
+
+    score = tl.load(
+        row_base[:, None] + STATE_WIDTH + block[None, :],
+        mask=combined_mask,
+        other=float("-inf"),
     )
     score = tl.softmax(score, dim=0)
+
+    kv = tl.load(
+        row_base[:, None] + block[None, :],
+        mask=combined_mask,
+        other=0.0,
+    )
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 

@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-import math
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
-from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -54,8 +52,7 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash"]
-DFlashDDTreeModelTypes = Literal["dflash_ddtree"]
+DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
 DSparkModelTypes = Literal["dspark"]
 DDTreeBuildMode = Literal["best_first", "root_leaf", "spine_leaf"]
 EagleModelTypes = Literal[
@@ -64,7 +61,6 @@ EagleModelTypes = Literal[
     "extract_hidden_states",
     MTPModelTypes,
     DFlashModelTypes,
-    DFlashDDTreeModelTypes,
     DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
@@ -123,10 +119,6 @@ class SpeculativeConfig:
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
     backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
-    kv_cache_dtype: CacheDType | None = None
-    """KV cache dtype for the draft model. When ``None``, the draft inherits
-    the target cache dtype, except for SM70 DFlash with a quantized target,
-    which is resolved to ``auto`` during draft model loading."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""
@@ -158,11 +150,6 @@ class SpeculativeConfig:
     prompt_lookup_min: int | None = Field(default=None, ge=1)
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
-    ngram_assist: bool = False
-    """Try prompt-ngram lookup before DFlash2 draft generation. Full-width
-    ngram hits skip the DFlash2 query and selector while preserving its
-    context-KV state. Only valid with ``method='dflash'`` and a DFlash2
-    selector capability."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -299,20 +286,6 @@ class SpeculativeConfig:
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
 
-    dspark_confidence_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
-    """Conditional-acceptance threshold for DSpark prefix scheduling. A value
-    of zero keeps every proposed position. Positive values retain only the
-    leading positions whose calibrated confidence is at least the threshold."""
-
-    dspark_confidence_temperatures: list[float] | None = None
-    """Optional positive per-position temperatures applied to DSpark confidence
-    logits before prefix scheduling. The list must match num_speculative_tokens."""
-
-    dspark_max_verification_tokens: int | None = Field(default=None, ge=0)
-    """Optional cap on DSpark draft tokens submitted to target verification.
-    DSpark still generates the checkpoint's complete block; only a prefix is
-    scheduled, so values below the checkpoint block size remain lossless."""
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -334,7 +307,7 @@ class SpeculativeConfig:
                 "eagle3",
                 "extract_hidden_states",
             )
-            or self.use_dflash_family()
+            or self.use_dflash()
             or self.use_dspark()
         )
         factors.append(uses_aux_hidden_states)
@@ -670,22 +643,6 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
-        if self.ngram_assist:
-            if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
-                self.prompt_lookup_min = 5
-                self.prompt_lookup_max = 5
-            elif self.prompt_lookup_min is None:
-                self.prompt_lookup_min = self.prompt_lookup_max
-            elif self.prompt_lookup_max is None:
-                self.prompt_lookup_max = self.prompt_lookup_min
-            assert self.prompt_lookup_min is not None
-            assert self.prompt_lookup_max is not None
-            if self.prompt_lookup_min > self.prompt_lookup_max:
-                raise ValueError(
-                    f"prompt_lookup_min={self.prompt_lookup_min} must "
-                    f"be <= prompt_lookup_max={self.prompt_lookup_max}"
-                )
-
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
             if self.prompt_lookup_min is None and self.prompt_lookup_max is None:
@@ -762,9 +719,8 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
 
         else:
-            if not self.ngram_assist:
-                self.prompt_lookup_max = 0
-                self.prompt_lookup_min = 0
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
 
             if self.model is not None:
                 self.draft_model_config = ModelConfig(
@@ -792,7 +748,7 @@ class SpeculativeConfig:
                 # Automatically detect the method
                 if (
                     self.method in ("eagle", "eagle3")
-                    or self.use_dflash_family()
+                    or self.use_dflash()
                     or self.use_dspark()
                 ):
                     pass
@@ -832,7 +788,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3") or self.use_dflash_family():
+                if self.method in ("eagle", "eagle3") or self.use_dflash():
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -844,9 +800,7 @@ class SpeculativeConfig:
                     ):
                         pass
                     else:
-                        eagle_method = (
-                            "dflash" if self.use_dflash_family() else self.method
-                        )
+                        eagle_method = "dflash" if self.use_dflash() else self.method
                         eagle_config = EAGLEConfig(
                             self.draft_model_config.hf_config,
                             method=eagle_method,
@@ -861,7 +815,7 @@ class SpeculativeConfig:
                     draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
-                if self.use_dflash_family() or self.use_dspark():
+                if self.use_dflash() or self.use_dspark():
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -910,32 +864,6 @@ class SpeculativeConfig:
                             f"{self.num_speculative_tokens}. Smaller values "
                             "produce incorrect output."
                         )
-                    if (
-                        self.dspark_max_verification_tokens is not None
-                        and self.dspark_max_verification_tokens
-                        > self.num_speculative_tokens
-                    ):
-                        raise ValueError(
-                            "dspark_max_verification_tokens must be <= "
-                            f"num_speculative_tokens ({self.num_speculative_tokens}); "
-                            f"got {self.dspark_max_verification_tokens}."
-                        )
-                    temperatures = self.dspark_confidence_temperatures
-                    if temperatures is not None:
-                        if len(temperatures) != self.num_speculative_tokens:
-                            raise ValueError(
-                                "dspark_confidence_temperatures must have length "
-                                f"{self.num_speculative_tokens}; got {temperatures}."
-                            )
-                        if not all(
-                            math.isfinite(value) and value > 0.0
-                            for value in temperatures
-                        ):
-                            raise ValueError(
-                                "dspark_confidence_temperatures entries must be "
-                                f"finite and positive; got {temperatures}."
-                            )
-                    self._verify_dspark_final_stage_ownership()
 
                 if self.use_dflash_ddtree() and self.ddtree_budget is None:
                     self.ddtree_budget = self.num_speculative_tokens
@@ -958,48 +886,16 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config,
-                        self.draft_tensor_parallel_size,
-                        # The runner constructs the complete DSpark drafter on
-                        # the target model's final PP rank. It is local to that
-                        # stage rather than partitioned across target PP ranks.
-                        speculative_draft_pipeline_parallel_size=(
-                            1 if self.use_dspark() else None
-                        ),
+                        self.target_parallel_config, self.draft_tensor_parallel_size
                     )
                 )
         return self
-
-    def _verify_dspark_final_stage_ownership(self) -> None:
-        """Validate the layer contract for a final-stage-local drafter."""
-        from vllm.distributed.utils import get_pp_indices
-
-        pp_size = self.target_parallel_config.pipeline_parallel_size
-        num_layers = self.target_model_config.get_total_num_hidden_layers()
-        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
-        layer_ids = tuple(
-            getattr(
-                self.draft_model_config.hf_config,
-                "dspark_target_layer_ids",
-                (),
-            )
-        )
-        outside_last_stage = [
-            layer_id for layer_id in layer_ids if not last_start <= layer_id < last_end
-        ]
-        if not layer_ids or outside_last_stage:
-            raise ValueError(
-                "DSpark's final-stage-local drafter requires every "
-                "dspark_target_layer_id to belong to the final target pipeline "
-                f"stage [{last_start}, {last_end}); got {layer_ids}. Adjust "
-                "VLLM_PP_LAYER_PARTITION or the DSpark layer contract."
-            )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
             raise ImportError(
                 "Arctic Inference is required for suffix decoding. "
-                "Install via `pip install arctic-inference==0.2.0`."
+                "Install via `pip install arctic-inference==0.1.1`."
             )
         if self.num_speculative_tokens is None:
             # Suffix decoding decides the actual number of speculative tokens
@@ -1133,19 +1029,13 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
-        speculative_draft_pipeline_parallel_size: int | None = None,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
-        This is mostly a copy of the target parallel config, except the draft
-        tensor size and, for final-stage-local drafters, pipeline size.
+        This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=(
-                target_parallel_config.pipeline_parallel_size
-                if speculative_draft_pipeline_parallel_size is None
-                else speculative_draft_pipeline_parallel_size
-            ),
+            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -1185,13 +1075,6 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
-        if self.ngram_assist:
-            if not self.use_dflash():
-                raise ValueError("ngram_assist is only supported with method='dflash'.")
-            draft_hf_config = getattr(self.draft_model_config, "hf_config", None)
-            dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
-            if int(dflash_config.get("selector_top_k", 0) or 0) <= 0:
-                raise ValueError("ngram_assist requires DFlash2 selector capability.")
         if self.use_dflash_ddtree():
             if self.ddtree_budget is None:
                 self.ddtree_budget = self.num_speculative_tokens
@@ -1252,12 +1135,6 @@ class SpeculativeConfig:
         Calculate the maximum number of new slots that might be added to the batch
         when drafting.
         """
-        if self.use_dflash():
-            # MRV2 DFlash uses one bonus query followed by K mask queries. The
-            # scheduler already owns the target query slot, so K more slots
-            # must be available to the drafter.
-            return self.num_speculative_tokens
-
         slots_per_req = 0  # for serial non-draft-model methods, no change needed
         if self.parallel_drafting:
             # For parallel drafting, we need one new slot per 'masked' token
@@ -1287,27 +1164,15 @@ class SpeculativeConfig:
     def use_eagle(self) -> bool:
         return (
             self.method in ("eagle", "eagle3", "mtp")
-            or self.use_dflash_family()
+            or self.use_dflash()
             or self.use_dspark()
         )
 
-    def use_eagle_kv_cache(self) -> bool:
-        """Whether prefix hits need Eagle's final target-block recompute."""
-        # MRV2 DFlash caches its projected draft context KV alongside the
-        # target KV. It only needs target hidden states for the uncached suffix,
-        # so dropping an additional target block is both unnecessary and can
-        # eliminate all prefix hits when hybrid page unification makes blocks
-        # large. Keep DDTree and DSpark on their established V1 semantics.
-        return self.use_eagle() and not self.use_dflash()
-
     def use_dflash(self) -> bool:
-        return self.method == "dflash"
+        return self.method in get_args(DFlashModelTypes)
 
     def use_dflash_ddtree(self) -> bool:
         return self.method == "dflash_ddtree"
-
-    def use_dflash_family(self) -> bool:
-        return self.use_dflash() or self.use_dflash_ddtree()
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"

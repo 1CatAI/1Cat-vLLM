@@ -5,7 +5,6 @@ import numpy as np
 import pytest
 import torch
 
-import vllm.envs as envs
 from tests.v1.sample.utils import create_allowed_token_ids
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -24,30 +23,6 @@ DEVICES = [
     for i in range(1 if current_platform.device_count() == 1 else 2)
 ]
 MAX_NUM_PROMPT_TOKENS = 64
-
-
-def test_sm70_compact_topk20_metadata_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(envs, "VLLM_SM70_COMPACT_TOPK20_SAMPLER", True)
-    metadata = _create_default_sampling_metadata(
-        num_output_tokens=0,
-        batch_size=1,
-        vocab_size=VOCAB_SIZE,
-        device=torch.device("cpu"),
-    )
-    metadata.all_greedy = False
-    metadata.all_random = True
-    metadata.max_num_logprobs = None
-    metadata.top_k_cpu = (20,)
-    metadata.top_p_cpu = (0.95,)
-    metadata.temperature_cpu = (1.0,)
-
-    assert Sampler._sm70_compact_topk20_metadata_supported(metadata, "raw_logprobs")
-    metadata.top_k_cpu = (19,)
-    assert not Sampler._sm70_compact_topk20_metadata_supported(metadata, "raw_logprobs")
-    metadata.top_k_cpu = (20,)
-    assert not Sampler._sm70_compact_topk20_metadata_supported(
-        metadata, "processed_logits"
-    )
 
 
 def _create_fake_logits(batch_size: int, vocab_size: int) -> torch.Tensor:

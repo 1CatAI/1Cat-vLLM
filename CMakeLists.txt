@@ -396,10 +396,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_8.cu"
       "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
 
     set_gencode_flags_for_srcs(
@@ -711,44 +707,6 @@ define_extension_target(
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
-endif()
-
-# Keep the accepted SM70 chunked sampler in a separate wheel module so adding
-# it does not perturb the quality- and speed-frozen primary vllm._C module.
-if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
-  set(VLLM_SM70_SAMPLER_FRAGMENT_SRCS
-    "csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp"
-    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu")
-  set_gencode_flags_for_srcs(
-    SRCS "${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}"
-    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
-  define_extension_target(
-    _sm70_sampler_C
-    DESTINATION vllm
-    LANGUAGE CUDA
-    SOURCES ${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}
-    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES ${VLLM_GPU_ARCHES}
-    USE_SABI 3
-    WITH_SOABI)
-  set_target_properties(_sm70_sampler_C PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF
-    CUDA_STANDARD 17
-    CUDA_STANDARD_REQUIRED ON
-    CUDA_EXTENSIONS OFF)
-  target_compile_definitions(_sm70_sampler_C PRIVATE
-    TORCH_API_INCLUDE_EXTENSION_H
-    $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_HALF_OPERATORS__>
-    $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_HALF_CONVERSIONS__>
-    $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_BFLOAT16_CONVERSIONS__>
-    $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_HALF2_OPERATORS__>)
-  target_compile_options(_sm70_sampler_C PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-UNDEBUG>
-    $<$<COMPILE_LANGUAGE:CUDA>:-UNDEBUG;-lineinfo>)
-  target_link_libraries(_sm70_sampler_C PRIVATE
-    "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")

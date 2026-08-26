@@ -161,12 +161,12 @@ void sm70_all_reduce_gemma_rms_norm_impl(
                 "SM70 TP4 Gemma RMSNorm prototype residual must be float32.");
   } else {
     TORCH_CHECK(residual.scalar_type() == at::ScalarType::Half ||
-                    residual.scalar_type() == at::ScalarType::Float,
+                residual.scalar_type() == at::ScalarType::Float,
                 "SM70 Gemma RMSNorm prototype residual must be float16 or "
                 "float32.");
   }
   TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half ||
-                  weight.scalar_type() == at::ScalarType::Float,
+              weight.scalar_type() == at::ScalarType::Float,
               "SM70 Gemma RMSNorm prototype weight must be float16 or "
               "float32.");
   TORCH_CHECK_EQ(inp.dim(), 2);
@@ -176,9 +176,8 @@ void sm70_all_reduce_gemma_rms_norm_impl(
   TORCH_CHECK(normalized_out.sizes() == inp.sizes(),
               "SM70 Gemma RMSNorm prototype normalized_out shape must match "
               "inp.");
-  TORCH_CHECK(
-      residual_out.sizes() == inp.sizes(),
-      "SM70 Gemma RMSNorm prototype residual_out shape must match inp.");
+  TORCH_CHECK(residual_out.sizes() == inp.sizes(),
+              "SM70 Gemma RMSNorm prototype residual_out shape must match inp.");
   TORCH_CHECK_EQ(weight.dim(), 1);
   TORCH_CHECK_EQ(weight.numel(), kHiddenSize);
   TORCH_CHECK_EQ(residual.get_device(), inp.get_device());
@@ -278,83 +277,6 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
       reg_buffer_sz_bytes, epsilon);
 }
 
-void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
-    torch::Tensor& weight, torch::Tensor& normalized_out,
-    torch::Tensor& residual_out, fptr_t _reg_input_buffer,
-    fptr_t _reg_output_buffer, int64_t reg_buffer_sz_bytes, double epsilon) {
-  constexpr int64_t kWorldSize = 4;
-  constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
-  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
-
-  TORCH_CHECK_EQ(fa->world_size_, kWorldSize);
-  TORCH_CHECK(fa->fully_connected_);
-  TORCH_CHECK_EQ(inp.scalar_type(), at::ScalarType::Half);
-  TORCH_CHECK_EQ(residual.scalar_type(), at::ScalarType::Float);
-  TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half ||
-              weight.scalar_type() == at::ScalarType::Float);
-  TORCH_CHECK_EQ(normalized_out.scalar_type(), at::ScalarType::Half);
-  TORCH_CHECK_EQ(residual_out.scalar_type(), at::ScalarType::Float);
-  TORCH_CHECK_EQ(inp.dim(), 2);
-  TORCH_CHECK_EQ(inp.size(1), kHiddenSize);
-  TORCH_CHECK_EQ(inp.size(0) % kWorldSize, 0);
-  TORCH_CHECK_LE(inp.size(0) / kWorldSize,
-                 vllm::kSm70LongPrefillMaxTokensPerRank);
-  TORCH_CHECK(residual.sizes() == inp.sizes());
-  TORCH_CHECK(normalized_out.sizes() == inp.sizes());
-  TORCH_CHECK(residual_out.sizes() == inp.sizes());
-  TORCH_CHECK_EQ(weight.dim(), 1);
-  TORCH_CHECK_EQ(weight.numel(), kHiddenSize);
-  TORCH_CHECK_EQ(residual.get_device(), inp.get_device());
-  TORCH_CHECK_EQ(weight.get_device(), inp.get_device());
-  TORCH_CHECK_EQ(normalized_out.get_device(), inp.get_device());
-  TORCH_CHECK_EQ(residual_out.get_device(), inp.get_device());
-  TORCH_CHECK(inp.is_contiguous());
-  TORCH_CHECK(residual.is_contiguous());
-  TORCH_CHECK(weight.is_contiguous());
-  TORCH_CHECK(normalized_out.is_contiguous());
-  TORCH_CHECK(residual_out.is_contiguous());
-
-  auto* reg_input_buffer = reinterpret_cast<void*>(_reg_input_buffer);
-  auto* reg_output_buffer = reinterpret_cast<void*>(_reg_output_buffer);
-  const int64_t input_size = inp.numel() * inp.element_size();
-  TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
-  if (reg_input_buffer != nullptr) {
-    AT_CUDA_CHECK(cudaMemcpyAsync(reg_input_buffer, inp.data_ptr(), input_size,
-                                  cudaMemcpyDeviceToDevice, stream));
-  } else {
-    reg_input_buffer = inp.data_ptr();
-  }
-  if (reg_output_buffer == nullptr) {
-    reg_output_buffer = normalized_out.data_ptr();
-  }
-
-  auto* input_ptr = reinterpret_cast<half*>(reg_input_buffer);
-  auto* shared_output_ptr = reinterpret_cast<half*>(reg_output_buffer);
-  auto* residual_ptr = reinterpret_cast<const float*>(residual.data_ptr());
-  auto* residual_out_ptr = reinterpret_cast<float*>(residual_out.data_ptr());
-  const int num_tokens = static_cast<int>(inp.size(0));
-  const float epsilon_f = static_cast<float>(epsilon);
-  if (weight.scalar_type() == at::ScalarType::Float) {
-    fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, float>(
-        stream, input_ptr, shared_output_ptr, residual_ptr,
-        reinterpret_cast<const float*>(weight.data_ptr()), residual_out_ptr,
-        num_tokens, kHiddenSize, epsilon_f);
-  } else {
-    fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, half>(
-        stream, input_ptr, shared_output_ptr, residual_ptr,
-        reinterpret_cast<const half*>(weight.data_ptr()), residual_out_ptr,
-        num_tokens, kHiddenSize, epsilon_f);
-  }
-  if (_reg_output_buffer != 0) {
-    AT_CUDA_CHECK(cudaMemcpyAsync(normalized_out.data_ptr(), reg_output_buffer,
-                                  input_size, cudaMemcpyDeviceToDevice,
-                                  stream));
-  }
-}
-
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
@@ -385,17 +307,17 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
 
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
-      fa->allreduce_sum2<float>(
-          stream, reinterpret_cast<float*>(inp_a.data_ptr()),
-          reinterpret_cast<float*>(inp_b.data_ptr()),
-          reinterpret_cast<float*>(out.data_ptr()), out.numel());
+      fa->allreduce_sum2<float>(stream, reinterpret_cast<float*>(inp_a.data_ptr()),
+                                reinterpret_cast<float*>(inp_b.data_ptr()),
+                                reinterpret_cast<float*>(out.data_ptr()),
+                                out.numel());
       break;
     }
     case at::ScalarType::Half: {
-      fa->allreduce_sum2<half>(
-          stream, reinterpret_cast<half*>(inp_a.data_ptr()),
-          reinterpret_cast<half*>(inp_b.data_ptr()),
-          reinterpret_cast<half*>(out.data_ptr()), out.numel());
+      fa->allreduce_sum2<half>(stream, reinterpret_cast<half*>(inp_a.data_ptr()),
+                               reinterpret_cast<half*>(inp_b.data_ptr()),
+                               reinterpret_cast<half*>(out.data_ptr()),
+                               out.numel());
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -441,7 +363,8 @@ void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
 }
 
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
-                             fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes,
+                             fptr_t _reg_buffer,
+                             int64_t reg_buffer_sz_bytes,
                              int64_t tile_numel, int64_t engine_blocks,
                              int64_t compute_iters) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
@@ -489,7 +412,8 @@ void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
 void tile_runtime_all_reduce_engine(fptr_t _fa, torch::Tensor& inp,
                                     torch::Tensor& out, fptr_t _reg_buffer,
                                     int64_t reg_buffer_sz_bytes,
-                                    int64_t tile_numel, int64_t producer_blocks,
+                                    int64_t tile_numel,
+                                    int64_t producer_blocks,
                                     int64_t reducer_blocks,
                                     int64_t compute_iters) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
@@ -575,10 +499,6 @@ void dispose(fptr_t _fa) {
 
 int64_t meta_size() { return sizeof(vllm::Signal); }
 
-int64_t sm70_tp4_push_allreduce_buffer_size() {
-  return vllm::kSm70Tp4PushAllreduceBufferBytes;
-}
-
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
@@ -587,19 +507,6 @@ void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
     ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
   }
   fa->register_buffer(ipc_ptrs);
-}
-
-void register_sm70_tp4_push_allreduce_buffer(
-    fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
-  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
-  TORCH_CHECK_EQ(fake_ipc_ptrs.size(),
-                 static_cast<size_t>(vllm::kSm70Tp4PushAllreduceWorldSize));
-  TORCH_CHECK_EQ(fake_ipc_ptrs.size(), static_cast<size_t>(fa->world_size_));
-  void* ipc_ptrs[vllm::kSm70Tp4PushAllreduceWorldSize];
-  for (size_t peer = 0; peer < fake_ipc_ptrs.size(); ++peer) {
-    ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
-  }
-  fa->register_sm70_tp4_push_buffer(ipc_ptrs);
 }
 
 // Use vector<int64_t> to represent byte data for python binding compatibility.

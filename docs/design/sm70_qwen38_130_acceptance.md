@@ -131,28 +131,22 @@ issue, not an idle-GPU or missing graph-shape issue.
 ## Wheel And Compatibility
 
 - Wheel: `1cat_vllm-1.3.0-cp312-cp312-linux_x86_64.whl`.
-- Final release source: `6ada86ed64af6d1a7b3cb0f34df237fd86f06d48`.
-- SHA256: `2bdb14a9c44f83ee6a766d88ed0d85b11390d6f5d65747e8dbe80a8e2d5d63e0`
-  (68,764,308 bytes).
+- SHA256: `e4ffba3bf61e16dcba0eeeafac4036b7cead5abe047e4474ecacb7e5abb35da3`
+  (75,765,498 bytes).
 - A cloned environment imports vLLM 1.3.0 from site-packages with Torch
   2.10.0+cu128. `_moe_C.moe_permute_sort_workspace_size` is present.
 - The wheel contains `_C`, `_C_stable_libtorch`, `_moe_C`, Flash-V100,
   vLLM FA2, and `flash_qla_sm70_gdn_strided.so`.
 - A clean-cache MTP4 plus FP8-KV boundary run does not create
   `TORCH_EXTENSIONS_DIR`, proving FlashQLA does not invoke NVCC at runtime.
-- The final 2026-08-17 wheel uses source-controlled Python from the release
-  source above and the accepted SM70 native payload at source `383bbdd166`.
-  Every `.so` member and `vllm-rs` is byte-identical to that accepted payload;
-  the precompiled packaging path preserves both Flash-V100 and the SM70
-  FlashQLA extension. In an isolated Python 3.12 install, all native modules
-  and FlashQLA load successfully; the MTP mixed-batch guard and Flash-V100
-  policy suites pass 87 tests.
-- The accepted runtime evidence remains Qwen3.8-27B-FP8 TP4 with the `fp8`
-  shorthand resolving to E5M2. In both no-MTP and MTP4 lanes, repeated
-  fixed-seed greedy responses were byte-identical and official sampling
-  stopped naturally without replacement characters. MTP's first request may
-  still JIT Triton helper kernels; this is a cold-latency concern, not a
-  numerical-output difference.
+- The 2026-08-17 release candidate was packaged from the accepted SM70 build
+  at source `383bbdd166`, installed into a fresh Python 3.12 environment, and
+  served Qwen3.8-27B-FP8 TP4 with the `fp8` shorthand resolving to E5M2. In
+  both no-MTP and MTP4
+  lanes, repeated fixed-seed greedy responses were byte-identical and official
+  sampling stopped naturally without replacement characters. MTP's first
+  request may still JIT Triton helper kernels; this is a cold-latency concern,
+  not a numerical-output difference.
 - Qwen3.6-35B-A3B-AWQ TP2 final-wheel checks pass. Official 1K/256 and
   4K/1024 pure decode are 95.63 and 95.29 tok/s (10.457 and 10.494 ms TPOT),
   with complete, non-corrupted outputs and the TurboMind AWQ MoE route.

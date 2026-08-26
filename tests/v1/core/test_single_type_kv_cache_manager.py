@@ -14,14 +14,9 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
-    PrefixAnchoredSWAManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import (
-    ChunkedLocalAttentionSpec,
-    PrefixAnchoredSWASpec,
-    SlidingWindowSpec,
-)
+from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -486,103 +481,3 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
-
-
-def test_prefix_anchored_swa_remove_skipped_blocks_gap_range():
-    block_size = 4
-    spec = PrefixAnchoredSWASpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        decode_sliding_window=8,
-    )
-    block_pool = BlockPool(
-        num_gpu_blocks=2000, enable_caching=True, hash_block_size=block_size
-    )
-    manager = PrefixAnchoredSWAManager(
-        spec,
-        block_pool=block_pool,
-        enable_caching=True,
-        kv_cache_group_id=0,
-    )
-
-    null_block_id = block_pool.null_block.block_id
-    original_block_ids = list(range(1000, 1010))
-    block_table = [KVCacheBlock(id_) for id_ in original_block_ids]
-    manager.req_to_blocks["test"] = block_table
-
-    prefix_len = 16
-
-    # Without num_prompt_tokens, gap blocks are not evicted (full-attention
-    # default path).
-    manager.remove_skipped_blocks("test", 28)
-    assert [b.block_id for b in block_table] == original_block_ids
-
-    # Gap = block 4 only (tokens [16, 20) fall in the gap).
-    manager.remove_skipped_blocks("test", 28, num_prompt_tokens=prefix_len)
-    expected = original_block_ids.copy()
-    expected[4] = null_block_id
-    assert [b.block_id for b in block_table] == expected
-
-    # Window moves: blocks 5 and 6 also enter the gap; block 4 is already
-    # null and stays null.
-    manager.remove_skipped_blocks("test", 36, num_prompt_tokens=prefix_len)
-    expected[5] = null_block_id
-    expected[6] = null_block_id
-    assert [b.block_id for b in block_table] == expected
-
-    # Blocks holding the prefix and the live decode window are never touched.
-    assert [b.block_id for b in block_table[:4]] == original_block_ids[:4]
-    assert [b.block_id for b in block_table[7:]] == original_block_ids[7:]
-
-
-def test_prefix_anchored_swa_spec_merge():
-    def make_spec(window: int) -> PrefixAnchoredSWASpec:
-        return PrefixAnchoredSWASpec(
-            block_size=16,
-            num_kv_heads=2,
-            head_size=64,
-            dtype=torch.float16,
-            decode_sliding_window=window,
-        )
-
-    merged = PrefixAnchoredSWASpec.merge([make_spec(128), make_spec(128)])
-    assert isinstance(merged, PrefixAnchoredSWASpec)
-    assert merged.decode_sliding_window == 128
-    assert merged.block_size == 16
-    assert merged.num_kv_heads == 2
-    assert merged.head_size == 64
-    assert merged.head_size_v == 64
-    assert merged.dtype == torch.float16
-
-    with pytest.raises(AssertionError):
-        PrefixAnchoredSWASpec.merge([make_spec(128), make_spec(64)])
-
-
-def test_prefix_anchored_swa_manager_registered():
-    from vllm.v1.core.single_type_kv_cache_manager import (
-        get_manager_for_kv_cache_spec,
-        spec_manager_map,
-    )
-
-    assert spec_manager_map[PrefixAnchoredSWASpec] is PrefixAnchoredSWAManager
-
-    spec = PrefixAnchoredSWASpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=64,
-        dtype=torch.float16,
-        decode_sliding_window=128,
-    )
-    block_pool = BlockPool(num_gpu_blocks=100, enable_caching=False, hash_block_size=16)
-    manager = get_manager_for_kv_cache_spec(
-        spec,
-        max_in_flight_tokens=1024,
-        max_model_len=4096,
-        block_pool=block_pool,
-        enable_caching=False,
-        kv_cache_group_id=0,
-    )
-    assert isinstance(manager, PrefixAnchoredSWAManager)
-    assert manager.decode_sliding_window == 128

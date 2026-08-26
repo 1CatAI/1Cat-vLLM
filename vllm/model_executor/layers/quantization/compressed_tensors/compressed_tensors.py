@@ -380,12 +380,6 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_symmetric
         )
 
-    def _contains_nvfp4_weights(self) -> bool:
-        return any(
-            scheme is not None and self._is_nvfp4_format(scheme.get("weights"))
-            for scheme in self.target_scheme_map.values()
-        )
-
     @staticmethod
     def _is_mxfp4(quant_args: QuantizationArgs) -> bool:
         if quant_args is None:
@@ -682,7 +676,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                     return CompressedTensorsW8A16Fp8(
                         weight_quant=weight_quant,
                         is_static_input_scheme=not input_quant.dynamic,
-                        enable_sm70_qpn8_by_default=self._contains_nvfp4_weights(),
                     )
 
             # note: input_quant can be None
@@ -691,7 +684,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return CompressedTensorsW8A16Fp8(
                     weight_quant=weight_quant,
                     is_static_input_scheme=is_static_input_scheme,
-                    enable_sm70_qpn8_by_default=self._contains_nvfp4_weights(),
                 )
 
             if self._is_static_tensor_w8a8(weight_quant, input_quant):
@@ -861,19 +853,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
-
-    def apply_fused_silu_and_mul(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-    ) -> torch.Tensor | None:
-        scheme = layer.scheme
-        if scheme is None:
-            raise ValueError("A scheme must be defined for each layer")
-        fused_apply = getattr(scheme, "apply_fused_silu_and_mul", None)
-        if fused_apply is None:
-            return None
-        return fused_apply(layer, x)
 
 
 class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):

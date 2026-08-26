@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -13,7 +12,6 @@ from tests.v1.attention.utils import (
     create_standard_kv_cache_spec,
     try_get_attention_backend,
 )
-from vllm import envs
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
@@ -28,119 +26,9 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.llm_base_proposer import (
-    SpecDecodeBaseProposer,
-    _sm70_mtp_hotpath_warmup_batch_sizes,
-    _sm70_mtp_moe_warmup_sizes,
-)
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
-
-
-def test_sm70_mtp_moe_warmup_sizes():
-    assert _sm70_mtp_moe_warmup_sizes(256, 8, 8192) == (9, 33, 257)
-    assert _sm70_mtp_moe_warmup_sizes(256, 8, 32) == (9,)
-    assert _sm70_mtp_moe_warmup_sizes(256, 8, 8192, 16) == (
-        *range(1, 17),
-        33,
-        257,
-    )
-    assert _sm70_mtp_moe_warmup_sizes(0, 8, 8192) == ()
-
-
-def test_sm70_mtp_hotpath_warmup_batch_sizes():
-    assert _sm70_mtp_hotpath_warmup_batch_sizes(1) == (1,)
-    assert _sm70_mtp_hotpath_warmup_batch_sizes(4) == (4,)
-    assert _sm70_mtp_hotpath_warmup_batch_sizes(4, include_alternate=True) == (1, 4)
-    assert _sm70_mtp_hotpath_warmup_batch_sizes(64, include_alternate=True) == (1, 4)
-
-
-def test_sm70_mtp_concurrency_warmup_is_default_off(monkeypatch):
-    monkeypatch.delenv("VLLM_SM70_MTP_CONCURRENCY_WARMUP", raising=False)
-    envs.disable_envs_cache()
-    try:
-        assert not envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP
-    finally:
-        envs.disable_envs_cache()
-
-
-def test_sm70_mtp_moe_warmup_runs_each_shape_once():
-    dummy_run = mock.Mock()
-    draft_model_config = SimpleNamespace(
-        is_moe=True,
-        hf_text_config=SimpleNamespace(
-            num_experts_per_tok=8,
-            moe_intermediate_size=512,
-        ),
-        get_num_experts=lambda: 256,
-        get_hidden_size=lambda: 4096,
-    )
-    proposer = SimpleNamespace(
-        method="mtp",
-        device=torch.device("cuda"),
-        draft_model_config=draft_model_config,
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=4)
-        ),
-        max_num_tokens=8192,
-        dummy_run=dummy_run,
-        _sm70_mtp_moe_warmed=False,
-    )
-
-    with (
-        mock.patch.object(current_platform, "is_device_capability", return_value=True),
-        mock.patch.object(torch.accelerator, "synchronize"),
-    ):
-        assert SpecDecodeBaseProposer.warmup_sm70_mtp_moe_kernels(proposer) == (
-            "mtp_draft_moe",
-        )
-
-    assert [call.args[0] for call in dummy_run.call_args_list] == [9, 33, 257]
-    assert all(call.kwargs["spec_step_idx"] == 0 for call in dummy_run.call_args_list)
-
-
-def test_sm70_mtp_moe_warmup_covers_opted_in_exact_tiles():
-    dummy_run = mock.Mock()
-    draft_model_config = SimpleNamespace(
-        is_moe=True,
-        hf_text_config=SimpleNamespace(
-            num_experts_per_tok=8,
-            moe_intermediate_size=512,
-        ),
-        get_num_experts=lambda: 256,
-        get_hidden_size=lambda: 2048,
-    )
-    proposer = SimpleNamespace(
-        method="mtp",
-        device=torch.device("cuda"),
-        draft_model_config=draft_model_config,
-        vllm_config=SimpleNamespace(
-            parallel_config=SimpleNamespace(tensor_parallel_size=4)
-        ),
-        max_num_tokens=8192,
-        dummy_run=dummy_run,
-        _sm70_mtp_moe_warmed=False,
-    )
-
-    with (
-        mock.patch.object(current_platform, "is_device_capability", return_value=True),
-        mock.patch.object(torch.accelerator, "synchronize"),
-        mock.patch.object(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True),
-    ):
-        assert SpecDecodeBaseProposer.warmup_sm70_mtp_moe_kernels(proposer) == (
-            "mtp_draft_moe",
-        )
-
-    assert [call.args[0] for call in dummy_run.call_args_list] == [
-        *range(1, 17),
-        33,
-        257,
-        1,
-        2,
-        9,
-        10,
-    ]
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:

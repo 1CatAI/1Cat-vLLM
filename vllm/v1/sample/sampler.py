@@ -8,9 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config.model import LogprobsMode
-from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -21,7 +19,6 @@ from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 
 _SAMPLING_EPS = 1e-5
 _SM70_LOGITS_DUMP_COUNTER = 0
-logger = init_logger(__name__)
 
 
 def _sm70_cuda_graph_capture_active() -> bool:
@@ -80,7 +77,10 @@ def _maybe_dump_sm70_sampler_logits(
             ],
         },
         path
-        / (f"sampler_logits_pid{os.getpid()}_step{_SM70_LOGITS_DUMP_COUNTER:04d}.pt"),
+        / (
+            f"sampler_logits_pid{os.getpid()}"
+            f"_step{_SM70_LOGITS_DUMP_COUNTER:04d}.pt"
+        ),
     )
 
 
@@ -303,217 +303,6 @@ class Sampler(nn.Module):
     def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
         return logits.argmax(dim=-1).view(-1)
 
-    @staticmethod
-    def _try_sm70_compact_topk20_sample(
-        logits: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-        logprobs_mode: LogprobsMode,
-    ) -> torch.Tensor | None:
-        if not Sampler._sm70_compact_topk20_metadata_supported(
-            sampling_metadata, logprobs_mode
-        ):
-            return None
-        if (
-            logits.dtype != torch.float32
-            or not logits.is_cuda
-            or logits.shape != (1, 248320)
-            or torch.cuda.get_device_capability(logits.device) != (7, 0)
-        ):
-            return None
-
-        chunks = envs.VLLM_SM70_CHUNKED_TOPK20_CHUNKS
-        if (
-            chunks > 0
-            and 248320 % chunks == 0
-            and hasattr(torch.ops._C, "sm70_sample_chunked_top20_philox_token_out")
-            and len(sampling_metadata.generators) <= 1
-        ):
-            from vllm import _sm70_ops as sm70_ops
-
-            chunk_size = 248320 // chunks
-            local_values, local_indices = torch.topk(
-                logits.view(chunks, chunk_size),
-                k=20,
-                dim=-1,
-                largest=True,
-                sorted=False,
-            )
-            global_values, global_positions = torch.topk(
-                local_values.view(1, -1),
-                k=20,
-                dim=-1,
-                largest=True,
-                sorted=False,
-            )
-            sampled = torch.empty((1,), dtype=torch.int64, device=logits.device)
-            generator = next(iter(sampling_metadata.generators.values()), None)
-            sm70_ops.sm70_sample_chunked_top20_philox_token_out(
-                sampled,
-                global_values,
-                local_indices,
-                global_positions,
-                generator,
-                248320,
-                0.95,
-                chunk_size,
-            )
-            logger.info_once(
-                "SM70 exact %d-way chunked top-k20 Philox sampler path enabled.",
-                chunks,
-            )
-            return sampled
-
-        # The sparse-Philox kernel canonicalizes the selected pairs itself, so
-        # skip torch.topk's final ordering pass only when that exact path will
-        # consume the result. Keep sorted output for the legacy fallback.
-        use_sparse_philox = (
-            hasattr(torch.ops._C, "sm70_sample_sorted_top20_philox_token_out")
-            or hasattr(torch.ops._C, "sm70_sample_sorted_top20_philox_out")
-        ) and len(sampling_metadata.generators) <= 1
-        top_values, top_indices = torch.topk(
-            logits,
-            k=20,
-            dim=-1,
-            largest=True,
-            sorted=not use_sparse_philox,
-        )
-        return Sampler._sm70_sample_top20_pairs(
-            top_values, top_indices, sampling_metadata
-        )
-
-    @staticmethod
-    def _sm70_compact_topk20_metadata_supported(
-        sampling_metadata: SamplingMetadata,
-        logprobs_mode: LogprobsMode,
-    ) -> bool:
-        if not envs.VLLM_SM70_COMPACT_TOPK20_SAMPLER:
-            return False
-        if logprobs_mode in ("processed_logits", "processed_logprobs"):
-            return False
-        if sampling_metadata.max_num_logprobs is not None:
-            return False
-        if sampling_metadata.logprob_token_ids:
-            return False
-        if not sampling_metadata.all_random:
-            return False
-        if sampling_metadata.top_k_cpu != (20,):
-            return False
-        top_p_cpu = sampling_metadata.top_p_cpu
-        temperature_cpu = sampling_metadata.temperature_cpu
-        return not (
-            top_p_cpu is None
-            or len(top_p_cpu) != 1
-            or abs(top_p_cpu[0] - 0.95) > 1e-6
-            or temperature_cpu is None
-            or len(temperature_cpu) != 1
-            or abs(temperature_cpu[0] - 1.0) > 1e-6
-        )
-
-    @staticmethod
-    def _sm70_sample_top20_pairs(
-        top_values: torch.Tensor,
-        top_indices: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor | None:
-        if (
-            top_values.dtype != torch.float32
-            or top_indices.dtype != torch.int64
-            or not top_values.is_cuda
-            or not top_indices.is_cuda
-            or top_values.shape != (1, 20)
-            or top_indices.shape != (1, 20)
-            or top_values.device != top_indices.device
-            or torch.cuda.get_device_capability(top_values.device) != (7, 0)
-        ):
-            return None
-
-        from vllm import _sm70_ops as sm70_ops
-
-        has_token_philox = hasattr(
-            torch.ops._C, "sm70_sample_sorted_top20_philox_token_out"
-        )
-        has_metadata_philox = hasattr(
-            torch.ops._C, "sm70_sample_sorted_top20_philox_out"
-        )
-        if not (
-            has_token_philox
-            or has_metadata_philox
-            or hasattr(torch.ops._C, "sm70_sample_packed_top20_out")
-        ):
-            return None
-
-        sampled = torch.empty((1,), dtype=torch.int64, device=top_values.device)
-        generators = sampling_metadata.generators
-        if has_token_philox and len(generators) <= 1:
-            generator = next(iter(generators.values()), None)
-            sm70_ops.sm70_sample_sorted_top20_philox_token_out(
-                sampled,
-                top_values,
-                top_indices,
-                generator,
-                248320,
-                0.95,
-            )
-            logger.info_once(
-                "SM70 exact token-only Philox compact top-k20 sampler path enabled."
-            )
-            return sampled
-
-        sparse_ids = torch.empty((20,), dtype=torch.int64, device=top_values.device)
-        sparse_probs = torch.empty((20,), dtype=torch.float32, device=top_values.device)
-        if has_metadata_philox and len(generators) <= 1:
-            generator = next(iter(generators.values()), None)
-            sm70_ops.sm70_sample_sorted_top20_philox_out(
-                sampled,
-                sparse_ids,
-                sparse_probs,
-                top_values,
-                top_indices,
-                generator,
-                248320,
-                0.95,
-            )
-            logger.info_once(
-                "SM70 exact sparse-Philox compact top-k20 sampler path enabled."
-            )
-            return sampled
-
-        top_indices_float = top_indices[0].to(torch.float32)
-        pairs = torch.stack(
-            (top_values[0], top_indices_float, top_indices_float), dim=-1
-        )
-        exponentials = torch.empty(
-            (1, 248320), dtype=torch.float32, device=top_values.device
-        )
-        if len(generators) != 1:
-            exponentials.exponential_()
-        for row, generator in generators.items():
-            exponentials[row].exponential_(generator=generator)
-
-        sm70_ops.sm70_sample_packed_top20_out(
-            sampled,
-            sparse_ids,
-            sparse_probs,
-            pairs,
-            exponentials,
-            0.95,
-        )
-        logger.info_once("SM70 exact compact top-k20 random sampler path enabled.")
-        return sampled
-
-    def sm70_compact_topk20_pairs_sample(
-        self,
-        top_values: torch.Tensor,
-        top_indices: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor | None:
-        """Sample exact global top-20 pairs while preserving native RNG use."""
-        if not self._sm70_compact_topk20_metadata_supported(
-            sampling_metadata, self.logprobs_mode
-        ):
-            return None
-        return self._sm70_sample_top20_pairs(top_values, top_indices, sampling_metadata)
-
     def sample(
         self,
         logits: torch.Tensor,
@@ -555,12 +344,6 @@ class Sampler(nn.Module):
         # (argmax invariant)
         for processor in sampling_metadata.logitsprocs.argmax_invariant:
             logits = processor.apply(logits)
-
-        compact_sampled = self._try_sm70_compact_topk20_sample(
-            logits, sampling_metadata, logprobs_mode
-        )
-        if compact_sampled is not None:
-            return compact_sampled, None
 
         # Apply top_k and/or top_p.
         random_sampled, processed_logprobs = self.topk_topp_sampler(

@@ -237,35 +237,6 @@ def test_sm70_fa2_d256_prefill_env_is_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_FA2_D256_PREFILL is False
 
 
-def test_sm70_d256_gqa_architecture_env_is_default_on(monkeypatch):
-    import vllm.envs as envs
-
-    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
-    monkeypatch.delenv(name, raising=False)
-    envs.disable_envs_cache()
-    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL is True
-
-    monkeypatch.setenv(name, "0")
-    envs.disable_envs_cache()
-    assert envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL is False
-
-
-def test_sm70_e4m3_batch_xqa_env_contract(monkeypatch):
-    import vllm.envs as envs
-
-    monkeypatch.delenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", raising=False)
-    monkeypatch.delenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", raising=False)
-    envs.disable_envs_cache()
-    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA is True
-    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED is True
-
-    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "0")
-    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "0")
-    envs.disable_envs_cache()
-    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA is False
-    assert envs.VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED is False
-
-
 def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     import vllm.envs as envs
 
@@ -274,7 +245,6 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
         "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE",
         "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS",
         "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
-        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -284,7 +254,6 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE is True
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS is True
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD is True
-    assert envs.VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD is True
     assert envs.VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN == 61633
 
     for name in names:
@@ -294,7 +263,6 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE is False
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS is False
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD is False
-    assert envs.VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD is False
 
     monkeypatch.setenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "49152")
     envs.disable_envs_cache()
@@ -408,15 +376,10 @@ def test_sm70_prefill_dense_splitkv3_env_is_default_on(monkeypatch):
 
     monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", raising=False)
     monkeypatch.delenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", raising=False)
-    monkeypatch.delenv(
-        "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL",
-        raising=False,
-    )
     envs.disable_envs_cache()
 
     assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3 is True
     assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV == 32768
-    assert envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL is False
 
     monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3", "0")
     envs.disable_envs_cache()
@@ -617,7 +580,6 @@ def test_prefix_prefill_prioritizes_gathered_exact_dense_over_paged(
     impl.head_size = 256
     impl.scale = 0.0625
     impl.sliding_window = None
-    impl.prefix_anchored_decode_window = None
     impl.kv_cache_dtype = "auto"
     impl.use_flash_v100_decode = False
     impl.use_decode_paged_prefill = False
@@ -738,36 +700,6 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, splitkv3)
 
 
-def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
-    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
-
-    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
-    fake_package = types.ModuleType("vllm.vllm_flash_attn")
-    fake_package.__dict__["flash_attn_interface"] = fake_interface
-    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.vllm_flash_attn.flash_attn_interface",
-        fake_interface,
-    )
-
-    architecture = object()
-    fake_ops = SimpleNamespace(
-        _vllm_fa2_C=SimpleNamespace(
-            sm70_d256_gqa_architecture_fwd=architecture,
-        )
-    )
-    monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
-    monkeypatch.setattr(
-        flash_v100,
-        "_sm70_d256_gqa_architecture_op_checked",
-        False,
-    )
-    monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", None)
-
-    assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
-
-
 def test_prefill_dense_splitkv3_workspace_reuses_exact_shape(monkeypatch):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
@@ -811,8 +743,6 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
     key = torch.empty((1, 65536, 1, 256), dtype=torch.float16, device="meta")
     key_32k = torch.empty((1, 32768, 1, 256), dtype=torch.float16, device="meta")
     key_16k = torch.empty((1, 16384, 1, 256), dtype=torch.float16, device="meta")
-    query_8k = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
-    query_8192 = torch.empty((1, 8192, 6, 256), dtype=torch.float16, device="meta")
 
     assert flash_v100._should_use_prefill_dense_splitkv3(
         query,
@@ -842,168 +772,6 @@ def test_prefill_dense_splitkv3_policy_is_exact_shape_bounded(monkeypatch):
         max_seqlen_k=65536,
         splitkv3_op=object(),
     )
-    assert not flash_v100._should_use_prefill_dense_splitkv3(
-        query_8k,
-        key,
-        max_seqlen_q=8000,
-        max_seqlen_k=65536,
-        splitkv3_op=object(),
-    )
-
-    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL", "1")
-    envs.disable_envs_cache()
-    assert flash_v100._should_use_prefill_dense_splitkv3(
-        query_8k,
-        key,
-        max_seqlen_q=8000,
-        max_seqlen_k=65536,
-        splitkv3_op=object(),
-    )
-    assert not flash_v100._should_use_prefill_dense_splitkv3(
-        query_8192,
-        key,
-        max_seqlen_q=8192,
-        max_seqlen_k=65536,
-        splitkv3_op=object(),
-    )
-
-
-def test_prefill_d256_gqa_architecture_policy_is_shape_family_bounded(monkeypatch):
-    import vllm.envs as envs
-    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
-
-    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
-    query = torch.empty((1, 8000, 6, 256), dtype=torch.float16, device="meta")
-    key = torch.empty((1, 128000, 1, 256), dtype=torch.float16, device="meta")
-    value = torch.empty_like(key)
-
-    monkeypatch.setenv(name, "0")
-    envs.disable_envs_cache()
-    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
-        query,
-        key,
-        value,
-        max_seqlen_q=8000,
-        max_seqlen_k=128000,
-        softmax_scale=0.0625,
-        architecture_op=object(),
-    )
-
-    monkeypatch.delenv(name, raising=False)
-    envs.disable_envs_cache()
-    for kv_len in range(40000, 128001, 8000):
-        family_key = torch.empty(
-            (1, kv_len, 1, 256), dtype=torch.float16, device="meta"
-        )
-        assert flash_v100._should_use_prefill_d256_gqa_architecture(
-            query,
-            family_key,
-            torch.empty_like(family_key),
-            max_seqlen_q=8000,
-            max_seqlen_k=kv_len,
-            softmax_scale=0.0625,
-            architecture_op=object(),
-        )
-    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
-        query[:, :7999],
-        key,
-        value,
-        max_seqlen_q=7999,
-        max_seqlen_k=128000,
-        softmax_scale=0.0625,
-        architecture_op=object(),
-    )
-    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
-        query,
-        key[:, :127999],
-        value[:, :127999],
-        max_seqlen_q=8000,
-        max_seqlen_k=127999,
-        softmax_scale=0.0625,
-        architecture_op=object(),
-    )
-    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
-        query,
-        key[:, :44000],
-        value[:, :44000],
-        max_seqlen_q=8000,
-        max_seqlen_k=44000,
-        softmax_scale=0.0625,
-        architecture_op=object(),
-    )
-    assert not flash_v100._should_use_prefill_d256_gqa_architecture(
-        query,
-        key,
-        value,
-        max_seqlen_q=8000,
-        max_seqlen_k=128000,
-        softmax_scale=1.0,
-        architecture_op=object(),
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_prefill_d256_gqa_architecture_oom_uses_dense_fallback(monkeypatch):
-    import vllm.envs as envs
-    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
-
-    if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("SM70/V100 is required")
-
-    name = "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
-    monkeypatch.delenv(name, raising=False)
-    envs.disable_envs_cache()
-    monkeypatch.setattr(flash_v100, "_is_cuda_graph_capturing", lambda _: False)
-
-    dense_calls = 0
-
-    def dense_op(query, key, value, out, softmax_scale, causal):
-        nonlocal dense_calls
-        dense_calls += 1
-        out.fill_(3)
-        return out
-
-    def architecture_oom(*args, **kwargs):
-        raise torch.OutOfMemoryError("expected architecture workspace OOM")
-
-    monkeypatch.setattr(
-        flash_v100,
-        "_get_sm70_splitd_d256_ops",
-        lambda: (dense_op, object(), None),
-    )
-    monkeypatch.setattr(
-        flash_v100,
-        "_get_sm70_d256_gqa_architecture_op",
-        lambda: architecture_oom,
-    )
-    monkeypatch.setattr(flash_v100, "_warned_prefill_d256_gqa_architecture_oom", False)
-
-    query = torch.zeros((1, 8000, 6, 256), dtype=torch.float16, device="cuda")
-    key = torch.zeros((1, 40000, 1, 256), dtype=torch.float16, device="cuda")
-    value = torch.zeros_like(key)
-    out = torch.zeros_like(query)
-    cu_seqlens_q = torch.tensor([0, 8000], dtype=torch.int32, device="cuda")
-    cu_seqlens_k = torch.tensor([0, 40000], dtype=torch.int32, device="cuda")
-
-    result = flash_v100._try_sm70_fa2_d256_prefill(
-        query,
-        key,
-        value,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=8000,
-        max_seqlen_k=40000,
-        softmax_scale=0.0625,
-        causal=True,
-        window_size=(-1, -1),
-        out=out,
-    )
-
-    assert result is not None
-    assert result.data_ptr() == out.data_ptr()
-    assert dense_calls == 1
-    assert torch.all(out == 3)
-    assert flash_v100._warned_prefill_d256_gqa_architecture_oom is True
 
 
 def test_dense_prefill_restores_uniform_batch_view_for_exact_splitd(monkeypatch):
@@ -1528,27 +1296,6 @@ def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(
     assert _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs) == expected
 
 
-@pytest.mark.parametrize(
-    ("max_num_seqs", "expected"),
-    [
-        (1, [5]),
-        (2, [5, 10]),
-        (4, [5, 10, 20]),
-        (6, [5, 10, 20, 30]),
-        (12, [5, 10, 20, 30, 40, 60]),
-        (16, [5, 10, 20, 30, 40, 60, 80]),
-        (32, [5, 10, 20, 30, 40, 60, 80]),
-    ],
-)
-def test_sm70_mtp_cudagraph_capture_sizes_cover_production_concurrency(
-    max_num_seqs: int,
-    expected: list[int],
-):
-    from vllm.config.vllm import _sm70_mtp_cudagraph_capture_sizes
-
-    assert _sm70_mtp_cudagraph_capture_sizes(max_num_seqs, 5) == expected
-
-
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(
     monkeypatch,
     local_flash_v100_model,
@@ -1652,89 +1399,6 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
     assert result is output
     assert captured["block_table"].data_ptr() == persistent_block_table.data_ptr()
     assert captured["seq_lens"].data_ptr() == persistent_seq_lens.data_ptr()
-    assert torch.all(output == 1)
-
-
-def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata():
-    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
-
-    impl = FlashAttnV100Impl(
-        num_heads=6,
-        head_size=256,
-        scale=1.0,
-        num_kv_heads=1,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="fp8_e5m2",
-    )
-    impl.use_dflash2_grouped_verify = True
-    captured: dict[str, object] = {}
-
-    def grouped_verify(
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        seq_lens,
-        **kwargs,
-    ):
-        captured["block_table"] = block_table
-        captured["seq_lens"] = seq_lens
-        captured["one_pass"] = kwargs["one_pass"]
-        kwargs["out"].fill_(1)
-
-    impl.flash_attn_grouped_verify_paged = grouped_verify
-    impl.flash_attn_decode_paged = lambda *args, **kwargs: pytest.fail(
-        "exact DFlash2 grouped route fell through to independent rows"
-    )
-    original_block_table = torch.tensor([[7, 3]], dtype=torch.int32)
-    original_seq_lens = torch.tensor([2056], dtype=torch.int32)
-    attn_metadata = SimpleNamespace(
-        num_actual_tokens=8,
-        causal=True,
-        is_dflash_selector_target=True,
-        max_model_len=32768,
-        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
-        seq_lens=original_seq_lens,
-        block_table=original_block_table,
-        smallq_decode_block_table=torch.zeros((8, 2), dtype=torch.int32),
-        smallq_decode_seq_lens=torch.arange(2049, 2057, dtype=torch.int32),
-        smallq_query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
-    )
-    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=2.0)
-    query = torch.zeros((8, 6, 256), dtype=torch.float16)
-    output = torch.zeros_like(query)
-    key_cache = torch.zeros((2, 3296, 1, 256), dtype=torch.uint8)
-    value_cache = torch.zeros_like(key_cache)
-
-    attn_metadata.max_model_len = 8192
-    assert not impl._dflash2_grouped_verify_allowed(
-        query,
-        key_cache,
-        value_cache,
-        attn_metadata,
-        num_query_tokens=8,
-    )
-    attn_metadata.max_model_len = 32768
-    result = impl._flash_v100_small_query_prefill_as_decode(
-        layer,
-        query,
-        key_cache,
-        value_cache,
-        attn_metadata,
-        output,
-        attn_metadata.query_start_loc,
-        original_seq_lens,
-    )
-
-    assert result is output
-    captured_block_table = captured["block_table"]
-    captured_seq_lens = captured["seq_lens"]
-    assert isinstance(captured_block_table, torch.Tensor)
-    assert isinstance(captured_seq_lens, torch.Tensor)
-    assert captured_block_table.data_ptr() == original_block_table.data_ptr()
-    assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
-    assert captured["one_pass"] is True
     assert torch.all(output == 1)
 
 
@@ -1849,126 +1513,6 @@ def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch)
 
     assert result is output
     assert calls == ["xqa"]
-    assert torch.all(output == 1)
-
-
-def test_flash_v100_decode_uses_xqa_for_e4m3_g6_d256(monkeypatch):
-    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
-
-    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
-    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
-
-    impl = FlashAttnV100Impl(
-        num_heads=6,
-        head_size=256,
-        scale=1.0,
-        num_kv_heads=1,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="fp8_e4m3",
-    )
-    calls: list[tuple[str, int | None, str | None]] = []
-
-    def hit_xqa(*args, **kwargs):
-        calls.append(
-            (
-                "xqa",
-                kwargs.get("partition_size_hint"),
-                kwargs.get("kv_cache_dtype"),
-            )
-        )
-        kwargs["out"].fill_(1)
-
-    def fail_scalar(*args, **kwargs):
-        raise AssertionError("E4M3 G6/D256 decode should select XQA")
-
-    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
-    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
-    attn_metadata = SimpleNamespace(
-        num_actual_tokens=1,
-        block_table=torch.tensor([[0]], dtype=torch.int32),
-        seq_lens=torch.tensor([1025], dtype=torch.int32),
-        flash_v100_decode_max_seq_len_hint=1025,
-        flash_v100_decode_workspace_seq_capacity_hint=262144,
-        flash_v100_decode_active_num_partitions=torch.tensor([5], dtype=torch.int32),
-    )
-    layer = SimpleNamespace(_k_scale_float=0.04, _v_scale_float=0.25)
-    query = torch.zeros((1, 6, 256), dtype=torch.float16)
-    output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 2, 1568, 1, 256), dtype=torch.uint8)
-
-    result = impl._flash_v100_decode(
-        layer,
-        query,
-        query,
-        query,
-        kv_cache,
-        attn_metadata,
-        output,
-    )
-
-    assert result is output
-    assert calls == [("xqa", 64, "fp8_e4m3")]
-    assert torch.all(output == 1)
-
-
-@pytest.mark.parametrize(
-    ("batch_size", "enabled", "expected_route"),
-    ((2, False, "scalar"), (2, True, "xqa"), (16, True, "xqa"), (17, True, "scalar")),
-)
-def test_flash_v100_e4m3_batched_xqa_is_exactly_gated(
-    monkeypatch, batch_size, enabled, expected_route
-):
-    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
-
-    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1" if enabled else "0")
-    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
-    impl = FlashAttnV100Impl(
-        num_heads=6,
-        head_size=256,
-        scale=1.0,
-        num_kv_heads=1,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="fp8_e4m3",
-    )
-    calls: list[str] = []
-
-    def hit_xqa(*args, **kwargs):
-        calls.append("xqa")
-        kwargs["out"].fill_(1)
-
-    def hit_scalar(*args, **kwargs):
-        calls.append("scalar")
-        kwargs["out"].fill_(1)
-
-    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
-    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
-    attn_metadata = SimpleNamespace(
-        num_actual_tokens=batch_size,
-        block_table=torch.zeros((batch_size, 2), dtype=torch.int32),
-        seq_lens=torch.full((batch_size,), 16384, dtype=torch.int32),
-        flash_v100_decode_max_seq_len_hint=16384,
-        flash_v100_decode_workspace_seq_capacity_hint=32768,
-        flash_v100_decode_active_num_partitions=torch.tensor([64], dtype=torch.int32),
-    )
-    layer = SimpleNamespace(_k_scale_float=0.04, _v_scale_float=0.25)
-    query = torch.zeros((batch_size, 6, 256), dtype=torch.float16)
-    output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 2, 1568, 1, 256), dtype=torch.uint8)
-
-    result = impl._flash_v100_decode(
-        layer,
-        query,
-        query,
-        query,
-        kv_cache,
-        attn_metadata,
-        output,
-    )
-
-    assert result is output
-    assert calls == [expected_route]
     assert torch.all(output == 1)
 
 
@@ -2177,113 +1721,6 @@ def test_flash_v100_fp8_xqa_graph_capture_uses_static_context_hint(
     )
 
     assert mod._decode_fp8_xqa_allowed(metadata, torch.empty(1)) is expected
-
-
-@pytest.mark.parametrize(
-    ("routing_enabled", "graph_variant", "expected"),
-    (
-        (True, None, True),
-        (True, 0, False),
-        (True, -1, True),
-        (False, None, False),
-        (False, -1, False),
-    ),
-)
-def test_flash_v100_batch_context_routing_isolated_by_graph_variant(
-    routing_enabled,
-    graph_variant,
-    expected,
-):
-    from vllm.v1.attention.backends import flash_attn_v100 as mod
-
-    assert (
-        mod._batch_context_routing_for_graph_variant(
-            routing_enabled,
-            graph_variant,
-        )
-        is expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("cache_dtype", "e4m3_enabled", "expected"),
-    (
-        ("fp8_e5m2", False, True),
-        ("fp8_e4m3", True, True),
-        ("fp8", True, True),
-        ("fp8_e4m3", False, False),
-        ("auto", True, False),
-    ),
-)
-def test_flash_v100_batch_context_routing_accepts_exact_fp8_xqa_formats(
-    monkeypatch,
-    cache_dtype,
-    e4m3_enabled,
-    expected,
-):
-    from vllm.v1.attention.backends import flash_attn_v100 as mod
-
-    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1" if e4m3_enabled else "0")
-    assert mod._batch_context_routing_cache_dtype_supported(cache_dtype) is expected
-
-
-@pytest.mark.parametrize("routing_enabled", (True, False))
-def test_flash_v100_fp8_xqa_full_capacity_graph_preserves_baseline_xqa(
-    monkeypatch,
-    routing_enabled,
-):
-    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
-
-    impl = FlashAttnV100Impl(
-        num_heads=6,
-        head_size=256,
-        scale=1.0,
-        num_kv_heads=1,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="fp8_e5m2",
-    )
-    calls: list[tuple[str, bool]] = []
-
-    def hit_xqa(*args, **kwargs):
-        calls.append(("xqa", kwargs.get("batch_context_routing", False)))
-        kwargs["out"].fill_(1)
-
-    def hit_scalar(*args, **kwargs):
-        calls.append(("scalar", False))
-        kwargs["out"].fill_(1)
-
-    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
-    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
-    attn_metadata = SimpleNamespace(
-        num_actual_tokens=4,
-        block_table=torch.zeros((4, 256), dtype=torch.int32),
-        seq_lens=torch.full((4,), 1, dtype=torch.int32),
-        flash_v100_cudagraph_capture=True,
-        flash_v100_batch_context_routing=routing_enabled,
-        flash_v100_decode_max_seq_len_hint=1,
-        flash_v100_static_decode_seq_hint=262144,
-        flash_v100_decode_workspace_seq_capacity_hint=262144,
-        flash_v100_decode_active_num_partitions=torch.tensor([16], dtype=torch.int32),
-    )
-    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
-    query = torch.zeros((4, 6, 256), dtype=torch.float16)
-    output = torch.zeros_like(query)
-    kv_cache = torch.zeros((2, 2, 16, 1, 256), dtype=torch.uint8)
-
-    result = impl._flash_v100_decode(
-        layer,
-        query,
-        query,
-        query,
-        kv_cache,
-        attn_metadata,
-        output,
-    )
-
-    assert result is output
-    assert calls == [("xqa", routing_enabled)]
-    assert torch.all(output == 1)
 
 
 def test_flash_v100_mtp5_dual_cta_partition_policy(monkeypatch):
@@ -2642,7 +2079,7 @@ def test_flash_v100_decode_e5m2_keeps_small_pages_on_default_planner(monkeypatch
     )
 
 
-def test_flash_v100_decode_e4m3_uses_exact_p64_partition_hint(monkeypatch):
+def test_flash_v100_decode_e4m3_does_not_use_e5m2_partition_hint(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import (
         _g6_aligned_page_partition_size_hint,
     )
@@ -2654,7 +2091,7 @@ def test_flash_v100_decode_e4m3_uses_exact_p64_partition_hint(monkeypatch):
 
     assert (
         _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "fp8_e4m3")
-        == 64
+        is None
     )
 
 

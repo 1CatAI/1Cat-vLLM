@@ -891,9 +891,6 @@ class precompiled_wheel_utils:
                 flash_qla_sm70_ext_regex = re.compile(
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
-                sm70_sampler_ext_regex = re.compile(
-                    r"vllm/_sm70_sampler_C(?:\.[^/]+)?\.so$"
-                )
                 file_members = []
                 for member in wheel.filelist:
                     if member.filename in exact_members:
@@ -913,7 +910,6 @@ class precompiled_wheel_utils:
                         or deep_gemm_regex.match(member.filename)
                         or flash_attn_v100_ext_regex.match(member.filename)
                         or flash_qla_sm70_ext_regex.match(member.filename)
-                        or sm70_sampler_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
@@ -1239,8 +1235,6 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    if _cuda_arch_contains(7, 0):
-        ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
@@ -1392,10 +1386,10 @@ setup(
             "zentorch-weekly==5.2.1.dev20260408"
         ],  # Zentorch has weekly releases. This pulls the known-good version.
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy", "plotly"],
-        "tensorizer": ["tensorizer==2.12.1"],
-        "fastsafetensors": ["fastsafetensors >= 0.3.3"],
+        "tensorizer": ["tensorizer==2.10.1"],
+        "fastsafetensors": ["fastsafetensors >= 0.2.2"],
         "instanttensor": ["instanttensor >= 0.1.5"],
-        "runai": ["runai-model-streamer[s3,gcs,azure] >= 0.16.1"],
+        "runai": ["runai-model-streamer[s3,gcs,azure] >= 0.15.7"],
         "audio": [
             "av",
             "scipy",
@@ -1408,7 +1402,7 @@ setup(
         # NOTE: When updating helion version, also update CI files:
         #   - .buildkite/test_areas/kernels.yaml
         #   - .buildkite/test-amd.yaml
-        "helion": ["helion==1.4.0"],
+        "helion": ["helion==1.0.0"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],
         # Optional deps for OpenTelemetry tracing

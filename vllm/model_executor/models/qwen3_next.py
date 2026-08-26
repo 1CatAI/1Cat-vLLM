@@ -549,7 +549,7 @@ class Qwen3NextAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        output: torch.Tensor | None,
+        output: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -623,16 +623,13 @@ class Qwen3NextAttention(nn.Module):
                 attn_output,
             )
 
-        projected_output, _ = self.o_proj(attn_output)
-        if output is not None:
-            output[:] = projected_output
+        output[:], _ = self.o_proj(attn_output)
         _sm70_dump_qwen_layer_tensor(
             "full_attn_o_proj_out",
             self.layer_idx,
             "full_attention",
-            projected_output,
+            output,
         )
-        return projected_output
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -747,33 +744,21 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states,
         )
 
-        use_direct_attention_output = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM and torch.compiler.is_compiling()
-        )
-        self_attention_output = (
-            None if use_direct_attention_output else torch.empty_like(hidden_states)
-        )
+        self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
-            projected_attention_output = self.linear_attn(
+            self.linear_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
             )
         elif self.layer_type == "full_attention":
-            projected_attention_output = self.self_attn(
+            self.self_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
                 positions=positions,
             )
         else:
             raise ValueError("Invalid layer_type")
-        if use_direct_attention_output:
-            if projected_attention_output is None:
-                raise RuntimeError(
-                    "SM70 TP4 fused prefill requires a direct attention output"
-                )
-            hidden_states = projected_attention_output
-        else:
-            hidden_states = self_attention_output
+        hidden_states = self_attention_output
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "attn_out",
             self.layer_idx,

@@ -5,8 +5,6 @@
 import functools
 import json
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -35,20 +33,6 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-_force_sm70_mtp_moe_legacy_config = False
-
-
-@contextmanager
-def force_sm70_mtp_moe_legacy_config() -> Iterator[None]:
-    """Temporarily select the legacy SM70 MoE tile during startup warmup."""
-    global _force_sm70_mtp_moe_legacy_config
-    previous = _force_sm70_mtp_moe_legacy_config
-    _force_sm70_mtp_moe_legacy_config = True
-    try:
-        yield
-    finally:
-        _force_sm70_mtp_moe_legacy_config = previous
 
 
 @triton.jit
@@ -1216,32 +1200,6 @@ def should_moe_wna16_use_cuda(
     )
 
 
-def _get_sm70_mtp_moe_decode_config(
-    M: int,
-    E: int,
-    N: int,
-    K: int,
-    topk: int,
-) -> dict[str, int] | None:
-    """Return the graph-tuned exact-shape SM70 MTP tile for M2-M16."""
-    if _force_sm70_mtp_moe_legacy_config or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG:
-        return None
-    if (E, N, K, topk) != (256, 128, 2048, 8) or not 2 <= M <= 16:
-        return None
-
-    # TP4 shards the checkpoint-global I512 expert width to I128 per rank.
-    # M2-M16 all select this tile in the exact local-shape graph oracle.
-    return {
-        "BLOCK_SIZE_M": 8,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 1,
-        "SPLIT_K": 1,
-        "num_warps": 4,
-        "num_stages": 3,
-    }
-
-
 def get_default_config(
     M: int,
     E: int,
@@ -1304,11 +1262,7 @@ def get_default_config(
         # upstream's larger small-batch tiles are poor for single-token SM70
         # decode, which is the FP8-MoE-dequant fallback route used by the
         # old 35B-FP8 baseline.
-        sm70_mtp_config = _get_sm70_mtp_moe_decode_config(M, E, N, K, topk)
-        if sm70_mtp_config is not None:
-            config = sm70_mtp_config
-            logger.info_once(f"Using tuned exact-shape SM70 MTP MoE config: {config}")
-        elif M <= E:
+        if M <= E:
             config = {
                 "BLOCK_SIZE_M": 16,
                 "BLOCK_SIZE_N": 32,
@@ -1324,7 +1278,9 @@ def get_default_config(
                 "GROUP_SIZE_M": 8,
                 "SPLIT_K": 1,
             }
-        logger.info_once(f"Using SM70 0.0.3 unquantized MoE default config: {config}")
+        logger.info_once(
+            f"Using SM70 0.0.3 unquantized MoE default config: {config}"
+        )
     else:
         # General defaults for bf16/fp16 and fp8 per-tensor.
         # Tile sizes scale with batch: small batches are memory-bound

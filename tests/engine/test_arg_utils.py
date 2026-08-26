@@ -237,35 +237,19 @@ def _fake_qwen_hybrid_model_config():
     )
 
 
-def _apply_sm70_defaults(
-    monkeypatch,
-    *,
-    env=None,
-    speculative_config=None,
-    enable_prefix_caching=None,
-    max_num_seqs=None,
-):
+def _apply_sm70_defaults(monkeypatch, *, env=None, speculative_config=None):
     for key in (
         "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS",
         "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS",
         "VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS",
         "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS",
-        "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("vllm.engine.arg_utils.current_platform", _FakeSM70Platform())
-    monkeypatch.setattr(
-        "vllm.engine.arg_utils.get_model_path", lambda model, revision: model
-    )
 
-    args = EngineArgs(
-        model="dummy",
-        tensor_parallel_size=4,
-        enable_prefix_caching=enable_prefix_caching,
-        max_num_seqs=max_num_seqs,
-    )
+    args = EngineArgs(model="dummy", tensor_parallel_size=4)
     args.speculative_config = speculative_config
     args._maybe_apply_sm70_mtp_defaults(
         UsageContext.OPENAI_API_SERVER,
@@ -313,39 +297,6 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
     ]
 
 
-def test_sm70_mtp_split_cudagraphs_are_opt_in(monkeypatch):
-    args = _apply_sm70_defaults(
-        monkeypatch,
-        env={
-            "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1",
-            "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": "1",
-        },
-    )
-
-    assert args.compilation_config.cudagraph_capture_sizes == [5, 10, 20]
-
-
-def test_sm70_mtp_split_cudagraphs_cover_production_batches(monkeypatch):
-    args = _apply_sm70_defaults(
-        monkeypatch,
-        env={
-            "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": "1",
-            "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": "1",
-        },
-        max_num_seqs=16,
-    )
-
-    assert args.compilation_config.cudagraph_capture_sizes == [
-        5,
-        10,
-        20,
-        30,
-        40,
-        60,
-        80,
-    ]
-
-
 def test_sm70_mtp_defaults_treat_zero_env_as_disabled(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,
@@ -386,37 +337,6 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
     assert args.max_num_seqs == 4
-
-
-def test_sm70_explicit_dflash_preserves_probabilistic_default(monkeypatch):
-    args = _apply_sm70_defaults(
-        monkeypatch,
-        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
-    )
-
-    assert args.speculative_config == {
-        "method": "dflash",
-        "num_speculative_tokens": 7,
-        "draft_sample_method": "probabilistic",
-    }
-    assert args.enable_prefix_caching is True
-    assert args.mamba_cache_mode == "align"
-
-
-def test_sm70_explicit_dflash_accepts_explicit_greedy(monkeypatch):
-    args = _apply_sm70_defaults(
-        monkeypatch,
-        speculative_config={
-            "method": "dflash",
-            "num_speculative_tokens": 7,
-            "draft_sample_method": "greedy",
-        },
-        enable_prefix_caching=True,
-    )
-
-    assert args.speculative_config["draft_sample_method"] == "greedy"
-    assert args.enable_prefix_caching is True
-    assert args.mamba_cache_mode == "align"
 
 
 @pytest.mark.parametrize(

@@ -54,69 +54,6 @@ def reset_default_device():
     torch.set_default_device(original_device)
 
 
-@pytest.mark.skipif(not HAS_TRITON, reason="Triton is not available")
-def test_sm70_topk_topp_8_warp_policy(monkeypatch: pytest.MonkeyPatch):
-    from vllm.v1.sample.ops import topk_topp_triton
-
-    monkeypatch.delenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", raising=False)
-    monkeypatch.delenv("VLLM_SM70_TOPK_TOPP_8_WARPS", raising=False)
-    monkeypatch.setattr(topk_topp_triton.current_platform, "is_cuda", lambda: True)
-    monkeypatch.setattr(
-        topk_topp_triton.current_platform,
-        "is_device_capability",
-        lambda capability: capability == (7, 0),
-    )
-
-    use_8_warps = topk_topp_triton._use_sm70_topk_topp_8_warps
-    cuda = torch.device("cuda:0")
-    assert use_8_warps(cuda, 8, 248_320, True, True)
-    assert use_8_warps(cuda, 16, 248_320, True, True)
-    assert not use_8_warps(cuda, 5, 248_320, True, True)
-
-    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "1")
-    assert use_8_warps(cuda, 5, 248_320, True, True)
-    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "0")
-    assert not use_8_warps(cuda, 8, 248_320, True, True)
-
-    assert not use_8_warps(cuda, 16, 128_000, True, True)
-    assert not use_8_warps(cuda, 16, 248_320, False, True)
-    assert not use_8_warps(torch.device("cpu"), 16, 248_320, True, True)
-
-
-@pytest.mark.parametrize("batch_size", (8, 16))
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_sm70_topk_topp_b8_b16_8_warps_matches_rollback(
-    monkeypatch: pytest.MonkeyPatch,
-    batch_size: int,
-):
-    if torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("The eight-warp production schedule is SM70-only")
-
-    import vllm.envs as envs
-    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
-
-    generator = Generator(device="cuda").manual_seed(20260824 + batch_size)
-    logits = torch.randn(
-        (batch_size, 248_320),
-        generator=generator,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    k = torch.full((batch_size,), 20, device="cuda", dtype=torch.int32)
-    p = torch.full((batch_size,), 0.95, device="cuda", dtype=torch.float32)
-
-    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "0")
-    envs.disable_envs_cache()
-    rollback = apply_top_k_top_p_triton(logits.clone(), k, p)
-
-    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1")
-    envs.disable_envs_cache()
-    candidate = apply_top_k_top_p_triton(logits.clone(), k, p)
-
-    torch.accelerator.synchronize()
-    assert torch.equal(candidate, rollback)
-
-
 def test_flashinfer_sampler_default_falls_back_when_import_fails(monkeypatch):
     from vllm.v1.sample.ops import topk_topp_sampler as sampler_mod
 

@@ -404,57 +404,11 @@ class HiddenStateCacheSpec(MLAAttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
-class PrefixAnchoredSWASpec(FullAttentionSpec):
-    """KV cache spec for prefix-anchored sliding-window attention.
-
-    Prefill (prompt/prefix) tokens are always globally visible.
-    Only the last ``decode_sliding_window`` generated tokens are kept in the
-    KV cache; gap blocks (between the prefill tail and the current decode
-    window) are evicted during each decode step to bound per-request memory
-    at O(prefix_blocks + window_blocks).
-    """
-
-    decode_sliding_window: int
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.decode_sliding_window <= 0:
-            raise ValueError("decode_sliding_window must be greater than zero")
-
-    @classmethod
-    def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, PrefixAnchoredSWASpec) for spec in specs), (
-            "All attention layers in the same KV cache group must be "
-            "PrefixAnchoredSWASpec."
-        )
-        windows = {spec.decode_sliding_window for spec in specs}
-        assert len(windows) == 1, (
-            "All prefix-anchored SWA layers must share the same "
-            f"decode_sliding_window, got {windows}"
-        )
-        # Delegate common field merging to the parent, then reattach the
-        # decode window.
-        base = FullAttentionSpec.merge(specs)  # type: ignore[arg-type]
-        return cls(
-            block_size=base.block_size,
-            num_kv_heads=base.num_kv_heads,
-            head_size=base.head_size,
-            head_size_v=base.head_size_v,
-            dtype=base.dtype,
-            kv_quant_mode=base.kv_quant_mode,
-            page_size_padded=base.page_size_padded,
-            sliding_window=base.sliding_window,
-            attention_chunk_size=base.attention_chunk_size,
-            decode_sliding_window=windows.pop(),
-        )
-
-
-@dataclass(frozen=True, kw_only=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
     attention_chunk_size: int
 
     def max_admission_blocks_per_request(
-        self, max_in_flight_tokens: int, max_model_len: int
+        self, max_num_batched_tokens: int, max_model_len: int
     ) -> int:
         """Per-request admission cap, in blocks.
 
@@ -464,15 +418,15 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
         """
         # During chunked prefill, we hold KV for at most one chunk window.
         num_tokens = min(
-            self.attention_chunk_size + max_in_flight_tokens, max_model_len
+            self.attention_chunk_size + max_num_batched_tokens, max_model_len
         )
         return cdiv(num_tokens, self.block_size)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
-        max_in_flight_tokens = vllm_config.max_in_flight_tokens
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_blocks = self.max_admission_blocks_per_request(
-            max_in_flight_tokens=max_in_flight_tokens, max_model_len=max_model_len
+            max_num_batched_tokens=max_num_batched_tokens, max_model_len=max_model_len
         )
         return max_blocks * self.page_size_bytes
 
@@ -507,7 +461,7 @@ class SlidingWindowSpec(AttentionSpec):
         )
 
     def max_admission_blocks_per_request(
-        self, max_in_flight_tokens: int, max_model_len: int
+        self, max_num_batched_tokens: int, max_model_len: int
     ) -> int:
         """Per-request admission cap, in blocks.
 
@@ -520,7 +474,9 @@ class SlidingWindowSpec(AttentionSpec):
         # During chunked prefill, we hold KV for the last `sliding_window-1`
         # computed tokens plus the newly scheduled tokens, and never more
         # than `max_model_len`.
-        num_tokens = min(self.sliding_window - 1 + max_in_flight_tokens, max_model_len)
+        num_tokens = min(
+            self.sliding_window - 1 + max_num_batched_tokens, max_model_len
+        )
         # +1 because the sliding window may not start from the beginning of
         # the block. E.g. block size 4 and num_token 4 needs two blocks
         # [XXCD][EF] to store the 6-token window [CDEF].
@@ -531,9 +487,9 @@ class SlidingWindowSpec(AttentionSpec):
             "DCP not support sliding window."
         )
         max_model_len = vllm_config.model_config.max_model_len
-        max_in_flight_tokens = vllm_config.max_in_flight_tokens
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_blocks = self.max_admission_blocks_per_request(
-            max_in_flight_tokens=max_in_flight_tokens, max_model_len=max_model_len
+            max_num_batched_tokens=max_num_batched_tokens, max_model_len=max_model_len
         )
         return max_blocks * self.page_size_bytes
 

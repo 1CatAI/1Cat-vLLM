@@ -263,7 +263,9 @@ def _active_ctas_per_sm(
     threads_per_cta: int,
     shared_bytes_per_cta: int,
 ) -> int:
-    register_limited = SM70_REGISTERS_PER_SM // (registers_per_thread * threads_per_cta)
+    register_limited = SM70_REGISTERS_PER_SM // (
+        registers_per_thread * threads_per_cta
+    )
     shared_limited = SM70_SHARED_BYTES_PER_SM // shared_bytes_per_cta
     thread_limited = SM70_THREADS_PER_SM // threads_per_cta
     return min(register_limited, shared_limited, thread_limited, SM70_MAX_CTA_PER_SM)
@@ -348,7 +350,9 @@ def _paged_resource_gate(kernel: Mapping[str, Any]) -> dict[str, Any]:
             f"requires <= {PAGED_MAX_SHARED_BYTES}"
         )
     if kernel["active_ctas_per_sm"] != 2:
-        reasons.append(f"active_ctas_per_sm={kernel['active_ctas_per_sm']}, requires 2")
+        reasons.append(
+            f"active_ctas_per_sm={kernel['active_ctas_per_sm']}, requires 2"
+        )
     instructions = kernel["instructions"]
     if instructions["hmma"] == 0:
         reasons.append("paged target has no HMMA")
@@ -613,9 +617,15 @@ def _pairwise_stats(
     return {
         "right_minus_left_mean_ms": float(statistics.mean(deltas)),
         "right_minus_left_p50_ms": float(statistics.median(deltas)),
-        "right_faster_wins": sum(right_ms < left_ms for left_ms, right_ms in paired),
-        "left_faster_wins": sum(left_ms < right_ms for left_ms, right_ms in paired),
-        "ties": sum(left_ms == right_ms for left_ms, right_ms in paired),
+        "right_faster_wins": sum(
+            right_ms < left_ms for left_ms, right_ms in paired
+        ),
+        "left_faster_wins": sum(
+            left_ms < right_ms for left_ms, right_ms in paired
+        ),
+        "ties": sum(
+            left_ms == right_ms for left_ms, right_ms in paired
+        ),
         "right_vs_left_mean_pct": (
             (right_stats["mean_ms"] / left_stats["mean_ms"] - 1.0) * 100.0
         ),

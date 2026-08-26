@@ -539,7 +539,7 @@ def sm70_mhc_post_fp32_stage_tilelang(
     n_thr: int = 256,
     n_splits: int = 8,
 ) -> tilelang.JITKernel:
-    """Materialize a small-token post mapping without rounding the dot input."""
+    """Materialize the M=1 post mapping without rounding the dot input."""
     num_tokens = T.dynamic("num_tokens")
     h_per_split = hidden // n_splits
     h_iters = h_per_split // n_thr
@@ -608,7 +608,7 @@ def sm70_mhc_dot_from_fp32_stage_tilelang(
     tile_n: int = 2,
     n_splits: int = 8,
 ) -> tilelang.JITKernel:
-    """Run small-token dot accumulation from the exact FP32 post stage."""
+    """Run the M=1 dot accumulation from the exact FP32 post stage."""
     num_tokens = T.dynamic("num_tokens")
     h_per_split = hidden // n_splits
     h_iters = h_per_split // n_thr

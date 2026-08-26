@@ -220,9 +220,9 @@ def main() -> None:
                     "im_end_count": result["im_end_count"],
                     "unique_tokens": result["unique_tokens"],
                     "top_token_count_id": result["top_token_count_id"],
-                    "steady_decode_tps": (result["request_metrics"] or {}).get(
-                        "steady_decode_tps"
-                    ),
+                    "steady_decode_tps": (
+                        result["request_metrics"] or {}
+                    ).get("steady_decode_tps"),
                     "prefix": text[:160],
                 },
                 ensure_ascii=False,

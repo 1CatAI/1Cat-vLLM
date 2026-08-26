@@ -68,7 +68,6 @@ logger = init_logger(__name__)
 
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
-_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
@@ -78,19 +77,6 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     }
     capture_sizes.update((1, 2, max_graph_reqs))
     return sorted(capture_sizes)
-
-
-def _sm70_mtp_cudagraph_capture_sizes(
-    max_num_seqs: int,
-    decode_query_len: int,
-) -> list[int]:
-    """Return exact SM70 MTP verifier token shapes for production requests."""
-    max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
-    request_sizes = {
-        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
-    }
-    request_sizes.add(max_graph_reqs)
-    return [decode_query_len * size for size in sorted(request_sizes)]
 
 
 class OptimizationLevel(IntEnum):
@@ -228,81 +214,6 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
     from vllm._aiter_ops import check_aiter_fused_qk_rmsnorm, rocm_aiter_ops
 
     return rocm_aiter_ops.is_enabled() and check_aiter_fused_qk_rmsnorm()
-
-
-def apply_prefix_anchored_swa_constraints(cfg: "VllmConfig") -> None:
-    """Validate the model-agnostic prefix-anchored SWA engine contract."""
-    window = cfg.attention_config.prefix_anchored_decode_window
-    if window is None:
-        return
-
-    from vllm.platforms import current_platform
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-    ):
-        raise ValueError("prefix_anchored_decode_window requires an NVIDIA SM70 GPU")
-
-    model_config = cfg.model_config
-    if model_config is None:
-        raise ValueError("prefix_anchored_decode_window requires a model config")
-    if model_config.use_mla:
-        raise ValueError("prefix_anchored_decode_window does not support MLA attention")
-    if cfg.attention_config.use_non_causal:
-        raise ValueError(
-            "prefix_anchored_decode_window requires causal decoder attention"
-        )
-
-    cache_dtype = cfg.cache_config.cache_dtype
-    effective_cache_dtype = model_config.dtype if cache_dtype == "auto" else cache_dtype
-    if effective_cache_dtype not in (torch.float16, "float16"):
-        raise ValueError(
-            "prefix_anchored_decode_window requires an fp16 KV cache; "
-            f"got cache_dtype={cache_dtype!r} and model dtype={model_config.dtype}"
-        )
-
-    parallel_config = cfg.parallel_config
-    if (
-        parallel_config.decode_context_parallel_size != 1
-        or parallel_config.prefill_context_parallel_size != 1
-    ):
-        raise ValueError(
-            "prefix_anchored_decode_window does not support decode or prefill "
-            "context parallelism"
-        )
-    if cfg.cache_config.kv_offloading_size is not None:
-        raise ValueError(
-            "prefix_anchored_decode_window does not support KV-cache offloading"
-        )
-    if (
-        cfg.kv_transfer_config is not None
-        and cfg.kv_transfer_config.kv_connector is not None
-    ):
-        raise ValueError("prefix_anchored_decode_window does not support KV connectors")
-    if cfg.speculative_config is not None:
-        raise ValueError(
-            "prefix_anchored_decode_window does not yet support speculative decoding"
-        )
-
-    backend = cfg.attention_config.backend
-    if backend is None:
-        cfg.attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
-        logger.info(
-            "Prefix-anchored sliding-window attention: auto-selecting the "
-            "FLASH_ATTN_V100 backend."
-        )
-    elif backend != AttentionBackendEnum.FLASH_ATTN_V100:
-        raise ValueError(
-            "prefix_anchored_decode_window requires FLASH_ATTN_V100; "
-            f"got {backend.name}"
-        )
-    if cfg.cache_config.enable_prefix_caching:
-        cfg.cache_config.enable_prefix_caching = False
-        logger.info(
-            "Prefix-anchored sliding-window attention: disabling prefix "
-            "caching (windowed decode KV is not reusable across requests)."
-        )
 
 
 OPTIMIZATION_LEVEL_00 = {
@@ -601,28 +512,6 @@ class VllmConfig:
         return hash_str
 
     @property
-    def max_concurrent_batches(self) -> int:
-        # Scheduler-side upper bound mirroring the executors'
-        # `max_concurrent_batches` (multiproc: queue depth under async
-        # scheduling, else the PP pipeline depth).
-        pp_size = self.parallel_config.pipeline_parallel_size
-        if pp_size <= 1 and self.scheduler_config.async_scheduling:
-            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
-        return pp_size
-
-    @property
-    def max_in_flight_tokens(self) -> int:
-        # Upper bound on tokens that are scheduled but not yet settled (freed):
-        # every concurrent batch may hold up to a full `max_num_batched_tokens`.
-        # Recycling-aware KV cache specs (sliding-window, chunked-local,
-        # prefix-anchored SWA) reserve for this because out-of-window blocks
-        # are freed on the processed-token basis, so in-flight steps
-        # transiently keep their blocks.
-        return (
-            self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
-        )
-
-    @property
     def num_speculative_tokens(self) -> int:
         if (
             self.speculative_config is not None
@@ -632,37 +521,10 @@ class VllmConfig:
         return 0
 
     @property
-    def num_lookahead_tokens(self) -> int:
-        """KV positions reserved beyond the target model's scheduled query."""
-        speculative_config = self.speculative_config
-        if speculative_config is None:
-            return 0
-        if speculative_config.use_dflash_family():
-            # DFlash has one anchor query plus the checkpoint-owned draft state.
-            return speculative_config.num_speculative_state_tokens() + 1
-        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
-            return self.num_speculative_tokens
-        return 0
-
-    @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
-        is_mrv2_dflash = (
-            self.speculative_config is not None and self.speculative_config.use_dflash()
-        )
         if use_v2_model_runner is not None:
-            if is_mrv2_dflash and not use_v2_model_runner:
-                raise ValueError(
-                    "method='dflash' is implemented only by Model Runner V2. "
-                    "Use method='dflash_ddtree' for the retained V1 DDTree route."
-                )
             return use_v2_model_runner
-
-        # The old V1 flat-DFlash route is intentionally removed. Force every
-        # method='dflash' checkpoint through the MRV2 speculator and fail in
-        # _validate_v2_model_runner if another configured feature is unsupported.
-        if is_mrv2_dflash:
-            return True
 
         if not self._is_default_v2_model_runner_model():
             return False
@@ -964,8 +826,8 @@ class VllmConfig:
         # producing RDMA failures like IBV_WC_REM_ACCESS_ERR /
         # NIXL_ERR_REMOTE_DISCONNECT at the first inter-node KV transfer.
         # We can't enumerate every in-tree and out-of-tree connector that
-        # pins memory, so we conservatively reject the combination unless the
-        # connector explicitly opts into the VMM-safe transfer contract.
+        # pins memory, so we conservatively reject the combination whenever
+        # any KV connector is configured.
         #
         # CuMem allocator is exempt: CuMemAllocator.use_memory_pool toggles
         # expandable_segments off around its pool (see #40812), so the KV
@@ -976,14 +838,6 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
-            return
-        if self._connector_supports_vmm_safe_transfers():
-            logger.warning_once(
-                "Allowing KV connector %s with "
-                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True because "
-                "it implements SupportsVmmSafeTransfers.",
-                self.kv_transfer_config.kv_connector,
-            )
             return
 
         raise ValueError(
@@ -998,25 +852,6 @@ class VllmConfig:
             "routes KV allocations through CuMemAllocator's pool, where "
             "expandable_segments is automatically disabled)."
         )
-
-    def _connector_supports_vmm_safe_transfers(self) -> bool:
-        """Resolve the connector and check its explicit VMM-safety marker."""
-        from vllm.distributed.kv_transfer.kv_connector.factory import (
-            KVConnectorFactory,
-        )
-        from vllm.distributed.kv_transfer.kv_connector.v1 import (
-            supports_vmm_safe_transfers,
-        )
-
-        kv_transfer_config = self.kv_transfer_config
-        if kv_transfer_config is None:
-            return False
-
-        try:
-            connector_cls = KVConnectorFactory.get_connector_class(kv_transfer_config)
-            return supports_vmm_safe_transfers(connector_cls)
-        except (ValueError, AttributeError, ImportError, TypeError):
-            return False
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
@@ -1061,8 +896,6 @@ class VllmConfig:
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
-
-        apply_prefix_anchored_swa_constraints(self)
 
         if (
             self.mamba_config.enable_stochastic_rounding
@@ -1474,6 +1307,7 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
+
         sm70_flash_0dot3_compile_graph = envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         sm70_flash_no_compile_graph = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
@@ -1507,6 +1341,11 @@ class VllmConfig:
                         self.speculative_config is not None
                         and self.speculative_config.num_speculative_tokens
                     ):
+                        cudagraph_capture_sizes = (
+                            [1, 2, 4, 8, 9, 18]
+                            if self.parallel_config.tensor_parallel_size >= 4
+                            else [1, 2, 4, 8, 9]
+                        )
                         decode_query_len = (
                             self.speculative_config.num_speculative_state_tokens() + 1
                         )
@@ -1524,47 +1363,26 @@ class VllmConfig:
                                 smallq_env,
                                 decode_query_len,
                             )
-                        if (
-                            envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
-                            and self.speculative_config.method == "mtp"
-                        ):
-                            cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
-                                self.scheduler_config.max_num_seqs,
-                                decode_query_len,
-                            )
-                            logger.info_once(
-                                "Using split SM70 MTP verifier cudagraph token "
-                                "shapes %s for Flash-V100 compile graph.",
-                                tuple(cudagraph_capture_sizes),
-                            )
-                        else:
-                            cudagraph_capture_sizes = (
-                                [1, 2, 4, 8, 9, 18]
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else [1, 2, 4, 8, 9]
-                            )
-                            max_graph_reqs = (
-                                4
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else 1
-                            )
-                            max_graph_reqs = min(
-                                max(int(self.scheduler_config.max_num_seqs), 1),
-                                max_graph_reqs,
-                            )
-                            cudagraph_capture_sizes = sorted(
-                                set(cudagraph_capture_sizes)
-                                | {
-                                    decode_query_len * num_reqs
-                                    for num_reqs in range(1, max_graph_reqs + 1)
-                                }
-                            )
-                            logger.info_once(
-                                "Using SM70 speculative verifier cudagraph shapes "
-                                "%sx1..%s for Flash-V100 compile graph.",
-                                decode_query_len,
-                                max_graph_reqs,
-                            )
+                        max_graph_reqs = (
+                            4 if self.parallel_config.tensor_parallel_size >= 4 else 1
+                        )
+                        max_graph_reqs = min(
+                            max(int(self.scheduler_config.max_num_seqs), 1),
+                            max_graph_reqs,
+                        )
+                        cudagraph_capture_sizes = sorted(
+                            set(cudagraph_capture_sizes)
+                            | {
+                                decode_query_len * num_reqs
+                                for num_reqs in range(1, max_graph_reqs + 1)
+                            }
+                        )
+                        logger.info_once(
+                            "Using SM70 speculative verifier cudagraph shapes "
+                            "%sx1..%s for Flash-V100 compile graph.",
+                            decode_query_len,
+                            max_graph_reqs,
+                        )
                     elif cudagraph_capture_sizes != [1, 2]:
                         logger.info_once(
                             "Using SM70 no-MTP decode cudagraph request shapes %s.",
@@ -1870,22 +1688,6 @@ class VllmConfig:
                     self.compilation_config.cudagraph_mode = (
                         CUDAGraphMode.FULL_DECODE_ONLY
                     )
-
-            # Prefix-anchored sliding-window attention: full-graph capture
-            # bakes attention metadata that carries no per-request anchor
-            # lengths, so the anchored decode-window mask cannot run inside a
-            # full cudagraph. Piecewise graphs keep attention outside capture.
-            if (
-                self.attention_config.prefix_anchored_decode_window is not None
-                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-            ):
-                logger.info(
-                    "Prefix-anchored sliding-window attention does not "
-                    "support full cudagraphs. Overriding cudagraph_mode "
-                    "from %s to PIECEWISE.",
-                    self.compilation_config.cudagraph_mode.name,
-                )
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
             # Check if KV connector requires PIECEWISE mode for CUDA graphs
             if (
@@ -2653,6 +2455,13 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
 
+        if (
+            model_config is not None
+            and model_config.has_inner_state
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            unsupported.append("hybrid/mamba models with align cache mode")
+
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallelism")
 
@@ -2669,19 +2478,11 @@ class VllmConfig:
             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
             if speculative_config.method in ("ngram", "ngram_gpu"):
                 unsupported.append("ngram/ngram_gpu speculative decoding")
-            elif speculative_config.method not in (
-                "eagle",
-                "eagle3",
-                "mtp",
-                "dflash",
-            ):
+            elif speculative_config.method not in ("eagle", "eagle3", "mtp"):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (required by PEagle)
-            if (
-                speculative_config.parallel_drafting
-                and speculative_config.method != "dflash"
-            ):
+            if speculative_config.parallel_drafting:
                 unsupported.append("parallel drafting for speculative decoding")
 
             if (
@@ -2689,11 +2490,6 @@ class VllmConfig:
                 and self.parallel_config.pipeline_parallel_size > 1
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
-            if (
-                speculative_config.method == "dflash"
-                and self.parallel_config.pipeline_parallel_size > 1
-            ):
-                unsupported.append("DFlash with pipeline parallelism")
 
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
@@ -2795,6 +2591,10 @@ class VllmConfig:
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
+            )
+            # TODO: support align mamba cache mode for model runner v2
+            assert not envs.VLLM_USE_V2_MODEL_RUNNER, (
+                "Model Runner V2 has not yet supported mamba_cache_mode='align'. "
             )
 
     @model_validator(mode="after")

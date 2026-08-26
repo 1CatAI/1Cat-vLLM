@@ -25,739 +25,653 @@
 
 namespace turbomind::gemm {
 
-void ExportDispatchCache(
-    std::ostream& os,
-    const std::vector<std::pair<GemmDesc, LaunchSpec>>& entries);
+void ExportDispatchCache(std::ostream& os, const std::vector<std::pair<GemmDesc, LaunchSpec>>& entries);
 
-void ImportDispatchCache(std::istream& is,
+void ImportDispatchCache(std::istream&                                 is,
                          std::vector<std::pair<GemmDesc, LaunchSpec>>& entries,
-                         const std::vector<std::unique_ptr<Kernel>>& kernels);
+                         const std::vector<std::unique_ptr<Kernel>>&   kernels);
 
 namespace {
 
-template <class Cmp>
-std::vector<int> ArgSort(size_t size, const Cmp& cmp) {
-  std::vector<int> idxs(size);
-  std::iota(idxs.begin(), idxs.end(), 0);
-  std::stable_sort(idxs.begin(), idxs.end(), cmp);
-  return idxs;
+template<class Cmp>
+std::vector<int> ArgSort(size_t size, const Cmp& cmp)
+{
+    std::vector<int> idxs(size);
+    std::iota(idxs.begin(), idxs.end(), 0);
+    std::stable_sort(idxs.begin(), idxs.end(), cmp);
+    return idxs;
 }
 
-bool GemmTraceEnabled() {
-  const char* raw = std::getenv("TM_GEMM_TRACE");
-  return raw && std::atoi(raw) != 0;
+bool GemmTraceEnabled()
+{
+    const char* raw = std::getenv("TM_GEMM_TRACE");
+    return raw && std::atoi(raw) != 0;
 }
 
-int GemmTraceLimit() {
-  const char* raw = std::getenv("TM_GEMM_TRACE_LIMIT");
-  return raw ? std::max(std::atoi(raw), 0) : 256;
+int GemmTraceLimit()
+{
+    const char* raw = std::getenv("TM_GEMM_TRACE_LIMIT");
+    return raw ? std::max(std::atoi(raw), 0) : 256;
 }
 
-bool GemmTraceFilterAllows(const std::string& desc) {
-  const char* raw = std::getenv("TM_GEMM_TRACE_FILTER");
-  return !raw || !*raw || desc.find(raw) != std::string::npos;
+bool GemmTraceFilterAllows(const std::string& desc)
+{
+    const char* raw = std::getenv("TM_GEMM_TRACE_FILTER");
+    return !raw || !*raw || desc.find(raw) != std::string::npos;
 }
 
-bool Sm70AwqTp2FastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR");
-  return !raw || std::atoi(raw) != 0;
+bool Sm70AwqTp2FastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
 }
 
 // Keep the accepted QKVZ route enabled by default, while allowing an isolated
 // end-to-end A/B comparison without disabling the other exact small-M routes.
-bool Sm70AwqTp4QkvCta64Enabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TP4_QKV_CTA64");
-  return !raw || std::atoi(raw) != 0;
+bool Sm70AwqTp4QkvCta64Enabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_TP4_QKV_CTA64");
+    return !raw || std::atoi(raw) != 0;
 }
 
 // Default-on A/B gate for the exact TP4 MTP verifier M=5 routes.
-bool Sm70AwqMtpM5FastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR");
-  return !raw || std::atoi(raw) != 0;
+bool Sm70AwqMtpM5FastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_MTP_M5_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
 }
 
-bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled() {
-  const char* grouped = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
-  if (!grouped || std::atoi(grouped) == 0) {
-    return false;
-  }
-  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
-  return !raw || std::atoi(raw) != 0;
-}
-
-bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
-  return !raw || std::atoi(raw) != 0;
-}
-
-// Default-on gate for exact block-FP8 8K prefill GEMM descriptors.
-bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR");
-  return !raw || std::atoi(raw) != 0;
-}
-
-bool Sm70Fp8GroupedBmmDecodeEnabled() {
-  const char* raw = std::getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE");
-  return !raw || std::atoi(raw) != 0;
+bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()
+{
+    const char* grouped = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
+    if (!grouped || std::atoi(grouped) == 0) {
+        return false;
+    }
+    const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
 }
 
 struct Sm70AwqTp2FastTarget {
-  int n;
-  int k;
-  int cta_m;
-  int cta_n;
-  int cta_k;
-  int splits;
-  int swizzle;
-  bool require_mgroup;
-  std::string name_contains;
+    int  n;
+    int  k;
+    int  cta_m;
+    int  cta_n;
+    int  cta_k;
+    int  splits;
+    int  swizzle;
+    bool require_mgroup;
+    std::string name_contains;
 };
 
-std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(
-    const GemmDesc& desc, const std::string_view desc_str) {
-  const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_TARGETS");
-  if (!raw || !*raw) {
+std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(const GemmDesc&         desc,
+                                                               const std::string_view desc_str)
+{
+    const char* raw = std::getenv("VLLM_SM70_AWQ_TP2_FAST_TARGETS");
+    if (!raw || !*raw) {
+        return std::nullopt;
+    }
+    const std::string targets(raw);
+    size_t            begin = 0;
+    while (begin <= targets.size()) {
+        const size_t end   = targets.find(';', begin);
+        const auto   entry = targets.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const size_t sep   = entry.find('|');
+        if (sep != std::string::npos && entry.substr(0, sep) == desc_str) {
+            std::string spec = entry.substr(sep + 1);
+            std::string name_contains;
+            if (const size_t name_sep = spec.find('@'); name_sep != std::string::npos) {
+                name_contains = spec.substr(name_sep + 1);
+                spec.resize(name_sep);
+            }
+            std::replace(spec.begin(), spec.end(), 'x', ',');
+            std::replace(spec.begin(), spec.end(), ':', ',');
+            for (char& ch : spec) {
+                if (ch == ',') {
+                    ch = ' ';
+                }
+            }
+            std::istringstream is(spec);
+            int                cta_m{};
+            int                cta_n{};
+            int                cta_k{};
+            int                splits{};
+            int                swizzle{};
+            int                require_mgroup{};
+            if (is >> cta_m >> cta_n >> cta_k >> splits >> swizzle >> require_mgroup) {
+                if (name_contains.empty()) {
+                    is >> name_contains;
+                }
+                return Sm70AwqTp2FastTarget{desc.n,
+                                            desc.k,
+                                            cta_m,
+                                            cta_n,
+                                            cta_k,
+                                            splits,
+                                            swizzle,
+                                            require_mgroup != 0,
+                                            name_contains};
+            }
+            if (GemmTraceEnabled() && GemmTraceFilterAllows(std::string(desc_str))) {
+                std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str
+                          << " stage=invalid_env_target entry=" << entry << std::endl;
+            }
+            return std::nullopt;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
     return std::nullopt;
-  }
-  const std::string targets(raw);
-  size_t begin = 0;
-  while (begin <= targets.size()) {
-    const size_t end = targets.find(';', begin);
-    const auto entry = targets.substr(
-        begin, end == std::string::npos ? std::string::npos : end - begin);
-    const size_t sep = entry.find('|');
-    if (sep != std::string::npos && entry.substr(0, sep) == desc_str) {
-      std::string spec = entry.substr(sep + 1);
-      std::string name_contains;
-      if (const size_t name_sep = spec.find('@');
-          name_sep != std::string::npos) {
-        name_contains = spec.substr(name_sep + 1);
-        spec.resize(name_sep);
-      }
-      std::replace(spec.begin(), spec.end(), 'x', ',');
-      std::replace(spec.begin(), spec.end(), ':', ',');
-      for (char& ch : spec) {
-        if (ch == ',') {
-          ch = ' ';
+}
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc)
+{
+    const bool        awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
+    const std::string desc_str = to_string(desc);
+    if (awq_fast_selector_enabled) {
+        if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
+            return target;
         }
-      }
-      std::istringstream is(spec);
-      int cta_m{};
-      int cta_n{};
-      int cta_k{};
-      int splits{};
-      int swizzle{};
-      int require_mgroup{};
-      if (is >> cta_m >> cta_n >> cta_k >> splits >> swizzle >>
-          require_mgroup) {
-        if (name_contains.empty()) {
-          is >> name_contains;
+    }
+    if (!awq_fast_selector_enabled) {
+        return std::nullopt;
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x17408x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 1, 0, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x8192x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 0, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x5120x3072_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 3, 0, false, ""};
+    }
+    if (Sm70AwqMtpM5FastSelectorEnabled()) {
+        // TP4 MTP verifier, M=5. Both routes are bitwise exact on all TP shards.
+        if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x8704x5120_1") {
+            return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 4, false, ""};
         }
+        if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x4096x5120_1") {
+            return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 4, 4, false, ""};
+        }
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 3, 3, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x8704x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 4, false, ""};
+    }
+    if (Sm70AwqTp4QkvCta64Enabled()
+        && desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x4096x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 4, 4, false, ""};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x1536_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 12, 4, false, "s884_1x4x1"};
+    }
+    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 7, 0, false, ""};
+    }
+    return std::nullopt;
+}
+
+std::optional<Sm70AwqTp2FastTarget> GetSm70Mxfp4MoeGroupedM8FastTarget(const GemmDesc& desc)
+{
+    if (!Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()) {
+        return std::nullopt;
+    }
+    const std::string desc_str = to_string(desc);
+    if (desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_48x512x4096_1") {
         return Sm70AwqTp2FastTarget{
-            desc.n,       desc.k, cta_m,   cta_n,
-            cta_k,        splits, swizzle, require_mgroup != 0,
-            name_contains};
-      }
-      if (GemmTraceEnabled() && GemmTraceFilterAllows(std::string(desc_str))) {
-        std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str
-                  << " stage=invalid_env_target entry=" << entry << std::endl;
-      }
-      return std::nullopt;
+            desc.n, desc.k, 8, 128, 64, 5, 0, true, "c8x128_a1x1x64_01"};
     }
-    if (end == std::string::npos) {
-      break;
+    if (desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_48x4096x256_1") {
+        return Sm70AwqTp2FastTarget{
+            desc.n, desc.k, 16, 128, 32, 1, 0, true, "c16x128_a1x1x32_01"};
     }
-    begin = end + 1;
-  }
-  return std::nullopt;
-}
-
-std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
-    const GemmDesc& desc) {
-  const std::string desc_str = to_string(desc);
-  if (Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled()) {
-    // Qwen3.8-27B NVFP4 TP4 decode. The exact-MNK registry entries keep
-    // these small-N tactics out of prefill and unrelated model shapes.
-    if (desc_str == "sm70_f16_e2m1k16_f16_tnt_fff_1x8704x5120_1" ||
-        desc_str == "sm70_f16_e2m1k16_f16_tnt_fff_1x5120x4352_1") {
-      return Sm70AwqTp2FastTarget{
-          desc.n, desc.k, 8, 32, 64, 3, 4, true, "c8x32_a1x1x64_01"};
-    }
-  }
-  if (Sm70Fp8BlockPrefillFastSelectorEnabled() &&
-      (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
-       desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1")) {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 64, 256, 16, 1, 3, true, ""};
-  }
-  if (Sm70Fp8GroupedBmmDecodeEnabled() &&
-      desc_str == "sm70_f16_e4m3k128_f16_tnt_bbb_2x1024x4096_1") {
-    // Match the accepted dense 1x1024x4096 accumulation tree while launching
-    // both independent WO-A groups through one blocked descriptor.
-    return Sm70AwqTp2FastTarget{
-        desc.n, desc.k, 8, 128, 64, 7, 2, true, "c8x128_a1x1x64_01"};
-  }
-  const bool awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
-  if (awq_fast_selector_enabled) {
-    if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
-      return target;
-    }
-  }
-  const char* selector_rerank = std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK");
-  const char* selector_shadow =
-      std::getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW");
-  const bool exact_selector_rerank =
-      (selector_rerank && std::atoi(selector_rerank) != 0) ||
-      (selector_shadow && std::atoi(selector_shadow) != 0);
-  if (exact_selector_rerank && desc.arch == 700 && desc.type_a == kHalf &&
-      desc.type_b == kHalf && desc.type_c == kHalf && desc.m >= 1 &&
-      desc.m <= 8 && desc.n == 62080 && desc.k == 5120 && desc.num == 1) {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8,    256,         64,
-                                10,     1,      true, "s884_1x4x1"};
-  }
-  if (!awq_fast_selector_enabled) {
     return std::nullopt;
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x17408x5120_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 1, 0, false, ""};
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x8192x5120_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 0, false, ""};
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x5120x3072_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 3, 0, false, ""};
-  }
-  if (Sm70AwqMtpM5FastSelectorEnabled()) {
-    // TP4 MTP verifier, M=5. Both routes are bitwise exact on all TP shards.
-    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x8704x5120_1") {
-      return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 4, false, ""};
-    }
-    if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_5x4096x5120_1") {
-      return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 4, 4, false, ""};
-    }
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x17408x5120_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 3, 3, false, ""};
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x8704x5120_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 2, 4, false, ""};
-  }
-  if (Sm70AwqTp4QkvCta64Enabled() &&
-      desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x4096x5120_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 64, 64, 4, 4, false, ""};
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x1536_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8,     256,         64,
-                                12,     4,      false, "s884_1x4x1"};
-  }
-  if (desc_str == "sm70_f16_u4k128_f16_tnt_fff_1x5120x3072_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 256, 64, 7, 0, false, ""};
-  }
-  return std::nullopt;
 }
 
-std::optional<Sm70AwqTp2FastTarget> GetSm70Mxfp4MoeGroupedM8FastTarget(
-    const GemmDesc& desc) {
-  if (!Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()) {
+bool MatchesSm70AwqTp2FastKernel(const Kernel& kernel, const Sm70AwqTp2FastTarget& target)
+{
+    const int3 cta = kernel.cta_tile_size();
+    if (cta.x != target.cta_m || cta.y != target.cta_n || cta.z != target.cta_k) {
+        return false;
+    }
+    const std::string name = kernel.name();
+    const bool        is_mgroup = name.find("mgroup") != std::string::npos;
+    if (is_mgroup != target.require_mgroup) {
+        return false;
+    }
+    return target.name_contains.empty() || name.find(target.name_contains) != std::string::npos;
+}
+
+void MaybeTraceSm70AwqTp2FastSelector(const GemmDesc& desc, const char* stage, const LaunchSpec* spec = nullptr)
+{
+    if (!GemmTraceEnabled()) {
+        return;
+    }
+    const std::string desc_str = to_string(desc);
+    if (!GemmTraceFilterAllows(desc_str)) {
+        return;
+    }
+    std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str << " stage=" << stage;
+    if (spec && spec->kernel) {
+        std::cerr << " kernel=" << spec->kernel->name() << " splits=" << spec->splits
+                  << " swizzle=" << spec->swizzle;
+    }
+    std::cerr << std::endl;
+}
+
+std::optional<LaunchSpec> SelectSm70AwqTp2FastSpec(Context&                              ctx,
+                                                   const std::vector<LaunchSpec>&        specs,
+                                                   const Sm70AwqTp2FastTarget&           target,
+                                                   size_t                                barriers_size,
+                                                   size_t                                partials_size)
+{
+    for (const auto& spec : specs) {
+        if (!spec.kernel || !MatchesSm70AwqTp2FastKernel(*spec.kernel, target)) {
+            continue;
+        }
+        if (spec.splits != target.splits) {
+            continue;
+        }
+        auto selected = spec;
+        const auto& actual_desc = ctx.get_desc(*selected.kernel);
+        const int4  shape{actual_desc.m, actual_desc.n, actual_desc.k, actual_desc.num};
+        if (target.swizzle > selected.kernel->GetMaxSwizzle(shape)) {
+            continue;
+        }
+        (void)barriers_size;
+        (void)partials_size;
+        selected.splits  = target.splits;
+        selected.swizzle = target.swizzle;
+        MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "selected", &selected);
+        return selected;
+    }
+    MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "no_match");
     return std::nullopt;
-  }
-  const std::string desc_str = to_string(desc);
-  if (desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_48x512x4096_1") {
-    return Sm70AwqTp2FastTarget{
-        desc.n, desc.k, 8, 128, 64, 5, 0, true, "c8x128_a1x1x64_01"};
-  }
-  if (desc_str == "sm70_f16_e2m1k32_f16_tnt_bbb_48x4096x256_1") {
-    return Sm70AwqTp2FastTarget{
-        desc.n, desc.k, 16, 128, 32, 1, 0, true, "c16x128_a1x1x32_01"};
-  }
-  return std::nullopt;
 }
 
-std::optional<Sm70AwqTp2FastTarget> GetSm70Fp8BlockPrefillPrescaledTarget(
-    const GemmDesc& desc) {
-  const std::string desc_str = to_string(desc);
-  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1" ||
-      desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {
-    return Sm70AwqTp2FastTarget{
-        desc.n, desc.k, 64, 256, 16, 1, 3, true, "sm70_fp8_pscale_full"};
-  }
-  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1536x4096_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 5, 1, true,
-                                "sm70_fp8_pscale_m1"};
-  }
-  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x8192x1024_1" ||
-      desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x2048_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 3, true,
-                                "sm70_fp8_pscale_m1"};
-  }
-  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x1024x4096_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 7, 1, true,
-                                "sm70_fp8_pscale_m1"};
-  }
-  if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_1x4096x512_1") {
-    return Sm70AwqTp2FastTarget{desc.n, desc.k, 8, 128, 64, 2, 1, true,
-                                "sm70_fp8_pscale_m1"};
-  }
-  return std::nullopt;
+const char* ToString(DispatchPolicy policy)
+{
+    if ((policy & DispatchPolicy::kPreserveDefaultSplits)
+        || (policy & DispatchPolicy::kPreserveDefaultSplitCount)
+        || (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast)) {
+        static thread_local std::string text;
+        auto base =
+            static_cast<DispatchPolicy>((int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits
+                                        & ~(int)DispatchPolicy::kPreserveDefaultSplitCount
+                                        & ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast);
+        text = std::string(ToString(base));
+        if (policy & DispatchPolicy::kPreserveDefaultSplits) {
+            text += "|preserve_default_splits";
+        }
+        if (policy & DispatchPolicy::kPreserveDefaultSplitCount) {
+            text += "|preserve_default_split_count";
+        }
+        if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
+            text += "|mxfp4_moe_grouped_m8_fast";
+        }
+        return text.c_str();
+    }
+    switch (policy) {
+        case DispatchPolicy::kDefault:
+            return "default";
+        case DispatchPolicy::kMeasure:
+            return "measure";
+        case DispatchPolicy::kReuse:
+            return "reuse";
+        case DispatchPolicy::kAppend:
+            return "append";
+        default:
+            return "unknown";
+    }
 }
 
-bool MatchesSm70AwqTp2FastKernel(const Kernel& kernel,
-                                 const Sm70AwqTp2FastTarget& target) {
-  const int3 cta = kernel.cta_tile_size();
-  if (cta.x != target.cta_m || cta.y != target.cta_n || cta.z != target.cta_k) {
-    return false;
-  }
-  const std::string name = kernel.name();
-  const bool is_mgroup = name.find("mgroup") != std::string::npos;
-  if (is_mgroup != target.require_mgroup) {
-    return false;
-  }
-  return target.name_contains.empty() ||
-         name.find(target.name_contains) != std::string::npos;
-}
+void MaybeTraceGemmDispatch(const GemmDesc& desc, DispatchPolicy policy, const LaunchSpec& spec, bool measured)
+{
+    if (!GemmTraceEnabled()) {
+        return;
+    }
+    const std::string desc_str = to_string(desc);
+    if (!GemmTraceFilterAllows(desc_str)) {
+        return;
+    }
+    static std::atomic<int> logged{0};
+    const int limit = GemmTraceLimit();
+    if (limit > 0 && logged.fetch_add(1, std::memory_order_relaxed) >= limit) {
+        return;
+    }
 
-void MaybeTraceSm70AwqTp2FastSelector(const GemmDesc& desc, const char* stage,
-                                      const LaunchSpec* spec = nullptr) {
-  if (!GemmTraceEnabled()) {
-    return;
-  }
-  const std::string desc_str = to_string(desc);
-  if (!GemmTraceFilterAllows(desc_str)) {
-    return;
-  }
-  std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str
-            << " stage=" << stage;
-  if (spec && spec->kernel) {
-    std::cerr << " kernel=" << spec->kernel->name()
-              << " splits=" << spec->splits << " swizzle=" << spec->swizzle;
-  }
-  std::cerr << std::endl;
-}
-
-std::optional<LaunchSpec> SelectSm70AwqTp2FastSpec(
-    Context& ctx, const std::vector<LaunchSpec>& specs,
-    const Sm70AwqTp2FastTarget& target, size_t barriers_size,
-    size_t partials_size) {
-  for (const auto& spec : specs) {
-    if (!spec.kernel || !MatchesSm70AwqTp2FastKernel(*spec.kernel, target)) {
-      continue;
+    std::cerr << "[TM_GEMM_TRACE] desc=" << desc_str << " policy=" << ToString(policy) << " measured="
+              << (measured ? 1 : 0);
+    if (spec.kernel) {
+        const int3 cta = spec.kernel->cta_tile_size();
+        const int3 mma = spec.kernel->warp_tile_size();
+        std::cerr << " kernel=" << spec.kernel->name() << " splits=" << spec.splits << " swizzle=" << spec.swizzle
+                  << " cta=" << cta.x << "x" << cta.y << "x" << cta.z << " mma=" << mma.x << "x" << mma.y
+                  << "x" << mma.z << " stages=" << spec.kernel->stages() << " smem=" << spec.kernel->smem_size();
     }
-    if (spec.splits != target.splits) {
-      continue;
+    else {
+        std::cerr << " kernel=<none>";
     }
-    auto selected = spec;
-    const auto& actual_desc = ctx.get_desc(*selected.kernel);
-    const int4 shape{actual_desc.m, actual_desc.n, actual_desc.k,
-                     actual_desc.num};
-    if (target.swizzle > selected.kernel->GetMaxSwizzle(shape)) {
-      continue;
-    }
-    (void)barriers_size;
-    (void)partials_size;
-    selected.splits = target.splits;
-    selected.swizzle = target.swizzle;
-    MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "selected", &selected);
-    return selected;
-  }
-  MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "no_match");
-  return std::nullopt;
-}
-
-const char* ToString(DispatchPolicy policy) {
-  if ((policy & DispatchPolicy::kPreserveDefaultSplits) ||
-      (policy & DispatchPolicy::kPreserveDefaultSplitCount) ||
-      (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) ||
-      (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled)) {
-    static thread_local std::string text;
-    auto base = static_cast<DispatchPolicy>(
-        (int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits &
-        ~(int)DispatchPolicy::kPreserveDefaultSplitCount &
-        ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast &
-        ~(int)DispatchPolicy::kSm70Fp8PrefillPrescaled);
-    text = std::string(ToString(base));
-    if (policy & DispatchPolicy::kPreserveDefaultSplits) {
-      text += "|preserve_default_splits";
-    }
-    if (policy & DispatchPolicy::kPreserveDefaultSplitCount) {
-      text += "|preserve_default_split_count";
-    }
-    if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
-      text += "|mxfp4_moe_grouped_m8_fast";
-    }
-    if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
-      text += "|sm70_fp8_prefill_prescaled";
-    }
-    return text.c_str();
-  }
-  switch (policy) {
-    case DispatchPolicy::kDefault:
-      return "default";
-    case DispatchPolicy::kMeasure:
-      return "measure";
-    case DispatchPolicy::kReuse:
-      return "reuse";
-    case DispatchPolicy::kAppend:
-      return "append";
-    default:
-      return "unknown";
-  }
-}
-
-void MaybeTraceGemmDispatch(const GemmDesc& desc, DispatchPolicy policy,
-                            const LaunchSpec& spec, bool measured) {
-  if (!GemmTraceEnabled()) {
-    return;
-  }
-  const std::string desc_str = to_string(desc);
-  if (!GemmTraceFilterAllows(desc_str)) {
-    return;
-  }
-  static std::atomic<int> logged{0};
-  const int limit = GemmTraceLimit();
-  if (limit > 0 && logged.fetch_add(1, std::memory_order_relaxed) >= limit) {
-    return;
-  }
-
-  std::cerr << "[TM_GEMM_TRACE] desc=" << desc_str
-            << " policy=" << ToString(policy)
-            << " measured=" << (measured ? 1 : 0);
-  if (spec.kernel) {
-    const int3 cta = spec.kernel->cta_tile_size();
-    const int3 mma = spec.kernel->warp_tile_size();
-    std::cerr << " kernel=" << spec.kernel->name() << " splits=" << spec.splits
-              << " swizzle=" << spec.swizzle << " cta=" << cta.x << "x" << cta.y
-              << "x" << cta.z << " mma=" << mma.x << "x" << mma.y << "x"
-              << mma.z << " stages=" << spec.kernel->stages()
-              << " smem=" << spec.kernel->smem_size()
-              << " regs=" << spec.kernel->info().attr.numRegs
-              << " max_ctas=" << spec.kernel->info().max_active_ctas;
-  } else {
-    std::cerr << " kernel=<none>";
-  }
-  std::cerr << std::endl;
+    std::cerr << std::endl;
 }
 
 }  // namespace
 
 struct Gemm::Impl {
-  Impl()
-      : props_{GetCudaDeviceProps()},
+
+    Impl():
+        props_{GetCudaDeviceProps()},
         arch_{props_->major * 100 + props_->minor * 10},
         registry_{props_},
-        cache_{registry_.kernels()},
-        sm70_fp8_prefill_cache_{registry_.kernels()} {
-    if (arch_ == 700) {
-      // V100 decode is dominated by many tiny GEMM/GEMV problems. A
-      // broader search space consistently finds better launch specs than
-      // the generic defaults for these SM70 workloads.
-      tuning_.max_splits = 16;
-      tuning_.max_waves = 32;
-      tuning_.swizzle = {0, 1, 2, 3, 4};
-      tuning_.top_k = 0;
-      tuning_.clusters = 0;
-      tuning_.min_iter = 2;
-      tuning_.max_iter = 20;
-      tuning_.max_time = 2.f;
-    }
-    if (auto str = std::getenv("TM_GEMM_TUNE")) {
-      try {
-        ParseTuningParams(tuning_, str);
-      } catch (...) {
-        std::cerr << "[Gemm2] Failed to parse `TM_GEMM_TUNE`, default value "
-                     "will be used.\n";
-        tuning_ = {};
-      }
-    }
-    if (std::getenv("TM_GEMM_WARN_CACHE_MISS")) {
-      warn_cache_miss_ = true;
-    }
-    measurer_.emplace(CreateStoppingCriterion(
-        tuning_.min_iter, tuning_.max_iter, tuning_.max_time));
-  }
-
-  // find launch spec in dispatch cache, dispatch by heuristic on cache miss
-  LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size,
-                      size_t partials_size) {
-    const auto& desc = ctx.desc();
-    const bool allow_prescaled =
-        policy & DispatchPolicy::kSm70Fp8PrefillPrescaled;
-    const auto is_feasible = [&](const LaunchSpec& spec) {
-      return spec.kernel &&
-             (allow_prescaled ||
-              spec.kernel->name().find("_sm70_fp8_pscale") ==
-                  std::string::npos) &&
-             spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
-    };
-    if (policy & DispatchPolicy::kSm70Fp8PrefillPrescaled) {
-      if (auto spec = sm70_fp8_prefill_cache_.Find(desc);
-          spec && is_feasible(*spec)) {
-        return *spec;
-      }
-      if (auto fast_target = GetSm70Fp8BlockPrefillPrescaledTarget(desc)) {
-        auto specs = Find(ctx, barriers_size, partials_size, 0, true);
-        if (auto fast_spec = SelectSm70AwqTp2FastSpec(
-                ctx, specs, *fast_target, barriers_size, partials_size)) {
-          sm70_fp8_prefill_cache_.Insert(desc, *fast_spec);
-          return *fast_spec;
+        cache_{registry_.kernels()}
+    {
+        if (arch_ == 700) {
+            // V100 decode is dominated by many tiny GEMM/GEMV problems. A
+            // broader search space consistently finds better launch specs than
+            // the generic defaults for these SM70 workloads.
+            tuning_.max_splits = 16;
+            tuning_.max_waves  = 32;
+            tuning_.swizzle    = {0, 1, 2, 3, 4};
+            tuning_.top_k      = 0;
+            tuning_.clusters   = 0;
+            tuning_.min_iter   = 2;
+            tuning_.max_iter   = 20;
+            tuning_.max_time   = 2.f;
         }
-      }
-      return {};
+        if (auto str = std::getenv("TM_GEMM_TUNE")) {
+            try {
+                ParseTuningParams(tuning_, str);
+            }
+            catch (...) {
+                std::cerr << "[Gemm2] Failed to parse `TM_GEMM_TUNE`, default value will be used.\n";
+                tuning_ = {};
+            }
+        }
+        if (std::getenv("TM_GEMM_WARN_CACHE_MISS")) {
+            warn_cache_miss_ = true;
+        }
+        measurer_.emplace(CreateStoppingCriterion(tuning_.min_iter, tuning_.max_iter, tuning_.max_time));
     }
-    if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
-      if (auto fast_target = GetSm70Mxfp4MoeGroupedM8FastTarget(desc)) {
-        auto specs = Find(ctx, barriers_size, partials_size, 0, false);
-        if (auto fast_spec = SelectSm70AwqTp2FastSpec(
-                ctx, specs, *fast_target, barriers_size, partials_size)) {
-          return *fast_spec;
+
+    // find launch spec in dispatch cache, dispatch by heuristic on cache miss
+    LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size, size_t partials_size)
+    {
+        const auto& desc = ctx.desc();
+        const auto is_feasible = [&](const LaunchSpec& spec) {
+            return spec.kernel && spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
+        };
+        if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
+            if (auto fast_target = GetSm70Mxfp4MoeGroupedM8FastTarget(desc)) {
+                auto specs = Find(ctx, barriers_size, partials_size, 0);
+                if (auto fast_spec = SelectSm70AwqTp2FastSpec(
+                        ctx, specs, *fast_target, barriers_size, partials_size)) {
+                    return *fast_spec;
+                }
+                return {};
+            }
+        }
+        if (policy & DispatchPolicy::kReuse) {
+            if (auto spec = cache_.LowerBound(desc); spec && is_feasible(*spec)) {
+                return *spec;
+            }
+            if (warn_cache_miss_) {
+                std::cerr << "Failed to find a feasible kernel in the cache, will dispatch by heuristic: "
+                          << to_string(ctx.desc()) << std::endl;
+            }
+        }
+
+        if (auto spec = cache_.Find(desc); spec && is_feasible(*spec)) {
+            return *spec;
+        }
+
+        const auto fast_target = GetSm70AwqTp2FastTarget(desc);
+        auto specs = Find(ctx, barriers_size, partials_size, fast_target ? 0 : 1);
+        if (!specs.empty()) {
+            auto selected = specs.front();
+            if (fast_target) {
+                if (auto fast_spec =
+                        SelectSm70AwqTp2FastSpec(ctx, specs, *fast_target, barriers_size, partials_size)) {
+                    selected = *fast_spec;
+                }
+            }
+            cache_.Insert(desc, selected);
+            return selected;
         }
         return {};
-      }
-    }
-    if (policy & DispatchPolicy::kReuse) {
-      if (auto spec = cache_.LowerBound(desc); spec && is_feasible(*spec)) {
-        return *spec;
-      }
-      if (warn_cache_miss_) {
-        std::cerr << "Failed to find a feasible kernel in the cache, will "
-                     "dispatch by heuristic: "
-                  << to_string(ctx.desc()) << std::endl;
-      }
     }
 
-    if (auto spec = cache_.Find(desc); spec && is_feasible(*spec)) {
-      return *spec;
-    }
-
-    const auto fast_target = GetSm70AwqTp2FastTarget(desc);
-    auto specs =
-        Find(ctx, barriers_size, partials_size, fast_target ? 0 : 1, false);
-    if (!specs.empty()) {
-      auto selected = specs.front();
-      if (fast_target) {
-        if (auto fast_spec = SelectSm70AwqTp2FastSpec(
-                ctx, specs, *fast_target, barriers_size, partials_size)) {
-          selected = *fast_spec;
-        }
-      }
-      cache_.Insert(desc, selected);
-      return selected;
-    }
-    return {};
-  }
-
-  std::vector<LaunchSpec> Find(Context& ctx, size_t barrier_size,
-                               size_t partials_size, int top_k,
-                               bool include_prescaled) {
-    std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
-    if (!include_prescaled) {
-      feasible.erase(
-          std::remove_if(feasible.begin(), feasible.end(), [](const Kernel* k) {
-            return k->name().find("_sm70_fp8_pscale") != std::string::npos;
-          }),
-          feasible.end());
-    }
-
-    std::vector<std::vector<LaunchSpec>> clusters;
+    std::vector<LaunchSpec> Find(Context& ctx, size_t barrier_size, size_t partials_size, int top_k)
     {
-      std::vector<LaunchSpec> tmp;
-      tmp.reserve(feasible.size());
-      for (const auto& k : feasible) {
-        LaunchSpec spec{k};
-        tmp.push_back(spec);
-      }
-      clusters = Cluster(tmp, ClusteringParam{false, true});
-    }
-    std::vector<Kernel*> proxies;
-    proxies.reserve(clusters.size());
+        std::vector<Kernel*> feasible = ctx.Filter(registry_.kernels());
 
-    for (const auto& c : clusters) {
-      proxies.push_back(c.front().kernel);
-    }
+        std::vector<std::vector<LaunchSpec>> clusters;
+        {
+            std::vector<LaunchSpec> tmp;
+            tmp.reserve(feasible.size());
+            for (const auto& k : feasible) {
+                LaunchSpec spec{k};
+                tmp.push_back(spec);
+            }
+            clusters = Cluster(tmp, ClusteringParam{false, true});
+        }
+        std::vector<Kernel*> proxies;
+        proxies.reserve(clusters.size());
 
-    std::vector<std::pair<int, LaunchSpec>> specs;
+        for (const auto& c : clusters) {
+            proxies.push_back(c.front().kernel);
+        }
 
-    PopulateParam param{};
-    param.max_splits = tuning_.max_splits;
-    param.max_waves = tuning_.max_waves;
-    param.swizzle = tuning_.swizzle.at(0);
-    param.barriers_size = barrier_size;
-    param.partials_size = partials_size;
+        std::vector<std::pair<int, LaunchSpec>> specs;
 
-    for (int cluster_id = 0; cluster_id < (int)proxies.size(); ++cluster_id) {
-      auto& kernel = *proxies[cluster_id];
+        PopulateParam param{};
+        param.max_splits    = tuning_.max_splits;
+        param.max_waves     = tuning_.max_waves;
+        param.swizzle       = tuning_.swizzle.at(0);
+        param.barriers_size = barrier_size;
+        param.partials_size = partials_size;
 
-      auto tmp = ctx.Populate(kernel, param);
-      for (const auto& s : tmp) {
-        specs.emplace_back(cluster_id, s);
-      }
-    }
+        for (int cluster_id = 0; cluster_id < (int)proxies.size(); ++cluster_id) {
+            auto& kernel = *proxies[cluster_id];
 
-    // std::cerr << "#kernel: " << kernels.size() << ", #cluster: " <<
-    // clusters.size()
-    //           << ", #metric: " << metrics.size() << "\n";
+            auto tmp = ctx.Populate(kernel, param);
+            for (const auto& s : tmp) {
+                specs.emplace_back(cluster_id, s);
+            }
+        }
 
-    int64_t mio_max = 0;
-    int64_t mma_max = 0;
-    for (const auto& [_, s] : specs) {
-      auto& [mio, mma] = s.estimated;
-      mio_max = std::max(mio_max, mio);
-      mma_max = std::max(mma_max, mma);
-    }
-    std::vector<float> mio_ratio;
-    std::vector<float> mma_ratio;
-    std::vector<float> avg_ratio;
-    for (const auto& [_, s] : specs) {
-      auto& [mio, mma] = s.estimated;
-      mio_ratio.push_back((float)mio / mio_max);
-      mma_ratio.push_back((float)mma / mma_max);
-      avg_ratio.push_back(.5 * (mio_ratio.back() + mma_ratio.back()));
-    }
-    auto idxs = ArgSort(specs.size(), [&](int i, int j) {  //
-      return avg_ratio[i] < avg_ratio[j];
-    });
+        // std::cerr << "#kernel: " << kernels.size() << ", #cluster: " << clusters.size()
+        //           << ", #metric: " << metrics.size() << "\n";
 
-    // for (const auto& i : idxs) {
-    //     auto [cid, s, m] = metrics[i];
-    //     std::cout << clusters[cid].front().kernel->name() << " s" << s << " "
-    //     << avg_ratio[i] << " " << mio_ratio[i]
-    //               << " " << mma_ratio[i] << " " << m.mio_cost << " " <<
-    //               m.mma_cost << "\n";
-    // }
+        int64_t mio_max = 0;
+        int64_t mma_max = 0;
+        for (const auto& [_, s] : specs) {
+            auto& [mio, mma] = s.estimated;
+            mio_max          = std::max(mio_max, mio);
+            mma_max          = std::max(mma_max, mma);
+        }
+        std::vector<float> mio_ratio;
+        std::vector<float> mma_ratio;
+        std::vector<float> avg_ratio;
+        for (const auto& [_, s] : specs) {
+            auto& [mio, mma] = s.estimated;
+            mio_ratio.push_back((float)mio / mio_max);
+            mma_ratio.push_back((float)mma / mma_max);
+            avg_ratio.push_back(.5 * (mio_ratio.back() + mma_ratio.back()));
+        }
+        auto idxs = ArgSort(specs.size(), [&](int i, int j) {  //
+            return avg_ratio[i] < avg_ratio[j];
+        });
 
-    top_k = top_k > 0 ? std::min<int>(idxs.size(), top_k) : (int)idxs.size();
-    std::vector<LaunchSpec> ret;
-    ret.reserve(top_k);
-    for (int i = 0; i < top_k; ++i) {
-      const auto& [cluster_id, spec] = specs[idxs[i]];
-      // Apply `splits` to all kernels in the cluster
-      for (const auto& s : clusters[cluster_id]) {
-        auto tmp = spec;
-        tmp.kernel = s.kernel;
-        ret.push_back(tmp);
-      }
-    }
+        // for (const auto& i : idxs) {
+        //     auto [cid, s, m] = metrics[i];
+        //     std::cout << clusters[cid].front().kernel->name() << " s" << s << " " << avg_ratio[i] << " " <<
+        //     mio_ratio[i]
+        //               << " " << mma_ratio[i] << " " << m.mio_cost << " " << m.mma_cost << "\n";
+        // }
 
-    return ret;
-  }
+        top_k = top_k > 0 ? std::min<int>(idxs.size(), top_k) : (int)idxs.size();
+        std::vector<LaunchSpec> ret;
+        ret.reserve(top_k);
+        for (int i = 0; i < top_k; ++i) {
+            const auto& [cluster_id, spec] = specs[idxs[i]];
+            // Apply `splits` to all kernels in the cluster
+            for (const auto& s : clusters[cluster_id]) {
+                auto tmp   = spec;
+                tmp.kernel = s.kernel;
+                ret.push_back(tmp);
+            }
+        }
 
-  template <class LaunchFunc>
-  int Measure(Context& ctx, size_t barriers_size, size_t partials_size,
-              int top_k, LaunchFunc launch_func, cudaStream_t st) {
-    // Early exit on exact match
-    if (cache_.Find(ctx.desc())) {
-      return 0;
-    }
-    // std::cerr << "GEMM: " << desc.m << "x" << desc.n << "x" << desc.k <<
-    // "\n";
-
-    const auto tmp =
-        Find(ctx, barriers_size, partials_size, tuning_.top_k, false);
-
-    std::vector<LaunchSpec> specs;
-    for (const auto& spec : tmp) {
-      // populate swizzle parameters
-      const auto swis = ctx.Swizzle(spec, tuning_.swizzle);
-      specs.insert(specs.end(), swis.begin(), swis.end());
+        return ret;
     }
 
-    specs = Sampler{*measurer_, tuning_.clusters}.Run(specs, launch_func, st);
+    template<class LaunchFunc>
+    int Measure(
+        Context& ctx, size_t barriers_size, size_t partials_size, int top_k, LaunchFunc launch_func, cudaStream_t st)
+    {
+        // Early exit on exact match
+        if (cache_.Find(ctx.desc())) {
+            return 0;
+        }
+        // std::cerr << "GEMM: " << desc.m << "x" << desc.n << "x" << desc.k << "\n";
 
-    // for (const auto& s : specs) {
-    //     std::cout << s.kernel->name()          //
-    //               << " swizzle=" << s.swizzle  //
-    //               << ", splits=" << s.splits   //
-    //               << ", measured=" << s.measured << "ms\n";
-    //     break;
-    // }
+        const auto tmp = Find(ctx, barriers_size, partials_size, tuning_.top_k);
 
-    if (!specs.empty()) {
-      cache_.Insert(ctx.desc(), specs.front());
-    } else {
-      std::cerr << "No valid kernel found for the problem\n";
-      return -1;
+        std::vector<LaunchSpec> specs;
+        for (const auto& spec : tmp) {
+            // populate swizzle parameters
+            const auto swis = ctx.Swizzle(spec, tuning_.swizzle);
+            specs.insert(specs.end(), swis.begin(), swis.end());
+        }
+
+        specs = Sampler{*measurer_, tuning_.clusters}.Run(specs, launch_func, st);
+
+        // for (const auto& s : specs) {
+        //     std::cout << s.kernel->name()          //
+        //               << " swizzle=" << s.swizzle  //
+        //               << ", splits=" << s.splits   //
+        //               << ", measured=" << s.measured << "ms\n";
+        //     break;
+        // }
+
+        if (!specs.empty()) {
+            cache_.Insert(ctx.desc(), specs.front());
+        }
+        else {
+            std::cerr << "No valid kernel found for the problem\n";
+            return -1;
+        }
+
+        return 0;
     }
 
-    return 0;
-  }
+    /// TODO: move to cuda utils
+    static std::unique_ptr<cudaDeviceProp> GetCudaDeviceProps()
+    {
+        auto props     = std::make_unique<cudaDeviceProp>();
+        int  device_id = -1;
+        cudaGetDevice(&device_id);
+        cudaGetDeviceProperties(props.get(), device_id);
+        return props;
+    }
 
-  /// TODO: move to cuda utils
-  static std::unique_ptr<cudaDeviceProp> GetCudaDeviceProps() {
-    auto props = std::make_unique<cudaDeviceProp>();
-    int device_id = -1;
-    cudaGetDevice(&device_id);
-    cudaGetDeviceProperties(props.get(), device_id);
-    return props;
-  }
+    std::shared_ptr<cudaDeviceProp> props_;
 
-  std::shared_ptr<cudaDeviceProp> props_;
+    int arch_;
 
-  int arch_;
+    Registry registry_;
 
-  Registry registry_;
+    TuningParams tuning_;
 
-  TuningParams tuning_;
+    bool warn_cache_miss_{};
 
-  bool warn_cache_miss_{};
+    std::optional<Measurer> measurer_;
 
-  std::optional<Measurer> measurer_;
+    DispatchCache cache_;
 
-  DispatchCache cache_;
-
-  DispatchCache sm70_fp8_prefill_cache_;
-
-  std::mutex dispatch_mutex_;
+    std::mutex dispatch_mutex_;
 };
 
 // implementation of GEMM interfaces
 
-Gemm::Gemm() : impl_{new Impl{}} {}
+Gemm::Gemm(): impl_{new Impl{}} {}
 
 Gemm::~Gemm() = default;
 
-int Gemm::Run(const Operation& operation, float alpha, const void* A,
-              const MatrixLayout& Adesc, const void* U,
-              const MatrixLayout& Udesc, const void* B,
-              const MatrixLayout& Bdesc, const void* V,
-              const MatrixLayout& Vdesc, float beta, const void* C,
-              const MatrixLayout& Cdesc, void* D, const MatrixLayout& Ddesc,
-              const Workspace& workspace, cudaStream_t stream) {
-  Context context{*impl_->props_};
+int Gemm::Run(const Operation&    operation,
+              float               alpha,
+              const void*         A,
+              const MatrixLayout& Adesc,
+              const void*         U,
+              const MatrixLayout& Udesc,
+              const void*         B,
+              const MatrixLayout& Bdesc,
+              const void*         V,
+              const MatrixLayout& Vdesc,
+              float               beta,
+              const void*         C,
+              const MatrixLayout& Cdesc,
+              void*               D,
+              const MatrixLayout& Ddesc,
+              const Workspace&    workspace,
+              cudaStream_t        stream)
+{
 
-  const auto desc =
-      context.Init(operation, Adesc, Udesc, Bdesc, Vdesc, Cdesc, Ddesc);
+    Context context{*impl_->props_};
 
-  if (!desc) {
-    fprintf(stderr, "invalid argument.\n");
-    TM_CHECK(0);
-    return -1;
-  }
+    const auto desc = context.Init(operation, Adesc, Udesc, Bdesc, Vdesc, Cdesc, Ddesc);
 
-  const auto launch = [=](LaunchSpec spec, cudaStream_t st) {
-    auto _workspace = workspace;
-    return spec.kernel->Launch(operation, alpha, A, Adesc, U, Udesc, B, Bdesc,
-                               V, Vdesc, beta, C, Cdesc, D, Ddesc, spec.swizzle,
-                               spec.splits, _workspace, st);
-  };
-
-  std::optional<Context> dispatch_context_storage;
-  Context* dispatch_context = &context;
-  if (operation.dispatch_num_override > 0 &&
-      operation.dispatch_num_override != context.desc().num) {
-    MatrixLayout dispatch_Adesc = Adesc;
-    MatrixLayout dispatch_Bdesc = Bdesc;
-    MatrixLayout dispatch_Ddesc = Ddesc;
-    dispatch_Adesc.num = operation.dispatch_num_override;
-    dispatch_Bdesc.num = operation.dispatch_num_override;
-    dispatch_Ddesc.num = operation.dispatch_num_override;
-    dispatch_context_storage.emplace(*impl_->props_);
-    if (dispatch_context_storage->Init(operation, dispatch_Adesc, Udesc,
-                                       dispatch_Bdesc, Vdesc, Cdesc,
-                                       dispatch_Ddesc)) {
-      dispatch_context = &*dispatch_context_storage;
-    } else {
-      dispatch_context_storage.reset();
-      dispatch_context = &context;
+    if (!desc) {
+        fprintf(stderr, "invalid argument.\n");
+        TM_CHECK(0);
+        return -1;
     }
-  }
+
+    const auto launch = [=](LaunchSpec spec, cudaStream_t st) {
+        auto _workspace = workspace;
+        return spec.kernel->Launch(operation,
+                                   alpha,
+                                   A,
+                                   Adesc,
+                                   U,
+                                   Udesc,
+                                   B,
+                                   Bdesc,
+                                   V,
+                                   Vdesc,
+                                   beta,
+                                   C,
+                                   Cdesc,
+                                   D,
+                                   Ddesc,
+                                   spec.swizzle,
+                                   spec.splits,
+                                   _workspace,
+                                   st);
+    };
+
+    std::optional<Context> dispatch_context_storage;
+    Context*               dispatch_context = &context;
+    if (operation.dispatch_num_override > 0 && operation.dispatch_num_override != context.desc().num) {
+        MatrixLayout dispatch_Adesc = Adesc;
+        MatrixLayout dispatch_Bdesc = Bdesc;
+        MatrixLayout dispatch_Ddesc = Ddesc;
+        dispatch_Adesc.num          = operation.dispatch_num_override;
+        dispatch_Bdesc.num          = operation.dispatch_num_override;
+        dispatch_Ddesc.num          = operation.dispatch_num_override;
+        dispatch_context_storage.emplace(*impl_->props_);
+        if (dispatch_context_storage->Init(
+                operation, dispatch_Adesc, Udesc, dispatch_Bdesc, Vdesc, Cdesc, dispatch_Ddesc)) {
+            dispatch_context = &*dispatch_context_storage;
+        }
+        else {
+            dispatch_context_storage.reset();
+            dispatch_context = &context;
+        }
+    }
 
 #if 0
     if (operation.reserved) {
@@ -773,70 +687,70 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
     }
 #endif
 
-  LaunchSpec spec{};
+    LaunchSpec spec{};
 
-  const bool measured = operation.dispatch & DispatchPolicy::kMeasure;
-  {
-    std::lock_guard<std::mutex> lock(impl_->dispatch_mutex_);
-    if (measured) {
-      impl_->Measure(*dispatch_context, workspace.barriers_size,
-                     workspace.partials_size, 1, launch, stream);
-    }
-
-    spec = impl_->Dispatch(*dispatch_context, operation.dispatch,
-                           workspace.barriers_size, workspace.partials_size);
-    const bool preserve_default_kernel =
-        operation.dispatch & DispatchPolicy::kPreserveDefaultSplits;
-    const bool preserve_default_split_count =
-        operation.dispatch & DispatchPolicy::kPreserveDefaultSplitCount;
-    if (spec.kernel &&
-        (preserve_default_kernel || preserve_default_split_count)) {
-      auto default_specs =
-          impl_->Find(*dispatch_context, workspace.barriers_size,
-                      workspace.partials_size, 1, false);
-      if (!default_specs.empty()) {
-        const auto default_spec = default_specs.front();
-        if (preserve_default_kernel) {
-          spec.kernel = default_spec.kernel;
+    const bool measured = operation.dispatch & DispatchPolicy::kMeasure;
+    {
+        std::lock_guard<std::mutex> lock(impl_->dispatch_mutex_);
+        if (measured) {
+            impl_->Measure(*dispatch_context, workspace.barriers_size, workspace.partials_size, 1, launch, stream);
         }
-        spec.splits = default_spec.splits;
-        const auto& default_desc = dispatch_context->get_desc(*spec.kernel);
-        spec.swizzle = std::min(spec.swizzle, spec.kernel->GetMaxSwizzle({
-                                                  default_desc.m,
-                                                  default_desc.n,
-                                                  default_desc.k,
-                                                  default_desc.num,
-                                              }));
-      }
+
+        spec = impl_->Dispatch(*dispatch_context, operation.dispatch, workspace.barriers_size, workspace.partials_size);
+        const bool preserve_default_kernel = operation.dispatch & DispatchPolicy::kPreserveDefaultSplits;
+        const bool preserve_default_split_count = operation.dispatch & DispatchPolicy::kPreserveDefaultSplitCount;
+        if (spec.kernel && (preserve_default_kernel || preserve_default_split_count)) {
+            auto default_specs = impl_->Find(*dispatch_context, workspace.barriers_size, workspace.partials_size, 1);
+            if (!default_specs.empty()) {
+                const auto default_spec = default_specs.front();
+                if (preserve_default_kernel) {
+                    spec.kernel = default_spec.kernel;
+                }
+                spec.splits = default_spec.splits;
+                const auto& default_desc = dispatch_context->get_desc(*spec.kernel);
+                spec.swizzle = std::min(
+                    spec.swizzle,
+                    spec.kernel->GetMaxSwizzle({
+                        default_desc.m,
+                        default_desc.n,
+                        default_desc.k,
+                        default_desc.num,
+                    }));
+            }
+        }
     }
-  }
-  if (spec.kernel && dispatch_context != &context) {
-    const auto& actual_desc = context.get_desc(*spec.kernel);
-    spec.swizzle =
-        std::min(spec.swizzle,
-                 spec.kernel->GetMaxSwizzle({actual_desc.m, actual_desc.n,
-                                             actual_desc.k, actual_desc.num}));
-  }
-  MaybeTraceGemmDispatch(dispatch_context->desc(), operation.dispatch, spec,
-                         measured);
+    if (spec.kernel && dispatch_context != &context) {
+        const auto& actual_desc = context.get_desc(*spec.kernel);
+        spec.swizzle =
+            std::min(spec.swizzle, spec.kernel->GetMaxSwizzle({actual_desc.m, actual_desc.n, actual_desc.k, actual_desc.num}));
+    }
+    MaybeTraceGemmDispatch(dispatch_context->desc(), operation.dispatch, spec, measured);
 
-  if (spec.kernel) {
-    // std::cout << "[Gemm] dispatch: " << spec.kernel->name()  //
-    //           << " split_k=" << spec.splits                  //
-    //           << " swizzle=" << spec.swizzle << std::endl;
-    return launch(spec, stream);
-  }
+    if (spec.kernel) {
+        // std::cout << "[Gemm] dispatch: " << spec.kernel->name()  //
+        //           << " split_k=" << spec.splits                  //
+        //           << " swizzle=" << spec.swizzle << std::endl;
+        return launch(spec, stream);
+    }
 
-  TM_CHECK(0) << "No feasible kernel found for the problem: "
-              << to_string(context.desc());
+    TM_CHECK(0) << "No feasible kernel found for the problem: " << to_string(context.desc());
 
-  return -1;
+    return -1;
 }
 
-int Gemm::Export(std::ostream& os) { return impl_->cache_.Export(os); }
+int Gemm::Export(std::ostream& os)
+{
+    return impl_->cache_.Export(os);
+}
 
-int Gemm::Import(std::istream& is) { return impl_->cache_.Import(is); }
+int Gemm::Import(std::istream& is)
+{
+    return impl_->cache_.Import(is);
+}
 
-std::vector<int> Gemm::GetTuningSeq() const { return impl_->tuning_.seq; }
+std::vector<int> Gemm::GetTuningSeq() const
+{
+    return impl_->tuning_.seq;
+}
 
 }  // namespace turbomind::gemm

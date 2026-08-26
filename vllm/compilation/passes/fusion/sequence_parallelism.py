@@ -256,71 +256,6 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
         )
 
 
-class MiddleAllReduceSm70GemmaLongPrefillPattern(_SequenceParallelPatternHelper):
-    """Keep the accepted mixed-dtype SM70 norm while applying SP."""
-
-    def __init__(
-        self,
-        epsilon: float,
-        dtype: torch.dtype,
-        device: str | None,
-        weight_dtype: torch.dtype,
-    ) -> None:
-        super().__init__(epsilon, dtype, device)
-        self.weight_dtype = weight_dtype
-
-    def get_inputs(self) -> list[torch.Tensor]:
-        residual = torch.empty([4, 4], device=self.device, dtype=torch.float32)
-        mm_1 = torch.empty([4, 4], device=self.device, dtype=self.dtype)
-        weight = torch.empty([4], device=self.device, dtype=self.weight_dtype)
-        return [residual, mm_1, weight]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            residual: torch.Tensor,
-            mm_1: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            all_reduce = self._all_reduce(mm_1)
-            return torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm(
-                all_reduce,
-                residual,
-                weight,
-                self.epsilon,
-            )
-
-        def replacement(
-            residual: torch.Tensor,
-            mm_1: torch.Tensor,
-            weight: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            reduce_scatter = self._reduce_scatter(mm_1)
-            local_len = reduce_scatter.size(0)
-            residual = residual[
-                self.tp_rank * local_len : self.tp_rank * local_len + local_len, ...
-            ]
-            normalized, residual_out = (
-                torch.ops.vllm.sm70_gemma_long_prefill_fused_add_rms_norm(
-                    reduce_scatter,
-                    residual,
-                    weight,
-                    self.epsilon,
-                )
-            )
-            return self._all_gather(normalized), residual_out
-
-        pm.register_replacement(
-            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
-        pm.register_replacement(
-            get_first_out_wrapper(pattern),
-            get_first_out_wrapper(replacement),
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-        )
-
-
 class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
     def __init__(
         self,
@@ -648,16 +583,6 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
             MiddleAllReduceRMSNormPattern(
                 epsilon, self.model_dtype, self.device
             ).register(self.patterns)
-            if epsilon == 1e-6 and hasattr(
-                torch.ops.vllm,
-                "sm70_gemma_long_prefill_fused_add_rms_norm",
-            ):
-                MiddleAllReduceSm70GemmaLongPrefillPattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                    self.model_dtype,
-                ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 

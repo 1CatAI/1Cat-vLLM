@@ -64,27 +64,6 @@ def _mxfp4_grouped_m8_enabled() -> bool:
     return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8)
 
 
-def _mxfp4_grouped_verifier_enabled() -> bool:
-    return bool(envs.VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER)
-
-
-def _mxfp4_grouped_verifier_for_tokens(num_tokens: int) -> bool:
-    return bool(
-        (num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled())
-        or (
-            1 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS
-            and _mxfp4_grouped_verifier_enabled()
-        )
-    )
-
-
-def _mxfp4_grouped_m8_expert_rows_enabled() -> bool:
-    return bool(
-        (_mxfp4_grouped_m8_enabled() or _mxfp4_grouped_verifier_enabled())
-        and envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS
-    )
-
-
 @triton.jit
 def _compact_sorted_experts_kernel(
     sorted_expert_ids_ptr,
@@ -161,13 +140,7 @@ def _select_mxfp4_stage_dispatch(
         # tail entries as zero-row experts, avoiding a host readback of the
         # dynamic unique-expert count.
         graph_expert_slots = num_tokens * _DEEPSEEK_V4_FLASH_TOP_K
-        if _mxfp4_grouped_verifier_for_tokens(num_tokens):
-            if _mxfp4_grouped_m8_expert_rows_enabled():
-                return (
-                    buffers["compact_expert_offsets"],
-                    buffers["active_expert_ids"],
-                    graph_expert_slots,
-                )
+        if num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled():
             return (
                 buffers["slot_expert_offsets"],
                 buffers["permuted_experts_id"],
@@ -183,18 +156,6 @@ def _select_mxfp4_stage_dispatch(
             graph_expert_slots,
         )
     return buffers["expert_offsets"], buffers["dense_expert_ids"], num_experts
-
-
-def _select_mxfp4_direct_order_offsets(
-    buffers: dict[str, torch.Tensor],
-) -> torch.Tensor:
-    """Return immutable one-row offsets for B1 direct-order decode.
-
-    Active-expert compaction overwrites ``compact_expert_offsets`` during
-    M2--M8 warmup and verifier calls. Direct-order B1 has one row per route,
-    so it must use the separately maintained slot offsets instead.
-    """
-    return buffers["slot_expert_offsets"]
 
 
 def validate_mxfp4_sm70_moe_contract(
@@ -355,11 +316,6 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         )
         if envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE:
             required_ops += ("mxfp4_moe_single_token_prepare_w13_sm70_out",)
-        if (
-            envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
-            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
-        ):
-            required_ops += ("awq_moe_single_token_weighted_reduce_out",)
         missing_ops = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing_ops:
             raise RuntimeError(
@@ -743,49 +699,6 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts
         )
-        direct_order = (
-            direct_top6
-            and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
-            and topk_ids.dtype == torch.int32
-            and topk_ids.is_contiguous()
-        )
-        if direct_order:
-            route_ids = topk_ids.view(-1)
-            route_offsets = _select_mxfp4_direct_order_offsets(buffers)
-            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-                buffers["gate_up"],
-                x,
-                route_offsets,
-                route_ids,
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_w13_k_dim,
-                layer.sm70_mxfp4_w13_n_dim,
-                layer.sm70_mxfp4_group_size,
-            )
-            self._apply_swiglu(layer, buffers["intermediate"], buffers["gate_up"])
-            sm70_ops.mxfp4_moe_dense_stage_sm70_out(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                route_offsets,
-                route_ids,
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_w2_k_dim,
-                layer.sm70_mxfp4_w2_n_dim,
-                layer.sm70_mxfp4_group_size,
-            )
-            sm70_ops.awq_moe_single_token_weighted_reduce_out(
-                buffers["sorted_output"],
-                topk_weights,
-                buffers["token_expert_indices"],
-                output,
-                _DEEPSEEK_V4_FLASH_TOP_K,
-                layer.sm70_mxfp4_hidden_size,
-            )
-            return output
         if direct_top6:
             sm70_ops.mxfp4_moe_single_token_prepare_w13_sm70_out(
                 buffers["gate_up"],
@@ -854,8 +767,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             num_tokens > 1
             and num_tokens <= _mxfp4_active_expert_max_tokens()
             and not (
-                _mxfp4_grouped_verifier_for_tokens(num_tokens)
-                and not _mxfp4_grouped_m8_expert_rows_enabled()
+                num_tokens == _GRAPH_SAFE_MAX_TOKENS and _mxfp4_grouped_m8_enabled()
             )
             and layer.expert_map is None
             and layer.local_num_experts == layer.global_num_experts

@@ -40,11 +40,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _qk_dsplit_block_h(num_heads: int) -> int:
-    """Use one CTA head group for the exact TP4 decode shape."""
-    return 16 if num_heads == 16 else 8
-
-
 class DeepseekV4SM70SparseBackend(DeepseekV4FlashMLASparseBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
 
@@ -263,7 +258,6 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
                     partial_qk=partial_qk,
                     partial_probs=partial_probs,
-                    stage1_block_h=_qk_dsplit_block_h(q.shape[1]),
                     **common_kwargs,
                 )
             else:

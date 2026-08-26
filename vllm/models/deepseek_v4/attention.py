@@ -308,7 +308,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.mla_attn.prefix,
-                validity_cache_prefix=self.swa_cache_layer.prefix,
             )
 
     def forward(
@@ -416,11 +415,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     hidden_states,
                     compressor.fused_wkv_wgate.weight,
                     torch.float32,
-                    getattr(
-                        compressor.fused_wkv_wgate,
-                        "_sm70_dsv4_fp13_weight",
-                        None,
-                    ),
                 )
                 if output is not None:
                     return output
@@ -440,11 +434,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     hidden_states,
                     indexer.weights_proj.weight,
                     hidden_states.dtype,
-                    getattr(
-                        indexer.weights_proj,
-                        "_sm70_dsv4_fp13_weight",
-                        None,
-                    ),
                 )
                 if output is not None:
                     return output
@@ -457,11 +446,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight,
                     torch.float32,
-                    getattr(
-                        indexer.compressor.fused_wkv_wgate,
-                        "_sm70_dsv4_fp13_weight",
-                        None,
-                    ),
                 )
                 if output is not None:
                     return output
@@ -866,7 +850,6 @@ class DeepseekV4Indexer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.weights_proj",
         )
-        self.weights_proj._sm70_dsv4_fp13_gemv = True
         self.softmax_scale = self.head_dim**-0.5
 
         self.scale_fmt = "ue8m0"
@@ -940,7 +923,7 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            if indexer_metadata.compressed_max_seq_len <= self.topk_tokens:
+            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
                 compressor(compressed_kv_score, positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (

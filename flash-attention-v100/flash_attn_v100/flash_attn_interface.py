@@ -18,13 +18,11 @@ except ImportError:
 
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
-E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
-_grouped_verify_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
 
@@ -52,12 +50,6 @@ class _PrefillSplitkv3Workspace:
     row_sum: torch.Tensor
     out: torch.Tensor
     softmax_lse: torch.Tensor
-
-
-@dataclass
-class _GroupedVerifyWorkspace:
-    partial_out: torch.Tensor
-    partial_lse: torch.Tensor
 
 
 def maybe_contiguous(x):
@@ -160,7 +152,6 @@ def _get_decode_plan(
     workspace_seq_capacity_hint: int | None = None,
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
-    valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
 ) -> _DecodePlan:
     batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
@@ -193,7 +184,6 @@ def _get_decode_plan(
         _validate_decode_partition_size(
             int(partition_size_hint),
             "partition_size_hint",
-            valid_partition_sizes,
         )
         if partition_size_hint is not None
         else _get_decode_partition_size(
@@ -503,35 +493,6 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
-    device_index = q.device.index if q.device.index is not None else -1
-    key = (
-        q.device.type,
-        device_index,
-        _workspace_stream_id(q.device),
-        q.dtype,
-    )
-    workspace = (
-        _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
-    )
-    if workspace is None:
-        workspace = _GroupedVerifyWorkspace(
-            partial_out=torch.empty(
-                (80, 8, 6, 256),
-                dtype=torch.float16,
-                device=q.device,
-            ),
-            partial_lse=torch.empty(
-                (80, 8, 6),
-                dtype=torch.float32,
-                device=q.device,
-            ),
-        )
-        if _can_cache_workspace(q):
-            _grouped_verify_workspace_cache[key] = workspace
-    return workspace
-
-
 def _get_decode_partition_size(
     max_seq_capacity: int,
     head_dim: int,
@@ -568,13 +529,11 @@ def _select_default_decode_partition_size(
     return DEFAULT_DECODE_PARTITION_SIZE
 
 
-def _validate_decode_partition_size(
-    value: int,
-    name: str,
-    valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
-) -> int:
-    if value not in valid_partition_sizes:
-        raise ValueError(f"{name} must be one of {valid_partition_sizes}, got {value}")
+def _validate_decode_partition_size(value: int, name: str) -> int:
+    if value not in VALID_DECODE_PARTITION_SIZES:
+        raise ValueError(
+            f"{name} must be one of {VALID_DECODE_PARTITION_SIZES}, got {value}"
+        )
     return value
 
 
@@ -938,8 +897,6 @@ def flash_attn_decode_paged(
     workspace_seq_capacity_hint: int | None = None,
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
-    anchor_lens: torch.Tensor | None = None,
-    anchored_window: int = 0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -948,16 +905,9 @@ def flash_attn_decode_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
-    anchor_lens = maybe_contiguous(anchor_lens)
     window_size_left, window_size_right = window_size
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
-    if anchored_window < 0:
-        raise ValueError("anchored_window must be non-negative")
-    if (anchored_window > 0) != (anchor_lens is not None):
-        raise ValueError(
-            "anchor_lens and a positive anchored_window must be provided together"
-        )
     batch_capacity = q.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
@@ -1010,8 +960,6 @@ def flash_attn_decode_paged(
         float(v_scale),
         int(window_size_left),
         int(window_size_right),
-        anchor_lens,
-        int(anchored_window),
     )
 
 
@@ -1021,49 +969,6 @@ def flash_attn_decode_paged_xqa_available() -> bool:
 
 def flash_attn_decode_paged_xqa_staged_available() -> bool:
     return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
-
-
-def flash_attn_grouped_verify_paged(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    softmax_scale: float | None = None,
-    out: torch.Tensor | None = None,
-    kv_cache_dtype: str = "fp8_e5m2",
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-    one_pass: bool = False,
-) -> torch.Tensor:
-    """Exact grouped q8/H6/D256 DFlash2 verifier prototype for SM70.
-
-    The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across four GQA heads. Workspaces are stream-local and fixed
-    size so a warmed entry is CUDA-graph safe. Unsupported shapes fail closed.
-    """
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** -0.5
-    q = maybe_contiguous(q)
-    block_table = maybe_contiguous(block_table)
-    seq_lens = maybe_contiguous(seq_lens)
-    out = maybe_contiguous(out)
-    workspace = _get_grouped_verify_workspace(q)
-    return flash_attn_v100_cuda.grouped_verify_paged_fwd(
-        q,
-        k_cache,
-        v_cache,
-        out,
-        block_table,
-        seq_lens,
-        workspace.partial_out,
-        workspace.partial_lse,
-        float(softmax_scale),
-        kv_cache_dtype,
-        float(k_scale),
-        float(v_scale),
-        bool(one_pass),
-    )
 
 
 def flash_attn_decode_paged_xqa(
@@ -1082,7 +987,6 @@ def flash_attn_decode_paged_xqa(
     workspace_seq_capacity_hint: int | None = None,
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
-    batch_context_routing: bool = False,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -1112,22 +1016,6 @@ def flash_attn_decode_paged_xqa(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
-        valid_partition_sizes=(
-            E4M3_XQA_VALID_DECODE_PARTITION_SIZES
-            if kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and q.ndim == 3
-            and q.shape[1:] == (6, 256)
-            and (
-                q.shape[0] == 1
-                or (
-                    os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
-                    and 1 < q.shape[0] <= 16
-                )
-            )
-            and k_cache.dtype == torch.uint8
-            and v_cache.dtype == torch.uint8
-            else VALID_DECODE_PARTITION_SIZES
-        ),
     )
     _assert_decode_launch_covers_seq_lens(
         plan,
@@ -1186,22 +1074,6 @@ def flash_attn_decode_paged_xqa(
             int(window_size_right),
         )
 
-    batch_context_max_seq_len = 0
-    if batch_context_routing:
-        live_max_seq_len = int(max_seq_len_hint or 0)
-        workspace_max_seq_len = int(workspace_seq_capacity_hint or 0)
-        if _cuda_graph_capture_active():
-            batch_context_max_seq_len = max(
-                live_max_seq_len,
-                workspace_max_seq_len,
-            )
-        else:
-            batch_context_max_seq_len = live_max_seq_len
-        if batch_context_max_seq_len <= 0:
-            batch_context_max_seq_len = workspace_max_seq_len
-        if batch_context_max_seq_len <= 0:
-            batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
-
     return flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
         k_cache,
@@ -1221,7 +1093,6 @@ def flash_attn_decode_paged_xqa(
         float(v_scale),
         int(window_size_left),
         int(window_size_right),
-        int(batch_context_max_seq_len),
     )
 
 
@@ -1361,8 +1232,6 @@ def flash_attn_prefill_paged(
     v_scale: float = 1.0,
     causal: bool = True,
     window_size: tuple = (-1, -1),
-    anchor_lens: torch.Tensor | None = None,
-    anchored_window: int = 0,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1372,16 +1241,9 @@ def flash_attn_prefill_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
-    anchor_lens = maybe_contiguous(anchor_lens)
     window_size_left, window_size_right = window_size
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
-    if anchored_window < 0:
-        raise ValueError("anchored_window must be non-negative")
-    if (anchored_window > 0) != (anchor_lens is not None):
-        raise ValueError(
-            "anchor_lens and a positive anchored_window must be provided together"
-        )
 
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
@@ -1400,8 +1262,6 @@ def flash_attn_prefill_paged(
         causal,
         int(window_size_left),
         int(window_size_right),
-        anchor_lens,
-        int(anchored_window),
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
@@ -1573,8 +1433,6 @@ def flash_attn_prefill_paged_bhmd(
         causal,
         int(window_size_left),
         int(window_size_right),
-        None,
-        0,
     )
 
 
@@ -1663,7 +1521,6 @@ __all__ = [
     "flash_attn_decode_paged",
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
-    "flash_attn_grouped_verify_paged",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

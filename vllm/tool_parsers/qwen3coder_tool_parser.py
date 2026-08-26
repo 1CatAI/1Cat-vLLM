@@ -358,7 +358,10 @@ class Qwen3CoderToolParser(ToolParser):
                 if pos != -1
             ]
             tool_start = min(tool_start_candidates) if tool_start_candidates else -1
-            if self.tool_call_start_token_id in delta_token_ids or tool_start != -1:
+            if (
+                self.tool_call_start_token_id in delta_token_ids
+                or tool_start != -1
+            ):
                 self.is_tool_call_started = True
                 # Return any content before the tool call
                 if tool_start > len(previous_text):

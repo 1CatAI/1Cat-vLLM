@@ -388,9 +388,6 @@ class CommonAttentionMetadata:
 
     causal: bool = True
 
-    cudagraph_graph_variant: int | None = None
-    """Optional semantic variant for CUDA graph capture dummy runs."""
-
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
@@ -418,14 +415,6 @@ class CommonAttentionMetadata:
     and for all rows outside async spec decode; optimistic for async-spec
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
-
-    prefix_anchor_lens: torch.Tensor | None = None
-    """(batch_size,) per-request prefix length (prompt token count) for
-    prefix-anchored sliding-window attention. Tokens with logical index below
-    this stay globally visible; later (generated) tokens additionally see a
-    fixed sliding window. None disables the mechanism. The attention backend
-    copies this into its own persistent buffer and reads the window size from
-    the cache group's ``PrefixAnchoredSWASpec``."""
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
@@ -527,7 +516,6 @@ class CommonAttentionMetadata:
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
             causal=self.causal,
-            cudagraph_graph_variant=self.cudagraph_graph_variant,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
@@ -535,7 +523,6 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
             is_prefilling=maybe_slice_reqs(self.is_prefilling),
-            prefix_anchor_lens=maybe_slice_reqs(self.prefix_anchor_lens),
         )
 
 

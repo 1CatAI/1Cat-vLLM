@@ -15,7 +15,6 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_v100 import (
-    DFlash2SmallQPreparedMetadata,
     FlashAttnV100Backend,
     FlashAttnV100Impl,
     FlashAttnV100MetadataBuilder,
@@ -263,7 +262,6 @@ class FlashInferSM70MetadataBuilder(FlashAttnV100MetadataBuilder):
         fast_build: bool = False,
         ddtree_parent_ids=None,
         ddtree_num_tree_tokens_cpu=None,
-        prepared_dflash2_smallq_metadata: DFlash2SmallQPreparedMetadata | None = None,
     ):
         attn_metadata = super().build(
             common_prefix_len,
@@ -271,7 +269,6 @@ class FlashInferSM70MetadataBuilder(FlashAttnV100MetadataBuilder):
             fast_build,
             ddtree_parent_ids,
             ddtree_num_tree_tokens_cpu,
-            prepared_dflash2_smallq_metadata,
         )
         return self._attach_planner_decision(
             attn_metadata,

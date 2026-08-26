@@ -137,12 +137,6 @@ class StagedWriteTensor:
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
 
-    def get_cpu_view(self) -> torch.Tensor:
-        """Return the host view when this tensor is backed by mapped memory."""
-        if not hasattr(self, "_uva_buf"):
-            raise RuntimeError("This StagedWriteTensor is not UVA-backed")
-        return self._uva_buf.cpu
-
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
     ) -> None:

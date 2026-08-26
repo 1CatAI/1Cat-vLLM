@@ -22,7 +22,9 @@ int sm70_splitk_ceil_div_int(int numerator, int denominator) {
 }
 
 CUTLASS_HOST_DEVICE
-int sm70_splitk_min_int(int lhs, int rhs) { return lhs < rhs ? lhs : rhs; }
+int sm70_splitk_min_int(int lhs, int rhs) {
+  return lhs < rhs ? lhs : rhs;
+}
 
 template <int GroupSize, int CtaK = kCtaK>
 CUTLASS_HOST_DEVICE int sm70_splitk_group_tiles() {
@@ -74,8 +76,8 @@ int sm70_splitk_partition_tile_count(int remaining_tiles,
 }
 
 template <int GroupSize, int CtaK = kCtaK>
-CUTLASS_HOST_DEVICE Sm70SplitKPartition
-sm70_splitk_partition(int k, int requested_split_k, int partition_idx) {
+CUTLASS_HOST_DEVICE Sm70SplitKPartition sm70_splitk_partition(
+    int k, int requested_split_k, int partition_idx) {
   int const active_split_k = sm70_active_split_k(k, requested_split_k, CtaK);
   if (partition_idx >= active_split_k) {
     return {0, 0};
@@ -133,9 +135,10 @@ class Sm70AtomicFp16Epilogue {
           int const frag_row_idx =
               row + ThreadMap::Iterations::kRow *
                         (group + ThreadMap::Iterations::kGroup * cluster);
-          int const row_offset = row * ThreadMap::Delta::kRow +
-                                 group * ThreadMap::Delta::kGroup +
-                                 cluster * ThreadMap::Delta::kCluster;
+          int const row_offset =
+              row * ThreadMap::Delta::kRow +
+              group * ThreadMap::Delta::kGroup +
+              cluster * ThreadMap::Delta::kCluster;
           int const logical_row = thread_start_row + row_offset;
 
           CUTLASS_PRAGMA_UNROLL
@@ -165,7 +168,7 @@ class Sm70AtomicFp16Epilogue {
  public:
   CUTLASS_DEVICE
   Sm70AtomicFp16Epilogue(SharedStorage& shared_storage, int thread_idx,
-                         int warp_idx, int lane_idx)
+                              int warp_idx, int lane_idx)
       : warp_tile_iterator_(shared_storage.reference(), lane_idx),
         shared_load_iterator_(shared_storage.reference(), thread_idx) {
     using WarpCount = typename CutlassEpilogue::WarpCount;
@@ -174,7 +177,8 @@ class Sm70AtomicFp16Epilogue {
     int const warp_m = warp_mn % WarpCount::kM;
     int const warp_n = warp_mn / WarpCount::kM;
 
-    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m, warp_n};
+    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m,
+                                     warp_n};
     warp_tile_iterator_.add_tile_offset(warp_offset);
   }
 
@@ -216,7 +220,8 @@ class Sm70AtomicFp16Epilogue {
             CutlassEpilogue::kSmemPointerOffset);
       }
 
-      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c, n);
+      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c,
+                            n);
       ++destination_iterator;
     }
   }
@@ -258,9 +263,10 @@ class Sm70AtomicFp32Epilogue {
           int const frag_row_idx =
               row + ThreadMap::Iterations::kRow *
                         (group + ThreadMap::Iterations::kGroup * cluster);
-          int const row_offset = row * ThreadMap::Delta::kRow +
-                                 group * ThreadMap::Delta::kGroup +
-                                 cluster * ThreadMap::Delta::kCluster;
+          int const row_offset =
+              row * ThreadMap::Delta::kRow +
+              group * ThreadMap::Delta::kGroup +
+              cluster * ThreadMap::Delta::kCluster;
           int const logical_row = thread_start_row + row_offset;
 
           CUTLASS_PRAGMA_UNROLL
@@ -289,7 +295,7 @@ class Sm70AtomicFp32Epilogue {
  public:
   CUTLASS_DEVICE
   Sm70AtomicFp32Epilogue(SharedStorage& shared_storage, int thread_idx,
-                         int warp_idx, int lane_idx)
+                              int warp_idx, int lane_idx)
       : warp_tile_iterator_(shared_storage.reference(), lane_idx),
         shared_load_iterator_(shared_storage.reference(), thread_idx) {
     using WarpCount = typename CutlassEpilogue::WarpCount;
@@ -298,14 +304,15 @@ class Sm70AtomicFp32Epilogue {
     int const warp_m = warp_mn % WarpCount::kM;
     int const warp_n = warp_mn / WarpCount::kM;
 
-    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m, warp_n};
+    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m,
+                                     warp_n};
     warp_tile_iterator_.add_tile_offset(warp_offset);
   }
 
   CUTLASS_DEVICE
   void operator()(OutputTileIterator destination_iterator,
-                  AccumulatorTile const& accumulators, float* __restrict__ c,
-                  int n) {
+                  AccumulatorTile const& accumulators,
+                  float* __restrict__ c, int n) {
     AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
 
     CUTLASS_PRAGMA_UNROLL
@@ -340,16 +347,17 @@ class Sm70AtomicFp32Epilogue {
             CutlassEpilogue::kSmemPointerOffset);
       }
 
-      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c, n);
+      atomic_store_fragment(destination_iterator, aligned_accum_fragment, c,
+                            n);
       ++destination_iterator;
     }
   }
 };
 
-// 0009: single fp32->fp16 narrow of the split-K scratch (replaces the
-// per-partial
-// __float2half_rn narrow the fp16-atomic epilogue did S times). Templated so
-// the symbol has vague linkage across the 7 gemm TUs that include this header.
+
+// 0009: single fp32->fp16 narrow of the split-K scratch (replaces the per-partial
+// __float2half_rn narrow the fp16-atomic epilogue did S times). Templated so the
+// symbol has vague linkage across the 7 gemm TUs that include this header.
 template <int BlockSize = 256>
 __global__ void sm70_marlin_narrow_f32_to_f16(const float* __restrict__ src,
                                               half* __restrict__ dst,

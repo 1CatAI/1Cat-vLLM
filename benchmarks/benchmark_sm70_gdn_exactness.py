@@ -165,15 +165,12 @@ def _make_inputs(args: argparse.Namespace) -> dict[str, torch.Tensor]:
         )
         * args.input_scale
     ).to(dtype)
-    g = (
-        -torch.rand(
-            (args.batch, args.seqlen, args.v_heads),
-            device=device,
-            dtype=torch.float32,
-            generator=generator,
-        )
-        * args.gate_scale
-    )
+    g = -torch.rand(
+        (args.batch, args.seqlen, args.v_heads),
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    ) * args.gate_scale
     beta = torch.sigmoid(
         torch.randn(
             (args.batch, args.seqlen, args.v_heads),
@@ -214,7 +211,9 @@ def _make_inputs(args: argparse.Namespace) -> dict[str, torch.Tensor]:
         "initial_state": initial_state.cpu(),
     }
     if args.cu_seqlens:
-        result["cu_seqlens"] = torch.tensor([0, args.seqlen], dtype=torch.int32)
+        result["cu_seqlens"] = torch.tensor(
+            [0, args.seqlen], dtype=torch.int32
+        )
     return result
 
 
@@ -566,17 +565,25 @@ def _make_spec_decode_cudagraph_inputs(
     max_query_len = args.num_spec + 1
     graph_rows = args.graph_rows or max_query_len
     if graph_rows < max_query_len:
-        raise ValueError(f"--graph-rows must be >= num_spec + 1 ({max_query_len})")
+        raise ValueError(
+            f"--graph-rows must be >= num_spec + 1 ({max_query_len})"
+        )
     if args.state_slots < max_query_len:
-        raise ValueError(f"--state-slots must be >= num_spec + 1 ({max_query_len})")
+        raise ValueError(
+            f"--state-slots must be >= num_spec + 1 ({max_query_len})"
+        )
     if args.fixed_query_len is not None and not (
         1 <= args.fixed_query_len <= max_query_len
     ):
-        raise ValueError(f"--fixed-query-len must be in [1, {max_query_len}]")
+        raise ValueError(
+            f"--fixed-query-len must be in [1, {max_query_len}]"
+        )
     if args.fixed_accepted is not None and not (
         1 <= args.fixed_accepted <= max_query_len
     ):
-        raise ValueError(f"--fixed-accepted must be in [1, {max_query_len}]")
+        raise ValueError(
+            f"--fixed-accepted must be in [1, {max_query_len}]"
+        )
 
     q_dim = args.k_heads * args.head_k_dim
     k_dim = args.k_heads * args.head_k_dim
@@ -762,27 +769,7 @@ def _load_or_create_spec_decode_cudagraph_inputs(
         payload = _torch_load(Path(args.input_file))
         if "inputs" not in payload:
             raise ValueError(f"{args.input_file} does not contain saved inputs")
-        inputs = payload["inputs"]
-        available_steps = int(inputs["mixed_qkv_seq"].shape[0])
-        if args.steps > available_steps:
-            raise ValueError(
-                f"--steps={args.steps} exceeds the {available_steps} saved steps"
-            )
-        if args.steps < available_steps:
-            inputs = dict(inputs)
-            for name in (
-                "mixed_qkv_seq",
-                "a_seq",
-                "b_seq",
-                "query_start_loc_seq",
-                "state_indices_seq",
-                "num_accepted_tokens_seq",
-                "query_lens",
-                "z_seq",
-            ):
-                if name in inputs:
-                    inputs[name] = inputs[name][: args.steps].contiguous()
-        return inputs
+        return payload["inputs"]
     return _make_spec_decode_cudagraph_inputs(args)
 
 
@@ -865,7 +852,13 @@ def _add_spec_projection_inputs(
 def _load_or_create_spec_projection_inputs(
     args: argparse.Namespace,
 ) -> dict[str, torch.Tensor]:
-    inputs = _load_or_create_spec_decode_cudagraph_inputs(args)
+    if args.input_file:
+        payload = _torch_load(Path(args.input_file))
+        if "inputs" not in payload:
+            raise ValueError(f"{args.input_file} does not contain saved inputs")
+        inputs = payload["inputs"]
+    else:
+        inputs = _make_spec_decode_cudagraph_inputs(args)
     return _add_spec_projection_inputs(args, inputs)
 
 
@@ -913,14 +906,12 @@ def _make_sigmoid_gating_inputs(args: argparse.Namespace) -> dict[str, torch.Ten
         )
         * args.gate_scale
     )
-    inputs.update(
-        {
-            "a": a.cpu(),
-            "b": b.cpu(),
-            "A_log": a_log.cpu(),
-            "dt_bias": dt_bias.cpu(),
-        }
-    )
+    inputs.update({
+        "a": a.cpu(),
+        "b": b.cpu(),
+        "A_log": a_log.cpu(),
+        "dt_bias": dt_bias.cpu(),
+    })
     if getattr(args, "decode_segments", False):
         if args.batch != 1:
             raise ValueError("decode-segments fixture requires --batch 1")
@@ -946,7 +937,9 @@ def _make_sigmoid_gating_inputs(args: argparse.Namespace) -> dict[str, torch.Ten
                 dtype=state_dtype,
             )
         inputs["initial_state"] = initial_state.cpu()
-        inputs["cu_seqlens"] = torch.arange(0, args.seqlen + 1, dtype=torch.int32)
+        inputs["cu_seqlens"] = torch.arange(
+            0, args.seqlen + 1, dtype=torch.int32
+        )
         inputs["ssm_state_indices"] = torch.arange(
             1, args.seqlen + 1, dtype=torch.int32
         )
@@ -1112,7 +1105,9 @@ def run_case(args: argparse.Namespace) -> int:
 
     outputs: dict[str, torch.Tensor | None] = {
         "out": out.detach().cpu(),
-        "final_state": final_state.detach().cpu() if final_state is not None else None,
+        "final_state": final_state.detach().cpu()
+        if final_state is not None
+        else None,
     }
     if args.save_intermediates:
         pipeline_outputs = _run_chunk_pipeline(cuda_inputs, cu_seqlens, scale)
@@ -1166,17 +1161,12 @@ def run_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "elapsed_s": elapsed_s,
-                "timing_summary": payload["timing_summary"],
-                "output_summaries": payload["output_summaries"],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "elapsed_s": elapsed_s,
+        "timing_summary": payload["timing_summary"],
+        "output_summaries": payload["output_summaries"],
+    }, indent=2))
     return 0
 
 
@@ -1279,17 +1269,12 @@ def run_recurrent_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "elapsed_s": elapsed_s,
-                "timing_summary": payload["timing_summary"],
-                "output_summaries": payload["output_summaries"],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "elapsed_s": elapsed_s,
+        "timing_summary": payload["timing_summary"],
+        "output_summaries": payload["output_summaries"],
+    }, indent=2))
     return 0
 
 
@@ -1400,17 +1385,12 @@ def run_sigmoid_gating_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "elapsed_s": elapsed_s,
-                "timing_summary": payload["timing_summary"],
-                "output_summaries": payload["output_summaries"],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "elapsed_s": elapsed_s,
+        "timing_summary": payload["timing_summary"],
+        "output_summaries": payload["output_summaries"],
+    }, indent=2))
     return 0
 
 
@@ -1532,17 +1512,12 @@ def run_sigmoid_gating_mixed_qkv_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "elapsed_s": elapsed_s,
-                "timing_summary": payload["timing_summary"],
-                "output_summaries": payload["output_summaries"],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "elapsed_s": elapsed_s,
+        "timing_summary": payload["timing_summary"],
+        "output_summaries": payload["output_summaries"],
+    }, indent=2))
     return 0
 
 
@@ -1876,17 +1851,12 @@ def run_packed_recurrent_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "elapsed_s": elapsed_s,
-                "timing_summary": payload["timing_summary"],
-                "output_summaries": payload["output_summaries"],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "elapsed_s": elapsed_s,
+        "timing_summary": payload["timing_summary"],
+        "output_summaries": payload["output_summaries"],
+    }, indent=2))
     return 0
 
 
@@ -1977,7 +1947,9 @@ def run_flashqla_decode_case(args: argparse.Namespace) -> int:
         "metadata": _metadata(args),
         "config": {
             "op": "flashqla_sm70_gdn_decode_full_route",
-            "route_components": ("fused_mixed_qkv+gating+l2norm+global_state_update"),
+            "route_components": (
+                "fused_mixed_qkv+gating+l2norm+global_state_update"
+            ),
             "batch": args.batch,
             "k_heads": args.k_heads,
             "v_heads": args.v_heads,
@@ -2012,17 +1984,12 @@ def run_flashqla_decode_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "elapsed_s": elapsed_s,
-                "timing_summary": payload["timing_summary"],
-                "output_summaries": payload["output_summaries"],
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "elapsed_s": elapsed_s,
+        "timing_summary": payload["timing_summary"],
+        "output_summaries": payload["output_summaries"],
+    }, indent=2))
     return 0
 
 
@@ -2149,10 +2116,13 @@ def run_packed_recurrent_cudagraph_case(args: argparse.Namespace) -> int:
     }
     comparisons = {
         "out": _compare_tensor(outputs["eager_out"], outputs["graph_out"]),
-        "final_state": _compare_tensor(outputs["eager_state"], outputs["graph_state"]),
+        "final_state": _compare_tensor(
+            outputs["eager_state"], outputs["graph_state"]
+        ),
     }
     strict_ok = all(
-        item["torch_equal"] and item["max_diff"] == 0.0 for item in comparisons.values()
+        item["torch_equal"] and item["max_diff"] == 0.0
+        for item in comparisons.values()
     )
     saved_inputs = {name: tensor.cpu() for name, tensor in inputs.items()}
     payload = {
@@ -2190,17 +2160,12 @@ def run_packed_recurrent_cudagraph_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "strict_ok": strict_ok,
-                "elapsed_s": elapsed_s,
-                "comparisons": comparisons,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "elapsed_s": elapsed_s,
+        "comparisons": comparisons,
+    }, indent=2))
     return 0 if strict_ok else 1
 
 
@@ -2282,10 +2247,13 @@ def run_conv_update_cudagraph_case(args: argparse.Namespace) -> int:
     }
     comparisons = {
         "out": _compare_tensor(outputs["eager_out"], outputs["graph_out"]),
-        "final_state": _compare_tensor(outputs["eager_state"], outputs["graph_state"]),
+        "final_state": _compare_tensor(
+            outputs["eager_state"], outputs["graph_state"]
+        ),
     }
     strict_ok = all(
-        item["torch_equal"] and item["max_diff"] == 0.0 for item in comparisons.values()
+        item["torch_equal"] and item["max_diff"] == 0.0
+        for item in comparisons.values()
     )
     saved_inputs = {name: tensor.cpu() for name, tensor in inputs.items()}
     payload = {
@@ -2320,17 +2288,12 @@ def run_conv_update_cudagraph_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "strict_ok": strict_ok,
-                "elapsed_s": elapsed_s,
-                "comparisons": comparisons,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "elapsed_s": elapsed_s,
+        "comparisons": comparisons,
+    }, indent=2))
     return 0 if strict_ok else 1
 
 
@@ -2401,9 +2364,6 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             a,
             b,
             cuda_inputs["dt_bias"],
-            beta_dtype=(
-                torch.float32 if args.beta_output_dtype == "float32" else b.dtype
-            ),
         )
         core_out, _ = fused_recurrent_gated_delta_rule(
             q=query,
@@ -2511,7 +2471,8 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
 
     query_lens = inputs["query_lens"].to(torch.int64)
     live_token_mask = (
-        torch.arange(max_query_len, dtype=torch.int64)[None, :] < query_lens[:, None]
+        torch.arange(max_query_len, dtype=torch.int64)[None, :]
+        < query_lens[:, None]
     )
     outputs: dict[str, torch.Tensor | None] = {
         "eager_live_out": eager_out.detach().cpu()[live_token_mask],
@@ -2568,7 +2529,6 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             "conv_width": args.conv_width,
             "dtype": args.dtype,
             "state_dtype": args.state_dtype,
-            "beta_output_dtype": args.beta_output_dtype,
             "seed": args.seed,
             "scale": scale,
             "silu": args.silu,
@@ -2597,18 +2557,13 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "strict_ok": strict_ok,
-                "elapsed_s": elapsed_s,
-                "config": payload["config"],
-                "comparisons": comparisons,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "elapsed_s": elapsed_s,
+        "config": payload["config"],
+        "comparisons": comparisons,
+    }, indent=2))
     return 0 if strict_ok else 1
 
 
@@ -2695,9 +2650,6 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
             a,
             b,
             cuda_inputs["dt_bias"],
-            beta_dtype=(
-                torch.float32 if args.beta_output_dtype == "float32" else b.dtype
-            ),
         )
         core_out, _ = fused_recurrent_gated_delta_rule(
             q=query,
@@ -2752,9 +2704,7 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
         )
         out.copy_(core_out.squeeze(0))
 
-    def run_eager_sequence(
-        launch_fn: Any,
-    ) -> tuple[
+    def run_eager_sequence(launch_fn: Any) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -2854,7 +2804,8 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
 
     query_lens = inputs["query_lens"].to(torch.int64)
     live_token_mask = (
-        torch.arange(max_query_len, dtype=torch.int64)[None, :] < query_lens[:, None]
+        torch.arange(max_query_len, dtype=torch.int64)[None, :]
+        < query_lens[:, None]
     )
     outputs: dict[str, torch.Tensor] = {
         "split_live_out": split_out.detach().cpu()[live_token_mask],
@@ -2920,7 +2871,6 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
             "conv_width": args.conv_width,
             "dtype": args.dtype,
             "state_dtype": args.state_dtype,
-            "beta_output_dtype": args.beta_output_dtype,
             "seed": args.seed,
             "scale": scale,
             "silu": args.silu,
@@ -2948,18 +2898,13 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "strict_ok": strict_ok,
-                "timing": timing,
-                "config": payload["config"],
-                "comparisons": comparisons,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "timing": timing,
+        "config": payload["config"],
+        "comparisons": comparisons,
+    }, indent=2))
     return 0 if strict_ok else 1
 
 
@@ -3224,7 +3169,8 @@ def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
 
     query_lens = inputs["query_lens"].to(torch.int64)
     live_token_mask = (
-        torch.arange(max_query_len, dtype=torch.int64)[None, :] < query_lens[:, None]
+        torch.arange(max_query_len, dtype=torch.int64)[None, :]
+        < query_lens[:, None]
     )
     outputs: dict[str, torch.Tensor | None] = {
         "standard_live_out": standard_out.detach().cpu()[live_token_mask],
@@ -3340,18 +3286,13 @@ def run_spec_commit_vs_standard_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "strict_ok": strict_ok,
-                "elapsed_s": elapsed_s,
-                "config": payload["config"],
-                "comparisons": comparisons,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "elapsed_s": elapsed_s,
+        "config": payload["config"],
+        "comparisons": comparisons,
+    }, indent=2))
     return 0 if strict_ok else 1
 
 
@@ -3855,7 +3796,8 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
 
     query_lens = inputs["query_lens"].to(torch.int64)
     live_token_mask = (
-        torch.arange(max_query_len, dtype=torch.int64)[None, :] < query_lens[:, None]
+        torch.arange(max_query_len, dtype=torch.int64)[None, :]
+        < query_lens[:, None]
     )
     outputs: dict[str, torch.Tensor | None] = {
         "standard_live_output": standard_output.detach().cpu()[live_token_mask],
@@ -4044,15 +3986,12 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
                 "direct_compile_ssm_state",
             ]
         )
-    strict_ok = (
-        all(
-            comparisons[name] is not None
-            and comparisons[name]["torch_equal"]
-            and comparisons[name]["max_diff"] == 0.0
-            for name in strict_keys
-        )
-        and compile_step_error is None
-    )
+    strict_ok = all(
+        comparisons[name] is not None
+        and comparisons[name]["torch_equal"]
+        and comparisons[name]["max_diff"] == 0.0
+        for name in strict_keys
+    ) and compile_step_error is None
     accepted_hist = torch.bincount(
         inputs["num_accepted_tokens_seq"][:, 0].to(torch.int64),
         minlength=max_query_len + 1,
@@ -4111,18 +4050,13 @@ def run_spec_commit_projection_case(args: argparse.Namespace) -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, out_path)
-    print(
-        json.dumps(
-            {
-                "out": str(out_path),
-                "strict_ok": strict_ok,
-                "elapsed_s": elapsed_s,
-                "config": payload["config"],
-                "comparisons": comparisons,
-            },
-            indent=2,
-        )
-    )
+    print(json.dumps({
+        "out": str(out_path),
+        "strict_ok": strict_ok,
+        "elapsed_s": elapsed_s,
+        "config": payload["config"],
+        "comparisons": comparisons,
+    }, indent=2))
     return 0 if strict_ok else 1
 
 
@@ -4297,7 +4231,9 @@ def make_parser() -> argparse.ArgumentParser:
     sigmoid.add_argument("--v-heads", type=int, default=8)
     sigmoid.add_argument("--head-k-dim", type=int, default=128)
     sigmoid.add_argument("--head-v-dim", type=int, default=128)
-    sigmoid.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    sigmoid.add_argument(
+        "--dtype", choices=("float16", "bfloat16"), default="float16"
+    )
     sigmoid.add_argument(
         "--state-dtype",
         choices=("same", "float16", "bfloat16", "float32"),
@@ -4358,7 +4294,9 @@ def make_parser() -> argparse.ArgumentParser:
     model_mixed = subparsers.add_parser("run-model-mixed-qkv-route")
     model_mixed.add_argument("--out", required=True)
     model_mixed.add_argument("--input-file")
-    model_mixed.add_argument("--case-name", default="gdn_model_mixed_qkv_route_smoke")
+    model_mixed.add_argument(
+        "--case-name", default="gdn_model_mixed_qkv_route_smoke"
+    )
     model_mixed.add_argument("--batch", type=int, default=1)
     model_mixed.add_argument("--seqlen", type=int, default=16)
     model_mixed.add_argument("--k-heads", type=int, default=4)
@@ -4476,12 +4414,16 @@ def make_parser() -> argparse.ArgumentParser:
     )
     packed_cg.add_argument("--random-initial-state", action="store_true")
     packed_cg.add_argument("--capture-null-indices", action="store_true")
-    packed_cg.set_defaults(func=run_packed_recurrent_cudagraph_case, l2norm_inputs=True)
+    packed_cg.set_defaults(
+        func=run_packed_recurrent_cudagraph_case, l2norm_inputs=True
+    )
 
     conv_cg = subparsers.add_parser("run-conv-update-cudagraph")
     conv_cg.add_argument("--out", required=True)
     conv_cg.add_argument("--input-file")
-    conv_cg.add_argument("--case-name", default="gdn_conv_update_cudagraph_exactness")
+    conv_cg.add_argument(
+        "--case-name", default="gdn_conv_update_cudagraph_exactness"
+    )
     conv_cg.add_argument("--batch", type=int, default=2)
     conv_cg.add_argument("--seqlen", type=int, default=1024)
     conv_cg.add_argument("--k-heads", type=int, default=4)
@@ -4506,7 +4448,9 @@ def make_parser() -> argparse.ArgumentParser:
     spec_cg = subparsers.add_parser("run-spec-decode-cudagraph")
     spec_cg.add_argument("--out", required=True)
     spec_cg.add_argument("--input-file")
-    spec_cg.add_argument("--case-name", default="gdn_spec_decode_cudagraph_exactness")
+    spec_cg.add_argument(
+        "--case-name", default="gdn_spec_decode_cudagraph_exactness"
+    )
     spec_cg.add_argument("--steps", type=int, default=512)
     spec_cg.add_argument("--num-spec", type=int, default=4)
     spec_cg.add_argument("--graph-rows", type=int)
@@ -4518,12 +4462,6 @@ def make_parser() -> argparse.ArgumentParser:
     spec_cg.add_argument("--head-v-dim", type=int, default=128)
     spec_cg.add_argument("--conv-width", type=int, default=4)
     spec_cg.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
-    spec_cg.add_argument(
-        "--beta-output-dtype",
-        choices=("input", "float32"),
-        default="float32",
-        help="Materialize split-verifier beta in the input dtype or FP32.",
-    )
     spec_cg.add_argument(
         "--state-dtype",
         choices=("same", "float16", "bfloat16", "float32"),
@@ -4551,7 +4489,9 @@ def make_parser() -> argparse.ArgumentParser:
     spec_mixed = subparsers.add_parser("run-spec-mixed-qkv-candidate")
     spec_mixed.add_argument("--out", required=True)
     spec_mixed.add_argument("--input-file")
-    spec_mixed.add_argument("--case-name", default="gdn_spec_mixed_qkv_candidate")
+    spec_mixed.add_argument(
+        "--case-name", default="gdn_spec_mixed_qkv_candidate"
+    )
     spec_mixed.add_argument("--steps", type=int, default=512)
     spec_mixed.add_argument("--num-spec", type=int, default=4)
     spec_mixed.add_argument("--graph-rows", type=int)
@@ -4564,12 +4504,6 @@ def make_parser() -> argparse.ArgumentParser:
     spec_mixed.add_argument("--conv-width", type=int, default=4)
     spec_mixed.add_argument(
         "--dtype", choices=("float16", "bfloat16"), default="float16"
-    )
-    spec_mixed.add_argument(
-        "--beta-output-dtype",
-        choices=("input", "float32"),
-        default="float32",
-        help="Materialize split-verifier beta in the input dtype or FP32.",
     )
     spec_mixed.add_argument(
         "--state-dtype",
@@ -4598,7 +4532,9 @@ def make_parser() -> argparse.ArgumentParser:
     spec_op = subparsers.add_parser("run-spec-commit-vs-standard")
     spec_op.add_argument("--out", required=True)
     spec_op.add_argument("--input-file")
-    spec_op.add_argument("--case-name", default="gdn_spec_commit_vs_standard_exactness")
+    spec_op.add_argument(
+        "--case-name", default="gdn_spec_commit_vs_standard_exactness"
+    )
     spec_op.add_argument("--steps", type=int, default=512)
     spec_op.add_argument("--num-spec", type=int, default=4)
     spec_op.add_argument("--graph-rows", type=int)

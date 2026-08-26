@@ -79,13 +79,11 @@ def _load_records(root: Path) -> dict[tuple[Any, ...], list[dict[str, Any]]]:
         source = payload.get("source", payload.get("layer_type", "unknown"))
         shape = tuple(payload.get("shape", tuple(tensor.shape)))
         key = (step, layer_idx, source, label, shape)
-        records.setdefault(key, []).append(
-            {
-                "path": str(path),
-                "pid": payload.get("pid"),
-                "tensor": tensor,
-            }
-        )
+        records.setdefault(key, []).append({
+            "path": str(path),
+            "pid": payload.get("pid"),
+            "tensor": tensor,
+        })
     return records
 
 
@@ -136,37 +134,33 @@ def compare_dirs(left: Path, right: Path, top: int) -> dict[str, Any]:
         right_items = right_records.get(key, [])
         step, layer_idx, source, label, shape = key
         if not left_items or not right_items:
-            missing.append(
-                {
-                    "step": step,
-                    "layer_idx": layer_idx,
-                    "source": source,
-                    "label": label,
-                    "shape": shape,
-                    "left_count": len(left_items),
-                    "right_count": len(right_items),
-                }
-            )
+            missing.append({
+                "step": step,
+                "layer_idx": layer_idx,
+                "source": source,
+                "label": label,
+                "shape": shape,
+                "left_count": len(left_items),
+                "right_count": len(right_items),
+            })
             continue
         _, pairs = _best_pairing(left_items, right_items)
         for left_idx, right_idx, stats in pairs:
             left_tensor = left_items[left_idx]["tensor"]
             right_tensor = right_items[right_idx]["tensor"]
-            summaries.append(
-                {
-                    "step": step,
-                    "layer_idx": layer_idx,
-                    "source": source,
-                    "label": label,
-                    "shape": shape,
-                    "left_pid": left_items[left_idx]["pid"],
-                    "right_pid": right_items[right_idx]["pid"],
-                    "left_path": left_items[left_idx]["path"],
-                    "right_path": right_items[right_idx]["path"],
-                    **stats,
-                    "rows": _row_stats(left_tensor, right_tensor),
-                }
-            )
+            summaries.append({
+                "step": step,
+                "layer_idx": layer_idx,
+                "source": source,
+                "label": label,
+                "shape": shape,
+                "left_pid": left_items[left_idx]["pid"],
+                "right_pid": right_items[right_idx]["pid"],
+                "left_path": left_items[left_idx]["path"],
+                "right_path": right_items[right_idx]["path"],
+                **stats,
+                "rows": _row_stats(left_tensor, right_tensor),
+            })
 
     by_worst = sorted(
         summaries,
@@ -268,12 +262,10 @@ def _numeric_gate(
 
     if missing and not allow_missing:
         for item in missing[:20]:
-            violations.append(
-                {
-                    "reason": "missing_tensor_dump",
-                    **item,
-                }
-            )
+            violations.append({
+                "reason": "missing_tensor_dump",
+                **item,
+            })
 
     for item in compared:
         max_abs = float(item.get("max_abs", math.inf))
@@ -288,25 +280,21 @@ def _numeric_gate(
             )
 
         if item.get("shape_mismatch"):
-            violations.append(
-                {
-                    "reason": "shape_mismatch",
-                    **_record_ref(item),
-                    "left_shape": item.get("left_shape"),
-                    "right_shape": item.get("right_shape"),
-                }
-            )
+            violations.append({
+                "reason": "shape_mismatch",
+                **_record_ref(item),
+                "left_shape": item.get("left_shape"),
+                "right_shape": item.get("right_shape"),
+            })
             continue
 
         if not math.isfinite(max_abs) or not math.isfinite(mean_abs):
-            violations.append(
-                {
-                    "reason": "non_finite_diff",
-                    **_record_ref(item),
-                    "max_abs": item.get("max_abs"),
-                    "mean_abs": item.get("mean_abs"),
-                }
-            )
+            violations.append({
+                "reason": "non_finite_diff",
+                **_record_ref(item),
+                "max_abs": item.get("max_abs"),
+                "mean_abs": item.get("mean_abs"),
+            })
             continue
 
         item_max_abs_bound, max_abs_rule = _bound_for_item(
@@ -316,25 +304,21 @@ def _numeric_gate(
         )
         if item_max_abs_bound is None:
             if max_abs != 0.0:
-                pending.append(
-                    {
-                        "reason": "nonzero_max_abs_without_bound",
-                        **_record_ref(item),
-                        "max_abs": max_abs,
-                    }
-                )
+                pending.append({
+                    "reason": "nonzero_max_abs_without_bound",
+                    **_record_ref(item),
+                    "max_abs": max_abs,
+                })
         else:
             checked_max_abs += 1
             if max_abs > item_max_abs_bound:
-                violations.append(
-                    {
-                        "reason": "max_abs_exceeds_bound",
-                        **_record_ref(item),
-                        "max_abs": max_abs,
-                        "bound": item_max_abs_bound,
-                        "bound_rule": max_abs_rule,
-                    }
-                )
+                violations.append({
+                    "reason": "max_abs_exceeds_bound",
+                    **_record_ref(item),
+                    "max_abs": max_abs,
+                    "bound": item_max_abs_bound,
+                    "bound_rule": max_abs_rule,
+                })
 
         item_mean_abs_bound, mean_abs_rule = _bound_for_item(
             item,
@@ -344,27 +328,23 @@ def _numeric_gate(
         if item_mean_abs_bound is not None:
             checked_mean_abs += 1
             if mean_abs > item_mean_abs_bound:
-                violations.append(
-                    {
-                        "reason": "mean_abs_exceeds_bound",
-                        **_record_ref(item),
-                        "mean_abs": mean_abs,
-                        "bound": item_mean_abs_bound,
-                        "bound_rule": mean_abs_rule,
-                    }
-                )
+                violations.append({
+                    "reason": "mean_abs_exceeds_bound",
+                    **_record_ref(item),
+                    "mean_abs": mean_abs,
+                    "bound": item_mean_abs_bound,
+                    "bound_rule": mean_abs_rule,
+                })
 
         if min_cosine is not None and cosine is not None:
             checked_cosine += 1
             if cosine < min_cosine:
-                violations.append(
-                    {
-                        "reason": "cosine_below_bound",
-                        **_record_ref(item),
-                        "cosine": cosine,
-                        "bound": min_cosine,
-                    }
-                )
+                violations.append({
+                    "reason": "cosine_below_bound",
+                    **_record_ref(item),
+                    "cosine": cosine,
+                    "bound": min_cosine,
+                })
 
     if checked_max_abs == 0 and (max_abs_bound is not None or max_abs_rules):
         pending.append("no tensors matched any max_abs bound")

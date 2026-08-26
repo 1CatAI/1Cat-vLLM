@@ -136,9 +136,6 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_TP2_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_TP2_FAST_TARGETS: str | None = None
     VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION: bool = False
-    VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM: bool = False
-    VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS: int = 512
-    VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS: int = 80
     VLLM_SM70_AWQ_MLP_ENGINE: bool = False
     VLLM_SM70_AWQ_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_AWQ_MLP_DOWN_TILE_AR: bool = False
@@ -156,23 +153,11 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
-    VLLM_SM70_FP8_GROUPED_BMM_DECODE: bool = True
-    VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
-    VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
-    VLLM_SM70_FP8_PRESCALED_M1_DECODE: bool = True
-    VLLM_SM70_FP8_PREFILL_CUTLASS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
-    VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_FP8_QPN8_PP2_TP4: bool = True
-    VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
-    VLLM_SM70_SAMPLER_LIBRARY: str | None = None
-    VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
-    VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
-    VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -184,50 +169,22 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
-    VLLM_SM70_DSV4_FP13_GEMV: bool = True
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
-    VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4: bool = True
-    VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
-    VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS: int = 128
     VLLM_SM70_ENABLE_DENSE_F16_FASTPATH: bool = False
     VLLM_SM70_ENABLE_LM_HEAD_FASTPATH: bool = False
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
-    VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
-    VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
-    VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
-    VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
-    VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
-    VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
-    VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = False
-    VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA: bool = False
-    VLLM_SM70_DFLASH2_FUSED_QKV_PACK: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
-    VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
-    VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
-    VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
-    VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
-    VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
-    VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
-    VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
-    VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
-    VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING: bool = False
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
-    VLLM_SM70_TP4_SMALL_AR_PACK32: bool = False
     VLLM_SM70_F16_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_MOE_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_F16_DENSE_MAX_M: int = 64
@@ -241,21 +198,13 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
-    VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
-    VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
-    VLLM_SM70_NVFP4_QPN4: bool = True
-    VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
-    VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = True
+    VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8: bool = False
-    VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER: bool = False
-    VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
-    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = True
-    VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = True
-    VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE: bool = True
+    VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
@@ -288,12 +237,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DECODE_EVENT_TRACE_EVERY: int = 16
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
-    VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = False
-    VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
-    VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE: bool = False
-    VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE: str | None = None
     VLLM_SM70_REJECTION_PROFILE: bool = False
     VLLM_SM70_REJECTION_PROFILE_INTERVAL: int = 20
@@ -353,8 +298,6 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV: int = 8192
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3: bool = True
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
-    VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL: bool = False
-    VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -392,8 +335,6 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_BHMD_OUT: bool = True
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
-    VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = False
-    VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH: bool = True
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE: bool = False
@@ -403,20 +344,11 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE: bool = True
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_WARPS: int = 8
     VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE: bool = False
-    VLLM_FLASH_V100_XQA_G6_DUAL_CTA: bool = False
-    VLLM_FLASH_V100_XQA_SPLIT_REDUCE: bool = False
-    VLLM_FLASH_V100_E4M3_BATCH_XQA: bool = True
-    VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED: bool = True
-    VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH: bool = True
-    VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE: bool = False
-    VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING: bool = True
-    VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE: bool = False
     VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA: bool = True
     VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE: bool = True
     VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN: int = 61633
     VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS: bool = True
     VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD: bool = True
-    VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD: bool = True
     VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE: bool = False
     VLLM_FLASH_V100_TRACE_DECODE_ACTIVE: bool = False
     VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED: bool = True
@@ -511,8 +443,6 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP: bool = False
     VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP: bool = False
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
-    VLLM_SM70_GDN_QPN8_BA_SPLIT: bool = False
-    VLLM_SM70_GDN_RMSNORM_ONEPASS: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
@@ -530,7 +460,6 @@ if TYPE_CHECKING:
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
-    VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = False
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -1655,17 +1584,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION": lambda: bool(
         int(os.getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION", "0"))
     ),
-    # Default-off exact-8K TP4 experiment: fuse the row-parallel reduction,
-    # mixed-FP32-residual Gemma RMSNorm, and normalized-output all-gather.
-    "VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM", "0"))
-    ),
-    "VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS": lambda: int(
-        os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS", "512")
-    ),
-    "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS": lambda: int(
-        os.getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS", "80")
-    ),
     # Experimental TileRT-inspired dense MLP lane for SM70 AWQ decode. The
     # first stage fuses gate_up_proj + SiluAndMul through the TurboMind GEMM
     # epilogue for M=1/TP2 while keeping the existing down_proj/reduce path.
@@ -1683,31 +1601,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
-    # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
-    # dense projections. Pure-FP8 checkpoints must opt in;
-    # a mixed NVFP4 checkpoint may select its separately validated default in
-    # the compressed-tensors scheme. Explicit 0 disables both routes.
-    "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
-    # Default-on QPN8 route for the validated serialized PP2 x TP4 contract.
-    # Admission additionally requires exact operator shapes/layouts, B1,
-    # no speculative decoding, no DBO, and no explicit ubatching. Set this to
-    # 0 (or the generic QPN8 flag to 0) to retain TurboMind everywhere.
-    "VLLM_SM70_FP8_QPN8_PP2_TP4": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4", "1"))
-    ),
-    # Optional source-built QPN8-only extension. Production builds leave this
-    # unset because the same operators are linked into vllm._C.
-    "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
-    "VLLM_SM70_SAMPLER_LIBRARY": lambda: os.getenv("VLLM_SM70_SAMPLER_LIBRARY", None),
-    "VLLM_SM70_FP8_PREFILL_CUTLASS": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_CUTLASS", "1"))
-    ),
-    "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM", "0"))
-    ),
-    # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
-    # stays on the existing TurboMind path.
-    "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
@@ -1759,18 +1652,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
     ),
-    "VLLM_SM70_FP8_GROUPED_BMM_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "1"))
-    ),
-    "VLLM_SM70_FP8_PREFILL_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "1"))
-    ),
-    "VLLM_SM70_FP8_PREFILL_PRESCALED": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))
-    ),
-    "VLLM_SM70_FP8_PRESCALED_M1_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))
-    ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))
     ),
@@ -1782,9 +1663,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))
-    ),
-    "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR", "1"))
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))
@@ -1818,25 +1696,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DSV4_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))
     ),
-    "VLLM_SM70_DSV4_FP13_GEMV": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_FP13_GEMV", "1"))
-    ),
     "VLLM_SM70_DSV4_MHC_FP32_STAGE": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_MHC_FP32_STAGE", "1"))
     ),
-    "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "1"))
-    ),
-    # Skip PP metadata and TP reconstruction only for the exact, replicated
-    # SM70 B1 hidden-state schema validated by the worker on both stages.
-    "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER": lambda: bool(
-        int(os.getenv("VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER", "1"))
-    ),
     "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS", "128")
-    ),
-    "VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS": lambda: int(
-        os.getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS", "128")
     ),
     # Experimental unquantized FP16 SM70 TurboMind fast paths. Keep default-off:
     # these must pass the numeric policy and model-level token gate before
@@ -1873,110 +1737,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_LM_HEAD_TOP1_TC": lambda: bool(
         int(os.getenv("VLLM_SM70_LM_HEAD_TOP1_TC", "0"))
     ),
-    # Candidate-only QPN8 LM head. QPN8 selects a conservative local top-64
-    # support, then directly re-evaluates the original FP16 rows and restores
-    # dense-vocabulary top-k tie order. Keep default-off until real-hidden,
-    # quality, and complete Graph/Nsight gates all pass.
-    "VLLM_SM70_DFLASH2_QPN8_RERANK": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK", "0"))
-    ),
-    # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
-    # local top-k, and return the dense result so the baseline trajectory is
-    # unchanged.  This intentionally synchronizes for diagnostics.
-    "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", "0"))
-    ),
-    # Preserve the production full-vocabulary torch.topk tie contract by
-    # default.  The candidate-order experiment avoids a host-blocking SM70
-    # multi-block top-k, but may be enabled only for paired quality tests.
-    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))
-    ),
-    # Umbrella gate for selector-based DFlash verification optimizations. Keep
-    # this default-off while each stage is checked against the unchanged path.
-    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))
-    ),
-    # Build all selector-based DFlash target GDN state-index metadata with one
-    # pointer-table Triton launch. Keep separate from the shared-classification
-    # gate until the fixed-trajectory and mixed-batch Graph checks pass.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
-    ),
-    # Debug-only oracle: materialize the legacy advanced-indexing contract and
-    # compare it with the fused persistent buffers before graph replay.
-    "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "0"))
-    ),
-    # Debug-only device-value assertion. The metadata producers and FULL graph
-    # replay share the current CUDA stream, so production ordering does not
-    # require a host-blocking Tensor.item(). The no-sync route preserves the
-    # accepted token/acceptance trajectory; opt in only when auditing metadata.
-    "VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT", "0"))
-    ),
-    # Selector-based DFlash packed GDN verification kernel. This is deliberately
-    # independent from the shared-metadata umbrella gate so each optimization
-    # can be paired against the unchanged verifier in isolation.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))
-    ),
-    # Route compatible target GDN output gates through the existing one-pass
-    # CUDA RMSNormGated implementation. This remains an explicit opt-in.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))
-    ),
-    # Fuse compatible nonzero-offset GDN z/b/a materialization into one
-    # copy kernel. This must stay separate from the plain-view path because
-    # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
-    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
-    ),
-    # Build Flash-V100 small-query verifier rows directly in their persistent
-    # graph buffers. This replaces four repeat_interleave scans per KV group.
-    # The matched TP4 trace is token/acceptance exact and cuts the synchronized
-    # DFlash2 draft-to-target interval from 5.720 ms to 1.911 ms on V100.
-    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))
-    ),
-    # Collapse five compatible target small-query metadata launches into one
-    # heterogeneous-width pointer-table kernel. The paired
-    # TP4 node trace is token/acceptance exact and reduces synchronized D2T.
-    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA", "0"))
-    ),
-    # Copy the post-convolution Q/K/V row slices into the recurrent kernel's
-    # packed contiguous layout with one bitwise Triton launch. This replaces
-    # three reshape copies plus one cat in the exact block-eight verifier.
-    "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_QKV_PACK", "0"))
-    ),
-    # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
-    # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
-    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
-    ),
-    # Avoid materializing/gathering full-vocabulary target logits when the
-    # DFlash2 proposal and target sampling distributions both have compact
-    # top-k support. Default-off until paired output/acceptance and end-to-end
-    # V100 gates pass; unsupported sampling features fall back to dense logits.
-    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))
-    ),
-    # Compute the compatible 25600->5120 target-hidden projection as four output
-    # shards, then all-gather only the 80-KiB block-eight result. This
-    # remains opt-in until the acceptance/quality gate follows the positive
-    # production-weight TP4 microbenchmark.
-    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
-    ),
-    # Default-on SGLang-style push collective for the validated FP16 80-KiB
-    # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA
-    # Graphs. Other devices, topologies, sizes, and eager calls retain the
-    # ordinary pull path; explicit 0 is the rollback.
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))
-    ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
     # or custom logits processing. It still computes local logits with the
@@ -1987,16 +1747,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))
-    ),
-    # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
-    "VLLM_SM70_TOPK_TOPP_8_WARPS": lambda: bool(
-        int(os.getenv("VLLM_SM70_TOPK_TOPP_8_WARPS", "0"))
-    ),
-    # The exact B8/B16, 248320-column sampler contract uses one logits row per
-    # request. Eight warps preserves Qrita's masking math while improving SM70
-    # reduction parallelism. Set to 0 to restore Triton's launch heuristic.
-    "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS": lambda: bool(
-        int(os.getenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1"))
     ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
@@ -2025,17 +1775,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
         else None
     ),
-    # Opt in exact MTP4 verifier payloads on fully-connected SM70 TP4.
-    "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING", "0"))
-    ),
     "VLLM_SM70_TP4_M5_AR_THREADS": lambda: (
         int(os.environ["VLLM_SM70_TP4_M5_AR_THREADS"])
         if "VLLM_SM70_TP4_M5_AR_THREADS" in os.environ
         else None
-    ),
-    "VLLM_SM70_TP4_SMALL_AR_PACK32": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP4_SMALL_AR_PACK32", "0"))
     ),
     # Optional custom allreduce for the tiny per-rank top1 pair. Keep default
     # off until the communicator path has same-criterion model evidence.
@@ -2088,34 +1831,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # non-TurboMind route for diagnostics.
     "VLLM_SM70_NVFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "1"))
-    ),
-    # Dispatch all 256 routed experts in one grouped TurboMind call for the
-    # exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 decode keeps
-    # the compact active-expert route; larger graph shapes use full groups.
-    "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1"))
-    ),
-    "VLLM_SM70_NVFP4_DENSE_GATED_SILU": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_DENSE_GATED_SILU", "1"))
-    ),
-    # Memory-neutral native QPN4 M=1 decode for the accepted Qwen3.8-27B
-    # NVFP4 TP4 no-MTP contract. Larger-M prefill dequantizes into one bounded
-    # shared FP16 workspace. Set to 0 to retain the TurboMind NVFP4 route.
-    "VLLM_SM70_NVFP4_QPN4": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN4", "1"))),
-    "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE", "0"))
-    ),
-    # Exact no-MTP random sampler for the Qwen3.8 TP4 batch-one contract.
-    # The base flag enables exact compact sampling after full-logits gather.
-    # The separate TP-local flag opts into rank-local top-20 reduction.
-    "VLLM_SM70_COMPACT_TOPK20_SAMPLER": lambda: bool(
-        int(os.getenv("VLLM_SM70_COMPACT_TOPK20_SAMPLER", "0"))
-    ),
-    "VLLM_SM70_CHUNKED_TOPK20_CHUNKS": lambda: int(
-        os.getenv("VLLM_SM70_CHUNKED_TOPK20_CHUNKS", "0")
-    ),
-    "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER": lambda: bool(
-        int(os.getenv("VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER", "0"))
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
@@ -2185,23 +1900,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse the six one-row DeepSeek V4 MXFP4 decode experts into one
     # TurboMind launch. The C++ route reads this value directly as well.
     "VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "1"))
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE", "0"))
     ),
     # Experimental verifier-M8 grouped dispatch. This collapses the fixed 48
     # active-expert stage calls into one TurboMind grouped launch.
     "VLLM_SM70_MXFP4_MOE_GROUPED_M8": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))
-    ),
-    # Extend the one-launch grouped verifier route from M=8 to M=2..M=8.
-    # Kept independent until each width passes its CUDA Graph and model gates.
-    "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER", "0"))
-    ),
-    # Group verifier slots routed to the same expert into one multi-row group.
-    # This changes the MXFP4 reduction tactic, so it stays behind an
-    # independent acceptance/quality gate.
-    "VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS", "0"))
     ),
     # Use deterministic W13/W2 tactics for the fixed 48 one-row
     # verifier groups instead of relying on capture-time autotune stability.
@@ -2211,17 +1915,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip the generic 256-expert sort/permute/unpermute pipeline for the
     # exact DeepSeek V4 B1, replicated-expert, top-k=6 decode contract.
     "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "1"))
-    ),
-    # Keep the six B1 routes in their original top-k order. Compact W13/W2
-    # then consume topk_ids directly, so no sort/inverse-permutation prepare
-    # kernel is needed. Exact shape/route checks remain in the caller and =0
-    # restores the stable-sort path.
-    "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))
-    ),
-    "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE", "0"))
     ),
     # FP8 caller for the generic SM70 TurboMind active-source-group compact
     # decode path. The backend scheduler keeps source expert group semantics
@@ -2311,25 +2005,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_PROFILE_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
     ),
-    "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0"))
-    ),
-    # Compile alternate single/concurrent MTP helper signatures at startup.
-    # Default-off until matched cold-start and steady-state evidence is complete.
-    "VLLM_SM70_MTP_CONCURRENCY_WARMUP": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_CONCURRENCY_WARMUP", "0"))
-    ),
     "VLLM_SM70_MTP_CONTEXT_BUCKETS": lambda: os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKETS"),
     "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
         "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
-    ),
-    # The private ring changes compressor-state ownership and lifetime. Keep it
-    # opt-in until its long-context quality and capacity gates are complete.
-    "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE": lambda: bool(
-        int(os.getenv("VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE", "0"))
-    ),
-    "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS": lambda: os.getenv(
-        "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
     ),
     "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE": lambda: os.getenv(
         "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE"
@@ -2491,22 +2169,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV": lambda: int(
         os.getenv("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV", "32768")
     ),
-    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL",
-                "0",
-            )
-        )
-    ),
-    "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
-        int(
-            os.getenv(
-                "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL",
-                "1",
-            )
-        )
-    ),
     "VLLM_FLASH_V100_PREFILL_SPLIT_KV": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_PREFILL_SPLIT_KV", "0"))
     ),
@@ -2629,12 +2291,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_DECODE_USE_XQA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1"))
     ),
-    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "0"))
-    ),
-    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
-        os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
-    ),
     "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")
     ),
@@ -2671,32 +2327,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_G6_QK_PIPELINE_TRACE", "0"))
     ),
-    "VLLM_FLASH_V100_XQA_G6_DUAL_CTA": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0"))
-    ),
-    "VLLM_FLASH_V100_XQA_SPLIT_REDUCE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_SPLIT_REDUCE", "0"))
-    ),
-    # Exact SM70 G6/D256 E4M3 XQA for B2-B16. Set to 0 to restore the scalar
-    # paged decoder for matched control runs or emergency rollback.
-    "VLLM_FLASH_V100_E4M3_BATCH_XQA": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1"))
-    ),
-    "VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA_OPTIMIZED", "1"))
-    ),
-    "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH", "1"))
-    ),
-    "VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_E4M3_PAGE800_FASTPATH_TRACE", "0"))
-    ),
-    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING", "1"))
-    ),
-    "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING_TRACE", "0"))
-    ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA", "1"))
     ),
@@ -2711,9 +2341,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD", "1"))
-    ),
-    "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD", "1"))
     ),
     "VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_XQA_E5M2_G6_DUAL_CTA_TRACE", "0"))
@@ -3048,14 +2675,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP", "0"))
     ),
-    # Exact-shape SM70 GDN decode fusions. The measured workload is evidence,
-    # not a model-identity selector; runtime admission uses operator contracts.
-    "VLLM_SM70_GDN_QPN8_BA_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_QPN8_BA_SPLIT", "0"))
-    ),
-    "VLLM_SM70_GDN_RMSNORM_ONEPASS": lambda: bool(
-        int(os.getenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0"))
-    ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
     "VLLM_SM70_GEMMA_RMS_NORM_EAGER": lambda: bool(
@@ -3128,11 +2747,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": lambda: bool(
         int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))
-    ),
-    # Opt-in decode tiles for the exact E256/N128/K2048/top-k8 SM70 contract.
-    # Larger or unmatched token shapes retain the 0.0.3 config.
-    "VLLM_SM70_MTP_MOE_TUNED_CONFIG": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0"))
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on

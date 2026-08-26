@@ -97,7 +97,8 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
         ):
             logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
+                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path "
+                "enabled."
             )
             sm70_tm.prepare_nvfp4_linear(layer)
             layer.weight = Parameter(

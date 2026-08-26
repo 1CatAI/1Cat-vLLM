@@ -14,98 +14,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-
-@triton.jit
-def _sm70_dflash2_gemma_fused_add_rms_kernel(
-    x,
-    residual,
-    weight,
-    normalized_out,
-    residual_out,
-    hidden_size: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    epsilon,
-):
-    row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < hidden_size
-    values = tl.load(x + row * hidden_size + cols, mask=mask, other=0.0).to(tl.float32)
-    values += tl.load(residual + row * hidden_size + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    tl.store(residual_out + row * hidden_size + cols, values, mask=mask)
-
-    variance = tl.sum(tl.where(mask, values * values, 0.0), axis=0)
-    inverse_rms = tl.rsqrt(variance / hidden_size + epsilon)
-    gemma_weight = tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
-    tl.store(
-        normalized_out + row * hidden_size + cols,
-        values * inverse_rms * gemma_weight,
-        mask=mask,
-    )
-
-
-def _sm70_dflash2_gemma_fused_add_rms_norm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-    *,
-    num_warps: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    normalized_out = torch.empty_like(x)
-    residual_out = torch.empty_like(residual)
-    _sm70_dflash2_gemma_fused_add_rms_kernel[(x.shape[0],)](
-        x,
-        residual,
-        weight,
-        normalized_out,
-        residual_out,
-        hidden_size=x.shape[1],
-        BLOCK_SIZE=triton.next_power_of_2(x.shape[1]),
-        epsilon=variance_epsilon,
-        num_warps=num_warps,
-        num_stages=1,
-    )
-    return normalized_out, residual_out
-
-
-def _use_sm70_dflash2_gemma_fused_add_rms(
-    x: torch.Tensor,
-    residual: torch.Tensor | None,
-    weight: torch.Tensor,
-) -> bool:
-    # Keep the dynamic token dimension out of this Python predicate. AOT traces
-    # the target once at a large warmup shape; a decode-only row bound would be
-    # constant-folded there and would leave the M=8 replay on the decomposed path.
-    return bool(
-        envs.VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS
-        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-        # Keep the cached platform query out of the AOT fullgraph. The helper
-        # below is explicitly constant-foldable by Dynamo.
-        and _sm70_gemma_long_prefill_available()
-        and residual is not None
-        and x.is_cuda
-        and x.dtype == torch.float16
-        and residual.dtype == torch.float32
-        and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and x.ndim == 2
-        and x.shape[0] > 0
-        and x.shape[1] == 5120
-        and residual.shape == x.shape
-        and residual.device == x.device
-        and weight.device == x.device
-        and weight.ndim == 1
-        and weight.numel() == 5120
-        and x.is_contiguous()
-        and residual.is_contiguous()
-        and weight.is_contiguous()
-    )
 
 
 @torch.compiler.assume_constant_result
@@ -427,14 +338,6 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
-        if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
-            assert residual is not None
-            return _sm70_dflash2_gemma_fused_add_rms_norm(
-                x,
-                residual,
-                self.weight,
-                self.variance_epsilon,
-            )
         if self._use_sm70_long_prefill_fused(x, residual):
             assert residual is not None
             if not torch.compiler.is_compiling():
@@ -481,14 +384,6 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
-            assert residual is not None
-            return _sm70_dflash2_gemma_fused_add_rms_norm(
-                x,
-                residual,
-                self.weight,
-                self.variance_epsilon,
-            )
         if self._use_sm70_long_prefill_fused(x, residual):
             assert residual is not None
             if not torch.compiler.is_compiling():

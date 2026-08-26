@@ -21,10 +21,9 @@ from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
-_SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
-_SEEN_TP_ALLREDUCE_PATHS: set[tuple[str, str, tuple[int, ...], torch.dtype, int]] = (
-    set()
-)
+_SEEN_TP_ALLREDUCE_PATHS: set[
+    tuple[str, str, tuple[int, ...], torch.dtype, int]
+] = set()
 
 
 def _trace_all_reduce_path(
@@ -83,7 +82,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_top1_custom_ar = False
             use_sm70_awq_mlp_down_tile_ar = False
             use_sm70_awq_mlp_down_tile_overlap = False
-            use_sm70_tp4_long_prefill_fused_norm = False
             use_torch_symm_mem = False
             use_flashinfer_allreduce = False
         else:
@@ -95,19 +93,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_sm70_awq_mlp_down_tile_overlap = (
                 envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
             )
-            use_sm70_tp4_long_prefill_fused_norm = (
-                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-                and self.world_size == 4
-                and current_platform.is_device_capability(70)
-            )
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_top1_custom_ar = use_top1_custom_ar
         self.use_sm70_awq_mlp_down_tile_ar = use_sm70_awq_mlp_down_tile_ar
-        self.use_sm70_awq_mlp_down_tile_overlap = use_sm70_awq_mlp_down_tile_overlap
-        self.use_sm70_tp4_long_prefill_fused_norm = use_sm70_tp4_long_prefill_fused_norm
+        self.use_sm70_awq_mlp_down_tile_overlap = (
+            use_sm70_awq_mlp_down_tile_overlap
+        )
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
 
@@ -155,7 +149,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             or use_top1_custom_ar
             or use_sm70_awq_mlp_down_tile_ar
             or use_sm70_awq_mlp_down_tile_overlap
-            or use_sm70_tp4_long_prefill_fused_norm
         ) and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             # `use_top1_custom_ar` deliberately only provisions the IPC/signaling
@@ -168,12 +161,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
-                max_size=(
-                    _SM70_TP4_LONG_PREFILL_BUFFER_BYTES
-                    if use_sm70_tp4_long_prefill_fused_norm
-                    else 8192 * 1024
-                ),
-                long_prefill_fusion_enabled=use_sm70_tp4_long_prefill_fused_norm,
             )
 
             if current_platform.is_rocm():
@@ -448,31 +435,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, residual, weight, epsilon
         )
 
-    def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-        self,
-        input_: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        ca_comm = self.ca_comm
-        if (
-            not self.use_sm70_tp4_long_prefill_fused_norm
-            or ca_comm is None
-            or ca_comm.disabled
-            or not ca_comm.can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-                input_, residual, weight
-            )
-        ):
-            raise RuntimeError(
-                "SM70 TP4 long-prefill fused collective-norm route was "
-                "compiled for an unsupported runtime shape or communicator."
-            )
-        _trace_all_reduce_path(self, "sm70_tp4_fused_rs_norm_ag", input_)
-        return ca_comm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
-            input_, residual, weight, epsilon
-        )
-
     def sm70_awq_mlp_down_tile_all_reduce(self, input_):
         if not self.use_sm70_awq_mlp_down_tile_ar:
             return None
@@ -506,14 +468,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             k_ld,
             q_ld,
             tile_numel=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL,
-            reducer_blocks=(envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS),
+            reducer_blocks=(
+                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS
+            ),
             kernel_reducer_blocks=(
                 envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS
             ),
             overlap=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM,
         )
         if out is not None:
-            _trace_all_reduce_path(self, "sm70_awq_mlp_down_tile_overlap", input_)
+            _trace_all_reduce_path(
+                self, "sm70_awq_mlp_down_tile_overlap", input_
+            )
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):

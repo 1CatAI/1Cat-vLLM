@@ -40,9 +40,6 @@ class UVAOffloadConfig:
         - For parameter name "mlp.experts.w2_weight":
             - "experts" or "experts.w2_weight" will match.
             - "expert" or "w2" will NOT match (must be exact segments).
-        - A tower component name such as "visual" selects that complete
-          multimodal tower, including parameters whose names are relative to
-          the tower module.
     This allows distinguishing parameters like "w2_weight" and "w2_weight_scale".
     """
 

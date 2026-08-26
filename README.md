@@ -1,20 +1,26 @@
 # 1Cat-vLLM
 
-> 一猫之下始终相信，V100 不该在今天的大模型浪潮里被轻易宣判“过时”。
+> 一猫之下始终相信，V100 不该在今天的大模型浪潮中被轻易宣判“过时”。
 >
-> 1Cat-vLLM 是面向 **SM70 / Tesla V100** 的 vLLM 工程分支。项目围绕
-> AWQ、注意力后端、长上下文稳定性、MTP 投机解码、运行时默认值和部署
-> 路径做了成体系的优化，让更多现代模型场景在 V100 上真正变得可用、
-> 好用、能持续部署。
+> 1Cat-vLLM 是一个专注于 **SM70 / Tesla V100** 的 vLLM 工程分支。我们
+> 不追求覆盖所有硬件，而是围绕 Volta 架构补齐并优化现代大模型推理的
+> 关键路径，包括量化推理、注意力后端、长上下文、MTP 投机解码、
+> CUDA Graph、分布式通信、运行时策略和部署工具链，让 Qwen、DeepSeek
+> 等新模型在 V100 上从“能跑”走向“可部署、可验证、可持续优化”。
 >
-> 我们希望把一猫之下在 V100 上的工程经验、优化成果和验证过程贡献给
-> 开源社区，也欢迎继续使用 V100 的个人开发者、工作室和团队一起反馈、
-> 复现和改进。
+> 我们希望把来自真实 V100 环境的工程实现、性能数据和验证过程贡献给
+> 开源社区，也欢迎仍在使用 V100 的个人开发者、工作室和团队参与测试、
+> 复现、反馈和共建，让这批依然有价值的算力继续发挥作用。
 
-1Cat-vLLM is a **Tesla V100 / SM70** focused vLLM fork for serving modern
-Qwen-class AWQ and experimental FP8 models on Volta GPUs. It integrates
-TurboMind-derived SM70 kernels, a V100 FlashAttention path, runtime defaults
-for long-context serving, and OpenAI-compatible API fixes for common clients.
+1Cat-vLLM is a vLLM engineering fork focused on **SM70 / Tesla V100**.
+Rather than targeting every hardware platform, it fills and optimizes the
+critical inference paths required by modern models on Volta, including
+quantized inference, attention backends, long-context serving, MTP speculative
+decoding, CUDA Graph execution, distributed communication, runtime policies,
+and deployment tooling.
+
+The goal is to make models such as Qwen and DeepSeek not merely runnable on
+V100, but deployable, reproducible, and continuously optimizable.
 
 ## Project Focus
 
@@ -25,6 +31,12 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - **V100 FlashAttention path**: `FLASH_ATTN_V100` decode and prefill backend
   for Volta GPUs, with SM70 compile-graph, guarded XQA decode, and D=256
   paged-prefix low-smem fast paths enabled by default.
+- **DeepSeek V4 Flash**: supports running the original, unmodified DeepSeek V4
+  Flash weights across eight GPUs.
+- **Day-0 Qwen3.8-27B support**: native Day-0 support for Qwen3.8-27B.
+- **Quantization support**: FP8, NVFP4, MXFP4, AWQ, and GPTQ inference paths
+  are included for supported model and hardware combinations. Availability
+  and production status vary by checkpoint and runtime route.
 - **Long-context serving**: public profiles default to 256K context where the
   model and memory budget allow it.
 - **MTP serving**: Qwen3.6-class MTP speculative decoding remains available as
@@ -42,6 +54,7 @@ for long-context serving, and OpenAI-compatible API fixes for common clients.
 - `tclf90/Qwen3.6-27B-AWQ`
 - `tclf90/Qwen3.6-35B-A3B-AWQ`
 - `tclf90/Qwen3.5-122B-A10B-AWQ` for larger 4-GPU setups
+- `Qwen/Qwen3.8-27B` for the latest supported Qwen release
 
 The launch examples use local paths such as `/path/to/Qwen3.6-27B-AWQ`.
 Replace them with your local model path or a Hugging Face repository id.
@@ -57,6 +70,7 @@ validation.
 | --- | --- |
 | 4 x Tesla V100 32 GB | Main public reference target |
 | 2 x Tesla V100 32 GB | Supported for selected 27B profiles with lower concurrency |
+| 8 x Tesla V100 32 GB | DeepSeek V4 Flash original-checkpoint TP8 target |
 
 Typical model placement:
 
@@ -65,6 +79,10 @@ Typical model placement:
   the long-context public default.
 - `Qwen3.6-35B-A3B-AWQ`: TP4 recommended.
 - `Qwen3.5-122B-A10B-AWQ`: TP4 supported for larger deployments.
+- `DeepSeek-V4-Flash`: the original mixed MXFP4/FP8 checkpoint is supported
+  on eight 32 GB V100 GPUs with TP8.
+- `Qwen3.8-27B`: supported natively from Day 0, with validated FP16 and FP8
+  serving paths.
 
 Multimodal defaults:
 
@@ -349,17 +367,26 @@ python -m pip install -e . --no-build-isolation
 
 请使用微信扫描下方二维码加入群组：
 
-![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr-7.png)
+![1Cat-vLLM 微信交流群二维码](docs/assets/wechat-group-qr-6.png)
 
-> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请重新打开本页查看最新图片，或关注仓库更新。
+> 提示：微信群二维码通常 7 天内有效。若扫描失败或提示过期，请联系微信号：YM_isi。
+
+## Roadmap
+
+1Cat-vLLM will continue to prioritize Tesla V100 / SM70, making modern LLM inference more usable, stable, and deployable on existing GPUs.
+
+- **Near term:** Complete Volta compatibility and validation for DeepSeek V4, GLM5, and other new model families, while improving long-context serving, quantization, multi-GPU parallelism, and runtime stability.
+- **Mid term:** Expand the Volta model support matrix with a focus on models up to 300B parameters, backed by reproducible performance, quality, and release validation.
+- **Long term:** Build on the Volta foundation and extend hardware support in stages: **Volta → Turing/Ampere → CDNA**, bringing sustainable LLM inference to a broader range of existing accelerators.
+
 
 ## Repository Notes
 
-- Upstream project: [vLLM](https://github.com/vllm-project/vllm)
-- This fork focuses on SM70 AWQ support, V100-oriented attention/runtime
-  tuning, and experimental FP8/MTP/DFlash validation paths.
-- Prebuilt wheels are the public installation path.
-- Source builds are for development and kernel work.
+- This fork focuses on SM70 quantized inference, V100-oriented attention and
+  long-context tuning, model-specific runtime and deployment paths, and
+  continued MTP and DFlash research.
+- Production status is route-specific. Use the documented public profiles and
+  validated release matrices as the source of truth.
 
 ## Acknowledgements
 

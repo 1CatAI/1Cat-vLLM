@@ -19,9 +19,6 @@ from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 logger = init_logger(__name__)
 
-CUDAGRAPH_VARIANT_DEFAULT = 0
-CUDAGRAPH_VARIANT_LONG_CONTEXT = -1
-
 track_batchsize: bool = envs.VLLM_LOG_BATCHSIZE_INTERVAL >= 0
 last_logging_time: float = 0
 forward_start_time: float = 0
@@ -59,13 +56,11 @@ class BatchDescriptor:
     (like fused_moe_lora) whose grid size depends on num_active_loras
     to be properly captured.
     """
-    graph_variant: int = CUDAGRAPH_VARIANT_DEFAULT
+    graph_variant: int = 0
     """
     Optional semantic specialization for CUDA graphs that share the same batch
     shape but execute different model branches. The default keeps existing graph
-    keys unchanged. Negative values are reserved for target-model attention
-    specializations; MTP drafter uses non-negative values to separate per-step
-    layer selection.
+    keys unchanged. MTP drafter uses this to separate per-step layer selection.
     """
     attention_context_bucket: int | None = None
     """

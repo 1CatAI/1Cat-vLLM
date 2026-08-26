@@ -108,11 +108,15 @@ class CompressedTensorsW4A4Mxfp4(CompressedTensorsScheme):
             )
             sm70_tm.prepare_mxfp4_linear(layer)
             layer.weight_packed = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight_packed.device),
+                torch.empty(
+                    0, dtype=torch.uint8, device=layer.weight_packed.device
+                ),
                 requires_grad=False,
             )
             layer.weight_scale = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight_scale.device),
+                torch.empty(
+                    0, dtype=torch.uint8, device=layer.weight_scale.device
+                ),
                 requires_grad=False,
             )
             return

@@ -2,16 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
-# Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
-# zero draws before the flipped Gumbel transform below.
+# Smallest positive normal fp32 value. Used to clamp the uniform draw so that
+# `log(u)` cannot produce -inf (and thus `-log(-log(u))` stays finite).
 #
 # Triton requires globals accessed from `@triton.jit` functions to be wrapped
 # in `tl.constexpr(...)`. We can only do that when Triton is actually
 # available — on the CPU worker path `tl` is a placeholder whose `constexpr`
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
-_TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
+_FP32_TINY = (
+    tl.constexpr(float.fromhex("0x1p-126")) if HAS_TRITON else float.fromhex("0x1p-126")
+)
 
 
 @triton.jit
@@ -74,46 +76,6 @@ def tl_rand64(seed, offset, includes_zero: tl.constexpr):
 
 
 @triton.jit
-def tl_rand32(seed, offset, includes_zero: tl.constexpr):
-    u = tl.rand(seed, offset)
-    if not includes_zero:
-        u = tl.maximum(u, _TL_RAND_MIN)
-    return u
-
-
-@triton.jit
-def gumbel_noised_argmax(
-    logits,
-    keys,
-    mask,
-    seed,
-    pos,
-    temp,
-    USE_FP64: tl.constexpr,
-    APPLY_TEMPERATURE: tl.constexpr = True,
-):
-    """Argmax under token-keyed Gumbel noise, or plain argmax at temp zero."""
-    if temp != 0.0 and APPLY_TEMPERATURE:
-        logits = logits / temp
-
-    if USE_FP64:
-        logits = logits.to(tl.float64)
-    if temp != 0.0:
-        gumbel_seed = tl.randint(seed, pos)
-        if USE_FP64:
-            u = tl_rand64(gumbel_seed, keys, includes_zero=False)
-            gumbel_noise = -tl.log(-tl.log(u))
-        else:
-            u = tl_rand32(gumbel_seed, keys, includes_zero=False)
-            # Flip the transform so the deciding tail lies near zero, where
-            # fp32 uniforms retain resolution. `log1p` avoids cancellation.
-            gumbel_noise = -tl.log(-tldevice.log1p(-u))
-        logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
-
-    return tl.max(logits, axis=0, return_indices=True)
-
-
-@triton.jit
 def gumbel_block_argmax(
     logits,
     block,
@@ -125,24 +87,21 @@ def gumbel_block_argmax(
     pos_ptr,
     processed_logits_ptr,
     processed_logits_stride,
-    processed_logits_col_stride,
     processed_logits_col_ptr,
     vocab_size,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
-    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
-    is_valid_req = req_state_idx >= 0
-    temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
-        tl.float32
-    )
+    req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx)
+    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
     if temp != 0.0 and APPLY_TEMPERATURE:
-        # Preserve the established MRV2 contract: proposal logits handed to
-        # rejection sampling have already had request temperature applied.
+        # Apply temperature.
+        # NOTE(woosuk): Match the behavior of _temperature_kernel.
+        # E.g., if the kernel uses tl.div_rn, we should use tl.div_rn here too.
         logits = logits / temp
 
     if processed_logits_ptr is not None:
-        # Store the temperature-applied proposal distribution.
+        # Store the temperature-applied logits.
         if processed_logits_col_ptr is not None:
             col = tl.load(processed_logits_col_ptr)
         else:
@@ -150,24 +109,34 @@ def gumbel_block_argmax(
         tl.store(
             processed_logits_ptr
             + req_state_idx * processed_logits_stride
-            + col * processed_logits_col_stride
+            + col * vocab_size
             + block,
             logits,
-            mask=mask & is_valid_req,
+            mask=mask,
         )
 
-    seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
-    pos = tl.load(pos_ptr + token_idx)
-    return gumbel_noised_argmax(
-        logits,
-        block,
-        mask & is_valid_req,
-        seed,
-        pos,
-        temp,
-        USE_FP64=USE_FP64,
-        APPLY_TEMPERATURE=False,
-    )
+    # fp32 is the default reduction dtype; fp64 is ~1/32–1/64x the throughput
+    # on H100/Ada/Blackwell and empirically indistinguishable for Gumbel-max.
+    if USE_FP64:
+        logits = logits.to(tl.float64)
+    if temp != 0.0:
+        # Calculate the seed for gumbel noise.
+        seed = tl.load(seeds_ptr + req_state_idx)
+        pos = tl.load(pos_ptr + token_idx)
+        gumbel_seed = tl.randint(seed, pos)
+
+        if USE_FP64:
+            u = tl_rand64(gumbel_seed, block, includes_zero=False)
+        else:
+            u = tl.rand(gumbel_seed, block)
+            u = tl.maximum(u, _FP32_TINY)
+        gumbel_noise = -tl.log(-tl.log(u))
+
+        # Apply gumbel noise.
+        logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
+
+    value, idx = tl.max(logits, axis=0, return_indices=True)
+    return value, idx
 
 
 @triton.jit
@@ -178,7 +147,6 @@ def _gumbel_sample_kernel(
     local_max_stride,
     processed_logits_ptr,
     processed_logits_stride,
-    processed_logits_col_stride,
     processed_logits_col_ptr,
     logits_ptr,
     logits_stride,
@@ -213,7 +181,6 @@ def _gumbel_sample_kernel(
         pos_ptr,
         processed_logits_ptr,
         processed_logits_stride,
-        processed_logits_col_stride,
         processed_logits_col_ptr,
         vocab_size,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
@@ -248,7 +215,6 @@ def gumbel_sample(
         local_max.stride(0),
         output_processed_logits,
         output_processed_logits.stride(0) if output_processed_logits is not None else 0,
-        output_processed_logits.stride(1) if output_processed_logits is not None else 0,
         output_processed_logits_col,
         logits,
         logits.stride(0),

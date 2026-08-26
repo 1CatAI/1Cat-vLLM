@@ -198,7 +198,8 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
         dtype = config.model_config.dtype
         if FUSED_QK_ROPE_OP is None:
             logger.warning_once(
-                "QK Norm+RoPE fusion not enabled: fused_qk_norm_rope is unavailable."
+                "QK Norm+RoPE fusion not enabled: fused_qk_norm_rope is "
+                "unavailable."
             )
             return
 

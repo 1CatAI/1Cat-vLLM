@@ -41,8 +41,6 @@ from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
-    KVQuantMode,
-    PrefixAnchoredSWASpec,
     SlidingWindowSpec,
     get_kv_quant_mode,
 )
@@ -374,42 +372,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 f"but got {self.attn_backend.get_name()}."
             )
 
-        prefix_anchored_decode_window = getattr(
-            vllm_config.attention_config,
-            "prefix_anchored_decode_window",
-            None,
-        )
-        if (
-            prefix_anchored_decode_window is not None
-            and attn_type == AttentionType.DECODER
-        ):
-            if self.attn_backend.get_name() != "FLASH_ATTN_V100":
-                raise ValueError(
-                    "prefix-anchored SWA requires standard full decoder "
-                    "attention on FLASH_ATTN_V100"
-                )
-            if self.sliding_window is not None:
-                raise ValueError(
-                    "prefix-anchored SWA cannot be combined with per-layer "
-                    "sliding-window attention"
-                )
-            if (
-                get_kv_quant_mode(self.kv_cache_dtype) != KVQuantMode.NONE
-                or self.kv_cache_torch_dtype != torch.float16
-            ):
-                raise ValueError("prefix-anchored SWA requires an fp16 KV cache")
-            if self.head_size_v != self.head_size:
-                raise ValueError(
-                    "prefix-anchored SWA requires identical key/value head sizes"
-                )
-            if self.has_sink:
-                raise ValueError(
-                    "prefix-anchored SWA cannot be combined with attention sinks"
-                )
-            extra_impl_args["prefix_anchored_decode_window"] = (
-                prefix_anchored_decode_window
-            )
-
         if self.attn_backend.get_name() == "FLEX_ATTENTION":
             block_m = vllm_config.attention_config.flex_attn_block_m
             block_n = vllm_config.attention_config.flex_attn_block_n
@@ -639,45 +601,6 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
-        anchored_window = getattr(
-            vllm_config.attention_config,
-            "prefix_anchored_decode_window",
-            None,
-        )
-        if anchored_window is not None:
-            if self.attn_backend.get_name() != "FLASH_ATTN_V100":
-                raise ValueError(
-                    "prefix-anchored SWA requires the FLASH_ATTN_V100 backend"
-                )
-            if self.sliding_window is not None:
-                raise ValueError(
-                    "prefix-anchored SWA cannot be combined with per-layer "
-                    "sliding-window attention"
-                )
-            if (
-                quant_mode != KVQuantMode.NONE
-                or self.kv_cache_torch_dtype != torch.float16
-            ):
-                raise ValueError("prefix-anchored SWA requires an fp16 KV cache")
-            if self.kv_cache_dtype.startswith("turboquant_"):
-                raise ValueError("prefix-anchored SWA does not support TurboQuant KV")
-            if self.head_size_v != self.head_size:
-                raise ValueError(
-                    "prefix-anchored SWA requires identical key/value head sizes"
-                )
-            if self.has_sink:
-                raise ValueError(
-                    "prefix-anchored SWA cannot be combined with attention sinks"
-                )
-            return PrefixAnchoredSWASpec(
-                block_size=block_size,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                head_size_v=self.head_size_v,
-                dtype=self.kv_cache_torch_dtype,
-                kv_quant_mode=quant_mode,
-                decode_sliding_window=anchored_window,
-            )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"

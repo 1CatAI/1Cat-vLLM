@@ -2,12 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
-from vllm.triton_utils import tl, tldevice, triton
-from vllm.v1.worker.gpu.sample.gumbel import (
-    gumbel_block_argmax,
-    gumbel_noised_argmax,
-    tl_rand32,
-)
+from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand64
 
 
 @triton.jit
@@ -247,7 +243,7 @@ def _rejection_kernel(
 
                 if SYNTHETIC_MODE:
                     pos = tl.load(pos_ptr + logit_idx)
-                    u = tl_rand32(seed, pos, includes_zero=False)
+                    u = tl_rand64(seed, pos, includes_zero=False)
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
                 else:
@@ -271,7 +267,7 @@ def _rejection_kernel(
                 )
                 target_log_prob = target_logit - target_lse
                 pos = tl.load(pos_ptr + logit_idx)
-                u = tl_rand32(seed, pos, includes_zero=False)
+                u = tl_rand64(seed, pos, includes_zero=False)
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(
                         draft_logits_ptr
@@ -392,7 +388,7 @@ def _resample_kernel(
         ratio = tl.exp(draft_log_probs - target_log_probs)
         residual_logits = tl.where(
             ratio < 1.0,
-            target_log_probs + tldevice.log1p(-ratio),
+            target_log_probs + tl.log(1 - ratio),
             float("-inf"),
         ).to(tl.float32)
     else:
@@ -417,7 +413,6 @@ def _resample_kernel(
         pos_ptr,
         None,  # processed_logits_ptr
         0,  # processed_logits_stride
-        0,  # processed_logits_col_stride
         None,  # processed_logits_col_ptr
         vocab_size,
         APPLY_TEMPERATURE=False,
@@ -493,327 +488,6 @@ def _insert_resampled_kernel(
         sampled_ptr + req_idx * sampled_stride + num_sampled,
         resampled,
     )
-
-
-@triton.jit
-def _dflash2_compact_target_row(
-    target_ids_ptr,
-    target_logits_ptr,
-    target_stride,
-    row,
-    temperature,
-    top_p,
-    TOP_K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    offsets = tl.arange(0, BLOCK_K)
-    mask = offsets < TOP_K
-    token_ids = tl.load(
-        target_ids_ptr + row * target_stride + offsets,
-        mask=mask,
-        other=0,
-    ).to(tl.int64)
-    logits = tl.load(
-        target_logits_ptr + row * target_stride + offsets,
-        mask=mask,
-        other=float("-inf"),
-    ).to(tl.float32)
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    # get_topk_tokens_and_logits returns scores in descending order. Apply
-    # nucleus filtering only within that exact top-k support, matching the
-    # target's top-k-first sampling contract without materializing V columns.
-    row_max = tl.max(logits, axis=0)
-    unnormalized = tl.where(mask, tl.exp(logits - row_max), 0.0)
-    normalizer = tl.sum(unnormalized, axis=0)
-    probs = unnormalized / normalizer
-    cumulative_before = tl.cumsum(probs, axis=0) - probs
-    keep = mask & ((top_p >= 1.0) | (cumulative_before < top_p))
-    logits = tl.where(keep, logits, float("-inf"))
-
-    kept_max = tl.max(logits, axis=0)
-    kept_sumexp = tl.sum(tl.where(keep, tl.exp(logits - kept_max), 0.0), axis=0)
-    logsumexp = kept_max + tl.log(kept_sumexp)
-    return token_ids, logits, keep, logsumexp
-
-
-@triton.jit
-def _dflash2_sparse_topk_rejection_kernel(
-    # [num_reqs, num_speculative_steps + 1]
-    sampled_ptr,
-    sampled_stride,
-    # [num_reqs]
-    num_sampled_ptr,
-    # [num_logits, target_top_k]
-    target_ids_ptr,
-    target_logits_ptr,
-    target_stride,
-    # [max_num_reqs, num_speculative_steps, draft_top_k]
-    draft_ids_ptr,
-    draft_logits_ptr,
-    draft_stride_0,
-    draft_stride_1,
-    # [num_logits]
-    draft_sampled_ptr,
-    # [num_reqs + 1]
-    cu_num_logits_ptr,
-    # [num_reqs]
-    idx_mapping_ptr,
-    # [max_num_reqs]
-    temperature_ptr,
-    top_p_ptr,
-    seed_ptr,
-    # [num_logits]
-    pos_ptr,
-    num_speculative_steps: tl.constexpr,
-    TARGET_TOP_K: tl.constexpr,
-    TARGET_BLOCK_K: tl.constexpr,
-    DRAFT_TOP_K: tl.constexpr,
-    DRAFT_BLOCK_K: tl.constexpr,
-    USE_FP64: tl.constexpr,
-):
-    """DFlash2 chain rejection on compact target/draft supports.
-
-    The target distribution is zero outside its top-k/top-p support and the
-    DFlash2 proposal is zero outside selector top-k. Therefore both the
-    acceptance ratio and ``relu(p - q)`` recovery distribution are exact on
-    these compact sets; scanning or storing a full-vocabulary row is unnecessary.
-    """
-    req_idx = tl.program_id(0)
-    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
-    num_tokens = end_idx - start_idx
-    temperature = tl.load(temperature_ptr + req_state_idx).to(tl.float32)
-    top_p = tl.load(top_p_ptr + req_state_idx).to(tl.float32)
-    seed = tl.load(seed_ptr + req_state_idx)
-
-    target_offsets = tl.arange(0, TARGET_BLOCK_K)
-    target_mask = target_offsets < TARGET_TOP_K
-    draft_offsets = tl.arange(0, DRAFT_BLOCK_K)
-    draft_mask = draft_offsets < DRAFT_TOP_K
-
-    accepted = True
-    accepted_steps = tl.zeros((), dtype=tl.int32)
-    for step in range(num_speculative_steps):
-        if accepted and step < num_tokens - 1:
-            row = start_idx + step
-            target_ids, target_logits, target_keep, target_lse = (
-                _dflash2_compact_target_row(
-                    target_ids_ptr,
-                    target_logits_ptr,
-                    target_stride,
-                    row,
-                    temperature,
-                    top_p,
-                    TOP_K=TARGET_TOP_K,
-                    BLOCK_K=TARGET_BLOCK_K,
-                )
-            )
-            proposed = tl.load(draft_sampled_ptr + row + 1).to(tl.int64)
-            target_proposed_logit = tl.max(
-                tl.where(
-                    target_keep & (target_ids == proposed),
-                    target_logits,
-                    float("-inf"),
-                ),
-                axis=0,
-            )
-
-            draft_base = (
-                draft_logits_ptr
-                + req_state_idx * draft_stride_0
-                + step * draft_stride_1
-            )
-            draft_id_base = (
-                draft_ids_ptr + req_state_idx * draft_stride_0 + step * draft_stride_1
-            )
-            draft_ids = tl.load(
-                draft_id_base + draft_offsets,
-                mask=draft_mask,
-                other=0,
-            ).to(tl.int64)
-            draft_logits = tl.load(
-                draft_base + draft_offsets,
-                mask=draft_mask,
-                other=float("-inf"),
-            ).to(tl.float32)
-            draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
-            draft_lse = draft_max + tl.log(draft_sumexp)
-            draft_proposed_logit = tl.max(
-                tl.where(
-                    draft_mask & (draft_ids == proposed),
-                    draft_logits,
-                    float("-inf"),
-                ),
-                axis=0,
-            )
-
-            pos = tl.load(pos_ptr + row)
-            uniform = tl_rand32(seed, pos, includes_zero=False)
-            accepted &= (target_proposed_logit - target_lse) > (
-                tl.log(uniform) + draft_proposed_logit - draft_lse
-            )
-            tl.store(
-                sampled_ptr + req_idx * sampled_stride + step,
-                proposed,
-            )
-            accepted_steps += accepted.to(tl.int32)
-
-    resample_step = accepted_steps
-    resample_row = start_idx + resample_step
-    target_ids, target_logits, target_keep, target_lse = _dflash2_compact_target_row(
-        target_ids_ptr,
-        target_logits_ptr,
-        target_stride,
-        resample_row,
-        temperature,
-        top_p,
-        TOP_K=TARGET_TOP_K,
-        BLOCK_K=TARGET_BLOCK_K,
-    )
-    is_bonus = resample_row == end_idx - 1
-    residual_logits = target_logits
-    if not is_bonus:
-        draft_base = (
-            draft_logits_ptr
-            + req_state_idx * draft_stride_0
-            + resample_step * draft_stride_1
-        )
-        draft_id_base = (
-            draft_ids_ptr
-            + req_state_idx * draft_stride_0
-            + resample_step * draft_stride_1
-        )
-        draft_ids = tl.load(
-            draft_id_base + draft_offsets,
-            mask=draft_mask,
-            other=0,
-        ).to(tl.int64)
-        draft_logits = tl.load(
-            draft_base + draft_offsets,
-            mask=draft_mask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
-        draft_lse = draft_max + tl.log(draft_sumexp)
-
-        id_match = target_ids[:, None] == draft_ids[None, :]
-        draft_logits_at_target = tl.max(
-            tl.where(
-                id_match & target_mask[:, None] & draft_mask[None, :],
-                draft_logits[None, :],
-                float("-inf"),
-            ),
-            axis=1,
-        )
-        target_log_probs = target_logits - target_lse
-        draft_log_probs = draft_logits_at_target - draft_lse
-        ratio = tl.exp(draft_log_probs - target_log_probs)
-        residual_logits = tl.where(
-            target_keep & (ratio < 1.0),
-            target_log_probs + tldevice.log1p(-ratio),
-            float("-inf"),
-        )
-
-    pos = tl.load(pos_ptr + resample_row)
-    _, selected_offset = gumbel_noised_argmax(
-        residual_logits,
-        target_ids,
-        target_keep,
-        seed,
-        pos,
-        temperature,
-        USE_FP64=USE_FP64,
-        APPLY_TEMPERATURE=False,
-    )
-    selected_token = tl.load(
-        target_ids_ptr + resample_row * target_stride + selected_offset
-    )
-    tl.store(
-        sampled_ptr + req_idx * sampled_stride + resample_step,
-        selected_token,
-    )
-    tl.store(num_sampled_ptr + req_idx, resample_step + 1)
-
-
-def dflash2_sparse_topk_rejection_sample(
-    target_topk_ids: torch.Tensor,
-    target_topk_logits: torch.Tensor,
-    draft_topk_ids: torch.Tensor,
-    draft_topk_logits: torch.Tensor,
-    draft_sampled: torch.Tensor,
-    cu_num_logits: torch.Tensor,
-    pos: torch.Tensor,
-    idx_mapping: torch.Tensor,
-    temperature: torch.Tensor,
-    top_p: torch.Tensor,
-    seed: torch.Tensor,
-    num_speculative_steps: int,
-    use_fp64: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run exact DFlash2 rejection on compact top-k distributions.
-
-    Callers must enforce the no-penalty/no-logit-bias contract and provide
-    target candidates after a global top-k merge. Draft scores must be the
-    temperature-applied scores used to draw the corresponding proposal.
-    """
-    if target_topk_ids.ndim != 2 or target_topk_logits.ndim != 2:
-        raise ValueError("target top-k tensors must be two-dimensional")
-    if target_topk_ids.shape != target_topk_logits.shape:
-        raise ValueError("target top-k ids/logits shapes must match")
-    if draft_topk_ids.ndim != 3 or draft_topk_logits.ndim != 3:
-        raise ValueError("draft top-k tensors must be three-dimensional")
-    if draft_topk_ids.shape != draft_topk_logits.shape:
-        raise ValueError("draft top-k ids/logits shapes must match")
-    if draft_topk_ids.shape[1] != num_speculative_steps:
-        raise ValueError("draft top-k step count does not match configuration")
-    if target_topk_ids.shape[0] != draft_sampled.shape[0]:
-        raise ValueError("target rows and sampled-token rows must match")
-    if not 0 < target_topk_ids.shape[1] <= 64:
-        raise ValueError("target top-k width must be in [1, 64]")
-    if not 0 < draft_topk_ids.shape[2] <= 64:
-        raise ValueError("draft top-k width must be in [1, 64]")
-
-    target_topk_ids = target_topk_ids.contiguous()
-    target_topk_logits = target_topk_logits.contiguous()
-    draft_topk_ids = draft_topk_ids.contiguous()
-    draft_topk_logits = draft_topk_logits.contiguous()
-    num_reqs = cu_num_logits.shape[0] - 1
-    sampled = draft_sampled.new_empty(
-        num_reqs,
-        num_speculative_steps + 1,
-        dtype=torch.int64,
-    )
-    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
-    _dflash2_sparse_topk_rejection_kernel[(num_reqs,)](
-        sampled,
-        sampled.stride(0),
-        num_sampled,
-        target_topk_ids,
-        target_topk_logits,
-        target_topk_ids.stride(0),
-        draft_topk_ids,
-        draft_topk_logits,
-        draft_topk_ids.stride(0),
-        draft_topk_ids.stride(1),
-        draft_sampled,
-        cu_num_logits,
-        idx_mapping,
-        temperature,
-        top_p,
-        seed,
-        pos,
-        num_speculative_steps=num_speculative_steps,
-        TARGET_TOP_K=target_topk_ids.shape[1],
-        TARGET_BLOCK_K=triton.next_power_of_2(target_topk_ids.shape[1]),
-        DRAFT_TOP_K=draft_topk_ids.shape[2],
-        DRAFT_BLOCK_K=triton.next_power_of_2(draft_topk_ids.shape[2]),
-        USE_FP64=use_fp64,
-        num_warps=1,
-    )
-    return sampled, num_sampled
 
 
 def rejection_sample(
