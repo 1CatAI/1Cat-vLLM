@@ -27,6 +27,27 @@ class Qwen38PrescaledFullTileKernelImpl final : public KernelImpl<Gemm> {
   }
 };
 
+template <class Gemm>
+class Dsv4PrescaledM1KernelImpl final : public KernelImpl<Gemm> {
+ public:
+  Dsv4PrescaledM1KernelImpl() {
+    this->info_.name += "_sm70_fp8_pscale_dsv4_m1";
+  }
+
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    if (desc.m != 1 || desc.num != 1) {
+      return false;
+    }
+    const bool accepted_shape =
+        (desc.n == 1536 && desc.k == 4096) ||
+        (desc.n == 8192 && desc.k == 1024) ||
+        (desc.n == 4096 && desc.k == 2048) ||
+        (desc.n == 1024 && desc.k == 4096) ||
+        (desc.n == 4096 && desc.k == 512);
+    return accepted_shape && KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
 }  // namespace
 
 void Registry::sm70_884_8() {
@@ -50,6 +71,9 @@ void Registry::sm70_884_8() {
         using CP = Config_E4M3_Prescaled<kColMajor, 0>;
         using Q38PrescaledFull = CP::Type<64, 256, 16, 1, 4, 1, D, S, 2, true, 1, 128, 64, 128, 1, true>;
         Add(std::make_unique<Qwen38PrescaledFullTileKernelImpl<typename Q38PrescaledFull::Kernel>>());
+
+        using Dsv4PrescaledM1 = CP::Type<8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 128>;
+        Add(std::make_unique<Dsv4PrescaledM1KernelImpl<typename Dsv4PrescaledM1::Kernel>>());
     // clang-format on
   }
 }

@@ -168,6 +168,33 @@ _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] 
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
+def _is_sm70_dsv4_fp8_prescaled_decode_layer(layer: torch.nn.Module) -> bool:
+    """Admit only the replicated V4 fused WQA/WKV block-FP8 projection."""
+    return bool(
+        getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "fused_wqa_wkv"
+        and int(getattr(layer, "tp_size", 1)) == 1
+        and getattr(layer, "weight_block_size", None) == [128, 128]
+        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
+        and int(getattr(layer, "output_size_per_partition", 0)) == 1536
+        and tuple(layer.weight.shape) == (1536, 4096)
+    )
+
+
+def _is_sm70_dsv4_fp8_prescaled_decode_runtime_contract() -> bool:
+    """Require the measured PP2 x TP4 no-spec single-request decode lane."""
+    vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    scheduler_config = vllm_config.scheduler_config
+    return bool(
+        parallel_config.pipeline_parallel_size == 2
+        and parallel_config.tensor_parallel_size == 4
+        and scheduler_config.max_num_seqs == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
 def _is_sm70_fp8_exact_8k_prefill_layer(layer: torch.nn.Module) -> bool:
     if getattr(layer, "tp_size", 1) != 4:
         return False
@@ -1079,6 +1106,12 @@ class Fp8LinearMethod(LinearMethodBase):
                         "workspace; retaining the TurboMind layout."
                     )
 
+            use_dsv4_prescaled_decode = bool(
+                envs.VLLM_SM70_DSV4_FP8_PRESCALED_DECODE
+                and self.is_scale_e8m0
+                and _is_sm70_dsv4_fp8_prescaled_decode_layer(layer)
+                and _is_sm70_dsv4_fp8_prescaled_decode_runtime_contract()
+            )
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight,
                 weight_scale_inv,
@@ -1106,6 +1139,23 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
             layer.sm70_fp8_k_ld = int(meta[0].item())
             layer.sm70_fp8_q_ld = int(meta[1].item())
+            if use_dsv4_prescaled_decode:
+                if not hasattr(
+                    torch.ops._C, "fp8_gemm_sm70_prefill_prescaled_out"
+                ):
+                    raise RuntimeError(
+                        "VLLM_SM70_DSV4_FP8_PRESCALED_DECODE=1 requires the "
+                        "source-built SM70 prescaled FP8 operator."
+                    )
+                layer.register_buffer(
+                    "sm70_fp8_decode_prescaled_scales",
+                    tm_scales.mul(256),
+                    persistent=False,
+                )
+                logger.info_once(
+                    "Exact SM70 DeepSeek V4 fused-WQA/WKV prescaled decode "
+                    "path enabled."
+                )
             if (
                 envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
                 and envs.VLLM_SM70_FP8_PREFILL_PRESCALED
@@ -1391,6 +1441,9 @@ class Fp8LinearMethod(LinearMethodBase):
             prefill_prescaled_scales = getattr(
                 layer, "sm70_fp8_prefill_prescaled_scales", None
             )
+            decode_prescaled_scales = getattr(
+                layer, "sm70_fp8_decode_prescaled_scales", None
+            )
             prefill_min_m = getattr(
                 layer,
                 "sm70_fp8_prefill_exact_dense_min_m",
@@ -1404,7 +1457,21 @@ class Fp8LinearMethod(LinearMethodBase):
                 gated_silu=False,
                 min_prefill_m=prefill_min_m,
             )
-            if visible_dense_out is not None:
+            if (
+                decode_prescaled_scales is not None
+                and envs.VLLM_SM70_DSV4_FP8_PRESCALED_DECODE
+                and x_2d.shape[0] == 1
+            ):
+                sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
+                    out_2d,
+                    x_2d,
+                    layer.weight,
+                    decode_prescaled_scales,
+                    128,
+                    layer.sm70_fp8_k_ld,
+                    layer.sm70_fp8_q_ld,
+                )
+            elif visible_dense_out is not None:
                 out_2d = visible_dense_out
             elif prefill_workspace_ptr is not None and x_2d.dtype == torch.float16:
                 sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(

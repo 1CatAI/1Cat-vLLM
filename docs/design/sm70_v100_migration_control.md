@@ -43678,3 +43678,26 @@ Interpretation:
   blocked before collection by the environment's unrelated stale
   `mistral_common` (`NamedToolChoice` import); no service or end-to-end run is
   claimed.
+
+## 2026-08-26 DeepSeek V4 exact FP8 prescaled-decode screen
+
+- The SM70 E4M3 transform normally applies the exact exponent-bias factor and
+  the checkpoint block scale as two FP16 multiplies. DeepSeek V4 UE8M0 block
+  scales are powers of two, so multiplying each prepared scale by 256 once at
+  load time removes the per-fragment exponent-bias multiply without changing
+  the MMA layout, split count, swizzle, FP32 accumulation order, or FP16
+  epilogue.
+- A same-process CUDA Graph A/B/B/A screen uses real layer-0 TP4-rank-0
+  weights and the five non-gated M=1 decode shapes. All 320 changing-input
+  comparisons are bitwise equal. The fused WQA/WKV projection improves from
+  63.330 to 20.577 microseconds (`3.078x`); the weighted five-shape projection
+  saves 1.867 ms/token warm and 1.821 ms/token after a 256-MiB cache scrub.
+  Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp8-prescaled-decode-screen-20260826-r1/`.
+- Production admission is initially narrower than the operator screen: SM70,
+  UE8M0 128x128 block scales, PP2 x TP4, one sequence, no DBO/ubatching or
+  speculation, M=1, and the exact replicated K4096/N1536 fused-WQA/WKV role.
+  Prefill, gated activation, other shapes, and other scale formats retain the
+  original TurboMind transform. The route is opt-in through
+  `VLLM_SM70_DSV4_FP8_PRESCALED_DECODE=1` until matched full-model speed and
+  pinned dataset gates complete.

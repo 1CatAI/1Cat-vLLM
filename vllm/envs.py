@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_GROUPED_BMM_DECODE: bool = True
     VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
+    VLLM_SM70_DSV4_FP8_PRESCALED_DECODE: bool = False
     VLLM_SM70_FP8_PREFILL_CUTLASS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
@@ -1765,6 +1766,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_FP8_PREFILL_PRESCALED": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))
+    ),
+    "VLLM_SM70_DSV4_FP8_PRESCALED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_FP8_PRESCALED_DECODE", "0"))
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))
