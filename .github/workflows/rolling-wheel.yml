@@ -196,7 +196,7 @@ jobs:
       VLLM_REQUIRE_RUST_FRONTEND: "1"
       MAX_JOBS: "20"
       CMAKE_BUILD_PARALLEL_LEVEL: "20"
-      NVCC_THREADS: "20"
+      NVCC_THREADS: "1"
       CARGO_BUILD_JOBS: "20"
       VLLM_VERSION_OVERRIDE: ${{ needs.resolve.outputs.expected_version }}
       BASE_RELEASE_REPO: ${{ needs.resolve.outputs.base_release_repo }}
@@ -346,7 +346,7 @@ jobs:
           fi
           echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
-          echo "NVCC_THREADS=$jobs" >> "$GITHUB_ENV"
+          echo "NVCC_THREADS=1" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "Official runner build parallelism: $jobs"
 

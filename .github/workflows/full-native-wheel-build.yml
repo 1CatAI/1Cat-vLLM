@@ -197,10 +197,6 @@ jobs:
       TORCH_CUDA_ARCH_LIST: "7.0"
       FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
       VLLM_BUILD_FLASH_ATTN_V100: "1"
-      MAX_JOBS: "20"
-      CMAKE_BUILD_PARALLEL_LEVEL: "20"
-      NVCC_THREADS: "20"
-      CARGO_BUILD_JOBS: "20"
       CMAKE_BUILD_TYPE: Release
 
     steps:
@@ -263,6 +259,21 @@ jobs:
           unzip -p "$baseline_wheel" vllm/vllm-rs > vllm/vllm-rs
           test -s vllm/vllm-rs
           chmod +x vllm/vllm-rs
+
+      - name: Resolve build parallelism
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpu_count="$(nproc)"
+          jobs="$cpu_count"
+          if (( jobs > 8 )); then
+            jobs=8
+          fi
+          echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
+          echo "NVCC_THREADS=1" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "Build parallelism: ${jobs} compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
 
       - name: Install the pinned Rust toolchain
         if: env.RUST_CHANGED == 'true'
@@ -402,7 +413,7 @@ jobs:
           fi
           echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
-          echo "NVCC_THREADS=$jobs" >> "$GITHUB_ENV"
+          echo "NVCC_THREADS=1" >> "$GITHUB_ENV"
           echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "Official runner build parallelism: $jobs"
 
