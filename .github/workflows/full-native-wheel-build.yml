@@ -188,8 +188,6 @@ jobs:
       HTTP_PROXY_URL: ${{ vars.HTTP_PROXY_URL }}
       HTTP_PROXY: ${{ vars.HTTP_PROXY_URL }}
       HTTPS_PROXY: ${{ vars.HTTP_PROXY_URL }}
-      http_proxy: ${{ vars.HTTP_PROXY_URL }}
-      https_proxy: ${{ vars.HTTP_PROXY_URL }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
       VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
