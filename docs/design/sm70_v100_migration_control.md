@@ -43459,6 +43459,25 @@ Interpretation:
   capture. The corrected branch uses the immutable `slot_expert_offsets`
   buffer. Keep the route opt-in until a post-fix full-model and GSM8K-64 gate
   pass; the failed endpoint is rejection evidence, not a speed baseline.
+- A follow-up C4 scheduling screen joins the `N=2048` main compressor,
+  `N=512` indexer compressor, and `N=64` indexer-weight FP16 row GEMVs into
+  one `N=2624` launch on one auxiliary stream. It preserves the original
+  `K=4096`, block-K=1024 FP32 FMA and reduction order; all three outputs and
+  the concurrently executed prescaled WQA/WKV output are bitwise equal across
+  64 changing inputs. The exact FP16 arm improves the four-stream overlap from
+  `103.809` to `51.639 us/C4 layer` warm and from `99.104` to
+  `73.856 us/C4 layer` after cache scrub. This is preferred over the slightly
+  faster packed-FP13 arm because it introduces no weight approximation. The
+  joined non-persistent buffer costs 20.5 MiB per C4 layer. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp13-fused-overlap-screen-20260826-r2/`.
+  The production kernel also passes a driver-free SM70 compile gate at 32
+  registers with zero stack, local, or static shared memory, plus a real-V100
+  CUDA Graph bitwise test under
+  `/data/models/v100-dsv4-0731-pp2tp4-fused-fp16-aux-gpu-test-20260826-r1/`.
+  Admission additionally requires the existing exact FP16 GEMV route through
+  `VLLM_SM70_DSV4_FP16_GEMV=1`; keep
+  `VLLM_SM70_DSV4_FUSED_FP16_AUX_GEMV` opt-in until an endpoint trace and
+  aggregate dataset gate pass.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 
