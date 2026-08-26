@@ -749,9 +749,8 @@ perceptron==0.1.4
     # via -r requirements/test/rocm.in
 perf-analyzer==0.1.0
     # via genai-perf
-pillow==12.3.0
+pillow==12.1.1
     # via
-    #   -c requirements/common.txt
     #   -r requirements/test/../common.txt
     #   genai-perf
     #   imagehash
