@@ -25,10 +25,7 @@ pytestmark = pytest.mark.skipif(
 def _make_cos_sin_cache(max_position: int, device: str) -> torch.Tensor:
     inv_freq = 1.0 / (
         10000.0
-        ** (
-            torch.arange(0, ROPE_DIM, 2, dtype=torch.float32, device=device)
-            / ROPE_DIM
-        )
+        ** (torch.arange(0, ROPE_DIM, 2, dtype=torch.float32, device=device) / ROPE_DIM)
     )
     positions = torch.arange(max_position, dtype=torch.float32, device=device)
     frequencies = torch.outer(positions, inv_freq)

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Validate an uncached SM70 FP8 GEMM shape under CUDA Graph capture."""
 

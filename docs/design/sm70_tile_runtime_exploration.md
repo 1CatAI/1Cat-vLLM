@@ -19,12 +19,12 @@ decode path:
 
 Relevant public references:
 
-- TileRT README: https://github.com/tile-ai/TileRT
-- TileRT execution-model blog: https://www.tilert.ai/blog/speed-as-the-next-scaling-law.html
-- TileRT 1000 TPS blog: https://www.tilert.ai/blog/breaking-1000-tps.html
-- DistFuse tile-wise GEMM/all-reduce paper: https://mcanini.github.io/papers/distfuse.hotinfra24.pdf
-- TokenWeave paper: https://arxiv.org/html/2505.11329v2
-- CUTLASS-native Distributed GEMM write-up: https://blog.shi-labs.com/distributed-gemm-88be6a481e2b
+- TileRT README: <https://github.com/tile-ai/TileRT>
+- TileRT execution-model blog: <https://www.tilert.ai/blog/speed-as-the-next-scaling-law.html>
+- TileRT 1000 TPS blog: <https://www.tilert.ai/blog/breaking-1000-tps.html>
+- DistFuse tile-wise GEMM/all-reduce paper: <https://mcanini.github.io/papers/distfuse.hotinfra24.pdf>
+- TokenWeave paper: <https://arxiv.org/html/2505.11329v2>
+- CUTLASS-native Distributed GEMM write-up: <https://blog.shi-labs.com/distributed-gemm-88be6a481e2b>
 
 The TileRT repository currently ships Python wrappers and binary backends, not
 the core engine source. The actionable implementation detail therefore comes
@@ -314,8 +314,8 @@ Correctness:
   `gated_silu` epilogue produced `max_abs=0`; interleaved normal output
   restored to the original order also produced `max_abs=0`.
 - End-to-end Qwen3.6-27B-AWQ TP2 token hashes matched baseline:
-  - 16-token smoke: `3d326cfe4c2bcd0aae49b11ed684dc2baff445be00e7eff6472cb014eb269cdb`.
-  - 128-token repeat-3: `25acc1257b65019cd7398d36105134378675d9de82bc7d30c6b49d78b1f7b755`.
+    - 16-token smoke: `3d326cfe4c2bcd0aae49b11ed684dc2baff445be00e7eff6472cb014eb269cdb`.
+    - 128-token repeat-3: `25acc1257b65019cd7398d36105134378675d9de82bc7d30c6b49d78b1f7b755`.
 
 Performance, 27B-AWQ TP2 on GPU0/1, `input_len=512`, `output_len=128`,
 `repeat=3`, Flash-V100 compile graph:
@@ -390,9 +390,9 @@ Correctness:
   both repeats produced token hash
   `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
 - Tail-worker reduce also matches the normal path:
-  - short smoke, `output_len=4`: token hash
+    - short smoke, `output_len=4`: token hash
     `e3b3ebc930b09ed8921c4e20f0c8dd6fb93f0bd51c382cdc33a485050ef60939`;
-  - stable comparison, `output_len=32`: both repeats produced token hash
+    - stable comparison, `output_len=32`: both repeats produced token hash
     `1ccba72c62311edee3c604b4d41cdeddad72adb96fd6666a1af609c59708fd68`.
 
 Performance, 27B-AWQ TP2 on GPU0/1, `input_len=512`, `output_len=32`,

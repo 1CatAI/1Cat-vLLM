@@ -104,9 +104,7 @@ class BlockTable:
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
     def _mark_dirty(self, row_idx: int) -> None:
-        self._block_table_dirty_until = max(
-            self._block_table_dirty_until, row_idx + 1
-        )
+        self._block_table_dirty_until = max(self._block_table_dirty_until, row_idx + 1)
 
     def append_row(
         self,

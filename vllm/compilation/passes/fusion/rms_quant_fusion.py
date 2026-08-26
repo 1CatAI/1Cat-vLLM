@@ -124,12 +124,9 @@ def _register_fused_op(
 
 
 _register_fused_op(kFp8StaticTensorSym, False, "rms_norm_static_fp8_quant")
-_register_fused_op(kFp8StaticTensorSym, True,
-                   "fused_add_rms_norm_static_fp8_quant")
-_register_fused_op(kFp8DynamicTokenSym, False,
-                   "rms_norm_dynamic_per_token_quant")
-_register_fused_op(kFp8DynamicTokenSym, True,
-                   "rms_norm_dynamic_per_token_quant")
+_register_fused_op(kFp8StaticTensorSym, True, "fused_add_rms_norm_static_fp8_quant")
+_register_fused_op(kFp8DynamicTokenSym, False, "rms_norm_dynamic_per_token_quant")
+_register_fused_op(kFp8DynamicTokenSym, True, "rms_norm_dynamic_per_token_quant")
 _register_fused_op(kFp8Dynamic128Sym, False, "rms_norm_per_block_quant")
 _register_fused_op(kFp8Dynamic128Sym, True, "rms_norm_per_block_quant")
 _register_fused_op(kFp8Dynamic64Sym, False, "rms_norm_per_block_quant")

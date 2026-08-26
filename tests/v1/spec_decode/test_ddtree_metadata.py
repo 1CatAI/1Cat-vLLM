@@ -34,7 +34,8 @@ def test_single_request_metadata_indices() -> None:
     assert metadata.compact_logits_indices[0] == 6
     assert metadata.compact_logits_indices[1] == 7
     assert metadata.node_compact_indices == tuple(
-        range(1, tree.non_root_nodes[-1].index + 1))
+        range(1, tree.non_root_nodes[-1].index + 1)
+    )
     assert metadata.edge_parent_compact_indices[0] == 0
     assert metadata.edge_parent_compact_indices[1] == 1
     assert metadata.tree_position_ids[:3] == (7, 8, 9)

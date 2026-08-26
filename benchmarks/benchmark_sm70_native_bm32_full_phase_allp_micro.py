@@ -87,10 +87,7 @@ def _require_environment(args: argparse.Namespace) -> None:
     if args.rounds < K_DEFAULT_ROUNDS:
         raise ValueError(f"rounds must be at least {K_DEFAULT_ROUNDS}.")
     if args.launches_per_sample < K_DEFAULT_LAUNCHES:
-        raise ValueError(
-            "launches-per-sample must be at least "
-            f"{K_DEFAULT_LAUNCHES}."
-        )
+        raise ValueError(f"launches-per-sample must be at least {K_DEFAULT_LAUNCHES}.")
 
 
 def _graphics_clock_mhz(physical_gpu: int) -> int:
@@ -239,8 +236,7 @@ def _inspect_sass(binary: Path) -> dict[str, Any]:
             "ctas_per_group": ctas_per_group,
             "instructions": instructions,
             "instructions_per_group": {
-                name: count * ctas_per_group
-                for name, count in instructions.items()
+                name: count * ctas_per_group for name, count in instructions.items()
             },
         }
     return {"available": True, "binary": str(binary), "kernels": kernels}
@@ -266,8 +262,7 @@ def _resource_gate(
         reasons.append("C++ runtime resource gate did not pass")
     if baseline.get("threads_per_cta") != 512:
         reasons.append(
-            "baseline threads_per_cta="
-            f"{baseline.get('threads_per_cta')}, requires 512"
+            f"baseline threads_per_cta={baseline.get('threads_per_cta')}, requires 512"
         )
     if baseline.get("active_ctas_per_sm", 0) < 2:
         reasons.append(
@@ -281,18 +276,15 @@ def _resource_gate(
         )
     if candidate.get("registers_per_thread", 65) > 64:
         reasons.append(
-            "candidate REG="
-            f"{candidate.get('registers_per_thread')}, requires <=64"
+            f"candidate REG={candidate.get('registers_per_thread')}, requires <=64"
         )
     if candidate.get("local_bytes_per_thread") != 0:
         reasons.append(
-            "candidate LOCAL="
-            f"{candidate.get('local_bytes_per_thread')}, requires 0"
+            f"candidate LOCAL={candidate.get('local_bytes_per_thread')}, requires 0"
         )
     if candidate.get("static_shared_bytes", 48 * 1024 + 1) > 48 * 1024:
         reasons.append(
-            "candidate shared="
-            f"{candidate.get('static_shared_bytes')}, requires <=49152"
+            f"candidate shared={candidate.get('static_shared_bytes')}, requires <=49152"
         )
     if candidate.get("active_ctas_per_sm", 0) < 2:
         reasons.append(
@@ -348,40 +340,31 @@ def _resource_gate(
     return not reasons, reasons
 
 
-def _correctness_gate(
-    payload: dict[str, Any], groups: int
-) -> tuple[bool, list[str]]:
+def _correctness_gate(payload: dict[str, Any], groups: int) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     exactness = payload.get("exactness", {})
     expected_words = groups * K_M * K_D // 2
     if exactness.get("word_dtype") != "uint32 packed fp16":
         reasons.append(
-            "word_dtype="
-            f"{exactness.get('word_dtype')}, requires uint32 packed fp16"
+            f"word_dtype={exactness.get('word_dtype')}, requires uint32 packed fp16"
         )
     if exactness.get("word_count") != expected_words:
         reasons.append(
-            "word_count="
-            f"{exactness.get('word_count')}, requires {expected_words}"
+            f"word_count={exactness.get('word_count')}, requires {expected_words}"
         )
     if exactness.get("full_output") is not True:
         reasons.append("C++ probe did not compare the full output")
     if exactness.get("bitwise_equal") is not True:
         reasons.append("candidate output is not bitwise equal to baseline")
     if exactness.get("mismatch_words") != 0:
-        reasons.append(
-            "mismatch_words="
-            f"{exactness.get('mismatch_words')}, requires 0"
-        )
+        reasons.append(f"mismatch_words={exactness.get('mismatch_words')}, requires 0")
     xor = exactness.get("xor", {})
     if xor.get("max_word") != 0 or xor.get("reduction") != 0:
         reasons.append("packed uint32 XOR result is nonzero")
     return not reasons, reasons
 
 
-def _performance_gate(
-    payload: dict[str, Any], rounds: int
-) -> tuple[bool, list[str]]:
+def _performance_gate(payload: dict[str, Any], rounds: int) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     timing = payload.get("timing", {})
     pairs = payload.get("pairs", {})
@@ -390,8 +373,7 @@ def _performance_gate(
         reasons.append("candidate speedup was not reported")
     elif speedup < K_REQUIRED_SPEEDUP_PCT:
         reasons.append(
-            f"candidate speedup {speedup:.3f}% is below "
-            f"{K_REQUIRED_SPEEDUP_PCT:.3f}%"
+            f"candidate speedup {speedup:.3f}% is below {K_REQUIRED_SPEEDUP_PCT:.3f}%"
         )
     if pairs.get("count") != rounds:
         reasons.append(f"pair count={pairs.get('count')}, requires {rounds}")
@@ -468,9 +450,7 @@ def _run_case(
     resource_passed, resource_reasons = _resource_gate(
         payload, sass, ptxas_candidate, build_command
     )
-    performance_passed, performance_reasons = _performance_gate(
-        payload, args.rounds
-    )
+    performance_passed, performance_reasons = _performance_gate(payload, args.rounds)
     reasons = [
         *([] if completed.returncode == 0 else ["C++ benchmark returned nonzero"]),
         *correctness_reasons,
@@ -584,14 +564,11 @@ def _run_ncu_kernel(
             "long_scoreboard_per_warp_active": metrics.get(
                 "smsp__warp_issue_stalled_long_scoreboard_per_warp_active"
             ),
-            "tensor_instructions": metrics.get(
-                "smsp__inst_executed_pipe_tensor.sum"
-            ),
+            "tensor_instructions": metrics.get("smsp__inst_executed_pipe_tensor.sum"),
         },
         "stdout_tail": completed.stdout[-3000:],
         "stderr_tail": completed.stderr[-3000:],
-        "permission_error": "ERR_NVGPUCTRPERM"
-        in (completed.stdout + completed.stderr),
+        "permission_error": "ERR_NVGPUCTRPERM" in (completed.stdout + completed.stderr),
     }
 
 
@@ -620,9 +597,7 @@ def _ncu_payload(
 def _aggregate_gates(cases: list[dict[str, Any]]) -> dict[str, Any]:
     primary_cases = [case for case in cases if case["nblocks"] == 4]
     short_cases = [case for case in cases if case["nblocks"] != 4]
-    correctness_all_cases = all(
-        case["gates"]["correctness_passed"] for case in cases
-    )
+    correctness_all_cases = all(case["gates"]["correctness_passed"] for case in cases)
     resource_all_cases = all(case["gates"]["resource_passed"] for case in cases)
     primary_performance_passed = all(
         case["gates"]["performance_passed"] for case in primary_cases
@@ -631,9 +606,7 @@ def _aggregate_gates(cases: list[dict[str, Any]]) -> dict[str, Any]:
         case["gates"]["performance_passed"] for case in cases
     )
     short_case_performance_failures = [
-        case["name"]
-        for case in short_cases
-        if not case["gates"]["performance_passed"]
+        case["name"] for case in short_cases if not case["gates"]["performance_passed"]
     ]
     aggregate_passed = (
         correctness_all_cases and resource_all_cases and primary_performance_passed
@@ -702,8 +675,7 @@ def main() -> int:
         "benchmark": "sm70_native_bm32_full_phase_allp_micro",
         "target": "sm_70",
         "matrix": [
-            {"pattern": pattern, "nblocks": nblocks}
-            for pattern, nblocks in K_CASES
+            {"pattern": pattern, "nblocks": nblocks} for pattern, nblocks in K_CASES
         ],
         "configuration": {
             "groups": args.groups,

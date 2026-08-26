@@ -184,11 +184,7 @@ def get_block_size(dtype: torch.dtype, head_dim: int | None = None) -> int:
         80
     ):
         return 128
-    elif (
-        current_platform.is_cuda_alike()
-        and head_dim is not None
-        and head_dim >= 256
-    ):
+    elif current_platform.is_cuda_alike() and head_dim is not None and head_dim >= 256:
         # SM70/SM75 only expose 96KB shared memory per block. With head_dim=256,
         # BLOCK=64 requires 128KB in this Triton kernel.
         return 32

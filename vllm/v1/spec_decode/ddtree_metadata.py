@@ -52,10 +52,10 @@ class DDTreeVerifierMetadata:
         tree_token_ids = tree.token_ids_for_verifier()
         parent_indices = tree.parent_indices_for_verifier()
         node_depths = tree.node_depths_for_verifier()
-        tree_position_ids = tuple(prompt_len + depth - 1
-                                  for depth in node_depths)
+        tree_position_ids = tuple(prompt_len + depth - 1 for depth in node_depths)
         compact_logits_indices = (prompt_len - 1,) + tuple(
-            prompt_len + offset for offset in range(len(tree_token_ids)))
+            prompt_len + offset for offset in range(len(tree_token_ids))
+        )
 
         edge_parent_compact_indices: list[int] = []
         node_compact_indices: list[int] = []
@@ -98,8 +98,7 @@ def _offset_parent_indices(
     parent_indices: tuple[int, ...],
     tree_start: int,
 ) -> list[int]:
-    return [parent if parent < 0 else parent + tree_start
-            for parent in parent_indices]
+    return [parent if parent < 0 else parent + tree_start for parent in parent_indices]
 
 
 def make_prefill_tree_attention_mask(
@@ -115,7 +114,7 @@ def make_prefill_tree_attention_mask(
     visible = torch.zeros((total_len, total_len), device=device, dtype=torch.bool)
 
     for row in range(prompt_len):
-        visible[row, :row + 1] = True
+        visible[row, : row + 1] = True
 
     for node in tree.non_root_nodes:
         row = prompt_len + node.index - 1
@@ -126,10 +125,9 @@ def make_prefill_tree_attention_mask(
             col = prompt_len + ancestor_index - 1
             visible[row, col] = True
 
-    mask = torch.full((total_len, total_len),
-                      torch.finfo(dtype).min,
-                      device=device,
-                      dtype=dtype)
+    mask = torch.full(
+        (total_len, total_len), torch.finfo(dtype).min, device=device, dtype=dtype
+    )
     mask.masked_fill_(visible, 0)
     return mask.unsqueeze(0).unsqueeze(0)
 
@@ -157,7 +155,8 @@ def make_batched_metadata(
 
     max_total_len = max(
         prompt_len + len(tree.non_root_nodes)
-        for prompt_len, tree in zip(prompt_lens, trees, strict=True))
+        for prompt_len, tree in zip(prompt_lens, trees, strict=True)
+    )
     tree_token_ids: list[int] = []
     parent_indices: list[int] = []
     node_depths: list[int] = []
@@ -172,15 +171,18 @@ def make_batched_metadata(
     for metadata in per_request:
         tree_token_ids.extend(metadata.tree_token_ids)
         parent_indices.extend(
-            _offset_parent_indices(metadata.parent_indices, tree_start))
+            _offset_parent_indices(metadata.parent_indices, tree_start)
+        )
         node_depths.extend(metadata.node_depths)
         compact_logits_indices.extend(
-            seq_start + index for index in metadata.compact_logits_indices)
+            seq_start + index for index in metadata.compact_logits_indices
+        )
         edge_parent_compact_indices.extend(
-            compact_start + index
-            for index in metadata.edge_parent_compact_indices)
+            compact_start + index for index in metadata.edge_parent_compact_indices
+        )
         node_compact_indices.extend(
-            compact_start + index for index in metadata.node_compact_indices)
+            compact_start + index for index in metadata.node_compact_indices
+        )
 
         row = list(metadata.all_position_ids())
         row.extend([0] * (max_total_len - len(row)))
@@ -192,24 +194,20 @@ def make_batched_metadata(
 
     return BatchedDDTreeVerifierMetadata(
         prompt_lens=tuple(prompt_lens),
-        tree_token_ids=torch.tensor(tree_token_ids, device=device,
-                                    dtype=torch.int32),
-        parent_indices=torch.tensor(parent_indices, device=device,
-                                    dtype=torch.int32),
+        tree_token_ids=torch.tensor(tree_token_ids, device=device, dtype=torch.int32),
+        parent_indices=torch.tensor(parent_indices, device=device, dtype=torch.int32),
         node_depths=torch.tensor(node_depths, device=device, dtype=torch.int32),
-        position_ids=torch.tensor(position_rows, device=device,
-                                  dtype=torch.long),
-        cu_num_tree_nodes=torch.tensor(cu_nodes, device=device,
-                                       dtype=torch.int32),
-        compact_logits_indices=torch.tensor(compact_logits_indices,
-                                            device=device,
-                                            dtype=torch.int32),
-        edge_parent_compact_indices=torch.tensor(edge_parent_compact_indices,
-                                                 device=device,
-                                                 dtype=torch.int32),
-        node_compact_indices=torch.tensor(node_compact_indices,
-                                          device=device,
-                                          dtype=torch.int32),
+        position_ids=torch.tensor(position_rows, device=device, dtype=torch.long),
+        cu_num_tree_nodes=torch.tensor(cu_nodes, device=device, dtype=torch.int32),
+        compact_logits_indices=torch.tensor(
+            compact_logits_indices, device=device, dtype=torch.int32
+        ),
+        edge_parent_compact_indices=torch.tensor(
+            edge_parent_compact_indices, device=device, dtype=torch.int32
+        ),
+        node_compact_indices=torch.tensor(
+            node_compact_indices, device=device, dtype=torch.int32
+        ),
     )
 
 
@@ -226,7 +224,8 @@ def greedy_sample_from_compact_logits(
     if compact_logits.shape[0] != expected_rows:
         raise ValueError(
             f"compact_logits row mismatch: expected {expected_rows}, "
-            f"got {compact_logits.shape[0]}")
+            f"got {compact_logits.shape[0]}"
+        )
 
     target_argmax = compact_logits.argmax(dim=-1)
     path_to_compact_index: dict[tuple[int, ...], int] = {(): 0}
@@ -252,7 +251,8 @@ def greedy_sample_from_compact_top_tokens(
     if compact_top_tokens.shape[0] != expected_rows:
         raise ValueError(
             f"compact_top_tokens row mismatch: expected {expected_rows}, "
-            f"got {compact_top_tokens.shape[0]}")
+            f"got {compact_top_tokens.shape[0]}"
+        )
 
     target_tokens = compact_top_tokens.detach().cpu().tolist()
     path_to_compact_index: dict[tuple[int, ...], int] = {(): 0}

@@ -27,22 +27,22 @@
 
 namespace marlin_moe_wna16 {
 
-using marlin::sm70::Sm70CtaGeometry;
-using marlin::sm70::Sm70MarlinAutoParams;
-using marlin::sm70::Sm70MarlinMoeAutoParamsContext;
-using marlin::sm70::Sm70SplitKPartition;
-using marlin::sm70::Sm70MarlinMmaPipelined;
-using marlin::sm70::Sm70WarpShape;
 using marlin::sm70::configure_sm70_dynamic_smem;
 using marlin::sm70::kQuantTileK;
 using marlin::sm70::kQuantTileN;
+using marlin::sm70::sm70_active_split_k;
 using marlin::sm70::sm70_marlin_any_auto_env_is_set;
 using marlin::sm70::sm70_marlin_auto_packed_macro_n;
 using marlin::sm70::sm70_marlin_auto_params_from_env;
 using marlin::sm70::sm70_marlin_cta_geometry_is_supported;
 using marlin::sm70::sm70_marlin_default_auto_params;
-using marlin::sm70::sm70_active_split_k;
 using marlin::sm70::sm70_splitk_partition;
+using marlin::sm70::Sm70CtaGeometry;
+using marlin::sm70::Sm70MarlinAutoParams;
+using marlin::sm70::Sm70MarlinMmaPipelined;
+using marlin::sm70::Sm70MarlinMoeAutoParamsContext;
+using marlin::sm70::Sm70SplitKPartition;
+using marlin::sm70::Sm70WarpShape;
 using marlin::sm70::validate_sm70_marlin_auto_params;
 
 inline constexpr char const* kSupportedSm70MarlinMoeCtaGeometries =
@@ -55,9 +55,9 @@ inline constexpr char const* kSupportedSm70MarlinMoeCtaGeometries =
     "geometries are dense-only.";
 
 inline bool sm70_marlin_moe_auto_env_is_set() {
-  return sm70_marlin_any_auto_env_is_set(
-      "SM70_MARLIN_MOE_CTA_GEOMETRY", "SM70_MARLIN_MOE_SPLIT_K",
-      "SM70_MARLIN_MOE_METADATA_CACHE");
+  return sm70_marlin_any_auto_env_is_set("SM70_MARLIN_MOE_CTA_GEOMETRY",
+                                         "SM70_MARLIN_MOE_SPLIT_K",
+                                         "SM70_MARLIN_MOE_METADATA_CACHE");
 }
 
 inline Sm70MarlinAutoParams sm70_marlin_moe_auto_params_from_env(
@@ -68,16 +68,14 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_params_from_env(
 }
 
 inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
-      ctx.group_size != 128 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4") != 0 || ctx.group_size != 128 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -152,8 +150,7 @@ inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
       }
       return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
     }
-    if (ctx.moe_block_size == 64 &&
-        (ctx.size_n == 256 || ctx.size_n == 1024)) {
+    if (ctx.moe_block_size == 64 && (ctx.size_n == 256 || ctx.size_n == 1024)) {
       return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
     }
   }
@@ -162,16 +159,14 @@ inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
 }
 
 inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_5_122b_a10b_awq_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
-      ctx.group_size != 128 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4") != 0 || ctx.group_size != 128 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -278,16 +273,14 @@ inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_5_122b_a10b_awq_params(
 }
 
 inline bool sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
-      ctx.group_size != 128 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4") != 0 || ctx.group_size != 128 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -378,17 +371,16 @@ inline bool sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
   return false;
 }
 
-inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+inline bool
+sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_params(
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint8b128") != 0 ||
-      ctx.group_size != 32 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint8b128") != 0 || ctx.group_size != 32 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -400,57 +392,57 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_param
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 128) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 256) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1024) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,128,64,8,32,32,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 64, 8, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 512) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,256,32,4,32,64,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 2048) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,256,32,4,32,64,32}, 2, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 2, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -460,13 +452,13 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_param
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1024) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 2048) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -476,13 +468,13 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_param
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1024) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 2048) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -492,33 +484,33 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_param
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1024) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 512) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 2048) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -527,16 +519,14 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_5_122b_a10b_awq_8bit_param
 }
 
 inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_4bit_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
-      ctx.group_size != 32 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4") != 0 || ctx.group_size != 32 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -548,63 +538,63 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_4bit_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,64,32,4,32,32,16}, 1, false);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 1, false);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,64,32,4,32,32,16}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,64,16}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, false);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,64,8,32,64,16}, 2, false);
-          }
-          return set_params({32,128,128,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, false);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 64, 8, 32, 64, 16}, 2, false);
+        }
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, false);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,256,32,4,32,64,32}, 4, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 4, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -614,16 +604,16 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_4bit_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,64,8,32,64,32}, 1, false);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, false);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -633,13 +623,13 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_4bit_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({32,256,64,8,32,64,32}, 1, true);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -649,36 +639,36 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_4bit_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 2048) {
-            return set_params({64,128,32,4,64,64,16}, 1, false);
-          }
-          return set_params({64,128,32,8,32,32,32}, 1, true);
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 128, 32, 4, 64, 64, 16}, 1, false);
+        }
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -686,17 +676,16 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_4bit_params(
   return false;
 }
 
-inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+inline bool
+sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params(
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
-      ctx.group_size != 16 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "nvfp4") != 0 || ctx.group_size != 16 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -708,63 +697,63 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,64,4,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 64, 4, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,32,32}, 1, false);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, false);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,64,4,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 64, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,64,32,4,32,32,16}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,64,8,32,32,32}, 4, true);
-          }
-          return set_params({32,128,128,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 64, 8, 32, 32, 32}, 4, true);
+        }
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 4, false);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 4, false);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -774,16 +763,16 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,128,32,4,32,32,32}, 1, false);
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -793,13 +782,13 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,128,32,4,32,32,32}, 1, true);
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({32,256,64,8,32,64,32}, 1, false);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, false);
       }
     }
   }
@@ -809,45 +798,45 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,64,32,4,32,32,32}, 1, true);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, false);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 64, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, true);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 2048) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({64,128,32,8,32,32,32}, 1, true);
+        if (ctx.size_m <= 2048) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 2048) {
-            return set_params({64,256,32,4,64,64,32}, 1, true);
-          }
-          return set_params({64,256,64,8,64,64,32}, 1, false);
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 64, 8, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
   }
@@ -855,17 +844,16 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_6_35b_a3b_awq_nvfp4_params
   return false;
 }
 
-inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+inline bool
+sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params(
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4b8") != 0 ||
-      ctx.group_size != 32 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4b8") != 0 || ctx.group_size != 32 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -877,63 +865,63 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,128,64,4,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 128, 64, 4, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,64,32,4,32,32,16}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,64,8,32,64,16}, 2, true);
-          }
-          return set_params({32,128,128,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 64, 8, 32, 64, 16}, 2, true);
+        }
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,256,32,4,32,64,32}, 4, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 4, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -943,13 +931,13 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -959,23 +947,23 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-        return set_params({64,128,32,8,32,32,32}, 1, false);
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -985,33 +973,33 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-        return set_params({64,128,32,4,32,64,32}, 1, true);
+        return set_params({64, 128, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -1019,17 +1007,16 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_4bit_params
   return false;
 }
 
-inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+inline bool
+sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params(
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint8b128") != 0 ||
-      ctx.group_size != 32 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint8b128") != 0 || ctx.group_size != 32 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -1041,63 +1028,63 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,64,32,4,32,32,16}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,64,8,32,64,16}, 2, true);
-          }
-          return set_params({32,128,128,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 64, 8, 32, 64, 16}, 2, true);
+        }
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,256,32,4,32,64,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -1107,13 +1094,13 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({32,256,32,4,32,64,32}, 1, true);
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -1123,23 +1110,23 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-        return set_params({64,128,32,8,32,32,32}, 1, false);
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -1149,33 +1136,33 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-        return set_params({64,128,32,8,32,32,32}, 1, false);
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -1184,16 +1171,14 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_qwen3_coder_next_awq_8bit_params
 }
 
 inline bool sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
-      ctx.group_size != 16 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "nvfp4") != 0 || ctx.group_size != 16 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -1205,63 +1190,63 @@ inline bool sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 192) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,32,32}, 1, false);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, false);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 384) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 1536) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, false);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 384) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,32,4,32,64,16}, 2, true);
-          }
-          return set_params({32,128,32,4,32,64,16}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 2, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 768) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,64,16}, 4, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,32,4,32,64,16}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 4, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 4, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 3072) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 2, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 2, true);
       }
     }
   }
@@ -1271,19 +1256,19 @@ inline bool sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 1536) {
-          if (ctx.size_m <= 256) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 256) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 3072) {
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,32,4,32,32,32}, 4, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -1293,13 +1278,13 @@ inline bool sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 1536) {
-        return set_params({32,256,64,8,32,64,32}, 1, true);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 3072) {
-        return set_params({32,256,64,8,32,64,32}, 1, true);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -1309,42 +1294,42 @@ inline bool sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 192) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, true);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, false);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 384) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, true);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 5120) {
       if (ctx.size_k == 1536) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 384) {
-          if (ctx.size_m <= 2048) {
-            return set_params({64,128,32,8,32,32,32}, 1, false);
-          }
-          return set_params({64,128,32,8,32,32,32}, 1, true);
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
+        }
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 768) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 5120) {
       if (ctx.size_n == 3072) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
   }
@@ -1353,16 +1338,14 @@ inline bool sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
 }
 
 inline bool sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
-      ctx.group_size != 16 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "nvfp4") != 0 || ctx.group_size != 16 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -1374,63 +1357,63 @@ inline bool sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 192) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 384) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,256,32,4,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,256,32,4,32,64,32}, 1, false);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, false);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1536) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,32,4,32,64,16}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 384) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, false);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,32,4,32,64,16}, 2, true);
-          }
-          return set_params({32,128,32,4,32,64,16}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, false);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 2, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 768) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 4, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,32,4,32,64,16}, 1, true);
-          }
-          return set_params({32,128,32,4,32,64,16}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 64, 16}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 3072) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 4, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -1440,19 +1423,19 @@ inline bool sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1536) {
-          if (ctx.size_m <= 256) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 256) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 3072) {
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -1462,13 +1445,13 @@ inline bool sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1536) {
-        return set_params({32,256,64,8,32,64,32}, 1, true);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 3072) {
-        return set_params({32,256,64,8,32,64,32}, 1, false);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, false);
       }
     }
   }
@@ -1478,45 +1461,45 @@ inline bool sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 192) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, true);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, false);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 384) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, true);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 3072) {
       if (ctx.size_k == 1536) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, true);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, false);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 384) {
-          if (ctx.size_m <= 2048) {
-            return set_params({64,128,32,8,32,32,32}, 1, true);
-          }
-          return set_params({64,128,32,8,32,32,32}, 1, false);
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 128, 32, 8, 32, 32, 32}, 1, true);
+        }
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 768) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 3072) {
       if (ctx.size_n == 3072) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
   }
@@ -1525,16 +1508,14 @@ inline bool sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
 }
 
 inline bool sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
-      ctx.group_size != 16 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "nvfp4") != 0 || ctx.group_size != 16 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -1546,63 +1527,63 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,64,64,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 64, 64, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,64,64,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 256) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 64, 64, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 256) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 8) {
-            return set_params({32,128,64,4,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 8) {
+          return set_params({32, 128, 64, 4, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,64,32,4,32,32,16}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,64,8,32,32,32}, 4, true);
-          }
-          return set_params({32,128,128,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 64, 8, 32, 32, 32}, 4, true);
+        }
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 4, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 4, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -1612,16 +1593,16 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,128,32,4,32,32,32}, 1, true);
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -1631,13 +1612,13 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,128,32,4,32,32,32}, 1, true);
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({32,256,64,8,32,64,32}, 1, true);
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
   }
@@ -1647,48 +1628,48 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,64,32,4,32,32,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, false);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 64, 32, 4, 32, 32, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 16384) {
-            return set_params({64,256,32,4,64,64,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, true);
+        if (ctx.size_m <= 16384) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     // top_k=8
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 2048) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({64,128,32,8,32,32,32}, 1, true);
+        if (ctx.size_m <= 2048) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 2048) {
-            return set_params({64,256,32,4,64,64,32}, 1, true);
-          }
-          return set_params({64,256,64,8,64,64,32}, 1, false);
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
+        }
+        return set_params({64, 256, 64, 8, 64, 64, 32}, 1, false);
       }
     }
     if (ctx.top_k == 8 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 2048) {
-            return set_params({64,256,32,4,64,64,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, true);
+        if (ctx.size_m <= 2048) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
   }
@@ -1696,17 +1677,16 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
   return false;
 }
 
-inline bool sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+inline bool
+sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_params(
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
-      ctx.group_size != 16 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "nvfp4") != 0 || ctx.group_size != 16 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -1718,69 +1698,69 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,128,32,4,32,32,32}, 1, false);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,256,32,4,32,64,32}, 1, true);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 256, 32, 4, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 10) {
-            return set_params({32,256,64,8,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 320) {
-            return set_params({32,128,32,4,32,32,32}, 1, true);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, false);
+        if (ctx.size_m <= 10) {
+          return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 320) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, false);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,64,32,4,32,32,16}, 8, false);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,64,8,32,64,16}, 2, true);
-          }
-          return set_params({32,128,128,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 64, 32, 4, 32, 32, 16}, 8, false);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 64, 8, 32, 64, 16}, 2, true);
+        }
+        return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,32,4,32,32,32}, 8, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          return set_params({32,256,64,8,32,64,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 32, 4, 32, 32, 32}, 8, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        return set_params({32, 256, 64, 8, 32, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-          if (ctx.size_m <= 1) {
-            return set_params({32,128,128,8,32,64,32}, 1, true);
-          }
-          if (ctx.size_m <= 32) {
-            return set_params({32,256,32,4,32,64,32}, 1, false);
-          }
-          return set_params({32,128,32,4,32,32,32}, 1, true);
+        if (ctx.size_m <= 1) {
+          return set_params({32, 128, 128, 8, 32, 64, 32}, 1, true);
+        }
+        if (ctx.size_m <= 32) {
+          return set_params({32, 256, 32, 4, 32, 64, 32}, 1, false);
+        }
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -1790,13 +1770,13 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-        return set_params({32,128,32,4,32,32,32}, 1, true);
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({32,128,32,4,32,32,32}, 1, true);
+        return set_params({32, 128, 32, 4, 32, 32, 32}, 1, true);
       }
     }
   }
@@ -1806,23 +1786,23 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-        return set_params({64,128,32,8,32,32,32}, 1, false);
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, false);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, false);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
       }
     }
   }
@@ -1832,36 +1812,36 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_
     // top_k=1
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 64) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 128) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 1 && ctx.size_n == 2048) {
       if (ctx.size_k == 512) {
-          if (ctx.size_m <= 20480) {
-            return set_params({64,256,32,4,64,64,32}, 1, false);
-          }
-          return set_params({64,256,32,4,64,64,32}, 1, true);
+        if (ctx.size_m <= 20480) {
+          return set_params({64, 256, 32, 4, 64, 64, 32}, 1, false);
+        }
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     // top_k=10
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 128) {
-        return set_params({64,128,32,8,32,32,32}, 1, true);
+        return set_params({64, 128, 32, 8, 32, 32, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 256) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
     if (ctx.top_k == 10 && ctx.size_k == 2048) {
       if (ctx.size_n == 1024) {
-        return set_params({64,256,32,4,64,64,32}, 1, true);
+        return set_params({64, 256, 32, 4, 64, 64, 32}, 1, true);
       }
     }
   }
@@ -1870,16 +1850,14 @@ inline bool sm70_marlin_moe_try_select_nvidia_qwen3_next_80b_a3b_thinking_nvfp4_
 }
 
 inline bool sm70_marlin_moe_try_select_cyankiwi_minimax_m2_7_awq_4bit_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4b8") != 0 ||
-      ctx.group_size != 32 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4b8") != 0 || ctx.group_size != 32 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -1995,16 +1973,14 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_minimax_m2_7_awq_4bit_params(
 }
 
 inline bool sm70_marlin_moe_try_select_cyankiwi_glm_4_7_awq_4bit_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4b8") != 0 ||
-      ctx.group_size != 32 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4b8") != 0 || ctx.group_size != 32 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -2108,16 +2084,14 @@ inline bool sm70_marlin_moe_try_select_cyankiwi_glm_4_7_awq_4bit_params(
 }
 
 inline bool sm70_marlin_moe_try_select_quanttrio_glm_4_7_awq_params(
-    Sm70MarlinMoeAutoParamsContext const& ctx,
-    Sm70MarlinAutoParams& params) {
+    Sm70MarlinMoeAutoParamsContext const& ctx, Sm70MarlinAutoParams& params) {
   if (ctx.quant_format == nullptr ||
-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
-      ctx.group_size != 128 || ctx.size_m <= 0) {
+      std::strcmp(ctx.quant_format, "uint4") != 0 || ctx.group_size != 128 ||
+      ctx.size_m <= 0) {
     return false;
   }
 
-  auto const set_params = [&](Sm70CtaGeometry geometry,
-                              int requested_split_k,
+  auto const set_params = [&](Sm70CtaGeometry geometry, int requested_split_k,
                               bool use_metadata_vector_words) {
     params = {geometry, requested_split_k, use_metadata_vector_words,
               ctx.packed_macro_n};
@@ -2206,20 +2180,21 @@ inline bool sm70_marlin_moe_try_select_quanttrio_glm_4_7_awq_params(
 }
 
 inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
-    char const* quant_format, int64_t group_size,
-    int64_t moe_block_size, int64_t top_k, int64_t size_m,
-    int64_t size_n, int64_t size_k) {
+    char const* quant_format, int64_t group_size, int64_t moe_block_size,
+    int64_t top_k, int64_t size_m, int64_t size_n, int64_t size_k) {
   Sm70MarlinMoeAutoParamsContext const ctx{
-      quant_format, group_size, moe_block_size, top_k, size_m, size_n, size_k,
-      sm70_marlin_auto_packed_macro_n(size_n)};
+      quant_format,   group_size,
+      moe_block_size, top_k,
+      size_m,         size_n,
+      size_k,         sm70_marlin_auto_packed_macro_n(size_n)};
 
   if (sm70_marlin_moe_auto_env_is_set()) {
     return sm70_marlin_moe_auto_params_from_env(ctx);
   }
 
   Sm70MarlinAutoParams params{};
-  if (sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(ctx,
+                                                                      params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
@@ -2228,8 +2203,8 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
-  if (sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(ctx,
+                                                                   params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
@@ -2258,18 +2233,17 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
-  if (sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_nvidia_glm_4_7_nvfp4_params(ctx, params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
-  if (sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_nvidia_minimax_m2_7_nvfp4_params(ctx,
+                                                                  params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
-  if (sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_nvidia_qwen3_6_35b_a3b_nvfp4_params(ctx,
+                                                                     params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
@@ -2283,13 +2257,12 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
-  if (sm70_marlin_moe_try_select_cyankiwi_glm_4_7_awq_4bit_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_cyankiwi_glm_4_7_awq_4bit_params(ctx,
+                                                                  params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
-  if (sm70_marlin_moe_try_select_quanttrio_glm_4_7_awq_params(
-          ctx, params)) {
+  if (sm70_marlin_moe_try_select_quanttrio_glm_4_7_awq_params(ctx, params)) {
     validate_sm70_marlin_auto_params("MoE", params);
     return params;
   }
@@ -2303,46 +2276,44 @@ inline bool sm70_marlin_moe_cta_geometry_is_supported(
          sm70_marlin_cta_geometry_is_supported(geometry);
 }
 
-inline void validate_sm70_marlin_moe_stage_cta_geometry_supported(char const* op_name,
-                                                                  Sm70CtaGeometry geometry) {
+inline void validate_sm70_marlin_moe_stage_cta_geometry_supported(
+    char const* op_name, Sm70CtaGeometry geometry) {
   TORCH_CHECK(sm70_marlin_moe_cta_geometry_is_supported(geometry),
               "Unsupported SM70 Marlin MoE CTA geometry for ", op_name, ": ",
-              geometry.cta_m, "x", geometry.cta_n, "x", geometry.cta_k,
-              "x", geometry.warps, "x", geometry.warp_m, "x",
-              geometry.warp_n, "x", geometry.warp_k,
-              ". Supported geometries are ",
+              geometry.cta_m, "x", geometry.cta_n, "x", geometry.cta_k, "x",
+              geometry.warps, "x", geometry.warp_m, "x", geometry.warp_n, "x",
+              geometry.warp_k, ". Supported geometries are ",
               kSupportedSm70MarlinMoeCtaGeometries, ".");
 }
 
-inline void validate_sm70_marlin_moe_stage_cta_n_alignment(char const* op_name,
-                                                           Sm70CtaGeometry geometry,
-                                                           int64_t size_n) {
+inline void validate_sm70_marlin_moe_stage_cta_n_alignment(
+    char const* op_name, Sm70CtaGeometry geometry, int64_t size_n) {
   TORCH_CHECK(
       size_n % geometry.cta_n == 0 && size_n % kQuantTileN == 0,
       "SM70 Marlin MoE requires size_n divisible by both CTA_N and 64 for ",
-      op_name, " with CTA geometry ", geometry.cta_m, "x", geometry.cta_n,
-      "x", geometry.cta_k, "x", geometry.warps, "x", geometry.warp_m,
-      "x", geometry.warp_n, "x", geometry.warp_k, ". Got size_n = ",
-      size_n, ".");
+      op_name, " with CTA geometry ", geometry.cta_m, "x", geometry.cta_n, "x",
+      geometry.cta_k, "x", geometry.warps, "x", geometry.warp_m, "x",
+      geometry.warp_n, "x", geometry.warp_k, ". Got size_n = ", size_n, ".");
 }
 
 template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
           int WarpK, int PackedMacroN, typename Launcher>
-torch::Tensor dispatch_sm70_marlin_moe_group_size(
-    Launcher const& launcher, int64_t group_size, char const* quant_name) {
+torch::Tensor dispatch_sm70_marlin_moe_group_size(Launcher const& launcher,
+                                                  int64_t group_size,
+                                                  char const* quant_name) {
   switch (group_size) {
     case -1:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, -1, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, -1, PackedMacroN>();
     case 32:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 32, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 32, PackedMacroN>();
     case 64:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 64, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 64, PackedMacroN>();
     case 128:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 128, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false, "SM70 Marlin MoE ", quant_name,
                   " supports only group_size -1, 32, 64, or 128. Got ",
@@ -2357,17 +2328,17 @@ torch::Tensor dispatch_sm70_marlin_moe_group_size_with_group32(
     Launcher const& launcher, int64_t group_size, char const* quant_name) {
   switch (group_size) {
     case -1:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, -1, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, -1, PackedMacroN>();
     case 32:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 32, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 32, PackedMacroN>();
     case 64:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 64, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 64, PackedMacroN>();
     case 128:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 128, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false, "SM70 Marlin MoE ", quant_name,
                   " supports only group_size -1, 32, 64, or 128. Got ",
@@ -2378,15 +2349,15 @@ torch::Tensor dispatch_sm70_marlin_moe_group_size_with_group32(
 
 template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
           int WarpK, int PackedMacroN, typename Launcher>
-torch::Tensor dispatch_sm70_marlin_moe_fp8_group_size(
-    Launcher const& launcher, int64_t group_size) {
+torch::Tensor dispatch_sm70_marlin_moe_fp8_group_size(Launcher const& launcher,
+                                                      int64_t group_size) {
   switch (group_size) {
     case -1:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, -1, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, -1, PackedMacroN>();
     case 128:
-      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM,
-                                          WarpN, WarpK, 128, PackedMacroN>();
+      return launcher.template operator()<CtaM, CtaN, CtaK, Warps, WarpM, WarpN,
+                                          WarpK, 128, PackedMacroN>();
     default:
       TORCH_CHECK(false,
                   "SM70 Marlin MoE fp8_e4m3 supports only group_size -1 "
@@ -2448,10 +2419,9 @@ struct Sm70MarlinMoeFp8GroupSizeDispatchLauncher {
   template <int CtaM, int CtaN, int CtaK, int Warps, int WarpM, int WarpN,
             int WarpK, int PackedMacroN>
   torch::Tensor operator()() const {
-    return dispatch_sm70_marlin_moe_fp8_group_size<CtaM, CtaN, CtaK, Warps,
-                                                   WarpM, WarpN, WarpK,
-                                                   PackedMacroN>(
-        inner, group_size);
+    return dispatch_sm70_marlin_moe_fp8_group_size<
+        CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, PackedMacroN>(inner,
+                                                                    group_size);
   }
 };
 
@@ -2465,59 +2435,59 @@ struct Sm70MarlinMoeFixedGroupSizeDispatchLauncher {
             int WarpK, int PackedMacroN>
   torch::Tensor operator()() const {
     return dispatch_sm70_marlin_moe_fixed_group_size<
-        CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize,
-        PackedMacroN>(inner, group_size, quant_name);
+        CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK, GroupSize, PackedMacroN>(
+        inner, group_size, quant_name);
   }
 };
 
 template <typename Launcher>
-torch::Tensor dispatch_sm70_marlin_moe_cta_geometry(
-    Launcher const& launcher, Sm70CtaGeometry geometry, int packed_macro_n,
-    char const* quant_name) {
-#define DISPATCH_SM70_MOE_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, PMN)  \
+torch::Tensor dispatch_sm70_marlin_moe_cta_geometry(Launcher const& launcher,
+                                                    Sm70CtaGeometry geometry,
+                                                    int packed_macro_n,
+                                                    char const* quant_name) {
+#define DISPATCH_SM70_MOE_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, PMN)   \
   if (packed_macro_n == PMN) {                                             \
     return launcher.template operator()<CM, CN, CK, W, WM, WN, WK, PMN>(); \
   }
 
-#define DISPATCH_SM70_MOE_GEOMETRY(CM, CN, CK, W, WM, WN, WK, PMN)         \
-  if (geometry.cta_m == CM && geometry.cta_n == CN &&                      \
-      geometry.cta_k == CK && geometry.warps == W &&                       \
-      geometry.warp_m == WM && geometry.warp_n == WN &&                    \
-      geometry.warp_k == WK) {                                             \
-    DISPATCH_SM70_MOE_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, PMN)       \
+#define DISPATCH_SM70_MOE_GEOMETRY(CM, CN, CK, W, WM, WN, WK, PMN)             \
+  if (geometry.cta_m == CM && geometry.cta_n == CN && geometry.cta_k == CK &&  \
+      geometry.warps == W && geometry.warp_m == WM && geometry.warp_n == WN && \
+      geometry.warp_k == WK) {                                                 \
+    DISPATCH_SM70_MOE_PACKED_MACRO_N(CM, CN, CK, W, WM, WN, WK, PMN)           \
   }
 
-#define FOR_EACH_SM70_MOE_GEOMETRY(M)                                     \
-  M(32, 64, 32, 4, 32, 32, 16, 128)                                       \
-  M(32, 64, 32, 4, 32, 32, 16, 256)                                       \
-  M(32, 64, 64, 4, 32, 32, 32, 128)                                       \
-  M(32, 64, 64, 4, 32, 32, 32, 256)                                       \
-  M(32, 128, 32, 4, 32, 32, 32, 128)                                      \
-  M(32, 128, 32, 4, 32, 32, 32, 256)                                      \
-  M(32, 128, 32, 4, 32, 64, 16, 128)                                      \
-  M(32, 128, 32, 4, 32, 64, 16, 256)                                      \
-  M(32, 128, 64, 4, 32, 64, 32, 128)                                      \
-  M(32, 128, 64, 4, 32, 64, 32, 256)                                      \
-  M(32, 128, 64, 8, 32, 32, 32, 128)                                      \
-  M(32, 128, 64, 8, 32, 32, 32, 256)                                      \
-  M(32, 128, 64, 8, 32, 64, 16, 128)                                      \
-  M(32, 128, 64, 8, 32, 64, 16, 256)                                      \
-  M(32, 128, 128, 8, 32, 64, 32, 128)                                     \
-  M(32, 128, 128, 8, 32, 64, 32, 256)                                     \
-  M(32, 256, 32, 4, 32, 64, 32, 256)                                      \
-  M(32, 256, 64, 8, 32, 64, 32, 256)                                      \
-  M(64, 64, 32, 4, 32, 32, 32, 64)                                        \
-  M(64, 64, 32, 4, 32, 32, 32, 128)                                       \
-  M(64, 64, 32, 4, 32, 32, 32, 256)                                       \
-  M(64, 128, 32, 4, 32, 64, 32, 128)                                      \
-  M(64, 128, 32, 4, 32, 64, 32, 256)                                      \
-  M(64, 128, 32, 4, 64, 64, 16, 128)                                      \
-  M(64, 128, 32, 4, 64, 64, 16, 256)                                      \
-  M(64, 128, 32, 8, 32, 32, 32, 128)                                      \
-  M(64, 128, 32, 8, 32, 32, 32, 256)                                      \
-  M(64, 128, 64, 4, 64, 64, 32, 128)                                      \
-  M(64, 128, 64, 4, 64, 64, 32, 256)                                      \
-  M(64, 256, 32, 4, 64, 64, 32, 256)                                      \
+#define FOR_EACH_SM70_MOE_GEOMETRY(M) \
+  M(32, 64, 32, 4, 32, 32, 16, 128)   \
+  M(32, 64, 32, 4, 32, 32, 16, 256)   \
+  M(32, 64, 64, 4, 32, 32, 32, 128)   \
+  M(32, 64, 64, 4, 32, 32, 32, 256)   \
+  M(32, 128, 32, 4, 32, 32, 32, 128)  \
+  M(32, 128, 32, 4, 32, 32, 32, 256)  \
+  M(32, 128, 32, 4, 32, 64, 16, 128)  \
+  M(32, 128, 32, 4, 32, 64, 16, 256)  \
+  M(32, 128, 64, 4, 32, 64, 32, 128)  \
+  M(32, 128, 64, 4, 32, 64, 32, 256)  \
+  M(32, 128, 64, 8, 32, 32, 32, 128)  \
+  M(32, 128, 64, 8, 32, 32, 32, 256)  \
+  M(32, 128, 64, 8, 32, 64, 16, 128)  \
+  M(32, 128, 64, 8, 32, 64, 16, 256)  \
+  M(32, 128, 128, 8, 32, 64, 32, 128) \
+  M(32, 128, 128, 8, 32, 64, 32, 256) \
+  M(32, 256, 32, 4, 32, 64, 32, 256)  \
+  M(32, 256, 64, 8, 32, 64, 32, 256)  \
+  M(64, 64, 32, 4, 32, 32, 32, 64)    \
+  M(64, 64, 32, 4, 32, 32, 32, 128)   \
+  M(64, 64, 32, 4, 32, 32, 32, 256)   \
+  M(64, 128, 32, 4, 32, 64, 32, 128)  \
+  M(64, 128, 32, 4, 32, 64, 32, 256)  \
+  M(64, 128, 32, 4, 64, 64, 16, 128)  \
+  M(64, 128, 32, 4, 64, 64, 16, 256)  \
+  M(64, 128, 32, 8, 32, 32, 32, 128)  \
+  M(64, 128, 32, 8, 32, 32, 32, 256)  \
+  M(64, 128, 64, 4, 64, 64, 32, 128)  \
+  M(64, 128, 64, 4, 64, 64, 32, 256)  \
+  M(64, 256, 32, 4, 64, 64, 32, 256)  \
   M(64, 256, 64, 8, 64, 64, 32, 256)
 
   FOR_EACH_SM70_MOE_GEOMETRY(DISPATCH_SM70_MOE_GEOMETRY)
@@ -2537,8 +2507,8 @@ torch::Tensor dispatch_sm70_marlin_moe_geometry(Launcher const& launcher,
                                                 int64_t group_size,
                                                 char const* quant_name) {
   return dispatch_sm70_marlin_moe_cta_geometry(
-      Sm70MarlinMoeGroupSizeDispatchLauncher<Launcher>{
-          launcher, group_size, quant_name},
+      Sm70MarlinMoeGroupSizeDispatchLauncher<Launcher>{launcher, group_size,
+                                                       quant_name},
       geometry, packed_macro_n, quant_name);
 }
 
@@ -2547,18 +2517,18 @@ torch::Tensor dispatch_sm70_marlin_moe_geometry_with_group32(
     Launcher const& launcher, Sm70CtaGeometry geometry, int packed_macro_n,
     int64_t group_size, char const* quant_name) {
   return dispatch_sm70_marlin_moe_cta_geometry(
-      Sm70MarlinMoeGroupSize32DispatchLauncher<Launcher>{
-          launcher, group_size, quant_name},
+      Sm70MarlinMoeGroupSize32DispatchLauncher<Launcher>{launcher, group_size,
+                                                         quant_name},
       geometry, packed_macro_n, quant_name);
 }
 
 template <typename Launcher>
-torch::Tensor dispatch_sm70_marlin_moe_fp8_geometry(
-    Launcher const& launcher, Sm70CtaGeometry geometry, int packed_macro_n,
-    int64_t group_size) {
+torch::Tensor dispatch_sm70_marlin_moe_fp8_geometry(Launcher const& launcher,
+                                                    Sm70CtaGeometry geometry,
+                                                    int packed_macro_n,
+                                                    int64_t group_size) {
   return dispatch_sm70_marlin_moe_cta_geometry(
-      Sm70MarlinMoeFp8GroupSizeDispatchLauncher<Launcher>{launcher,
-                                                          group_size},
+      Sm70MarlinMoeFp8GroupSizeDispatchLauncher<Launcher>{launcher, group_size},
       geometry, packed_macro_n, "fp8_e4m3");
 }
 
@@ -2603,8 +2573,8 @@ class Sm70MoeGatherIteratorA {
   using Element = cutlass::half_t;
   using Layout = cutlass::layout::RowMajor;
   using TensorCoord = cutlass::MatrixCoord;
-  using Fragment = cutlass::Array<
-      Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+  using Fragment = cutlass::Array<Element, ThreadMap::Iterations::kCount *
+                                               ThreadMap::kElementsPerAccess>;
   struct Params {
     int lda;
     int moe_block_size;
@@ -2689,9 +2659,8 @@ class Sm70MoeGatherIteratorA {
 
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-      int const local_row =
-          local_m_offset_ + thread_offset_.strided() +
-          s * ThreadMap::Delta::kStrided;
+      int const local_row = local_m_offset_ + thread_offset_.strided() +
+                            s * ThreadMap::Delta::kStrided;
       int const route_row = moe_block_ * params_.moe_block_size + local_row;
 
       int sorted_id = -1;
@@ -2699,20 +2668,17 @@ class Sm70MoeGatherIteratorA {
                        route_row < params_.padded_tokens;
       if (valid_row) {
         sorted_id = sorted_token_ids_[route_row];
-        valid_row =
-            sorted_id >= 0 && sorted_id < params_.expanded_token_count;
+        valid_row = sorted_id >= 0 && sorted_id < params_.expanded_token_count;
       }
 
       int const token_row = valid_row ? (sorted_id / params_.top_k) : 0;
 
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c) {
-        int const logical_k =
-            k_offset_ + thread_offset_.contiguous() +
-            c * ThreadMap::Delta::kContiguous;
-        int const frag_base =
-            (c + s * ThreadMap::Iterations::kContiguous) *
-            ThreadMap::kElementsPerAccess;
+        int const logical_k = k_offset_ + thread_offset_.contiguous() +
+                              c * ThreadMap::Delta::kContiguous;
+        int const frag_base = (c + s * ThreadMap::Iterations::kContiguous) *
+                              ThreadMap::kElementsPerAccess;
         bool const valid = valid_row && logical_k < params_.lda;
 
         CUTLASS_PRAGMA_UNROLL
@@ -2754,8 +2720,8 @@ struct Sm70MarlinMoeGemmTraits {
   using LayoutB = cutlass::layout::RowMajor;
   using LayoutC = cutlass::layout::RowMajor;
   using ThreadblockShape = cutlass::gemm::GemmShape<CtaM, CtaN, CtaK>;
-  using WarpShape =
-      typename Sm70WarpShape<CtaM, CtaN, CtaK, Warps, WarpM, WarpN, WarpK>::Type;
+  using WarpShape = typename Sm70WarpShape<CtaM, CtaN, CtaK, Warps, WarpM,
+                                           WarpN, WarpK>::Type;
   static_assert(WarpShape::kM <= 64 && WarpShape::kN <= 64,
                 "SM70 Marlin MoE keeps per-warp M/N no larger than 64.");
   using InstructionShape = cutlass::gemm::GemmShape<8, 8, 4>;
@@ -2763,13 +2729,16 @@ struct Sm70MarlinMoeGemmTraits {
       ThreadblockShape, WarpShape, InstructionShape, ElementA, LayoutA,
       ElementB, LayoutB, ElementAccumulator, LayoutC,
       cutlass::arch::OpClassTensorOp, 2, cutlass::arch::OpMultiplyAdd>;
-  static_assert(MmaCore::kThreads == Warps * 32,
-                "SM70 Marlin MoE launch threads must match CUTLASS warp count.");
-  using IteratorA = typename Spec::template IteratorA<
-      ThreadblockShape, typename MmaCore::IteratorThreadMapA>;
-  using IteratorB = typename Spec::template IteratorB<
-      ThreadblockShape, typename MmaCore::IteratorThreadMapB, GroupSize,
-      PackedMacroN>;
+  static_assert(
+      MmaCore::kThreads == Warps * 32,
+      "SM70 Marlin MoE launch threads must match CUTLASS warp count.");
+  using IteratorA =
+      typename Spec::template IteratorA<ThreadblockShape,
+                                        typename MmaCore::IteratorThreadMapA>;
+  using IteratorB =
+      typename Spec::template IteratorB<ThreadblockShape,
+                                        typename MmaCore::IteratorThreadMapB,
+                                        GroupSize, PackedMacroN>;
   using Mma = Sm70MarlinMmaPipelined<
       ThreadblockShape, IteratorA, typename MmaCore::SmemIteratorA, IteratorB,
       typename MmaCore::SmemIteratorB, ElementAccumulator, LayoutC,
@@ -2818,11 +2787,11 @@ class Sm70MoeScatterEpilogue {
                       typename SharedLoadIterator::Fragment const& frag,
                       int32_t const* __restrict__ sorted_token_ids,
                       float const* __restrict__ topk_weights,
-                      cutlass::half_t* __restrict__ c,
-                      int n, int moe_block, int local_m_offset,
-                      int moe_block_size, int expanded_token_count,
-                      int padded_tokens, bool mul_topk_weights,
-                      bool atomic_store, float output_scale) const {
+                      cutlass::half_t* __restrict__ c, int n, int moe_block,
+                      int local_m_offset, int moe_block_size,
+                      int expanded_token_count, int padded_tokens,
+                      bool mul_topk_weights, bool atomic_store,
+                      float output_scale) const {
     float const* frag_ptr = reinterpret_cast<float const*>(&frag);
     half* c_half = reinterpret_cast<half*>(c);
     int const thread_start_row = destination_iterator.thread_start_row();
@@ -2838,20 +2807,17 @@ class Sm70MoeScatterEpilogue {
           int const frag_row_idx =
               row + ThreadMap::Iterations::kRow *
                         (group + ThreadMap::Iterations::kGroup * cluster);
-          int const row_offset =
-              row * ThreadMap::Delta::kRow +
-              group * ThreadMap::Delta::kGroup +
-              cluster * ThreadMap::Delta::kCluster;
-          int const local_row =
-              local_m_offset + thread_start_row + row_offset;
+          int const row_offset = row * ThreadMap::Delta::kRow +
+                                 group * ThreadMap::Delta::kGroup +
+                                 cluster * ThreadMap::Delta::kCluster;
+          int const local_row = local_m_offset + thread_start_row + row_offset;
           int const route_row = moe_block * moe_block_size + local_row;
           bool valid_row =
               local_row < moe_block_size && route_row < padded_tokens;
           int sorted_id = -1;
           if (valid_row) {
             sorted_id = sorted_token_ids[route_row];
-            valid_row =
-                sorted_id >= 0 && sorted_id < expanded_token_count;
+            valid_row = sorted_id >= 0 && sorted_id < expanded_token_count;
           }
           float const route_scale =
               (valid_row && mul_topk_weights) ? topk_weights[sorted_id] : 1.0f;
@@ -2896,8 +2862,7 @@ class Sm70MoeScatterEpilogue {
     int const warp_mn = warp_idx % (WarpCount::kM * WarpCount::kN);
     int const warp_m = warp_mn % WarpCount::kM;
     int const warp_n = warp_mn / WarpCount::kM;
-    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m,
-                                     warp_n};
+    cutlass::MatrixCoord warp_offset{warp_k * WarpCount::kM + warp_m, warp_n};
     warp_tile_iterator_.add_tile_offset(warp_offset);
   }
 
@@ -2906,11 +2871,11 @@ class Sm70MoeScatterEpilogue {
                   AccumulatorTile const& accumulators,
                   int32_t const* __restrict__ sorted_token_ids,
                   float const* __restrict__ topk_weights,
-                  cutlass::half_t* __restrict__ c,
-                  int n, int moe_block, int local_m_offset,
-                  int moe_block_size, int expanded_token_count,
-                  int padded_tokens, bool mul_topk_weights,
-                  bool atomic_store, float output_scale = 1.0f) {
+                  cutlass::half_t* __restrict__ c, int n, int moe_block,
+                  int local_m_offset, int moe_block_size,
+                  int expanded_token_count, int padded_tokens,
+                  bool mul_topk_weights, bool atomic_store,
+                  float output_scale = 1.0f) {
     AccumulatorFragmentIterator accum_fragment_iterator(accumulators);
 
     CUTLASS_PRAGMA_UNROLL
@@ -2956,19 +2921,19 @@ class Sm70MoeScatterEpilogue {
 };
 
 template <typename Traits, bool SplitK>
-__global__ __launch_bounds__(Traits::MmaCore::kThreads, 1)
-void sm70_marlin_moe_gemm_kernel(
+__global__
+__launch_bounds__(Traits::MmaCore::kThreads, 1) void sm70_marlin_moe_gemm_kernel(
     cutlass::half_t const* __restrict__ a,
     uint32_t const* __restrict__ b_q_weight,
     typename Traits::GemmSpec::ScaleElement const* __restrict__ b_scales,
     typename Traits::GemmSpec::ZeroElement const* __restrict__ b_zeros,
-    float const* __restrict__ global_scale,
-    cutlass::half_t* __restrict__ c,
+    float const* __restrict__ global_scale, cutlass::half_t* __restrict__ c,
     int32_t const* __restrict__ sorted_token_ids,
     int32_t const* __restrict__ expert_ids,
     int32_t const* __restrict__ num_tokens_past_padded,
     float const* __restrict__ topk_weights, int moe_block_size, int top_k,
-    bool mul_topk_weights, int m, int n, int k, int lda, int requested_split_k) {
+    bool mul_topk_weights, int m, int n, int k, int lda,
+    int requested_split_k) {
   using Mma = typename Traits::Mma;
   using Epilogue = Sm70MoeScatterEpilogue<Traits>;
   constexpr int CtaM = Traits::ThreadblockShape::kM;
@@ -3002,8 +2967,8 @@ void sm70_marlin_moe_gemm_kernel(
   int partition_k = k;
   if constexpr (SplitK) {
     Sm70SplitKPartition const partition =
-        sm70_splitk_partition<Traits::kGroupSize, CtaK>(
-            k, requested_split_k, int(blockIdx.z));
+        sm70_splitk_partition<Traits::kGroupSize, CtaK>(k, requested_split_k,
+                                                        int(blockIdx.z));
     if (partition.partition_k == 0) {
       return;
     }
@@ -3014,8 +2979,8 @@ void sm70_marlin_moe_gemm_kernel(
   int const n_offset = int(blockIdx.y) * CtaN;
 
   typename Mma::IteratorA iterator_A(
-      typename Mma::IteratorA::Params(lda, moe_block_size, top_k, m,
-                                      m * top_k, padded_tokens),
+      typename Mma::IteratorA::Params(lda, moe_block_size, top_k, m, m * top_k,
+                                      padded_tokens),
       a, sorted_token_ids, thread_idx, moe_block, local_m_offset, k_begin);
   typename Mma::IteratorB iterator_B(
       typename Mma::IteratorB::Params(k, n),
@@ -3042,8 +3007,8 @@ void sm70_marlin_moe_gemm_kernel(
   }
   Epilogue epilogue(shared_storage.epilogue, thread_idx, warp_idx, lane_idx);
   epilogue(iterator_D, accumulators, sorted_token_ids, topk_weights, c, n,
-           moe_block, local_m_offset, moe_block_size, m * top_k,
-           padded_tokens, mul_topk_weights, SplitK, output_scale);
+           moe_block, local_m_offset, moe_block_size, m * top_k, padded_tokens,
+           mul_topk_weights, SplitK, output_scale);
 }
 
 template <typename Traits>
@@ -3103,9 +3068,9 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
   smem_bytes = configure_sm70_dynamic_smem<SharedStorage>(split_kernel);
 
   int64_t const numel = size_m * top_k * size_n;
-  C10_CUDA_CHECK(cudaMemsetAsync(
-      c.data_ptr<at::Half>(), 0,
-      static_cast<size_t>(numel) * sizeof(at::Half), stream));
+  C10_CUDA_CHECK(cudaMemsetAsync(c.data_ptr<at::Half>(), 0,
+                                 static_cast<size_t>(numel) * sizeof(at::Half),
+                                 stream));
 
   int const active_split_k =
       sm70_active_split_k(static_cast<int>(size_k), requested_split_k, CtaK);
@@ -3115,11 +3080,11 @@ torch::Tensor launch_sm70_marlin_moe_gemm(
       reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr<int32_t>()),
       b_scales_ptr, b_zeros_ptr, global_scale_ptr,
       reinterpret_cast<cutlass::half_t*>(c.data_ptr<at::Half>()),
-      sorted_token_ids.data_ptr<int32_t>(),
-      expert_ids.data_ptr<int32_t>(), num_tokens_past_padded.data_ptr<int32_t>(),
+      sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
+      num_tokens_past_padded.data_ptr<int32_t>(),
       topk_weights.data_ptr<float>(), int(moe_block_size), int(top_k),
-      mul_topk_weights, int(size_m), int(size_n), int(size_k),
-      int(a.stride(0)), requested_split_k);
+      mul_topk_weights, int(size_m), int(size_n), int(size_k), int(a.stride(0)),
+      requested_split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return c;
 }

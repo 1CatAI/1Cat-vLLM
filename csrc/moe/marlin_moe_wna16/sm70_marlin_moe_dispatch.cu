@@ -43,15 +43,13 @@ __device__ __forceinline__ int sm70_inverse_zp_interleave(int idx,
   return inv[idx];
 }
 
-__device__ __forceinline__ int sm70_inverse_scale_perm(int idx,
-                                                       int perm_len) {
+__device__ __forceinline__ int sm70_inverse_scale_perm(int idx, int perm_len) {
   if (perm_len == 64) {
     return (idx % 8) * 8 + idx / 8;
   }
-  constexpr int inv[32] = {0,  1,  8,  9,  16, 17, 24, 25,
-                           2,  3,  10, 11, 18, 19, 26, 27,
-                           4,  5,  12, 13, 20, 21, 28, 29,
-                           6,  7,  14, 15, 22, 23, 30, 31};
+  constexpr int inv[32] = {0,  1,  8,  9,  16, 17, 24, 25, 2,  3,  10,
+                           11, 18, 19, 26, 27, 4,  5,  12, 13, 20, 21,
+                           28, 29, 6,  7,  14, 15, 22, 23, 30, 31};
   return inv[idx];
 }
 
@@ -66,10 +64,9 @@ __global__ void sm70_unpermute_half_metadata_kernel(
 }
 
 __global__ void sm70_unpack_moe_zp_to_half_kernel(
-    const int32_t* __restrict__ packed_zp,
-    const half* __restrict__ scales, half* __restrict__ out,
-    int64_t total, int64_t num_groups, int64_t size_n, int64_t packed_n,
-    int num_bits, bool is_a_8bit) {
+    const int32_t* __restrict__ packed_zp, const half* __restrict__ scales,
+    half* __restrict__ out, int64_t total, int64_t num_groups, int64_t size_n,
+    int64_t packed_n, int num_bits, bool is_a_8bit) {
   const int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) return;
 
@@ -83,15 +80,14 @@ __global__ void sm70_unpack_moe_zp_to_half_kernel(
   if (!is_a_8bit) {
     packed_col_in_block =
         (packed_col_in_block / pack_factor) * pack_factor +
-        sm70_inverse_zp_interleave(packed_col_in_block % pack_factor,
-                                   num_bits);
+        sm70_inverse_zp_interleave(packed_col_in_block % pack_factor, num_bits);
   }
   const int64_t packed_col = block64 * 64 + packed_col_in_block;
-  const uint32_t word = reinterpret_cast<const uint32_t*>(packed_zp)
-      [(expert * num_groups + group) * packed_n + packed_col / pack_factor];
-  const uint32_t zp =
-      (word >> ((packed_col % pack_factor) * num_bits)) &
-      ((1u << num_bits) - 1u);
+  const uint32_t word = reinterpret_cast<const uint32_t*>(
+      packed_zp)[(expert * num_groups + group) * packed_n +
+                 packed_col / pack_factor];
+  const uint32_t zp = (word >> ((packed_col % pack_factor) * num_bits)) &
+                      ((1u << num_bits) - 1u);
   out[idx] = __float2half(static_cast<float>(zp) * __half2float(scales[idx]));
 }
 
@@ -111,8 +107,8 @@ torch::Tensor sm70_moe_scales_as_logical(torch::Tensor const& b_scales,
   const int64_t total = out.numel();
   constexpr int threads = 256;
   const int blocks = static_cast<int>((total + threads - 1) / threads);
-  sm70_unpermute_half_metadata_kernel<<<
-      blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  sm70_unpermute_half_metadata_kernel<<<blocks, threads, 0,
+                                        at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(b_scales.data_ptr<at::Half>()),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()), total, perm_len);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -120,9 +116,8 @@ torch::Tensor sm70_moe_scales_as_logical(torch::Tensor const& b_scales,
 }
 
 torch::Tensor sm70_moe_zp_as_half(torch::Tensor const& b_zeros,
-                                  torch::Tensor const& b_scales,
-                                  int64_t size_n, int num_bits,
-                                  bool is_a_8bit) {
+                                  torch::Tensor const& b_scales, int64_t size_n,
+                                  int num_bits, bool is_a_8bit) {
   if (b_zeros.scalar_type() == at::ScalarType::Half) {
     return b_zeros;
   }
@@ -143,14 +138,13 @@ torch::Tensor sm70_moe_zp_as_half(torch::Tensor const& b_zeros,
   TORCH_CHECK(b_scales.scalar_type() == at::ScalarType::Half,
               "SM70 Marlin MoE packed zero-point adapter expects fp16 scales.");
 
-  auto out =
-      torch::empty({b_scales.size(0), b_scales.size(1), size_n},
-                   b_scales.options());
+  auto out = torch::empty({b_scales.size(0), b_scales.size(1), size_n},
+                          b_scales.options());
   const int64_t total = out.numel();
   constexpr int threads = 256;
   const int blocks = static_cast<int>((total + threads - 1) / threads);
-  sm70_unpack_moe_zp_to_half_kernel<<<
-      blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  sm70_unpack_moe_zp_to_half_kernel<<<blocks, threads, 0,
+                                      at::cuda::getCurrentCUDAStream()>>>(
       b_zeros.data_ptr<int32_t>(),
       reinterpret_cast<const half*>(b_scales.data_ptr<at::Half>()),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()), total,
@@ -229,8 +223,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     std::optional<torch::Tensor> const& global_scale_or_none,
     std::optional<torch::Tensor> const& b_zeros_or_none,
     std::optional<torch::Tensor> const& g_idx_or_none,
-    std::optional<torch::Tensor> const& perm_or_none,
-    torch::Tensor& workspace,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
     torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
     torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
     int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
@@ -308,8 +301,7 @@ torch::Tensor moe_wna16_marlin_gemm(
               "SM70 Marlin MoE supports only float16 outputs.");
   TORCH_CHECK(s_type == vllm::kFloat16 ||
                   (b_type == vllm::kFE2M1f &&
-                   (s_type == vllm::kFE4M3fn ||
-                    s_type == vllm::kFE8M0fnu)),
+                   (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu)),
               "SM70 Marlin MoE supports only float16 scales, "
               "except FP4 uses float8_e4m3fn scales for NVFP4 or "
               "float8_e8m0fnu scales for MXFP4.");
@@ -364,10 +356,8 @@ torch::Tensor moe_wna16_marlin_gemm(
   TORCH_CHECK(b_scales.is_contiguous(), "b_scales is not contiguous");
   TORCH_CHECK(b_scales.scalar_type() == at::ScalarType::Half ||
                   (b_type == vllm::kFE2M1f &&
-                   (b_scales.scalar_type() ==
-                        at::ScalarType::Float8_e4m3fn ||
-                    b_scales.scalar_type() ==
-                        at::ScalarType::Float8_e8m0fnu)),
+                   (b_scales.scalar_type() == at::ScalarType::Float8_e4m3fn ||
+                    b_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu)),
               "SM70 Marlin MoE supports float16 scales, except FP4 uses "
               "float8_e4m3fn scales for NVFP4 or float8_e8m0fnu scales for "
               "MXFP4.");
@@ -457,17 +447,15 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   torch::Tensor b_scales_kernel = b_scales;
   if (b_scales.scalar_type() == at::ScalarType::Half) {
-    b_scales_kernel =
-        sm70_moe_scales_as_logical(b_scales, size_k, group_size,
-                                   a_type.size_bits() == 8);
+    b_scales_kernel = sm70_moe_scales_as_logical(b_scales, size_k, group_size,
+                                                 a_type.size_bits() == 8);
   }
 
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(
-        b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
-        "SM70 Marlin MoE supports global_scale only for nvfp4 format.");
+    TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
+                "SM70 Marlin MoE supports global_scale only for nvfp4 format.");
     TORCH_CHECK(global_scale.device().is_cuda(), "global_scale is not on GPU");
     TORCH_CHECK(global_scale.is_contiguous(), "global_scale is not contiguous");
     TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
@@ -510,9 +498,9 @@ torch::Tensor moe_wna16_marlin_gemm(
                 "weights when zero-points are enabled. Got = ",
                 b_type.str());
     if (!is_zp_float && b_zeros.scalar_type() == at::ScalarType::Int) {
-      b_zeros = sm70_moe_zp_as_half(
-          b_zeros, b_scales_kernel, size_n, b_type == vllm::kU4 ? 4 : 8,
-          a_type.size_bits() == 8);
+      b_zeros = sm70_moe_zp_as_half(b_zeros, b_scales_kernel, size_n,
+                                    b_type == vllm::kU4 ? 4 : 8,
+                                    a_type.size_bits() == 8);
       zp_is_float = true;
     }
   } else {
@@ -535,8 +523,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     TORCH_CHECK(num_groups == b_zeros.size(1),
                 "b_zeros dim 1 = ", b_zeros.size(1),
                 " is not num_groups = ", num_groups);
-    TORCH_CHECK(b_zeros.size(2) == size_n,
-                "b_zeros dim 2 = ", b_zeros.size(2),
+    TORCH_CHECK(b_zeros.size(2) == size_n, "b_zeros dim 2 = ", b_zeros.size(2),
                 " is not size_n = ", size_n);
   } else {
     TORCH_CHECK(!zp_is_float,
@@ -559,20 +546,18 @@ torch::Tensor moe_wna16_marlin_gemm(
 
   TORCH_CHECK(!has_act_order,
               "act_order is not supported for the SM70 Marlin MoE path.");
-  TORCH_CHECK(!has_bias,
-              "SM70 Marlin MoE does not support bias.");
+  TORCH_CHECK(!has_bias, "SM70 Marlin MoE does not support bias.");
   TORCH_CHECK(!use_atomic_add,
               "SM70 Marlin MoE does not support atomic-add "
               "output.");
-  TORCH_CHECK(is_k_full,
-              "SM70 Marlin MoE requires full-K inputs.");
+  TORCH_CHECK(is_k_full, "SM70 Marlin MoE requires full-K inputs.");
 
   if (b_type == vllm::kU4) {
     TORCH_CHECK(has_zp && zp_is_float,
                 "SM70 Marlin MoE uint4 path requires fp16 zero points.");
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u4_gemm(
-        a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids,
+        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
         mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
@@ -580,8 +565,8 @@ torch::Tensor moe_wna16_marlin_gemm(
     TORCH_CHECK(has_zp && zp_is_float,
                 "SM70 Marlin MoE uint8 path requires fp16 zero points.");
     return MARLIN_NAMESPACE_NAME::sm70_marlin_u8_gemm(
-        a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids, expert_ids,
-        num_tokens_past_padded, topk_weights, moe_block_size, top_k,
+        a, c, b_q_weight, b_scales_kernel, b_zeros, sorted_token_ids,
+        expert_ids, num_tokens_past_padded, topk_weights, moe_block_size, top_k,
         mul_topk_weights, size_m, size_n, size_k, group_size);
   }
 
@@ -622,8 +607,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     TORCH_CHECK(!has_zp && !is_zp_float,
                 "SM70 Marlin MoE fp4 does not support zero-point metadata.");
     if (s_type == vllm::kFE4M3fn) {
-      TORCH_CHECK(global_scale.numel() == num_experts,
-                  "the global_scale parameter must be passed for nvfp4 format.");
+      TORCH_CHECK(
+          global_scale.numel() == num_experts,
+          "the global_scale parameter must be passed for nvfp4 format.");
       TORCH_CHECK(group_size == 16,
                   "SM70 Marlin MoE NVFP4 supports only group_size 16. "
                   "Got ",

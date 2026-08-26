@@ -65,8 +65,9 @@ def _candidate_layers(model_path: Path) -> tuple[dict[str, str], list[str]]:
     return weight_map, layers
 
 
-def _select_layers(layers: list[str], layer_ids: set[int],
-                   max_layers: int) -> list[str]:
+def _select_layers(
+    layers: list[str], layer_ids: set[int], max_layers: int
+) -> list[str]:
     selected: list[str] = []
     seen_kind: set[str] = set()
     for prefix in layers:
@@ -100,8 +101,7 @@ def _run_case(
             "skip": "shape_not_multiple_128",
         }
 
-    tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
-        qweight, scales, group_size)
+    tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(qweight, scales, group_size)
     x = torch.randn((m, k), device=qweight.device, dtype=torch.float16)
 
     fixed = torch.empty((m, n), device=qweight.device, dtype=torch.float16)
@@ -120,8 +120,7 @@ def _run_case(
 
     os.environ["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = "0"
     fixed_after = torch.empty((m, n), device=qweight.device, dtype=torch.float16)
-    sm70_ops.fp8_gemm_sm70_out_meta(
-        fixed_after, x, tm_weight, tm_scales, meta)
+    sm70_ops.fp8_gemm_sm70_out_meta(fixed_after, x, tm_weight, tm_scales, meta)
     torch.accelerator.synchronize(qweight.device)
 
     diff_dynamic = (fixed.float() - dynamic.float()).abs()
@@ -178,8 +177,7 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     try:
         for prefix in selected:
-            qweight, scales = _load_fp8_layer(
-                args.model, weight_map, prefix, device)
+            qweight, scales = _load_fp8_layer(args.model, weight_map, prefix, device)
             for m in args.m:
                 results.append(_run_case(prefix, qweight, scales, m))
     finally:
@@ -189,7 +187,8 @@ def main() -> int:
             os.environ["VLLM_SM70_FP8_TUNE_SMALL_SHAPES"] = original_env
 
     failures = [
-        item for item in results
+        item
+        for item in results
         if item.get("fixed_vs_dynamic_max_diff", 0.0) != 0.0
         or not item.get("fixed_vs_dynamic_equal", True)
     ]

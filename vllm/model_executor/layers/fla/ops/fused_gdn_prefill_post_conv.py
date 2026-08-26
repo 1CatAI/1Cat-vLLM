@@ -76,8 +76,7 @@ def _fused_post_conv_kernel(
 
         # Load Q features: mixed_qkv[t, i_h*K + k]
         q_offsets = (
-            offs_t[:, None] * stride_x_tok
-            + (i_h * K + offs_k[None, :]) * stride_x_feat
+            offs_t[:, None] * stride_x_tok + (i_h * K + offs_k[None, :]) * stride_x_feat
         )
         q_f32 = tl.load(mixed_qkv_ptr + q_offsets, mask=qk_mask_2d, other=0).to(
             tl.float32
