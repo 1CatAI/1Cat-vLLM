@@ -182,12 +182,13 @@ jobs:
     name: Build native wheel (self-hosted)
     needs: prepare
     runs-on: [self-hosted, Linux, X64]
+    environment: actions
     timeout-minutes: 340
     env:
       GH_TOKEN: ${{ github.token }}
-      HTTP_PROXY_URL: ${{ vars.HTTP_PROXY_URL }}
-      HTTP_PROXY: ${{ vars.HTTP_PROXY_URL }}
-      HTTPS_PROXY: ${{ vars.HTTP_PROXY_URL }}
+      HTTP_PROXY_URL: ${{ secrets.HTTP_PROXY_URL }}
+      HTTP_PROXY: ${{ secrets.HTTP_PROXY_URL }}
+      HTTPS_PROXY: ${{ secrets.HTTP_PROXY_URL }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
       VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}

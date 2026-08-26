@@ -186,12 +186,13 @@ jobs:
     needs: resolve
     if: needs.resolve.result == 'success' && needs.resolve.outputs.native_changed == 'false'
     runs-on: [self-hosted, Linux, X64]
+    environment: actions
     timeout-minutes: 180
     env:
       GH_TOKEN: ${{ github.token }}
-      HTTP_PROXY_URL: ${{ vars.HTTP_PROXY_URL }}
-      HTTP_PROXY: ${{ vars.HTTP_PROXY_URL }}
-      HTTPS_PROXY: ${{ vars.HTTP_PROXY_URL }}
+      HTTP_PROXY_URL: ${{ secrets.HTTP_PROXY_URL }}
+      HTTP_PROXY: ${{ secrets.HTTP_PROXY_URL }}
+      HTTPS_PROXY: ${{ secrets.HTTP_PROXY_URL }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
       VLLM_USE_PRECOMPILED: "1"
