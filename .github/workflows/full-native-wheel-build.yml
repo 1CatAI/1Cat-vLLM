@@ -185,6 +185,11 @@ jobs:
     timeout-minutes: 340
     env:
       GH_TOKEN: ${{ github.token }}
+      HTTP_PROXY_URL: ${{ vars.HTTP_PROXY_URL }}
+      HTTP_PROXY: ${{ vars.HTTP_PROXY_URL }}
+      HTTPS_PROXY: ${{ vars.HTTP_PROXY_URL }}
+      http_proxy: ${{ vars.HTTP_PROXY_URL }}
+      https_proxy: ${{ vars.HTTP_PROXY_URL }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
       VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
@@ -236,6 +241,11 @@ jobs:
             --name "$container_name" \
             --cpus 20 \
             -e GH_TOKEN \
+            -e HTTP_PROXY_URL \
+            -e HTTP_PROXY \
+            -e HTTPS_PROXY \
+            -e http_proxy \
+            -e https_proxy \
             -e PYTHON_VERSION \
             -e VLLM_VERSION_OVERRIDE \
             -e VLLM_TARGET_DEVICE \

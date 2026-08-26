@@ -4,6 +4,13 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p "${RUNNER_TEMP}"
 
+if [[ -n "${HTTP_PROXY_URL:-}" ]]; then
+  export HTTP_PROXY="${HTTP_PROXY_URL}"
+  export HTTPS_PROXY="${HTTP_PROXY_URL}"
+  export http_proxy="${HTTP_PROXY_URL}"
+  export https_proxy="${HTTP_PROXY_URL}"
+fi
+
 cpu_count="$(nproc)"
 if (( cpu_count < 20 )); then
   echo "Build container exposes only ${cpu_count} CPUs; 20 are required." >&2
