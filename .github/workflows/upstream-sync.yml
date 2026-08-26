@@ -1,0 +1,56 @@
+name: Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UPSTREAM_REPOSITORY: 1CatAI/1Cat-vLLM
+
+    steps:
+      - name: Check out the current main branch
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Synchronize from upstream while preserving .github
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main --prune
+          origin_main_sha="$(git rev-parse origin/main)"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream main --prune
+
+          preserved_github="$RUNNER_TEMP/preserved-github"
+          cp -a .github "$preserved_github"
+
+          git reset --hard upstream/main
+          rm -rf .github
+          cp -a "$preserved_github" .github
+          git add -A
+
+          if git diff --cached --quiet "$origin_main_sha" --; then
+            echo "Upstream has no non-.github changes to apply."
+            exit 0
+          fi
+
+          git commit -m "chore(sync): update from ${UPSTREAM_REPOSITORY}@main"
+          git push --force-with-lease origin HEAD:main

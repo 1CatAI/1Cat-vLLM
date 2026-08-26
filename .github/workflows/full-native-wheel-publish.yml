@@ -1,0 +1,247 @@
+name: Full Native Wheel Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Successful Full Native Wheel Build run ID to publish"
+        required: true
+        type: string
+      artifact_name:
+        description: "Native wheel artifact name; defaults to native-wheel for legacy runs"
+        required: false
+        default: native-wheel
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: actions
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      ARTIFACT_NAME: ${{ inputs.artifact_name || 'native-wheel' }}
+
+    steps:
+      - name: Validate build run
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}")"
+          [[ "$(jq -r '.name' <<< "$run_json")" == "Full Native Wheel Build" ]] || {
+            echo "Run ${BUILD_RUN_ID} is not a Full Native Wheel Build run." >&2
+            exit 1
+          }
+          [[ "$(jq -r '.conclusion' <<< "$run_json")" == "success" ]] || {
+            echo "Build run ${BUILD_RUN_ID} did not succeed." >&2
+            exit 1
+          }
+          [[ "$(jq -r '.head_repository.full_name' <<< "$run_json")" == "$GITHUB_REPOSITORY" ]] || {
+            echo "Build run ${BUILD_RUN_ID} is from another repository." >&2
+            exit 1
+          }
+          echo "BUILD_HEAD_SHA=$(jq -r '.head_sha' <<< "$run_json")" >> "$GITHUB_ENV"
+
+      - name: Download build metadata
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN_ID }}
+          name: native-build-metadata
+          path: metadata
+
+      - name: Download native wheels
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.BUILD_RUN_ID }}
+          name: ${{ env.ARTIFACT_NAME }}
+          merge-multiple: true
+          path: dist
+
+      - name: Validate artifacts
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          metadata_file="metadata/native-build-metadata.json"
+          test -s "$metadata_file"
+          source_sha="$(jq -r '.source_sha // empty' "$metadata_file")"
+          build_date="$(jq -r '.build_date // empty' "$metadata_file")"
+          base_release_repo="$(jq -r '.base_release_repo // empty' "$metadata_file")"
+          base_tag="$(jq -r '.base_tag // empty' "$metadata_file")"
+          base_version="$(jq -r '.base_version // empty' "$metadata_file")"
+          rolling_tag="$(jq -r '.rolling_tag // empty' "$metadata_file")"
+          source_sha="${source_sha:-$BUILD_HEAD_SHA}"
+
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one native wheel artifact, found ${#wheels[@]}." >&2
+            exit 1
+          fi
+
+          wheel_path="${wheels[0]}"
+          case "$(basename "$wheel_path")" in
+            *-cp312-cp312-linux_x86_64.whl) ;;
+            *)
+              echo "Unexpected wheel platform: $(basename "$wheel_path")" >&2
+              exit 1
+              ;;
+          esac
+          wheel_listing="$RUNNER_TEMP/$(basename "$wheel_path").listing"
+          unzip -l "$wheel_path" > "$wheel_listing"
+          grep -q "vllm/vllm-rs" "$wheel_listing"
+          grep -q "vllm/_C.abi3.so" "$wheel_listing"
+          metadata_name="$(awk '/\.dist-info\/METADATA$/ {print $4; exit}' "$wheel_listing")"
+          wheel_metadata="$RUNNER_TEMP/$(basename "$wheel_path").metadata"
+          unzip -p "$wheel_path" "$metadata_name" > "$wheel_metadata"
+          version="$(sed -n 's/^Version: //p' "$wheel_metadata" | sed -n '1p')"
+
+          if [[ -z "$base_version" || -z "$build_date" ]]; then
+            if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.post([0-9]{8})$ ]]; then
+              base_version="${base_version:-${BASH_REMATCH[1]}}"
+              build_date="${build_date:-${BASH_REMATCH[2]}}"
+            else
+              echo "Cannot derive release metadata from wheel version: $version" >&2
+              exit 1
+            fi
+          fi
+          expected_version="${base_version}.post${build_date}"
+          if [[ "$version" != "$expected_version" ]]; then
+            echo "Unexpected wheel version in $(basename "$wheel_path"): $version (expected $expected_version)" >&2
+            exit 1
+          fi
+
+          if [[ -z "$base_release_repo" ]]; then
+            if gh api "repos/${GITHUB_REPOSITORY}/releases/latest" >/dev/null 2>&1; then
+              base_release_repo="$GITHUB_REPOSITORY"
+            else
+              base_release_repo="1CatAI/1Cat-vLLM"
+            fi
+          fi
+          base_tag="${base_tag:-v${base_version}}"
+          rolling_tag="${rolling_tag:-${base_tag}-native-rolling}"
+          sha256sum "$wheel_path"
+
+          {
+            echo "source_sha=$source_sha"
+            echo "build_date=$build_date"
+            echo "base_release_repo=$base_release_repo"
+            echo "base_tag=$base_tag"
+            echo "base_version=$base_version"
+            echo "rolling_tag=$rolling_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the native rolling release
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
+          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
+          BASE_RELEASE_REPO: ${{ steps.metadata.outputs.base_release_repo }}
+          BASE_TAG: ${{ steps.metadata.outputs.base_tag }}
+          ROLLING_TAG: ${{ steps.metadata.outputs.rolling_tag }}
+        run: |
+          set -euo pipefail
+
+          notes_file="$RUNNER_TEMP/native-release-notes.md"
+          cat > "$notes_file" <<EOF
+          Full native rolling wheels for ${BASE_RELEASE_REPO}@${BASE_TAG}.
+
+          - Source: ${SOURCE_SHA}
+          - Build date: ${BUILD_DATE} UTC+8
+          - Wheel: cp312-cp312-linux_x86_64
+          - CUDA/C++ extensions are built from source.
+          - The Rust frontend is rebuilt only when Rust sources changed; otherwise it is reused from the stable release wheel.
+          EOF
+
+          if gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$ROLLING_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${BASE_TAG} native rolling update" \
+              --notes-file "$notes_file" \
+              --prerelease
+          else
+            # GITHUB_TOKEN cannot create a release targeting a commit that
+            # changes workflow files. Keep SOURCE_SHA in the notes and let
+            # GitHub target the current default branch for the release tag.
+            gh release create "$ROLLING_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${BASE_TAG} native rolling update" \
+              --notes-file "$notes_file" \
+              --prerelease
+          fi
+
+          mapfile -t wheel_paths < <(find dist -maxdepth 1 -type f -name '*.whl' -print | sort)
+          for wheel_path in "${wheel_paths[@]}"; do
+            gh release upload "$ROLLING_TAG" "$wheel_path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          done
+
+          mapfile -t current_assets < <(
+            for wheel_path in "${wheel_paths[@]}"; do
+              basename "$wheel_path"
+            done
+          )
+          gh release view "$ROLLING_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' > "$RUNNER_TEMP/release-assets.txt"
+          while IFS= read -r asset_name; do
+            [[ "$asset_name" == *.whl ]] || continue
+            keep=false
+            for current_asset in "${current_assets[@]}"; do
+              if [[ "$asset_name" == "$current_asset" ]]; then
+                keep=true
+                break
+              fi
+            done
+            if [[ "$keep" != true ]]; then
+              gh release delete-asset "$ROLLING_TAG" "$asset_name" \
+                --repo "$GITHUB_REPOSITORY" --yes || \
+                echo "::warning::Could not remove old asset $asset_name"
+            fi
+          done < "$RUNNER_TEMP/release-assets.txt"
+
+          echo "Published ${#wheel_paths[@]} native wheels to ${ROLLING_TAG}."
+
+      - name: Notify rolling Docker image workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DOCKER_REPOSITORY_DISPATCH_TOKEN }}
+          DOCKER_REPOSITORY: DSYZayn/1cat-vllm-v100-docker
+          RELEASE_TAG: ${{ steps.metadata.outputs.rolling_tag }}
+          SOURCE_SHA: ${{ steps.metadata.outputs.source_sha }}
+          WHEEL_VERSION: ${{ steps.metadata.outputs.base_version }}.post${{ steps.metadata.outputs.build_date }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::error::DOCKER_REPOSITORY_DISPATCH_TOKEN is not configured; rolling Docker build cannot be triggered."
+            exit 1
+          fi
+
+          release_updated_at="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            --jq '.updated_at')"
+          jq -n \
+            --arg event_type rolling-wheel-published \
+            --arg release_tag "${RELEASE_TAG}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg wheel_version "${WHEEL_VERSION}" \
+            --arg release_updated_at "${release_updated_at}" \
+            '{event_type: $event_type, client_payload: {
+              release_tag: $release_tag,
+              source_sha: $source_sha,
+              wheel_version: $wheel_version,
+              release_updated_at: $release_updated_at
+            }}' \
+            | gh api "repos/${DOCKER_REPOSITORY}/dispatches" \
+                --method POST --input -
+
+          echo "Triggered rolling Docker build for ${RELEASE_TAG}."

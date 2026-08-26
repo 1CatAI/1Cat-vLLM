@@ -1,0 +1,553 @@
+name: Full Native Wheel Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact main commit to build; empty means current main"
+        required: false
+        type: string
+      build_date:
+        description: "UTC+8 build date in YYYYMMDD format; empty means today"
+        required: false
+        type: string
+      rust_changed:
+        description: "Whether Rust sources changed; defaults to rebuilding Rust"
+        required: false
+        default: "true"
+        type: string
+
+concurrency:
+  group: full-native-wheel-build-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA_INPUT: ${{ inputs.source_sha }}
+      BUILD_DATE_INPUT: ${{ inputs.build_date }}
+      RUST_CHANGED_INPUT: ${{ inputs.rust_changed }}
+    outputs:
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      base_release_repo: ${{ steps.metadata.outputs.base_release_repo }}
+      base_tag: ${{ steps.metadata.outputs.base_tag }}
+      base_version: ${{ steps.metadata.outputs.base_version }}
+      base_wheel_url: ${{ steps.metadata.outputs.base_wheel_url }}
+      rust_changed: ${{ steps.metadata.outputs.rust_changed }}
+      rolling_tag: ${{ steps.metadata.outputs.rolling_tag }}
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve build metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --prune
+          if [[ -n "$SOURCE_SHA_INPUT" ]]; then
+            if ! git cat-file -e "${SOURCE_SHA_INPUT}^{commit}" 2>/dev/null; then
+              git fetch origin main --prune
+            fi
+            git checkout --detach "$SOURCE_SHA_INPUT"
+          else
+            git checkout --detach origin/main
+          fi
+
+          source_sha="$(git rev-parse HEAD)"
+          build_date="$BUILD_DATE_INPUT"
+          if [[ -z "$build_date" ]]; then
+            build_date="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          fi
+          if [[ ! "$build_date" =~ ^[0-9]{8}$ ]]; then
+            echo "Invalid build date: $build_date" >&2
+            exit 1
+          fi
+
+          fallback_release_repo="1CatAI/1Cat-vLLM"
+          base_release_repo="$GITHUB_REPOSITORY"
+          if ! release_json="$(gh api \
+            "repos/${base_release_repo}/releases/latest" 2>/dev/null)"; then
+            base_release_repo="$fallback_release_repo"
+            release_json="$(gh api \
+              "repos/${base_release_repo}/releases/latest")"
+          fi
+
+          base_tag="$(jq -r '.tag_name' <<< "$release_json")"
+          base_version="${base_tag#v}"
+          if [[ ! "$base_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Latest release tag is not a stable semantic version: $base_tag" >&2
+            exit 1
+          fi
+
+          base_wheel_name="$(jq -r \
+            '[.assets[]? | select(.name | test("cp312-cp312-linux_x86_64\\.whl$")) | .name][0] // empty' \
+            <<< "$release_json")"
+          if [[ -z "$base_wheel_name" && "$base_release_repo" != "$fallback_release_repo" ]]; then
+            base_release_repo="$fallback_release_repo"
+            release_json="$(gh api \
+              "repos/${base_release_repo}/releases/latest")"
+            base_tag="$(jq -r '.tag_name' <<< "$release_json")"
+            base_version="${base_tag#v}"
+            base_wheel_name="$(jq -r \
+              '[.assets[]? | select(.name | test("cp312-cp312-linux_x86_64\\.whl$")) | .name][0] // empty' \
+              <<< "$release_json")"
+          fi
+          if [[ -z "$base_wheel_name" ]]; then
+            echo "No compatible cp312 Linux x86_64 wheel found in ${base_release_repo}." >&2
+            exit 1
+          fi
+          base_wheel_url="$(jq -r --arg name "$base_wheel_name" \
+            '.assets[]? | select(.name == $name) | .browser_download_url' \
+            <<< "$release_json")"
+          if [[ -z "$base_wheel_url" || "$base_wheel_url" == "null" ]]; then
+            echo "Could not resolve the baseline wheel download URL." >&2
+            exit 1
+          fi
+
+          git fetch --tags --force origin
+          if ! git describe --tags >/dev/null 2>&1; then
+            git fetch --no-tags \
+              "https://github.com/${base_release_repo}.git" \
+              "refs/tags/${base_tag}:refs/tags/${base_tag}"
+          fi
+
+          rust_changed="$RUST_CHANGED_INPUT"
+          if [[ -z "$rust_changed" ]]; then
+            rust_changed=true
+          fi
+          if [[ "$rust_changed" != "true" && "$rust_changed" != "false" ]]; then
+            echo "Invalid rust_changed value: $rust_changed" >&2
+            exit 1
+          fi
+
+          rolling_tag="${base_tag}-native-rolling"
+          {
+            echo "source_sha=$source_sha"
+            echo "build_date=$build_date"
+            echo "base_release_repo=$base_release_repo"
+            echo "base_tag=$base_tag"
+            echo "base_version=$base_version"
+            echo "base_wheel_url=$base_wheel_url"
+            echo "rust_changed=$rust_changed"
+            echo "rolling_tag=$rolling_tag"
+          } >> "$GITHUB_OUTPUT"
+
+          jq -n \
+            --arg source_sha "$source_sha" \
+            --arg build_date "$build_date" \
+            --arg base_release_repo "$base_release_repo" \
+            --arg base_tag "$base_tag" \
+            --arg base_version "$base_version" \
+            --arg base_wheel_url "$base_wheel_url" \
+            --arg rust_changed "$rust_changed" \
+            --arg rolling_tag "$rolling_tag" \
+            '{source_sha: $source_sha, build_date: $build_date,
+              base_release_repo: $base_release_repo, base_tag: $base_tag,
+              base_version: $base_version, base_wheel_url: $base_wheel_url,
+              rust_changed: $rust_changed, rolling_tag: $rolling_tag}' \
+            > "$RUNNER_TEMP/native-build-metadata.json"
+
+          echo "Source commit: $source_sha"
+          echo "Build date: $build_date UTC+8"
+          echo "Base release: $base_release_repo@$base_tag"
+          echo "Native rolling release: $rolling_tag"
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-metadata
+          path: ${{ runner.temp }}/native-build-metadata.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Check source repository
+        shell: bash
+        run: bash tools/check_repo.sh
+
+  build_self_hosted:
+    name: Build native wheel (self-hosted)
+    needs: prepare
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 340
+    container:
+      image: nvidia/cuda:12.8.2-devel-ubuntu24.04
+      options: --user 0
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHON_VERSION: "3.12"
+      VLLM_TARGET_DEVICE: cuda
+      VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
+      VLLM_REQUIRE_RUST_FRONTEND: ${{ needs.prepare.outputs.rust_changed }}
+      RUST_CHANGED: ${{ needs.prepare.outputs.rust_changed }}
+      BASE_WHEEL_URL: ${{ needs.prepare.outputs.base_wheel_url }}
+      TORCH_CUDA_ARCH_LIST: "7.0"
+      FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
+      VLLM_BUILD_FLASH_ATTN_V100: "1"
+      MAX_JOBS: "20"
+      CMAKE_BUILD_PARALLEL_LEVEL: "20"
+      NVCC_THREADS: "20"
+      CARGO_BUILD_JOBS: "20"
+      CMAKE_BUILD_TYPE: Release
+
+    steps:
+      - name: Install build tools in the CUDA container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            jq \
+            libssl-dev \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            python3.12 \
+            python3.12-dev \
+            python3.12-venv \
+            unzip
+
+      - name: Check out the source commit
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Mark checkout as safe for Git
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements/**/*.txt
+            pyproject.toml
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create build environment
+        shell: bash
+        run: uv venv --python "${PYTHON_VERSION}"
+
+      - name: Reuse Rust frontend from the latest release
+        if: env.RUST_CHANGED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_wheel="$RUNNER_TEMP/base-wheel.whl"
+          curl -fL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$BASE_WHEEL_URL" \
+            -o "$baseline_wheel"
+          unzip -p "$baseline_wheel" vllm/vllm-rs > vllm/vllm-rs
+          test -s vllm/vllm-rs
+          chmod +x vllm/vllm-rs
+
+      - name: Install the pinned Rust toolchain
+        if: env.RUST_CHANGED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          source "$HOME/.cargo/env"
+          rustup toolchain install 1.95.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install build and runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -E -i \
+            's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
+            requirements/cuda.txt
+          uv pip install --python .venv/bin/python \
+            -r requirements/build/cuda.txt \
+            -r requirements/cuda.txt \
+            --torch-backend=cu128
+
+      - name: Verify CUDA PyTorch installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PY'
+          import torch
+
+          if torch.version.cuda is None:
+              raise SystemExit("The resolved PyTorch package is CPU-only.")
+          print(f"PyTorch CUDA runtime: {torch.version.cuda}")
+          PY
+
+      - name: Build the complete native wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build dist vllm.egg-info
+          rm -rf .deps/*-build .deps/*-subbuild
+          .venv/bin/python setup.py bdist_wheel --dist-dir=dist
+
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          if [[ -z "$wheel_path" ]]; then
+            echo "The build produced no wheel." >&2
+            exit 1
+          fi
+          case "$(basename "$wheel_path")" in
+            *-cp312-cp312-linux_x86_64.whl) ;;
+            *)
+              echo "Unexpected wheel platform: $(basename "$wheel_path")" >&2
+              exit 1
+              ;;
+          esac
+
+          wheel_listing="$RUNNER_TEMP/wheel.listing"
+          unzip -l "$wheel_path" > "$wheel_listing"
+          grep -q "vllm/vllm-rs" "$wheel_listing"
+          grep -q "vllm/_C.abi3.so" "$wheel_listing"
+
+          metadata_name="$(awk '/\.dist-info\/METADATA$/ {print $4; exit}' "$wheel_listing")"
+          unzip -p "$wheel_path" "$metadata_name" > "$RUNNER_TEMP/wheel.metadata"
+          actual_version="$(sed -n 's/^Version: //p' "$RUNNER_TEMP/wheel.metadata" | sed -n '1p')"
+          if [[ "$actual_version" != "$VLLM_VERSION_OVERRIDE" ]]; then
+            echo "Wheel version mismatch: $actual_version != $VLLM_VERSION_OVERRIDE" >&2
+            exit 1
+          fi
+          echo "Validated $(basename "$wheel_path")"
+
+      - name: Upload the native wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-wheel-self-hosted
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  build_official:
+    name: Build native wheel (official fallback)
+    needs: [prepare, build_self_hosted]
+    if: >-
+      always() &&
+      needs.prepare.result == 'success' &&
+      needs.build_self_hosted.result != 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    container:
+      image: nvidia/cuda:12.8.2-devel-ubuntu24.04
+      options: --user 0
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHON_VERSION: "3.12"
+      VLLM_TARGET_DEVICE: cuda
+      VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
+      VLLM_REQUIRE_RUST_FRONTEND: ${{ needs.prepare.outputs.rust_changed }}
+      RUST_CHANGED: ${{ needs.prepare.outputs.rust_changed }}
+      BASE_WHEEL_URL: ${{ needs.prepare.outputs.base_wheel_url }}
+      TORCH_CUDA_ARCH_LIST: "7.0"
+      FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
+      VLLM_BUILD_FLASH_ATTN_V100: "1"
+      CMAKE_BUILD_TYPE: Release
+
+    steps:
+      - name: Install build tools in the CUDA container
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            jq \
+            libssl-dev \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            python3.12 \
+            python3.12-dev \
+            python3.12-venv \
+            unzip
+
+      - name: Resolve official runner parallelism
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs="$(nproc)"
+          if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Could not resolve official runner CPU count: $jobs" >&2
+            exit 1
+          fi
+          echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
+          echo "NVCC_THREADS=$jobs" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "Official runner build parallelism: $jobs"
+
+      - name: Check out the source commit
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Mark checkout as safe for Git
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            requirements/**/*.txt
+            pyproject.toml
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Create build environment
+        shell: bash
+        run: uv venv --python "${PYTHON_VERSION}"
+
+      - name: Reuse Rust frontend from the latest release
+        if: env.RUST_CHANGED != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_wheel="$RUNNER_TEMP/base-wheel.whl"
+          curl -fL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$BASE_WHEEL_URL" \
+            -o "$baseline_wheel"
+          unzip -p "$baseline_wheel" vllm/vllm-rs > vllm/vllm-rs
+          test -s vllm/vllm-rs
+          chmod +x vllm/vllm-rs
+
+      - name: Install the pinned Rust toolchain
+        if: env.RUST_CHANGED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          source "$HOME/.cargo/env"
+          rustup toolchain install 1.95.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install build and runtime dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -E -i \
+            's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
+            requirements/cuda.txt
+          uv pip install --python .venv/bin/python \
+            -r requirements/build/cuda.txt \
+            -r requirements/cuda.txt \
+            --torch-backend=cu128
+
+      - name: Verify CUDA PyTorch installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python - <<'PY'
+          import torch
+
+          if torch.version.cuda is None:
+              raise SystemExit("The resolved PyTorch package is CPU-only.")
+          print(f"PyTorch CUDA runtime: {torch.version.cuda}")
+          PY
+
+      - name: Build the complete native wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build dist vllm.egg-info
+          rm -rf .deps/*-build .deps/*-subbuild
+          .venv/bin/python setup.py bdist_wheel --dist-dir=dist
+
+          wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          if [[ -z "$wheel_path" ]]; then
+            echo "The build produced no wheel." >&2
+            exit 1
+          fi
+          case "$(basename "$wheel_path")" in
+            *-cp312-cp312-linux_x86_64.whl) ;;
+            *)
+              echo "Unexpected wheel platform: $(basename "$wheel_path")" >&2
+              exit 1
+              ;;
+          esac
+
+          wheel_listing="$RUNNER_TEMP/wheel.listing"
+          unzip -l "$wheel_path" > "$wheel_listing"
+          grep -q "vllm/vllm-rs" "$wheel_listing"
+          grep -q "vllm/_C.abi3.so" "$wheel_listing"
+
+          metadata_name="$(awk '/\.dist-info\/METADATA$/ {print $4; exit}' "$wheel_listing")"
+          unzip -p "$wheel_path" "$metadata_name" > "$RUNNER_TEMP/wheel.metadata"
+          actual_version="$(sed -n 's/^Version: //p' "$RUNNER_TEMP/wheel.metadata" | sed -n '1p')"
+          if [[ "$actual_version" != "$VLLM_VERSION_OVERRIDE" ]]; then
+            echo "Wheel version mismatch: $actual_version != $VLLM_VERSION_OVERRIDE" >&2
+            exit 1
+          fi
+          echo "Validated $(basename "$wheel_path")"
+
+      - name: Upload the native wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-wheel-official
+          path: dist/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  publish:
+    name: Dispatch native wheel publish
+    needs: [build_self_hosted, build_official]
+    if: >-
+      always() &&
+      (
+        needs.build_self_hosted.result == 'success' ||
+        needs.build_official.result == 'success'
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_NAME: ${{ needs.build_self_hosted.result == 'success' && 'native-wheel-self-hosted' || 'native-wheel-official' }}
+    steps:
+      - name: Dispatch native wheel publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run full-native-wheel-publish.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f build_run_id="$GITHUB_RUN_ID" \
+            -f artifact_name="$ARTIFACT_NAME"
+          echo "Native wheel publish dispatched for build run ${GITHUB_RUN_ID}."
