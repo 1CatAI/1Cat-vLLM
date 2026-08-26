@@ -9,7 +9,6 @@ UE8M0 scales. It never materializes an FP16/BF16 expert-weight copy.
 
 from __future__ import annotations
 
-import os
 from typing import Final
 
 import torch
@@ -51,21 +50,15 @@ def _mxfp4_qpn_m1_op_available() -> bool:
 
 
 def _mxfp4_qpn_m1_extension_enabled() -> bool:
-    """Resolve the default-on route without breaking an older extension."""
+    """Resolve the diagnostic route and fail closed without its extension."""
     if not envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE:
         return False
     if _mxfp4_qpn_m1_op_available():
         return True
-    if os.getenv(_MXFP4_QPN_M1_ENV) is not None:
-        raise RuntimeError(
-            "The explicitly enabled SM70 MXFP4 QPN M1 route requires the "
-            f"source-built {_MXFP4_QPN_M1_OP} operator."
-        )
-    logger.warning_once(
-        "The default SM70 MXFP4 QPN M1 route is unavailable in the loaded "
-        "vllm._C; retaining the TurboMind dense-stage path."
+    raise RuntimeError(
+        "The explicitly enabled SM70 MXFP4 QPN M1 route requires the "
+        f"source-built {_MXFP4_QPN_M1_OP} operator."
     )
-    return False
 
 
 def _mxfp4_active_expert_b1_enabled() -> bool:

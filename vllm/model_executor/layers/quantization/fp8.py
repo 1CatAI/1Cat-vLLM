@@ -1239,7 +1239,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         persistent=False,
                     )
                     logger.info_once(
-                        "Exact SM70 fused-WQA/WKV prescaled decode path enabled."
+                        "Diagnostic SM70 fused-WQA/WKV prescaled decode path enabled."
                     )
             if (
                 envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR

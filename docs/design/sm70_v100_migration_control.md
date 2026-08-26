@@ -43954,6 +43954,14 @@ Interpretation:
   are `62/64`, `29/32`, `52.169`, and `73.560 token/s`. Both isolated
   comparisons fail row-level quality and exact-output checks. None is an
   admitted baseline or optimization.
+- WQA prescale also slows the current matched endpoint by `1.068 token/s`, so
+  retaining it does not preserve speed. The MXFP4-QPN operator gate is a
+  bounded-error rather than bitwise result: `93/136` comparisons differ, with
+  minimum exact fraction `98.816%`, maximum absolute difference `0.001953125`,
+  and maximum relative L2 `4.69e-5`. Combined with the model-level
+  correct-to-wrong transition, this is insufficient for a default route.
+  Private Draft PR 21 therefore defaults both WQA prescale and MXFP4-QPN off;
+  explicit opt-ins remain available only for the strict diagnostic matrix.
 - The last arm has the same effective runtime routes as the previous
   quality-safe endpoint, but the earlier run produced GSM8K `64/64`,
   HumanEval `29/32`, and LongBench `44.740`. Server logs show that startup
@@ -43972,8 +43980,8 @@ Interpretation:
   tests and `17` SM70 warmup tests), and changed-file pre-commit passes.
 - Two matched unsafe-dynamic startup traces are queued to record the exact
   kernel/split/swizzle chosen on all eight ranks. A subsequent strict matrix
-  compares fixed FP8, safe FP8, safe FP8 plus exact MXFP4-QPN, and a second
-  identical candidate startup. Admission requires exact GSM8K rows,
+  compares fixed FP8, safe FP8, safe FP8 plus the MXFP4-QPN diagnostic, and a
+  second identical candidate startup. Admission requires exact GSM8K rows,
   HumanEval responses, LongBench rows, chat output and performance-output
   hashes, plus zero correct-to-wrong transitions versus the pinned GSM8K
   baseline. Until that matrix passes, PR 21 remains Draft and no speed result
