@@ -201,27 +201,43 @@ jobs:
       CMAKE_BUILD_TYPE: Release
 
     steps:
-      - name: Install build tools on the self-hosted runner
+      - name: Verify preinstalled self-hosted build tools
         shell: bash
         run: |
           set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          sudo -n apt-get update
-          sudo -n apt-get install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            cmake \
-            curl \
-            git \
-            jq \
-            libssl-dev \
-            ninja-build \
-            patchelf \
-            pkg-config \
-            python3.12 \
-            python3.12-dev \
-            python3.12-venv \
+          required_tools=(
+            cmake
+            ninja
+            nvcc
+            gcc
+            g++
+            git
+            curl
+            jq
+            patchelf
+            pkg-config
             unzip
+          )
+          missing_tools=()
+          for tool in "${required_tools[@]}"; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing_tools+=("$tool")
+            fi
+          done
+          if ((${#missing_tools[@]})); then
+            printf 'Missing preinstalled self-hosted tools: %s\n' \
+              "${missing_tools[*]}" >&2
+            exit 1
+          fi
+          cpu_count="$(nproc)"
+          if (( cpu_count < 20 )); then
+            echo "Self-hosted runner exposes only ${cpu_count} CPUs; 20 are required." >&2
+            exit 1
+          fi
+          cmake --version | head -n 1
+          echo "Ninja version: $(ninja --version)"
+          nvcc --version | tail -n 1
+          echo "Verified ${cpu_count} CPUs and the complete CUDA build toolchain."
 
       - name: Check out the source commit
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
