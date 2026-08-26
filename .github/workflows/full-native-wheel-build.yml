@@ -224,7 +224,7 @@ jobs:
 
       - name: Build native wheel in the CUDA container
         env:
-          BUILD_IMAGE: nvidia/cuda:12.8.2-devel-ubuntu24.04
+          BUILD_IMAGE: ngc.nju.edu.cn/nvidia/cuda:12.8.2-devel-ubuntu24.04
         shell: bash
         run: |
           set -euo pipefail
@@ -234,7 +234,17 @@ jobs:
           }
           trap cleanup EXIT
 
-          docker pull "$BUILD_IMAGE"
+          for attempt in 1 2 3; do
+            if docker pull "$BUILD_IMAGE"; then
+              break
+            fi
+            if (( attempt == 3 )); then
+              echo "Failed to pull CUDA build image after ${attempt} attempts." >&2
+              exit 1
+            fi
+            echo "Retrying CUDA image pull (${attempt}/3)..." >&2
+            sleep $((attempt * 10))
+          done
           docker rm -f "$container_name" >/dev/null 2>&1 || true
           docker create \
             --name "$container_name" \
