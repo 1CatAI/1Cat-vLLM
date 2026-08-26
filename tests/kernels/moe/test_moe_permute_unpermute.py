@@ -473,9 +473,7 @@ def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
         )
         topk_weights = torch.randn((1, topk), device=device, dtype=torch.float32)
         dummy_hidden = torch.randn((1, hidden), device=device, dtype=torch.float16)
-        _, _, offsets, inv, _ = moe_permute(
-            dummy_hidden, None, topk_ids, n_expert
-        )
+        _, _, offsets, inv, _ = moe_permute(dummy_hidden, None, topk_ids, n_expert)
         sorted_output_storage = torch.randn(
             (topk, hidden + pad), device=device, dtype=torch.float16
         )
@@ -483,12 +481,8 @@ def test_sm70_single_token_weighted_reduce_matches_moe_unpermute():
 
         expected = torch.empty((1, hidden), device=device, dtype=torch.float16)
         actual = torch.empty_like(expected)
-        reference_sorted_output = (
-            sorted_output.contiguous() if pad else sorted_output
-        )
-        moe_unpermute(
-            expected, reference_sorted_output, topk_weights, inv, offsets
-        )
+        reference_sorted_output = sorted_output.contiguous() if pad else sorted_output
+        moe_unpermute(expected, reference_sorted_output, topk_weights, inv, offsets)
         torch.ops._C.awq_moe_single_token_weighted_reduce_out(
             sorted_output,
             topk_weights,

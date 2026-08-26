@@ -461,9 +461,7 @@ class EngineCore:
         profile_sample_ms = 0.0
         profile_update_ms = 0.0
         if profile_ddtree_engine:
-            profile_step = getattr(
-                self, "_dflash_ddtree_engine_profile_step", 0
-            ) + 1
+            profile_step = getattr(self, "_dflash_ddtree_engine_profile_step", 0) + 1
             self._dflash_ddtree_engine_profile_step = profile_step
             profile_t0 = time.perf_counter()
 
@@ -478,9 +476,7 @@ class EngineCore:
             profile_part_t0 = time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         if profile_ddtree_engine:
-            profile_execute_submit_ms = (
-                time.perf_counter() - profile_part_t0
-            ) * 1000.0
+            profile_execute_submit_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             profile_part_t0 = time.perf_counter()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         if profile_ddtree_engine:
@@ -497,9 +493,7 @@ class EngineCore:
                 profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
                 model_output = self.model_executor.sample_tokens(grammar_output)
                 if profile_ddtree_engine:
-                    profile_sample_ms = (
-                        time.perf_counter() - profile_part_t0
-                    ) * 1000.0
+                    profile_sample_ms = (time.perf_counter() - profile_part_t0) * 1000.0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -611,9 +605,7 @@ class EngineCore:
             trace_schedule_t0 = time.perf_counter() if trace_log else 0.0
             scheduler_output = self.scheduler.schedule()
             if trace_log:
-                trace_schedule_ms = (
-                    time.perf_counter() - trace_schedule_t0
-                ) * 1000.0
+                trace_schedule_ms = (time.perf_counter() - trace_schedule_t0) * 1000.0
                 trace_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
             with self.log_error_detail(scheduler_output):
                 trace_execute_t0 = time.perf_counter() if trace_log else 0.0

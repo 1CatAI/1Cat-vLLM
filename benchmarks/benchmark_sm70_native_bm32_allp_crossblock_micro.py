@@ -103,8 +103,7 @@ def _require_environment(args: argparse.Namespace) -> None:
         raise ValueError(f"formal runs require exactly {K_DEFAULT_ROUNDS} rounds.")
     if args.launches_per_sample != K_DEFAULT_LAUNCHES:
         raise ValueError(
-            "formal runs require exactly "
-            f"{K_DEFAULT_LAUNCHES} launches per sample."
+            f"formal runs require exactly {K_DEFAULT_LAUNCHES} launches per sample."
         )
 
 
@@ -261,12 +260,8 @@ def _inspect_sass(binary: Path) -> dict[str, Any]:
         "kernels": kernels,
         "static_instruction_delta": {
             mnemonic: (
-                kernels.get("candidate", {})
-                .get("instructions", {})
-                .get(mnemonic, 0)
-                - kernels.get("baseline", {})
-                .get("instructions", {})
-                .get(mnemonic, 0)
+                kernels.get("candidate", {}).get("instructions", {}).get(mnemonic, 0)
+                - kernels.get("baseline", {}).get("instructions", {}).get(mnemonic, 0)
             )
             for mnemonic in ("hmma", "ldg", "lds", "sts", "ldl", "stl", "bar")
         },
@@ -302,13 +297,11 @@ def _resource_gate(
             )
         if resource.get("registers_per_thread", 65) > 64:
             reasons.append(
-                f"{path} REG={resource.get('registers_per_thread')}, "
-                "requires <=64"
+                f"{path} REG={resource.get('registers_per_thread')}, requires <=64"
             )
         if resource.get("local_bytes_per_thread") != 0:
             reasons.append(
-                f"{path} LOCAL={resource.get('local_bytes_per_thread')}, "
-                "requires 0"
+                f"{path} LOCAL={resource.get('local_bytes_per_thread')}, requires 0"
             )
         if resource.get("static_shared_bytes") != K_ALLP_SHARED_BYTES:
             reasons.append(
@@ -333,8 +326,7 @@ def _resource_gate(
             continue
         if ptxas["registers_per_thread"] > 64:
             reasons.append(
-                f"PTXAS {path} REG={ptxas['registers_per_thread']}, "
-                "requires <=64"
+                f"PTXAS {path} REG={ptxas['registers_per_thread']}, requires <=64"
             )
         for key in ("stack_frame_bytes", "spill_store_bytes", "spill_load_bytes"):
             if ptxas[key] != 0:
@@ -356,9 +348,7 @@ def _resource_gate(
             instructions = path_sass.get("instructions", {})
             for mnemonic in ("hmma", "ldg", "lds", "sts"):
                 if instructions.get(mnemonic, 0) == 0:
-                    reasons.append(
-                        f"{path} SASS has no {mnemonic.upper()} instruction"
-                    )
+                    reasons.append(f"{path} SASS has no {mnemonic.upper()} instruction")
             if instructions.get("ldl", 0) or instructions.get("stl", 0):
                 reasons.append(
                     f"{path} SASS has local instructions "
@@ -397,40 +387,31 @@ def _resource_gate(
     return not reasons, reasons
 
 
-def _correctness_gate(
-    payload: dict[str, Any], groups: int
-) -> tuple[bool, list[str]]:
+def _correctness_gate(payload: dict[str, Any], groups: int) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     exactness = payload.get("exactness") or {}
     expected_words = groups * K_M * K_D // 2
     if exactness.get("word_dtype") != "uint32 packed fp16":
         reasons.append(
-            "word_dtype="
-            f"{exactness.get('word_dtype')}, requires uint32 packed fp16"
+            f"word_dtype={exactness.get('word_dtype')}, requires uint32 packed fp16"
         )
     if exactness.get("word_count") != expected_words:
         reasons.append(
-            "word_count="
-            f"{exactness.get('word_count')}, requires {expected_words}"
+            f"word_count={exactness.get('word_count')}, requires {expected_words}"
         )
     if exactness.get("full_output") is not True:
         reasons.append("C++ probe did not compare the full output")
     if exactness.get("bitwise_equal") is not True:
         reasons.append("candidate output is not bitwise equal to baseline")
     if exactness.get("mismatch_words") != 0:
-        reasons.append(
-            "mismatch_words="
-            f"{exactness.get('mismatch_words')}, requires 0"
-        )
+        reasons.append(f"mismatch_words={exactness.get('mismatch_words')}, requires 0")
     xor = exactness.get("xor", {})
     if xor.get("max_word") != 0 or xor.get("reduction") != 0:
         reasons.append("packed uint32 XOR result is nonzero")
     return not reasons, reasons
 
 
-def _performance_gate(
-    payload: dict[str, Any], rounds: int
-) -> tuple[bool, list[str]]:
+def _performance_gate(payload: dict[str, Any], rounds: int) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     pairs = payload.get("pairs") or {}
     if pairs.get("count") != rounds:
@@ -441,13 +422,10 @@ def _performance_gate(
             f"candidate_faster={pairs.get('candidate_faster')}, "
             f"requires >= {required_wins}/{rounds}"
         )
-    speedup_pct = (payload.get("timing") or {}).get(
-        "candidate_speedup_vs_baseline_pct"
-    )
+    speedup_pct = (payload.get("timing") or {}).get("candidate_speedup_vs_baseline_pct")
     if speedup_pct is None or speedup_pct < K_REQUIRED_SPEEDUP_PCT:
         reasons.append(
-            f"median speedup={speedup_pct}, requires "
-            f">= {K_REQUIRED_SPEEDUP_PCT}%"
+            f"median speedup={speedup_pct}, requires >= {K_REQUIRED_SPEEDUP_PCT}%"
         )
     return not reasons, reasons
 
@@ -666,14 +644,11 @@ def _run_ncu_kernel(
             "mio_throttle_per_warp_active": metrics.get(
                 "smsp__warp_issue_stalled_mio_throttle_per_warp_active"
             ),
-            "tensor_instructions": metrics.get(
-                "smsp__inst_executed_pipe_tensor.sum"
-            ),
+            "tensor_instructions": metrics.get("smsp__inst_executed_pipe_tensor.sum"),
         },
         "stdout_tail": completed.stdout[-3000:],
         "stderr_tail": completed.stderr[-3000:],
-        "permission_error": "ERR_NVGPUCTRPERM"
-        in (completed.stdout + completed.stderr),
+        "permission_error": "ERR_NVGPUCTRPERM" in (completed.stdout + completed.stderr),
     }
 
 
@@ -830,8 +805,7 @@ def _main() -> int:
         "benchmark": "sm70_native_bm32_allp_crossblock_micro",
         "target": "sm_70",
         "matrix": [
-            {"pattern": pattern, "nblocks": nblocks}
-            for pattern, nblocks in K_CASES
+            {"pattern": pattern, "nblocks": nblocks} for pattern, nblocks in K_CASES
         ],
         "configuration": {
             "groups": args.groups,

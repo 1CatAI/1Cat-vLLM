@@ -174,9 +174,7 @@ def _sparse_target_topk_topp_rejection_prototype(
     target_logits = sampled_logits[:num_tokens].float()
     bonus_logits = sampled_logits[num_tokens:].float()
 
-    target_topk_values, target_topk_ids = torch.topk(
-        target_logits, k=top_k, dim=-1
-    )
+    target_topk_values, target_topk_ids = torch.topk(target_logits, k=top_k, dim=-1)
     target_topk_probs = target_topk_values.softmax(dim=-1, dtype=torch.float32)
     target_remove_mask = target_topk_probs.cumsum(dim=-1) > top_p
     target_remove_mask[:, 1:] = target_remove_mask[:, :-1].clone()
@@ -191,9 +189,7 @@ def _sparse_target_topk_topp_rejection_prototype(
     bonus_remove_mask = bonus_topk_probs.cumsum(dim=-1) > top_p
     bonus_remove_mask[:, 1:] = bonus_remove_mask[:, :-1].clone()
     bonus_remove_mask[:, 0] = False
-    bonus_topk_values = bonus_topk_values.masked_fill(
-        bonus_remove_mask, -float("inf")
-    )
+    bonus_topk_values = bonus_topk_values.masked_fill(bonus_remove_mask, -float("inf"))
     bonus_topk_probs = bonus_topk_values.softmax(dim=-1, dtype=torch.float32)
 
     draft_ids_i64 = draft_token_ids.to(torch.int64).view(-1, 1)
@@ -210,9 +206,9 @@ def _sparse_target_topk_topp_rejection_prototype(
     ).clamp_max(1.0)
     accepted_prefix = (torch.rand_like(accept_ratio) <= accept_ratio).cumprod(0)
 
-    residual = (
-        target_topk_probs - draft_probs.gather(1, target_topk_ids)
-    ).clamp_min_(0.0)
+    residual = (target_topk_probs - draft_probs.gather(1, target_topk_ids)).clamp_min_(
+        0.0
+    )
     residual_q = torch.empty_like(residual).exponential_()
     recovered_offsets = (residual / residual_q).argmax(dim=-1, keepdim=True)
     recovered_token_ids = target_topk_ids.gather(1, recovered_offsets).view(-1)
@@ -247,9 +243,9 @@ def _full_vocab_topk_topp_probability_reference(
         k=min(top_k, probs.shape[-1]),
         dim=-1,
     )
-    residual = (
-        target_top_probs - draft_probs.gather(1, target_top_ids)
-    ).clamp_min_(0.0)
+    residual = (target_top_probs - draft_probs.gather(1, target_top_ids)).clamp_min_(
+        0.0
+    )
     return target_draft_probs, target_top_ids, residual
 
 
@@ -292,9 +288,7 @@ def _compact_tp2_topk_topp_probability_prototype(
         target_probs,
         torch.zeros_like(target_probs),
     ).sum(dim=-1)
-    residual = (
-        target_probs - draft_probs.gather(1, target_ids)
-    ).clamp_min_(0.0)
+    residual = (target_probs - draft_probs.gather(1, target_ids)).clamp_min_(0.0)
     return target_draft_probs, target_ids, residual
 
 
@@ -394,9 +388,7 @@ def main() -> None:
         bonus_logits_indices=torch.tensor(
             [num_tokens], dtype=torch.int32, device=device
         ),
-        logits_indices=torch.arange(
-            num_tokens + 1, dtype=torch.int32, device=device
-        ),
+        logits_indices=torch.arange(num_tokens + 1, dtype=torch.int32, device=device),
     )
 
     target_logits_constrained = apply_sampling_constraints(
@@ -495,9 +487,9 @@ def main() -> None:
             args.iters,
         ),
         "target_prepare_with_clone": _time_cuda(
-            lambda: target_prepare_base[target_prepare_indices].to(
-                torch.float32
-            ).clone(),
+            lambda: target_prepare_base[target_prepare_indices]
+            .to(torch.float32)
+            .clone(),
             args.warmup,
             args.iters,
         ),

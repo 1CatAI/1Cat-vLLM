@@ -80,7 +80,12 @@ CHECK_IMPORTS = {
         allowed_pattern=re.compile(
             "from vllm.triton_utils import (triton|tl|tl, triton)"
         ),
-        allowed_files={"vllm/triton_utils/importing.py"},
+        allowed_files={
+            "vllm/triton_utils/importing.py",
+            # AOT inspection needs compiler/backend modules that the vLLM
+            # runtime shim deliberately does not export.
+            "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",
+        },
     ),
 }
 

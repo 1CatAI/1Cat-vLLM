@@ -77,10 +77,7 @@ def _ddtree_paged_attention_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < head_size
     q_ptrs = (
-        query
-        + (q_start + row) * q_stride_t
-        + q_head * q_stride_h
-        + offs_d * q_stride_d
+        query + (q_start + row) * q_stride_t + q_head * q_stride_h + offs_d * q_stride_d
     )
     q_vec = tl.load(q_ptrs, mask=d_mask & active, other=0.0).to(tl.float32)
 
@@ -101,18 +98,10 @@ def _ddtree_paged_attention_kernel(
         for _ in range(max_q_len):
             cur_valid = active & (cur >= 0) & (cur < max_q_len) & (cur < q_len)
             visible = visible | (
-                (local == cur)
-                & (local >= 0)
-                & (local < q_len)
-                & n_mask
-                & cur_valid
+                (local == cur) & (local >= 0) & (local < q_len) & n_mask & cur_valid
             )
             safe_cur = tl.maximum(tl.minimum(cur, max_q_len - 1), 0)
-            parent_ptr = (
-                parent_ids
-                + req_i * parent_stride0
-                + safe_cur * parent_stride1
-            )
+            parent_ptr = parent_ids + req_i * parent_stride0 + safe_cur * parent_stride1
             parent = tl.load(parent_ptr, mask=cur_valid, other=0).to(tl.int32)
             # In vLLM DDTree metadata, -1 means "root child". The verifier has
             # a synthetic prefix/root row at local slot 0, so root children must
@@ -126,9 +115,7 @@ def _ddtree_paged_attention_kernel(
 
         block_offsets = offs_n - (offs_n // block_size) * block_size
         block_ptrs = (
-            block_table
-            + req_i * block_stride0
-            + (offs_n // block_size) * block_stride1
+            block_table + req_i * block_stride0 + (offs_n // block_size) * block_stride1
         )
         block_ids = tl.load(block_ptrs, mask=n_mask, other=0).to(tl.int64)
 

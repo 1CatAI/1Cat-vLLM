@@ -15,11 +15,7 @@ from torch.utils.cpp_extension import load
 
 
 def _load_extension() -> object:
-    source = (
-        Path(__file__).resolve().parent
-        / "csrc"
-        / "sm70_wmma_fragment_probe.cu"
-    )
+    source = Path(__file__).resolve().parent / "csrc" / "sm70_wmma_fragment_probe.cu"
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
     return load(
         name="sm70_wmma_fragment_probe_v3",
@@ -41,17 +37,16 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     device = torch.device(args.device)
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(
-        device
-    ) != (7, 0):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != (
+        7,
+        0,
+    ):
         raise RuntimeError("This probe requires an SM70 CUDA device.")
 
     extension = _load_extension()
     tile = torch.arange(256, device=device, dtype=torch.float16).reshape(16, 16)
     words = extension.dump_matrix_a_fragment(tile, args.stride)
-    reference_words, swizzled_words = (
-        extension.compare_swizzled_matrix_a_fragment(tile)
-    )
+    reference_words, swizzled_words = extension.compare_swizzled_matrix_a_fragment(tile)
     matrix_b_row_words = extension.dump_matrix_b_fragment(tile, False)
     matrix_b_col_storage = tile.t().contiguous()
     matrix_b_col_words = extension.dump_matrix_b_fragment(
@@ -59,9 +54,7 @@ def main() -> int:
         True,
     )
     matrix_b_reference_words, matrix_b_compact_words = (
-        extension.compare_compact_matrix_b_col_fragment(
-            matrix_b_col_storage
-        )
+        extension.compare_compact_matrix_b_col_fragment(matrix_b_col_storage)
     )
     torch.accelerator.synchronize(device)
     elements = words.cpu().view(torch.float16).to(torch.int32).reshape(32, 16)
@@ -69,15 +62,10 @@ def main() -> int:
     counts = Counter(value for lane in mapping for value in lane)
     multiplicities = Counter(counts.values())
     matrix_b_elements = (
-        matrix_b_col_words.cpu()
-        .view(torch.float16)
-        .to(torch.int32)
-        .reshape(32, 16)
+        matrix_b_col_words.cpu().view(torch.float16).to(torch.int32).reshape(32, 16)
     )
     matrix_b_mapping = matrix_b_elements.tolist()
-    matrix_b_counts = Counter(
-        value for lane in matrix_b_mapping for value in lane
-    )
+    matrix_b_counts = Counter(value for lane in matrix_b_mapping for value in lane)
     matrix_b_multiplicities = Counter(matrix_b_counts.values())
     payload = {
         "device": str(device),
@@ -94,10 +82,7 @@ def main() -> int:
             torch.equal(reference_words, swizzled_words)
         ),
         "swizzled_fragment_max_word_xor": int(
-            torch.bitwise_xor(reference_words, swizzled_words)
-            .abs()
-            .max()
-            .item()
+            torch.bitwise_xor(reference_words, swizzled_words).abs().max().item()
         ),
         "matrix_b": {
             "lane_elements": matrix_b_mapping,
@@ -106,8 +91,7 @@ def main() -> int:
                 str(key): value
                 for key, value in sorted(matrix_b_multiplicities.items())
             },
-            "all_elements_covered": sorted(matrix_b_counts)
-            == list(range(256)),
+            "all_elements_covered": sorted(matrix_b_counts) == list(range(256)),
             "row_col_fragment_words_equal": bool(
                 torch.equal(matrix_b_row_words, matrix_b_col_words)
             ),

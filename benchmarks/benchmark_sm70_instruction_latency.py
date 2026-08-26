@@ -7,12 +7,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 
 def _parse_args() -> argparse.Namespace:

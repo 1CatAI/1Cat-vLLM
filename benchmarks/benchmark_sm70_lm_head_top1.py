@@ -111,9 +111,7 @@ def main() -> int:
 
     x = torch.randn((args.m, args.k), device=device, dtype=torch.float16)
     weight = torch.randn((args.n, args.k), device=device, dtype=torch.float16)
-    torch_logits_out = torch.empty(
-        (args.m, args.n), device=device, dtype=torch.float16
-    )
+    torch_logits_out = torch.empty((args.m, args.n), device=device, dtype=torch.float16)
     prepared = sm70_ops.sm70_f16_prepare(weight)
     tm_weight = prepared[0]
     k_ld = int(prepared[1][0].item())
@@ -121,7 +119,7 @@ def main() -> int:
     def torch_mm_max() -> tuple[torch.Tensor, torch.Tensor]:
         logits = torch.mm(x, weight.t())
         if args.pad:
-            logits[:, -args.pad:] = -float("inf")
+            logits[:, -args.pad :] = -float("inf")
         values, indices = logits.max(dim=-1)
         return values, indices.to(torch.int64) + args.vocab_start
 
@@ -189,15 +187,21 @@ def main() -> int:
     def sm70_gemm_max() -> tuple[torch.Tensor, torch.Tensor]:
         sm70_ops.sm70_f16_gemm_out(logits_out, x, tm_weight, k_ld, False)
         if args.pad:
-            logits_out[:, -args.pad:] = -float("inf")
+            logits_out[:, -args.pad :] = -float("inf")
         values, indices = logits_out.max(dim=-1)
         return values, indices.to(torch.int64) + args.vocab_start
 
     sm70_values, sm70_indices = sm70_gemm_max()
     sm70_ms = _bench_cuda_ms(lambda: sm70_gemm_max(), args.warmup, args.iters)
     results.append(
-        _stats("sm70_gemm_then_max", sm70_values, sm70_indices, ref_values,
-               ref_indices, sm70_ms)
+        _stats(
+            "sm70_gemm_then_max",
+            sm70_values,
+            sm70_indices,
+            ref_values,
+            ref_indices,
+            sm70_ms,
+        )
     )
 
     torch_mm_ms = _bench_cuda_ms(lambda: torch_mm_max(), args.warmup, args.iters)

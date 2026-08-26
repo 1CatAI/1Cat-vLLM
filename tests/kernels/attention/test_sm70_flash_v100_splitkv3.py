@@ -37,18 +37,14 @@ def _run_case(
         dtype=torch.float16,
     )
     value_cache = torch.randn_like(key_cache)
-    block_table = torch.tensor(
-        [page_ids], device="cuda", dtype=torch.int32
-    )
+    block_table = torch.tensor([page_ids], device="cuda", dtype=torch.int32)
     sequence_lengths = torch.full(
         (batch_size,), sequence_len, device="cuda", dtype=torch.int32
     )
     softmax_scale = head_dim**-0.5
 
     unsplit_out = torch.empty_like(query)
-    unsplit_lse = torch.empty(
-        query.shape[:-1], device="cuda", dtype=torch.float32
-    )
+    unsplit_lse = torch.empty(query.shape[:-1], device="cuda", dtype=torch.float32)
     split_out = torch.empty_like(query)
     split_lse = torch.empty_like(unsplit_lse)
     split_tmp_out = torch.empty(
@@ -202,6 +198,4 @@ def test_splitkv3_python_wrapper_reuses_stream_workspace() -> None:
         rtol=0.0,
         atol=0.001953125,
     )
-    torch.testing.assert_close(
-        second_lse, result["unsplit_lse"], rtol=0.0, atol=0.001
-    )
+    torch.testing.assert_close(second_lse, result["unsplit_lse"], rtol=0.0, atol=0.001)

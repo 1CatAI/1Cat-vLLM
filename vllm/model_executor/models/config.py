@@ -361,9 +361,7 @@ class MambaModelConfig(VerifyAndUpdateConfig):
                     )
                 else:
                     cache_config.mamba_cache_mode = (
-                        "all"
-                        if model_config.supports_mamba_prefix_caching
-                        else "align"
+                        "all" if model_config.supports_mamba_prefix_caching else "align"
                     )
                     logger.warning(
                         "Mamba cache mode is set to '%s' for %s by default "

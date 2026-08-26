@@ -108,9 +108,7 @@ def _build_binary(verbose: bool) -> tuple[Path, list[str], str]:
     if nvcc is None:
         raise RuntimeError("nvcc is required to build the SM70 BM32 PV microbenchmark.")
     source = (
-        Path(__file__).resolve().parent
-        / "csrc"
-        / "sm70_native_bm32_pv_panel_micro.cu"
+        Path(__file__).resolve().parent / "csrc" / "sm70_native_bm32_pv_panel_micro.cu"
     )
     build_dir = (
         Path(tempfile.gettempdir())
@@ -228,8 +226,7 @@ def _resource_gate(
         )
     if baseline.get("threads_per_cta") != 512:
         reasons.append(
-            "baseline threads_per_cta="
-            f"{baseline.get('threads_per_cta')}, requires 512"
+            f"baseline threads_per_cta={baseline.get('threads_per_cta')}, requires 512"
         )
     if baseline.get("resident_active_warps") != 32:
         reasons.append(
@@ -258,13 +255,11 @@ def _resource_gate(
         )
     if candidate.get("registers_per_thread", 65) > 64:
         reasons.append(
-            "candidate REG="
-            f"{candidate.get('registers_per_thread')}, requires <=64"
+            f"candidate REG={candidate.get('registers_per_thread')}, requires <=64"
         )
     if candidate.get("local_bytes_per_thread") != 0:
         reasons.append(
-            "candidate LOCAL="
-            f"{candidate.get('local_bytes_per_thread')}, requires 0"
+            f"candidate LOCAL={candidate.get('local_bytes_per_thread')}, requires 0"
         )
     if candidate_topology.get("ctas_per_group") != 1:
         reasons.append(
@@ -388,9 +383,7 @@ def _run_ncu_kernel(
             "long_scoreboard_per_warp_active": metrics.get(
                 "smsp__warp_issue_stalled_long_scoreboard_per_warp_active"
             ),
-            "tensor_instructions": metrics.get(
-                "smsp__inst_executed_pipe_tensor.sum"
-            ),
+            "tensor_instructions": metrics.get("smsp__inst_executed_pipe_tensor.sum"),
         },
         "stdout_tail": result.stdout[-3000:],
         "stderr_tail": result.stderr[-3000:],

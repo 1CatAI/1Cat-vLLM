@@ -7,17 +7,16 @@
 
 namespace marlin::sm70 {
 
-template <
-    typename Shape_, typename IteratorA_, typename SmemIteratorA_,
-    typename IteratorB_, typename SmemIteratorB_, typename ElementC_,
-    typename LayoutC_, typename Policy_,
-    typename TransformA_ = cutlass::NumericArrayConverter<
-        typename SmemIteratorA_::Element, typename IteratorA_::Element,
-        IteratorA_::Fragment::kElements>,
-    typename TransformB_ = cutlass::NumericArrayConverter<
-        typename SmemIteratorB_::Element, typename IteratorB_::Element,
-        IteratorB_::Fragment::kElements>,
-    typename Enable = bool>
+template <typename Shape_, typename IteratorA_, typename SmemIteratorA_,
+          typename IteratorB_, typename SmemIteratorB_, typename ElementC_,
+          typename LayoutC_, typename Policy_,
+          typename TransformA_ = cutlass::NumericArrayConverter<
+              typename SmemIteratorA_::Element, typename IteratorA_::Element,
+              IteratorA_::Fragment::kElements>,
+          typename TransformB_ = cutlass::NumericArrayConverter<
+              typename SmemIteratorB_::Element, typename IteratorB_::Element,
+              IteratorB_::Fragment::kElements>,
+          typename Enable = bool>
 class Sm70MarlinMmaPipelined
     : public cutlass::gemm::threadblock::MmaBase<Shape_, Policy_, 2> {
  public:
@@ -106,10 +105,10 @@ class Sm70MarlinMmaPipelined
 
  public:
   CUTLASS_DEVICE
-  Sm70MarlinMmaPipelined(
-      typename Base::SharedStorage& shared_storage, int thread_idx,
-      int warp_idx, int lane_idx, TransformA transform_A = TransformA(),
-      TransformB transform_B = TransformB())
+  Sm70MarlinMmaPipelined(typename Base::SharedStorage& shared_storage,
+                         int thread_idx, int warp_idx, int lane_idx,
+                         TransformA transform_A = TransformA(),
+                         TransformB transform_B = TransformB())
       : Base(shared_storage, thread_idx, warp_idx, lane_idx),
         smem_iterator_A_(shared_storage.operand_A_ref(), thread_idx),
         smem_iterator_B_(shared_storage.operand_B_ref(), thread_idx),
@@ -154,12 +153,12 @@ class Sm70MarlinMmaPipelined
       this->smem_iterator_B_.add_tile_offset({-Base::kStages, 0});
 
       if constexpr (Policy::kPartitionsK > 1) {
-        add_warp_tile_k_group_offset(
-            (Policy::kPartitionsK - 1) * Base::kWarpGemmIterations);
+        add_warp_tile_k_group_offset((Policy::kPartitionsK - 1) *
+                                     Base::kWarpGemmIterations);
       }
     } else {
-      add_warp_tile_k_group_offset(
-          -(Policy::kPartitionsK + 1) * Base::kWarpGemmIterations);
+      add_warp_tile_k_group_offset(-(Policy::kPartitionsK + 1) *
+                                   Base::kWarpGemmIterations);
     }
 
     smem_write_stage_idx ^= 1;
@@ -222,10 +221,10 @@ class Sm70MarlinMmaPipelined
           advance_smem_stages();
         }
 
-        this->warp_tile_iterator_A_.set_kgroup_index(
-            (warp_mma_k + 1) % Base::kWarpGemmIterations);
-        this->warp_tile_iterator_B_.set_kgroup_index(
-            (warp_mma_k + 1) % Base::kWarpGemmIterations);
+        this->warp_tile_iterator_A_.set_kgroup_index((warp_mma_k + 1) %
+                                                     Base::kWarpGemmIterations);
+        this->warp_tile_iterator_B_.set_kgroup_index((warp_mma_k + 1) %
+                                                     Base::kWarpGemmIterations);
 
         this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
         this->warp_tile_iterator_B_.load(warp_frag_B[(warp_mma_k + 1) % 2]);

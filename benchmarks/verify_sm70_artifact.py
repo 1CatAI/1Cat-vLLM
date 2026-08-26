@@ -75,18 +75,14 @@ AWQ_TURBOMIND_DENSE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.awq_turbomind_effective", True),
 )
 
-AWQ_TURBOMIND_DENSE_REQUIRED_LOGS = (
-    "SM70 AWQ TurboMind dense path enabled",
-)
+AWQ_TURBOMIND_DENSE_REQUIRED_LOGS = ("SM70 AWQ TurboMind dense path enabled",)
 
 FP8_TURBOMIND_DENSE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.fp8_turbomind_effective", True),
     ("sm70_turbomind_policy.fp8_dequant_fallback_effective", True),
 )
 
-FP8_TURBOMIND_DENSE_REQUIRED_LOGS = (
-    "SM70 FP8 TurboMind W8A16 dense path enabled",
-)
+FP8_TURBOMIND_DENSE_REQUIRED_LOGS = ("SM70 FP8 TurboMind W8A16 dense path enabled",)
 
 FP8_0DOT3_DENSE_DEQUANT_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.fp8_turbomind_effective", False),
@@ -105,8 +101,7 @@ AWQ_MOE_SAFE_ROUTE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.accepted_awq_moe_default_policy", True),
     ("sm70_turbomind_policy.awq_moe_disable_effective", False),
     ("sm70_turbomind_policy.awq_moe_batched_gemm_effective", False),
-    ("sm70_turbomind_policy.awq_moe_legacy_single_token_compact_effective",
-     False),
+    ("sm70_turbomind_policy.awq_moe_legacy_single_token_compact_effective", False),
     ("sm70_moe_policy.single_token_unpermute_fastpath_effective", True),
 )
 
@@ -121,8 +116,7 @@ AWQ_MOE_BATCHED_SAFE_ROUTE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.accepted_awq_moe_default_policy", True),
     ("sm70_turbomind_policy.awq_moe_disable_effective", False),
     ("sm70_turbomind_policy.awq_moe_batched_gemm_effective", True),
-    ("sm70_turbomind_policy.awq_moe_legacy_single_token_compact_effective",
-     False),
+    ("sm70_turbomind_policy.awq_moe_legacy_single_token_compact_effective", False),
 )
 
 AWQ_MOE_BATCHED_SAFE_ROUTE_REQUIRED_LOGS = (
@@ -138,8 +132,7 @@ AWQ_MOE_0DOT3_BASELINE_ROUTE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.awq_moe_0dot3_baseline_policy", True),
     ("sm70_turbomind_policy.awq_moe_disable_effective", False),
     ("sm70_turbomind_policy.awq_moe_batched_gemm_effective", True),
-    ("sm70_turbomind_policy.awq_moe_legacy_single_token_compact_effective",
-     True),
+    ("sm70_turbomind_policy.awq_moe_legacy_single_token_compact_effective", True),
 )
 
 AWQ_MOE_0DOT3_BASELINE_ROUTE_REQUIRED_LOGS = (
@@ -153,9 +146,7 @@ FP8_MOE_SAFE_ROUTE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.fp8_moe_batched_gemm_effective", True),
 )
 
-FP8_MOE_SAFE_ROUTE_REQUIRED_LOGS = (
-    "SM70 FP8 MoE TurboMind batched path enabled",
-)
+FP8_MOE_SAFE_ROUTE_REQUIRED_LOGS = ("SM70 FP8 MoE TurboMind batched path enabled",)
 
 FP8_MOE_0DOT3_FALLBACK_ROUTE_JSON_EXPECTATIONS = (
     ("sm70_turbomind_policy.fp8_moe_0dot3_dequant_fallback_policy", True),
@@ -281,9 +272,7 @@ def _get_json_path(payload: Any, path: str) -> Any:
 
 def _parse_expectation(raw: str) -> tuple[str, Any]:
     if "=" not in raw:
-        raise ValueError(
-            f"Expected PATH=VALUE for --expect-json, got {raw!r}"
-        )
+        raise ValueError(f"Expected PATH=VALUE for --expect-json, got {raw!r}")
     path, expected = raw.split("=", 1)
     if not path:
         raise ValueError(f"Expected non-empty PATH in {raw!r}")
@@ -339,17 +328,13 @@ def _awq_moe_safe_tune_gate_for_meta(meta: Any) -> dict[str, Any]:
         }
 
     raw = tune_policy.get("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES")
-    tune_safe_default = tune_policy.get(
-        "awq_moe_safe_default_selector_effective"
-    )
+    tune_safe_default = tune_policy.get("awq_moe_safe_default_selector_effective")
     turbomind_safe_default = turbomind_policy.get(
         "awq_moe_safe_default_selector_effective"
     )
     pinned = raw == "0"
     source_safe_unset = (
-        raw is None
-        and tune_safe_default is True
-        and turbomind_safe_default is True
+        raw is None and tune_safe_default is True and turbomind_safe_default is True
     )
     return {
         "passed": pinned or source_safe_unset,
@@ -409,10 +394,12 @@ def _awq_moe_safe_tune_gate(payload: Any) -> dict[str, Any]:
     return {
         "passed": False,
         "location": None,
-        "checks": [{
-            "passed": False,
-            "reason": "no top-level or compare metadata policies found",
-        }],
+        "checks": [
+            {
+                "passed": False,
+                "reason": "no top-level or compare metadata policies found",
+            }
+        ],
     }
 
 
@@ -529,8 +516,7 @@ def _model_quality_failures(payload: Any) -> list[str]:
     failures = []
     if gate.get("label") != "model-pass":
         failures.append(
-            "model_quality_gate.label is not model-pass "
-            f"({gate.get('label')!r})"
+            f"model_quality_gate.label is not model-pass ({gate.get('label')!r})"
         )
     if gate.get("default_acceptance") != "model-level gate passed":
         failures.append(
@@ -586,8 +572,7 @@ def _inventory_complete_failures(payload: Any) -> list[str]:
     failures = []
     if gate.get("label") != "inventory-complete":
         failures.append(
-            "inventory_gate.label is not inventory-complete "
-            f"({gate.get('label')!r})"
+            f"inventory_gate.label is not inventory-complete ({gate.get('label')!r})"
         )
     if gate.get("complete") is not True:
         failures.append("inventory_gate.complete is not true")
@@ -595,8 +580,7 @@ def _inventory_complete_failures(payload: Any) -> list[str]:
     old_only_env_vars = gate.get("old_only_env_vars")
     if old_only_env_vars:
         failures.append(
-            "inventory_gate.old_only_env_vars is not empty: "
-            f"{old_only_env_vars!r}"
+            f"inventory_gate.old_only_env_vars is not empty: {old_only_env_vars!r}"
         )
     if gate.get("old_only_env_vars_count") != 0:
         failures.append(
@@ -647,11 +631,13 @@ def _verify(
         present = location is not None
         if not present:
             missing_policies.append(policy)
-        policy_results.append({
-            "policy": policy,
-            "present": present,
-            "location": location,
-        })
+        policy_results.append(
+            {
+                "policy": policy,
+                "present": present,
+                "location": location,
+            }
+        )
 
     json_results = []
     failed_json_expectations = []
@@ -678,10 +664,12 @@ def _verify(
         present = text in logs
         if not present:
             missing_log_texts.append(text)
-        log_results.append({
-            "text": text,
-            "present": present,
-        })
+        log_results.append(
+            {
+                "text": text,
+                "present": present,
+            }
+        )
 
     log_regex_results = []
     missing_log_regexes = []
@@ -689,10 +677,12 @@ def _verify(
         present = re.search(pattern, logs) is not None
         if not present:
             missing_log_regexes.append(pattern)
-        log_regex_results.append({
-            "pattern": pattern,
-            "present": present,
-        })
+        log_regex_results.append(
+            {
+                "pattern": pattern,
+                "present": present,
+            }
+        )
 
     rejected_log_results = []
     rejected_log_texts = []
@@ -700,10 +690,12 @@ def _verify(
         present = text in logs
         if present:
             rejected_log_texts.append(text)
-        rejected_log_results.append({
-            "text": text,
-            "present": present,
-        })
+        rejected_log_results.append(
+            {
+                "text": text,
+                "present": present,
+            }
+        )
 
     rejected_log_regex_results = []
     rejected_log_regexes = []
@@ -711,10 +703,12 @@ def _verify(
         present = re.search(pattern, logs) is not None
         if present:
             rejected_log_regexes.append(pattern)
-        rejected_log_regex_results.append({
-            "pattern": pattern,
-            "present": present,
-        })
+        rejected_log_regex_results.append(
+            {
+                "pattern": pattern,
+                "present": present,
+            }
+        )
 
     decode_timing_failures = (
         _decode_timing_failures(payload) if require_decode_timing else []
@@ -723,8 +717,7 @@ def _verify(
         _model_quality_failures(payload) if require_model_quality_pass else []
     )
     inventory_complete_failures = (
-        _inventory_complete_failures(payload)
-        if require_inventory_complete else []
+        _inventory_complete_failures(payload) if require_inventory_complete else []
     )
 
     passed = not (
@@ -888,9 +881,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--require-awq-turbomind-dense",
         action="store_true",
-        help=(
-            "Require SM70 AWQ TurboMind dense policy and its runtime route log."
-        ),
+        help=("Require SM70 AWQ TurboMind dense policy and its runtime route log."),
     )
     parser.add_argument(
         "--require-fp8-turbomind-dense",
@@ -1017,9 +1008,7 @@ def main() -> int:
 
     try:
         payload = _read_json(args.json)
-        expectations = [
-            _parse_expectation(raw) for raw in args.expect_json
-        ]
+        expectations = [_parse_expectation(raw) for raw in args.expect_json]
         log_expectations = list(args.expect_log)
         log_regex_expectations = list(args.expect_log_regex)
         rejected_log_expectations = list(args.reject_log)
@@ -1034,9 +1023,7 @@ def main() -> int:
             log_expectations.extend(FULL_FLASH_V100_REQUIRED_LOGS)
             log_expectations.extend(SM70_FP8_KV_CACHE_ROUTE_REQUIRED_LOGS)
             rejected_log_expectations.extend(FULL_FLASH_V100_REJECTED_LOGS)
-            rejected_log_expectations.extend(
-                SM70_FP8_KV_CACHE_ROUTE_REJECTED_LOGS
-            )
+            rejected_log_expectations.extend(SM70_FP8_KV_CACHE_ROUTE_REJECTED_LOGS)
         if args.require_turbomind_default_policy:
             expectations.extend(TURBOMIND_DEFAULT_JSON_EXPECTATIONS)
         if args.require_awq_turbomind_dense:
@@ -1057,27 +1044,17 @@ def main() -> int:
         if args.require_awq_moe_batched_safe_route:
             expectations.extend(AWQ_MOE_BATCHED_SAFE_ROUTE_JSON_EXPECTATIONS)
             log_expectations.extend(AWQ_MOE_BATCHED_SAFE_ROUTE_REQUIRED_LOGS)
-            rejected_log_expectations.extend(
-                AWQ_MOE_BATCHED_SAFE_ROUTE_REJECTED_LOGS
-            )
+            rejected_log_expectations.extend(AWQ_MOE_BATCHED_SAFE_ROUTE_REJECTED_LOGS)
         if args.require_awq_moe_0dot3_baseline_route:
             expectations.extend(AWQ_MOE_0DOT3_BASELINE_ROUTE_JSON_EXPECTATIONS)
-            log_expectations.extend(
-                AWQ_MOE_0DOT3_BASELINE_ROUTE_REQUIRED_LOGS
-            )
+            log_expectations.extend(AWQ_MOE_0DOT3_BASELINE_ROUTE_REQUIRED_LOGS)
         if args.require_fp8_moe_safe_route:
             expectations.extend(FP8_MOE_SAFE_ROUTE_JSON_EXPECTATIONS)
             log_expectations.extend(FP8_MOE_SAFE_ROUTE_REQUIRED_LOGS)
         if args.require_fp8_moe_0dot3_fallback_route:
-            expectations.extend(
-                FP8_MOE_0DOT3_FALLBACK_ROUTE_JSON_EXPECTATIONS
-            )
-            log_expectations.extend(
-                FP8_MOE_0DOT3_FALLBACK_ROUTE_REQUIRED_LOGS
-            )
-            rejected_log_expectations.extend(
-                FP8_MOE_0DOT3_FALLBACK_ROUTE_REJECTED_LOGS
-            )
+            expectations.extend(FP8_MOE_0DOT3_FALLBACK_ROUTE_JSON_EXPECTATIONS)
+            log_expectations.extend(FP8_MOE_0DOT3_FALLBACK_ROUTE_REQUIRED_LOGS)
+            rejected_log_expectations.extend(FP8_MOE_0DOT3_FALLBACK_ROUTE_REJECTED_LOGS)
         extra_required_policies = list(args.require_policy)
         if args.require_sm70_breakable_graph_route:
             extra_required_policies.append("sm70_graph_policy")
@@ -1085,12 +1062,8 @@ def main() -> int:
             log_expectations.extend(SM70_BREAKABLE_GRAPH_ROUTE_REQUIRED_LOGS)
         if args.require_sm70_flash_v100_0dot3_compile_graph:
             extra_required_policies.append("sm70_graph_policy")
-            expectations.extend(
-                SM70_FLASH_V100_0DOT3_COMPILE_GRAPH_JSON_EXPECTATIONS
-            )
-            log_expectations.extend(
-                SM70_FLASH_V100_0DOT3_COMPILE_GRAPH_REQUIRED_LOGS
-            )
+            expectations.extend(SM70_FLASH_V100_0DOT3_COMPILE_GRAPH_JSON_EXPECTATIONS)
+            log_expectations.extend(SM70_FLASH_V100_0DOT3_COMPILE_GRAPH_REQUIRED_LOGS)
             rejected_log_expectations.extend(
                 SM70_FLASH_V100_0DOT3_COMPILE_GRAPH_REJECTED_LOGS
             )
@@ -1098,19 +1071,17 @@ def main() -> int:
             extra_required_policies.append("sm70_comm_policy")
             expectations.extend(SM70_CUSTOM_ALLREDUCE_ROUTE_JSON_EXPECTATIONS)
             log_expectations.extend(SM70_CUSTOM_ALLREDUCE_ROUTE_REQUIRED_LOGS)
-            rejected_log_expectations.extend(
-                SM70_CUSTOM_ALLREDUCE_ROUTE_REJECTED_LOGS
-            )
+            rejected_log_expectations.extend(SM70_CUSTOM_ALLREDUCE_ROUTE_REJECTED_LOGS)
         if args.require_sm70_all_reduce_sum2_route:
             extra_required_policies.append("sm70_comm_policy")
             expectations.extend(SM70_ALL_REDUCE_SUM2_ROUTE_JSON_EXPECTATIONS)
             log_expectations.extend(SM70_ALL_REDUCE_SUM2_ROUTE_REQUIRED_LOGS)
-            log_regex_expectations.extend(
-                SM70_ALL_REDUCE_SUM2_ROUTE_REQUIRED_REGEXES
-            )
-        required_policies = [] if args.require_inventory_complete else list(
-            dict.fromkeys(
-                list(DEFAULT_REQUIRED_POLICIES) + extra_required_policies
+            log_regex_expectations.extend(SM70_ALL_REDUCE_SUM2_ROUTE_REQUIRED_REGEXES)
+        required_policies = (
+            []
+            if args.require_inventory_complete
+            else list(
+                dict.fromkeys(list(DEFAULT_REQUIRED_POLICIES) + extra_required_policies)
             )
         )
         result = _verify(
@@ -1127,10 +1098,7 @@ def main() -> int:
             require_model_quality_pass=args.require_model_quality_pass,
             require_inventory_complete=args.require_inventory_complete,
         )
-        if (
-            args.require_awq_moe_safe_route
-            or args.require_awq_moe_batched_safe_route
-        ):
+        if args.require_awq_moe_safe_route or args.require_awq_moe_batched_safe_route:
             awq_moe_safe_tune_gate = _awq_moe_safe_tune_gate(payload)
             result["awq_moe_safe_tune_gate"] = awq_moe_safe_tune_gate
             if not awq_moe_safe_tune_gate["passed"]:

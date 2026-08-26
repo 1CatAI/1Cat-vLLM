@@ -304,9 +304,7 @@ def test_mamba_postprocess_ddtree_state_slot_bias_uses_compact_node_index(
         forward_context=forward_context,
         mamba_state_copy_funcs=(copy_func,),
         copy_bufs=copy_bufs,
-        ddtree_accepted_node_indices=torch.tensor(
-            [[0, 2, 5, 9]], dtype=torch.int32
-        ),
+        ddtree_accepted_node_indices=torch.tensor([[0, 2, 5, 9]], dtype=torch.int32),
     )
 
     assert calls == [(9, 1)]
@@ -317,9 +315,7 @@ def test_update_states_after_model_execute_keeps_compact_state_selector() -> Non
     runner.speculative_config = object()
     runner.model_config = SimpleNamespace(is_hybrid=True)
     runner.cache_config = SimpleNamespace(mamba_cache_mode="none")
-    runner.num_accepted_tokens = SimpleNamespace(
-        gpu=torch.ones(1, dtype=torch.int32)
-    )
+    runner.num_accepted_tokens = SimpleNamespace(gpu=torch.ones(1, dtype=torch.int32))
     runner.spec_state_slot_selectors = SimpleNamespace(
         gpu=torch.ones(1, dtype=torch.int32)
     )
@@ -389,9 +385,7 @@ def test_compact_ddtree_drafter_context_moves_branch_to_prefix() -> None:
     scheduler_output = _scheduler_output(payload)
     scheduler_output.num_scheduled_tokens = {"r0": 6}
     scheduler_output.total_num_scheduled_tokens = 6
-    scheduler_output.scheduled_spec_decode_tokens = {
-        "r0": list(payload.tree_token_ids)
-    }
+    scheduler_output.scheduled_spec_decode_tokens = {"r0": list(payload.tree_token_ids)}
 
     runner._compact_ddtree_drafter_context(
         hidden_states,

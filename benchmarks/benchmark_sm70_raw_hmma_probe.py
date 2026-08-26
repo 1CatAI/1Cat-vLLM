@@ -32,10 +32,7 @@ def _build_binary(source: Path, verbose: bool) -> tuple[Path, list[str]]:
     if nvcc is None:
         raise RuntimeError("nvcc is required to build the SM70 raw HMMA probe.")
 
-    build_dir = (
-        Path(tempfile.gettempdir())
-        / f"vllm-sm70-raw-hmma-probe-{os.getuid()}"
-    )
+    build_dir = Path(tempfile.gettempdir()) / f"vllm-sm70-raw-hmma-probe-{os.getuid()}"
     build_dir.mkdir(parents=True, exist_ok=True)
     binary = build_dir / "sm70_raw_hmma_probe_sm70"
     command = [

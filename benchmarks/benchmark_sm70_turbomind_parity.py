@@ -94,8 +94,9 @@ def _load_awq(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     weight_map = _weight_map(model_path)
-    with safe_open(model_path / weight_map[f"{layer}.qweight"],
-                   framework="pt", device="cpu") as f:
+    with safe_open(
+        model_path / weight_map[f"{layer}.qweight"], framework="pt", device="cpu"
+    ) as f:
         qweight = f.get_tensor(f"{layer}.qweight").to(device).contiguous()
         scales = f.get_tensor(f"{layer}.scales").to(device).contiguous()
         qzeros = f.get_tensor(f"{layer}.qzeros").to(device).contiguous()
@@ -108,8 +109,9 @@ def _load_fp8(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     weight_map = _weight_map(model_path)
-    with safe_open(model_path / weight_map[f"{layer}.weight"],
-                   framework="pt", device="cpu") as f:
+    with safe_open(
+        model_path / weight_map[f"{layer}.weight"], framework="pt", device="cpu"
+    ) as f:
         weight = f.get_tensor(f"{layer}.weight").to(device).contiguous()
         scales = (
             f.get_tensor(f"{layer}.weight_scale_inv")
@@ -158,9 +160,7 @@ def _dump_fp8(
     ops = _import_sm70_ops()
     weight, scales = _load_fp8(args.model, args.layer, device)
     x = _make_input(args.m, weight.shape[1], device)
-    tm_weight, tm_scales, meta = ops.fp8_sm70_prepare(
-        weight, scales, args.group_size
-    )
+    tm_weight, tm_scales, meta = ops.fp8_sm70_prepare(weight, scales, args.group_size)
     out = torch.empty((args.m, weight.shape[0]), device=device, dtype=torch.float16)
     ops.fp8_gemm_sm70_out_meta(out, x, tm_weight, tm_scales, meta)
     details = {
@@ -205,8 +205,13 @@ def _dump(args: argparse.Namespace) -> int:
         "output": out.detach().cpu(),
     }
     torch.save(payload, args.out)
-    print(json.dumps({k: v for k, v in payload.items() if k != "output"},
-                     indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {k: v for k, v in payload.items() if k != "output"},
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -270,9 +275,9 @@ def _bench_awq(
     tm_weight, tm_scales, meta = ops.awq_sm70_prepare(
         qweight, scales, qzeros, args.group_size
     )
-    out = torch.empty((args.m, qweight.shape[1] * 8),
-                      device=device,
-                      dtype=torch.float16)
+    out = torch.empty(
+        (args.m, qweight.shape[1] * 8), device=device, dtype=torch.float16
+    )
     k_ld = int(meta[0].item())
     q_ld = int(meta[1].item())
 
@@ -300,9 +305,7 @@ def _bench_fp8(
     ops = _import_sm70_ops()
     weight, scales = _load_fp8(args.model, args.layer, device)
     x = _make_input(args.m, weight.shape[1], device)
-    tm_weight, tm_scales, meta = ops.fp8_sm70_prepare(
-        weight, scales, args.group_size
-    )
+    tm_weight, tm_scales, meta = ops.fp8_sm70_prepare(weight, scales, args.group_size)
     out = torch.empty((args.m, weight.shape[0]), device=device, dtype=torch.float16)
 
     def run() -> None:

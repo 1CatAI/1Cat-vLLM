@@ -1384,7 +1384,7 @@ def test_streaming_multi_param_single_chunk(qwen3_tool_parser, qwen3_tokenizer):
 @pytest.mark.parametrize(
     "deltas, expected_content",
     [
-        (["<", "meta charset=\"UTF-8\">"], '<meta charset="UTF-8">'),
+        (["<", 'meta charset="UTF-8">'], '<meta charset="UTF-8">'),
         (["<t", "itle>macOS</title>"], "<title>macOS</title>"),
         (["<", "<", "span>text</span>"], "<<span>text</span>"),
     ],

@@ -502,19 +502,14 @@ def _scan_tree(root: Path) -> dict[str, Any]:
         "file_count": file_count,
         "scanned_bytes": scanned_bytes,
         "env_vars": {
-            name: sorted(files)
-            for name, files in sorted(env_to_files.items())
+            name: sorted(files) for name, files in sorted(env_to_files.items())
         },
         "runtime_env_vars": {
-            name: sorted(files)
-            for name, files in sorted(runtime_env_to_files.items())
+            name: sorted(files) for name, files in sorted(runtime_env_to_files.items())
         },
         "env_file_counts": dict(sorted(env_counts.items())),
         "keyword_files": dict(sorted(keyword_files.items())),
-        "torch_ops": {
-            name: sorted(files)
-            for name, files in sorted(torch_ops.items())
-        },
+        "torch_ops": {name: sorted(files) for name, files in sorted(torch_ops.items())},
     }
 
 
@@ -597,11 +592,11 @@ def _compact_diff(old: dict[str, Any], latest: dict[str, Any]) -> dict[str, Any]
     diff["old_only_torch_op_classification"] = _classify_old_only_torch_ops(
         diff["torch_ops"]["old_only"]
     )
-    diff["old_only_runtime_env_classification"] = (
-        _classify_old_only_runtime_envs(diff["runtime_env_vars"]["old_only"])
+    diff["old_only_runtime_env_classification"] = _classify_old_only_runtime_envs(
+        diff["runtime_env_vars"]["old_only"]
     )
-    diff["old_only_keyword_file_classification"] = (
-        _classify_old_only_keyword_files(diff["keyword_files"]["old_only"])
+    diff["old_only_keyword_file_classification"] = _classify_old_only_keyword_files(
+        diff["keyword_files"]["old_only"]
     )
     return diff
 
@@ -617,15 +612,9 @@ def _classification_counts(section: dict[str, Any]) -> dict[str, Any]:
 
 
 def _inventory_gate(diff: dict[str, Any]) -> dict[str, Any]:
-    runtime_env = _classification_counts(
-        diff["old_only_runtime_env_classification"]
-    )
-    keyword_files = _classification_counts(
-        diff["old_only_keyword_file_classification"]
-    )
-    torch_ops = _classification_counts(
-        diff["old_only_torch_op_classification"]
-    )
+    runtime_env = _classification_counts(diff["old_only_runtime_env_classification"])
+    keyword_files = _classification_counts(diff["old_only_keyword_file_classification"])
+    torch_ops = _classification_counts(diff["old_only_torch_op_classification"])
     old_only_env_vars = diff["env_vars"]["old_only"]
     complete = (
         not old_only_env_vars
@@ -675,32 +664,37 @@ def main() -> int:
         json.dumps(payload, indent=args.indent, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    print(json.dumps({
-        "out": str(args.out),
-        "old_files": payload["old"]["file_count"],
-        "latest_files": payload["latest"]["file_count"],
-        "old_env_vars": len(payload["old"]["env_vars"]),
-        "latest_env_vars": len(payload["latest"]["env_vars"]),
-        "old_runtime_env_vars": len(payload["old"]["runtime_env_vars"]),
-        "latest_runtime_env_vars": len(payload["latest"]["runtime_env_vars"]),
-            "old_keyword_files": len(payload["old"]["keyword_files"]),
-            "latest_keyword_files": len(payload["latest"]["keyword_files"]),
-            "old_torch_ops": len(payload["old"]["torch_ops"]),
-            "latest_torch_ops": len(payload["latest"]["torch_ops"]),
-            "inventory_complete": payload["inventory_gate"]["complete"],
-            "old_only_env_vars": payload["inventory_gate"][
-                "old_only_env_vars_count"
-            ],
-            "old_only_runtime_env_unclassified": payload["inventory_gate"][
-                "old_only_runtime_env"
-            ]["unclassified_count"],
-            "old_only_keyword_files_unclassified": payload["inventory_gate"][
-                "old_only_keyword_files"
-            ]["unclassified_count"],
-            "old_only_torch_ops_unclassified": payload["inventory_gate"][
-                "old_only_torch_ops"
-            ]["unclassified_count"],
-        }, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "out": str(args.out),
+                "old_files": payload["old"]["file_count"],
+                "latest_files": payload["latest"]["file_count"],
+                "old_env_vars": len(payload["old"]["env_vars"]),
+                "latest_env_vars": len(payload["latest"]["env_vars"]),
+                "old_runtime_env_vars": len(payload["old"]["runtime_env_vars"]),
+                "latest_runtime_env_vars": len(payload["latest"]["runtime_env_vars"]),
+                "old_keyword_files": len(payload["old"]["keyword_files"]),
+                "latest_keyword_files": len(payload["latest"]["keyword_files"]),
+                "old_torch_ops": len(payload["old"]["torch_ops"]),
+                "latest_torch_ops": len(payload["latest"]["torch_ops"]),
+                "inventory_complete": payload["inventory_gate"]["complete"],
+                "old_only_env_vars": payload["inventory_gate"][
+                    "old_only_env_vars_count"
+                ],
+                "old_only_runtime_env_unclassified": payload["inventory_gate"][
+                    "old_only_runtime_env"
+                ]["unclassified_count"],
+                "old_only_keyword_files_unclassified": payload["inventory_gate"][
+                    "old_only_keyword_files"
+                ]["unclassified_count"],
+                "old_only_torch_ops_unclassified": payload["inventory_gate"][
+                    "old_only_torch_ops"
+                ]["unclassified_count"],
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
