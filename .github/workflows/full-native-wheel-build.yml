@@ -189,6 +189,7 @@ jobs:
       HTTP_PROXY_URL: ${{ secrets.HTTP_PROXY_URL }}
       HTTP_PROXY: ${{ secrets.HTTP_PROXY_URL }}
       HTTPS_PROXY: ${{ secrets.HTTP_PROXY_URL }}
+      PYPI_MIRROR_URL: ${{ secrets.PYPI_MIRROR_URL || 'https://pypi.tuna.tsinghua.edu.cn/simple' }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
       VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
@@ -198,11 +199,12 @@ jobs:
       TORCH_CUDA_ARCH_LIST: "7.0"
       FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
       VLLM_BUILD_FLASH_ATTN_V100: "1"
-      MAX_JOBS: "20"
-      CMAKE_BUILD_PARALLEL_LEVEL: "20"
+      MAX_JOBS: "8"
+      CMAKE_BUILD_PARALLEL_LEVEL: "8"
       NVCC_THREADS: "1"
-      CARGO_BUILD_JOBS: "20"
+      CARGO_BUILD_JOBS: "8"
       CMAKE_BUILD_TYPE: Release
+      BUILD_JOBS: "8"
 
     steps:
       - name: Verify host Docker access
@@ -224,7 +226,8 @@ jobs:
 
       - name: Build native wheel in the CUDA container
         env:
-          BUILD_IMAGE: ngc.nju.edu.cn/nvidia/cuda:12.8.2-devel-ubuntu24.04
+          BUILD_IMAGE_MIRROR: docker.m.daocloud.io/pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
+          BUILD_IMAGE: pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
         shell: bash
         run: |
           set -euo pipefail
@@ -234,17 +237,23 @@ jobs:
           }
           trap cleanup EXIT
 
-          for attempt in 1 2 3; do
-            if docker pull "$BUILD_IMAGE"; then
-              break
-            fi
-            if (( attempt == 3 )); then
-              echo "Failed to pull CUDA build image after ${attempt} attempts." >&2
-              exit 1
-            fi
-            echo "Retrying CUDA image pull (${attempt}/3)..." >&2
-            sleep $((attempt * 10))
+          build_image=""
+          for candidate in "$BUILD_IMAGE_MIRROR" "$BUILD_IMAGE"; do
+            [[ -n "$candidate" ]] || continue
+            for attempt in 1 2 3; do
+              if docker pull "$candidate"; then
+                build_image="$candidate"
+                break 2
+              fi
+              echo "Retrying build image pull (${attempt}/3): ${candidate}" >&2
+              sleep $((attempt * 10))
+            done
           done
+          if [[ -z "$build_image" ]]; then
+            echo "Failed to pull an environment-complete PyTorch CUDA build image." >&2
+            exit 1
+          fi
+          echo "Using build image: $build_image"
           docker rm -f "$container_name" >/dev/null 2>&1 || true
           docker create \
             --name "$container_name" \
@@ -253,6 +262,7 @@ jobs:
             -e HTTP_PROXY_URL \
             -e HTTP_PROXY \
             -e HTTPS_PROXY \
+            -e PYPI_MIRROR_URL \
             -e http_proxy \
             -e https_proxy \
             -e PYTHON_VERSION \
@@ -269,11 +279,19 @@ jobs:
             -e NVCC_THREADS \
             -e CARGO_BUILD_JOBS \
             -e CMAKE_BUILD_TYPE \
+            -e BUILD_JOBS \
             -e RUNNER_TEMP=/tmp/runner-temp \
-            "$BUILD_IMAGE" \
+            "$build_image" \
             bash -lc 'cd /workspace && exec bash tools/ci/build_native_wheel_in_docker.sh'
           docker cp "$GITHUB_WORKSPACE/." "$container_name:/workspace"
-          docker start --attach "$container_name"
+          if ! docker start --attach "$container_name"; then
+            echo "Container build failed; inspecting exit and OOM state." >&2
+            docker inspect --format \
+              'status={{.State.Status}} exit={{.State.ExitCode}} oom_killed={{.State.OOMKilled}} error={{.State.Error}}' \
+              "$container_name" >&2 || true
+            docker system df >&2 || true
+            exit 1
+          fi
 
           rm -rf dist
           mkdir -p dist
@@ -298,10 +316,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
-      image: nvidia/cuda:12.8.2-devel-ubuntu24.04
+      image: pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel
       options: --user 0
     env:
       GH_TOKEN: ${{ github.token }}
+      HTTP_PROXY_URL: ${{ secrets.HTTP_PROXY_URL }}
+      HTTP_PROXY: ${{ secrets.HTTP_PROXY_URL }}
+      HTTPS_PROXY: ${{ secrets.HTTP_PROXY_URL }}
+      PYPI_MIRROR_URL: ${{ secrets.PYPI_MIRROR_URL || 'https://pypi.tuna.tsinghua.edu.cn/simple' }}
       PYTHON_VERSION: "3.12"
       VLLM_TARGET_DEVICE: cuda
       VLLM_VERSION_OVERRIDE: ${{ needs.prepare.outputs.base_version }}.post${{ needs.prepare.outputs.build_date }}
@@ -312,6 +334,7 @@ jobs:
       FLASH_ATTN_V100_CUDA_ARCH_LIST: "7.0"
       VLLM_BUILD_FLASH_ATTN_V100: "1"
       CMAKE_BUILD_TYPE: Release
+      BUILD_JOBS: "8"
 
     steps:
       - name: Install build tools in the CUDA container
@@ -319,8 +342,27 @@ jobs:
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
+          if [[ -n "${HTTP_PROXY_URL:-}" ]]; then
+            export http_proxy="${HTTP_PROXY_URL}"
+            export https_proxy="${HTTP_PROXY_URL}"
+          fi
+          for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [[ -f "${source_file}" ]]; then
+              sed -i -e 's|https\?://archive\.ubuntu\.com/ubuntu|https://mirrors.jlu.edu.cn/ubuntu|g' \
+                -e 's|https\?://security\.ubuntu\.com/ubuntu|https://mirrors.jlu.edu.cn/ubuntu|g' "${source_file}"
+            fi
+          done
+          apt_options=(-o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0)
+          if ! apt-get "${apt_options[@]}" update; then
+            echo "Configured Ubuntu mirror is unavailable; retrying the image's default source." >&2
+            for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [[ -f "${source_file}" ]]; then
+                sed -i 's|https\?://mirrors\.jlu\.edu\.cn/ubuntu|https://archive.ubuntu.com/ubuntu|g' "${source_file}"
+              fi
+            done
+            apt-get "${apt_options[@]}" update
+          fi
+          apt-get "${apt_options[@]}" install -y --no-install-recommends \
             build-essential \
             ca-certificates \
             cmake \
@@ -344,6 +386,9 @@ jobs:
           if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
             echo "Could not resolve official runner CPU count: $jobs" >&2
             exit 1
+          fi
+          if (( jobs > 8 )); then
+            jobs=8
           fi
           echo "MAX_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
@@ -372,7 +417,7 @@ jobs:
 
       - name: Create build environment
         shell: bash
-        run: uv venv --python "${PYTHON_VERSION}"
+        run: uv venv --python "${PYTHON_VERSION}" --system-site-packages
 
       - name: Reuse Rust frontend from the latest release
         if: env.RUST_CHANGED != 'true'
@@ -407,10 +452,17 @@ jobs:
           sed -E -i \
             's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
             requirements/cuda.txt
-          uv pip install --python .venv/bin/python \
+          if ! uv pip install --python .venv/bin/python \
             -r requirements/build/cuda.txt \
             -r requirements/cuda.txt \
-            --torch-backend=cu128
+            --torch-backend=cu128; then
+            echo "Package mirror install failed; retrying through PyPI." >&2
+            UV_INDEX_URL="https://pypi.org/simple" uv pip install \
+              --python .venv/bin/python \
+              -r requirements/build/cuda.txt \
+              -r requirements/cuda.txt \
+              --torch-backend=cu128
+          fi
 
       - name: Verify CUDA PyTorch installation
         shell: bash

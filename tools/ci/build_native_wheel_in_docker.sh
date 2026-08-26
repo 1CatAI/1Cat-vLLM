@@ -12,11 +12,18 @@ if [[ -n "${HTTP_PROXY_URL:-}" ]]; then
 fi
 
 cpu_count="$(nproc)"
-if (( cpu_count < 20 )); then
-  echo "Build container exposes only ${cpu_count} CPUs; 20 are required." >&2
+build_jobs="${BUILD_JOBS:-8}"
+if [[ ! "${cpu_count}" =~ ^[1-9][0-9]*$ || ! "${build_jobs}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid CPU/build parallelism: CPUs=${cpu_count}, jobs=${build_jobs}" >&2
   exit 1
 fi
-echo "Build parallelism: 20 compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
+if (( build_jobs > cpu_count )); then
+  build_jobs="${cpu_count}"
+fi
+export MAX_JOBS="${build_jobs}"
+export CMAKE_BUILD_PARALLEL_LEVEL="${build_jobs}"
+export CARGO_BUILD_JOBS="${build_jobs}"
+echo "Build parallelism: ${build_jobs} compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
 
 jlu_ubuntu_source="https://mirrors.jlu.edu.cn/ubuntu"
 for source_file in \
@@ -37,7 +44,20 @@ apt_options=(
   -o Acquire::http::Pipeline-Depth=0
 )
 
-apt-get "${apt_options[@]}" update
+if ! apt-get "${apt_options[@]}" update; then
+  echo "Configured Ubuntu mirror is unavailable; retrying the image's default source." >&2
+  for source_file in \
+    /etc/apt/sources.list \
+    /etc/apt/sources.list.d/*.list \
+    /etc/apt/sources.list.d/*.sources; do
+    if [[ -f "${source_file}" ]]; then
+      sed -i \
+        -e 's|https\?://mirrors\.jlu\.edu\.cn/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+        "${source_file}"
+    fi
+  done
+  apt-get "${apt_options[@]}" update
+fi
 
 build_packages=(
   build-essential \
@@ -75,10 +95,11 @@ done
 
 rm -rf /var/lib/apt/lists/*
 
-curl -LsSf https://astral.sh/uv/install.sh | sh
+curl --retry 5 --retry-delay 3 -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="${HOME}/.local/bin:${PATH}"
+export UV_INDEX_URL="${PYPI_MIRROR_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 
-uv venv --python "${PYTHON_VERSION}"
+uv venv --python "${PYTHON_VERSION}" --system-site-packages
 
 if [[ "${RUST_CHANGED}" != "true" ]]; then
   baseline_wheel="${RUNNER_TEMP}/base-wheel.whl"
@@ -103,10 +124,17 @@ fi
 sed -E -i \
   's/^nvidia-cutlass-dsl\[cu13\]([<>=])/nvidia-cutlass-dsl\1/' \
   requirements/cuda.txt
-uv pip install --python .venv/bin/python \
+if ! uv pip install --python .venv/bin/python \
   -r requirements/build/cuda.txt \
   -r requirements/cuda.txt \
-  --torch-backend=cu128
+  --torch-backend=cu128; then
+  echo "Package mirror install failed; retrying through the configured proxy and PyPI." >&2
+  export UV_INDEX_URL="https://pypi.org/simple"
+  uv pip install --python .venv/bin/python \
+    -r requirements/build/cuda.txt \
+    -r requirements/cuda.txt \
+    --torch-backend=cu128
+fi
 
 .venv/bin/python - <<'PY'
 import torch
@@ -118,7 +146,12 @@ PY
 
 rm -rf build dist vllm.egg-info
 rm -rf .deps/*-build .deps/*-subbuild
-.venv/bin/python setup.py bdist_wheel --dist-dir=dist
+if ! .venv/bin/python setup.py bdist_wheel --dist-dir=dist; then
+  echo "Native wheel build failed; collecting container diagnostics." >&2
+  free -h >&2 || true
+  df -h >&2 || true
+  exit 1
+fi
 
 wheel_path="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
 if [[ -z "${wheel_path}" ]]; then
