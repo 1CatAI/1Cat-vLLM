@@ -18,17 +18,19 @@ if (( cpu_count < 20 )); then
 fi
 echo "Build parallelism: 20 compile jobs, 1 nvcc thread per job (CPUs: ${cpu_count})"
 
+jlu_ubuntu_source="https://mirrors.jlu.edu.cn/ubuntu"
 for source_file in \
   /etc/apt/sources.list \
   /etc/apt/sources.list.d/*.list \
   /etc/apt/sources.list.d/*.sources; do
   if [[ -f "${source_file}" ]]; then
     sed -i \
-      -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-      -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+      -e "s|https\?://archive\.ubuntu\.com/ubuntu|${jlu_ubuntu_source}|g" \
+      -e "s|https\?://security\.ubuntu\.com/ubuntu|${jlu_ubuntu_source}|g" \
       "${source_file}"
   fi
 done
+echo "Using Ubuntu package source: ${jlu_ubuntu_source}"
 
 apt_options=(
   -o Acquire::Retries=5
