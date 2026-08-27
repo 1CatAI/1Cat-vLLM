@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.envs import VLLM_QWEN3X_TOOL_FIX
 from vllm.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicContextManagement,
@@ -143,36 +144,23 @@ class AnthropicServingMessages(OpenAIServingChat):
         openai_messages: list[dict[str, Any]],
     ) -> None:
         """Convert Anthropic system message to OpenAI format"""
-        system_parts: list[str] = []
+        if not anthropic_request.system:
+            return
 
-        # Top-level system field
-        if anthropic_request.system:
-            if isinstance(anthropic_request.system, str):
-                system_parts.append(anthropic_request.system)
-            else:
-                for block in anthropic_request.system:
-                    if block.type == "text" and block.text:
-                        # Strip Claude Code's attribution header which contains
-                        # a per-request hash that defeats prefix caching.
-                        if block.text.startswith("x-anthropic-billing-header"):
-                            continue
-                        system_parts.append(block.text)
-
-        # System messages embedded inside the messages array
-        for msg in anthropic_request.messages:
-            if msg.role != "system":
-                continue
-            if isinstance(msg.content, str):
-                system_parts.append(msg.content)
-            else:
-                for block in msg.content:
-                    if block.type == "text" and block.text:
-                        if block.text.startswith("x-anthropic-billing-header"):
-                            continue
-                        system_parts.append(block.text)
-
-        if system_parts:
-            openai_messages.append({"role": "system", "content": "".join(system_parts)})
+        if isinstance(anthropic_request.system, str):
+            openai_messages.append(
+                {"role": "system", "content": anthropic_request.system}
+            )
+        else:
+            system_prompt = ""
+            for block in anthropic_request.system:
+                if block.type == "text" and block.text:
+                    # Strip Claude Code's attribution header which contains
+                    # a per-request hash that defeats prefix caching.
+                    if block.text.startswith("x-anthropic-billing-header"):
+                        continue
+                    system_prompt += block.text
+            openai_messages.append({"role": "system", "content": system_prompt})
 
     @classmethod
     def _convert_messages(
@@ -180,9 +168,6 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> None:
         """Convert Anthropic messages to OpenAI format"""
         for msg in messages:
-            if msg.role == "system":
-                continue
-
             openai_msg: dict[str, Any] = {"role": msg.role}  # type: ignore
 
             if isinstance(msg.content, str):
@@ -261,6 +246,18 @@ class AnthropicServingMessages(OpenAIServingChat):
             # Tool references are expanded during tool_result processing
             # when they appear inside tool_result content.
             pass
+        elif block.type == "nested_memory":
+            # cc-haha injects CLAUDE.md / memory files as nested_memory
+            # blocks. Without explicit handling the block is silently dropped
+            # and the model never sees the instruction file — which is why the
+            # dual-format tool-call rules (and show-vs-execute protection)
+            # were not applied in real sessions.
+            mem_content = getattr(block, "content", None)
+            if isinstance(mem_content, str) and mem_content:
+                content_parts.append({
+                    "type": "text",
+                    "text": f"\n\n# memory file: {getattr(block, 'path', '')}\n{mem_content}",
+                })
 
     @classmethod
     def _convert_tool_use_block(cls, block, tool_calls: list[dict[str, Any]]) -> None:
@@ -366,7 +363,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
             )
 
-        return ChatCompletionRequest(
+        req = ChatCompletionRequest(
             model=anthropic_request.model,
             messages=openai_messages,
             max_tokens=anthropic_request.max_tokens,
@@ -378,6 +375,20 @@ class AnthropicServingMessages(OpenAIServingChat):
             kv_transfer_params=anthropic_request.kv_transfer_params,
             chat_template_kwargs=anthropic_request.chat_template_kwargs,
         )
+        # opt23 §11.35: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser
+        # 路由对齐（对齐 openai _effective_chat_template_kwargs 注入）。
+        # fix=0/1/4 不注入（fix=1 双格式模型自主、fix=0 原始兜底、fix=4 伪流式）。
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            req.chat_template_kwargs = {
+                **(req.chat_template_kwargs or {}),
+                "tool_call_format": "json",
+            }
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            req.chat_template_kwargs = {
+                **(req.chat_template_kwargs or {}),
+                "tool_call_format": "xml",
+            }
+        return req
 
     @classmethod
     def _handle_output_config(
@@ -503,6 +514,8 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> AnthropicMessagesResponse:
         result = AnthropicMessagesResponse(
             id=generator.id,
+            type="message",
+            role="assistant",
             content=[],
             model=generator.model,
             usage=AnthropicUsage(
@@ -512,6 +525,7 @@ class AnthropicServingMessages(OpenAIServingChat):
             kv_transfer_params=generator.kv_transfer_params,
         )
         choice = generator.choices[0]
+        import sys as _dbg3
         if choice.finish_reason == "stop":
             result.stop_reason = "end_turn"
         elif choice.finish_reason == "length":
@@ -546,6 +560,8 @@ class AnthropicServingMessages(OpenAIServingChat):
             content += [anthropic_tool_call]
 
         result.content = content
+        import sys as _dbg4
+        _dumped = result.model_dump(exclude_none=True)
 
         return result
 
@@ -655,6 +671,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
                                     id=origin_chunk.id,
+                                    type="message",
+                                    role="assistant",
                                     content=[],
                                     model=origin_chunk.model,
                                     stop_reason=None,
