@@ -227,15 +227,15 @@ def test_mxfp4_sm70_direct_order_ignores_compacted_offsets():
     torch.testing.assert_close(offsets, torch.arange(7, dtype=torch.int32))
 
 
-def test_mxfp4_sm70_qpn_m1_is_default_with_rollback(monkeypatch):
+def test_mxfp4_sm70_qpn_m1_is_default_off_with_opt_in(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", raising=False)
     envs.disable_envs_cache()
     try:
-        assert envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
-
-        monkeypatch.setenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "0")
-        envs.disable_envs_cache()
         assert not envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
+
+        monkeypatch.setenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1")
+        envs.disable_envs_cache()
+        assert envs.VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE
     finally:
         envs.disable_envs_cache()
 

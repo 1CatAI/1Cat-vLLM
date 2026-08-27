@@ -43932,3 +43932,75 @@ Interpretation:
   PR for this continuation use the private remote and the isolated branch
   `agent/private-v100-dsv4-pp2tp4-followup-20260826`; public upstream is
   fetch-only for this work.
+
+## 2026-08-27 DeepSeek V4 FP8 tactic quality stabilization
+
+- The latest quality-safe PP2 x TP4 CUDA-graph trace is under
+  `/data/models/v100-dsv4-0731-pp2tp4-quality-safe-nsys-20260827-r2/`.
+  Output/reference prefixes are exact. Nsight-instrumented replay averages
+  `15.410 ms/token`; this is profiler evidence, not a replacement for the
+  uninstrumented endpoint. Excluding pipeline dependency residency, the
+  two-stage service sums are FP8 dense `6.133 ms`, FP16 GEMV `2.328 ms`,
+  MXFP4 MoE `2.208 ms`, mHC `1.750 ms`, Q/KV `1.122 ms`, sparse MLA
+  `1.119 ms`, routing `1.003 ms`, TP all-reduce `0.852 ms`, and LM/sample
+  `0.481 ms`. The push all-reduce kernel itself averages about `8.18 us` per
+  call and is not the primary bottleneck.
+- A strict three-arm rerun on source `22a25e877f` invalidates the earlier
+  assumption that `73.539 token/s` plus GSM8K `64/64` was a reproducible
+  quality baseline. With WQA prescale disabled and MXFP4-QPN enabled, results
+  are GSM8K `61/64`, HumanEval `28/32`, LongBench `40.404`, and median
+  `74.628 token/s`. With WQA prescale enabled and MXFP4-QPN disabled, they are
+  `63/64`, `28/32`, `44.425`, and `70.729 token/s`. With both enabled, they
+  are `62/64`, `29/32`, `52.169`, and `73.560 token/s`. Both isolated
+  comparisons fail row-level quality and exact-output checks. None is an
+  admitted baseline or optimization.
+- WQA prescale also slows the current matched endpoint by `1.068 token/s`, so
+  retaining it does not preserve speed. The MXFP4-QPN operator gate is a
+  bounded-error rather than bitwise result: `93/136` comparisons differ, with
+  minimum exact fraction `98.816%`, maximum absolute difference `0.001953125`,
+  and maximum relative L2 `4.69e-5`. Combined with the model-level
+  correct-to-wrong transition, this is insufficient for a default route.
+  Private Draft PR 21 therefore defaults both WQA prescale and MXFP4-QPN off;
+  explicit opt-ins remain available only for the strict diagnostic matrix.
+- The last arm has the same effective runtime routes as the previous
+  quality-safe endpoint, but the earlier run produced GSM8K `64/64`,
+  HumanEval `29/32`, and LongBench `44.740`. Server logs show that startup
+  performs process-local TurboMind measurement before caching launch specs;
+  TP coordination only copies each pipeline stage's TP-leader cache. Kernel,
+  split-K, or swizzle winners can therefore vary with startup timing. Different
+  split-K trees alter FP16 rounding and can change greedy token trajectories.
+- This is consistent with the older control rule in this document: bare
+  `VLLM_SM70_FP8_TUNE_SMALL_SHAPES=1` is diagnostic-only because full-model
+  output hashes can drift. The source nevertheless defaulted dynamic FP8
+  tuning on while defaulting `VLLM_SM70_FP8_SAFE_FAST_SELECTOR` off. Private
+  Draft PR 21 changes the safe selector default to on in both Python and C++.
+  Dynamic measurement may still select scheduling-only swizzle, but the
+  default kernel and split-K accumulation tree are retained. Explicit `=0`
+  remains the unsafe diagnostic rollback. Host tests pass (`56` environment
+  tests and `17` SM70 warmup tests), and changed-file pre-commit passes.
+- MXFP4 TurboMind B1 had the same unguarded dynamic-tuning problem. PR 21 adds
+  `VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR=1` for only the exact six-route
+  W13 `M6/N1024/K4096` and W2 `M6/N4096/K512` descriptors. It preserves the
+  heuristic kernel and split-K tree while allowing measured swizzle. The first
+  queued matrix disables MXFP4 tuning entirely to establish the deterministic
+  arithmetic oracle with the already-built extension; the new safe selector
+  requires a rebuilt extension and a second exact-output/performance pair
+  before it can replace that oracle.
+- Two matched unsafe-dynamic startup traces are queued to record the exact
+  kernel/split/swizzle chosen on all eight ranks. A subsequent strict matrix
+  compares fixed FP8, safe FP8, safe FP8 plus the MXFP4-QPN diagnostic, and a
+  second identical candidate startup. Admission requires exact GSM8K rows,
+  HumanEval responses, LongBench rows, chat output and performance-output
+  hashes, plus zero correct-to-wrong transitions versus the pinned GSM8K
+  baseline. Until that matrix passes, PR 21 remains Draft and no speed result
+  from these routes is accepted.
+- Two exact operator candidates remain outside the endpoint. The current-source
+  joined FP16 C4 auxiliary route is bitwise for main and auxiliary outputs over
+  `64` changing inputs and moves warm overlap from `105.894` to
+  `51.884 us/layer` and cold overlap from `99.080` to `74.040 us/layer`.
+  The shared-gate prescale route, after matching the ordinary kernel,
+  split-K-7, and swizzle, is bitwise over `64` inputs and moves `62.229` to
+  `20.793 us/layer`. Its source matching is now limited to the exact
+  `M1/N1024/K4096` shared-gate shape so fused WQA retains existing semantics.
+  Both candidates still require the stabilized repeated dataset gate before
+  endpoint admission.

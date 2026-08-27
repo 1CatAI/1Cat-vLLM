@@ -155,11 +155,11 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
-    VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
+    VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_GROUPED_BMM_DECODE: bool = True
     VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
-    VLLM_SM70_FP8_PRESCALED_M1_DECODE: bool = True
+    VLLM_SM70_FP8_PRESCALED_M1_DECODE: bool = False
     VLLM_SM70_FP8_PREFILL_CUTLASS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
@@ -256,7 +256,8 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = True
-    VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE: bool = True
+    VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR: bool = True
+    VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE: bool = True
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
@@ -1767,7 +1768,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "0"))
     ),
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
+        int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "1"))
     ),
     "VLLM_SM70_FP8_GROUPED_BMM_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_GROUPED_BMM_DECODE", "1"))
@@ -1779,7 +1780,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_PREFILL_PRESCALED", "1"))
     ),
     "VLLM_SM70_FP8_PRESCALED_M1_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))
+        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "0"))
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))
@@ -2230,10 +2231,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "1"))
     ),
-    # Consume the existing TurboMind E2M1/UE8M0 pack directly for the exact
-    # six-route B1 W13/W2 tensors. Set to 0 to retain the dense-stage path.
+    # Preserve the default kernel and split-K tree for the exact DSV4 B1
+    # TurboMind route while retaining dynamic swizzle selection.
+    "VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_B1_SAFE_SELECTOR", "1"))
+    ),
+    # Diagnostic route over the existing TurboMind E2M1/UE8M0 pack. It remains
+    # default-off after the strict model-level quality comparison regressed.
     "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "1"))
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE", "0"))
     ),
     "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))
