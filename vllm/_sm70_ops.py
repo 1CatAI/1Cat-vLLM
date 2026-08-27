@@ -25,8 +25,8 @@ def _maybe_load_fp8_qpn8_library() -> None:
     generic_override = os.getenv("VLLM_SM70_FP8_QPN8")
     specific_override = os.getenv("VLLM_SM70_FP8_QPN8_PP2_TP4")
     generic_enabled = generic_override == "1"
-    default_route_enabled = generic_override != "0" and specific_override != "0"
-    if generic_enabled or default_route_enabled:
+    specific_enabled = generic_override != "0" and specific_override == "1"
+    if generic_enabled or specific_enabled:
         torch.ops.load_library(library_path)
 
 

@@ -52,20 +52,42 @@ def _sm70_fa2_d256_prefill_status(torch: Any) -> dict[str, Any]:
         "sm70_d256_splitd_n32_paged_fwd",
     )
     optional_ops = ("sm70_d256_splitd_n32_dense_splitkv3_fwd",)
-    try:
-        importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
-    except (AttributeError, ImportError, RuntimeError) as exc:
-        return {
-            "available": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "extension_file": None,
-            "extension_realpath": None,
-            "required_ops": {name: False for name in required_ops},
-            "optional_ops": {name: False for name in optional_ops},
-        }
-
     extension_file = _module_file("vllm.vllm_flash_attn._vllm_fa2_C")
     namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    import_error: Exception | None = None
+    if namespace is None or not all(hasattr(namespace, name) for name in required_ops):
+        try:
+            importlib.import_module("vllm.vllm_flash_attn.flash_attn_interface")
+        except (AttributeError, ImportError, RuntimeError) as exc:
+            import_error = exc
+        namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    if namespace is None or not all(hasattr(namespace, name) for name in required_ops):
+        library_path = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
+        if library_path is not None:
+            try:
+                torch.ops.load_library(library_path)
+            except (OSError, RuntimeError) as load_exc:
+                return {
+                    "available": False,
+                    "error": f"{type(load_exc).__name__}: {load_exc}",
+                    "extension_file": library_path,
+                    "extension_realpath": str(Path(library_path).resolve()),
+                    "required_ops": {name: False for name in required_ops},
+                    "optional_ops": {name: False for name in optional_ops},
+                }
+            extension_file = library_path
+        elif import_error is not None:
+            return {
+                "available": False,
+                "error": f"{type(import_error).__name__}: {import_error}",
+                "extension_file": None,
+                "extension_realpath": None,
+                "required_ops": {name: False for name in required_ops},
+                "optional_ops": {name: False for name in optional_ops},
+            }
+        namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    if extension_file is None:
+        extension_file = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
     required_status = {
         name: namespace is not None and hasattr(namespace, name)
         for name in required_ops

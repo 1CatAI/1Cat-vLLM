@@ -738,6 +738,44 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, splitkv3)
 
 
+def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    fake_package = types.ModuleType("vllm.vllm_flash_attn")
+    fake_package.__dict__["flash_attn_interface"] = fake_interface
+    monkeypatch.setitem(sys.modules, "vllm.vllm_flash_attn", fake_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.vllm_flash_attn.flash_attn_interface",
+        fake_interface,
+    )
+
+    namespace = SimpleNamespace()
+    loaded: list[str] = []
+
+    def load_library(path: str) -> None:
+        loaded.append(path)
+        namespace.sm70_d256_splitd_n32_dense_fwd = "dense"
+        namespace.sm70_d256_splitd_n32_paged_fwd = "paged"
+
+    fake_ops = SimpleNamespace(
+        _vllm_fa2_C=namespace,
+        load_library=load_library,
+    )
+    monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
+    monkeypatch.setenv("VLLM_SM70_FA2_D256_LIBRARY", "/tmp/stable-fa2.so")
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
+    monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops", None)
+
+    assert flash_v100._get_sm70_splitd_d256_ops() == (
+        "dense",
+        "paged",
+        None,
+    )
+    assert loaded == ["/tmp/stable-fa2.so"]
+
+
 def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 

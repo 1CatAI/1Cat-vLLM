@@ -14,12 +14,12 @@ import argparse
 import ast
 import hashlib
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import regex as re
 import requests
 
 TOOLACE_MARKER = "Here is a list of functions in JSON format that you can invoke:"

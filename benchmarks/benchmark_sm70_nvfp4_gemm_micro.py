@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Microbenchmark SM70 TurboMind NVFP4 dense GEMMs for 27B decode.
+"""Microbenchmark SM70 TurboMind and QPN4 NVFP4 dense GEMMs.
 
 The default case set models one Qwen3.5-27B-NVFP4 decode token on one TP rank
 with tensor_parallel_size=2. It times only nvfp4_gemm_sm70_out after synthetic
 weights have been prepared and dispatch has been warmed, so the weighted total
-is comparable to the Nsight "TurboMind NVFP4 GEMM" critical-path bucket.
+is comparable to the Nsight "TurboMind NVFP4 GEMM" critical-path bucket. The
+``qpn4-prefill`` mode measures the existing bounded-workspace large-M route,
+including weight dequantization on every call.
 """
 
 from __future__ import annotations
@@ -160,23 +162,30 @@ def _run_case(
     use_cuda_graph: bool,
     mode: str,
     gemv_split_k: int,
+    gated_silu: bool,
 ) -> dict[str, Any]:
     if case.k % group_size != 0:
         raise ValueError(f"{case.label}: K={case.k} not divisible by {group_size}.")
     qweight = _make_qweight(case.k, case.n, device)
     scales = _make_scales(case.k, case.n, group_size, device)
     x = _make_input(case.m, case.k, device)
-    out = torch.empty((case.m, case.n), dtype=torch.float16, device=device)
+    if gated_silu and case.n % 2 != 0:
+        raise ValueError(f"{case.label}: gated-SiLU requires even N, got {case.n}.")
+    output_size = case.n // 2 if gated_silu else case.n
+    out = torch.empty((case.m, output_size), dtype=torch.float16, device=device)
 
     k_ld = 0
     q_ld = 0
     tm_weight = None
     tm_scales = None
+    qpn4_codes = None
+    qpn4_scales = None
+    dense_weight = None
     qweight_packed = None
     partials = None
     if mode == "gemm":
         tm_weight, tm_scales, meta = ops.nvfp4_sm70_prepare(
-            qweight, scales, group_size, False
+            qweight, scales, group_size, gated_silu
         )
         k_ld = int(meta[0].item())
         q_ld = int(meta[1].item())
@@ -190,7 +199,21 @@ def _run_case(
             group_size,
             k_ld,
             q_ld,
+            gated_silu,
+        )
+    elif mode == "qpn4-prefill":
+        qpn4_codes, qpn4_scales = ops.nvfp4_qpn4_prepare_sm70(qweight, scales)
+        dense_weight = torch.empty((case.k, case.n), dtype=torch.float16, device=device)
+        run = partial(
+            ops.nvfp4_qpn4_dispatch_sm70_out,
+            out,
+            dense_weight.data_ptr(),
+            x,
+            qpn4_codes,
+            qpn4_scales,
+            0.0,
             False,
+            gated_silu,
         )
     elif mode in ("raw-gemv", "raw-gemv-warp", "raw-gemv-h2"):
         if case.m != 1:
@@ -254,6 +277,7 @@ def _run_case(
         "n": case.n,
         "k": case.k,
         "group_size": group_size,
+        "gated_silu": gated_silu,
         "gemv_split_k": gemv_split_k if mode in ("raw-gemv", "raw-gemv-h2") else 0,
         "k_ld": k_ld,
         "q_ld": q_ld,
@@ -266,15 +290,31 @@ def _run_case(
                 else (
                     f"raw_gemv_h2_split{gemv_split_k}_{case.m}x{case.n}x{case.k}"
                     if mode == "raw-gemv-h2"
-                    else f"sm70_f16_nvfp4k{group_size}_f16_tnt_fff_"
-                    f"{case.m}x{case.n}x{case.k}_1"
+                    else (
+                        f"qpn4_prefill_{case.m}x{case.n}x{case.k}"
+                        if mode == "qpn4-prefill"
+                        else f"sm70_f16_nvfp4k{group_size}_f16_tnt_fff_"
+                        f"{case.m}x{case.n}x{case.k}_1"
+                    )
                 )
             )
         ),
         **timing,
         "weighted_mean_ms": weighted_mean_ms,
     }
-    del qweight, scales, tm_weight, tm_scales, qweight_packed, partials, x, out
+    del (
+        qweight,
+        scales,
+        tm_weight,
+        tm_scales,
+        qpn4_codes,
+        qpn4_scales,
+        dense_weight,
+        qweight_packed,
+        partials,
+        x,
+        out,
+    )
     torch.accelerator.empty_cache()
     return row
 
@@ -289,6 +329,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "n",
         "k",
         "group_size",
+        "gated_silu",
         "gemv_split_k",
         "k_ld",
         "q_ld",
@@ -321,9 +362,20 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("gemm", "raw-gemv", "raw-gemv-warp", "raw-gemv-h2"),
+        choices=(
+            "gemm",
+            "qpn4-prefill",
+            "raw-gemv",
+            "raw-gemv-warp",
+            "raw-gemv-h2",
+        ),
         default="gemm",
         help="Operator implementation to benchmark.",
+    )
+    parser.add_argument(
+        "--gated-silu",
+        action="store_true",
+        help="Fuse gate/up SiLU and emit N/2 output columns.",
     )
     parser.add_argument(
         "--gemv-split-k",
@@ -351,6 +403,16 @@ def main() -> int:
         raise RuntimeError("Missing _C::nvfp4_sm70_prepare.")
     if not hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
         raise RuntimeError("Missing _C::nvfp4_gemm_sm70_out.")
+    if args.mode == "qpn4-prefill":
+        required_qpn4_ops = (
+            "nvfp4_qpn4_prepare_sm70",
+            "nvfp4_qpn4_dispatch_sm70_out",
+        )
+        missing_qpn4_ops = [
+            name for name in required_qpn4_ops if not hasattr(torch.ops._C, name)
+        ]
+        if missing_qpn4_ops:
+            raise RuntimeError(f"Missing QPN4 operators: {missing_qpn4_ops}.")
     if args.mode == "raw-gemv" and not hasattr(torch.ops._C, "nvfp4_gemv_sm70_raw_out"):
         raise RuntimeError("Missing _C::nvfp4_gemv_sm70_raw_out.")
     if args.mode == "raw-gemv-warp" and not hasattr(
@@ -378,6 +440,7 @@ def main() -> int:
             use_cuda_graph=args.cuda_graph,
             mode=args.mode,
             gemv_split_k=args.gemv_split_k,
+            gated_silu=args.gated_silu,
         )
         for case in cases
     ]
@@ -392,6 +455,7 @@ def main() -> int:
         "cuda_version": torch.version.cuda,
         "group_size": args.group_size,
         "mode": args.mode,
+        "gated_silu": args.gated_silu,
         "gemv_split_k": (
             args.gemv_split_k if args.mode in ("raw-gemv", "raw-gemv-h2") else 0
         ),

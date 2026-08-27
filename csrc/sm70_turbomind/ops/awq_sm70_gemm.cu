@@ -5826,6 +5826,23 @@ int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
 
 #if defined(ENABLE_SM70_TURBOMIND)
 
+namespace {
+
+__global__ void awq_moe_fill_strided_ptrs_kernel(
+    turbomind::gemm::StridedPtr* ptrs, char* base, int64_t expert_stride,
+    int stride, int64_t num_experts) {
+  const int64_t expert_id =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expert_id < num_experts) {
+    ptrs[expert_id] = {
+        base + expert_id * expert_stride,
+        stride,
+    };
+  }
+}
+
+}  // namespace
+
 std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
     torch::Tensor tm_weights,  // [E, ...]  stacked TM weights
     torch::Tensor tm_scales,   // [E, ...]  stacked TM scales
@@ -5844,12 +5861,6 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(tm_weights));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  // Build {ptr, stride} pairs for each expert
-  std::vector<std::pair<void*, int>> w_ptrs;
-  std::vector<std::pair<void*, int>> s_ptrs;
-  w_ptrs.reserve(num_experts);
-  s_ptrs.reserve(num_experts);
-
   const int64_t w_expert_stride =
       tm_weights.stride(0) * tm_weights.element_size();
   const int64_t s_expert_stride =
@@ -5857,30 +5868,21 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
   char* w_base = static_cast<char*>(tm_weights.data_ptr());
   char* s_base = static_cast<char*>(tm_scales.data_ptr());
 
-  for (int64_t e = 0; e < num_experts; ++e) {
-    w_ptrs.emplace_back(w_base + e * w_expert_stride, static_cast<int>(k_ld));
-    s_ptrs.emplace_back(s_base + e * s_expert_stride, static_cast<int>(q_ld));
-  }
-
-  // MakeStridedPtrs allocates GPU memory via cudaMallocAsync
-  void* w_gpu = turbomind::gemm::MakeStridedPtrs(w_ptrs, stream);
-  void* s_gpu = turbomind::gemm::MakeStridedPtrs(s_ptrs, stream);
-
-  // Wrap in torch tensors for lifetime management.
   // StridedPtr is 16 bytes (__align__(16): void* ptr + int stride + padding).
   const int64_t buf_bytes = num_experts * 16;
   auto opts =
       torch::TensorOptions().device(tm_weights.device()).dtype(torch::kUInt8);
-
-  // Copy into torch-managed tensors so cudaFree of the original is safe.
   auto w_tensor = torch::empty({buf_bytes}, opts);
   auto s_tensor = torch::empty({buf_bytes}, opts);
-  cudaMemcpyAsync(w_tensor.data_ptr(), w_gpu, buf_bytes,
-                  cudaMemcpyDeviceToDevice, stream);
-  cudaMemcpyAsync(s_tensor.data_ptr(), s_gpu, buf_bytes,
-                  cudaMemcpyDeviceToDevice, stream);
-  cudaFreeAsync(w_gpu, stream);
-  cudaFreeAsync(s_gpu, stream);
+  constexpr int kThreads = 256;
+  const int blocks = static_cast<int>((num_experts + kThreads - 1) / kThreads);
+  awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
+      reinterpret_cast<turbomind::gemm::StridedPtr*>(w_tensor.data_ptr()),
+      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts);
+  awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
+      reinterpret_cast<turbomind::gemm::StridedPtr*>(s_tensor.data_ptr()),
+      s_base, s_expert_stride, static_cast<int>(q_ld), num_experts);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {w_tensor, s_tensor};
 }

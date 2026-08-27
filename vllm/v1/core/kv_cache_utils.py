@@ -1069,6 +1069,42 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _select_hybrid_kv_cache_group_size(layer_counts: Sequence[int]) -> int:
+    """Select a group size without letting a singleton dominate the layout."""
+    min_num_layers = min(layer_counts)
+    max_num_layers = max(layer_counts)
+    if max_num_layers < min_num_layers * 1.5:
+        # If the number of layers is not much larger than the minimum number of
+        # layers, use the maximum number of layers as the group size to avoid
+        # too many padding layers. A typical example is gpt-oss-20b + eagle,
+        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
+        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
+        # layers while accommodating speculative decoding drafters that add
+        # extra layers to one attention type.
+        return max_num_layers
+
+    # A singleton auxiliary state cache can otherwise force group_size=1 and
+    # multiply metadata preparation for every repeated cache type. Find the
+    # largest divisor shared by the repeated types that keeps total padding at
+    # or below 20%. Restrict this optimization to singleton outliers so existing
+    # hybrid layouts retain their current behavior.
+    if min_num_layers == 1:
+        repeated_counts = [count for count in layer_counts if count > 1]
+        if repeated_counts:
+            common_divisor = math.gcd(*repeated_counts)
+            total_layers = sum(layer_counts)
+            for candidate in range(common_divisor, 1, -1):
+                if common_divisor % candidate != 0:
+                    continue
+                padded_layers = candidate * sum(
+                    cdiv(count, candidate) for count in layer_counts
+                )
+                if (padded_layers - total_layers) * 5 <= total_layers:
+                    return candidate
+
+    return min_num_layers
+
+
 def _prefer_padding_sliding_window_layers(
     same_type_layers: dict[KVCacheSpec, list[str]], group_size: int
 ) -> int:
@@ -1195,20 +1231,17 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
-    group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
-    if max_num_layers < min_num_layers * 1.5:
-        # If the number of layers is not much larger than the minimum number of
-        # layers, use the maximum number of layers as the group size to avoid
-        # too many padding layers. A typical example is gpt-oss-20b + eagle,
-        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
-        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
-        # layers while accommodating speculative decoding drafters that add
-        # extra layers to one attention type.
-        group_size = max_num_layers
-    else:
-        group_size = _prefer_padding_sliding_window_layers(same_type_layers, group_size)
+    layer_counts = [len(layers) for layers in same_type_layers.values()]
+    group_size = _select_hybrid_kv_cache_group_size(layer_counts)
+    group_size = _prefer_padding_sliding_window_layers(
+        same_type_layers, group_size
+    )
+    if group_size != min(layer_counts):
+        logger.info(
+            "Using hybrid KV cache group size %d for layer counts %s",
+            group_size,
+            sorted(layer_counts),
+        )
     grouped_layers = []
     for layers in same_type_layers.values():
         num_padding_layers = group_size - len(layers) % group_size

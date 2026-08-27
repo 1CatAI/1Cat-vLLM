@@ -489,6 +489,21 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         w13_q_ld = int(w13_meta[0][1].item())
         w2_k_ld = int(w2_meta[0][0].item())
         w2_q_ld = int(w2_meta[0][1].item())
+
+        # Stacking 256 experts temporarily holds both the per-expert tensors
+        # and their contiguous replacements. Release those load-only tensors
+        # before the pointer tables allocate so V100 does not exhaust driver
+        # memory while the CUDA caching allocator retains the stack workspace.
+        del w13_tm_weights, w13_tm_scales, w13_meta
+        del w2_tm_weights, w2_tm_scales, w2_meta
+        del w13_packed, w13_scales, prepared_w13
+        del w2_packed, w2_scales, prepared_w2
+        del layer.w13_weight
+        del layer.w13_weight_scale
+        del layer.w2_weight
+        del layer.w2_weight_scale
+        torch.accelerator.empty_cache()
+
         w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
             layer.w13_tm_scales,
@@ -519,12 +534,6 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer.sm70_mxfp4_group_size = MXFP4_GROUP_SIZE
         self._allocate_graph_safe_decode_buffers(layer)
 
-        # Raw checkpoint tensors are replaced by the equivalent TurboMind
-        # packed e2m1/UE8M0 representation, never by dequantized weights.
-        del layer.w13_weight
-        del layer.w13_weight_scale
-        del layer.w2_weight
-        del layer.w2_weight_scale
         logger.info_once(
             "SM70 TurboMind MXFP4 MoE enabled for DeepSeek-V4-Flash "
             "(local_experts=%d, graph_safe_decode=B1-B%d, "

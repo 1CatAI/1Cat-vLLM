@@ -169,6 +169,20 @@ _sm70_fp8_prefill_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] 
 _sm70_fp8_qpn8_pp2_tp4_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
+def _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer: torch.nn.Module) -> bool:
+    """Match the exact PP2 x TP4 shared-expert gate/up tensor."""
+    prefix = str(getattr(layer, "prefix", ""))
+    return bool(
+        prefix.endswith(".shared_experts.gate_up_proj")
+        and int(getattr(layer, "tp_size", 1)) == 4
+        and getattr(layer, "weight_block_size", None) == [128, 128]
+        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
+        and int(getattr(layer, "output_size_per_partition", 0)) == 1024
+        and getattr(layer, "output_partition_sizes", None) == [512, 512]
+        and tuple(layer.weight.shape) == (1024, 4096)
+    )
+
+
 def _is_sm70_fp8_prescaled_m1_decode_layer(layer: torch.nn.Module) -> bool:
     """Admit only the measured replicated fused WQA/WKV tensor contract."""
     return bool(
@@ -304,16 +318,7 @@ def _is_sm70_fp8_qpn8_pp2_tp4_shared_gate_contract(
     layer: torch.nn.Module,
 ) -> bool:
     """Match only the measured non-fused shared-expert gate/up tensor."""
-    prefix = str(getattr(layer, "prefix", ""))
-    return bool(
-        prefix.endswith(".shared_experts.gate_up_proj")
-        and int(getattr(layer, "tp_size", 1)) == 4
-        and getattr(layer, "weight_block_size", None) == [128, 128]
-        and int(getattr(layer, "input_size_per_partition", 0)) == 4096
-        and int(getattr(layer, "output_size_per_partition", 0)) == 1024
-        and getattr(layer, "output_partition_sizes", None) == [512, 512]
-        and tuple(layer.weight.shape) == (1024, 4096)
-    )
+    return _is_sm70_fp8_pp2_tp4_shared_gate_layer(layer)
 
 
 def _sm70_fp8_qpn8_pp2_tp4_config(
@@ -902,7 +907,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         )
                     if missing_ops:
                         logger.warning_once(
-                            "The default SM70 PP2 x TP4 QPN8 route is unavailable "
+                            "The requested SM70 PP2 x TP4 QPN8 route is unavailable "
                             "in the loaded vllm._C; retaining TurboMind FP8."
                         )
                     workspace = (
@@ -1086,7 +1091,7 @@ class Fp8LinearMethod(LinearMethodBase):
                             f"source-built operators; missing: {missing_ops}."
                         )
                     logger.warning_once(
-                        "The default SM70 FP8 QPN8 route is unavailable in "
+                        "The requested SM70 FP8 QPN8 route is unavailable in "
                         "the loaded vllm._C; retaining the TurboMind layout."
                     )
 

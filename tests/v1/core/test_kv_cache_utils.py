@@ -203,14 +203,14 @@ def test_sliding_window_padding_heuristic_rejects_excessive_padding():
     full_spec = new_kv_cache_spec()
     mamba_spec = new_mamba_spec(page_size_padded=full_spec.page_size_bytes)
     sliding_spec = new_sliding_window_spec(sliding_window=2048)
-    kv_cache_specs.update({f"full.{i}": full_spec for i in range(15)})
-    kv_cache_specs.update({f"mamba.{i}": mamba_spec for i in range(45)})
-    kv_cache_specs.update({"draft.0": sliding_spec})
+    kv_cache_specs.update({f"full.{i}": full_spec for i in range(14)})
+    kv_cache_specs.update({f"mamba.{i}": mamba_spec for i in range(42)})
+    kv_cache_specs.update({f"draft.{i}": sliding_spec for i in range(3)})
 
     groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_specs)
 
-    assert len(groups) == 61
-    assert max(len(group.layer_names) for group in groups) == 1
+    assert len(groups) == 20
+    assert max(len(group.layer_names) for group in groups) == 3
 
 
 def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
@@ -242,6 +242,26 @@ def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
     assert kv_cache_utils.resolve_kv_cache_block_sizes(
         kv_cache_config, vllm_config
     ) == (1648, 16)
+
+
+@pytest.mark.parametrize(
+    ("layer_counts", "expected_group_size"),
+    [
+        ([1, 12, 12, 12, 36], 12),
+        ([1, 20, 30], 10),
+        ([1, 64, 64], 16),
+        ([1, 5, 7], 1),
+        ([3, 7], 3),
+        ([5, 6], 6),
+    ],
+)
+def test_select_hybrid_kv_cache_group_size(
+    layer_counts: list[int], expected_group_size: int
+):
+    assert (
+        kv_cache_utils._select_hybrid_kv_cache_group_size(layer_counts)
+        == expected_group_size
+    )
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1994,6 +2014,7 @@ def test_deepseek_v4_tuple_width_minimizes_physical_pool_pages():
         ),
     ]
     vllm_config = SimpleNamespace(
+        max_in_flight_tokens=8192,
         model_config=SimpleNamespace(max_model_len=1_048_576),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
         parallel_config=SimpleNamespace(

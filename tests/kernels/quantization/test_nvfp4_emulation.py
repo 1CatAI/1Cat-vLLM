@@ -64,6 +64,74 @@ def test_nvfp4_sm70_e4m3_scale_fallback_matches_torch_float8(monkeypatch) -> Non
 
 
 @pytest.mark.skipif(
+    not (current_platform.is_cuda() and current_platform.has_device_capability(70)),
+    reason="Integer-decoded NVFP4 weight dequantization requires CUDA SM70+.",
+)
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_3d", [False, True])
+def test_integer_e4m3_weight_dequantization_matches_reference(
+    monkeypatch, output_dtype: torch.dtype, use_3d: bool
+) -> None:
+    """The integer E4M3 decoder must bit-match the PyTorch fallback."""
+    block_size = 16
+    raw_scales = torch.arange(256, dtype=torch.uint8)
+    rows = raw_scales.numel()
+    tensor_sf = raw_scales.reshape(rows, 1).view(torch.float8_e4m3fn).cuda()
+    tensor_fp4 = (
+        torch.arange(rows * (block_size // 2), dtype=torch.int32)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(rows, block_size // 2)
+        .cuda()
+    )
+    global_scale = torch.tensor(0.75, dtype=torch.float32, device="cuda")
+    finite_rows = (raw_scales & 0x7F) != 0x7F
+    if use_3d:
+        tensor_sf = tensor_sf.reshape(2, rows // 2, 1)
+        tensor_fp4 = tensor_fp4.reshape(2, rows // 2, block_size // 2)
+        global_scale = torch.tensor([0.5, 1.25], device="cuda")
+        finite_rows = finite_rows.reshape(2, rows // 2)
+
+    monkeypatch.setattr(
+        nvfp4_emulation_utils, "_TRITON_NVFP4_EMULATION_SUPPORTED", False
+    )
+    monkeypatch.setattr(
+        nvfp4_emulation_utils,
+        "_TRITON_NVFP4_DEQUANTIZATION_SUPPORTED",
+        True,
+    )
+    actual = dequantize_to_dtype(
+        tensor_fp4,
+        tensor_sf,
+        global_scale,
+        output_dtype,
+        block_size,
+        swizzle=False,
+    )
+
+    with monkeypatch.context() as reference_patch:
+        reference_patch.setattr(
+            nvfp4_emulation_utils,
+            "_TRITON_NVFP4_DEQUANTIZATION_SUPPORTED",
+            False,
+        )
+        expected = dequantize_to_dtype(
+            tensor_fp4,
+            tensor_sf,
+            global_scale,
+            output_dtype,
+            block_size,
+            swizzle=False,
+        )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+    assert torch.equal(
+        actual[finite_rows].view(torch.int16),
+        expected[finite_rows].view(torch.int16),
+    )
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
     reason="Triton NVFP4 kernel requires CUDA.",
 )
