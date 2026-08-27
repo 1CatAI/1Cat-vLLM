@@ -189,7 +189,7 @@ class TestReasoningStructuredOutput:
         # Should return False since reasoning hasn't ended
         assert result is False
 
-    def test_should_advance_reasoning_just_ended(
+    def test_should_advance_reasoning_just_ended_records_boundary(
         self,
         manager_with_reasoner,
         mock_request_with_structured_output,
@@ -204,16 +204,23 @@ class TestReasoningStructuredOutput:
         structured_req = mock_request_with_structured_output.structured_output_request
         structured_req.reasoner = reasoner
 
+        new_token_ids = [6, 7, 8]
         result = manager_with_reasoner.should_advance(
-            mock_request_with_structured_output
+            mock_request_with_structured_output,
+            new_token_ids=new_token_ids,
         )
 
-        # Should set reasoning_ended to True but return False for this step
+        # The scheduler must advance only the suffix after the marker in the
+        # same step; deferring loses that suffix under speculative decoding.
         assert (
             mock_request_with_structured_output.structured_output_request.reasoning_ended
             is True
         )
-        assert result is False
+        assert result is True
+        assert (
+            mock_request_with_structured_output.structured_output_request.reasoning_end_token_index
+            == 5
+        )
 
     def test_should_advance_reasoning_just_ended_with_spec_decode_structural_tag(
         self,
@@ -240,6 +247,46 @@ class TestReasoningStructuredOutput:
 
         assert structured_req.reasoning_ended is True
         assert result is True
+
+    def test_should_advance_uses_appended_tokens_not_stale_placeholders(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_ended = False
+        mock_request_with_structured_output.num_output_placeholders = 99
+
+        reasoner = MockReasoner(tokenizer=Mock())
+        reasoner.is_reasoning_end_streaming.side_effect = (
+            lambda _all_ids, delta_ids: 8 in list(delta_ids)
+        )
+        structured_req.reasoner = reasoner
+
+        assert manager_with_reasoner.should_advance(
+            mock_request_with_structured_output,
+            new_token_ids=[7, 8],
+        )
+        assert structured_req.reasoning_end_token_index == 7
+
+    def test_trim_reasoning_for_advance_keeps_only_post_marker_suffix(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_end_token_index = 6
+
+        assert manager_with_reasoner.trim_reasoning_for_advance(
+            mock_request_with_structured_output,
+            [6, 7, 8],
+        ) == [8]
+
+        mock_request_with_structured_output.all_token_ids.extend([9, 10])
+        assert manager_with_reasoner.trim_reasoning_for_advance(
+            mock_request_with_structured_output,
+            [9, 10],
+        ) == [9, 10]
 
     def test_should_advance_reasoning_already_ended(
         self,

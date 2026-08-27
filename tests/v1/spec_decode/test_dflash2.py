@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     _sm70_dflash2_dense_order_topk,
     _sm70_dflash2_rerank_output_buffers,
+    _sm70_dflash2_use_dense_order,
 )
 from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
@@ -64,6 +65,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
     names = (
         "VLLM_SM70_DFLASH2_QPN8_RERANK",
+        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
         "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
         "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
         "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW",
@@ -937,6 +939,23 @@ def test_qpn8_rerank_restores_dense_vocab_tie_order():
     expected_values, expected_ids = torch.topk(reference, 4, dim=-1, sorted=True)
     assert torch.equal(actual_values, expected_values)
     assert torch.equal(actual_ids, expected_ids + vocab_start)
+
+
+def test_qpn8_candidate_order_requires_explicit_experimental_opt_in(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", False)
+    monkeypatch.setattr(
+        envs,
+        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
+        False,
+    )
+    assert _sm70_dflash2_use_dense_order()
+
+    monkeypatch.setattr(
+        envs,
+        "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER",
+        True,
+    )
+    assert not _sm70_dflash2_use_dense_order()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

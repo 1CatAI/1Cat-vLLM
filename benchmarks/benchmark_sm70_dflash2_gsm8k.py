@@ -66,6 +66,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=4)
     parser.add_argument("--sequential", action="store_true")
+    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--mamba-cache-mode",
+        choices=("all", "align", "none"),
+        help="Override the engine Mamba cache mode for practical-contract runs.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument(
         "--target-kv-cache-dtype",
@@ -85,11 +91,25 @@ def _parse_args() -> argparse.Namespace:
         help="Draft-only attention backend; the target remains on FLASH_ATTN_V100.",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
+    seed_group = parser.add_mutually_exclusive_group()
+    seed_group.add_argument(
         "--request-seed",
         type=int,
         default=0,
         help="Sampling seed for every request; use -1 for server-style random seeds.",
+    )
+    seed_group.add_argument(
+        "--request-seeds",
+        help=(
+            "Comma-separated non-negative sampling seeds. Each seed replays the "
+            "selected prompt set without reloading the model."
+        ),
+    )
+    parser.add_argument(
+        "--request-seed-mode",
+        choices=("fixed", "index"),
+        default="fixed",
+        help="Use each seed as-is or add the original dataset index per request.",
     )
     parser.add_argument(
         "--cuda-profiler-capture",
@@ -105,6 +125,23 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _request_seeds(args: argparse.Namespace) -> list[int | None]:
+    if args.request_seeds is None:
+        if args.request_seed < -1:
+            raise ValueError("--request-seed must be -1 or a non-negative integer")
+        return [None if args.request_seed == -1 else args.request_seed]
+
+    try:
+        seeds = [int(value.strip()) for value in args.request_seeds.split(",")]
+    except ValueError as exc:
+        raise ValueError("--request-seeds must be comma-separated integers") from exc
+    if not seeds or any(seed < 0 for seed in seeds):
+        raise ValueError("--request-seeds must contain non-negative integers")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("--request-seeds must not contain duplicates")
+    return seeds
 
 
 def _model_weight_files(model: Path) -> dict[str, str]:
@@ -219,10 +256,11 @@ def main() -> int:
     args = _parse_args()
     if args.num_questions <= 0:
         raise ValueError("--num-questions must be positive")
-    if args.request_seed < -1:
-        raise ValueError("--request-seed must be -1 or a non-negative integer")
     if args.mode == "dflash" and args.draft_model is None:
         raise ValueError("--draft-model is required for --mode dflash")
+    if args.request_seed_mode == "index" and not args.sequential:
+        raise ValueError("--request-seed-mode index requires --sequential")
+    request_seeds = _request_seeds(args)
 
     import torch
     import vllm._C as vllm_c
@@ -275,12 +313,14 @@ def main() -> int:
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_seqs": args.max_num_seqs,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "enable_prefix_caching": False,
+        "enable_prefix_caching": args.enable_prefix_caching,
         "disable_log_stats": False,
         "enforce_eager": args.enforce_eager,
         "seed": args.seed,
         "speculative_config": speculative_config,
     }
+    if args.mamba_cache_mode is not None:
+        engine_kwargs["mamba_cache_mode"] = args.mamba_cache_mode
     if args.cuda_profiler_capture:
         engine_kwargs["profiler_config"] = {"profiler": "cuda"}
 
@@ -288,42 +328,84 @@ def main() -> int:
     llm = LLM(**engine_kwargs)
     load_seconds = time.perf_counter() - load_started
 
-    request_seed = None if args.request_seed == -1 else args.request_seed
+    warmup_seed = request_seeds[0]
+    if warmup_seed is not None and args.request_seed_mode == "index":
+        warmup_seed += rows[0][0]
     warmup_sampling = SamplingParams(
         temperature=args.temperature,
         top_p=0.95,
         top_k=20,
         max_tokens=args.warmup_tokens,
-        seed=request_seed,
+        seed=warmup_seed,
         skip_special_tokens=False,
     )
     llm.generate([prompts[0]], warmup_sampling, use_tqdm=False)
 
-    sampling = SamplingParams(
-        temperature=args.temperature,
-        top_p=0.95,
-        top_k=20,
-        max_tokens=args.max_tokens,
-        seed=request_seed,
-        skip_special_tokens=False,
-    )
     spec_before = _spec_metrics_snapshot(llm)
     if args.cuda_profiler_capture:
         llm.start_profile()
     started = time.perf_counter()
-    if args.sequential:
-        outputs = []
-        request_spec_metrics = []
-        for prompt in prompts:
-            request_spec_before = _spec_metrics_snapshot(llm)
-            outputs.append(llm.generate([prompt], sampling, use_tqdm=False)[0])
-            request_spec_after = _spec_metrics_snapshot(llm)
-            request_spec_metrics.append(
-                _diff_spec_metrics(request_spec_before, request_spec_after)
+    outputs = []
+    request_spec_metrics = []
+    case_inputs = []
+    for seed_base in request_seeds:
+        if args.sequential:
+            seed_outputs = []
+            seed_spec_metrics = []
+            actual_seeds = []
+            for (dataset_index, _row), prompt in zip(rows, prompts, strict=True):
+                request_seed = seed_base
+                if request_seed is not None and args.request_seed_mode == "index":
+                    request_seed += dataset_index
+                sampling = SamplingParams(
+                    temperature=args.temperature,
+                    top_p=0.95,
+                    top_k=20,
+                    max_tokens=args.max_tokens,
+                    seed=request_seed,
+                    skip_special_tokens=False,
+                )
+                request_spec_before = _spec_metrics_snapshot(llm)
+                seed_outputs.append(llm.generate([prompt], sampling, use_tqdm=False)[0])
+                request_spec_after = _spec_metrics_snapshot(llm)
+                seed_spec_metrics.append(
+                    _diff_spec_metrics(request_spec_before, request_spec_after)
+                )
+                actual_seeds.append(request_seed)
+        else:
+            sampling = SamplingParams(
+                temperature=args.temperature,
+                top_p=0.95,
+                top_k=20,
+                max_tokens=args.max_tokens,
+                seed=seed_base,
+                skip_special_tokens=False,
             )
-    else:
-        outputs = llm.generate(prompts, sampling, use_tqdm=False)
-        request_spec_metrics = [None] * len(outputs)
+            seed_outputs = llm.generate(prompts, sampling, use_tqdm=False)
+            seed_spec_metrics = [None] * len(seed_outputs)
+            actual_seeds = [seed_base] * len(seed_outputs)
+        outputs.extend(seed_outputs)
+        request_spec_metrics.extend(seed_spec_metrics)
+        case_inputs.extend(
+            (
+                seed_base,
+                request_seed,
+                dataset_index,
+                row,
+                prompt_content,
+                prompt_tokens,
+            )
+            for request_seed, (
+                dataset_index,
+                row,
+            ), prompt_content, prompt_tokens in zip(
+                actual_seeds,
+                rows,
+                prompt_contents,
+                prompt_token_counts,
+                strict=True,
+            )
+        )
     elapsed_seconds = time.perf_counter() - started
     if args.cuda_profiler_capture:
         llm.stop_profile()
@@ -331,10 +413,17 @@ def main() -> int:
 
     cases = []
     for (
+        request_seed_base,
+        request_seed,
         dataset_index,
         row,
-    ), prompt_content, prompt_tokens, output, request_spec in zip(
-        rows, prompt_contents, prompt_token_counts, outputs, request_spec_metrics
+        prompt_content,
+        prompt_tokens,
+    ), output, request_spec in zip(
+        case_inputs,
+        outputs,
+        request_spec_metrics,
+        strict=True,
     ):
         result = output.outputs[0]
         token_ids = list(result.token_ids)
@@ -348,7 +437,11 @@ def main() -> int:
             correct = None
         cases.append(
             {
+                "request_seed_base": request_seed_base,
+                "request_seed": request_seed,
                 "dataset_index": dataset_index,
+                "suite": row.get("_suite"),
+                "suite_index": row.get("_suite_index"),
                 "question": row.get("question"),
                 "prompt_content": prompt_content,
                 "expected_answer": expected,
@@ -400,6 +493,7 @@ def main() -> int:
             "dataset_format": args.dataset_format,
             "start_index": args.start_index,
             "num_questions": args.num_questions,
+            "num_samples": len(cases),
             "dataset_order": args.dataset_order,
             "model": str(args.model),
             "model_config_sha256": _sha256_file(args.model / "config.json"),
@@ -418,7 +512,14 @@ def main() -> int:
                 "top_p": 0.95,
                 "top_k": 20,
                 "max_tokens": args.max_tokens,
-                "seed": request_seed,
+                "seed": (
+                    request_seeds[0]
+                    if len(request_seeds) == 1 and args.request_seed_mode == "fixed"
+                    else None
+                ),
+                "seeds": (request_seeds if args.request_seed_mode == "fixed" else None),
+                "seed_bases": request_seeds,
+                "seed_mode": args.request_seed_mode,
                 "ignore_eos": False,
                 "thinking": True,
                 "reasoning_effort": "xhigh",

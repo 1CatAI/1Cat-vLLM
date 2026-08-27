@@ -23,6 +23,9 @@ class StructuredOutputRequest:
     params: StructuredOutputsParams
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
     reasoning_ended: bool | None = None
+    # Absolute index in all_token_ids of the last reasoning-marker token.
+    # Only the suffix after this boundary may advance the structured grammar.
+    reasoning_end_token_index: int | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
     # Cached per request; do not share reasoning parsers across requests because
     # their behavior can depend on reasoning_parser_kwargs.

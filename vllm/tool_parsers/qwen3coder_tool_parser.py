@@ -119,6 +119,7 @@ class Qwen3CoderToolParser(ToolParser):
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
+        self.json_tool_calls_streamed = 0
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -130,6 +131,103 @@ class Qwen3CoderToolParser(ToolParser):
         param_types = extract_types_from_schema(param_schema)
         return coerce_to_schema_type(param_value, param_types)
 
+    def _parameter_start_positions(
+        self,
+        text: str,
+        param_config: dict,
+    ) -> list[int]:
+        """Find parameter tags without treating inline code as markup.
+
+        Qwen's wire format puts parameter tags on structural boundaries. Tool
+        values, especially code and JSON passed to Write/Edit, may themselves
+        contain strings such as ``<parameter=x>``. A raw substring scan treats
+        those literals as new arguments and corrupts the tool call.
+
+        Unknown names at a bare line boundary are ignored when a schema is
+        available, but remain accepted after a real closing tag. This preserves
+        malformed-output recovery without interpreting an inline literal as a
+        schema field.
+        """
+        positions: list[int] = []
+        search_idx = 0
+        while True:
+            position = text.find(self.parameter_prefix, search_idx)
+            if position == -1:
+                break
+            search_idx = position + len(self.parameter_prefix)
+
+            name_end = text.find(">", search_idx)
+            if name_end == -1:
+                break
+            name = text[search_idx:name_end]
+
+            line_start = text.rfind("\n", 0, position) + 1
+            at_line_boundary = not text[line_start:position].strip()
+            after_close = text[:position].rstrip().endswith(self.parameter_end_token)
+            after_function_header = False
+            if not positions:
+                function_start = text.rfind(self.tool_call_prefix, 0, position)
+                if function_start != -1:
+                    function_header_end = text.find(">", function_start)
+                    after_function_header = (
+                        function_header_end != -1
+                        and not text[function_header_end + 1 : position].strip()
+                    )
+                elif not text[:position].strip():
+                    after_function_header = True
+
+            is_structural = at_line_boundary or after_close or after_function_header
+            if not is_structural:
+                continue
+            if (
+                param_config
+                and name not in param_config
+                and not after_close
+                and not after_function_header
+            ):
+                continue
+            positions.append(position)
+        return positions
+
+    def _find_structural_parameter_end(
+        self,
+        text: str,
+        *,
+        value_start: int,
+        next_parameter_start: int | None,
+        container_end: int | None,
+        allow_text_end: bool,
+    ) -> int | None:
+        """Return a closing tag only when its suffix is structural.
+
+        Literal ``</parameter>`` text is common in generated XML and source
+        files. It closes the current value only when followed by the next real
+        parameter, the function/tool boundary, or (for a complete non-streamed
+        body) the end of the text. Streaming deliberately waits for that one-
+        token lookahead instead of publishing a value that may later truncate.
+        """
+        search_idx = value_start
+        limit = next_parameter_start
+        if limit is None:
+            limit = container_end
+        if limit is None:
+            limit = len(text)
+
+        while True:
+            position = text.find(self.parameter_end_token, search_idx)
+            if position == -1 or position >= limit:
+                return None
+            suffix = position + len(self.parameter_end_token)
+            while suffix < len(text) and text[suffix].isspace():
+                suffix += 1
+            if next_parameter_start is not None and suffix == next_parameter_start:
+                return position
+            if container_end is not None and suffix == container_end:
+                return position
+            if allow_text_end and suffix == len(text):
+                return position
+            search_idx = position + len(self.parameter_end_token)
+
     def _parse_xml_function_call(self, function_call_str: str) -> ToolCall | None:
         # Extract function name
         end_index = function_call_str.find(">")
@@ -140,10 +238,29 @@ class Qwen3CoderToolParser(ToolParser):
         param_config = find_tool_properties(self.tools, function_name)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
-        for match_text in self.tool_call_parameter_regex.findall(parameters):
-            idx = match_text.index(">")
-            param_name = match_text[:idx]
-            param_value = str(match_text[idx + 1 :])
+        param_starts = self._parameter_start_positions(parameters, param_config)
+        for param_index, position in enumerate(param_starts):
+            name_start = position + len(self.parameter_prefix)
+            name_end = parameters.find(">", name_start)
+            if name_end == -1:
+                continue
+            param_name = parameters[name_start:name_end]
+            value_start = name_end + 1
+            next_start = (
+                param_starts[param_index + 1]
+                if param_index + 1 < len(param_starts)
+                else None
+            )
+            value_end = self._find_structural_parameter_end(
+                parameters,
+                value_start=value_start,
+                next_parameter_start=next_start,
+                container_end=len(parameters),
+                allow_text_end=True,
+            )
+            if value_end is None:
+                value_end = next_start if next_start is not None else len(parameters)
+            param_value = parameters[value_start:value_end]
             # Remove prefix and trailing \n
             if param_value.startswith("\n"):
                 param_value = param_value[1:]
@@ -159,6 +276,51 @@ class Qwen3CoderToolParser(ToolParser):
                 name=function_name, arguments=json.dumps(param_dict, ensure_ascii=False)
             ),
         )
+
+    @staticmethod
+    def _parse_json_function_call(payload: str) -> ToolCall | None:
+        """Parse the alternate Qwen/OpenCode JSON body inside ``<tool_call>``.
+
+        Some Qwen coding prompts teach ``{"name": ..., "arguments": ...}``
+        while the native model template teaches XML ``<function=...>``.  The
+        wrapper token is unambiguous, so accepting the JSON body keeps both
+        clients interoperable without treating arbitrary assistant JSON as a
+        tool call.
+        """
+        try:
+            raw_call = json.loads(payload.strip())
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw_call, dict):
+            return None
+
+        name = raw_call.get("name")
+        arguments = raw_call.get("arguments", {})
+        if not isinstance(name, str) or not name:
+            return None
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(arguments, dict):
+            return None
+
+        return ToolCall(
+            type="function",
+            function=FunctionCall(
+                name=name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            ),
+        )
+
+    def _get_json_function_calls(self, model_output: str) -> list[ToolCall]:
+        calls: list[ToolCall] = []
+        for match in self.tool_call_complete_regex.finditer(model_output):
+            parsed = self._parse_json_function_call(match.group(1))
+            if parsed is not None:
+                calls.append(parsed)
+        return calls
 
     def _get_function_calls(self, model_output: str) -> list[str]:
         # Find all tool calls
@@ -230,6 +392,106 @@ class Qwen3CoderToolParser(ToolParser):
             return pending_and_delta[: -len(current_prefix)]
         return pending_and_delta
 
+    def _finish_streaming_function(self, tool_text: str) -> None:
+        """Finalize one streamed XML function and its JSON argument state."""
+        self.json_closed = True
+
+        func_start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
+        func_content_end = tool_text.find(self.function_end_token, func_start)
+        if func_content_end != -1:
+            func_content = tool_text[func_start:func_content_end]
+            try:
+                parsed_tool = self._parse_xml_function_call(func_content)
+                if parsed_tool and self.current_tool_index < len(
+                    self.prev_tool_call_arr
+                ):
+                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                        parsed_tool.function.arguments
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to parse tool call during streaming: %s",
+                    tool_text,
+                    exc_info=True,
+                )
+
+        if self.current_tool_index < len(self.streamed_args_for_tool):
+            self.streamed_args_for_tool[self.current_tool_index] += "}"
+        else:
+            logger.warning(
+                "streamed_args_for_tool out of sync: index=%d len=%d",
+                self.current_tool_index,
+                len(self.streamed_args_for_tool),
+            )
+
+        self.in_function = False
+        self.accumulated_params = {}
+
+    def _extract_json_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+    ) -> DeltaMessage | None:
+        """Emit complete alternate-format JSON calls as atomic deltas.
+
+        Buffering until ``</tool_call>`` deliberately favors correctness over
+        partial display: downstream agents must never observe malformed JSON
+        arguments and then persist that broken call into the next turn.
+        """
+        matches = list(self.tool_call_complete_regex.finditer(current_text))
+        if self.json_tool_calls_streamed >= len(matches):
+            return None
+
+        deltas: list[DeltaToolCall] = []
+        first_new_match = None
+        for match_index in range(self.json_tool_calls_streamed, len(matches)):
+            match = matches[match_index]
+            parsed = self._parse_json_function_call(match.group(1))
+            if parsed is None:
+                continue
+            if first_new_match is None:
+                first_new_match = match
+
+            call_index = len(self.prev_tool_call_arr)
+            call_id = self._generate_tool_call_id()
+            arguments = parsed.function.arguments
+            self.prev_tool_call_arr.append(
+                {
+                    "name": parsed.function.name,
+                    "arguments": arguments,
+                }
+            )
+            self.streamed_args_for_tool.append(arguments)
+            deltas.append(
+                DeltaToolCall(
+                    index=call_index,
+                    id=call_id,
+                    function=DeltaFunctionCall(
+                        name=parsed.function.name,
+                        arguments=arguments,
+                    ),
+                    type="function",
+                )
+            )
+
+        # Complete wrappers, including malformed ones, are consumed once.
+        self.json_tool_calls_streamed = len(matches)
+        if not deltas:
+            return None
+
+        self.is_tool_call_started = False
+        self.header_sent = False
+        self.in_function = False
+        self.json_started = True
+        self.json_closed = True
+
+        content = None
+        if first_new_match is not None and first_new_match.start() > len(previous_text):
+            content = current_text[len(previous_text) : first_new_match.start()]
+            if not content:
+                content = None
+        return DeltaMessage(content=content, tool_calls=deltas)
+
     def extract_tool_calls(
         self,
         model_output: str,
@@ -237,6 +499,22 @@ class Qwen3CoderToolParser(ToolParser):
     ) -> ExtractedToolCallInformation:
         # Quick check to avoid unnecessary processing
         if self.tool_call_prefix not in model_output:
+            json_tool_calls = self._get_json_function_calls(model_output)
+            if json_tool_calls:
+                self.prev_tool_call_arr = [
+                    {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    }
+                    for call in json_tool_calls
+                ]
+                content_index = model_output.find(self.tool_call_start_token)
+                content = model_output[:content_index]
+                return ExtractedToolCallInformation(
+                    tools_called=True,
+                    tool_calls=json_tool_calls,
+                    content=content if content else None,
+                )
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
@@ -324,6 +602,17 @@ class Qwen3CoderToolParser(ToolParser):
 
         # Update accumulated text
         self.accumulated_text = current_text
+
+        # Qwen/OpenCode may emit a JSON body inside the same unambiguous
+        # <tool_call> wrapper used by the XML format. Handle a complete JSON
+        # call before the XML state machine consumes the wrapper and waits for
+        # a <function= header that will never arrive.
+        json_delta = self._extract_json_tool_calls_streaming(
+            previous_text,
+            current_text,
+        )
+        if json_delta is not None:
+            return json_delta
 
         # Check if we need to advance to next tool
         if self.json_closed and not self.in_function:
@@ -473,15 +762,10 @@ class Qwen3CoderToolParser(ToolParser):
                     ]
                 )
 
-            # Find all parameter start positions in current tool_text
-            param_starts = []
-            search_idx = 0
-            while True:
-                search_idx = tool_text.find(self.parameter_prefix, search_idx)
-                if search_idx == -1:
-                    break
-                param_starts.append(search_idx)
-                search_idx += len(self.parameter_prefix)
+            param_config = find_tool_properties(
+                self.tools, self.current_function_name or ""
+            )
+            param_starts = self._parameter_start_positions(tool_text, param_config)
 
             # Process ALL complete params in a loop (spec decode fix).
             # With speculative decoding a single delta can deliver
@@ -503,48 +787,46 @@ class Qwen3CoderToolParser(ToolParser):
                 current_param_name = remaining[:name_end]
 
                 value_start = param_start + name_end + 1
-                value_text = tool_text[value_start:]
-                if value_text.startswith("\n"):
-                    value_text = value_text[1:]
-
-                param_end_idx = value_text.find(self.parameter_end_token)
-                if param_end_idx == -1:
-                    next_param_idx = value_text.find(self.parameter_prefix)
-                    func_end_idx = value_text.find(self.function_end_token)
-
-                    if next_param_idx != -1 and (
-                        func_end_idx == -1 or next_param_idx < func_end_idx
-                    ):
-                        param_end_idx = next_param_idx
-                    elif func_end_idx != -1:
-                        param_end_idx = func_end_idx
+                next_param_idx = (
+                    param_starts[self.param_count + 1]
+                    if self.param_count + 1 < len(param_starts)
+                    else None
+                )
+                function_end_idx = tool_text.find(self.function_end_token, value_start)
+                tool_end_idx = tool_text.find(self.tool_call_end_token, value_start)
+                boundaries = [
+                    boundary
+                    for boundary in (function_end_idx, tool_end_idx)
+                    if boundary != -1
+                ]
+                container_end = min(boundaries) if boundaries else None
+                value_end = self._find_structural_parameter_end(
+                    tool_text,
+                    value_start=value_start,
+                    next_parameter_start=next_param_idx,
+                    container_end=container_end,
+                    allow_text_end=False,
+                )
+                if value_end is None:
+                    if next_param_idx is not None:
+                        # Recover a missing </parameter> before a real next tag.
+                        value_end = next_param_idx
+                    elif container_end is not None:
+                        # Recover a missing final close before function/tool end.
+                        value_end = container_end
                     else:
-                        # Fallback for malformed XML where </function>
-                        # is missing. Use </tool_call> as a delimiter
-                        # if present in the value so we don't include
-                        # the closing tag as part of the param value.
-                        tool_end_in_value = value_text.find(self.tool_call_end_token)
-                        if tool_end_in_value != -1:
-                            param_end_idx = tool_end_in_value
-                        else:
-                            # Parameter incomplete — break so we still
-                            # emit any fragments accumulated by earlier
-                            # loop iterations.
-                            break
+                        # Wait for structural lookahead. The current suffix may
+                        # be literal </parameter> text inside a long value.
+                        break
 
-                if param_end_idx == -1:
-                    break
-
-                param_value = value_text[:param_end_idx]
+                param_value = tool_text[value_start:value_end]
+                if param_value.startswith("\n"):
+                    param_value = param_value[1:]
                 if param_value.endswith("\n"):
                     param_value = param_value[:-1]
 
                 self.current_param_name = current_param_name
                 self.accumulated_params[current_param_name] = param_value
-
-                param_config = find_tool_properties(
-                    self.tools, self.current_function_name or ""
-                )
 
                 converted_value = self._convert_param_value(
                     param_value,
@@ -575,6 +857,14 @@ class Qwen3CoderToolParser(ToolParser):
                         len(self.streamed_args_for_tool),
                     )
 
+                # A speculative burst (or stream_interval > 1) can complete
+                # the final parameter and close the function in one parser
+                # call. Returning only the parameter fragment loses the final
+                # JSON brace because the next delta may be EOS/empty.
+                if not self.json_closed and self.function_end_token in tool_text:
+                    self._finish_streaming_function(tool_text)
+                    combined += "}"
+
                 return DeltaMessage(
                     tool_calls=[
                         DeltaToolCall(
@@ -591,39 +881,7 @@ class Qwen3CoderToolParser(ToolParser):
             # "}" and set in_function=False before the parameter loop
             # ever ran, causing the parameter to be silently dropped.
             if not self.json_closed and self.function_end_token in tool_text:
-                self.json_closed = True
-
-                func_start = tool_text.find(self.tool_call_prefix) + len(
-                    self.tool_call_prefix
-                )
-                func_content_end = tool_text.find(self.function_end_token, func_start)
-                if func_content_end != -1:
-                    func_content = tool_text[func_start:func_content_end]
-                    try:
-                        parsed_tool = self._parse_xml_function_call(
-                            func_content,
-                        )
-                        if parsed_tool and self.current_tool_index < len(
-                            self.prev_tool_call_arr
-                        ):
-                            self.prev_tool_call_arr[self.current_tool_index][
-                                "arguments"
-                            ] = parsed_tool.function.arguments
-                    except Exception:
-                        logger.debug(
-                            "Failed to parse tool call during streaming: %s",
-                            tool_text,
-                            exc_info=True,
-                        )
-
-                if self.current_tool_index < len(self.streamed_args_for_tool):
-                    self.streamed_args_for_tool[self.current_tool_index] += "}"
-                else:
-                    logger.warning(
-                        "streamed_args_for_tool out of sync: index=%d len=%d",
-                        self.current_tool_index,
-                        len(self.streamed_args_for_tool),
-                    )
+                self._finish_streaming_function(tool_text)
 
                 result = DeltaMessage(
                     tool_calls=[
@@ -633,10 +891,6 @@ class Qwen3CoderToolParser(ToolParser):
                         )
                     ]
                 )
-
-                self.in_function = False
-                self.json_closed = True
-                self.accumulated_params = {}
 
                 return result
 

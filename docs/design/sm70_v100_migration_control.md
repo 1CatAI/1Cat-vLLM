@@ -43936,3 +43936,65 @@ Interpretation:
   PR for this continuation use the private remote and the isolated branch
   `agent/private-v100-dsv4-pp2tp4-followup-20260826`; public upstream is
   fetch-only for this work.
+
+## 2026-08-27 NVFP4 DFlash2 output-quality audit
+
+- This audit starts from private main
+  `d63e9490f65f9e01f6649053c1ab72922034b931` in isolated worktree
+  `v100-dflash2-quality-audit-20260826-124851`. Source changes are in private
+  Draft PR #18; no public branch is used. Remote deployment and packaging are
+  explicitly out of scope.
+- The packaged launch forced selector QPN8 candidate-order tie resolution even
+  though source defaults retained dense-vocabulary order. Real-hidden evidence
+  shows a 1.49% top-20 set change and rare top-1 changes at equal-valued
+  cutoffs. Candidate order now requires a separate benchmark-only opt-in;
+  stale `DENSE_ORDER=0` launch files are ignored and log `dense_order=True`.
+  The five-arm three-seed screen keeps D1 and D2 at `14/24`; D2 improves mean
+  steady decode by 3.88% and changes request acceptance by `-0.0195`. The
+  unsafe D3 arm scores `13/24` and is not promoted.
+- The local fork predated upstream structured-output fixes. The minimal
+  backport uses the scheduler's exact accepted tokens, trims reasoning before
+  grammar advance, constrains bonus/post-marker rows, avoids expected FSM
+  errors for drafts produced before their masks, and stops/resets XGrammar at
+  termination. It does not change Eagle, MTP, DDTree, or their routing.
+- The practical temperature-1.0 coding gate uses NVFP4 target, official BF16
+  DFlash2 draft, TP4 V100, target E5M2 KV, draft FP16 KV, 256K max context,
+  4096 chunking, prefix cache, Mamba align, probabilistic block-8, and full
+  Graphs. Three seed bases produce:
+    - MBPP EvalPlus Base `89/93`, Plus `80/93`, natural stop `95/96`;
+    - HumanEval Base `94/96`, Plus `92/96`, natural stop `91/96`;
+    - LiveCodeBench `33/48`, exactly `11/16` for each seed, natural stop `32/48`.
+  The first-seed MBPP+HumanEval aggregate exactly matches historical
+  no-DFlash at Base `62/63`, Plus `59/63`. LiveCodeBench also matches both
+  historical no-DFlash and old DFlash at `11/16`, exchanging one passing task
+  rather than changing the total score.
+- LiveCodeBench's aggregate output rate is `170.283 token/s`, mean per-request
+  steady decode is `196.541 token/s`, pooled acceptance is `3.277`, and mean
+  per-request acceptance is `3.694`. All failures in the first two seeds are
+  16K length cases, while all naturally stopped cases pass. Excessive thinking
+  at temperature 1.0, not verifier corruption, is the remaining coding-product
+  risk.
+- The same weak middle seed at the official precise-coding temperature 0.6
+  improves MBPP Base/Plus from `27/24` to `29/27` out of 31, keeps HumanEval
+  Base/Plus at `31/31` out of 32, and keeps LiveCodeBench at `11/16`. Across all
+  80 requests, request-mean acceptance moves `4.273 -> 4.514` and mean steady
+  decode `233.187 -> 244.520 token/s`, but natural stops fall from `72/80` to
+  `70/80`. Temperature 0.6 is therefore an optional precise-coding profile,
+  not a global API-default replacement for temperature 1.0.
+- The current 256K/4096/prefix/Mamba-align Graph PPL pair scores 16,376 fixed
+  WikiText tokens. Target-only/DFlash2 weighted PPL is
+  `5.4993116/5.4993622`, a `+0.0000506` (`+0.00092%`) change; maximum per-segment
+  difference is `0.0062143`. This passes the fixed 0.01 segment-PPL bound and
+  provides distribution-level evidence against DFlash2-induced target-model
+  degradation.
+- The actual 256K Graph API gate enables prefix cache, Mamba align, `qwen3`
+  reasoning and `qwen3_coder` tools. B1 and B4 each pass 12/12 across
+  `json_object`, strict schema, and required tool calls. Alternating long
+  ALPHA/BETA prefixes pass 5/5 with exact sentinels and checksums; metrics show
+  59,396 queried and 32,960 cached tokens. The error-signature scan is empty.
+- Evidence is rooted at
+  `/data/minimax-h3/task-cache/v100-dflash2-quality-audit-20260826/`.
+  Detailed rationale and per-arm results are in
+  `docs/design/sm70_dflash2_quality_audit.md`. Do not cite acceptance length as
+  intelligence: it explains throughput, while official executable scores and
+  natural termination are the quality gates.

@@ -482,6 +482,162 @@ TX
     assert extracted_tool_calls.tool_calls[0].function.name == "get_current_weather"
 
 
+def test_extract_json_body_tool_call(qwen3_tool_parser):
+    """Accept the alternate JSON body emitted by Qwen/OpenCode prompts."""
+    model_output = (
+        "I will check it."
+        "<tool_call>\n"
+        '{"name":"get_current_weather","arguments":'
+        '{"city":"Dallas","state":"TX"}}\n'
+        "</tool_call>"
+    )
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    extracted = qwen3_tool_parser.extract_tool_calls(model_output, request=request)
+
+    assert extracted.tools_called
+    assert extracted.content == "I will check it."
+    assert len(extracted.tool_calls) == 1
+    assert extracted.tool_calls[0].function.name == "get_current_weather"
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "city": "Dallas",
+        "state": "TX",
+    }
+
+
+def test_streaming_json_body_tool_call(qwen3_tool_parser):
+    """Buffer split JSON arguments and emit one valid atomic tool delta."""
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    deltas = [
+        "I will check it.<tool_call>\n{",
+        '"name":"get_current_weather",',
+        '"arguments":{"city":"Dallas",',
+        '"state":"TX"}}\n</tool_call>',
+    ]
+
+    from tests.tool_parsers.utils import (
+        run_tool_extraction_streaming,
+    )
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert reconstructor.other_content == "I will check it."
+    assert len(reconstructor.tool_calls) == 1
+    assert reconstructor.tool_calls[0].function.name == "get_current_weather"
+    assert json.loads(reconstructor.tool_calls[0].function.arguments) == {
+        "city": "Dallas",
+        "state": "TX",
+    }
+
+
+def test_malformed_json_body_remains_content(qwen3_tool_parser):
+    model_output = '<tool_call>{"name":"get_current_weather","arguments":{</tool_call>'
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    extracted = qwen3_tool_parser.extract_tool_calls(model_output, request=request)
+
+    assert not extracted.tools_called
+    assert extracted.content == model_output
+
+
+def test_parameter_markers_inside_string_value(qwen3_tokenizer):
+    """Write/Edit payloads may contain XML-like text without adding fields."""
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "Write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                    "additionalProperties": False,
+                },
+            },
+        )
+    ]
+    content = '{"open":"<parameter=x>literal","close":"before</parameter>after"}'
+    model_output = (
+        "<tool_call>\n"
+        "<function=Write>\n"
+        "<parameter=file_path>\n/tmp/result.json\n</parameter>\n"
+        f"<parameter=content>\n{content}\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    extracted = parser.extract_tool_calls(model_output, request=request)
+
+    assert extracted.tools_called
+    assert len(extracted.tool_calls) == 1
+    assert json.loads(extracted.tool_calls[0].function.arguments) == {
+        "file_path": "/tmp/result.json",
+        "content": content,
+    }
+
+
+def test_streaming_parameter_markers_inside_string_value(qwen3_tokenizer):
+    """Wait for structural lookahead when a chunk ends on a literal close tag."""
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "Write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                    "additionalProperties": False,
+                },
+            },
+        )
+    ]
+    content = '{"open":"<parameter=x>literal","close":"before</parameter>after"}'
+    deltas = [
+        "<tool_call>",
+        "\n<function=Write>",
+        "\n",
+        "<parameter=file_path>\n/tmp/result.json\n</parameter>\n",
+        (
+            "<parameter=content>\n"
+            '{"open":"<parameter=x>literal","close":"before</parameter>'
+        ),
+        'after"}\n</parameter>\n</function>\n</tool_call>',
+    ]
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+
+    from tests.tool_parsers.utils import (
+        run_tool_extraction_streaming,
+    )
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    reconstructor = run_tool_extraction_streaming(
+        parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert len(reconstructor.tool_calls) == 1
+    assert json.loads(reconstructor.tool_calls[0].function.arguments) == {
+        "file_path": "/tmp/result.json",
+        "content": content,
+    }
+
+
 def test_extract_tool_calls_type_conversion(qwen3_tokenizer):
     """Test parameter type conversion based on tool schema"""
     tools = [
@@ -1379,6 +1535,40 @@ def test_streaming_multi_param_single_chunk(qwen3_tool_parser, qwen3_tokenizer):
     assert args["city"] == "Dallas"
     assert args["state"] == "TX"
     assert args["unit"] == "fahrenheit"
+
+
+def test_streaming_final_param_and_function_close_single_chunk(
+    qwen3_tool_parser,
+):
+    """A speculative burst must not omit the final JSON closing brace."""
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    deltas = [
+        "<tool_call>",
+        "\n<function=get_current_weather>",
+        "\n",
+        (
+            "<parameter=city>\nDallas\n</parameter>\n"
+            "<parameter=state>\nTX\n</parameter>\n"
+            "</function>\n</tool_call>"
+        ),
+    ]
+
+    from tests.tool_parsers.utils import (
+        run_tool_extraction_streaming,
+    )
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert len(reconstructor.tool_calls) == 1
+    assert json.loads(reconstructor.tool_calls[0].function.arguments) == {
+        "city": "Dallas",
+        "state": "TX",
+    }
 
 
 @pytest.mark.parametrize(

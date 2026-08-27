@@ -132,9 +132,11 @@ def _assert_distribution_match(
 
 @pytest.mark.parametrize("num_speculative_steps", [3, 7])
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
+@pytest.mark.parametrize("temperature", [0.6, 1.0])
 def test_dflash2_sparse_topk_matches_dense_rejection(
     num_speculative_steps: int,
     top_p: float,
+    temperature: float,
 ):
     """Compact p/q support must preserve the dense DFlash2 decision path."""
     torch.manual_seed(20260823)
@@ -174,7 +176,11 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
     top_p_rows = torch.full((num_logits,), top_p, dtype=torch.float32, device=device)
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
-    processed_target = apply_top_k_top_p(target_dense.clone(), top_k_tensor, top_p_rows)
+    processed_target = apply_top_k_top_p(
+        target_dense.clone() / temperature,
+        top_k_tensor,
+        top_p_rows,
+    )
 
     draft_topk_ids = torch.stack(
         [
@@ -187,12 +193,15 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
             for _ in range(num_reqs)
         ]
     )
-    draft_topk_logits = torch.randn(
-        num_reqs,
-        num_speculative_steps,
-        draft_top_k,
-        dtype=torch.float32,
-        device=device,
+    draft_topk_logits = (
+        torch.randn(
+            num_reqs,
+            num_speculative_steps,
+            draft_top_k,
+            dtype=torch.float32,
+            device=device,
+        )
+        / temperature
     )
     draft_dense = torch.full(
         (num_reqs, num_speculative_steps, VOCAB_SIZE),
@@ -216,7 +225,9 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
         rows_per_req, dtype=torch.int32, device=device
     ).repeat(num_reqs)
     pos = torch.arange(num_logits, dtype=torch.int64, device=device) + 8192
-    temperature = torch.ones(num_reqs, dtype=torch.float32, device=device)
+    temperature_per_req = torch.full(
+        (num_reqs,), temperature, dtype=torch.float32, device=device
+    )
     top_p_per_req = torch.full((num_reqs,), top_p, dtype=torch.float32, device=device)
     seeds = torch.arange(101, 101 + num_reqs, dtype=torch.int64, device=device)
 
@@ -229,7 +240,7 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
         idx_mapping,
         expanded_idx_mapping,
         expanded_local_pos,
-        temperature,
+        temperature_per_req,
         seeds,
         num_speculative_steps,
     )
@@ -242,7 +253,7 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
         cu_num_logits,
         pos,
         idx_mapping,
-        temperature,
+        temperature_per_req,
         top_p_per_req,
         seeds,
         num_speculative_steps,

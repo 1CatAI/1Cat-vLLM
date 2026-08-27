@@ -65,6 +65,24 @@ def _sm70_dflash2_qpn8_rerank_requested() -> bool:
     )
 
 
+def _sm70_dflash2_use_dense_order() -> bool:
+    """Keep production on the scored full-vocabulary tie-order contract."""
+    if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
+        return True
+    if envs.VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER:
+        logger.warning_once(
+            "Using experimental SM70 DFlash2 QPN8 candidate-order top-k. "
+            "This path is not authorized for quality-sensitive serving."
+        )
+        return False
+    logger.warning_once(
+        "Ignoring VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER=0 without the explicit "
+        "benchmark-only VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER=1; "
+        "using the scored dense-order path."
+    )
+    return True
+
+
 def _trace_sm70_lm_head_skip(reason: str) -> None:
     if envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE or envs.VLLM_SM70_PROFILE_TRACE:
         logger.warning_once("SM70 LM head fast path not prepared: %s", reason)
@@ -537,7 +555,8 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     values, _positions, ids = _sm70_dflash2_rerank_output_buffers(
         layer, num_rows, selector_k
     )
-    if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
+    use_dense_order = _sm70_dflash2_use_dense_order()
+    if use_dense_order:
         _sm70_dflash2_dense_order_topk(
             layer._sm70_dflash2_rerank_dense_logits[:num_rows],
             qpn8_ids,
@@ -595,7 +614,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     logger.info_once(
         "SM70 DFlash2 QPN8 top-64 plus exact packed TurboMind FP16 rerank "
         "path enabled (dense_order=%s).",
-        envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER,
+        use_dense_order,
     )
     output_shape = (*x.shape[:-1], selector_k)
     return values.reshape(output_shape), ids.reshape(output_shape)

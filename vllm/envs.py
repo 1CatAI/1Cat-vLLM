@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_RERANK: bool = False
     VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW: bool = False
     VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER: bool = True
+    VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
@@ -1901,6 +1902,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # multi-block top-k, but may be enabled only for paired quality tests.
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "1"))
+    ),
+    # Candidate-order tie handling is a benchmark-only experiment. Requiring
+    # a second opt-in prevents stale deployment scripts from silently trading
+    # scored quality for a small selector win.
+    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER", "0"))
     ),
     # Umbrella gate for selector-based DFlash verification optimizations. Keep
     # this default-off while each stage is checked against the unchanged path.
