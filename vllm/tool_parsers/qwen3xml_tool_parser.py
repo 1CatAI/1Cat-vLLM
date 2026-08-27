@@ -1,3 +1,4 @@
+from vllm.envs import VLLM_QWEN3X_TOOL_FIX
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
@@ -26,7 +27,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
 )
-from vllm.tool_parsers.utils import find_tool_properties
+from vllm.tool_parsers.utils import find_common_prefix, find_tool_properties
 
 logger = init_logger(__name__)
 
@@ -1157,9 +1158,309 @@ class Qwen3XMLToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.streamed_args_for_tool: list[str] = []
 
+        # opt23 §11.22: JSON 路由状态（对齐 qwen3-coder 机制——qwen3xml 内部实现）
+        self.current_tool_index: int = 0
+        self.header_sent: bool = False
+        self.current_tool_id: str | None = None
+        self.current_function_name: str | None = None
+        self.in_function: bool = False
+        self.json_started: bool = False
+        self.json_closed: bool = False
+        self.accumulated_params: dict = {}
+        self._json_processed_end: int = 0
+        self._partial_emit_offset: int = 0
+        self._partial_param_start: int = -1
+        self._partial_emitted: str = ""
+        self._partial_prefix: str = ""
+        self._pending_brace: bool = False
+        self._func_dup_detected: bool = False
+        self._stream_last_fp: str | None = None
+        self._stream_partial_name: str | None = None
+        self._stream_partial_value: str | None = None
+
         logger.info(
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
+
+    @property
+    def _fix_force_json(self) -> bool:
+        """opt23 §11.22: fix=2 强制 JSON 路由（对齐 qwen3-coder）。"""
+        return VLLM_QWEN3X_TOOL_FIX == 2
+
+    @property
+    def _fix_force_xml(self) -> bool:
+        """opt23 §11.22: fix=3/4 强制 XML 路由（对齐 qwen3-coder）。"""
+        return VLLM_QWEN3X_TOOL_FIX in (3, 4)
+
+    def _compute_json_diff(self, current_json: str, prev_streamed: str) -> str:
+        """Safe-prefix diff on JSON strings for incremental tool args
+        （对齐 qwen3-coder _compute_json_diff）。"""
+        if not prev_streamed:
+            return current_json
+        if not current_json:
+            return ""
+        common = find_common_prefix(prev_streamed, current_json)
+        return current_json[len(common):]
+
+    def _is_inside_json_string(self, json_text: str) -> bool:
+        """对齐 qwen3-coder：判断文本结尾是否在 JSON 字符串值内。"""
+        in_string = False
+        escape_next = False
+        for c in json_text:
+            if escape_next:
+                escape_next = False
+                continue
+            if c == '\\':
+                escape_next = True
+                continue
+            if c == '"':
+                in_string = not in_string
+        return in_string
+
+    def _unescape_display_chars(self, s: str) -> str:
+        """对齐 qwen3-coder：把 \\n/\\t/\\r 转义序列还原为字面字符（前端显示）。"""
+        result: list[str] = []
+        i = 0
+        while i < len(s):
+            c = s[i]
+            if c == '\\' and i + 1 < len(s):
+                nxt = s[i + 1]
+                if nxt == '\\' or nxt == '"':
+                    result.append(c)
+                    result.append(nxt)
+                elif nxt == 'n':
+                    result.append('\n')
+                elif nxt == 't':
+                    result.append('\t')
+                elif nxt == 'r':
+                    result.append('\r')
+                else:
+                    result.append(c)
+                    result.append(nxt)
+                i += 2
+                continue
+            result.append(c)
+            i += 1
+        return ''.join(result)
+
+    @staticmethod
+    def _escape_raw_control_chars(s: str) -> str:
+        """模型可能把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
+        字符串值，导致 JSON 非法（Write content 参数丢失根因）。仅在
+        字符串值内部把控制字符转义为 JSON 合法序列（\\n → \\\\n）。"""
+        out = []
+        i = 0
+        n = len(s)
+        in_str = False
+        _esc_map = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+        while i < n:
+            c = s[i]
+            if c == "\\":
+                out.append(c)
+                if i + 1 < n:
+                    out.append(s[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if c == '"':
+                in_str = not in_str
+                out.append(c)
+                i += 1
+                continue
+            if in_str and ord(c) < 0x20:
+                out.append(_esc_map.get(c, "\\u%04x" % ord(c)))
+                i += 1
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    def _handle_json_tool_streaming(
+        self, current_text: str, delta_text: str
+    ) -> DeltaMessage | None:
+        """JSON 格式工具调用流式处理（对齐 qwen3-coder _handle_json_tool_streaming）。
+
+        Supported format (single tool)::
+
+            {"name": "Write", "arguments": {"file_path": "/x", "content": "..."}}
+
+        每个 delta 是合法 JSON 前缀片段，适合 Anthropic input_json_delta 累积。
+        """
+        if not self.header_sent:
+            _name_kw = current_text.find('"name"')
+            if _name_kw == -1:
+                return None
+            _colon = current_text.find(":", _name_kw)
+            if _colon == -1:
+                return None
+            _q1 = current_text.find('"', _colon + 1)
+            if _q1 == -1:
+                return None
+            _q2 = current_text.find('"', _q1 + 1)
+            if _q2 == -1:
+                return None
+            name = current_text[_q1 + 1:_q2]
+            if not name:
+                return None
+
+            self.current_function_name = name
+            self.current_tool_id = make_tool_call_id()
+            self.header_sent = True
+            self.in_function = True
+            self.json_started = True
+            self.accumulated_params = {}
+
+            self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
+            self.streamed_args_for_tool.append("")
+
+            return DeltaMessage(
+                tool_calls=[
+                    DeltaToolCall(
+                        index=self.current_tool_index,
+                        id=self.current_tool_id,
+                        function=DeltaFunctionCall(name=name, arguments=""),
+                        type="function",
+                    )
+                ]
+            )
+
+        _args_kw = current_text.find('"arguments"')
+        if _args_kw == -1:
+            return None
+        _args_colon = current_text.find(":", _args_kw)
+        if _args_colon == -1:
+            return None
+        _val_start = _args_colon + 1
+        while _val_start < len(current_text) and current_text[_val_start] in " \t\n\r":
+            _val_start += 1
+        if _val_start >= len(current_text):
+            return None
+        if current_text[_val_start] != "{":
+            return None
+
+        _depth = 0
+        _in_str = False
+        _esc = False
+        _json_end = -1
+        for i in range(_val_start, len(current_text)):
+            c = current_text[i]
+            if _esc:
+                _esc = False
+                continue
+            if c == "\\":
+                _esc = True
+                continue
+            if c == '"' and not _esc:
+                _in_str = not _in_str
+                continue
+            if _in_str:
+                continue
+            if c == "{":
+                _depth += 1
+            elif c == "}":
+                _depth -= 1
+                if _depth == 0:
+                    _json_end = i + 1
+                    break
+
+        if _json_end > 0:
+            current_args = current_text[_val_start:_json_end]
+        else:
+            current_args = current_text[_val_start:]
+
+        # opt23: 模型把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
+        # 字符串值时 → 字符串值内转义为 JSON 合法序列，否则参数提取
+        # 非法/截断（Write content 丢失、工具调用参数不完整根因）。
+        current_args = self._escape_raw_control_chars(current_args)
+
+        idx = self.current_tool_index
+        prev = self.streamed_args_for_tool[idx] if idx < len(self.streamed_args_for_tool) else ""
+        # opt23 §11.29: 对齐主线 hermes `_compute_args_diff`（前缀截取增量）。
+        if len(current_args) <= len(prev):
+            return None
+        delta = current_args[len(prev):]
+        if not delta:
+            return None
+
+        if idx < len(self.streamed_args_for_tool):
+            self.streamed_args_for_tool[idx] += delta
+
+        if (_json_end > 0 and idx < len(self.prev_tool_call_arr)
+                and (_json_end == len(current_text)
+                     or current_text[_json_end] == '}')):
+            self.prev_tool_call_arr[idx]["arguments"] = current_args
+            self.json_closed = True
+            self.in_function = False
+            self._json_processed_end = _json_end
+
+        # opt23 §11.34: 对齐 qwen3-coder——之前为前端显示打字机效果把转义
+        # 序列（\n \t \r）反转义为真实控制字符，但前端累积拼接后 JSON 非法
+        # （真实换行在字符串值内），工具执行 InputValidationError。直接发射
+        # 转义版增量（字面 \n），前端拼接即可 json.parse。
+        display_delta = delta
+
+        return DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=idx,
+                    function=DeltaFunctionCall(arguments=display_delta),
+                )
+            ]
+        )
+
+    def _detect_json_output(self, current_text: str) -> bool:
+        """检测 JSON 格式工具调用输出（对齐 coder 的 _json_tool_active 检测）。"""
+        if self._fix_force_xml:
+            return False
+        _name = current_text.find('"name"')
+        _args = current_text.find('"arguments"')
+        _xml = current_text.find("<function=")
+        return _name != -1 and _args != -1 and _name < _args and _xml == -1
+
+    def _extract_tool_calls_json(self, model_output: str) -> list[ToolCall]:
+        """opt23 §11.22: 提取 JSON 格式工具调用（<tool_call>{...}</tool_call> 或裸 JSON）。
+
+        qwen3xml 是 expat XML parser，原生只解析 XML；模型输出 JSON 时由
+        此 fallback 提取，保证 JSON 格式调用也能成功（fix=1/2/3/4 通用）。
+        """
+        raw_calls: list[dict] = []
+        for _m in re.finditer(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+            model_output,
+            re.DOTALL,
+        ):
+            try:
+                raw_calls.append(json.loads(_m.group(1)))
+            except Exception:
+                pass
+        if not raw_calls:
+            try:
+                _start = model_output.find("{")
+                if _start != -1:
+                    _d = json.loads(model_output[_start:])
+                    if isinstance(_d, dict) and (
+                        "name" in _d or "arguments" in _d
+                    ):
+                        raw_calls.append(_d)
+            except Exception:
+                pass
+        tcs: list[ToolCall] = []
+        for _d in raw_calls:
+            _name = _d.get("name")
+            _args = _d.get("arguments")
+            if _name is None:
+                continue
+            if not isinstance(_args, str):
+                _args = json.dumps(_args, ensure_ascii=False)
+            tcs.append(
+                ToolCall(
+                    id=make_tool_call_id(),
+                    type="function",
+                    function=FunctionCall(name=str(_name), arguments=_args),
+                )
+            )
+        return tcs
 
     def extract_tool_calls(
         self,
@@ -1171,12 +1472,53 @@ class Qwen3XMLToolParser(ToolParser):
         self.prev_tool_call_arr = []
         self.streamed_args_for_tool = []
         self.parser.set_tools(self.tools)
-        result = self.parser.parse_single_streaming_chunks(model_output)
-        if not result.tool_calls:
+        # opt23 §11.22: JSON 路由（fix=2 强制 / fix=1 检测）→ 内部 JSON 提取
+        # （expat 对 JSON 输出会产生无效 XML tool_call，需绕过）。
+        if self._fix_force_json or self._detect_json_output(model_output):
+            json_tcs = self._extract_tool_calls_json(model_output)
+            if json_tcs:
+                self.prev_tool_call_arr = [
+                    {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                    for tc in json_tcs
+                ]
+                return ExtractedToolCallInformation(
+                    tool_calls=json_tcs,
+                    tools_called=True,
+                    content=None,
+                )
             return ExtractedToolCallInformation(
                 tool_calls=[],
                 tools_called=False,
-                content=result.content,
+                content=model_output,
+            )
+        try:
+            result = self.parser.parse_single_streaming_chunks(model_output)
+        except Exception:
+            result = None
+        if result is None or not result.tool_calls:
+            # opt23 §11.22: expat 未解析出 XML tool_call（模型输出 JSON 或
+            # expat 异常）→ 内部 JSON 提取兜底。
+            json_tcs = self._extract_tool_calls_json(model_output)
+            if json_tcs:
+                self.prev_tool_call_arr = [
+                    {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                    for tc in json_tcs
+                ]
+                return ExtractedToolCallInformation(
+                    tool_calls=json_tcs,
+                    tools_called=True,
+                    content=None,
+                )
+            return ExtractedToolCallInformation(
+                tool_calls=[],
+                tools_called=False,
+                content=result.content if result else model_output,
             )
         else:
             tool_calls = []
@@ -1242,6 +1584,43 @@ class Qwen3XMLToolParser(ToolParser):
             self.prev_tool_call_arr = []
             self.streamed_args_for_tool = []
             self.parser.set_tools(self.tools)
+            # Reset JSON 路由状态（对齐 qwen3-coder _reset_streaming_state）
+            self.current_tool_index = 0
+            self.header_sent = False
+            self.current_tool_id = None
+            self.current_function_name = None
+            self.in_function = False
+            self.json_started = False
+            self.json_closed = False
+            self.accumulated_params = {}
+            self._json_processed_end = 0
+
+        # opt23 §11.22: JSON 路由（fix=2 强制 / fix=1 检测）→ 内部
+        # _handle_json_tool_streaming（对齐 qwen3-coder 的 JSON 真流式增量）。
+        # fix=2 强制 JSON 但模型实际输出 XML（含 <function= 标记）时兜底走
+        # expat XML 路径——「xml 也强制走 json」指最终输出统一 JSON tool_calls。
+        # fix=2 强制需在 JSON 特征（"name"/"arguments"）出现后才进入——
+        # 无条件拦截会把纯文本正文吞进 JSON 工具解析（think 后无正文根因）。
+        if self._fix_force_json:
+            if current_text.find("<function=") == -1:
+                # opt23 §11.34: 对齐 qwen3-coder——<tool_call> 标记（模板 json
+                # 分支引导模型输出 <tool_call> 包裹 JSON）或 JSON 特征
+                # （"name"/"arguments"）出现即激活 JSON 路由；handler 返回
+                # None 时同样 return None（BLOCK expat XML 双路径——双路径
+                # 竞争导致增量不一致/参数非法）。<function= 表示模型实际
+                # 输出 XML，不强制 JSON（走 expat XML 解析）。
+                _json_name = current_text.find('"name"')
+                _json_args = current_text.find('"arguments"')
+                _has_marker = current_text.find("<tool_call>") != -1
+                if (_has_marker or (_json_name != -1 and _json_args != -1
+                                    and _json_name < _json_args)):
+                    return self._handle_json_tool_streaming(
+                        current_text, delta_text
+                    ) or None
+        elif self._detect_json_output(current_text):
+            return self._handle_json_tool_streaming(
+                current_text, delta_text
+            ) or None
 
         # Model sometimes outputs separately causing delta_text to be empty.
         # If there were tool_calls before and all current tool_calls have ended,

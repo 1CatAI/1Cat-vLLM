@@ -686,6 +686,7 @@ if TYPE_CHECKING:
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = False
+    VLLM_QWEN3X_TOOL_FIX: int = 1
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -4006,6 +4007,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default 0 (off).
     "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: bool(
         int(os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0"))
+    ),
+    # opt23 §11.22: qwen3-coder / qwen3-xml 共用 fix 环境变量（0/1/2/3/4）。
+    # 0=原始 / 1=双格式自选 / 2=强制 JSON 流式增量 / 3=强制 XML 流式增量 /
+    # 4=XML 伪流式。旧 VLLM_QWEN3CODER_STREAMING_FIX 作为兼容兜底。
+    "VLLM_QWEN3X_TOOL_FIX": lambda: int(
+        os.getenv(
+            "VLLM_QWEN3X_TOOL_FIX",
+            os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1"),
+        )
     ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(

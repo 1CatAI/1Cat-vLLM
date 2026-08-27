@@ -1,0 +1,3678 @@
+From 91ceff5f2ac59921e156b7bf1ba4b2aa8f89036e Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 17:01:12 +0800
+Subject: [PATCH 1/9] =?UTF-8?q?feat(opt21+25):=20v1.3.0=20=E9=87=8D?=
+ =?UTF-8?q?=E6=94=BE=20opt21=20=E5=9F=BA=E7=A1=80=E9=A1=B9=20+=20opt25=20A?=
+ =?UTF-8?q?nthropic=20=E5=8D=8F=E8=AE=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+opt21 (基础项):
+- envs.py: keepalive 5->600 + VLLM_PERSISTENT_CACHE Cache 迁移 /tmp
+- logger.py + api_server.py: _StartupLogHandler 启动日志持久化
+- outputs.py + async_llm.py + chat_completion/serving.py: STREAM_KEEPALIVE 双层保活 (引擎15s + API 120s)
+- engine/protocol.py + models/serving.py: API 能力发现 (context_window/max_output_tokens)
+- config/model.py: Auto Dynamic NTK RoPE 缩放 (yarn 补全)
+- config/speculative.py: MTP 安全检测 (无层自动禁用) + _verify_args 行首保护
+
+opt25 (Anthropic 协议):
+- anthropic/protocol.py: 响应 ID msg_<random_uuid>
+- anthropic/serving.py: SSE type/role 补全 (两处构造)
+- api_server.py + anthropic/api_router.py: HEAD 路由 (全局 + /v1/messages)
+---
+ config/model.py                               | 45 +++++++++++++++++++
+ config/speculative.py                         | 21 +++++++++
+ entrypoints/anthropic/api_router.py           |  8 +++-
+ entrypoints/anthropic/protocol.py             |  4 +-
+ entrypoints/anthropic/serving.py              |  4 ++
+ entrypoints/openai/api_server.py              | 11 +++++
+ entrypoints/openai/chat_completion/serving.py | 11 ++++-
+ entrypoints/openai/engine/protocol.py         |  2 +
+ entrypoints/openai/models/serving.py          | 19 ++++++++
+ logger.py                                     | 45 +++++++++++++++++++
+ outputs.py                                    |  5 +++
+ v1/engine/async_llm.py                        | 17 ++++++-
+ 12 files changed, 186 insertions(+), 6 deletions(-)
+
+diff --git a/config/model.py b/config/model.py
+index b41ab18..f838a7a 100644
+--- a/config/model.py
++++ b/config/model.py
+@@ -2246,6 +2246,51 @@ def _get_and_verify_max_len(
+                 "error."
+             )
+             if envs.VLLM_ALLOW_LONG_MAX_MODEL_LEN:
++                # 1) Hard reject beyond 524288
++                if max_model_len > 524288:
++                    raise ValueError(
++                        f"max_model_len ({max_model_len}) exceeds the maximum "
++                        f"supported length (524288)."
++                    )
++
++                # 2) Auto-dynamic NTK RoPE scaling
++                if rope_parameters is not None:
++                    for _rp_key, rp in rope_parameters.items():
++                        rope_type = rp.get("rope_type", "default")
++                        if rope_type == "default":
++                            from math import ceil
++
++                            if "mrope_section" in rp:
++                                new_rope_type = "yarn"
++                            else:
++                                new_rope_type = "dynamic"
++                            rp["rope_type"] = new_rope_type
++
++                            max_pos_emb = getattr(
++                                hf_config, "max_position_embeddings", None
++                            )
++                            if max_pos_emb is None or max_pos_emb <= 0:
++                                max_pos_emb = getattr(
++                                    hf_config,
++                                    "original_max_position_embeddings",
++                                    2048,
++                                )
++                            factor = ceil(max_model_len / max_pos_emb)
++                            rp["factor"] = float(factor)
++                            if new_rope_type == "yarn":
++                                rp["original_max_position_embeddings"] = max_pos_emb
++
++                            logger.warning_once(
++                                "Auto-upgraded rope_type from 'default' to '%s' "
++                                "with factor=%.1f (max_model_len=%d, "
++                                "max_position_embeddings=%d)",
++                                new_rope_type,
++                                rp["factor"],
++                                max_model_len,
++                                max_pos_emb,
++                            )
++                        break
++
+                 logger.warning_once("%s %s", msg, warning)
+             else:
+                 raise ValueError(
+diff --git a/config/speculative.py b/config/speculative.py
+index 27b1de7..45eedb0 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -599,6 +599,25 @@ class SpeculativeConfig:
+             )
+             self.method = "mtp"
+ 
++        # MTP safety detection: if the model has no MTP layers, disable speculation
++        if self.method == "mtp" and self.target_model_config is not None:
++            hf_config = self.target_model_config.hf_text_config
++            n_predict = getattr(hf_config, "n_predict", 0) or 0
++            mtp_layers = getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
++            nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
++            if n_predict <= 0 and mtp_layers <= 0 and nextn_layers <= 0:
++                logger.warning(
++                    "Model does not have MTP layers "
++                    "(n_predict=%s, mtp_num_hidden_layers=%s, "
++                    "num_nextn_predict_layers=%s). "
++                    "Disabling speculative decoding.",
++                    n_predict, mtp_layers, nextn_layers,
++                )
++                self.method = None
++                self.model = None
++                self.num_speculative_tokens = None
++                return self
++
+         if self.model is None and self.num_speculative_tokens is not None:
+             if self.method == "mtp":
+                 if self.target_model_config is None:
+@@ -1057,6 +1076,8 @@ class SpeculativeConfig:
+ 
+     @model_validator(mode="after")
+     def _verify_args(self) -> Self:
++        if self.method is None and self.model is None:
++            return self
+         if self.tensor_parallel_size is not None:
+             raise ValueError(
+                 "'tensor_parallel_size' is not a valid argument in the "
+diff --git a/entrypoints/anthropic/api_router.py b/entrypoints/anthropic/api_router.py
+index 1fe2be8..145219c 100644
+--- a/entrypoints/anthropic/api_router.py
++++ b/entrypoints/anthropic/api_router.py
+@@ -5,7 +5,7 @@
+ from http import HTTPStatus
+ 
+ from fastapi import APIRouter, Depends, FastAPI, Request
+-from fastapi.responses import JSONResponse, StreamingResponse
++from fastapi.responses import JSONResponse, StreamingResponse, Response
+ 
+ from vllm.entrypoints.anthropic.protocol import (
+     AnthropicCountTokensRequest,
+@@ -29,6 +29,12 @@ logger = init_logger(__name__)
+ router = APIRouter()
+ 
+ 
++@router.head("/v1/messages")
++@router.head("/v1/messages/count_tokens")
++async def handle_anthropic_head():
++    return Response(status_code=200)
++
++
+ def messages(request: Request) -> AnthropicServingMessages:
+     return request.app.state.anthropic_serving_messages
+ 
+diff --git a/entrypoints/anthropic/protocol.py b/entrypoints/anthropic/protocol.py
+index 279f362..90522de 100644
+--- a/entrypoints/anthropic/protocol.py
++++ b/entrypoints/anthropic/protocol.py
+@@ -219,8 +219,8 @@ class AnthropicMessagesResponse(BaseModel):
+     )
+ 
+     def model_post_init(self, __context):
+-        if not self.id:
+-            self.id = f"msg_{int(time.time() * 1000)}"
++        from vllm.utils import random_uuid
++        self.id = f"msg_{random_uuid()}"
+ 
+ 
+ class AnthropicContextManagement(BaseModel):
+diff --git a/entrypoints/anthropic/serving.py b/entrypoints/anthropic/serving.py
+index 2bdec6f..9ee6cad 100644
+--- a/entrypoints/anthropic/serving.py
++++ b/entrypoints/anthropic/serving.py
+@@ -503,6 +503,8 @@ class AnthropicServingMessages(OpenAIServingChat):
+     ) -> AnthropicMessagesResponse:
+         result = AnthropicMessagesResponse(
+             id=generator.id,
++            type="message",
++            role="assistant",
+             content=[],
+             model=generator.model,
+             usage=AnthropicUsage(
+@@ -655,6 +657,8 @@ class AnthropicServingMessages(OpenAIServingChat):
+                                 type="message_start",
+                                 message=AnthropicMessagesResponse(
+                                     id=origin_chunk.id,
++                                    type="message",
++                                    role="assistant",
+                                     content=[],
+                                     model=origin_chunk.model,
+                                     stop_reason=None,
+diff --git a/entrypoints/openai/api_server.py b/entrypoints/openai/api_server.py
+index 461128e..71a7943 100644
+--- a/entrypoints/openai/api_server.py
++++ b/entrypoints/openai/api_server.py
+@@ -179,6 +179,13 @@ def build_app(
+         app = FastAPI(lifespan=lifespan)
+     app.state.args = args
+ 
++    # opt25: global HEAD handler for CC-HAHA preconnect probe
++    @app.head("/")
++    @app.head("/{path:path}")
++    async def handle_head_probe():
++        from fastapi.responses import Response
++        return Response(status_code=200)
++
+     from vllm.entrypoints.serve import register_vllm_serve_api_routers
+ 
+     register_vllm_serve_api_routers(app)
+@@ -707,6 +714,10 @@ if __name__ == "__main__":
+     # NOTE(simon):
+     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
+     # entrypoints.
++    from vllm.logger import _StartupLogHandler
++
++    _StartupLogHandler.truncate()
++    _StartupLogHandler.install()
+     cli_env_setup()
+     parser = FlexibleArgumentParser(
+         description="vLLM OpenAI-Compatible RESTful API server."
+diff --git a/entrypoints/openai/chat_completion/serving.py b/entrypoints/openai/chat_completion/serving.py
+index 8f6d76d..60b3f68 100644
+--- a/entrypoints/openai/chat_completion/serving.py
++++ b/entrypoints/openai/chat_completion/serving.py
+@@ -66,7 +66,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+ from vllm.inputs import EngineInput
+ from vllm.logger import init_logger
+ from vllm.logprobs import Logprob
+-from vllm.outputs import CompletionOutput, RequestOutput
++from vllm.outputs import CompletionOutput, RequestOutput, STREAM_KEEPALIVE
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
+ from vllm.reasoning import ReasoningParser
+@@ -495,8 +495,17 @@ class OpenAIServingChat(OpenAIServing):
+             stream_options, self.enable_force_include_usage
+         )
+ 
++        last_server_send_time = time.time()
+         try:
+             async for res in result_generator:
++                # opt21: ignore engine keepalive (15s), handle server keepalive (120s)
++                if res is STREAM_KEEPALIVE:
++                    now = time.time()
++                    if now - last_server_send_time >= 120:
++                        yield ": keepalive\n\n"
++                        last_server_send_time = now
++                    continue
++
+                 if res.prompt_token_ids is not None:
+                     num_prompt_tokens = len(res.prompt_token_ids)
+                     if res.encoder_prompt_token_ids is not None:
+diff --git a/entrypoints/openai/engine/protocol.py b/entrypoints/openai/engine/protocol.py
+index 890af03..44ee6d0 100644
+--- a/entrypoints/openai/engine/protocol.py
++++ b/entrypoints/openai/engine/protocol.py
+@@ -90,6 +90,8 @@ class ModelCard(OpenAIBaseModel):
+     root: str | None = None
+     parent: str | None = None
+     max_model_len: int | None = None
++    context_window: int | None = None
++    max_output_tokens: int | None = None
+     permission: list[ModelPermission] = Field(default_factory=list)
+ 
+ 
+diff --git a/entrypoints/openai/models/serving.py b/entrypoints/openai/models/serving.py
+index 347752c..7ea352c 100644
+--- a/entrypoints/openai/models/serving.py
++++ b/entrypoints/openai/models/serving.py
+@@ -43,6 +43,22 @@ class OpenAIModelRegistry:
+         self.model_config = model_config
+         self.base_model_paths = base_model_paths
+ 
++    def _compute_context_window(self) -> tuple[int | None, int | None]:
++        """Compute context_window and max_output_tokens from max_model_len."""
++        max_model_len = self.model_config.max_model_len
++        if max_model_len is None:
++            return None, None
++        if max_model_len < 50000:
++            context_window = int(max_model_len * 0.9)
++            max_output_tokens = int(max_model_len * 0.1)
++        elif max_model_len < 100000:
++            context_window = int(max_model_len * 0.85)
++            max_output_tokens = int(max_model_len * 0.15)
++        else:
++            context_window = int(max_model_len * 0.8)
++            max_output_tokens = int(max_model_len * 0.2)
++        return context_window, max_output_tokens
++
+     def is_base_model(self, model_name: str) -> bool:
+         return any(model.name == model_name for model in self.base_model_paths)
+ 
+@@ -60,11 +76,14 @@ class OpenAIModelRegistry:
+     async def show_available_models(self) -> ModelList:
+         """Show available models (base models only)."""
+         max_model_len = self.model_config.max_model_len
++        context_window, max_output_tokens = self._compute_context_window()
+         return ModelList(
+             data=[
+                 ModelCard(
+                     id=base_model.name,
+                     max_model_len=max_model_len,
++                    context_window=context_window,
++                    max_output_tokens=max_output_tokens,
+                     root=base_model.model_path,
+                     permission=[ModelPermission()],
+                 )
+diff --git a/logger.py b/logger.py
+index fde9566..a52d545 100644
+--- a/logger.py
++++ b/logger.py
+@@ -291,6 +291,51 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
+     return partial(_trace_calls, log_path, root_dir)
+ 
+ 
++class _StartupLogHandler(logging.Handler):
++    """Intercept vLLM logger messages and write to a startup log file,
++    until the "Application startup complete" marker is seen."""
++
++    _log_file = "/tmp/log/vllm-starting-log.txt"
++    _installed = False
++
++    def __init__(self):
++        super().__init__(level=logging.DEBUG)
++        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
++
++    def emit(self, record: logging.LogRecord) -> None:
++        try:
++            msg = self.format(record)
++            with open(self._log_file, "a") as f:
++                f.write(msg + "\n")
++            if "Application startup complete" in msg:
++                self._remove()
++        except Exception:
++            self.handleError(record)
++
++    def _remove(self) -> None:
++        root_logger = logging.getLogger("vllm")
++        root_logger.removeHandler(self)
++        _StartupLogHandler._installed = False
++
++    @staticmethod
++    def install() -> None:
++        if _StartupLogHandler._installed:
++            return
++        handler = _StartupLogHandler()
++        root_logger = logging.getLogger("vllm")
++        root_logger.addHandler(handler)
++        _StartupLogHandler._installed = True
++
++    @staticmethod
++    def truncate() -> None:
++        try:
++            os.makedirs(os.path.dirname(_StartupLogHandler._log_file), exist_ok=True)
++            with open(_StartupLogHandler._log_file, "w"):
++                pass
++        except Exception:
++            pass
++
++
+ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
+     """
+     Enable tracing of every function call in code under `root_dir`.
+diff --git a/outputs.py b/outputs.py
+index 2c71d2a..24cc93a 100644
+--- a/outputs.py
++++ b/outputs.py
+@@ -198,6 +198,11 @@ STREAM_FINISHED = RequestOutput(
+     finished=True,
+ )
+ 
++STREAM_KEEPALIVE = RequestOutput(
++    request_id="", prompt=None, prompt_token_ids=None,
++    prompt_logprobs=None, outputs=[], finished=False,
++)
++
+ _O = TypeVar("_O", default=PoolingOutput)
+ 
+ 
+diff --git a/v1/engine/async_llm.py b/v1/engine/async_llm.py
+index 419e151..deb4765 100644
+--- a/v1/engine/async_llm.py
++++ b/v1/engine/async_llm.py
+@@ -25,7 +25,8 @@ from vllm.inputs import EngineInput, PromptType
+ from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+-from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
++from vllm.outputs import (STREAM_FINISHED, STREAM_KEEPALIVE,
++                          PoolingRequestOutput, RequestOutput)
+ from vllm.pooling_params import PoolingParams
+ from vllm.renderers import renderer_from_config
+ from vllm.renderers.inputs.preprocess import extract_prompt_components
+@@ -573,10 +574,21 @@ class AsyncLLM(EngineClient):
+             # The output_handler task pushes items into the queue.
+             # This task pulls from the queue and yields to caller.
+             finished = False
++            last_send_time = time.time()
++            _KEEPALIVE_INTERVAL = 15.0
+             while not finished:
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+-                out = q.get_nowait() or await q.get()
++                out = q.get_nowait()
++                if out is None:
++                    try:
++                        out = await asyncio.wait_for(
++                            q.get(), timeout=_KEEPALIVE_INTERVAL
++                        )
++                    except asyncio.TimeoutError:
++                        yield STREAM_KEEPALIVE
++                        last_send_time = time.time()
++                        continue
+ 
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+@@ -584,6 +596,7 @@ class AsyncLLM(EngineClient):
+                 finished = out.finished
+                 if out is not STREAM_FINISHED:
+                     yield out
++                last_send_time = time.time()
+ 
+         # If the request is disconnected by the client, generate()
+         # is cancelled or the generator is garbage collected. So,
+-- 
+2.43.0
+
+
+From 6d16aa0494eb7871d222cf06a4f8b467b3262989 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 17:23:35 +0800
+Subject: [PATCH 2/9] =?UTF-8?q?feat(opt22):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
+ =?UTF-8?q?=E5=8F=8C=E6=A0=BC=E5=BC=8F=E5=B7=A5=E5=85=B7=E8=B0=83=E7=94=A8?=
+ =?UTF-8?q?=EF=BC=88fix=20=E4=BD=93=E7=B3=BB=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- envs.py: VLLM_QWEN3X_TOOL_FIX (0/1/2/3/4) + 旧 VLLM_QWEN3CODER_STREAMING_FIX 兼容兜底
+- qwen3coder_tool_parser.py: 整体替换 v122 适配版 1943 行（删 hot-reload 段）——fix 强制路由/JSON流式/换行转义/Edit闭合/前缀截取/格式检测
+- qwen3xml_tool_parser.py: 整体替换 v122 适配版 1680 行
+- chat_completion/serving.py: fix=2/3 注入 tool_call_format=json/xml
+- anthropic/serving.py: _build_base_request 构造后注入 tool_call_format
+
+验证: fix=1 引擎实测 XML-Write(参数完整)/JSON-Edit(三参完整)/纯正文 全通过
+接口兼容: find_common_prefix/make_tool_call_id/extract_tool_calls 签名与 v130 一致
+---
+ entrypoints/anthropic/serving.py              |   41 +-
+ entrypoints/openai/chat_completion/serving.py |   14 +
+ envs.py                                       |   16 +
+ tool_parsers/qwen3coder_tool_parser.py        | 1325 ++++++++++++++++-
+ tool_parsers/qwen3xml_tool_parser.py          |  387 ++++-
+ 5 files changed, 1748 insertions(+), 35 deletions(-)
+
+diff --git a/entrypoints/anthropic/serving.py b/entrypoints/anthropic/serving.py
+index 9ee6cad..f0379af 100644
+--- a/entrypoints/anthropic/serving.py
++++ b/entrypoints/anthropic/serving.py
+@@ -360,24 +360,39 @@ class AnthropicServingMessages(OpenAIServingChat):
+     ) -> ChatCompletionRequest:
+         """Build base ChatCompletionRequest"""
+         if isinstance(anthropic_request, AnthropicCountTokensRequest):
+-            return ChatCompletionRequest(
++            req = ChatCompletionRequest(
+                 model=anthropic_request.model,
+                 messages=openai_messages,
+                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
+             )
++        else:
++            req = ChatCompletionRequest(
++                model=anthropic_request.model,
++                messages=openai_messages,
++                max_tokens=anthropic_request.max_tokens,
++                max_completion_tokens=anthropic_request.max_tokens,
++                stop=anthropic_request.stop_sequences,
++                temperature=anthropic_request.temperature,
++                top_p=anthropic_request.top_p,
++                top_k=anthropic_request.top_k,
++                kv_transfer_params=anthropic_request.kv_transfer_params,
++                chat_template_kwargs=anthropic_request.chat_template_kwargs,
++            )
+ 
+-        return ChatCompletionRequest(
+-            model=anthropic_request.model,
+-            messages=openai_messages,
+-            max_tokens=anthropic_request.max_tokens,
+-            max_completion_tokens=anthropic_request.max_tokens,
+-            stop=anthropic_request.stop_sequences,
+-            temperature=anthropic_request.temperature,
+-            top_p=anthropic_request.top_p,
+-            top_k=anthropic_request.top_k,
+-            kv_transfer_params=anthropic_request.kv_transfer_params,
+-            chat_template_kwargs=anthropic_request.chat_template_kwargs,
+-        )
++        # opt22: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser 路由对齐
++        from vllm.envs import VLLM_QWEN3X_TOOL_FIX
++
++        if VLLM_QWEN3X_TOOL_FIX == 2:
++            req.chat_template_kwargs = {
++                **(req.chat_template_kwargs or {}),
++                "tool_call_format": "json",
++            }
++        elif VLLM_QWEN3X_TOOL_FIX == 3:
++            req.chat_template_kwargs = {
++                **(req.chat_template_kwargs or {}),
++                "tool_call_format": "xml",
++            }
++        return req
+ 
+     @classmethod
+     def _handle_output_config(
+diff --git a/entrypoints/openai/chat_completion/serving.py b/entrypoints/openai/chat_completion/serving.py
+index 60b3f68..2233d7a 100644
+--- a/entrypoints/openai/chat_completion/serving.py
++++ b/entrypoints/openai/chat_completion/serving.py
+@@ -246,6 +246,20 @@ class OpenAIServingChat(OpenAIServing):
+         request: ChatCompletionRequest,
+         raw_request: Request | None = None,
+     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
++        # opt22: fix=2/3 时注入 tool_call_format → 模板渲染对应分支
++        from vllm.envs import VLLM_QWEN3X_TOOL_FIX
++
++        if VLLM_QWEN3X_TOOL_FIX == 2:
++            request.chat_template_kwargs = {
++                **(request.chat_template_kwargs or {}),
++                "tool_call_format": "json",
++            }
++        elif VLLM_QWEN3X_TOOL_FIX == 3:
++            request.chat_template_kwargs = {
++                **(request.chat_template_kwargs or {}),
++                "tool_call_format": "xml",
++            }
++
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
+diff --git a/envs.py b/envs.py
+index 3f04f9d..958ddb1 100644
+--- a/envs.py
++++ b/envs.py
+@@ -612,6 +612,8 @@ if TYPE_CHECKING:
+     VLLM_SYSTEM_START_DATE: str | None = None
+     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
+     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = False
++    VLLM_QWEN3CODER_STREAMING_FIX: int = 1
++    VLLM_QWEN3X_TOOL_FIX: int = 1
+     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
+     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
+     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
+@@ -3604,6 +3606,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: bool(
+         int(os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "0"))
+     ),
++    # opt23: streaming tool call fix for Qwen3Coder tool parser.
++    # 0=原始路径, 1=双格式客户端自选(默认), 2=仅XML真流式,
++    # 3=仅JSON真流式, 4=XML/JSON互转(待设计), 5=仅XML假流式
++    "VLLM_QWEN3CODER_STREAMING_FIX": lambda: int(
++        os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1")
++    ),
++    # opt23 §11.22: qwen3-coder / qwen3-xml 共用 fix 环境变量（0/1/2/3/4）。
++    # 新变量优先；旧 VLLM_QWEN3CODER_STREAMING_FIX 作为兼容兜底。
++    "VLLM_QWEN3X_TOOL_FIX": lambda: int(
++        os.getenv(
++            "VLLM_QWEN3X_TOOL_FIX",
++            os.getenv("VLLM_QWEN3CODER_STREAMING_FIX", "1"),
++        )
++    ),
+     # Add optional custom scopes for profiling, disable to avoid overheads
+     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(
+         int(os.getenv("VLLM_CUSTOM_SCOPES_FOR_PROFILING", "0"))
+diff --git a/tool_parsers/qwen3coder_tool_parser.py b/tool_parsers/qwen3coder_tool_parser.py
+index 2b21f8f..05db289 100644
+--- a/tool_parsers/qwen3coder_tool_parser.py
++++ b/tool_parsers/qwen3coder_tool_parser.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import json
++import time
+ import uuid
+ from collections.abc import Sequence
+ from typing import Any
+@@ -18,7 +19,10 @@ from vllm.entrypoints.openai.engine.protocol import (
+     FunctionCall,
+     ToolCall,
+ )
+-from vllm.envs import VLLM_ENFORCE_STRICT_TOOL_CALLING
++from vllm.envs import (
++    VLLM_ENFORCE_STRICT_TOOL_CALLING,
++    VLLM_QWEN3X_TOOL_FIX,
++)
+ from vllm.logger import init_logger
+ from vllm.tokenizers import TokenizerLike
+ from vllm.tool_parsers.abstract_tool_parser import (
+@@ -32,15 +36,58 @@ from vllm.tool_parsers.structural_tag_registry import (
+ from vllm.tool_parsers.utils import (
+     coerce_to_schema_type,
+     extract_types_from_schema,
++    find_common_prefix,
+     find_tool_properties,
+ )
+ 
+ logger = init_logger(__name__)
+ 
+ 
++# opt23 debug log (disabled by default; enable via VLLM_OPT23_DEBUG_LOG=1)
++_OPT23_LOG = None
++
++def _log(msg: str, *args: Any) -> None:
++    global _OPT23_LOG
++    import os as _os
++    if not _os.environ.get("VLLM_OPT23_DEBUG_LOG"):
++        return
++    if _OPT23_LOG is None:
++        _OPT23_LOG = open("/tmp/log/vllm-tool-log.txt", "a", buffering=1)
++    _OPT23_LOG.write(msg % args if args else msg)
++    _OPT23_LOG.write("\n")
++
++
+ class Qwen3CoderToolParser(ToolParser):
+     supports_required_and_named: bool = not VLLM_ENFORCE_STRICT_TOOL_CALLING
+ 
++    # opt23 Path B fake streaming (=5): partial streaming only for
++    # Write/Edit (tools with long string content params that benefit
++    # from incremental display).  Path B Native (=1,2) handles all
++    # XML tools via diff-based XML streaming — no whitelist needed.
++    _STREAMING_TOOLS: frozenset = frozenset({"Write", "Edit"})
++
++    @property
++    def _fix_force_json(self) -> bool:
++        """opt23 §11.22: fix=2 强制 JSON 真流式增量路由（XML 输出也最终按 JSON 输出）。"""
++        return VLLM_QWEN3X_TOOL_FIX == 2
++
++    @property
++    def _fix_force_xml(self) -> bool:
++        """opt23 §11.22: fix=3/4 强制 XML 路由（JSON 输出也走 XML 解析）。"""
++        return VLLM_QWEN3X_TOOL_FIX in (3, 4)
++
++    @property
++    def _is_streaming_tool(self) -> bool:
++        """Streaming optimizations apply to =1,2,5 for Write/Edit tools.
++
++        Guards _pending_brace, partial streaming, and remaining delta
++        paths for tools with long string content params that benefit
++        from incremental display.
++        """
++        return (VLLM_QWEN3X_TOOL_FIX in (1, 2, 4, 5)
++                and not self._json_tool_active
++                and self.current_function_name in self._STREAMING_TOOLS)
++
+     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
+         super().__init__(tokenizer, tools)
+ 
+@@ -119,6 +166,771 @@ class Qwen3CoderToolParser(ToolParser):
+         # Store accumulated parameters for type conversion
+         self.accumulated_params = {}
+         self.streaming_request = None
++        # opt23: partial streaming for long string params (write/edit content)
++        self._partial_emit_offset: int = 0
++        self._partial_param_start: int = -1
++        self._partial_emitted: str = ""
++        self._partial_prefix: str = ""
++        self._last_partial_time: float = 0.0
++        # opt23: defer standalone "{" to combine with first real delta
++        self._pending_brace: bool = False
++        # opt23: flag for model duplication of <function=...> in streaming
++        self._func_dup_detected: bool = False
++        # opt23 Path C: JSON-format tool call (not XML) detected in streaming
++        self._json_tool_active: bool = False
++        # opt23 =3 JSON path: end position of processed tool call for skip
++        self._json_processed_end: int = 0
++        # opt23 §11.42 (v122 框架迁入): resolved tool-call format
++        # ('xml'|'json', or None when unconfigured → auto-detect);
++        # config-first via request.chat_template_kwargs.tool_call_format.
++        self._tool_format: str | None = None
++        # opt23 =2 XML path: incomplete param saved from parsing loop
++        self._stream_partial_name: str | None = None
++        self._stream_partial_value: str | None = None
++        # opt23 =2 优化3: 状态指纹，无变化时跳过 diff
++        self._stream_last_fp: tuple | None = None
++
++    def _compute_json_diff(self, current_json: str, prev_streamed: str) -> str:
++        """Safe-prefix diff on JSON strings for incremental tool args.
++
++        Mirrors upstream ``_compute_arg_delta`` from vLLM PR #45413.
++        Returns only the suffix of *current_json* that is not already
++        present in *prev_streamed*, i.e. a valid JSON continuation.
++
++        When *prev_streamed* is empty the entire *current_json* is
++        returned (first emission).
++        """
++        if not prev_streamed:
++            return current_json
++        if not current_json:
++            return ""
++        common = find_common_prefix(prev_streamed, current_json)
++        return current_json[len(common):]
++
++    @staticmethod
++    def _safe_content_length(text: str) -> int:
++        """Return length of *text* prefix safe to emit as partial content.
++
++        Detects trailing XML close-tag fragments (``</parameter>``,
++        ``</function>``, ``</tool_call>``) that the model may generate
++        during streaming and truncates before them.  Characters that
++        look like a legitimate XML close tag are **not** emitted as
++        string content — when the tag completes the XML parser will
++        detect it and the streaming-param handler will emit the full
++        corrected value.
++        """
++        _pos = text.rfind('</')
++        if _pos < 0:
++            return len(text)
++
++        _after = text[_pos + 2:]       # text after '</'
++        _after_clean = _after.rstrip('>')
++
++        # Valid XML close-tag names in qwen3coder format.
++        for _tag in ('parameter', 'function', 'tool_call'):
++            if _tag.startswith(_after_clean) or _after_clean.startswith(_tag):
++                _result = _pos
++                if _result > 0 and text[_result - 1] == '\n':
++                    _result -= 1
++                return _result
++
++        # '</' not followed by a known close-tag name (e.g. </div>)
++        # — treat as legitimate string content.
++        return len(text)
++
++    def _is_string_param(self, param_name: str) -> bool:
++        """True when *param_name* is typed as ``string`` in the tool schema.
++
++        Used by the boundary detection in the param-completion loop to
++        decide whether ``<parameter=next>`` can serve as a fallback
++        delimiter — string params must wait for an explicit
++        ``</parameter>`` to avoid premature completion with a partial
++        value.
++        """
++        func = self.current_function_name
++        if not func:
++            return False
++        _pc = find_tool_properties(self.tools, func)
++        _ps = _pc.get(param_name, {})
++        _pt = extract_types_from_schema(_ps)
++        return bool(_pt and "string" in _pt)
++
++    @staticmethod
++    def _is_inside_json_string(json_text: str) -> bool:
++        """Return True if the final character position in *json_text*
++        is inside a JSON string value (between an unescaped ``"`` and
++        its matching closing ``"``).
++
++        Walks *json_text* character by character, tracking ``in_string``
++        and ``escape_next`` state.  Returns the string state at the
++        end of the text.
++        """
++        in_string = False
++        escape_next = False
++        for c in json_text:
++            if escape_next:
++                escape_next = False
++                continue
++            if c == '\\':
++                escape_next = True
++                continue
++            if c == '"':
++                in_string = not in_string
++        return in_string
++
++    @staticmethod
++    def _unescape_display_chars(s: str) -> str:
++        """Replace JSON escape sequences ``\\n``, ``\\t``, ``\\r`` with
++        literal newline / tab / carriage-return characters for frontend
++        display.
++
++        Preserves structural escapes ``\\\"`` and ``\\\\`` so the
++        accumulated JSON remains structurally parseable.
++        """
++        result: list[str] = []
++        i = 0
++        while i < len(s):
++            c = s[i]
++            if c == '\\' and i + 1 < len(s):
++                nxt = s[i + 1]
++                if nxt == '\\' or nxt == '"':
++                    # Structural escapes — keep as-is
++                    result.append(c)
++                    result.append(nxt)
++                    i += 2
++                    continue
++                elif nxt == 'n':
++                    result.append('\n')
++                    i += 2
++                    continue
++                elif nxt == 't':
++                    result.append('\t')
++                    i += 2
++                    continue
++                elif nxt == 'r':
++                    result.append('\r')
++                    i += 2
++                    continue
++            result.append(c)
++            i += 1
++        return ''.join(result)
++
++    @staticmethod
++    def _escape_raw_control_chars(s: str) -> str:
++        """模型可能把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
++        字符串值，导致 JSON 非法（Write content 参数丢失根因）。仅在
++        字符串值内部把控制字符转义为 JSON 合法序列（\\n → \\\\n）。"""
++        out = []
++        i = 0
++        n = len(s)
++        in_str = False
++        _esc_map = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
++        while i < n:
++            c = s[i]
++            if c == "\\":
++                out.append(c)
++                if i + 1 < n:
++                    out.append(s[i + 1])
++                    i += 2
++                else:
++                    i += 1
++                continue
++            if c == '"':
++                in_str = not in_str
++                out.append(c)
++                i += 1
++                continue
++            if in_str and ord(c) < 0x20:
++                out.append(_esc_map.get(c, "\\u%04x" % ord(c)))
++                i += 1
++                continue
++            out.append(c)
++            i += 1
++        return "".join(out)
++
++    def _handle_json_tool_streaming(
++        self, current_text: str, delta_text: str
++    ) -> DeltaMessage | None:
++        """Handle JSON-format tool calls with safe-prefix JSON diffing.
++
++        Supported format (single tool)::
++
++            {"name": "Write", "arguments": {"file_path": "/x", "content": "..."}}
++
++        Each emitted delta is a valid JSON continuation of the arguments
++        object, suitable for Anthropic ``input_json_delta`` accumulation.
++        """
++        # --- name extraction (first time only) ---
++        if not self.header_sent:
++            _name_kw = current_text.find('"name"')
++            if _name_kw == -1:
++                return None
++            _colon = current_text.find(":", _name_kw)
++            if _colon == -1:
++                return None
++            _q1 = current_text.find('"', _colon + 1)
++            if _q1 == -1:
++                return None
++            _q2 = current_text.find('"', _q1 + 1)
++            if _q2 == -1:
++                return None
++            name = current_text[_q1 + 1:_q2]
++            if not name:
++                return None
++
++            self.current_function_name = name
++            self.current_tool_id = self._generate_tool_call_id()
++            self.header_sent = True
++            self.in_function = True
++            self.json_started = True
++            self.accumulated_params = {}
++
++            self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
++            self.streamed_args_for_tool.append("")
++
++            return DeltaMessage(
++                tool_calls=[
++                    DeltaToolCall(
++                        index=self.current_tool_index,
++                        id=self.current_tool_id,
++                        function=DeltaFunctionCall(name=name, arguments=""),
++                        type="function",
++                    )
++                ]
++            )
++
++        # --- arguments JSON extraction ---
++        _args_kw = current_text.find('"arguments"')
++        if _args_kw == -1:
++            return None
++
++        _args_colon = current_text.find(":", _args_kw)
++        if _args_colon == -1:
++            return None
++
++        # skip whitespace after colon
++        _val_start = _args_colon + 1
++        while _val_start < len(current_text) and current_text[_val_start] in " \t\n\r":
++            _val_start += 1
++        if _val_start >= len(current_text):
++            return None
++        if current_text[_val_start] != "{":
++            return None
++
++        # Walk brace depth to find the end of the arguments JSON object.
++        # For incomplete streaming text the closing "}" may be absent;
++        # in that case we take everything from _val_start to end-of-text.
++        _depth = 0
++        _in_str = False
++        _esc = False
++        _json_end = -1
++        for i in range(_val_start, len(current_text)):
++            c = current_text[i]
++            if _esc:
++                _esc = False
++                continue
++            if c == "\\":
++                _esc = True
++                continue
++            if c == '"' and not _esc:
++                _in_str = not _in_str
++                continue
++            if _in_str:
++                continue
++            if c == "{":
++                _depth += 1
++            elif c == "}":
++                _depth -= 1
++                if _depth == 0:
++                    _json_end = i + 1
++                    break
++
++        if _json_end > 0:
++            current_args = current_text[_val_start:_json_end]
++        else:
++            current_args = current_text[_val_start:]
++
++        # opt23: 模型把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
++        # 字符串值时 → 字符串值内转义为 JSON 合法序列，否则参数提取
++        # 非法/截断（Write content 丢失、工具调用参数不完整根因）。
++        current_args = self._escape_raw_control_chars(current_args)
++
++        # --- diff against previously streamed ---
++        idx = self.current_tool_index
++        prev = self.streamed_args_for_tool[idx] if idx < len(self.streamed_args_for_tool) else ""
++        # opt23 §11.29: 对齐主线 hermes `_compute_args_diff`（前缀截取增量）。
++        # 主线用 `args[len(prev):]`（信任流式累积，current 是 prev 的超集），
++        # 替代本地 `_compute_json_diff`（find_common_prefix 手工 diff）。
++        if len(current_args) <= len(prev):
++            return None
++        delta = current_args[len(prev):]
++        if not delta:
++            return None
++
++        # Store raw (escaped) delta for future diffs and serving-layer
++        # remaining-delta computation.  We emit an unescaped version
++        # for display when inside a JSON string value.
++        if idx < len(self.streamed_args_for_tool):
++            self.streamed_args_for_tool[idx] += delta
++
++        # Update prev_tool_call_arr when JSON is complete so the serving
++        # layer can compute the correct remaining delta at stream end.
++        # 优化 A: 标记参数完整。确认外层工具调用也闭合了（}} 连续）
++        # 或文本正好在参数闭括号处结束（EOS 场景）。
++        if (_json_end > 0 and idx < len(self.prev_tool_call_arr)
++                and (_json_end == len(current_text)
++                     or current_text[_json_end] == '}')):
++            self.prev_tool_call_arr[idx]["arguments"] = current_args
++            self.json_closed = True
++            self.in_function = False
++            self._json_processed_end = _json_end
++            _log(
++                "opt23 JSON handler 优化A: idx=%s current_args=%s "
++                "prev_tool_call_arr=%s",
++                idx, current_args[:200],
++                self.prev_tool_call_arr)
++
++        # opt23: 之前为前端显示打字机效果把转义序列（\n \t \r）反转义为
++        # 真实控制字符——但前端累积拼接后 JSON 非法（真实换行在字符串值
++        # 内），工具执行 InputValidationError（Write content 参数失败
++        # 根因）。直接发射转义版增量（字面 \n），前端拼接即可 json.parse。
++        display_delta = delta
++
++        return DeltaMessage(
++            tool_calls=[
++                DeltaToolCall(
++                    index=idx,
++                    function=DeltaFunctionCall(arguments=display_delta),
++                )
++            ]
++        )
++
++    def _handle_xml_tool_streaming(
++        self, current_text: str, delta_text: str
++    ) -> DeltaMessage | None:
++        """Path B Native: XML-native true streaming with safe-prefix diffing.
++
++        Isomorphic to ``_handle_json_tool_streaming``.  Builds an XML
++        intermediate state from the current ``tool_text`` and emits the
++        diff against previously streamed XML.  Pure XML output — no JSON
++        involvement.
++
++        Algorithm:
++        1. HEADER EXTRACTION — find ``<function=NAME>``, send name delta
++        2. BUILD XML INTERMEDIATE STATE — parse completed + in-progress params
++        3. DIFF — ``find_common_prefix(prev_xml, current_xml)``
++        4. EMIT — return XML continuation delta
++
++        Activated when ``VLLM_QWEN3X_TOOL_FIX`` is 1 or 2 and
++        the model is generating XML-format tool calls.
++        """
++
++        # Find tool positions
++        tool_start_positions = self._tool_start_positions(current_text)
++        if self.current_tool_index >= len(tool_start_positions):
++            return None
++
++        tool_start_idx = tool_start_positions[self.current_tool_index]
++        tool_end_idx = current_text.find(
++            self.tool_call_end_token, tool_start_idx
++        )
++        if tool_end_idx == -1:
++            tool_text = current_text[tool_start_idx:]
++        else:
++            tool_text = current_text[
++                tool_start_idx:tool_end_idx + len(self.tool_call_end_token)
++            ]
++
++        # ---- Step 1: Header Extraction ----
++        if not self.header_sent:
++            if self.tool_call_prefix not in tool_text:
++                return None
++            func_start = tool_text.find(self.tool_call_prefix) + len(
++                self.tool_call_prefix
++            )
++            func_end = tool_text.find(">", func_start)
++            if func_end == -1:
++                return None
++
++            name = tool_text[func_start:func_end]
++            if not name:
++                return None
++
++            self.current_function_name = name
++            self.current_tool_id = self._generate_tool_call_id()
++            self.header_sent = True
++            self.in_function = True
++            self.json_started = True
++            self.accumulated_params = {}
++            self._pending_brace = False
++
++            self.prev_tool_call_arr.append(
++                {"name": name, "arguments": "{}"}
++            )
++            self.streamed_args_for_tool.append("")
++
++            return DeltaMessage(
++                tool_calls=[
++                    DeltaToolCall(
++                        index=self.current_tool_index,
++                        id=self.current_tool_id,
++                        function=DeltaFunctionCall(
++                            name=name, arguments=""
++                        ),
++                        type="function",
++                    )
++                ]
++            )
++
++        # ---- Step 2: Build XML Intermediate State ----
++        # Find all <parameter=...> positions in tool_text
++        param_starts: list[int] = []
++        search_idx = 0
++        while True:
++            search_idx = tool_text.find(
++                self.parameter_prefix, search_idx
++            )
++            if search_idx == -1:
++                break
++            param_starts.append(search_idx)
++            search_idx += len(self.parameter_prefix)
++
++        # Filter out stale params before the LAST <function=...> tag
++        # (model duplication artifact in streaming).
++        _func_positions: list[int] = []
++        _fsi = 0
++        while True:
++            _fsi = tool_text.find(self.tool_call_prefix, _fsi)
++            if _fsi == -1:
++                break
++            _close = tool_text.find(
++                ">", _fsi + len(self.tool_call_prefix)
++            )
++            if _close != -1:
++                _func_positions.append(_fsi)
++            _fsi += len(self.tool_call_prefix)
++
++        if param_starts and _func_positions:
++            _func_positions = [
++                p for p in _func_positions if p < param_starts[0]
++            ]
++        if len(_func_positions) > 1:
++            _last_func = _func_positions[-1]
++            param_starts = [
++                p for p in param_starts if p > _last_func
++            ]
++
++        # Build XML from parsed parameters
++        xml_parts: list[str] = []
++
++        for param_start_pos in param_starts:
++            param_start = param_start_pos + len(self.parameter_prefix)
++            remaining = tool_text[param_start:]
++
++            if ">" not in remaining:
++                break
++
++            name_end = remaining.find(">")
++            param_name = remaining[:name_end]
++
++            value_start = param_start + name_end + 1
++            value_text = tool_text[value_start:]
++            if value_text.startswith("\n"):
++                value_text = value_text[1:]
++
++            # Find end of this param
++            # 优化1: detect false-positive </parameter> inside content
++            # (e.g. Write content that contains "</parameter>" literally).
++            # Scan forward until a true close-tag is confirmed by the
++            # text that follows it (another <parameter=, </function>,
++            # </tool_call>, or end-of-text).
++            param_end_idx = -1
++            _pe_search = 0
++            while _pe_search < len(value_text):
++                _pe = value_text.find(self.parameter_end_token, _pe_search)
++                if _pe == -1:
++                    break
++                _after = value_text[_pe + len(self.parameter_end_token):].lstrip()
++                if (_after.startswith(self.parameter_prefix)
++                        or _after.startswith(self.function_end_token)
++                        or _after.startswith(self.tool_call_end_token)
++                        or not _after):
++                    param_end_idx = _pe
++                    break
++                # Content contained a </parameter> fragment — keep scanning
++                _pe_search = _pe + 1
++
++            if param_end_idx != -1:
++                # Complete param — include closing </parameter> tag
++                param_value = value_text[:param_end_idx]
++                if param_value.endswith("\n"):
++                    param_value = param_value[:-1]
++                xml_parts.append(
++                    f"<parameter={param_name}>\n{param_value}"
++                    f"\n</parameter>"
++                )
++                if param_name not in self.accumulated_params:
++                    # opt23 =2: 对完整参数做类型转换 (bool/int/string)，
++                    # 确保 json.dumps 输出正确的 JSON 类型
++                    param_config = find_tool_properties(
++                        self.tools, self.current_function_name or "")
++                    converted = self._convert_param_value(
++                        param_value, param_name,
++                        param_config, self.current_function_name or "")
++                    self.accumulated_params[param_name] = converted
++            else:
++                # Incomplete param — trim trailing XML tags from value
++                next_param = value_text.find(self.parameter_prefix)
++                func_end_v = value_text.find(self.function_end_token)
++                tool_end_v = value_text.find(self.tool_call_end_token)
++
++                end_candidates = []
++                if next_param != -1:
++                    end_candidates.append(next_param)
++                if func_end_v != -1:
++                    end_candidates.append(func_end_v)
++                if tool_end_v != -1:
++                    end_candidates.append(tool_end_v)
++
++                if end_candidates:
++                    param_value = value_text[:min(end_candidates)]
++                else:
++                    param_value = value_text
++
++                if param_value.endswith("\n"):
++                    param_value = param_value[:-1]
++
++                # opt23: guard against partial XML close-tag fragments
++                # (e.g. "</param", "</funct") leaking into the XML
++                # intermediate state.
++                _safe_len = self._safe_content_length(param_value)
++                if _safe_len < len(param_value):
++                    param_value = param_value[:_safe_len]
++                    if param_value.endswith("\n"):
++                        param_value = param_value[:-1]
++
++                xml_parts.append(
++                    f"<parameter={param_name}>\n{param_value}"
++                )
++                # Save incomplete param for Step 3 JSON building
++                self._stream_partial_name = param_name
++                self._stream_partial_value = param_value
++                break  # stop at first incomplete param
++
++        else:
++            # 优化2: for-else — all params complete this cycle, clear
++            # stale partial state so Step 3 doesn't attach a redundant
++            # in-progress fragment that was already fully parsed.
++            self._stream_partial_name = None
++            self._stream_partial_value = None
++
++        current_xml = "\n".join(xml_parts)
++
++        # ---- Step 3: Build JSON from accumulated params ----
++        # =2 and =1 XML path: XML input → JSON output (standard tool args).
++        # Build partial JSON from accumulated_params + current in-progress
++        # param, diff against previously streamed.
++        idx = self.current_tool_index
++        prev_raw = (
++            self.streamed_args_for_tool[idx]
++            if idx < len(self.streamed_args_for_tool)
++            else ""
++        )
++
++        # 优化3: state fingerprint — skip build+diff when nothing changed
++        _state_fp = (len(self.accumulated_params),
++                     len(self._stream_partial_value or ""))
++        if _state_fp == self._stream_last_fp:
++            delta = ""
++        else:
++            self._stream_last_fp = _state_fp
++
++            # Build partial JSON (no closing } — added at function-end)
++            parts: list[str] = []
++            first = True
++            for name, value in self.accumulated_params.items():
++                serialized = json.dumps(value, ensure_ascii=False)
++                if first:
++                    parts.append(f'"{name}": {serialized}')
++                    first = False
++                else:
++                    parts.append(f', "{name}": {serialized}')
++
++            # Attach the current in-progress param (trimmed by parsing loop)
++            partial_name = self._stream_partial_name
++            partial_value = self._stream_partial_value
++
++            # Guard: skip stale partial when the param was fully completed
++            # in this cycle (now in accumulated_params) to avoid duplicate keys.
++            if partial_name is not None and partial_value is not None:
++                if partial_name not in self.accumulated_params:
++                    # Only stream partial values for string-type params.
++                    # Bool/int params change JSON representation after type
++                    # conversion (e.g. "false" → false), which breaks the
++                    # safe-prefix diff and produces garbage deltas.
++                    _is_string = True
++                    if partial_name:
++                        _pc = find_tool_properties(
++                            self.tools, self.current_function_name or "")
++                        _ps = _pc.get(partial_name, {})
++                        _pt = extract_types_from_schema(_ps)
++                        if _pt and "string" not in _pt:
++                            _is_string = False
++                    if _is_string:
++                        escaped = json.dumps(partial_value, ensure_ascii=False)[1:-1]
++                        if first:
++                            parts.append(f'"{partial_name}": "{escaped}')
++                        else:
++                            parts.append(f', "{partial_name}": "{escaped}')
++
++            current_partial = "{" + "".join(parts)
++            delta = self._compute_json_diff(current_partial, prev_raw)
++
++        # ---- Step 4: Detect function end ----
++        func_ended = (
++            self.function_end_token in tool_text
++            and not self.json_closed
++        )
++
++        if func_ended:
++            # Build complete JSON from accumulated_params
++            full_json = json.dumps(
++                self.accumulated_params, ensure_ascii=False)
++
++            if idx < len(self.prev_tool_call_arr):
++                self.prev_tool_call_arr[idx]["arguments"] = full_json
++
++            _log(
++                "opt23 Step4 func_ended: tool=%s idx=%s "
++                "accumulated=%s full_json=%s prev_raw=%s delta_before=%s",
++                self.current_function_name, idx,
++                self.accumulated_params, full_json,
++                prev_raw, delta)
++
++            # Compute closing delta (the } suffix)
++            streamed_total = prev_raw + delta if delta else prev_raw
++            if full_json.startswith(streamed_total):
++                delta += full_json[len(streamed_total):]
++            elif full_json.startswith(prev_raw):
++                delta = full_json[len(prev_raw):]
++
++            self.json_closed = True
++            self.in_function = False
++            self.accumulated_params = {}
++
++        if not delta:
++            return None
++
++
++        # Update streamed args
++        if idx < len(self.streamed_args_for_tool):
++            self.streamed_args_for_tool[idx] += delta
++
++        return DeltaMessage(
++            tool_calls=[
++                DeltaToolCall(
++                    index=idx,
++                    function=DeltaFunctionCall(arguments=delta),
++                )
++            ]
++        )
++
++    def _emit_xml_json_diff(
++        self, tool_text: str, param_starts: list[int],
++        tool_start_idx: int, current_text: str,
++    ) -> DeltaMessage | None:
++        """Phase 3: build partial args JSON from XML params, emit via
++        safe-prefix JSON-diff.
++
++        Constructs a PARTIAL JSON string (no closing ``}``, trailing
++        string value has no closing ``"``) so that each diff is a valid
++        JSON continuation that can be safely accumulated by the client.
++
++        Activated when ``VLLM_QWEN3X_TOOL_FIX == 4`` (=4 互转, 待设计).
++        """
++        partial_name = None
++        partial_value = None
++
++        # Extract partial param value when a param is still forming
++        if self.param_count < len(param_starts):
++            incomplete_start = param_starts[self.param_count]
++            param_text = tool_text[
++                incomplete_start + len(self.parameter_prefix):
++            ]
++            if ">" not in param_text:
++                return None
++            name_end = param_text.find(">")
++            partial_name = param_text[:name_end]
++
++            # Type gate: only string params get partial-inclusion
++            _pc = find_tool_properties(
++                self.tools, self.current_function_name or "",
++            )
++            _ps = _pc.get(partial_name, {})
++            _pt = extract_types_from_schema(_ps)
++            if _pt and "string" not in _pt:
++                return None
++
++            value_start = (
++                incomplete_start + len(self.parameter_prefix) + name_end + 1
++            )
++            _abs_value_start = tool_start_idx + value_start
++            if (
++                _abs_value_start < len(current_text)
++                and current_text[_abs_value_start:_abs_value_start + 1] == "\n"
++            ):
++                _abs_value_start += 1
++            partial_value = current_text[_abs_value_start:]
++
++        # --- build partial JSON string ---
++        # Uses the same format as json_fragments: starts with "{",
++        # completed params have fully-formed key-value pairs, and the
++        # trailing string param (if any) is left open (no closing ").
++        parts = []
++        first = True
++        for name, value in self.accumulated_params.items():
++            serialized = json.dumps(value, ensure_ascii=False)
++            if first:
++                parts.append(f'"{name}": {serialized}')
++                first = False
++            else:
++                parts.append(f', "{name}": {serialized}')
++
++        if partial_name and partial_value is not None:
++            escaped = json.dumps(partial_value, ensure_ascii=False)[1:-1]
++            if first:
++                parts.append(f'"{partial_name}": "{escaped}')
++            else:
++                parts.append(f', "{partial_name}": "{escaped}')
++
++        current_partial = "{" + "".join(parts)
++
++        # --- diff ---
++        idx = self.current_tool_index
++        prev = (
++            self.streamed_args_for_tool[idx]
++            if idx < len(self.streamed_args_for_tool) else ""
++        )
++        delta = self._compute_json_diff(current_partial, prev)
++        if not delta:
++            return None
++
++        if idx < len(self.streamed_args_for_tool):
++            self.streamed_args_for_tool[idx] += delta
++
++        # _pending_brace is never used here — the "{" is always part
++        # of the partial JSON string built above.  Mark it consumed
++        # so the func-end handler won't re-emit it.
++        self._pending_brace = False
++
++        return DeltaMessage(
++            tool_calls=[
++                DeltaToolCall(
++                    index=idx,
++                    function=DeltaFunctionCall(arguments=delta),
++                )
++            ]
++        )
+ 
+     def _convert_param_value(
+         self, param_value: str, param_name: str, param_config: dict, func_name: str
+@@ -141,7 +953,12 @@ class Qwen3CoderToolParser(ToolParser):
+         parameters = function_call_str[end_index + 1 :]
+         param_dict = {}
+         for match_text in self.tool_call_parameter_regex.findall(parameters):
+-            idx = match_text.index(">")
++            try:
++                idx = match_text.index(">")
++            except ValueError:
++                # Truncated parameter tag (e.g. <parameter=name without >).
++                # Skip gracefully instead of crashing the entire extraction.
++                continue
+             param_name = match_text[:idx]
+             param_value = str(match_text[idx + 1 :])
+             # Remove prefix and trailing \n
+@@ -230,13 +1047,105 @@ class Qwen3CoderToolParser(ToolParser):
+             return pending_and_delta[: -len(current_prefix)]
+         return pending_and_delta
+ 
++    def _extract_tool_calls_json(self, model_output: str) -> list[ToolCall]:
++        """opt23 fix=2: 提取 JSON 格式工具调用（<tool_call>{...}</tool_call> 或裸 JSON）。"""
++        raw_calls: list[dict] = []
++        for _m in re.finditer(
++            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
++            model_output,
++            re.DOTALL,
++        ):
++            try:
++                raw_calls.append(json.loads(_m.group(1)))
++            except Exception:
++                pass
++        if not raw_calls:
++            try:
++                _start = model_output.find("{")
++                if _start != -1:
++                    _d = json.loads(model_output[_start:])
++                    if isinstance(_d, dict) and (
++                        "name" in _d or "arguments" in _d
++                    ):
++                        raw_calls.append(_d)
++            except Exception:
++                pass
++        tcs: list[ToolCall] = []
++        for _d in raw_calls:
++            _name = _d.get("name")
++            _args = _d.get("arguments")
++            if _name is None:
++                continue
++            if not isinstance(_args, str):
++                _args = json.dumps(_args, ensure_ascii=False)
++            tcs.append(
++                ToolCall(
++                    type="function",
++                    function=FunctionCall(name=str(_name), arguments=_args),
++                )
++            )
++        return tcs
++
++    @staticmethod
++    def _detect_tool_format(text: str) -> str:
++        """Auto-detect tool-call format from generated text."""
++        if text.find("<function=") != -1:
++            return "xml"
++        if '"name"' in text and '"arguments"' in text:
++            return "json"
++        return "xml"
++
++    @staticmethod
++    def _detect_tool_format_if_present(text: str) -> str | None:
++        """Detect an explicit tool-call format; None when absent."""
++        if text.find("<function=") != -1:
++            return "xml"
++        if '"name"' in text and '"arguments"' in text:
++            return "json"
++        return None
++
++    def _resolve_tool_format(
++        self,
++        request: ChatCompletionRequest,
++        text: str = "",
++    ) -> str | None:
++        """Resolve the client-selected tool-call format (config-first)."""
++        kwargs = getattr(request, "chat_template_kwargs", None) or {}
++        cfg = kwargs.get("tool_call_format")
++        if cfg in ("xml", "json"):
++            return cfg
++        if not text:
++            return None
++        return self._detect_tool_format(text)
++
+     def extract_tool_calls(
+         self,
+         model_output: str,
+         request: ChatCompletionRequest,
+     ) -> ExtractedToolCallInformation:
++        # opt23 §11.42 (v122 框架迁入): config-first 格式解析——serving 按
++        # fix 注入 request.chat_template_kwargs.tool_call_format（fix=2→json、
++        # fix=3→xml）优先；无配置则按输出形态检测（_detect_tool_format）。
++        _fmt = self._resolve_tool_format(request, model_output)
++
+         # Quick check to avoid unnecessary processing
+-        if self.tool_call_prefix not in model_output:
++        if _fmt == "json" or (_fmt is None and self.tool_call_prefix not in model_output):
++            # opt23 §11.22: 所有 fix 均 fallback JSON 提取（模型输出
++            # <tool_call>{"name"...}</tool_call> 或裸 JSON 时保证解析成功）
++            json_tcs = self._extract_tool_calls_json(model_output)
++            if json_tcs:
++                self.prev_tool_call_arr = [
++                    {
++                        "name": tc.function.name,
++                        "arguments": tc.function.arguments,
++                    }
++                    for tc in json_tcs
++                ]
++                return ExtractedToolCallInformation(
++                    tools_called=True,
++                    tool_calls=json_tcs,
++                    content=None,
++                )
+             return ExtractedToolCallInformation(
+                 tools_called=False, tool_calls=[], content=model_output
+             )
+@@ -327,7 +1236,32 @@ class Qwen3CoderToolParser(ToolParser):
+ 
+         # Check if we need to advance to next tool
+         if self.json_closed and not self.in_function:
+-            # Check if this tool call has ended
++            # 优化 B: JSON 格式无 </tool_call> 标记，参数完整后直接推进
++            if self._json_tool_active:
++                self.current_tool_index += 1
++                self.header_sent = False
++                self.param_count = 0
++                self.json_started = False
++                self.json_closed = False
++                self.accumulated_params = {}
++                self.is_tool_call_started = False
++                # Clear active flag so Section 3 can re-detect or release
++                # subsequent content, and Section 4 won't re-enter handler
++                # for an already-processed tool call. fix=2 时保持 JSON 激活。
++                self._json_tool_active = self._fix_force_json
++                # opt23: reset partial streaming state
++                self._partial_emit_offset = 0
++                self._partial_param_start = -1
++                self._partial_emitted = ""
++                self._partial_prefix = ""
++                self._pending_brace = False
++                self._func_dup_detected = False
++                self._stream_last_fp = None
++                self._stream_partial_name = None
++                self._stream_partial_value = None
++                return None
++
++            # Check if this tool call has ended (XML format)
+             tool_ends = current_text.count(self.tool_call_end_token)
+             if tool_ends > self.current_tool_index:
+                 # This tool has ended, advance to next
+@@ -337,6 +1271,16 @@ class Qwen3CoderToolParser(ToolParser):
+                 self.json_started = False
+                 self.json_closed = False
+                 self.accumulated_params = {}
++                # opt23: reset partial streaming state for next tool call
++                self._partial_emit_offset = 0
++                self._partial_param_start = -1
++                self._partial_emitted = ""
++                self._partial_prefix = ""
++                self._pending_brace = False
++                self._func_dup_detected = False
++                self._stream_last_fp = None
++                self._stream_partial_name = None
++                self._stream_partial_value = None
+ 
+                 # Check if there are more tool calls
+                 tool_starts = current_text.count(self.tool_call_start_token)
+@@ -348,7 +1292,41 @@ class Qwen3CoderToolParser(ToolParser):
+ 
+         # Handle normal content before tool calls
+         if not self.is_tool_call_started:
+-            # Check if tool call is starting
++            # opt23 fix=2: 强制 JSON 路由——<tool_call> 标记（模板 json 分支
++            # 引导模型输出 <tool_call> 包裹 JSON）或 JSON 特征（"name"/
++            # "arguments"）出现即激活。不能只等 "name" 特征：模型输出
++            # <tool_call>\n{"name":...} 时 <tool_call> 先到达，XML 检测会
++            # 抢先激活（expat 解析 JSON 失败吞掉工具调用）。无条件强制
++            # 则会吞纯文本正文（think 后无正文根因）。<function= 表示
++            # 模型实际输出 XML，不在此激活（走 XML 解析路径）。
++            if self._fix_force_json:
++                _json_name = current_text.find('"name"')
++                _json_args = current_text.find('"arguments"')
++                if (current_text.find(self.tool_call_start_token) != -1
++                        or (_json_name != -1 and _json_args != -1
++                            and _json_name < _json_args)):
++                    self._json_tool_active = True
++                    self.is_tool_call_started = True
++                    return None
++            # opt23 Path C: detect JSON-format tool calls before falling
++            # into XML detection.  JSON format looks like:
++            #   {"name": "Write", "arguments": {...}}
++            # Only activate when no XML markers are present (otherwise
++            # a JSON-looking substring inside XML content could trigger).
++            # 优化 C: 从已处理 JSON 工具调用的结束位置之后搜索，
++            # 避免重新检测到同一个已完成的工具调用。
++            _json_search = max(self._json_processed_end, 0)
++            _json_name = current_text.find('"name"', _json_search)
++            _json_args = current_text.find('"arguments"', _json_search)
++            if (_json_name != -1
++                    and _json_args != -1
++                    and _json_name < _json_args
++                    and current_text.find(self.tool_call_prefix) == -1):
++                self._json_tool_active = True
++                self.is_tool_call_started = True
++                return None  # routing takes effect on next call
++
++            # Check if tool call is starting (XML)
+             tool_start_candidates = [
+                 pos
+                 for pos in (
+@@ -390,6 +1368,34 @@ class Qwen3CoderToolParser(ToolParser):
+                 # Normal content, no tool call
+                 return DeltaMessage(content=delta_text)
+ 
++        # opt23 §11.27: JSON 激活时用 safe-prefix diff 增量发射（fix=1/2 的
++        # JSON 真流式——复刻 vLLM 主线 PR #45413 的 _compute_arg_delta）。
++        # 退休时认为「JSON format does not occur in practice」，但前端 JSON
++        # 指令会让模型输出 JSON——恢复接入，前端要流式 json 就提供增量。
++        if self._json_tool_active:
++            _json_delta = self._handle_json_tool_streaming(current_text, delta_text)
++            if _json_delta is not None:
++                return _json_delta
++            # opt23 fix=2: JSON 路由激活后不得落入 original incremental
++            # path——双路径竞争输出导致增量不一致（original path 未转义
++            # 真实控制字符/解码 \n，Write content 参数非法根因）。
++            return None
++
++        # v1.2.2+: =1, =2, =3, =5 all use the original incremental path
++        # (json_fragments loop + _is_streaming_tool enhancements for
++        # Write/Edit).  The JSON-diff and XML-diff handlers are retired
++        # — they emitted one combined delta per step which caused
++        # CC-HAHA SSE truncation for long-content tool calls.
++        # Qwen3Coder's structural tag is always XML, so JSON format
++        # does not occur in practice regardless of client format.
++        if VLLM_QWEN3X_TOOL_FIX != 0:
++            _log(
++                "opt23 original path: fix=%s json_closed=%s func=%s "
++                "delta_len=%d",
++                VLLM_QWEN3X_TOOL_FIX,
++                self.json_closed, self.current_function_name,
++                len(delta_text))
++
+         # Check if we're between tool calls (waiting for next one)
+         # Count tool calls we've seen vs processed
+         tool_start_positions = self._tool_start_positions(current_text)
+@@ -466,15 +1472,32 @@ class Qwen3CoderToolParser(ToolParser):
+             # json_started from what was actually streamed.
+             if not self.json_started:
+                 self.json_started = True
+-                self.streamed_args_for_tool[self.current_tool_index] += "{"
+-                return DeltaMessage(
+-                    tool_calls=[
+-                        DeltaToolCall(
+-                            index=self.current_tool_index,
+-                            function=DeltaFunctionCall(arguments="{"),
+-                        )
+-                    ]
+-                )
++                if self._is_streaming_tool:
++                    # opt23: if a parameter tag is already in tool_text,
++                    # defer "{" and combine it with the first param delta
++                    # so CC-HAHA receives a parseable partial_json.
++                    # Otherwise fall back to bare "{" — the original
++                    # behavior that the model can recover from when
++                    # params arrive in a subsequent delta.
++                    if tool_text.find(self.parameter_prefix) != -1:
++                        self._pending_brace = True
++                        # Fall through to parameter processing
++                    else:
++                        if self.current_tool_index < len(
++                                self.streamed_args_for_tool):
++                            self.streamed_args_for_tool[
++                                self.current_tool_index] += "{"
++                        return DeltaMessage(tool_calls=[
++                            DeltaToolCall(index=self.current_tool_index,
++                                function=DeltaFunctionCall(arguments="{"))
++                        ])
++                else:
++                    if self.current_tool_index < len(self.streamed_args_for_tool):
++                        self.streamed_args_for_tool[self.current_tool_index] += "{"
++                    return DeltaMessage(tool_calls=[
++                        DeltaToolCall(index=self.current_tool_index,
++                            function=DeltaFunctionCall(arguments="{"))
++                    ])
+ 
+             # Find all parameter start positions in current tool_text
+             param_starts = []
+@@ -486,6 +1509,52 @@ class Qwen3CoderToolParser(ToolParser):
+                 param_starts.append(search_idx)
+                 search_idx += len(self.parameter_prefix)
+ 
++            # opt23: detect model duplication of <function=...> within
++            # the same tool_text.  Gated by env var — this is a streaming
++            # artifact detection heuristic.
++            _func_positions: list = []
++            if VLLM_QWEN3X_TOOL_FIX:
++                _known_names = {t.function.name for t in (self.tools or [])
++                                if getattr(t, 'function', None)
++                                and getattr(t.function, 'name', None)}
++                _fsi = 0
++                while True:
++                    _fsi = tool_text.find(self.tool_call_prefix, _fsi)
++                    if _fsi == -1:
++                        break
++                    _close = tool_text.find(">", _fsi + len(self.tool_call_prefix))
++                    if _close != -1:
++                        _name = tool_text[
++                            _fsi + len(self.tool_call_prefix):_close
++                        ]
++                        if _name in _known_names:
++                            _func_positions.append(_fsi)
++                    _fsi += len(self.tool_call_prefix)
++
++                # Exclude <function=...> tags that appear inside
++                # parameter values.  Once the first <parameter= opens,
++                # any subsequent "<function=" is content text, not a
++                # real function tag.  Without this filter the detector
++                # falsely triggers when Write/Edit content happens to
++                # mention tool-call syntax (e.g. documenting tool usage).
++                if param_starts:
++                    _func_positions = [p for p in _func_positions
++                                       if p < param_starts[0]]
++
++                if len(_func_positions) > 1:
++                    # Model re-emitted the function tag. Use the LAST
++                    # <function=...> as the authoritative position and
++                    # ignore parameters that appear before it (they
++                    # belong to the stale/duplicated first function).
++                    _last_func = _func_positions[-1]
++                    param_starts = [p for p in param_starts if p > _last_func]
++                    # Only reset param_count the first time we detect
++                    # the duplication for this tool call.
++                    if not self._func_dup_detected:
++                        self._func_dup_detected = True
++                        self.param_count = 0
++
++
+             # Process ALL complete params in a loop (spec decode fix).
+             # With speculative decoding a single delta can deliver
+             # multiple complete parameters at once. The old single-pass
+@@ -518,6 +1587,14 @@ class Qwen3CoderToolParser(ToolParser):
+                     if next_param_idx != -1 and (
+                         func_end_idx == -1 or next_param_idx < func_end_idx
+                     ):
++                        # String params (file_path, old_string, etc.)
++                        # must wait for an explicit </parameter> tag.
++                        # Using the next <parameter= as a fallback
++                        # boundary would complete the param with a
++                        # partial value (e.g. file_path="/home" before
++                        # the model finishes generating the full path).
++                        if self._is_string_param(current_param_name):
++                            break
+                         param_end_idx = next_param_idx
+                     elif func_end_idx != -1:
+                         param_end_idx = func_end_idx
+@@ -563,11 +1640,55 @@ class Qwen3CoderToolParser(ToolParser):
+                 else:
+                     json_fragment = f', "{current_param_name}": {serialized_value}'
+ 
++                # opt23: If this parameter was partially streamed, emit
++                # only the delta (remaining content + closing quote).
++                if self._partial_emitted:
++                    emitted_total = len(self._partial_emitted)
++                    if len(json_fragment) > emitted_total:
++                        json_fragment = json_fragment[emitted_total:]
++                    else:
++                        # opt23 §11.40: partial 发射可能比完整参数长——
++                        # XML 参数值以换行包裹（<parameter=x>\n值\n</parameter>），
++                        # partial 发射保留尾部格式换行而完整参数 trim 掉，
++                        # 导致 emitted_total > len(json_fragment)。此时内容
++                        # 已全部发射，缺失的只是闭合引号——补发最后一个
++                        # 字符（闭合 "），否则前端拼接 JSON 非法
++                        # （Edit old_string 未闭合根因）。
++                        json_fragment = (
++                            json_fragment[-1:]
++                            if json_fragment.endswith('"') else ""
++                        )
++                    self._partial_emitted = ""
++                    self._partial_prefix = ""
++                    if not json_fragment:
++                        # All content was already streamed; skip
++                        # duplicate emission but still advance counters.
++                        self.param_count += 1
++                        continue
++
+                 self.param_count += 1
+                 json_fragments.append(json_fragment)
+ 
++            # opt23 XML→JSON 互转 (=4): build complete JSON from accumulated
++            # params (+ partial value) and emit via safe-prefix diffing.
++            # This bypasses the json_fragments + partial streaming paths
++            # entirely, producing only valid JSON continuation deltas.
++            # Only for =4 (双格式互转, 待设计), =3 is pure JSON no conversion.
++            if (VLLM_QWEN3X_TOOL_FIX == 4
++                    and self.current_function_name in self._STREAMING_TOOLS):
++                _ph3 = self._emit_xml_json_diff(
++                    tool_text, param_starts, tool_start_idx, current_text,
++                )
++                if _ph3 is not None:
++                    return _ph3
++
+             if json_fragments:
+                 combined = "".join(json_fragments)
++                # opt23: when _pending_brace deferred the "{", prepend
++                # it to the first json_fragment.
++                if self._pending_brace:
++                    combined = "{" + combined
++                    self._pending_brace = False
+ 
+                 if self.current_tool_index < len(self.streamed_args_for_tool):
+                     self.streamed_args_for_tool[self.current_tool_index] += combined
+@@ -587,6 +1708,115 @@ class Qwen3CoderToolParser(ToolParser):
+                     ]
+                 )
+ 
++            # opt23 Path B enhanced: partial streaming starts AFTER
++            # file_path has been fully parsed (appears in accumulated_params).
++            # This protects file_path from fragmentation regardless of
++            # parameter order (e.g. Edit [replace_all, file_path, ...]).
++            # Non-string params (replace_all boolean) are already blocked
++            # by the type gate below.  All other string params (old_string,
++            # content, new_string) get incremental streaming — even large
++            # old_string values don't block the frontend.
++            _param_config = find_tool_properties(
++                self.tools, self.current_function_name or "",
++            )
++            _expected_total = len(_param_config) if _param_config else 0
++
++            if (not json_fragments
++                    and self._is_streaming_tool
++                    and self.in_function
++                    and self.json_started
++                    and self.param_count > 0
++                    and self.param_count < len(param_starts)
++                    and _expected_total > 1
++                    and self.accumulated_params.get("file_path") is not None
++                    and self.current_tool_index < len(self.streamed_args_for_tool)):
++                incomplete_start = param_starts[self.param_count]
++                if incomplete_start != self._partial_param_start:
++                    self._partial_param_start = incomplete_start
++                    self._partial_emit_offset = 0
++                    self._partial_emitted = ""
++                    self._partial_prefix = ""
++
++                param_text = tool_text[incomplete_start
++                                       + len(self.parameter_prefix):]
++                if ">" in param_text:
++                    name_end = param_text.find(">")
++                    param_name = param_text[:name_end]
++                    # opt23: Partial streaming only for string-type
++                    # parameters.  Boolean (replace_all), integer etc.
++                    # must be fully parsed and type-coerced via
++                    # _convert_param_value.  Raw streaming bypasses
++                    # type coercion, producing "false" vs false
++                    # mismatches that break remaining-delta computation
++                    # and cause CC-HAHA to receive malformed JSON.
++                    _pc = _param_config  # reuse from gate above
++                    _ps = _pc.get(param_name, {})
++                    _pt = extract_types_from_schema(_ps)
++                    if _pt and "string" not in _pt:
++                        return None
++
++                    if not self._partial_prefix:
++                        if self.param_count == 0:
++                            _prefix = f'"{param_name}": "'
++                        else:
++                            _prefix = f', "{param_name}": "'
++                        self._partial_prefix = _prefix
++                    value_start = (incomplete_start
++                                   + len(self.parameter_prefix)
++                                   + name_end + 1)
++                    # value_start is relative to tool_text. Adjust to
++                    # absolute position in current_text for slicing.
++                    _abs_value_start = tool_start_idx + value_start
++                    if (_abs_value_start < len(current_text)
++                            and current_text[_abs_value_start:_abs_value_start + 1]
++                            == "\n"):
++                        _abs_value_start += 1
++
++                    current_value = current_text[_abs_value_start:]
++                    if len(current_value) > self._partial_emit_offset:
++                        _now = time.monotonic()
++                        if (_now - self._last_partial_time) < 0.25:
++                            return None
++                        _raw_new = current_value[
++                            self._partial_emit_offset:]
++                        # opt23: strip trailing XML close-tag fragments
++                        # (</parameter>, </function>, …) so they don't
++                        # leak into the streamed JSON string value.
++                        _safe_len = self._safe_content_length(_raw_new)
++                        if _safe_len == 0:
++                            return None
++                        new_content = _raw_new[:_safe_len]
++                        self._partial_emit_offset += _safe_len
++                        if new_content:
++                            escaped = json.dumps(
++                                new_content, ensure_ascii=False)[1:-1]
++                            if not self._partial_emitted:
++                                fragment = self._partial_prefix + escaped
++                                self._partial_emitted += fragment
++                            else:
++                                fragment = escaped
++                                self._partial_emitted += fragment
++                            if self.current_tool_index < len(
++                                    self.streamed_args_for_tool):
++                                self.streamed_args_for_tool[
++                                    self.current_tool_index] += fragment
++                            self._last_partial_time = _now
++                            return DeltaMessage(
++                                tool_calls=[
++                                    DeltaToolCall(
++                                        index=self.current_tool_index,
++                                        function=DeltaFunctionCall(
++                                            arguments=fragment),
++                                    )
++                                ]
++                            )
++                    return None
++
++            if (not json_fragments
++                    and self.param_count < len(param_starts)
++                    and self.current_tool_index < len(self.streamed_args_for_tool)):
++                return None
++
+             # Check for function end AFTER processing parameters.
+             # This ordering is critical: with speculative decoding a
+             # burst can deliver the final parameter value together with
+@@ -594,6 +1824,18 @@ class Qwen3CoderToolParser(ToolParser):
+             # "}" and set in_function=False before the parameter loop
+             # ever ran, causing the parameter to be silently dropped.
+             if not self.json_closed and self.function_end_token in tool_text:
++                # opt23: when _pending_brace deferred "{" but no
++                # <parameter=...> tags arrived, fall back to bare
++                # "{" + "}" — the original behavior that the model
++                # can recover from (user empirically confirmed).
++                if self._pending_brace and not param_starts:
++                    if self.current_tool_index < len(
++                            self.streamed_args_for_tool):
++                        self.streamed_args_for_tool[
++                            self.current_tool_index] += "{"
++                    self._pending_brace = False
++                    # Fall through to emit "}" via function-end handler
++
+                 self.json_closed = True
+ 
+                 func_start = tool_text.find(self.tool_call_prefix) + len(
+@@ -609,9 +1851,31 @@ class Qwen3CoderToolParser(ToolParser):
+                         if parsed_tool and self.current_tool_index < len(
+                             self.prev_tool_call_arr
+                         ):
++                            args = parsed_tool.function.arguments
+                             self.prev_tool_call_arr[self.current_tool_index][
+                                 "arguments"
+-                            ] = parsed_tool.function.arguments
++                            ] = args
++                            _log(
++                                "opt23 main func_end: tool=%s idx=%s "
++                                "args=%s streamed=%s",
++                                self.current_function_name,
++                                self.current_tool_index,
++                                args,
++                                self.streamed_args_for_tool[
++                                    self.current_tool_index]
++                                if self.current_tool_index < len(
++                                    self.streamed_args_for_tool)
++                                else "N/A")
++                            # opt23 Fix B: detect empty tool calls
++                            # (model emitted <function=NAME></function>
++                            # with no <parameter=...> tags).
++                            if args == "{}" and not self._is_streaming_tool:
++                                logger.warning(
++                                    "Qwen3Coder streaming: tool '%s' "
++                                    "has no parameters (empty {}) — "
++                                    "model error, call will fail",
++                                    self.current_function_name or "?",
++                                )
+                     except Exception:
+                         logger.debug(
+                             "Failed to parse tool call during streaming: %s",
+@@ -619,8 +1883,28 @@ class Qwen3CoderToolParser(ToolParser):
+                             exc_info=True,
+                         )
+ 
++                # opt23: for streaming tools (Write/Edit), compute the real
++                # remaining delta from the full parsed JSON minus what was
++                # already streamed, instead of emitting "}" as a bare
++                # punctuation delta that clients cannot parse.
++                remaining = "}"
++                if self._is_streaming_tool:
++                    if self.current_tool_index < len(self.prev_tool_call_arr):
++                        full_json = self.prev_tool_call_arr[
++                            self.current_tool_index
++                        ].get("arguments", "")
++                        streamed = (
++                            self.streamed_args_for_tool[self.current_tool_index]
++                            if self.current_tool_index < len(
++                                self.streamed_args_for_tool)
++                            else ""
++                        )
++                        if full_json and full_json.startswith(streamed):
++                            remaining = full_json[len(streamed):]
++                self._pending_brace = False
++
+                 if self.current_tool_index < len(self.streamed_args_for_tool):
+-                    self.streamed_args_for_tool[self.current_tool_index] += "}"
++                    self.streamed_args_for_tool[self.current_tool_index] += remaining
+                 else:
+                     logger.warning(
+                         "streamed_args_for_tool out of sync: index=%d len=%d",
+@@ -632,7 +1916,7 @@ class Qwen3CoderToolParser(ToolParser):
+                     tool_calls=[
+                         DeltaToolCall(
+                             index=self.current_tool_index,
+-                            function=DeltaFunctionCall(arguments="}"),
++                            function=DeltaFunctionCall(arguments=remaining),
+                         )
+                     ]
+                 )
+@@ -646,9 +1930,14 @@ class Qwen3CoderToolParser(ToolParser):
+         return None
+ 
+     def get_structural_tag(self, request: ChatCompletionRequest):
+-        return get_model_structural_tag(
++        tag = get_model_structural_tag(
+             model="qwen_3_5",
+             tools=request.tools,
+             tool_choice=request.tool_choice,
+             reasoning=get_enable_structured_outputs_in_reasoning(),
+         )
++        # v1.2.2+: 不再尝试检测客户端格式。Qwen3Coder 的 structural tag
++        # 始终是 XML 格式（str(tag) 返回 Python repr，不含 "name"），
++        # 所以 _json_tool_active 始终为 False。所有工具走原始路径。
++        return tag
++
+diff --git a/tool_parsers/qwen3xml_tool_parser.py b/tool_parsers/qwen3xml_tool_parser.py
+index d5b87ea..fea8633 100644
+--- a/tool_parsers/qwen3xml_tool_parser.py
++++ b/tool_parsers/qwen3xml_tool_parser.py
+@@ -1,3 +1,4 @@
++from vllm.envs import VLLM_QWEN3X_TOOL_FIX
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import ast
+@@ -26,7 +27,7 @@ from vllm.tool_parsers.abstract_tool_parser import (
+     Tool,
+     ToolParser,
+ )
+-from vllm.tool_parsers.utils import find_tool_properties
++from vllm.tool_parsers.utils import find_common_prefix, find_tool_properties
+ 
+ logger = init_logger(__name__)
+ 
+@@ -1157,10 +1158,310 @@ class Qwen3XMLToolParser(ToolParser):
+         self.prev_tool_call_arr: list[dict] = []
+         self.streamed_args_for_tool: list[str] = []
+ 
++        # opt23 §11.22: JSON 路由状态（对齐 qwen3-coder 机制——qwen3xml 内部实现）
++        self.current_tool_index: int = 0
++        self.header_sent: bool = False
++        self.current_tool_id: str | None = None
++        self.current_function_name: str | None = None
++        self.in_function: bool = False
++        self.json_started: bool = False
++        self.json_closed: bool = False
++        self.accumulated_params: dict = {}
++        self._json_processed_end: int = 0
++        self._partial_emit_offset: int = 0
++        self._partial_param_start: int = -1
++        self._partial_emitted: str = ""
++        self._partial_prefix: str = ""
++        self._pending_brace: bool = False
++        self._func_dup_detected: bool = False
++        self._stream_last_fp: str | None = None
++        self._stream_partial_name: str | None = None
++        self._stream_partial_value: str | None = None
++
+         logger.info(
+             "vLLM Successfully import tool parser %s !", self.__class__.__name__
+         )
+ 
++    @property
++    def _fix_force_json(self) -> bool:
++        """opt23 §11.22: fix=2 强制 JSON 路由（对齐 qwen3-coder）。"""
++        return VLLM_QWEN3X_TOOL_FIX == 2
++
++    @property
++    def _fix_force_xml(self) -> bool:
++        """opt23 §11.22: fix=3/4 强制 XML 路由（对齐 qwen3-coder）。"""
++        return VLLM_QWEN3X_TOOL_FIX in (3, 4)
++
++    def _compute_json_diff(self, current_json: str, prev_streamed: str) -> str:
++        """Safe-prefix diff on JSON strings for incremental tool args
++        （对齐 qwen3-coder _compute_json_diff）。"""
++        if not prev_streamed:
++            return current_json
++        if not current_json:
++            return ""
++        common = find_common_prefix(prev_streamed, current_json)
++        return current_json[len(common):]
++
++    def _is_inside_json_string(self, json_text: str) -> bool:
++        """对齐 qwen3-coder：判断文本结尾是否在 JSON 字符串值内。"""
++        in_string = False
++        escape_next = False
++        for c in json_text:
++            if escape_next:
++                escape_next = False
++                continue
++            if c == '\\':
++                escape_next = True
++                continue
++            if c == '"':
++                in_string = not in_string
++        return in_string
++
++    def _unescape_display_chars(self, s: str) -> str:
++        """对齐 qwen3-coder：把 \\n/\\t/\\r 转义序列还原为字面字符（前端显示）。"""
++        result: list[str] = []
++        i = 0
++        while i < len(s):
++            c = s[i]
++            if c == '\\' and i + 1 < len(s):
++                nxt = s[i + 1]
++                if nxt == '\\' or nxt == '"':
++                    result.append(c)
++                    result.append(nxt)
++                elif nxt == 'n':
++                    result.append('\n')
++                elif nxt == 't':
++                    result.append('\t')
++                elif nxt == 'r':
++                    result.append('\r')
++                else:
++                    result.append(c)
++                    result.append(nxt)
++                i += 2
++                continue
++            result.append(c)
++            i += 1
++        return ''.join(result)
++
++    @staticmethod
++    def _escape_raw_control_chars(s: str) -> str:
++        """模型可能把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
++        字符串值，导致 JSON 非法（Write content 参数丢失根因）。仅在
++        字符串值内部把控制字符转义为 JSON 合法序列（\\n → \\\\n）。"""
++        out = []
++        i = 0
++        n = len(s)
++        in_str = False
++        _esc_map = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
++        while i < n:
++            c = s[i]
++            if c == "\\":
++                out.append(c)
++                if i + 1 < n:
++                    out.append(s[i + 1])
++                    i += 2
++                else:
++                    i += 1
++                continue
++            if c == '"':
++                in_str = not in_str
++                out.append(c)
++                i += 1
++                continue
++            if in_str and ord(c) < 0x20:
++                out.append(_esc_map.get(c, "\\u%04x" % ord(c)))
++                i += 1
++                continue
++            out.append(c)
++            i += 1
++        return "".join(out)
++
++    def _handle_json_tool_streaming(
++        self, current_text: str, delta_text: str
++    ) -> DeltaMessage | None:
++        """JSON 格式工具调用流式处理（对齐 qwen3-coder _handle_json_tool_streaming）。
++
++        Supported format (single tool)::
++
++            {"name": "Write", "arguments": {"file_path": "/x", "content": "..."}}
++
++        每个 delta 是合法 JSON 前缀片段，适合 Anthropic input_json_delta 累积。
++        """
++        if not self.header_sent:
++            _name_kw = current_text.find('"name"')
++            if _name_kw == -1:
++                return None
++            _colon = current_text.find(":", _name_kw)
++            if _colon == -1:
++                return None
++            _q1 = current_text.find('"', _colon + 1)
++            if _q1 == -1:
++                return None
++            _q2 = current_text.find('"', _q1 + 1)
++            if _q2 == -1:
++                return None
++            name = current_text[_q1 + 1:_q2]
++            if not name:
++                return None
++
++            self.current_function_name = name
++            self.current_tool_id = make_tool_call_id()
++            self.header_sent = True
++            self.in_function = True
++            self.json_started = True
++            self.accumulated_params = {}
++
++            self.prev_tool_call_arr.append({"name": name, "arguments": "{}"})
++            self.streamed_args_for_tool.append("")
++
++            return DeltaMessage(
++                tool_calls=[
++                    DeltaToolCall(
++                        index=self.current_tool_index,
++                        id=self.current_tool_id,
++                        function=DeltaFunctionCall(name=name, arguments=""),
++                        type="function",
++                    )
++                ]
++            )
++
++        _args_kw = current_text.find('"arguments"')
++        if _args_kw == -1:
++            return None
++        _args_colon = current_text.find(":", _args_kw)
++        if _args_colon == -1:
++            return None
++        _val_start = _args_colon + 1
++        while _val_start < len(current_text) and current_text[_val_start] in " \t\n\r":
++            _val_start += 1
++        if _val_start >= len(current_text):
++            return None
++        if current_text[_val_start] != "{":
++            return None
++
++        _depth = 0
++        _in_str = False
++        _esc = False
++        _json_end = -1
++        for i in range(_val_start, len(current_text)):
++            c = current_text[i]
++            if _esc:
++                _esc = False
++                continue
++            if c == "\\":
++                _esc = True
++                continue
++            if c == '"' and not _esc:
++                _in_str = not _in_str
++                continue
++            if _in_str:
++                continue
++            if c == "{":
++                _depth += 1
++            elif c == "}":
++                _depth -= 1
++                if _depth == 0:
++                    _json_end = i + 1
++                    break
++
++        if _json_end > 0:
++            current_args = current_text[_val_start:_json_end]
++        else:
++            current_args = current_text[_val_start:]
++
++        # opt23: 模型把真实换行/控制字符（XML 换行习惯）直接输出进 JSON
++        # 字符串值时 → 字符串值内转义为 JSON 合法序列，否则参数提取
++        # 非法/截断（Write content 丢失、工具调用参数不完整根因）。
++        current_args = self._escape_raw_control_chars(current_args)
++
++        idx = self.current_tool_index
++        prev = self.streamed_args_for_tool[idx] if idx < len(self.streamed_args_for_tool) else ""
++        # opt23 §11.29: 对齐主线 hermes `_compute_args_diff`（前缀截取增量）。
++        if len(current_args) <= len(prev):
++            return None
++        delta = current_args[len(prev):]
++        if not delta:
++            return None
++
++        if idx < len(self.streamed_args_for_tool):
++            self.streamed_args_for_tool[idx] += delta
++
++        if (_json_end > 0 and idx < len(self.prev_tool_call_arr)
++                and (_json_end == len(current_text)
++                     or current_text[_json_end] == '}')):
++            self.prev_tool_call_arr[idx]["arguments"] = current_args
++            self.json_closed = True
++            self.in_function = False
++            self._json_processed_end = _json_end
++
++        # opt23 §11.34: 对齐 qwen3-coder——之前为前端显示打字机效果把转义
++        # 序列（\n \t \r）反转义为真实控制字符，但前端累积拼接后 JSON 非法
++        # （真实换行在字符串值内），工具执行 InputValidationError。直接发射
++        # 转义版增量（字面 \n），前端拼接即可 json.parse。
++        display_delta = delta
++
++        return DeltaMessage(
++            tool_calls=[
++                DeltaToolCall(
++                    index=idx,
++                    function=DeltaFunctionCall(arguments=display_delta),
++                )
++            ]
++        )
++
++    def _detect_json_output(self, current_text: str) -> bool:
++        """检测 JSON 格式工具调用输出（对齐 coder 的 _json_tool_active 检测）。"""
++        if self._fix_force_xml:
++            return False
++        _name = current_text.find('"name"')
++        _args = current_text.find('"arguments"')
++        _xml = current_text.find("<function=")
++        return _name != -1 and _args != -1 and _name < _args and _xml == -1
++
++    def _extract_tool_calls_json(self, model_output: str) -> list[ToolCall]:
++        """opt23 §11.22: 提取 JSON 格式工具调用（<tool_call>{...}</tool_call> 或裸 JSON）。
++
++        qwen3xml 是 expat XML parser，原生只解析 XML；模型输出 JSON 时由
++        此 fallback 提取，保证 JSON 格式调用也能成功（fix=1/2/3/4 通用）。
++        """
++        raw_calls: list[dict] = []
++        for _m in re.finditer(
++            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
++            model_output,
++            re.DOTALL,
++        ):
++            try:
++                raw_calls.append(json.loads(_m.group(1)))
++            except Exception:
++                pass
++        if not raw_calls:
++            try:
++                _start = model_output.find("{")
++                if _start != -1:
++                    _d = json.loads(model_output[_start:])
++                    if isinstance(_d, dict) and (
++                        "name" in _d or "arguments" in _d
++                    ):
++                        raw_calls.append(_d)
++            except Exception:
++                pass
++        tcs: list[ToolCall] = []
++        for _d in raw_calls:
++            _name = _d.get("name")
++            _args = _d.get("arguments")
++            if _name is None:
++                continue
++            if not isinstance(_args, str):
++                _args = json.dumps(_args, ensure_ascii=False)
++            tcs.append(
++                ToolCall(
++                    id=make_tool_call_id(),
++                    type="function",
++                    function=FunctionCall(name=str(_name), arguments=_args),
++                )
++            )
++        return tcs
++
+     def extract_tool_calls(
+         self,
+         model_output: str,
+@@ -1171,12 +1472,53 @@ class Qwen3XMLToolParser(ToolParser):
+         self.prev_tool_call_arr = []
+         self.streamed_args_for_tool = []
+         self.parser.set_tools(self.tools)
+-        result = self.parser.parse_single_streaming_chunks(model_output)
+-        if not result.tool_calls:
++        # opt23 §11.22: JSON 路由（fix=2 强制 / fix=1 检测）→ 内部 JSON 提取
++        # （expat 对 JSON 输出会产生无效 XML tool_call，需绕过）。
++        if self._fix_force_json or self._detect_json_output(model_output):
++            json_tcs = self._extract_tool_calls_json(model_output)
++            if json_tcs:
++                self.prev_tool_call_arr = [
++                    {
++                        "name": tc.function.name,
++                        "arguments": tc.function.arguments,
++                    }
++                    for tc in json_tcs
++                ]
++                return ExtractedToolCallInformation(
++                    tool_calls=json_tcs,
++                    tools_called=True,
++                    content=None,
++                )
+             return ExtractedToolCallInformation(
+                 tool_calls=[],
+                 tools_called=False,
+-                content=result.content,
++                content=model_output,
++            )
++        try:
++            result = self.parser.parse_single_streaming_chunks(model_output)
++        except Exception:
++            result = None
++        if result is None or not result.tool_calls:
++            # opt23 §11.22: expat 未解析出 XML tool_call（模型输出 JSON 或
++            # expat 异常）→ 内部 JSON 提取兜底。
++            json_tcs = self._extract_tool_calls_json(model_output)
++            if json_tcs:
++                self.prev_tool_call_arr = [
++                    {
++                        "name": tc.function.name,
++                        "arguments": tc.function.arguments,
++                    }
++                    for tc in json_tcs
++                ]
++                return ExtractedToolCallInformation(
++                    tool_calls=json_tcs,
++                    tools_called=True,
++                    content=None,
++                )
++            return ExtractedToolCallInformation(
++                tool_calls=[],
++                tools_called=False,
++                content=result.content if result else model_output,
+             )
+         else:
+             tool_calls = []
+@@ -1242,6 +1584,43 @@ class Qwen3XMLToolParser(ToolParser):
+             self.prev_tool_call_arr = []
+             self.streamed_args_for_tool = []
+             self.parser.set_tools(self.tools)
++            # Reset JSON 路由状态（对齐 qwen3-coder _reset_streaming_state）
++            self.current_tool_index = 0
++            self.header_sent = False
++            self.current_tool_id = None
++            self.current_function_name = None
++            self.in_function = False
++            self.json_started = False
++            self.json_closed = False
++            self.accumulated_params = {}
++            self._json_processed_end = 0
++
++        # opt23 §11.22: JSON 路由（fix=2 强制 / fix=1 检测）→ 内部
++        # _handle_json_tool_streaming（对齐 qwen3-coder 的 JSON 真流式增量）。
++        # fix=2 强制 JSON 但模型实际输出 XML（含 <function= 标记）时兜底走
++        # expat XML 路径——「xml 也强制走 json」指最终输出统一 JSON tool_calls。
++        # fix=2 强制需在 JSON 特征（"name"/"arguments"）出现后才进入——
++        # 无条件拦截会把纯文本正文吞进 JSON 工具解析（think 后无正文根因）。
++        if self._fix_force_json:
++            if current_text.find("<function=") == -1:
++                # opt23 §11.34: 对齐 qwen3-coder——<tool_call> 标记（模板 json
++                # 分支引导模型输出 <tool_call> 包裹 JSON）或 JSON 特征
++                # （"name"/"arguments"）出现即激活 JSON 路由；handler 返回
++                # None 时同样 return None（BLOCK expat XML 双路径——双路径
++                # 竞争导致增量不一致/参数非法）。<function= 表示模型实际
++                # 输出 XML，不强制 JSON（走 expat XML 解析）。
++                _json_name = current_text.find('"name"')
++                _json_args = current_text.find('"arguments"')
++                _has_marker = current_text.find("<tool_call>") != -1
++                if (_has_marker or (_json_name != -1 and _json_args != -1
++                                    and _json_name < _json_args)):
++                    return self._handle_json_tool_streaming(
++                        current_text, delta_text
++                    ) or None
++        elif self._detect_json_output(current_text):
++            return self._handle_json_tool_streaming(
++                current_text, delta_text
++            ) or None
+ 
+         # Model sometimes outputs separately causing delta_text to be empty.
+         # If there were tool_calls before and all current tool_calls have ended,
+-- 
+2.43.0
+
+
+From 470f8cb912f6b24b548265e006be1b7351b020f9 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 17:42:00 +0800
+Subject: [PATCH 3/9] =?UTF-8?q?feat(opt24):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
+ =?UTF-8?q?=20Drafter=20=E4=B8=8A=E4=B8=8B=E6=96=87=E5=AF=B9=E9=BD=90?=
+ =?UTF-8?q?=EF=BC=88=E5=8E=9F=20opt26=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- config/speculative.py: Auto-extend drafter max_position_embeddings/max_position
+  对齐 target max_model_len（插入 _maybe_override_draft_max_model_len 之后）
+
+已确认 v1.3.0 内置（无需重放）:
+- opt24 4.1 cudagraph MTP 尺寸自动化（config/vllm.py _sm70_nomtp_cudagraph_capture_sizes
+  + MTP 专用 [1,2,4,8,9,18] + smallq_env 自动设置，与 v122 等价）
+- opt21 B1 Auto Dynamic NTK / B2 MTP 安全检测（上一阶段已重放）
+---
+ config/speculative.py | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/config/speculative.py b/config/speculative.py
+index 45eedb0..499255f 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -903,6 +903,24 @@ class SpeculativeConfig:
+                     )
+                 )
+ 
++                # opt24 (opt26): Auto-extend drafter max_position_embeddings
++                # to match target model max_model_len.
++                hf_config = self.draft_model_config.hf_config
++                if hf_config is not None:
++                    for pos_attr in ("max_position_embeddings", "max_position"):
++                        current_pos = getattr(hf_config, pos_attr, None)
++                        if (current_pos is not None
++                                and current_pos < self.max_model_len):
++                            setattr(hf_config, pos_attr, self.max_model_len)
++                            logger.info_once(
++                                "Extended Drafter %s from %d to %d "
++                                "to match target model max_model_len=%d.",
++                                pos_attr,
++                                current_pos,
++                                self.max_model_len,
++                                self.max_model_len,
++                            )
++
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+-- 
+2.43.0
+
+
+From c0161e3fb00f1959bf32dc9ccac32154ba784f35 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 18:03:48 +0800
+Subject: [PATCH 4/9] =?UTF-8?q?feat(opt23):=20v1.3.0=20=E9=87=8D=E6=94=BE?=
+ =?UTF-8?q?=E5=B9=B6=E5=8F=91=E4=BC=98=E5=8C=96=EF=BC=88DDTree=20=E5=B0=81?=
+ =?UTF-8?q?=E9=A1=B6=20+=2065/35=20budget=20+=20GPU-LRU=20=E5=A4=9A?=
+ =?UTF-8?q?=E5=B9=B6=E5=8F=91=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+scheduler.py:
+- long_prefill_token_threshold 自动配置（max_seqs>=4 → 25% max_batched_tokens）
+- 65/35 prefill/decode budget（prefill_cap + decode_per_request）
+- DDTree 膨胀自封顶（num_new_tokens = min(tree, max(base, decode_per_request))）
+- WAITING prefill 封顶 prefill_cap
+
+envs.py:
+- VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT（默认 False）
+
+llm_base_proposer.py:
+- init 处：多并发放行（MULTI_CONCURRENT）/ 降级 CPU LRU 警告（替代硬 raise）
+- 方法内：解锁 max_batch_size>1 → total tail pool 1536（per_rank=min(512,1536//tp)）
+
+static_draft_vocab.py:
+- tail 校验拆 base/tail，多并发允许动态 tail（≤512/rank 编译限制）
+
+gpu_model_runner.py:
+- prefill bootstrap 多请求并集 top-k 注入共享 tail（逗号分隔 request_id）
+- _commit 逐 rid mark_consumed
+
+引擎验证:
+- 单并发回归：工具调用正常
+- 8 并发纯文本：全部 finish=stop 正确输出（6.1s）
+- 4 并发工具调用：全部 tool_calls 参数完整（2.7s）
+- GPU-LRU 多并发激活：max_num_seqs=8 per_rank_tail=384 total_pool=1536
+---
+ envs.py                              |  4 +++
+ v1/core/sched/scheduler.py           | 34 +++++++++++++++++++++-
+ v1/spec_decode/llm_base_proposer.py  | 34 +++++++++++++++++++++-
+ v1/spec_decode/static_draft_vocab.py | 19 ++++++++++--
+ v1/worker/gpu_model_runner.py        | 43 ++++++++++++++++++++++++++--
+ 5 files changed, 126 insertions(+), 8 deletions(-)
+
+diff --git a/envs.py b/envs.py
+index 958ddb1..84efabf 100644
+--- a/envs.py
++++ b/envs.py
+@@ -261,6 +261,7 @@ if TYPE_CHECKING:
+     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL: bool = False
+     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU: bool = False
+     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK: int = 0
++    VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT: bool = False
+     VLLM_SM70_MTP_DENSE_F16_FASTPATH: bool = True
+     VLLM_SM70_MTP_DENSE_F16_ALLOWLIST: str | None = None
+     VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS: bool = False
+@@ -2071,6 +2072,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU": lambda: bool(
+         int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU", "0"))
+     ),
++    "VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT": lambda: bool(
++        int(os.getenv("VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT", "0"))
++    ),
+     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK": lambda: int(
+         os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK", "0")
+     ),
+diff --git a/v1/core/sched/scheduler.py b/v1/core/sched/scheduler.py
+index 7fa7757..4ca0f20 100644
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -324,6 +324,23 @@ class Scheduler(SchedulerInterface):
+ 
+         self._pause_state: PauseState = PauseState.UNPAUSED
+ 
++        # opt23: auto-adjust long_prefill_token_threshold for concurrent loads
++        max_seqs = self.scheduler_config.max_num_seqs
++        max_batched_tokens = self.scheduler_config.max_num_batched_tokens
++        safe_threshold = int(max_batched_tokens * 0.25)
++        current_threshold = self.scheduler_config.long_prefill_token_threshold
++        if max_seqs >= 4:
++            if current_threshold == 0:
++                self.scheduler_config.long_prefill_token_threshold = safe_threshold
++                logger.info("Auto-adjusted long_prefill_token_threshold from 0 to %d",
++                            safe_threshold)
++            elif current_threshold < safe_threshold:
++                logger.warning(
++                    "long_prefill_token_threshold (%d) is below safe minimum (%d). Forcing to %d.",
++                    current_threshold, safe_threshold, safe_threshold,
++                )
++                self.scheduler_config.long_prefill_token_threshold = safe_threshold
++
+     @staticmethod
+     def _ddtree_payload_is_flat_chain(payload: object) -> bool:
+         is_flat_chain = getattr(payload, "is_flat_chain", None)
+@@ -495,6 +512,15 @@ class Scheduler(SchedulerInterface):
+         self.kv_cache_manager.new_step_starts()
+ 
+         # First, schedule the RUNNING requests.
++        # opt23: 65/35 prefill/decode budget split for concurrent loads
++        running_count = len(self.running)
++        if running_count > 0:
++            decode_per_request = self.scheduler_config.max_num_batched_tokens // running_count
++            prefill_cap = int(self.scheduler_config.max_num_batched_tokens * 0.65)
++        else:
++            decode_per_request = self.scheduler_config.max_num_batched_tokens
++            prefill_cap = self.scheduler_config.max_num_batched_tokens
++
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
+@@ -561,7 +587,10 @@ class Scheduler(SchedulerInterface):
+                     and tree_num_new_tokens <= token_budget
+                     and tree_num_new_tokens <= max_len_tokens
+                 ):
+-                    num_new_tokens = tree_num_new_tokens
++                    # opt23: DDTree expansion self-capping — never let the
++                    # tree draft exceed decode_per_request headroom.
++                    capped = max(num_new_tokens, decode_per_request)
++                    num_new_tokens = min(tree_num_new_tokens, capped)
+                     _ddtree_debug_log(
+                         "schedule expanded req=%s num_new=%d",
+                         request.request_id,
+@@ -891,6 +920,9 @@ class Scheduler(SchedulerInterface):
+                     threshold = self.scheduler_config.long_prefill_token_threshold
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
++                    # opt23: cap WAITING prefill when RUNNING requests exist
++                    if running_count > 0:
++                        num_new_tokens = min(num_new_tokens, prefill_cap)
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
+index 85811c4..95ac3f5 100644
+--- a/v1/spec_decode/llm_base_proposer.py
++++ b/v1/spec_decode/llm_base_proposer.py
+@@ -242,7 +242,17 @@ class SpecDecodeBaseProposer:
+         )
+         if draft_vocab_config.gpu_lru_enabled:
+             if self.max_batch_size != 1:
+-                raise ValueError("Dynamic GPU LRU requires scheduler max_num_seqs=1.")
++                if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                    logger.info(
++                        "Dynamic GPU LRU multi-concurrent: max_num_seqs=%d.",
++                        self.max_batch_size,
++                    )
++                else:
++                    logger.warning(
++                        "Dynamic GPU LRU requires scheduler max_num_seqs=1, "
++                        "but max_num_seqs=%d. Falling back to CPU LRU.",
++                        self.max_batch_size,
++                    )
+             if draft_vocab_config.full_refresh_interval != 0:
+                 raise ValueError("Dynamic GPU LRU requires full_refresh_interval=0.")
+         self.token_arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
+@@ -2265,6 +2275,28 @@ class SpecDecodeBaseProposer:
+         full_refresh_interval = vocab_config.full_refresh_interval
+         fused_proposal_enabled = vocab_config.fused_proposal_enabled
+         gpu_lru_enabled = vocab_config.gpu_lru_enabled
++        if gpu_lru_enabled and self.max_batch_size > 1:
++            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                # opt23: true multi-concurrent GPU-LRU
++                # total tail pool = 1536, per-rank = 1536 // tp_size
++                # shared LRU pool across all concurrent requests
++                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
++                per_rank_tail = min(512, 1536 // tp_size)
++                if vocab_config.using_defaults:
++                    dynamic_tail_size = per_rank_tail
++                logger.info(
++                    "GPU LRU multi-concurrent enabled: max_num_seqs=%d "
++                    "per_rank_tail=%d total_pool=%d",
++                    self.max_batch_size, per_rank_tail,
++                    per_rank_tail * tp_size,
++                )
++            else:
++                logger.warning(
++                    "Dynamic GPU LRU requires max_num_seqs=1, "
++                    "but max_num_seqs=%d. Disabling GPU LRU, falling back to CPU LRU.",
++                    self.max_batch_size,
++                )
++                gpu_lru_enabled = False
+         if vocab_config.using_defaults:
+             logger.info(
+                 "Using default MTP dynamic draft vocabulary: base=%d tail=%d "
+diff --git a/v1/spec_decode/static_draft_vocab.py b/v1/spec_decode/static_draft_vocab.py
+index f7dbba7..8f8e4a8 100644
+--- a/v1/spec_decode/static_draft_vocab.py
++++ b/v1/spec_decode/static_draft_vocab.py
+@@ -854,11 +854,24 @@ def initialize_dynamic_draft_vocab(
+             raise ValueError(
+                 "Dynamic GPU LRU is validated only with fused TP2/TP4 proposal."
+             )
+-        if base_size != 98_304 or tail_size != 512:
++        if base_size != 98_304:
+             raise ValueError(
+-                "Dynamic GPU LRU requires the validated 98,304 base plus "
+-                "512 shard-local tail rows per rank."
++                "Dynamic GPU LRU requires the validated 98,304 base."
+             )
++        if tail_size != 512:
++            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                if tail_size > 512:
++                    raise ValueError(
++                        "GPU LRU multi-concurrent tail_size exceeds "
++                        "compiled kernel limit (512 per rank)."
++                    )
++            else:
++                raise ValueError(
++                    "Dynamic GPU LRU requires the validated 512 "
++                    "shard-local tail rows per rank (got %d). "
++                    "Set VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT=1 "
++                    "for dynamic tail sizing." % tail_size
++                )
+         if target_lm_head.weight.dtype != torch.float16:
+             raise ValueError("Dynamic GPU LRU currently requires an FP16 LM-head.")
+         if full_refresh_interval != 0:
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index e6dbb57..b527a49 100644
+--- a/v1/worker/gpu_model_runner.py
++++ b/v1/worker/gpu_model_runner.py
+@@ -6811,7 +6811,39 @@ class GPUModelRunner(
+         if self.dynamic_draft_vocab_prefill_topk == 0:
+             return None
+         if self.input_batch.num_reqs != 1:
+-            return None
++            if not envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                return None
++            # opt23: multi-concurrent GPU-LRU — traverse all prefilling
++            # requests, union their top-k candidates into shared tail
++            all_candidate_ids = []
++            consumed_ids = []
++            for req_idx, req_id in enumerate(self.input_batch.req_ids):
++                num_computed = int(
++                    self.input_batch.num_computed_tokens_cpu[req_idx]
++                )
++                num_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
++                if num_computed >= num_prompt:
++                    continue  # not prefilling
++                candidate_ids = self._dynamic_draft_vocab_prefill_bootstrap.maybe_prepare_candidates(
++                    req_id,
++                    logits,
++                    topk=self.dynamic_draft_vocab_prefill_topk,
++                    num_computed_tokens=num_computed,
++                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens.get(
++                        req_id, 0
++                    ),
++                    num_prompt_tokens=num_prompt,
++                    spec_decode_active=spec_decode_metadata is not None,
++                )
++                if candidate_ids is not None:
++                    all_candidate_ids.append(candidate_ids)
++                    consumed_ids.append(req_id)
++            if not all_candidate_ids:
++                return None
++            if len(all_candidate_ids) == 1:
++                return consumed_ids[0], all_candidate_ids[0]
++            union = torch.unique(torch.cat(all_candidate_ids))
++            return ",".join(consumed_ids), union
+ 
+         request_id = self.input_batch.req_ids[0]
+         request_index = self.input_batch.req_id_to_index[request_id]
+@@ -6858,10 +6890,15 @@ class GPUModelRunner(
+ 
+         request_id, candidate_ids = bootstrap
+         update_dynamic_draft_vocab(candidate_ids, sampled_token_ids)
+-        self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(request_id)
++        # opt23: handle multi-concurrent (comma-separated request IDs)
++        for rid in request_id.split(","):
++            self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(rid)
++        num_reqs = request_id.count(",") + 1
+         logger.info(
+-            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: topk=%d.",
++            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: "
++            "topk=%d reqs=%d.",
+             self.dynamic_draft_vocab_prefill_topk,
++            num_reqs,
+         )
+ 
+     def _sample(
+-- 
+2.43.0
+
+
+From 65945fac173d8045f0a2562226e1518012fce1f3 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 18:42:19 +0800
+Subject: [PATCH 5/9] =?UTF-8?q?feat(mtp3):=20=E8=A7=A3=E9=99=A4=20Dynamic?=
+ =?UTF-8?q?=20fused=20proposal=20MTP4=20=E7=A1=AC=E9=99=90=E5=88=B6?=
+ =?UTF-8?q?=EF=BC=8C=E6=94=AF=E6=8C=81=20MTP3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- static_draft_vocab.py: 行993 num_speculative_tokens != 4 收紧限制
+  放宽为 (3, 4)（fused buffers 全部按 num_spec_tokens 参数化分配，
+  fused_sample 按 spec_step_idx 调用——内核本身支持 MTP3）
+
+引擎验证 (MTP3 + 8并发 + GPU LRU 多并发):
+- 就绪 355s，per_rank_tail=384 total_pool=1536
+- 工具调用回归：Write/Read 参数完整
+- 8 并发纯文本：全部 stop 正确输出（22.8s）
+- 4 并发工具调用：全部 tool_calls 参数完整（2.8s）
+---
+ v1/spec_decode/static_draft_vocab.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/v1/spec_decode/static_draft_vocab.py b/v1/spec_decode/static_draft_vocab.py
+index 8f8e4a8..77e6087 100644
+--- a/v1/spec_decode/static_draft_vocab.py
++++ b/v1/spec_decode/static_draft_vocab.py
+@@ -990,8 +990,10 @@ def initialize_dynamic_draft_vocab(
+         sm70_ops = _get_sm70_ops()
+         if tp_size not in (2, 4):
+             raise ValueError("Dynamic fused proposal currently requires TP2 or TP4.")
+-        if num_speculative_tokens != 4:
+-            raise ValueError("Dynamic fused proposal currently requires MTP4.")
++        if num_speculative_tokens not in (3, 4):
++            raise ValueError(
++                "Dynamic fused proposal currently requires MTP3 or MTP4."
++            )
+         if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
+             raise RuntimeError("Dynamic fused proposal SM70 ops are not built.")
+         if gpu_lru_enabled and (
+-- 
+2.43.0
+
+
+From 0124dad56fa1252b607e0aa7d5e691240557c1d1 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 19:35:34 +0800
+Subject: [PATCH 6/9] =?UTF-8?q?feat(opt21):=20KV=20=E7=BC=93=E5=AD=98?=
+ =?UTF-8?q?=E6=97=B6=E9=99=90=E4=BC=98=E5=8C=96=EF=BC=88Warm=20Block=20?=
+ =?UTF-8?q?=E6=97=B6=E9=97=B4=E5=80=92=E6=8E=92=E5=9B=9E=E6=94=B6=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原 opt22 独立设计重新纳入 opt21 基础项。唯一改动 block_pool.py（10 处）：
+- __init__: warm_blocks FIFO + _warm_freed_at 时间戳 + _retention_tiers 压力阶梯
+- free_blocks: 带 hash block 进 warm（保留 hash+时间戳），无 hash 直接回收
+- get_new_blocks: free queue 不足先 _promote_warm_blocks(shortage)
+- _get_retention_seconds: usage=(allocated+warm)/total 查阶梯（12h/6h/3h/1h/30m/即刻）
+- _promote_warm_blocks: Phase1 过期回收 + Phase2 无视时限冷→热
+- touch: in_warm 标记防 free_block_queue.remove() 崩溃（Bug#1）
+- get_num_free_blocks: free + warm
+- warm_block_count property
+- reset_prefix_cache: drain warm 到 free queue
+
+环境变量: VLLM_KV_RETENTION_P25~P80（os.environ 直读，不经 envs.py）
+---
+ v1/core/block_pool.py | 176 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 168 insertions(+), 8 deletions(-)
+
+diff --git a/v1/core/block_pool.py b/v1/core/block_pool.py
+index 513e4bf..c817882 100644
+--- a/v1/core/block_pool.py
++++ b/v1/core/block_pool.py
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++import time
++from collections import OrderedDict
+ from collections.abc import Iterable, Sequence
+ from typing import Any
+ 
+@@ -181,6 +184,47 @@ class BlockPool:
+ 
+         self.metrics_collector = metrics_collector
+ 
++        # --- Warm-block retention (opt21: cold→hot time-based reclaim) ---
++        # Blocks freed while still holding a valid hash are placed here
++        # instead of the free queue.  They stay in the prefix-cache hash
++        # table so that a subsequent request with the same prefix can
++        # touch() them without eviction.
++        #
++        # Each warm block carries a freed_at monotonic timestamp.
++        # Blocks are ordered FIFO (oldest freed → newest freed).
++        # When the free queue is empty, blocks are promoted (hash evicted,
++        # moved to free queue) oldest-first (cold→hot), governed by a
++        # pressure-gated retention time:
++        #
++        #   usage < 25 %  →  retain 12 hours
++        #   usage < 35 %  →  retain  6 hours
++        #   usage < 50 %  →  retain  3 hours
++        #   usage < 65 %  →  retain  1 hour
++        #   usage < 80 %  →  retain 30 minutes
++        #   usage ≥ 80 %  →  immediate reclaim (cold→hot)
++        #
++        # This naturally keeps ~25-35 % of blocks hot: frequently-hit
++        # blocks are touched, removed from warm, and re-freed with a
++        # fresh timestamp at the *back* of the queue, so they survive
++        # many reclamation cycles while cold blocks age out first.
++        #
++        # OrderedDict provides FIFO ordering and O(1) removal on touch().
++        self.warm_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
++        # Parallel map: block_id → freed_at (time.monotonic seconds).
++        self._warm_freed_at: dict[int, float] = {}
++
++        # Retention tiers: (max_usage, retention_seconds), cold→hot order.
++        # At ≥80% retention is 0: immediate cold→hot reclaim.
++        _p25 = int(os.environ.get("VLLM_KV_RETENTION_P25", "43200"))   # 12h
++        _p35 = int(os.environ.get("VLLM_KV_RETENTION_P35", "21600"))   #  6h
++        _p50 = int(os.environ.get("VLLM_KV_RETENTION_P50", "10800"))   #  3h
++        _p65 = int(os.environ.get("VLLM_KV_RETENTION_P65", "3600"))    #  1h
++        _p80 = int(os.environ.get("VLLM_KV_RETENTION_P80", "1800"))    # 30m
++        self._retention_tiers: list[tuple[float, int]] = [
++            (0.25, _p25), (0.35, _p35), (0.50, _p50),
++            (0.65, _p65), (0.80, _p80),
++        ]
++
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+     ) -> list[KVCacheBlock] | None:
+@@ -344,6 +388,13 @@ class BlockPool:
+         if num_blocks > self.get_num_free_blocks():
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
++        # Promote warm blocks if the free queue alone is insufficient.
++        # Promotion is time-based: only blocks whose age exceeds the
++        # current retention window are eligible (coldest first).
++        shortage = num_blocks - self.free_block_queue.num_free_blocks
++        if shortage > 0 and self.warm_blocks:
++            self._promote_warm_blocks(shortage)
++
+         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+ 
+         # In order to only iterate the list once, we duplicated code a bit
+@@ -401,16 +452,23 @@ class BlockPool:
+ 
+     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+         """Touch a block increases its reference count by 1, and may remove
+-        the block from the free queue. This is used when a block is hit by
+-        another request with the same prefix.
++        the block from the free queue or warm list. This is used when a
++        block is hit by another request with the same prefix.
+ 
+         Args:
+             blocks: A list of blocks to touch.
+         """
+         for block in blocks:
++            # Remove from warm list if the block was retained there.
++            # This avoids hash eviction — the block is reused directly.
++            in_warm = block.block_id in self.warm_blocks
++            if in_warm:
++                del self.warm_blocks[block.block_id]
++                self._warm_freed_at.pop(block.block_id, None)
+             # ref_cnt=0 means this block is in the free list (i.e. eviction
+-            # candidate), so remove it.
+-            if block.ref_cnt == 0 and not block.is_null:
++            # candidate), so remove it.  Skip if the block was in warm_blocks
++            # — warm blocks are NOT in the free queue.
++            if block.ref_cnt == 0 and not block.is_null and not in_warm:
+                 self.free_block_queue.remove(block)
+             block.ref_cnt += 1
+             if self.metrics_collector:
+@@ -420,6 +478,13 @@ class BlockPool:
+         """Free a list of blocks. The blocks should be ordered by their
+         eviction priority, where the first block will be evicted first.
+ 
++        Blocks that still hold a valid hash (were previously cached) are
++        placed in the *warm* list rather than the free queue.  This keeps
++        them in the hash table so subsequent requests with the same prefix
++        can ``touch()`` them without eviction.  They are only promoted to
++        the free queue (and their hashes evicted) when a new allocation
++        exhausts the free queue.
++
+         Args:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
+@@ -428,9 +493,19 @@ class BlockPool:
+         blocks_list = list(ordered_blocks)
+         for block in blocks_list:
+             block.ref_cnt -= 1
+-        self.free_block_queue.append_n(
+-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+-        )
++
++        free_list: list[KVCacheBlock] = []
++        now = time.monotonic()
++        for block in blocks_list:
++            if block.ref_cnt != 0 or block.is_null:
++                continue
++            if block.block_hash is not None and self.enable_caching:
++                # Retain hash: place in warm list with a timestamp.
++                self.warm_blocks[block.block_id] = block
++                self._warm_freed_at[block.block_id] = now
++            else:
++                free_list.append(block)
++        self.free_block_queue.append_n(free_list)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -469,6 +544,13 @@ class BlockPool:
+             )
+             return False
+ 
++        # Drain warm blocks to the free queue (evicting their hashes).
++        while self.warm_blocks:
++            _, block = self.warm_blocks.popitem(last=False)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++        self._warm_freed_at.clear()
++
+         # Remove all hashes so that no new blocks will hit.
+         self.cached_block_hash_to_block = BlockHashToBlockMap()
+ 
+@@ -486,13 +568,91 @@ class BlockPool:
+ 
+         return True
+ 
++    @property
++    def warm_block_count(self) -> int:
++        """Number of blocks currently retained in the warm list."""
++        return len(self.warm_blocks)
++
++    def _get_retention_seconds(self) -> float:
++        """Return retention time (seconds) for the current cache pressure.
++
++        Hot blocks (recently freed / frequently hit) are at the back of
++        the FIFO queue and survive longer; cold blocks (old, unused) are
++        at the front and age out first.  At ≥80 % usage, retention is 0
++        — immediate cold→hot reclaim.
++        """
++        total = self.num_gpu_blocks - 1  # exclude null block
++        free = self.free_block_queue.num_free_blocks
++        warm = len(self.warm_blocks)
++        allocated = max(total - free - warm, 0)
++        usage = (allocated + warm) / max(total, 1)
++
++        for threshold, retention in self._retention_tiers:
++            if usage < threshold:
++                return float(retention)
++        return 0.0  # ≥80%: immediate reclaim
++
++    def _promote_warm_blocks(self, num_blocks: int) -> int:
++        """Promote *num_blocks* warm blocks to the free queue.
++
++        Blocks are always reclaimed oldest-first (cold → hot).
++        Phase 1: promote blocks whose age exceeds the current retention
++        time.  Phase 2: if still short, promote the oldest remaining
++        blocks regardless of age.
++
++        Frequently-hit blocks are naturally protected: each cache hit
++        removes the block from warm via ``touch()``; when re-freed it
++        gets a fresh timestamp at the *back* of the queue, so it
++        survives many reclamation cycles.
++
++        Returns the number of blocks actually promoted.
++        """
++        now = time.monotonic()
++        retention = self._get_retention_seconds()
++
++        promoted = 0
++        # Phase 1: promote blocks whose retention has expired (oldest first).
++        expired: list[int] = []
++        for block_id in self.warm_blocks:
++            if promoted >= num_blocks:
++                break
++            freed_at = self._warm_freed_at.get(block_id, 0.0)
++            if freed_at <= 0.0 or (now - freed_at) >= retention:
++                expired.append(block_id)
++                promoted += 1
++
++        for block_id in expired:
++            block = self.warm_blocks.pop(block_id)
++            self._warm_freed_at.pop(block_id, None)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++
++        # Phase 2: still need blocks → promote oldest remaining (cold→hot).
++        while promoted < num_blocks and self.warm_blocks:
++            block_id, block = next(iter(self.warm_blocks.items()))
++            del self.warm_blocks[block_id]
++            self._warm_freed_at.pop(block_id, None)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++            promoted += 1
++
++        if promoted:
++            logger.debug(
++                "Promoted %d warm blocks (retention=%.0fs, %d remain).",
++                promoted, retention, len(self.warm_blocks),
++            )
++        return promoted
++
+     def get_num_free_blocks(self) -> int:
+         """Get the number of free blocks in the pool.
+ 
++        Includes warm blocks (freed but hash-retained) since they can be
++        promoted to the free queue on demand.
++
+         Returns:
+             The number of free blocks.
+         """
+-        return self.free_block_queue.num_free_blocks
++        return self.free_block_queue.num_free_blocks + len(self.warm_blocks)
+ 
+     def get_usage(self) -> float:
+         """Get the KV cache usage.
+-- 
+2.43.0
+
+
+From 042b658efde0974517fcefffbda4a91f13e14bd1 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 21:37:34 +0800
+Subject: [PATCH 7/9] =?UTF-8?q?feat(opt21):=20anthropic=20=E7=AB=AF?=
+ =?UTF-8?q?=E7=82=B9=20usage=20=E8=A1=A5=20cache=5Fread=5Finput=5Ftokens?=
+ =?UTF-8?q?=EF=BC=88=E7=9C=9F=E5=AE=9E=E7=BC=93=E5=AD=98=E5=91=BD=E4=B8=AD?=
+ =?UTF-8?q?=E6=95=B0=E6=8D=AE=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- anthropic/serving.py: 非流式 messages_full_converter + 流式 message_start/message_delta
+  三处从 usage.prompt_tokens_details.cached_tokens 填充 cache_read_input_tokens
+- 前端 cc-haha 可直接从 /v1/messages 获取真实缓存命中数据（替代固定常量修正）
+---
+ entrypoints/anthropic/serving.py | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/entrypoints/anthropic/serving.py b/entrypoints/anthropic/serving.py
+index f0379af..8d3571c 100644
+--- a/entrypoints/anthropic/serving.py
++++ b/entrypoints/anthropic/serving.py
+@@ -525,6 +525,12 @@ class AnthropicServingMessages(OpenAIServingChat):
+             usage=AnthropicUsage(
+                 input_tokens=generator.usage.prompt_tokens,
+                 output_tokens=generator.usage.completion_tokens,
++                cache_read_input_tokens=(
++                    generator.usage.prompt_tokens_details.cached_tokens
++                    if generator.usage.prompt_tokens_details
++                    and generator.usage.prompt_tokens_details.cached_tokens
++                    else None
++                ),
+             ),
+             kv_transfer_params=generator.kv_transfer_params,
+         )
+@@ -683,6 +689,13 @@ class AnthropicServingMessages(OpenAIServingChat):
+                                         if origin_chunk.usage
+                                         else 0,
+                                         output_tokens=0,
++                                        cache_read_input_tokens=(
++                                            origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                            if origin_chunk.usage
++                                            and origin_chunk.usage.prompt_tokens_details
++                                            and origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                            else None
++                                        ),
+                                     ),
+                                 ),
+                             )
+@@ -708,6 +721,13 @@ class AnthropicServingMessages(OpenAIServingChat):
+                                     output_tokens=origin_chunk.usage.completion_tokens
+                                     if origin_chunk.usage
+                                     else 0,
++                                    cache_read_input_tokens=(
++                                        origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                        if origin_chunk.usage
++                                        and origin_chunk.usage.prompt_tokens_details
++                                        and origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                        else None
++                                    ),
+                                 ),
+                             )
+                             data = chunk.model_dump_json(exclude_unset=True)
+-- 
+2.43.0
+
+
+From 7c53ee0f7156d04311c39bd93511a8dea0868e5e Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 22:22:40 +0800
+Subject: [PATCH 8/9] =?UTF-8?q?feat(opt23):=20MTP=20=E5=AE=8C=E6=95=B4?=
+ =?UTF-8?q?=E6=94=AF=E6=8C=81=EF=BC=880/1/2/3/4=EF=BC=89+=20fused=20?=
+ =?UTF-8?q?=E9=99=8D=E7=BA=A7=20+=20NTK=20=E9=BB=98=E8=AE=A4=20+=20fix=20?=
+ =?UTF-8?q?=E9=BB=98=E8=AE=A4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+opt23 MTP 完整支持（对齐原 opt24 设计）:
+- static_draft_vocab.py: resolve_mtp_draft_vocab_config 加 num_speculative_tokens
+  参数 + fused_ok（MTP1/2/3/4 共用参数化 kernel，fused 优先；kernel 不可用
+  降级 non-fused 标准 dynamic-vocab 路径）+ logger
+- static_draft_vocab.py: fused 校验放宽 MTP1/2/3/4（原仅 4）
+- llm_base_proposer.py: 两处 resolve 调用传 num_speculative_tokens
+
+MTP=0 关闭机制:
+- speculative.py: Field gt=0->ge=0 + __post_init__ 顶部 nst==0 self-disable
+  （method/model/nst->None）+ _verify_args 只拒负数
+- arg_utils.py: _maybe_apply_sm70_mtp_defaults spec_tokens<=0 跳过 auto-MTP +
+  create_speculative_config nst==0 返回 None
+
+NTK 默认启用:
+- config/model.py: Auto Dynamic NTK 去掉 VLLM_ALLOW_LONG_MAX_MODEL_LEN 条件
+  （默认启用；524288 硬拒绝保留）
+
+fix=1 默认启用（parser 绑定）:
+- cli_args.py: validate_parsed_serve_args 检测 tool_call_parser
+  qwen3_coder/qwen3_xml 且环境变量未设置 -> 自动 VLLM_QWEN3X_TOOL_FIX=1
+
+验证:
+- MTP0: --spec-tokens 0 关闭投机（speculative_config=None）+ 工具正常
+- MTP1/2/3/4: resolve 全档 fused=True（op 注册后）
+- MTP4 最终: GPU LRU 多并发 per_rank_tail=384 total=1536 + 工具矩阵正常
+  + 8 并发平方测试全对（10.6s）+ NTK yarn 自动升级 factor=2.0
+---
+ config/model.py                      | 91 +++++++++++++---------------
+ config/speculative.py                | 13 +++-
+ engine/arg_utils.py                  |  9 +++
+ entrypoints/openai/cli_args.py       | 11 ++++
+ v1/spec_decode/llm_base_proposer.py  |  2 +
+ v1/spec_decode/static_draft_vocab.py | 28 +++++++--
+ 6 files changed, 100 insertions(+), 54 deletions(-)
+
+diff --git a/config/model.py b/config/model.py
+index f838a7a..9768d75 100644
+--- a/config/model.py
++++ b/config/model.py
+@@ -2245,56 +2245,51 @@ def _get_and_verify_max_len(
+                 "derived_max_model_len will cause a CUDA array out-of-bounds "
+                 "error."
+             )
+-            if envs.VLLM_ALLOW_LONG_MAX_MODEL_LEN:
+-                # 1) Hard reject beyond 524288
+-                if max_model_len > 524288:
+-                    raise ValueError(
+-                        f"max_model_len ({max_model_len}) exceeds the maximum "
+-                        f"supported length (524288)."
+-                    )
+-
+-                # 2) Auto-dynamic NTK RoPE scaling
+-                if rope_parameters is not None:
+-                    for _rp_key, rp in rope_parameters.items():
+-                        rope_type = rp.get("rope_type", "default")
+-                        if rope_type == "default":
+-                            from math import ceil
+-
+-                            if "mrope_section" in rp:
+-                                new_rope_type = "yarn"
+-                            else:
+-                                new_rope_type = "dynamic"
+-                            rp["rope_type"] = new_rope_type
++            # opt21: Auto Dynamic NTK 默认启用（无论是否设置 VLLM_ALLOW_LONG_MAX_MODEL_LEN）
++            # 1) Hard reject beyond 524288
++            if max_model_len > 524288:
++                raise ValueError(
++                    f"max_model_len ({max_model_len}) exceeds the maximum "
++                    f"supported length (524288)."
++                )
+ 
++            # 2) Auto-dynamic NTK RoPE scaling
++            if rope_parameters is not None:
++                for _rp_key, rp in rope_parameters.items():
++                    rope_type = rp.get("rope_type", "default")
++                    if rope_type == "default":
++                        from math import ceil
++
++                        if "mrope_section" in rp:
++                            new_rope_type = "yarn"
++                        else:
++                            new_rope_type = "dynamic"
++                        rp["rope_type"] = new_rope_type
++
++                        max_pos_emb = getattr(
++                            hf_config, "max_position_embeddings", None
++                        )
++                        if max_pos_emb is None or max_pos_emb <= 0:
+                             max_pos_emb = getattr(
+-                                hf_config, "max_position_embeddings", None
++                                hf_config,
++                                "original_max_position_embeddings",
++                                2048,
+                             )
+-                            if max_pos_emb is None or max_pos_emb <= 0:
+-                                max_pos_emb = getattr(
+-                                    hf_config,
+-                                    "original_max_position_embeddings",
+-                                    2048,
+-                                )
+-                            factor = ceil(max_model_len / max_pos_emb)
+-                            rp["factor"] = float(factor)
+-                            if new_rope_type == "yarn":
+-                                rp["original_max_position_embeddings"] = max_pos_emb
+-
+-                            logger.warning_once(
+-                                "Auto-upgraded rope_type from 'default' to '%s' "
+-                                "with factor=%.1f (max_model_len=%d, "
+-                                "max_position_embeddings=%d)",
+-                                new_rope_type,
+-                                rp["factor"],
+-                                max_model_len,
+-                                max_pos_emb,
+-                            )
+-                        break
++                        factor = ceil(max_model_len / max_pos_emb)
++                        rp["factor"] = float(factor)
++                        if new_rope_type == "yarn":
++                            rp["original_max_position_embeddings"] = max_pos_emb
++
++                        logger.warning_once(
++                            "Auto-upgraded rope_type from 'default' to '%s' "
++                            "with factor=%.1f (max_model_len=%d, "
++                            "max_position_embeddings=%d)",
++                            new_rope_type,
++                            rp["factor"],
++                            max_model_len,
++                            max_pos_emb,
++                        )
++                    break
+ 
+-                logger.warning_once("%s %s", msg, warning)
+-            else:
+-                raise ValueError(
+-                    f"{msg} To allow overriding this maximum, set "
+-                    f"the env var VLLM_ALLOW_LONG_MAX_MODEL_LEN=1. {warning}"
+-                )
++            logger.warning_once("%s %s", msg, warning)
+     return int(max_model_len)
+diff --git a/config/speculative.py b/config/speculative.py
+index 499255f..8e63454 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -84,7 +84,7 @@ class SpeculativeConfig:
+     enforce_eager: bool | None = None
+     """Override the default enforce_eager from model_config"""
+     # General speculative decoding control
+-    num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
++    num_speculative_tokens: int = Field(default=None, ge=0)  # type: ignore[assignment]
+     """The number of speculative tokens, if provided. It will default to the
+     number in the draft model config if present, otherwise, it is required."""
+     model: str | None = None
+@@ -569,6 +569,15 @@ class SpeculativeConfig:
+         return hf_config
+ 
+     def __post_init__(self):
++        # opt23: MTP=0 disables speculative decoding (equivalent to not
++        # passing a speculative config at all).
++        if self.num_speculative_tokens is not None and self.num_speculative_tokens == 0:
++            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
++            self.method = None
++            self.model = None
++            self.num_speculative_tokens = None
++            return self
++
+         # Note: "method" is a new parameter that helps to extend the
+         # configuration of non-model-based proposers, and the "model" parameter
+         # will be used to set the draft model, eagle head, or additional weight
+@@ -1109,7 +1118,7 @@ class SpeculativeConfig:
+                 "n_predict parameter."
+             )
+ 
+-        if self.num_speculative_tokens <= 0:
++        if self.num_speculative_tokens < 0:
+             raise ValueError(
+                 "Expected num_speculative_tokens to be greater "
+                 f"than zero ({self.num_speculative_tokens})."
+diff --git a/engine/arg_utils.py b/engine/arg_utils.py
+index 121d2a3..ed2d1e0 100644
+--- a/engine/arg_utils.py
++++ b/engine/arg_utils.py
+@@ -1718,6 +1718,11 @@ class EngineArgs:
+         if self.speculative_config is None:
+             return None
+ 
++        # opt23: num_speculative_tokens=0 disables speculative decoding.
++        if self.speculative_config.get("num_speculative_tokens") == 0:
++            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
++            return None
++
+         if "enforce_eager" not in self.speculative_config:
+             self.speculative_config["enforce_eager"] = False
+             logger.info_once(
+@@ -1778,6 +1783,10 @@ class EngineArgs:
+             profile_updates.append("mamba_cache_mode=align")
+ 
+         if self.speculative_config is None:
++            # opt23: --spec-tokens 0 explicitly disables MTP — skip auto-MTP.
++            if self.spec_tokens is not None and self.spec_tokens <= 0:
++                logger.info("--spec-tokens=%d, skipping auto-MTP.", self.spec_tokens)
++                return
+             enable_auto_mtp = (
+                 envs.VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS
+                 or envs.VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS
+diff --git a/entrypoints/openai/cli_args.py b/entrypoints/openai/cli_args.py
+index f4b3c00..7dc96ab 100644
+--- a/entrypoints/openai/cli_args.py
++++ b/entrypoints/openai/cli_args.py
+@@ -8,6 +8,7 @@ purposes.
+ 
+ import argparse
+ import json
++import os
+ import ssl
+ from collections.abc import Sequence
+ from dataclasses import field
+@@ -394,6 +395,16 @@ def validate_parsed_serve_args(args: argparse.Namespace):
+     # Ensure that the chat template is valid; raises if it likely isn't
+     validate_chat_template(args.chat_template)
+ 
++    # opt22: enabling a qwen3 tool-call parser implies the dual-format fix=1
++    # by default — unless the user explicitly set VLLM_QWEN3X_TOOL_FIX (or the
++    # legacy VLLM_QWEN3CODER_STREAMING_FIX) in the environment.
++    if args.tool_call_parser in ("qwen3_coder", "qwen3_xml"):
++        if (
++            os.environ.get("VLLM_QWEN3X_TOOL_FIX") is None
++            and os.environ.get("VLLM_QWEN3CODER_STREAMING_FIX") is None
++        ):
++            os.environ["VLLM_QWEN3X_TOOL_FIX"] = "1"
++
+     # Enable auto tool needs a tool call parser to be valid
+     if args.enable_auto_tool_choice and not args.tool_call_parser:
+         raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
+diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
+index 95ac3f5..39367f7 100644
+--- a/v1/spec_decode/llm_base_proposer.py
++++ b/v1/spec_decode/llm_base_proposer.py
+@@ -239,6 +239,7 @@ class SpecDecodeBaseProposer:
+             vllm_config.parallel_config.tensor_parallel_size,
+             vllm_config.model_config.architecture,
+             vllm_config.model_config.model,
++            self.num_speculative_tokens,
+         )
+         if draft_vocab_config.gpu_lru_enabled:
+             if self.max_batch_size != 1:
+@@ -2268,6 +2269,7 @@ class SpecDecodeBaseProposer:
+             self.vllm_config.parallel_config.tensor_parallel_size,
+             self.vllm_config.model_config.architecture,
+             self.vllm_config.model_config.model,
++            self.num_speculative_tokens,
+         )
+         ranking_path = vocab_config.ranking_path
+         shortlist_size = vocab_config.shortlist_size
+diff --git a/v1/spec_decode/static_draft_vocab.py b/v1/spec_decode/static_draft_vocab.py
+index 77e6087..21e333b 100644
+--- a/v1/spec_decode/static_draft_vocab.py
++++ b/v1/spec_decode/static_draft_vocab.py
+@@ -15,6 +15,10 @@ import torch.nn.functional as F
+ 
+ import vllm.envs as envs
+ 
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.logits_processor import LogitsProcessor
+     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+@@ -65,6 +69,7 @@ def resolve_mtp_draft_vocab_config(
+     tensor_parallel_size: int = 2,
+     model_architecture: str | None = None,
+     model_name_or_path: str | None = None,
++    num_speculative_tokens: int | None = 4,
+ ) -> MTPDraftVocabConfig:
+     """Resolve explicit controls or the model-specific default MTP vocabulary."""
+     config = MTPDraftVocabConfig(
+@@ -108,13 +113,27 @@ def resolve_mtp_draft_vocab_config(
+         raise FileNotFoundError(
+             f"Default MTP dynamic-vocabulary ranking asset is missing: {ranking_path}"
+         )
++    # opt23: fused proposal 优先（MTP1/2/3/4 共用参数化 kernel）；
++    # fused kernel 不可用时按原设计理念降级 non-fused 标准 dynamic-vocab 路径。
++    nst = num_speculative_tokens or 4
++    fused_ok = (
++        nst in (1, 2, 3, 4)
++        and hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out")
++    )
++    if not fused_ok:
++        logger.warning_once(
++            "Fused proposal unavailable for num_speculative_tokens=%d "
++            "(kernel missing or unsupported). Falling back to non-fused "
++            "standard dynamic-vocab path.",
++            nst,
++        )
+     return MTPDraftVocabConfig(
+         ranking_path=str(ranking_path),
+         shortlist_size=98_304,
+         dynamic_tail_size=512,
+         full_refresh_interval=0,
+-        fused_proposal_enabled=True,
+-        gpu_lru_enabled=True,
++        fused_proposal_enabled=fused_ok,
++        gpu_lru_enabled=fused_ok,
+         prefill_topk=2048,
+         using_defaults=True,
+     )
+@@ -990,9 +1009,10 @@ def initialize_dynamic_draft_vocab(
+         sm70_ops = _get_sm70_ops()
+         if tp_size not in (2, 4):
+             raise ValueError("Dynamic fused proposal currently requires TP2 or TP4.")
+-        if num_speculative_tokens not in (3, 4):
++        if num_speculative_tokens not in (1, 2, 3, 4):
+             raise ValueError(
+-                "Dynamic fused proposal currently requires MTP3 or MTP4."
++                "Dynamic fused proposal currently requires MTP1/2/3/4 "
++                "(MTP=0 disables speculation before reaching this point)."
+             )
+         if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
+             raise RuntimeError("Dynamic fused proposal SM70 ops are not built.")
+-- 
+2.43.0
+
+
+From c084f80ad5780325d550f130945cf25f4e83e3ac Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Wed, 19 Aug 2026 01:29:36 +0800
+Subject: [PATCH 9/9] =?UTF-8?q?fix(opt24+23):=20NTK=20=E9=95=BF=E4=B8=8A?=
+ =?UTF-8?q?=E4=B8=8B=E6=96=87=EF=BC=88>262K=EF=BC=89MTP=20=E6=8A=95?=
+ =?UTF-8?q?=E6=9C=BA=E5=B4=A9=E6=BA=83=E4=BF=AE=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+场景: max_model_len=368640 + NTK yarn 缩放默认启用后，上下文超过
+max_position_embeddings(262144) 时引擎崩溃
+RuntimeError: Speculative decode scheduled draft input slots, but the
+worker draft tokens are list instead of a tensor.
+
+根因:
+1. v130 _maybe_override_draft_max_model_len 用 min(draft, target) 保持
+   draft_model_config.max_model_len=262144 -> worker effective_drafter_
+   max_model_len=262144；上下文 >262K 触发 Skipping speculative drafts
+2. scheduler 该步仍调度 draft slots，worker scatter 时 _draft_token_ids
+   是 list 而非 tensor -> raise -> EngineCore 崩溃
+
+修复:
+- config/speculative.py (opt24): Drafter 对齐补 max_model_len 扩展
+  （对齐 target_model_config.max_model_len=368640，用 target_len 而非
+  self.max_model_len——MTP 同模型场景 self.max_model_len 为 None）+ None 防护
+- v1/worker/gpu_model_runner.py (opt23): worker 容错——_draft_token_ids
+  非 tensor 时跳过 scatter 而非 raise
+
+验证:
+- 280K tokens 上下文请求成功（280010, 162s）——修复前 266K 即崩溃
+- Skipping: 16次 -> 0次；EngineDeadError: 0
+---
+ config/speculative.py         | 32 ++++++++++++++++++++++++++++----
+ v1/worker/gpu_model_runner.py | 13 +++++++------
+ 2 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/config/speculative.py b/config/speculative.py
+index 8e63454..367a41e 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -915,21 +915,45 @@ class SpeculativeConfig:
+                 # opt24 (opt26): Auto-extend drafter max_position_embeddings
+                 # to match target model max_model_len.
+                 hf_config = self.draft_model_config.hf_config
++                target_len = self.target_model_config.max_model_len
+                 if hf_config is not None:
+                     for pos_attr in ("max_position_embeddings", "max_position"):
+                         current_pos = getattr(hf_config, pos_attr, None)
+                         if (current_pos is not None
+-                                and current_pos < self.max_model_len):
+-                            setattr(hf_config, pos_attr, self.max_model_len)
++                                and target_len is not None
++                                and current_pos < target_len):
++                            setattr(hf_config, pos_attr, target_len)
+                             logger.info_once(
+                                 "Extended Drafter %s from %d to %d "
+                                 "to match target model max_model_len=%d.",
+                                 pos_attr,
+                                 current_pos,
+-                                self.max_model_len,
+-                                self.max_model_len,
++                                target_len,
++                                target_len,
+                             )
+ 
++                # opt24: also extend draft_model_config.max_model_len so the
++                # worker's effective_drafter_max_model_len tracks the target
++                # model. v130 keeps min(draft, target) = max_position_embeddings
++                # (262144), which forces "Skipping speculative drafts" once the
++                # context exceeds 262K; the scheduler still schedules draft
++                # slots on that step and the worker raises
++                # "draft tokens are list instead of a tensor" — engine crash
++                # (NTK long-context > 262K scenario).
++                if (
++                    self.draft_model_config.max_model_len is not None
++                    and target_len is not None
++                    and self.draft_model_config.max_model_len < target_len
++                ):
++                    self.draft_model_config.max_model_len = target_len
++                    logger.info_once(
++                        "Extended Drafter max_model_len from %d to %d "
++                        "to match target model max_model_len=%d.",
++                        self.draft_model_config.max_model_len,
++                        target_len,
++                        target_len,
++                    )
++
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index b527a49..92c23b3 100644
+--- a/v1/worker/gpu_model_runner.py
++++ b/v1/worker/gpu_model_runner.py
+@@ -4580,12 +4580,13 @@ class GPUModelRunner(
+             )
+ 
+         if not isinstance(self._draft_token_ids, torch.Tensor):
+-            raise RuntimeError(
+-                "Speculative decode scheduled draft input slots, but the "
+-                f"worker draft tokens are {type(self._draft_token_ids).__name__} "
+-                "instead of a tensor. The scheduler must trim invalid draft "
+-                "slots before target verification."
+-            )
++            # opt24: the drafter context limit was reached
++            # ("Skipping speculative drafts" path sets per-request empty
++            # lists). The scheduler may still carry draft slots from the
++            # previous step; scatter would crash on a non-tensor. Skip the
++            # scatter — the empty draft was already synced to the CPU, so the
++            # scheduler trims invalid slots on the next step.
++            return
+ 
+         draft_tokens_index_tensor = torch.tensor(
+             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+-- 
+2.43.0
+

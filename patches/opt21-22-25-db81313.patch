@@ -1,0 +1,458 @@
+commit db81313cc5396e4ace641994122bb859288958c1
+Author: Zeaxion <zeaxion@zeaxion-UB24>
+Date:   Tue Jul 28 17:19:53 2026 +0800
+
+    feat(opt21+22+25): 基础修复优化包 + Socket Keepalive + CC-HAHA Anthropic 协议兼容
+    
+    opt21 - 综合优化:
+      - 启动日志持久化 (_StartupLogHandler → /tmp/log)
+      - Cache 目录迁移到 /tmp (VLLM_PERSISTENT_CACHE)
+      - MTP 安全检测 (无 MTP 层时自动禁用)
+      - API 模型能力自动发现 (ModelCard context_window/max_output_tokens)
+      - Auto Dynamic NTK RoPE 缩放 (default→dynamic/yarn, 含 yarn 补全 original_max_position_embeddings)
+    
+    opt22 - Socket Keepalive:
+      - VLLM_HTTP_TIMEOUT_KEEP_ALIVE: 5s → 600s
+      - stream_interval: 1 → 3
+      - STREAM_KEEPALIVE 哨兵 + 引擎层 15s + API server 层 120s keepalive
+    
+    opt25 - CC-HAHA Anthropic 协议兼容:
+      - Fix 1A: model_post_init 始终覆盖 id 为 msg_{random_uuid}
+      - Fix 1B: messages_full_converter / message_stream_converter 显式传入 type/role
+      - Fix 2a: 全局 @app.head("/") 处理 CC-HAHA 预连接探测
+      - Fix 2b: @router.head("/v1/messages") Anthropic 路由 HEAD
+    
+    Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+
+diff --git a/config/model.py b/config/model.py
+index b41ab18..f838a7a 100644
+--- a/config/model.py
++++ b/config/model.py
+@@ -2246,6 +2246,51 @@ def _get_and_verify_max_len(
+                 "error."
+             )
+             if envs.VLLM_ALLOW_LONG_MAX_MODEL_LEN:
++                # 1) Hard reject beyond 524288
++                if max_model_len > 524288:
++                    raise ValueError(
++                        f"max_model_len ({max_model_len}) exceeds the maximum "
++                        f"supported length (524288)."
++                    )
++
++                # 2) Auto-dynamic NTK RoPE scaling
++                if rope_parameters is not None:
++                    for _rp_key, rp in rope_parameters.items():
++                        rope_type = rp.get("rope_type", "default")
++                        if rope_type == "default":
++                            from math import ceil
++
++                            if "mrope_section" in rp:
++                                new_rope_type = "yarn"
++                            else:
++                                new_rope_type = "dynamic"
++                            rp["rope_type"] = new_rope_type
++
++                            max_pos_emb = getattr(
++                                hf_config, "max_position_embeddings", None
++                            )
++                            if max_pos_emb is None or max_pos_emb <= 0:
++                                max_pos_emb = getattr(
++                                    hf_config,
++                                    "original_max_position_embeddings",
++                                    2048,
++                                )
++                            factor = ceil(max_model_len / max_pos_emb)
++                            rp["factor"] = float(factor)
++                            if new_rope_type == "yarn":
++                                rp["original_max_position_embeddings"] = max_pos_emb
++
++                            logger.warning_once(
++                                "Auto-upgraded rope_type from 'default' to '%s' "
++                                "with factor=%.1f (max_model_len=%d, "
++                                "max_position_embeddings=%d)",
++                                new_rope_type,
++                                rp["factor"],
++                                max_model_len,
++                                max_pos_emb,
++                            )
++                        break
++
+                 logger.warning_once("%s %s", msg, warning)
+             else:
+                 raise ValueError(
+diff --git a/config/scheduler.py b/config/scheduler.py
+index fb6951e..c3be6bf 100644
+--- a/config/scheduler.py
++++ b/config/scheduler.py
+@@ -148,7 +148,7 @@ class SchedulerConfig:
+     avoid gaps in GPU utilization, leading to better latency and throughput.
+     """
+ 
+-    stream_interval: int = Field(default=1, ge=1)
++    stream_interval: int = Field(default=3, ge=1)
+     """The interval (or buffer size) for streaming in terms of token length.
+     A smaller value (1) makes streaming smoother by sending each token immediately,
+     while a larger value (e.g., 10) reduces host overhead and may increase throughput
+diff --git a/config/speculative.py b/config/speculative.py
+index 42365d0..3ccfe39 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -582,6 +582,25 @@ class SpeculativeConfig:
+             )
+             self.method = "mtp"
+ 
++        # MTP safety detection: if the model has no MTP layers, disable speculation
++        if self.method == "mtp" and self.target_model_config is not None:
++            hf_config = self.target_model_config.hf_text_config
++            n_predict = getattr(hf_config, "n_predict", 0) or 0
++            mtp_layers = getattr(hf_config, "mtp_num_hidden_layers", 0) or 0
++            nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
++            if n_predict <= 0 and mtp_layers <= 0 and nextn_layers <= 0:
++                logger.warning(
++                    "Model does not have MTP layers "
++                    "(n_predict=%s, mtp_num_hidden_layers=%s, "
++                    "num_nextn_predict_layers=%s). "
++                    "Disabling speculative decoding.",
++                    n_predict, mtp_layers, nextn_layers,
++                )
++                self.method = None
++                self.model = None
++                self.num_speculative_tokens = None
++                return self
++
+         if self.model is None and self.num_speculative_tokens is not None:
+             if self.method == "mtp":
+                 if self.target_model_config is None:
+@@ -1007,6 +1026,8 @@ class SpeculativeConfig:
+ 
+     @model_validator(mode="after")
+     def _verify_args(self) -> Self:
++        if self.method is None and self.model is None:
++            return self
+         if self.tensor_parallel_size is not None:
+             raise ValueError(
+                 "'tensor_parallel_size' is not a valid argument in the "
+diff --git a/entrypoints/anthropic/api_router.py b/entrypoints/anthropic/api_router.py
+index 1fe2be8..1eddfbf 100644
+--- a/entrypoints/anthropic/api_router.py
++++ b/entrypoints/anthropic/api_router.py
+@@ -28,6 +28,14 @@ logger = init_logger(__name__)
+ 
+ router = APIRouter()
+ 
++from fastapi.responses import Response
++
++
++@router.head("/v1/messages")
++@router.head("/v1/messages/count_tokens")
++async def handle_anthropic_head():
++    return Response(status_code=200)
++
+ 
+ def messages(request: Request) -> AnthropicServingMessages:
+     return request.app.state.anthropic_serving_messages
+diff --git a/entrypoints/anthropic/protocol.py b/entrypoints/anthropic/protocol.py
+index 3ebc171..f2b6739 100644
+--- a/entrypoints/anthropic/protocol.py
++++ b/entrypoints/anthropic/protocol.py
+@@ -219,8 +219,8 @@ class AnthropicMessagesResponse(BaseModel):
+     )
+ 
+     def model_post_init(self, __context):
+-        if not self.id:
+-            self.id = f"msg_{int(time.time() * 1000)}"
++        from vllm.utils import random_uuid
++        self.id = f"msg_{random_uuid()}"
+ 
+ 
+ class AnthropicContextManagement(BaseModel):
+diff --git a/entrypoints/anthropic/serving.py b/entrypoints/anthropic/serving.py
+index 915cee5..a2483a0 100644
+--- a/entrypoints/anthropic/serving.py
++++ b/entrypoints/anthropic/serving.py
+@@ -487,6 +487,8 @@ class AnthropicServingMessages(OpenAIServingChat):
+     ) -> AnthropicMessagesResponse:
+         result = AnthropicMessagesResponse(
+             id=generator.id,
++            type="message",
++            role="assistant",
+             content=[],
+             model=generator.model,
+             usage=AnthropicUsage(
+@@ -639,6 +641,8 @@ class AnthropicServingMessages(OpenAIServingChat):
+                                 type="message_start",
+                                 message=AnthropicMessagesResponse(
+                                     id=origin_chunk.id,
++                                    type="message",
++                                    role="assistant",
+                                     content=[],
+                                     model=origin_chunk.model,
+                                     stop_reason=None,
+diff --git a/entrypoints/openai/api_server.py b/entrypoints/openai/api_server.py
+index 461128e..71a7943 100644
+--- a/entrypoints/openai/api_server.py
++++ b/entrypoints/openai/api_server.py
+@@ -179,6 +179,13 @@ def build_app(
+         app = FastAPI(lifespan=lifespan)
+     app.state.args = args
+ 
++    # opt25: global HEAD handler for CC-HAHA preconnect probe
++    @app.head("/")
++    @app.head("/{path:path}")
++    async def handle_head_probe():
++        from fastapi.responses import Response
++        return Response(status_code=200)
++
+     from vllm.entrypoints.serve import register_vllm_serve_api_routers
+ 
+     register_vllm_serve_api_routers(app)
+@@ -707,6 +714,10 @@ if __name__ == "__main__":
+     # NOTE(simon):
+     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
+     # entrypoints.
++    from vllm.logger import _StartupLogHandler
++
++    _StartupLogHandler.truncate()
++    _StartupLogHandler.install()
+     cli_env_setup()
+     parser = FlexibleArgumentParser(
+         description="vLLM OpenAI-Compatible RESTful API server."
+diff --git a/entrypoints/openai/chat_completion/serving.py b/entrypoints/openai/chat_completion/serving.py
+index b72bde1..d72835d 100644
+--- a/entrypoints/openai/chat_completion/serving.py
++++ b/entrypoints/openai/chat_completion/serving.py
+@@ -66,7 +66,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
+ from vllm.inputs import EngineInput
+ from vllm.logger import init_logger
+ from vllm.logprobs import Logprob
+-from vllm.outputs import CompletionOutput, RequestOutput
++from vllm.outputs import CompletionOutput, RequestOutput, STREAM_KEEPALIVE
+ from vllm.parser import ParserManager
+ from vllm.parser.abstract_parser import Parser
+ from vllm.reasoning import ReasoningParser
+@@ -412,6 +412,7 @@ class OpenAIServingChat(OpenAIServing):
+         created_time = int(time.time())
+         chunk_object_type: Final = "chat.completion.chunk"
+         first_iteration = True
++        last_server_send_time = time.time()
+ 
+         # Send response for each token for each request.n (index)
+         num_choices = 1 if request.n is None else request.n
+@@ -497,6 +498,14 @@ class OpenAIServingChat(OpenAIServing):
+ 
+         try:
+             async for res in result_generator:
++                # opt22: ignore engine keepalive (15s), handle server keepalive (120s)
++                if res is STREAM_KEEPALIVE:
++                    now = time.time()
++                    if now - last_server_send_time >= 120:
++                        yield ": keepalive\n\n"
++                        last_server_send_time = now
++                    continue
++
+                 if res.prompt_token_ids is not None:
+                     num_prompt_tokens = len(res.prompt_token_ids)
+                     if res.encoder_prompt_token_ids is not None:
+@@ -948,6 +957,7 @@ class OpenAIServingChat(OpenAIServing):
+ 
+                     data = chunk.model_dump_json(exclude_unset=True)
+                     yield f"data: {data}\n\n"
++                    last_server_send_time = time.time()
+ 
+             # once the final token is handled, if stream_options.include_usage
+             # is sent, send the usage
+diff --git a/entrypoints/openai/engine/protocol.py b/entrypoints/openai/engine/protocol.py
+index 890af03..44ee6d0 100644
+--- a/entrypoints/openai/engine/protocol.py
++++ b/entrypoints/openai/engine/protocol.py
+@@ -90,6 +90,8 @@ class ModelCard(OpenAIBaseModel):
+     root: str | None = None
+     parent: str | None = None
+     max_model_len: int | None = None
++    context_window: int | None = None
++    max_output_tokens: int | None = None
+     permission: list[ModelPermission] = Field(default_factory=list)
+ 
+ 
+diff --git a/entrypoints/openai/models/serving.py b/entrypoints/openai/models/serving.py
+index 347752c..7ea352c 100644
+--- a/entrypoints/openai/models/serving.py
++++ b/entrypoints/openai/models/serving.py
+@@ -43,6 +43,22 @@ class OpenAIModelRegistry:
+         self.model_config = model_config
+         self.base_model_paths = base_model_paths
+ 
++    def _compute_context_window(self) -> tuple[int | None, int | None]:
++        """Compute context_window and max_output_tokens from max_model_len."""
++        max_model_len = self.model_config.max_model_len
++        if max_model_len is None:
++            return None, None
++        if max_model_len < 50000:
++            context_window = int(max_model_len * 0.9)
++            max_output_tokens = int(max_model_len * 0.1)
++        elif max_model_len < 100000:
++            context_window = int(max_model_len * 0.85)
++            max_output_tokens = int(max_model_len * 0.15)
++        else:
++            context_window = int(max_model_len * 0.8)
++            max_output_tokens = int(max_model_len * 0.2)
++        return context_window, max_output_tokens
++
+     def is_base_model(self, model_name: str) -> bool:
+         return any(model.name == model_name for model in self.base_model_paths)
+ 
+@@ -60,11 +76,14 @@ class OpenAIModelRegistry:
+     async def show_available_models(self) -> ModelList:
+         """Show available models (base models only)."""
+         max_model_len = self.model_config.max_model_len
++        context_window, max_output_tokens = self._compute_context_window()
+         return ModelList(
+             data=[
+                 ModelCard(
+                     id=base_model.name,
+                     max_model_len=max_model_len,
++                    context_window=context_window,
++                    max_output_tokens=max_output_tokens,
+                     root=base_model.model_path,
+                     permission=[ModelPermission()],
+                 )
+diff --git a/envs.py b/envs.py
+index 4d8e1f8..d88a7ca 100644
+--- a/envs.py
++++ b/envs.py
+@@ -98,7 +98,8 @@ if TYPE_CHECKING:
+     VERBOSE: bool = False
+     VLLM_ALLOW_LONG_MAX_MODEL_LEN: bool = False
+     VLLM_RPC_TIMEOUT: int = 10000  # ms
+-    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 5  # seconds
++    VLLM_PERSISTENT_CACHE: bool = False
++    VLLM_HTTP_TIMEOUT_KEEP_ALIVE: int = 600  # seconds
+     VLLM_MAX_N_SEQUENCES: int = 16384
+     VLLM_PLUGINS: list[str] | None = None
+     VLLM_LORA_RESOLVER_CACHE_DIR: str | None = None
+@@ -1024,11 +1025,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     # ================== Runtime Env Vars ==================
+     # Root directory for vLLM cache files
+-    # Defaults to `~/.cache/vllm` unless `XDG_CACHE_HOME` is set
++    # Defaults to `/tmp/.cache/vllm` (tmpfs). Set VLLM_PERSISTENT_CACHE=1
++    # to fall back to `~/.cache/vllm`.
+     "VLLM_CACHE_ROOT": lambda: os.path.expanduser(
+         os.getenv(
+             "VLLM_CACHE_ROOT",
+-            os.path.join(get_default_cache_root(), "vllm"),
++            os.path.join(get_default_cache_root(), "vllm")
++            if os.environ.get("VLLM_PERSISTENT_CACHE", "0") == "1"
++            else "/tmp/.cache/vllm",
+         )
+     ),
+     # used in distributed environment to determine the ip address
+@@ -1407,7 +1411,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_RPC_TIMEOUT": lambda: int(os.getenv("VLLM_RPC_TIMEOUT", "10000")),
+     # Timeout in seconds for keeping HTTP connections alive in API server
+     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": lambda: int(
+-        os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "5")
++        os.environ.get("VLLM_HTTP_TIMEOUT_KEEP_ALIVE", "600")
+     ),
+     # Maximum allowed value for the `n` sampling parameter (number of output
+     # sequences per request). Limits resource consumption to prevent
+diff --git a/logger.py b/logger.py
+index fde9566..a52d545 100644
+--- a/logger.py
++++ b/logger.py
+@@ -291,6 +291,51 @@ def _trace_calls(log_path, root_dir, frame, event, arg=None):
+     return partial(_trace_calls, log_path, root_dir)
+ 
+ 
++class _StartupLogHandler(logging.Handler):
++    """Intercept vLLM logger messages and write to a startup log file,
++    until the "Application startup complete" marker is seen."""
++
++    _log_file = "/tmp/log/vllm-starting-log.txt"
++    _installed = False
++
++    def __init__(self):
++        super().__init__(level=logging.DEBUG)
++        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
++
++    def emit(self, record: logging.LogRecord) -> None:
++        try:
++            msg = self.format(record)
++            with open(self._log_file, "a") as f:
++                f.write(msg + "\n")
++            if "Application startup complete" in msg:
++                self._remove()
++        except Exception:
++            self.handleError(record)
++
++    def _remove(self) -> None:
++        root_logger = logging.getLogger("vllm")
++        root_logger.removeHandler(self)
++        _StartupLogHandler._installed = False
++
++    @staticmethod
++    def install() -> None:
++        if _StartupLogHandler._installed:
++            return
++        handler = _StartupLogHandler()
++        root_logger = logging.getLogger("vllm")
++        root_logger.addHandler(handler)
++        _StartupLogHandler._installed = True
++
++    @staticmethod
++    def truncate() -> None:
++        try:
++            os.makedirs(os.path.dirname(_StartupLogHandler._log_file), exist_ok=True)
++            with open(_StartupLogHandler._log_file, "w"):
++                pass
++        except Exception:
++            pass
++
++
+ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
+     """
+     Enable tracing of every function call in code under `root_dir`.
+diff --git a/v1/engine/async_llm.py b/v1/engine/async_llm.py
+index 419e151..993bec4 100644
+--- a/v1/engine/async_llm.py
++++ b/v1/engine/async_llm.py
+@@ -25,7 +25,7 @@ from vllm.inputs import EngineInput, PromptType
+ from vllm.logger import init_logger
+ from vllm.lora.request import LoRARequest
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+-from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
++from vllm.outputs import STREAM_FINISHED, STREAM_KEEPALIVE, PoolingRequestOutput, RequestOutput
+ from vllm.pooling_params import PoolingParams
+ from vllm.renderers import renderer_from_config
+ from vllm.renderers.inputs.preprocess import extract_prompt_components
+@@ -573,10 +573,21 @@ class AsyncLLM(EngineClient):
+             # The output_handler task pushes items into the queue.
+             # This task pulls from the queue and yields to caller.
+             finished = False
++            last_send_time = time.time()
++            _KEEPALIVE_INTERVAL = 15.0
+             while not finished:
+                 # Note: drain queue without await if possible (avoids
+                 # task switching under load which helps performance).
+-                out = q.get_nowait() or await q.get()
++                out = q.get_nowait()
++                if out is None:
++                    try:
++                        out = await asyncio.wait_for(
++                            q.get(), timeout=_KEEPALIVE_INTERVAL
++                        )
++                    except asyncio.TimeoutError:
++                        yield STREAM_KEEPALIVE
++                        last_send_time = time.time()
++                        continue
+ 
+                 # Note: both OutputProcessor and EngineCore handle their
+                 # own request cleanup based on finished.
+@@ -584,6 +595,7 @@ class AsyncLLM(EngineClient):
+                 finished = out.finished
+                 if out is not STREAM_FINISHED:
+                     yield out
++                last_send_time = time.time()
+ 
+         # If the request is disconnected by the client, generate()
+         # is cancelled or the generator is garbage collected. So,
