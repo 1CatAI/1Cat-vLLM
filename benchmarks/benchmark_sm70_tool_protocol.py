@@ -13,12 +13,12 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any
 
 import jsonschema
+import regex as re
 import requests
 
 TOOLS: list[dict[str, Any]] = [
