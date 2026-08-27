@@ -94,3 +94,53 @@ def test_split_managers_keep_exact_full_graph_shapes(
         assert draft_desc.cg_mode == CUDAGraphMode.FULL
         assert draft_desc.num_tokens == batch_size
         assert draft_desc.num_reqs == batch_size
+
+
+def test_dflash_lookup_captures_b1_q8_and_q16(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_global_graph_pool",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.get_pp_group",
+        lambda: MagicMock(is_first_rank=True, is_last_rank=True),
+    )
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4,
+            data_parallel_size=1,
+        ),
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            cudagraph_capture_sizes=[16],
+            max_cudagraph_capture_size=16,
+        ),
+        speculative_config=SimpleNamespace(
+            method="dflash",
+            ngram_assist=True,
+            num_speculative_tokens=15,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    dflash_config={"block_size": 8, "selector_top_k": 16}
+                )
+            ),
+        ),
+    )
+
+    manager = CudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=16,
+    )
+
+    assert manager.decode_query_lens == (8, 16)
+    assert manager._capture_sizes == [8, 16]
+    manager._graphs_captured = True
+    q8 = manager.dispatch(1, 8, 8)
+    q16 = manager.dispatch(1, 16, 16)
+    assert q8.cg_mode == CUDAGraphMode.FULL
+    assert q8.uniform_token_count == 8
+    assert q16.cg_mode == CUDAGraphMode.FULL
+    assert q16.uniform_token_count == 16

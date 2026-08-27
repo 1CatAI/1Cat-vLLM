@@ -47,7 +47,12 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
-from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
+from .speculative import (
+    EagleModelTypes,
+    NgramGPUTypes,
+    SpeculativeConfig,
+    uses_adaptive_dflash_lookup,
+)
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
@@ -1110,11 +1115,23 @@ class VllmConfig:
             and self.speculative_config.use_dflash_ddtree()
             and not self.speculative_config.ddtree_disable_tree_verify
         )
+        adaptive_dflash_lookup = bool(
+            self.speculative_config is not None
+            and uses_adaptive_dflash_lookup(self.speculative_config)
+            and envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
             # decoding.
+            if adaptive_dflash_lookup:
+                raise ValueError(
+                    "Async scheduling fixes the DFlash2 proposal width at its "
+                    "configured maximum and is incompatible with adaptive q8/q16 "
+                    "lookup verification. Disable async scheduling or set "
+                    "VLLM_DFLASH2_LOOKUP_ADAPTIVE=0 to use fixed q16 verification."
+                )
             if dflash_ddtree_tree_verify:
                 raise ValueError(
                     "Async scheduling is not compatible with dflash_ddtree "
@@ -1151,6 +1168,13 @@ class VllmConfig:
                 # impacts performance of pooling models, so we disable by default.
                 logger.debug(
                     "Disabling asynchronous scheduling by default for pooling model."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif adaptive_dflash_lookup:
+                logger.warning_once(
+                    "Disabling asynchronous scheduling because adaptive DFlash2 "
+                    "lookup verification must return a per-step q8/q16 width to "
+                    "the scheduler."
                 )
                 self.scheduler_config.async_scheduling = False
             elif dflash_ddtree_tree_verify:

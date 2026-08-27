@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.scheduler import SchedulerConfig
+from vllm.config.speculative import (
+    SpeculativeConfig,
+    get_dflash_model_draft_tokens,
+    uses_adaptive_dflash_lookup,
+)
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -16,7 +21,10 @@ from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
-from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
+from vllm.v1.worker.gpu.spec_decode.utils import (
+    DraftTokensHandler,
+    get_parallel_drafting_token_id,
+)
 
 
 def _config(method: str, num_speculative_tokens: int = 7) -> SpeculativeConfig:
@@ -43,6 +51,108 @@ def test_mrv2_dflash_reserves_all_mask_slots() -> None:
     assert _config("dflash").max_num_new_slots_for_drafting == 7
     # The retained DDTree path keeps its existing flat-parallel slot contract.
     assert _config("dflash_ddtree").max_num_new_slots_for_drafting == 6
+
+
+@pytest.mark.parametrize(
+    ("assist", "selector_top_k", "verify_tokens", "expected"),
+    [
+        (True, 16, 15, 7),
+        (False, 16, 15, 15),
+        (True, 0, 15, 15),
+        (True, 16, 7, 7),
+    ],
+)
+def test_lookup_decouples_checkpoint_and_verify_widths(
+    assist: bool,
+    selector_top_k: int,
+    verify_tokens: int,
+    expected: int,
+) -> None:
+    config = SimpleNamespace(
+        method="dflash",
+        ngram_assist=assist,
+        num_speculative_tokens=verify_tokens,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                dflash_config={
+                    "block_size": 8,
+                    "selector_top_k": selector_top_k,
+                }
+            )
+        ),
+    )
+
+    assert get_dflash_model_draft_tokens(config) == expected
+    assert uses_adaptive_dflash_lookup(config) is (expected < verify_tokens)
+
+
+def test_draft_token_handler_exposes_only_selected_verify_width() -> None:
+    handler = object.__new__(DraftTokensHandler)
+    handler.req_ids = []
+    handler.draft_tokens_np = None
+    handler.num_draft_tokens = 0
+    batch = SimpleNamespace(
+        req_ids=["req-0"],
+        has_structured_output_reqs=False,
+    )
+    proposals = torch.zeros((1, 15), dtype=torch.int64)
+
+    handler.set_draft_tokens(batch, proposals, num_draft_tokens=7)
+
+    assert handler.num_draft_tokens == 7
+    assert handler.req_ids == ["req-0"]
+    with pytest.raises(ValueError, match="proposal tensor width"):
+        handler.set_draft_tokens(batch, proposals, num_draft_tokens=16)
+
+
+def _adaptive_lookup_config() -> SpeculativeConfig:
+    config = object.__new__(SpeculativeConfig)
+    config.method = "dflash"
+    config.ngram_assist = True
+    config.num_speculative_tokens = 15
+    config.ddtree_disable_tree_verify = False
+    config.disable_padded_drafter_batch = False
+    config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            dflash_config={"block_size": 8, "selector_top_k": 16}
+        ),
+        verify_with_parallel_config=lambda *_args: None,
+        verify_with_model_config=lambda *_args: None,
+    )
+    config.verify_with_parallel_config = lambda *_args: None
+    config.verify_with_model_config = lambda *_args: None
+    return config
+
+
+def test_adaptive_lookup_disables_async_scheduling_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1")
+    scheduler = SchedulerConfig(
+        max_model_len=8192,
+        is_encoder_decoder=False,
+        async_scheduling=None,
+    )
+
+    config = VllmConfig(
+        scheduler_config=scheduler,
+        speculative_config=_adaptive_lookup_config(),
+    )
+
+    assert config.scheduler_config.async_scheduling is False
+
+
+def test_adaptive_lookup_rejects_explicit_async_scheduling(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1")
+    scheduler = SchedulerConfig(
+        max_model_len=8192,
+        is_encoder_decoder=False,
+        async_scheduling=True,
+    )
+
+    with pytest.raises(ValueError, match="adaptive q8/q16 lookup verification"):
+        VllmConfig(
+            scheduler_config=scheduler,
+            speculative_config=_adaptive_lookup_config(),
+        )
 
 
 def test_dflash_forces_v2_and_rejects_explicit_v1(monkeypatch) -> None:

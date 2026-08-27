@@ -1666,8 +1666,9 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
 
 
 @pytest.mark.parametrize("query_len", [8, 16])
+@pytest.mark.parametrize("page_size", [3296, 3456])
 def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
-    query_len: int,
+    query_len: int, page_size: int
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -1717,7 +1718,7 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=2.0)
     query = torch.zeros((query_len, 6, 256), dtype=torch.float16)
     output = torch.zeros_like(query)
-    key_cache = torch.zeros((2, 3296, 1, 256), dtype=torch.uint8)
+    key_cache = torch.zeros((2, page_size, 1, 256), dtype=torch.uint8)
     value_cache = torch.zeros_like(key_cache)
 
     attn_metadata.max_model_len = 8192

@@ -119,30 +119,45 @@ vllm serve <target-model> \
 
 #### DFlash2 with n-gram assistance
 
-Set `ngram_assist` on a DFlash2 configuration to try prompt lookup before the
-neural DFlash2 query and selector. When every active request has a full-width
-lookup hit, the batch skips that neural proposal work. Mixed-hit and miss
-batches keep the unchanged DFlash2 proposals. The target model still verifies
-every proposed token, including probabilistic sampling, so this does not
-change the target sampling distribution.
+Set `ngram_assist` on a DFlash2 configuration to combine prompt lookup with
+the neural drafter. Two layouts are supported:
+
+- At the checkpoint-native width (seven drafts for the official block-8
+  checkpoint), a full-batch lookup hit may skip the neural query and selector.
+- With a wider configured verifier, DFlash2 still produces only its seven
+  trained drafts. GPU lookup can replace that prefix and fill the remaining
+  positions from the request's own token history. The scheduler normally
+  verifies q8 and switches to q16 only after two consecutive strong copy
+  steps.
+
+The target model verifies every scheduled proposal. In probabilistic mode,
+each lookup position is represented by a point-mass draft distribution, so
+rejection sampling preserves the target distribution.
 
 ```bash
 vllm serve <target-model> \
   --speculative-config '{
     "method": "dflash",
     "model": "your-org/your-dflash2-selector-model",
-    "num_speculative_tokens": 7,
+    "num_speculative_tokens": 15,
     "draft_sample_method": "probabilistic",
     "ngram_assist": true,
-    "prompt_lookup_min": 5,
-    "prompt_lookup_max": 5
+    "prompt_lookup_min": 6,
+    "prompt_lookup_max": 12
   }'
 ```
 
 This hybrid route currently requires `method=dflash` and a DFlash2 checkpoint.
 It is intentionally not enabled for DFlash1, Eagle, MTP, or
-`dflash_ddtree`. Structured-output requests bypass prompt lookup and continue
-through DFlash2 until grammar-aware proposal masking is available.
+`dflash_ddtree`. Structured-output batches bypass lookup and retain the
+checkpoint-native q8 DFlash2 path until grammar-aware proposal masking is
+available.
+
+Adaptive q8/q16 verification requires the synchronous scheduler because the
+asynchronous scheduler fixes the proposal width at startup. vLLM disables
+asynchronous scheduling automatically for this layout; explicitly enabling it
+raises a configuration error. Set `VLLM_DFLASH2_LOOKUP_ADAPTIVE=0` only when a
+fixed q16 verifier is deliberately preferred.
 
 #### Suffix decoding
 

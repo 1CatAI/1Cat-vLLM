@@ -2849,6 +2849,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_PROFILE_LOG_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_DFLASH_PROFILE_LOG_INTERVAL", "32"))
     ),
+    # Lookup-augmented DFlash2 controller. The lookup itself is enabled by the
+    # speculative config's ngram_assist flag; these knobs tune only its
+    # experimental fusion and adaptive q8/q16 policy.
+    "VLLM_DFLASH2_LOOKUP_ADAPTIVE": lambda: bool(
+        int(os.getenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_NSTRONG": lambda: max(
+        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_AGREE": lambda: max(
+        0, int(os.getenv("VLLM_DFLASH2_LOOKUP_AGREE", "0"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": lambda: max(
+        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_LONG_MIN": lambda: max(
+        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_LONG_MIN", "6"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_SEARCH": lambda: max(
+        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))
+    ),
+    "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK": lambda: max(
+        1, int(os.getenv("VLLM_DFLASH2_LOOKUP_ENTRY_STREAK", "2"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_STICKY": lambda: max(
+        0, int(os.getenv("VLLM_DFLASH2_LOOKUP_STICKY", "3"))
+    ),
+    "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": lambda: max(
+        0, int(os.getenv("VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT", "0"))
+    ),
     "VLLM_DFLASH_DUMP_FIRST_PASS": lambda: bool(
         int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))
     ),

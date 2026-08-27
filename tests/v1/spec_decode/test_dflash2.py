@@ -357,6 +357,7 @@ def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
         self.max_num_reqs = 2
         self.num_query_per_req = 8
         self.num_speculative_steps = 7
+        self.draft_block = 7
         self.vocab_size = 31
         self.draft_tokens = torch.empty((2, 7), dtype=torch.int64, device=device)
         self.draft_logits = draft_logits
@@ -1146,6 +1147,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator.max_model_len = 256
     speculator.num_query_per_req = 8
     speculator.num_speculative_steps = 7
+    speculator.draft_block = 7
     speculator.max_num_reqs = 1
     speculator.max_num_tokens = 8
     speculator.hidden_states = torch.zeros(8, 3)

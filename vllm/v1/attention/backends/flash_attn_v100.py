@@ -23,6 +23,7 @@ from typing import cast
 import torch
 
 import vllm.envs as envs
+from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -3071,7 +3072,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._is_dflash_selector_target = bool(
             use_dflash
             and not self._is_speculative_draft_model
-            and getattr(spec_config, "num_speculative_tokens", None) == 7
+            and getattr(spec_config, "num_speculative_tokens", None) in (7, 15)
+            and get_dflash_model_draft_tokens(spec_config) == 7
             and selector_engine
         )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
@@ -5158,7 +5160,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.ndim == 4
             and key_cache.device == query.device
             and value_cache.device == query.device
-            and key_cache.shape[1] in (1648, 3296)
+            # q15 LABD increases the aligned hybrid-cache page from the
+            # block-8 service's 1648/3296 layout to 1728/3456. The grouped
+            # operator's runtime-stride implementation is exact for both.
+            and key_cache.shape[1] in (1648, 1728, 3296, 3456)
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8

@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import (
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     DFlash2Speculator,
+    _advance_lookup_controller,
     _apply_ngram_draft_kernel,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
@@ -201,6 +202,94 @@ def test_ngram_assist_rejects_non_dflash_method() -> None:
             num_speculative_tokens=2,
             ngram_assist=True,
         )
+
+
+def test_lookup_controller_requires_two_hits_and_preserves_pending_state() -> None:
+    state = dict(
+        last_want=False,
+        want_streak=0,
+        sticky_remaining=0,
+        long_active=False,
+    )
+
+    values = _advance_lookup_controller(
+        want=True,
+        num_reqs=1,
+        entry_streak=2,
+        sticky_steps=3,
+        **state,
+    )
+    state = dict(zip(state, values))
+    assert state == {
+        "last_want": True,
+        "want_streak": 1,
+        "sticky_remaining": 0,
+        "long_active": False,
+    }
+
+    values = _advance_lookup_controller(
+        want=True,
+        num_reqs=1,
+        entry_streak=2,
+        sticky_steps=3,
+        **state,
+    )
+    state = dict(zip(state, values))
+    assert state["long_active"] is True
+    assert state["sticky_remaining"] == 3
+
+    assert _advance_lookup_controller(
+        want=None,
+        num_reqs=1,
+        entry_streak=2,
+        sticky_steps=3,
+        **state,
+    ) == tuple(state.values())
+
+
+def test_lookup_controller_never_coasts_a_multi_request_batch() -> None:
+    values = _advance_lookup_controller(
+        want=False,
+        num_reqs=2,
+        entry_streak=2,
+        sticky_steps=3,
+        last_want=True,
+        want_streak=2,
+        sticky_remaining=3,
+        long_active=True,
+    )
+
+    assert values == (False, 0, 0, False)
+
+
+def test_lookup_controller_selects_q8_before_two_strong_hits(monkeypatch) -> None:
+    speculator = object.__new__(DFlash2Speculator)
+    speculator._lookup_enabled = True
+    speculator._lookup_current_req_key = (0,)
+    speculator._lookup_current_eligible = True
+    speculator._lookup_adaptive = True
+    speculator._lookup_cheap_context = 0
+    speculator._lookup_entry_streak = 2
+    speculator._lookup_sticky_steps = 3
+    speculator._lookup_last_want = False
+    speculator._lookup_want_streak = 0
+    speculator._lookup_sticky_remaining = 0
+    speculator._lookup_long_active = False
+    speculator._lookup_last_verify_tokens = 0
+    speculator._lookup_q8_rounds = 0
+    speculator._lookup_q16_rounds = 0
+    speculator.draft_block = 7
+    speculator.num_speculative_steps = 15
+    speculator.draft_max_seq_len = 32768
+    wants = iter((None, True, True))
+    monkeypatch.setattr(speculator, "_consume_lookup_flags", lambda: next(wants))
+    monkeypatch.setattr(speculator, "_queue_lookup_flags", lambda _num_reqs: None)
+
+    assert speculator.next_num_draft_tokens() == 7
+    assert speculator.next_num_draft_tokens() == 7
+    assert speculator.next_num_draft_tokens() == 15
+    assert speculator._lookup_q8_rounds == 2
+    assert speculator._lookup_q16_rounds == 1
 
 
 def test_ngram_one_hot_cache_overrides_only_hit_rows() -> None:

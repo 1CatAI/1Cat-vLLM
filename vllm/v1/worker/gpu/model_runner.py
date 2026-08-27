@@ -208,6 +208,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
+            self.speculator.set_req_states(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -1467,7 +1469,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
+            num_draft_tokens = None
+            if hasattr(self.speculator, "next_num_draft_tokens"):
+                num_draft_tokens = self.speculator.next_num_draft_tokens()
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                draft_tokens,
+                num_draft_tokens=num_draft_tokens,
+            )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

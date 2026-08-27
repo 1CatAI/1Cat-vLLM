@@ -81,6 +81,43 @@ RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
+def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
+    """Return the block width produced by the DFlash checkpoint itself.
+
+    Lookup-augmented DFlash2 may hand a wider proposal to the target, but its
+    model/convolutions must retain the block size used during training.
+    """
+    verify_tokens = int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    )
+    if (
+        getattr(speculative_config, "method", None) != "dflash"
+        or not getattr(speculative_config, "ngram_assist", False)
+    ):
+        return verify_tokens
+
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    trained_tokens = int(dflash_config.get("block_size", 0) or 0) - 1
+    has_selector = int(dflash_config.get("selector_top_k", 0) or 0) > 0
+    if has_selector and 0 < trained_tokens < verify_tokens:
+        return trained_tokens
+    return verify_tokens
+
+
+def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
+    """Whether DFlash2 can switch between model and augmented widths."""
+    verify_tokens = int(
+        getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    )
+    return (
+        getattr(speculative_config, "method", None) == "dflash"
+        and bool(getattr(speculative_config, "ngram_assist", False))
+        and 0 < get_dflash_model_draft_tokens(speculative_config) < verify_tokens
+    )
+
+
 @config
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
@@ -159,10 +196,12 @@ class SpeculativeConfig:
     """Minimum size of ngram token window when using Ngram proposer, if
     provided. Defaults to 1."""
     ngram_assist: bool = False
-    """Try prompt-ngram lookup before DFlash2 draft generation. Full-width
-    ngram hits skip the DFlash2 query and selector while preserving its
-    context-KV state. Only valid with ``method='dflash'`` and a DFlash2
-    selector capability."""
+    """Combine prompt-ngram lookup with DFlash2. At the checkpoint-native
+    width, full hits may skip the DFlash2 query and selector. If
+    ``num_speculative_tokens`` is wider than the checkpoint block, DFlash2
+    keeps its trained width and lookup may fill the extra target-verification
+    positions. Only valid with ``method='dflash'`` and a DFlash2 selector
+    capability."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
