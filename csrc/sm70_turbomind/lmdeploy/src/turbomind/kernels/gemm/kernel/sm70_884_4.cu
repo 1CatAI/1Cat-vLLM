@@ -32,6 +32,22 @@ class ExactMnkKernelImpl final : public KernelImpl<Gemm> {
   }
 };
 
+template <class Gemm>
+class Dsv4ExponentFoldedM6KernelImpl final : public KernelImpl<Gemm> {
+ public:
+  Dsv4ExponentFoldedM6KernelImpl() {
+    this->info_.name += "_sm70_mxfp4_efold_dsv4_m6";
+  }
+
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    const bool accepted_shape =
+        (desc.n == 1024 && desc.k == 4096) ||
+        (desc.n == 4096 && desc.k == 512);
+    return desc.m == 6 && desc.num == 1 && accepted_shape &&
+           KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
 }  // namespace
 
 void Registry::sm70_884_4() {
@@ -107,6 +123,25 @@ void Registry::sm70_884_4() {
         Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
         Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
         Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    // clang-format on
+  }
+
+  if constexpr (1) {
+    // Preserve the complete M=6 tactic search space. Dispatch maps the
+    // measured ordinary tactic to its exact folded counterpart and stores it
+    // separately, so this route cannot poison ordinary MXFP4 selection.
+    // clang-format off
+        using C = Config_MXF4_ExponentFolded<kColMajor, 0>;
+        using C128 = C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 32, 64, 128>;
+        using C64  = C::Type< 64, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32, 32, 128>;
+        using C32  = C::Type< 32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>;
+        using C16  = C::Type< 16, 128, 32, 1, 4, 1, D, S, 2, true, 1, 32>;
+        using C8   = C::Type<  8, 128, 64, 1, 4, 1, D, S, 2, true, 1, 32>;
+        Add(std::make_unique<Dsv4ExponentFoldedM6KernelImpl<typename C128::Kernel>>());
+        Add(std::make_unique<Dsv4ExponentFoldedM6KernelImpl<typename C64::Kernel>>());
+        Add(std::make_unique<Dsv4ExponentFoldedM6KernelImpl<typename C32::Kernel>>());
+        Add(std::make_unique<Dsv4ExponentFoldedM6KernelImpl<typename C16::Kernel>>());
+        Add(std::make_unique<Dsv4ExponentFoldedM6KernelImpl<typename C8::Kernel>>());
     // clang-format on
   }
 

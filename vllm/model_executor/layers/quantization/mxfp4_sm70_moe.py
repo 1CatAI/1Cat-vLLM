@@ -16,6 +16,7 @@ from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -83,6 +84,41 @@ def _mxfp4_grouped_m8_expert_rows_enabled() -> bool:
         (_mxfp4_grouped_m8_enabled() or _mxfp4_grouped_verifier_enabled())
         and envs.VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS
     )
+
+
+def _mxfp4_exponent_fold_decode_runtime_contract() -> bool:
+    """Admit only the measured PP2 x TP4 no-spec B1 direct-order lane."""
+    vllm_config = get_current_vllm_config()
+    parallel_config = vllm_config.parallel_config
+    scheduler_config = vllm_config.scheduler_config
+    return bool(
+        envs.VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE
+        and envs.VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE
+        and parallel_config.pipeline_parallel_size == 2
+        and parallel_config.tensor_parallel_size == 4
+        and scheduler_config.max_num_seqs == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0)) <= 1
+        and getattr(vllm_config, "speculative_config", None) is None
+    )
+
+
+def _validate_mxfp4_exponent_fold_scales(
+    **named_scales: torch.Tensor,
+) -> None:
+    """Prove that adding 14 keeps every adjusted UE8M0 exponent finite."""
+    for name, scales in named_scales.items():
+        if scales.dtype != torch.uint8:
+            raise TypeError(f"{name} must contain adjusted UE8M0 bytes")
+        minimum, maximum = torch.aminmax(scales)
+        min_exponent = int(minimum.item())
+        max_exponent = int(maximum.item())
+        if min_exponent < 1 or max_exponent > 16:
+            raise RuntimeError(
+                "Exact SM70 MXFP4 exponent folding requires adjusted UE8M0 "
+                f"exponents in [1, 16]; {name} has "
+                f"[{min_exponent}, {max_exponent}]."
+            )
 
 
 @triton.jit
@@ -336,6 +372,18 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         return hidden_size, intermediate_size_per_partition
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        use_exponent_fold_decode = bool(
+            envs.VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE
+        )
+        if (
+            use_exponent_fold_decode
+            and not _mxfp4_exponent_fold_decode_runtime_contract()
+        ):
+            raise RuntimeError(
+                "VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE=1 requires "
+                "DeepSeek V4 PP2 x TP4, max_num_seqs=1, no speculation, "
+                "and the direct-top6/direct-order decode route."
+            )
         required_ops: tuple[str, ...] = (
             "mxfp4_sm70_prepare",
             "mxfp4_moe_dense_stage_sm70_out",
@@ -425,6 +473,16 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
         layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
         layer.w2_tm_meta = Parameter(torch.stack(w2_meta), requires_grad=False)
+
+        if use_exponent_fold_decode:
+            _validate_mxfp4_exponent_fold_scales(
+                w13_tm_scales=layer.w13_tm_scales,
+                w2_tm_scales=layer.w2_tm_scales,
+            )
+            logger.info_once(
+                "Exact SM70 DeepSeek V4 MXFP4 exponent-folded decode "
+                "validated for adjusted UE8M0 exponents in [1, 16]."
+            )
 
         w13_k_ld = int(w13_meta[0][0].item())
         w13_q_ld = int(w13_meta[0][1].item())

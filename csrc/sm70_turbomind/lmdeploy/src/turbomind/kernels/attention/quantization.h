@@ -723,6 +723,7 @@ struct ConvertKvCache<fp4_e2m1_t, T> {
     return (Array<bfloat16_t, 8>&)vo;
   }
 
+  template <bool ApplyExponentBias = true>
   __device__ static Array<half, 8> cvt_f16x8_e2m1(
       const Array<fp4_e2m1_t, 8>& vi) {
     const uint32_t& x = (const uint32_t&)vi;
@@ -739,12 +740,16 @@ struct ConvertKvCache<fp4_e2m1_t, T> {
         vo[3] = (x <<  0 & S) | (x >> 3 & EM);
     // clang-format on
 
-    constexpr uint32_t e = (15U - 1U + 15U) << 10U;
-    constexpr uint32_t ee = e << 16U | e;
+    if constexpr (ApplyExponentBias) {
+      constexpr uint32_t e = (15U - 1U + 15U) << 10U;
+      constexpr uint32_t ee = e << 16U | e;
 
-    PRAGMA_UNROLL
-    for (int i = 0; i < 4; ++i) {
-      asm volatile("mul.f16x2 %0, %1, %2;" : "=r"(vo[i]) : "r"(vo[i]), "r"(ee));
+      PRAGMA_UNROLL
+      for (int i = 0; i < 4; ++i) {
+        asm volatile("mul.f16x2 %0, %1, %2;"
+                     : "=r"(vo[i])
+                     : "r"(vo[i]), "r"(ee));
+      }
     }
 
     return (Array<half, 8>&)vo;
@@ -759,7 +764,7 @@ struct ConvertKvCache<fp4_e2m1_t, T> {
       if constexpr (std::is_same_v<T, bfloat16_t>) {
         v = cvt_bf16x8_e2m1((Array<fp4_e2m1_t, 8>&)vi[i]);
       } else if constexpr (std::is_same_v<T, half_t>) {
-        v = cvt_f16x8_e2m1((Array<fp4_e2m1_t, 8>&)vi[i]);
+        v = cvt_f16x8_e2m1<true>((Array<fp4_e2m1_t, 8>&)vi[i]);
       } else {
         static_assert(N != N, "not implemented");
       }

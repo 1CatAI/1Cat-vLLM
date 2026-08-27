@@ -254,6 +254,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE: bool = False
+    VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE: bool = True
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
@@ -2215,6 +2216,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # quality acceptance are complete.
     "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE", "0"))
+    ),
+    "VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE", "0"))
     ),
     "VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_BROADCAST_INPUT_DECODE", "1"))

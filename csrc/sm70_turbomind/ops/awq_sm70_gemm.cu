@@ -1082,6 +1082,12 @@ bool mxfp4_moe_broadcast_input_decode_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool mxfp4_moe_exponent_folded_decode_enabled() {
+  const char* raw =
+      std::getenv("VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
 bool mxfp4_moe_grouped_m8_enabled() {
   const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
   return raw != nullptr && std::atoi(raw) != 0;
@@ -8248,6 +8254,21 @@ void mxfp4_moe_gemm_sm70_out_impl(
       device, static_cast<int>(total_tokens), static_cast<int>(n),
       static_cast<int>(k), static_cast<int>(num_experts),
       static_cast<int>(group_size), stream);
+  const bool exact_dsv4_exponent_fold_decode =
+      compact_grouped_rows && total_tokens == 6 && num_experts == 6 &&
+      group_size == 32 &&
+      ((n == 1024 && k == 4096) || (n == 4096 && k == 512)) &&
+      vllm::awq_sm70::mxfp4_moe_exponent_folded_decode_enabled();
+  if (exact_dsv4_exponent_fold_decode) {
+    op.dispatch =
+        op.dispatch |
+        turbomind::gemm::DispatchPolicy::kSm70Mxfp4ExponentFolded;
+    static std::atomic<unsigned> logged_mxfp4_exponent_folded{0u};
+    maybe_log_sm70_moe_route_once(
+        logged_mxfp4_exponent_folded,
+        "Exact SM70 DeepSeek V4 MXFP4 exponent-folded decode path enabled",
+        sorted_input, total_tokens, num_experts);
+  }
   op.epilogue = turbomind::gemm::Epilogue::kNone;
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};

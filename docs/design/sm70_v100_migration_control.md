@@ -43624,3 +43624,41 @@ Interpretation:
   original TurboMind transform. The route is opt-in through
   `VLLM_SM70_DSV4_FP8_PRESCALED_DECODE=1` until matched full-model speed and
   pinned dataset gates complete.
+
+## 2026-08-26 DeepSeek V4 exact MXFP4 exponent-fold decode screen
+
+- The E2M1 SM70 transform constructs an exact FP16 value scaled by `2^-14`,
+  multiplies by `2^14`, then applies the adjusted UE8M0 group scale. The new
+  transform adds 14 to the scale exponent and omits the first half2 multiply.
+  A full checkpoint mmap audit covers all 35,718 scale tensors and
+  9,261,408,000 E8M0 bytes: raw exponents are 114--126, their existing
+  adjusted FP16 exponents are 2--14, and folded exponents are 16--28. No
+  value reaches zero, INF, or the clamping boundary. All 16 signed E2M1 codes
+  across the 13 observed exponent values pass 208/208 CPU FP16 bit-pattern
+  comparisons.
+- Independently retuning the folded kernel is rejected even though the local
+  decode is numerically close: its different split-K choices alter FP32
+  reduction order. The accepted dispatcher first measures the ordinary
+  TurboMind tactic, finds the folded kernel with the identical base name, and
+  copies its CTA, split count, and swizzle verbatim. Only the input transform
+  changes; the ordinary and folded launch caches remain separate.
+- The fair pipeline-first CUDA Graph screen uses real layer-0 TP4-rank-0
+  weights for six routed experts. Across 64 changing inputs at scales
+  0.01/0.1/1/4, W13, SwiGLU activation, and W2 are bitwise equal on every
+  replay. A/B/B/A medians move the complete W13+activation+W2 graph from
+  95.141 to 53.163 microseconds, saving 41.978 microseconds per layer or a
+  1.805 ms/token 43-layer service projection. The final extension SHA256 is
+  `5b8cd4cd5796b8180b6e209c5737df753fd08c4118cbc3363741dce65785e2e6`;
+  evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-exponent-fold-screen-20260826-r4/`.
+  Screens that capture isolated W13 graphs before the pipeline are not used;
+  that capture order changes the later graph state and hides the endpoint-like
+  delta.
+- Admission is opt-in through
+  `VLLM_SM70_DSV4_MXFP4_EXPONENT_FOLD_DECODE=1` and requires the exact SM70
+  DeepSeek V4 PP2 x TP4, no-speculation, max-one-sequence direct-top6 and
+  direct-order M=6 shapes `(K4096,N1024)` and `(K512,N4096)`. Model loading
+  validates every prepared scale exponent in `[1,16]` and fails closed on any
+  unsupported checkpoint. Prefill, verifier rows, other shapes, and ordinary
+  MXFP4 dispatch remain unchanged. Matched full-model speed and GSM8K-64 gates
+  are still required before acceptance.

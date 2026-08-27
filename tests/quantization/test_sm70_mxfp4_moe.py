@@ -23,9 +23,48 @@ from vllm.model_executor.layers.quantization.mxfp4_sm70_moe import (
     Mxfp4SM70MoEMethod,
     _compact_mxfp4_active_experts,
     _select_mxfp4_stage_dispatch,
+    _validate_mxfp4_exponent_fold_scales,
     validate_mxfp4_sm70_moe_contract,
     validate_mxfp4_sm70_moe_weight_layout,
 )
+
+
+def test_mxfp4_exponent_fold_accepts_finite_adjusted_scale_range():
+    _validate_mxfp4_exponent_fold_scales(
+        scales=torch.tensor([1, 2, 14, 16], dtype=torch.uint8)
+    )
+
+
+@pytest.mark.parametrize("bad_exponent", [0, 17, 30])
+def test_mxfp4_exponent_fold_rejects_unsafe_adjusted_scale_range(
+    bad_exponent: int,
+):
+    with pytest.raises(RuntimeError, match=r"requires adjusted UE8M0.*\[1, 16\]"):
+        _validate_mxfp4_exponent_fold_scales(
+            scales=torch.tensor([bad_exponent], dtype=torch.uint8)
+        )
+
+
+def test_mxfp4_exponent_fold_is_bitwise_exact_for_all_e2m1_codes():
+    # The checkpoint-wide audit constrains the adjusted exponents to [2, 14].
+    # Cover both signs and all eight E2M1 exponent/mantissa bit patterns.
+    for code in range(16):
+        raw_bits = ((code >> 3) << 15) | ((code & 7) << 9)
+        raw = torch.tensor([raw_bits], dtype=torch.uint16).view(torch.float16)
+        bias = torch.tensor([29 << 10], dtype=torch.uint16).view(torch.float16)
+        decoded = raw * bias
+        for exponent in range(2, 15):
+            scale = torch.tensor(
+                [exponent << 10], dtype=torch.uint16
+            ).view(torch.float16)
+            folded_scale = torch.tensor(
+                [(exponent + 14) << 10], dtype=torch.uint16
+            ).view(torch.float16)
+            reference = decoded * scale
+            folded = raw * folded_scale
+            assert torch.equal(
+                reference.view(torch.uint16), folded.view(torch.uint16)
+            )
 
 
 def _v4_flash_moe_config() -> FusedMoEConfig:

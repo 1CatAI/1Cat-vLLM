@@ -190,4 +190,47 @@ struct Transform_HMMA_SIMT_B_PrescaledE4M3 {
   }
 };
 
+// DeepSeek V4's adjusted UE8M0 scale exponents are in [2, 14]. Folding the
+// E2M1 conversion factor (2^14) into that exponent removes the fragment-wide
+// half2 multiply while preserving every FP16 bit. The exact decode route
+// validates the scale range once during model loading.
+struct Transform_HMMA_SIMT_B_ExponentFoldedE2M1 {
+  template <class F, int Nf, int Mf, int K, class D, int Nd, int Md, class S,
+            int Ns, int Ms, int Ks>
+  __device__ static void apply(Array<F, Nf> (&frag)[K][Mf], int k,
+                               Array<D, Nd> (&data)[K][Md],
+                               Array<S, Ns> (&stat)[Ks][Ms], int div) {
+    static_assert(std::is_same_v<D, fp4_e2m1_t>);
+    static_assert(std::is_same_v<F, half>);
+    static_assert(std::is_same_v<S, uint8_t>);
+    static_assert(Nf * Mf == Nd * Md);
+    static_assert(Nd % Nf == 0 && Mf % Md == 0);
+    static_assert(Nd % 8 == 0);
+
+    auto& frag_k = reinterpret_cast<Array<F, Nd>(&)[Md]>(frag[k]);
+    auto& stat_k = reinterpret_cast<Array<S, 1>(&)[Ns * Ms]>(stat[k / div]);
+    auto& data_k = data[k];
+
+    PRAGMA_UNROLL
+    for (int m = 0; m < Md; ++m) {
+      Array<F, Nd> tmp;
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 8) {
+        auto& src = reinterpret_cast<Array<fp4_e2m1_t, 8>&>(data_k[m][i]);
+        reinterpret_cast<Array<half, 8>&>(tmp[i]) =
+            ConvertKvCache<fp4_e2m1_t, half>::cvt_f16x8_e2m1<false>(src);
+      }
+      PRAGMA_UNROLL
+      for (int i = 0; i < Nd; i += 2) {
+        const uint16_t exponent =
+            static_cast<uint16_t>(stat_k[(m * Nd + i) / Nf][0]) + 14U;
+        const auto scale = __ushort_as_half(exponent << 10U);
+        tmp[i] = __hmul(tmp[i], scale);
+        tmp[i + 1] = __hmul(tmp[i + 1], scale);
+      }
+      frag_k[m] = tmp;
+    }
+  }
+};
+
 }  // namespace turbomind::gemm
