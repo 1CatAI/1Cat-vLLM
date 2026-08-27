@@ -1293,6 +1293,11 @@ def _qsa_sparse_launch_profile(
             # A 32-column tile improves the exact 512-row and 8192-row Qwen4Exp
             # prefill shapes without changing small-batch or non-SM70 routes.
             block_n = 32
+        if base_programs >= 4096:
+            # Long prefill is register-limited at N32 (246 registers/thread).
+            # N16 with two warps lowers that to 160 and admits a third CTA/SM.
+            block_n = 16
+            partial_warps = 2
     return block_n, target_splits, partial_warps
 
 

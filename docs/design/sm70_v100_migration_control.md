@@ -79,6 +79,61 @@ Goal:
   `51.808ms` versus `55.682ms` at 8192 rows (`1.0748x`) and its output relative
   L2 is `0.5627`. At 512 rows it is only `1.2532x`. It is neither correct nor
   fast enough to justify a production integration or model restart.
+- Two cheaper selected-attention follow-ups are also rejected without a model
+  restart. Padding the six GQA query heads from Triton M8 to M16 does not make
+  Triton 3.4 emit Volta MMA: cached PTX still has zero `mma.sync`, shared memory
+  grows from 40960 to 49152 bytes, and exact 8192-row time regresses from
+  `55.595ms` to `121.561ms` with four warps or `113.971ms` with eight. Resolving
+  one page-table entry per four materialized consecutive QSA tokens is bitwise
+  exact, but also regresses from `55.607ms` to `57.873ms` (`0.9608x`) because
+  reshaping/masking and register pressure outweigh the saved address work.
+  This also bounds how the SGLang QSA prefill kernel can be reused on V100: its
+  modern-GPU M16 padding and contiguous first-prefill path are useful reference
+  designs, not drop-in SM70 wins. A larger selected-attention gain now requires
+  cross-query KV reuse or a genuinely tuned Volta kernel rather than more launch
+  or address arithmetic screening.
+- Existing one-second NVML samples rule out a coarse scheduler-idle explanation
+  for the remaining endpoint gap. The stable second 32K run averages `100%`
+  GPU utilization, the two 64K runs average `99.86%` and `100%`, and the 131K
+  run averages `97.06%`; corresponding mean board power is only about
+  `230W`, `207-221W`, and `201W`. The GPUs are continuously issuing work but
+  are not sustaining a compute-dense Tensor Core workload. The next Nsight
+  capture must therefore apportion the busy time among QSA, GDN, MoE and TP
+  communication rather than screen CPU scheduling or larger batch knobs.
+- The retained 8192-token TP4 Nsight capture confirms that selected QSA is the
+  first hotspot: 48 rank-layer instances consume `2647.245ms` in aggregate,
+  or `36.42%` of GPU kernel time and `55.151ms` per layer/rank. NCCL all-reduce
+  is `6.18%`; the main FlashQLA GDN chunk kernel is `3.11%`. The visible/top-k/
+  expand indexer kernels are `0.52%`; adding the four cuBLAS score GEMMs per
+  QSA layer brings the whole retained indexer route to only about `5-6%`.
+  The raw 29MB QDSTRM was recovered with the packaged host importer after the
+  CLI failed to locate it, so this evidence required no second model load.
+- Selected-QSA resource inspection gives a narrow production follow-up. N32
+  uses 246 registers/thread and 40960 bytes of shared memory with four warps,
+  limiting V100 to two CTAs/SM. N16 with two warps uses 160 registers/thread
+  and 24576 bytes, admitting three CTAs/SM. A 3-warmup/9-repeat 8192-row gate
+  measures N32 at `56.850ms` and N16 at `52.785ms`, a `1.0770x` speedup and
+  `7.15%` latency reduction. The cross-config maximum FP16 difference is
+  `0.0001220703125`; N8 is not compilable because Triton dot requires K>=16.
+  Production selects N16/two-warps only at 4096 or more base programs; the
+  accepted 512-row split-K and all non-SM70 profiles remain unchanged. Nsight
+  Compute hardware counters are unavailable to this user (`ERR_NVGPUCTRPERM`),
+  so do not repeat that counter attempt without an administrator changing the
+  host policy.
+- One retained TP4/V2/no-MTP/FP16-KV/FlashAttention model load closes the N16
+  endpoint gate. Pure-prefill means improve from `3623.04/3045.69/2314.11`
+  to `4532.07/4446.64/4108.16 tok/s` at 32K/64K/131K, respectively. That is
+  `1.2509x/1.4600x/1.7753x`, or `20.06%/31.51%/43.67%` less prefill latency.
+  Both 32K and 64K repetitions are stable, and every arithmetic, Chinese and
+  performance output token/hash is exactly equal to the retained N32 gate.
+- A one-shot diagnostic in that same model load sampled the selected compressed
+  blocks near positions 0--8191. Adjacent rows retain `81.92%` of the prior
+  row's 512 blocks (`0.6980` Jaccard), while gaps 4 and 16 retain `54.88%` and
+  `50.12%`. Same-rank ordering is only about `0.2--0.6%`, which explains why
+  sorting each row alone lost time. The next high-value candidate is therefore
+  a two-row union kernel that sorts/merges compressed block IDs and reuses each
+  K/V load across both queries; it must first pass an isolated numerical and
+  latency gate before another full-model startup.
 - The retained long-indexer candidate gathers one request's paged FP16 MQA
   keys once, applies a cuBLAS FP16-input/FP32-output Tensor Core GEMM in a
   bounded workspace, and fuses per-head ReLU, head sum, visibility and scale

@@ -10,10 +10,12 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
 )
 
 
-def test_sm70_qsa_prefill_uses_narrow_tiles_and_four_warps():
+def test_sm70_qsa_prefill_uses_occupancy_tuned_tiles_and_warps():
     assert _qsa_sparse_launch_profile(511, 8, True) == (64, 4, 4)
     assert _qsa_sparse_launch_profile(512, 8, True) == (32, 4, 4)
-    assert _qsa_sparse_launch_profile(8192, 8, True) == (32, 1, 4)
+    assert _qsa_sparse_launch_profile(4095, 8, True) == (32, 1, 4)
+    assert _qsa_sparse_launch_profile(4096, 8, True) == (16, 1, 2)
+    assert _qsa_sparse_launch_profile(8192, 8, True) == (16, 1, 2)
 
 
 def test_non_sm70_qsa_prefill_keeps_gb300_profile():
