@@ -711,13 +711,30 @@ class Qwen3CoderToolParser(ToolParser):
                     self.header_sent = True
                     self.in_function = True
 
+                    # A speculative burst can finish the entire function
+                    # before the parser has emitted its header. Do not rely on
+                    # a later delta to revisit the already-buffered body: the
+                    # next delta may only contain </tool_call> plus EOS. Parse
+                    # the complete body now and emit its arguments together
+                    # with the header.
+                    complete_arguments: str | None = None
+                    func_content_end = tool_text.find(
+                        self.function_end_token, func_start
+                    )
+                    if func_content_end != -1:
+                        parsed_tool = self._parse_xml_function_call(
+                            tool_text[func_start:func_content_end]
+                        )
+                        if parsed_tool is not None:
+                            complete_arguments = parsed_tool.function.arguments
+
                     # Always append — each tool call is a separate
                     # invocation even if the function name is the same
                     # (e.g. two consecutive "read" calls).
                     self.prev_tool_call_arr.append(
                         {
                             "name": self.current_function_name,
-                            "arguments": "{}",
+                            "arguments": complete_arguments or "{}",
                         }
                     )
 
@@ -726,7 +743,12 @@ class Qwen3CoderToolParser(ToolParser):
                     # compute remaining arguments at stream end. Without
                     # this, IndexError occurs when the serving layer
                     # accesses streamed_args_for_tool[index].
-                    self.streamed_args_for_tool.append("")
+                    self.streamed_args_for_tool.append(complete_arguments or "")
+
+                    if complete_arguments is not None:
+                        self.json_started = True
+                        self.json_closed = True
+                        self.in_function = False
 
                     # Send header with function info
                     return DeltaMessage(
@@ -735,7 +757,8 @@ class Qwen3CoderToolParser(ToolParser):
                                 index=self.current_tool_index,
                                 id=self.current_tool_id,
                                 function=DeltaFunctionCall(
-                                    name=self.current_function_name, arguments=""
+                                    name=self.current_function_name,
+                                    arguments=complete_arguments or "",
                                 ),
                                 type="function",
                             )

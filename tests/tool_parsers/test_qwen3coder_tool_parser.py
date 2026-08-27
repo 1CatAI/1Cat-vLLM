@@ -1571,6 +1571,60 @@ def test_streaming_final_param_and_function_close_single_chunk(
     }
 
 
+def test_streaming_parallel_function_body_buffered_before_header_emit(
+    qwen3_tokenizer,
+):
+    """A final speculative burst must not leave the last call as ``{}``."""
+    number_params = {
+        "type": "object",
+        "properties": {"number": {"type": "integer"}},
+        "required": ["number"],
+    }
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "math.factorial",
+                "description": "Calculate a factorial.",
+                "parameters": number_params,
+            },
+        )
+    ]
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    # These are the observed DFlash2 q15 streaming boundaries. The second
+    # function closes in the same burst that starts the third one; by the time
+    # the third header is emitted, its complete body is already buffered.
+    deltas = [
+        "<tool_call>",
+        "\n<function=math.factorial>",
+        "\n<parameter=number>\n5",
+        "\n</parameter>\n</function>",
+        "\n</tool_call>\n",
+        "<tool_call>\n<function=math.factorial",
+        ">\n<parameter=number>\n",
+        "1",
+        "0\n</parameter>\n</function",
+        ">\n</tool_call>\n<tool_call>\n<function=math.factorial>\n<parameter",
+        "=number>\n15",
+        "\n</parameter>\n</function>",
+        "\n</tool_call>",
+    ]
+
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    reconstructor = run_tool_extraction_streaming(
+        parser,
+        deltas,
+        request,
+        assert_one_tool_per_delta=False,
+    )
+
+    assert [
+        json.loads(call.function.arguments) for call in reconstructor.tool_calls
+    ] == [{"number": 5}, {"number": 10}, {"number": 15}]
+
+
 @pytest.mark.parametrize(
     "deltas, expected_content",
     [
