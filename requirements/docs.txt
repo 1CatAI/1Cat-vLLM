@@ -155,7 +155,7 @@ pyyaml-env-tag==1.1
     #   properdocs
 regex==2026.4.4
     # via -r requirements/docs.in
-requests==2.33.1
+requests==2.34.2
     # via mkdocs-material
 ruff==0.16.4
     # via -r requirements/docs.in
@@ -165,8 +165,9 @@ six==1.17.0
     # via python-dateutil
 smmap==5.0.3
     # via gitdb
-typing-extensions==4.15.0
+typing-extensions==4.16.0
     # via
+    #   mkdocstrings-python
     #   pydantic
     #   pydantic-core
     #   typing-inspection
