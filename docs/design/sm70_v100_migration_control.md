@@ -43459,6 +43459,56 @@ Interpretation:
   capture. The corrected branch uses the immutable `slot_expert_offsets`
   buffer. Keep the route opt-in until a post-fix full-model and GSM8K-64 gate
   pass; the failed endpoint is rejection evidence, not a speed baseline.
+- A follow-up C4 scheduling screen joins the `N=2048` main compressor,
+  `N=512` indexer compressor, and `N=64` indexer-weight FP16 row GEMVs into
+  one `N=2624` launch on one auxiliary stream. It preserves the original
+  `K=4096`, block-K=1024 FP32 FMA and reduction order; all three outputs and
+  the concurrently executed prescaled WQA/WKV output are bitwise equal across
+  64 changing inputs. The exact FP16 arm improves the four-stream overlap from
+  `103.809` to `51.639 us/C4 layer` warm and from `99.104` to
+  `73.856 us/C4 layer` after cache scrub. This is preferred over the slightly
+  faster packed-FP13 arm because it introduces no weight approximation. The
+  joined non-persistent buffer costs 20.5 MiB per C4 layer. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp13-fused-overlap-screen-20260826-r2/`.
+  The production kernel also passes a driver-free SM70 compile gate at 32
+  registers with zero stack, local, or static shared memory, plus a real-V100
+  CUDA Graph bitwise test under
+  `/data/models/v100-dsv4-0731-pp2tp4-fused-fp16-aux-gpu-test-20260826-r1/`.
+  Admission additionally requires the existing exact FP16 GEMV route through
+  `VLLM_SM70_DSV4_FP16_GEMV=1`; keep
+  `VLLM_SM70_DSV4_FUSED_FP16_AUX_GEMV` opt-in until an endpoint trace and
+  aggregate dataset gate pass.
+- Two smaller launch-shape candidates are rejected and their source changes
+  are not retained. Changing the M=1 mHC FP32 dot tile from N=2 to N=4 is
+  bitwise across 64 changing inputs, but a 43-layer, 64.5-MiB weight-streaming
+  graph moves only `0.162908` to `0.158266 ms/stage`, saving `0.004642 ms`.
+  Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mhc-tile4-screen-20260826-r1/`.
+  Likewise, reducing the M=1/E=256 sqrt-softplus router block from four warps
+  to one preserves initial, 64-pattern, and M=33 fallback hashes, but moves 40
+  layer calls only `0.274614` to `0.274186 ms/token`, saving `0.000428 ms`.
+  Evidence is
+  `/data/models/v100-dsv4-0731-pp2tp4-post-endpoint-screens-20260826-r1/results/topk_warp1.json`.
+- A separate FP8-E4M3 prescaled exponent-fold transform is also rejected; it
+  is unrelated to the accepted MXFP4-E2M1 fold. The rebuilt candidate has no
+  feasible kernel for the exact fused-WQA `M=1, N=1536, K=4096` descriptor,
+  both with ordinary selection and with the baseline
+  `8x128x64:5:1:1` tactic locked. Choosing a different tactic would abandon
+  the required reduction-order contract, so no further timing or dataset gate
+  is warranted and the source change is not retained. The isolated candidate
+  failure is under
+  `/data/models/v100-dsv4-0731-pp2tp4-fp8-exponent-fold-screen-20260826-r6/`.
+- MXFP4 gated-SwiGLU epilogues remain rejected as endpoint priorities. The
+  real layer-0 TP4-rank-0 screen is bitwise at the activated intermediate and
+  W2 output for 64 changing inputs across scales `0.01/0.1/1/4`, but the full
+  W13-to-W2 pipeline saves only `0.978 us/layer`, or `0.042 ms/token` across
+  43 layers. The much larger isolated W13-plus-activation delta is contradicted
+  by the complete pipeline and is not used. A same-address paired variant
+  independently projects only `0.143 ms/token`. Neither source candidate is
+  retained. Evidence is under
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-gated-silu-screen-20260826-r1/`
+  and
+  `/data/models/v100-dsv4-0731-pp2tp4-mxfp4-gated-epilogue-screen-20260826-r2/`.
 
 ## 2026-08-25 DFlash2 n-gram hybrid
 

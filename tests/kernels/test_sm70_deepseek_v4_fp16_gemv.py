@@ -9,7 +9,10 @@ import torch
 import vllm.envs as envs
 from vllm.models.deepseek_v4.sm70.gemv import (
     can_use_sm70_dsv4_fp16_gemv,
+    has_sm70_dsv4_fused_fp16_aux_weight_contract,
     maybe_sm70_dsv4_fp16_gemv,
+    maybe_sm70_dsv4_fused_fp16_aux_gemv,
+    prepare_sm70_dsv4_fused_fp16_aux_weight,
 )
 
 
@@ -25,6 +28,24 @@ def test_sm70_dsv4_fp16_gemv_is_default_off(monkeypatch) -> None:
     x = torch.empty((1, 4096), dtype=torch.float16)
     weight = torch.empty((256, 4096), dtype=torch.float16)
     assert not can_use_sm70_dsv4_fp16_gemv(x, weight, torch.float32)
+
+
+def test_sm70_dsv4_fused_fp16_aux_contract_is_exact_and_default_off(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_SM70_DSV4_FUSED_FP16_AUX_GEMV", raising=False)
+    weights = tuple(
+        torch.empty((rows, 4096), dtype=torch.float16, device="meta")
+        for rows in (2048, 512, 64)
+    )
+
+    assert has_sm70_dsv4_fused_fp16_aux_weight_contract(weights)
+    assert prepare_sm70_dsv4_fused_fp16_aux_weight(weights) is None
+    assert not has_sm70_dsv4_fused_fp16_aux_weight_contract(
+        (weights[1], weights[0], weights[2])
+    )
+    malformed_weights = (weights[0], torch.empty((), device="meta"), weights[2])
+    assert not has_sm70_dsv4_fused_fp16_aux_weight_contract(malformed_weights)
 
 
 @pytest.mark.skipif(
@@ -70,3 +91,53 @@ def test_sm70_dsv4_fp16_gemv_graph(
     else:
         reference = torch.mm(x, weight.T, out_dtype=torch.float32)
         torch.testing.assert_close(captured, reference, rtol=2e-4, atol=5e-5)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires NVIDIA V100/SM70",
+)
+def test_sm70_dsv4_fused_fp16_aux_graph_is_bitwise(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SM70_DSV4_FP16_GEMV", "1")
+    monkeypatch.setenv("VLLM_SM70_DSV4_FUSED_FP16_AUX_GEMV", "1")
+    torch.manual_seed(20260826)
+    x = torch.randn((1, 4096), device="cuda", dtype=torch.float16)
+    weights = tuple(
+        torch.randn((rows, 4096), device="cuda", dtype=torch.float16) * 0.01
+        for rows in (2048, 512, 64)
+    )
+    fused_weight = prepare_sm70_dsv4_fused_fp16_aux_weight(weights)
+    assert fused_weight is not None
+
+    output_dtypes = (torch.float32, torch.float32, torch.float16)
+    reference = tuple(
+        maybe_sm70_dsv4_fp16_gemv(x, weight, output_dtype)
+        for weight, output_dtype in zip(weights, output_dtypes)
+    )
+    candidate = maybe_sm70_dsv4_fused_fp16_aux_gemv(x, fused_weight)
+    assert all(output is not None for output in reference)
+    assert candidate is not None
+    torch.cuda.synchronize()
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(candidate, reference)
+        if expected is not None
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_reference = tuple(
+            maybe_sm70_dsv4_fp16_gemv(x, weight, output_dtype)
+            for weight, output_dtype in zip(weights, output_dtypes)
+        )
+        captured_candidate = maybe_sm70_dsv4_fused_fp16_aux_gemv(x, fused_weight)
+    assert all(output is not None for output in captured_reference)
+    assert captured_candidate is not None
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(captured_candidate, captured_reference)
+        if expected is not None
+    )
