@@ -1,0 +1,375 @@
+diff --git a/config/speculative.py b/config/speculative.py
+index 499255f..8e63454 100644
+--- a/config/speculative.py
++++ b/config/speculative.py
+@@ -84,7 +84,7 @@ class SpeculativeConfig:
+     enforce_eager: bool | None = None
+     """Override the default enforce_eager from model_config"""
+     # General speculative decoding control
+-    num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
++    num_speculative_tokens: int = Field(default=None, ge=0)  # type: ignore[assignment]
+     """The number of speculative tokens, if provided. It will default to the
+     number in the draft model config if present, otherwise, it is required."""
+     model: str | None = None
+@@ -569,6 +569,15 @@ class SpeculativeConfig:
+         return hf_config
+ 
+     def __post_init__(self):
++        # opt23: MTP=0 disables speculative decoding (equivalent to not
++        # passing a speculative config at all).
++        if self.num_speculative_tokens is not None and self.num_speculative_tokens == 0:
++            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
++            self.method = None
++            self.model = None
++            self.num_speculative_tokens = None
++            return self
++
+         # Note: "method" is a new parameter that helps to extend the
+         # configuration of non-model-based proposers, and the "model" parameter
+         # will be used to set the draft model, eagle head, or additional weight
+@@ -1109,7 +1118,7 @@ class SpeculativeConfig:
+                 "n_predict parameter."
+             )
+ 
+-        if self.num_speculative_tokens <= 0:
++        if self.num_speculative_tokens < 0:
+             raise ValueError(
+                 "Expected num_speculative_tokens to be greater "
+                 f"than zero ({self.num_speculative_tokens})."
+diff --git a/engine/arg_utils.py b/engine/arg_utils.py
+index 121d2a3..ed2d1e0 100644
+--- a/engine/arg_utils.py
++++ b/engine/arg_utils.py
+@@ -1718,6 +1718,11 @@ class EngineArgs:
+         if self.speculative_config is None:
+             return None
+ 
++        # opt23: num_speculative_tokens=0 disables speculative decoding.
++        if self.speculative_config.get("num_speculative_tokens") == 0:
++            logger.info("num_speculative_tokens=0, disabling speculative decoding.")
++            return None
++
+         if "enforce_eager" not in self.speculative_config:
+             self.speculative_config["enforce_eager"] = False
+             logger.info_once(
+@@ -1778,6 +1783,10 @@ class EngineArgs:
+             profile_updates.append("mamba_cache_mode=align")
+ 
+         if self.speculative_config is None:
++            # opt23: --spec-tokens 0 explicitly disables MTP — skip auto-MTP.
++            if self.spec_tokens is not None and self.spec_tokens <= 0:
++                logger.info("--spec-tokens=%d, skipping auto-MTP.", self.spec_tokens)
++                return
+             enable_auto_mtp = (
+                 envs.VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS
+                 or envs.VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS
+diff --git a/envs.py b/envs.py
+index 958ddb1..84efabf 100644
+--- a/envs.py
++++ b/envs.py
+@@ -261,6 +261,7 @@ if TYPE_CHECKING:
+     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL: bool = False
+     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU: bool = False
+     VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK: int = 0
++    VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT: bool = False
+     VLLM_SM70_MTP_DENSE_F16_FASTPATH: bool = True
+     VLLM_SM70_MTP_DENSE_F16_ALLOWLIST: str | None = None
+     VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS: bool = False
+@@ -2071,6 +2072,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU": lambda: bool(
+         int(os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU", "0"))
+     ),
++    "VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT": lambda: bool(
++        int(os.getenv("VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT", "0"))
++    ),
+     "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK": lambda: int(
+         os.getenv("VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK", "0")
+     ),
+diff --git a/v1/core/sched/scheduler.py b/v1/core/sched/scheduler.py
+index 7fa7757..4ca0f20 100644
+--- a/v1/core/sched/scheduler.py
++++ b/v1/core/sched/scheduler.py
+@@ -324,6 +324,23 @@ class Scheduler(SchedulerInterface):
+ 
+         self._pause_state: PauseState = PauseState.UNPAUSED
+ 
++        # opt23: auto-adjust long_prefill_token_threshold for concurrent loads
++        max_seqs = self.scheduler_config.max_num_seqs
++        max_batched_tokens = self.scheduler_config.max_num_batched_tokens
++        safe_threshold = int(max_batched_tokens * 0.25)
++        current_threshold = self.scheduler_config.long_prefill_token_threshold
++        if max_seqs >= 4:
++            if current_threshold == 0:
++                self.scheduler_config.long_prefill_token_threshold = safe_threshold
++                logger.info("Auto-adjusted long_prefill_token_threshold from 0 to %d",
++                            safe_threshold)
++            elif current_threshold < safe_threshold:
++                logger.warning(
++                    "long_prefill_token_threshold (%d) is below safe minimum (%d). Forcing to %d.",
++                    current_threshold, safe_threshold, safe_threshold,
++                )
++                self.scheduler_config.long_prefill_token_threshold = safe_threshold
++
+     @staticmethod
+     def _ddtree_payload_is_flat_chain(payload: object) -> bool:
+         is_flat_chain = getattr(payload, "is_flat_chain", None)
+@@ -495,6 +512,15 @@ class Scheduler(SchedulerInterface):
+         self.kv_cache_manager.new_step_starts()
+ 
+         # First, schedule the RUNNING requests.
++        # opt23: 65/35 prefill/decode budget split for concurrent loads
++        running_count = len(self.running)
++        if running_count > 0:
++            decode_per_request = self.scheduler_config.max_num_batched_tokens // running_count
++            prefill_cap = int(self.scheduler_config.max_num_batched_tokens * 0.65)
++        else:
++            decode_per_request = self.scheduler_config.max_num_batched_tokens
++            prefill_cap = self.scheduler_config.max_num_batched_tokens
++
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
+@@ -561,7 +587,10 @@ class Scheduler(SchedulerInterface):
+                     and tree_num_new_tokens <= token_budget
+                     and tree_num_new_tokens <= max_len_tokens
+                 ):
+-                    num_new_tokens = tree_num_new_tokens
++                    # opt23: DDTree expansion self-capping — never let the
++                    # tree draft exceed decode_per_request headroom.
++                    capped = max(num_new_tokens, decode_per_request)
++                    num_new_tokens = min(tree_num_new_tokens, capped)
+                     _ddtree_debug_log(
+                         "schedule expanded req=%s num_new=%d",
+                         request.request_id,
+@@ -891,6 +920,9 @@ class Scheduler(SchedulerInterface):
+                     threshold = self.scheduler_config.long_prefill_token_threshold
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
++                    # opt23: cap WAITING prefill when RUNNING requests exist
++                    if running_count > 0:
++                        num_new_tokens = min(num_new_tokens, prefill_cap)
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
+index 85811c4..39367f7 100644
+--- a/v1/spec_decode/llm_base_proposer.py
++++ b/v1/spec_decode/llm_base_proposer.py
+@@ -239,10 +239,21 @@ class SpecDecodeBaseProposer:
+             vllm_config.parallel_config.tensor_parallel_size,
+             vllm_config.model_config.architecture,
+             vllm_config.model_config.model,
++            self.num_speculative_tokens,
+         )
+         if draft_vocab_config.gpu_lru_enabled:
+             if self.max_batch_size != 1:
+-                raise ValueError("Dynamic GPU LRU requires scheduler max_num_seqs=1.")
++                if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                    logger.info(
++                        "Dynamic GPU LRU multi-concurrent: max_num_seqs=%d.",
++                        self.max_batch_size,
++                    )
++                else:
++                    logger.warning(
++                        "Dynamic GPU LRU requires scheduler max_num_seqs=1, "
++                        "but max_num_seqs=%d. Falling back to CPU LRU.",
++                        self.max_batch_size,
++                    )
+             if draft_vocab_config.full_refresh_interval != 0:
+                 raise ValueError("Dynamic GPU LRU requires full_refresh_interval=0.")
+         self.token_arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
+@@ -2258,6 +2269,7 @@ class SpecDecodeBaseProposer:
+             self.vllm_config.parallel_config.tensor_parallel_size,
+             self.vllm_config.model_config.architecture,
+             self.vllm_config.model_config.model,
++            self.num_speculative_tokens,
+         )
+         ranking_path = vocab_config.ranking_path
+         shortlist_size = vocab_config.shortlist_size
+@@ -2265,6 +2277,28 @@ class SpecDecodeBaseProposer:
+         full_refresh_interval = vocab_config.full_refresh_interval
+         fused_proposal_enabled = vocab_config.fused_proposal_enabled
+         gpu_lru_enabled = vocab_config.gpu_lru_enabled
++        if gpu_lru_enabled and self.max_batch_size > 1:
++            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                # opt23: true multi-concurrent GPU-LRU
++                # total tail pool = 1536, per-rank = 1536 // tp_size
++                # shared LRU pool across all concurrent requests
++                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
++                per_rank_tail = min(512, 1536 // tp_size)
++                if vocab_config.using_defaults:
++                    dynamic_tail_size = per_rank_tail
++                logger.info(
++                    "GPU LRU multi-concurrent enabled: max_num_seqs=%d "
++                    "per_rank_tail=%d total_pool=%d",
++                    self.max_batch_size, per_rank_tail,
++                    per_rank_tail * tp_size,
++                )
++            else:
++                logger.warning(
++                    "Dynamic GPU LRU requires max_num_seqs=1, "
++                    "but max_num_seqs=%d. Disabling GPU LRU, falling back to CPU LRU.",
++                    self.max_batch_size,
++                )
++                gpu_lru_enabled = False
+         if vocab_config.using_defaults:
+             logger.info(
+                 "Using default MTP dynamic draft vocabulary: base=%d tail=%d "
+diff --git a/v1/spec_decode/static_draft_vocab.py b/v1/spec_decode/static_draft_vocab.py
+index f7dbba7..21e333b 100644
+--- a/v1/spec_decode/static_draft_vocab.py
++++ b/v1/spec_decode/static_draft_vocab.py
+@@ -15,6 +15,10 @@ import torch.nn.functional as F
+ 
+ import vllm.envs as envs
+ 
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.logits_processor import LogitsProcessor
+     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+@@ -65,6 +69,7 @@ def resolve_mtp_draft_vocab_config(
+     tensor_parallel_size: int = 2,
+     model_architecture: str | None = None,
+     model_name_or_path: str | None = None,
++    num_speculative_tokens: int | None = 4,
+ ) -> MTPDraftVocabConfig:
+     """Resolve explicit controls or the model-specific default MTP vocabulary."""
+     config = MTPDraftVocabConfig(
+@@ -108,13 +113,27 @@ def resolve_mtp_draft_vocab_config(
+         raise FileNotFoundError(
+             f"Default MTP dynamic-vocabulary ranking asset is missing: {ranking_path}"
+         )
++    # opt23: fused proposal 优先（MTP1/2/3/4 共用参数化 kernel）；
++    # fused kernel 不可用时按原设计理念降级 non-fused 标准 dynamic-vocab 路径。
++    nst = num_speculative_tokens or 4
++    fused_ok = (
++        nst in (1, 2, 3, 4)
++        and hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out")
++    )
++    if not fused_ok:
++        logger.warning_once(
++            "Fused proposal unavailable for num_speculative_tokens=%d "
++            "(kernel missing or unsupported). Falling back to non-fused "
++            "standard dynamic-vocab path.",
++            nst,
++        )
+     return MTPDraftVocabConfig(
+         ranking_path=str(ranking_path),
+         shortlist_size=98_304,
+         dynamic_tail_size=512,
+         full_refresh_interval=0,
+-        fused_proposal_enabled=True,
+-        gpu_lru_enabled=True,
++        fused_proposal_enabled=fused_ok,
++        gpu_lru_enabled=fused_ok,
+         prefill_topk=2048,
+         using_defaults=True,
+     )
+@@ -854,11 +873,24 @@ def initialize_dynamic_draft_vocab(
+             raise ValueError(
+                 "Dynamic GPU LRU is validated only with fused TP2/TP4 proposal."
+             )
+-        if base_size != 98_304 or tail_size != 512:
++        if base_size != 98_304:
+             raise ValueError(
+-                "Dynamic GPU LRU requires the validated 98,304 base plus "
+-                "512 shard-local tail rows per rank."
++                "Dynamic GPU LRU requires the validated 98,304 base."
+             )
++        if tail_size != 512:
++            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                if tail_size > 512:
++                    raise ValueError(
++                        "GPU LRU multi-concurrent tail_size exceeds "
++                        "compiled kernel limit (512 per rank)."
++                    )
++            else:
++                raise ValueError(
++                    "Dynamic GPU LRU requires the validated 512 "
++                    "shard-local tail rows per rank (got %d). "
++                    "Set VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT=1 "
++                    "for dynamic tail sizing." % tail_size
++                )
+         if target_lm_head.weight.dtype != torch.float16:
+             raise ValueError("Dynamic GPU LRU currently requires an FP16 LM-head.")
+         if full_refresh_interval != 0:
+@@ -977,8 +1009,11 @@ def initialize_dynamic_draft_vocab(
+         sm70_ops = _get_sm70_ops()
+         if tp_size not in (2, 4):
+             raise ValueError("Dynamic fused proposal currently requires TP2 or TP4.")
+-        if num_speculative_tokens != 4:
+-            raise ValueError("Dynamic fused proposal currently requires MTP4.")
++        if num_speculative_tokens not in (1, 2, 3, 4):
++            raise ValueError(
++                "Dynamic fused proposal currently requires MTP1/2/3/4 "
++                "(MTP=0 disables speculation before reaching this point)."
++            )
+         if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
+             raise RuntimeError("Dynamic fused proposal SM70 ops are not built.")
+         if gpu_lru_enabled and (
+diff --git a/v1/worker/gpu_model_runner.py b/v1/worker/gpu_model_runner.py
+index e6dbb57..b527a49 100644
+--- a/v1/worker/gpu_model_runner.py
++++ b/v1/worker/gpu_model_runner.py
+@@ -6811,7 +6811,39 @@ class GPUModelRunner(
+         if self.dynamic_draft_vocab_prefill_topk == 0:
+             return None
+         if self.input_batch.num_reqs != 1:
+-            return None
++            if not envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
++                return None
++            # opt23: multi-concurrent GPU-LRU — traverse all prefilling
++            # requests, union their top-k candidates into shared tail
++            all_candidate_ids = []
++            consumed_ids = []
++            for req_idx, req_id in enumerate(self.input_batch.req_ids):
++                num_computed = int(
++                    self.input_batch.num_computed_tokens_cpu[req_idx]
++                )
++                num_prompt = int(self.input_batch.num_prompt_tokens[req_idx])
++                if num_computed >= num_prompt:
++                    continue  # not prefilling
++                candidate_ids = self._dynamic_draft_vocab_prefill_bootstrap.maybe_prepare_candidates(
++                    req_id,
++                    logits,
++                    topk=self.dynamic_draft_vocab_prefill_topk,
++                    num_computed_tokens=num_computed,
++                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens.get(
++                        req_id, 0
++                    ),
++                    num_prompt_tokens=num_prompt,
++                    spec_decode_active=spec_decode_metadata is not None,
++                )
++                if candidate_ids is not None:
++                    all_candidate_ids.append(candidate_ids)
++                    consumed_ids.append(req_id)
++            if not all_candidate_ids:
++                return None
++            if len(all_candidate_ids) == 1:
++                return consumed_ids[0], all_candidate_ids[0]
++            union = torch.unique(torch.cat(all_candidate_ids))
++            return ",".join(consumed_ids), union
+ 
+         request_id = self.input_batch.req_ids[0]
+         request_index = self.input_batch.req_id_to_index[request_id]
+@@ -6858,10 +6890,15 @@ class GPUModelRunner(
+ 
+         request_id, candidate_ids = bootstrap
+         update_dynamic_draft_vocab(candidate_ids, sampled_token_ids)
+-        self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(request_id)
++        # opt23: handle multi-concurrent (comma-separated request IDs)
++        for rid in request_id.split(","):
++            self._dynamic_draft_vocab_prefill_bootstrap.mark_consumed(rid)
++        num_reqs = request_id.count(",") + 1
+         logger.info(
+-            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: topk=%d.",
++            "Applied one-shot target-logits dynamic-vocab prefill bootstrap: "
++            "topk=%d reqs=%d.",
+             self.dynamic_draft_vocab_prefill_topk,
++            num_reqs,
+         )
+ 
+     def _sample(

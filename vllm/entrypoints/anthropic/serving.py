@@ -360,24 +360,39 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> ChatCompletionRequest:
         """Build base ChatCompletionRequest"""
         if isinstance(anthropic_request, AnthropicCountTokensRequest):
-            return ChatCompletionRequest(
+            req = ChatCompletionRequest(
                 model=anthropic_request.model,
                 messages=openai_messages,
                 chat_template_kwargs=anthropic_request.chat_template_kwargs,
             )
+        else:
+            req = ChatCompletionRequest(
+                model=anthropic_request.model,
+                messages=openai_messages,
+                max_tokens=anthropic_request.max_tokens,
+                max_completion_tokens=anthropic_request.max_tokens,
+                stop=anthropic_request.stop_sequences,
+                temperature=anthropic_request.temperature,
+                top_p=anthropic_request.top_p,
+                top_k=anthropic_request.top_k,
+                kv_transfer_params=anthropic_request.kv_transfer_params,
+                chat_template_kwargs=anthropic_request.chat_template_kwargs,
+            )
 
-        return ChatCompletionRequest(
-            model=anthropic_request.model,
-            messages=openai_messages,
-            max_tokens=anthropic_request.max_tokens,
-            max_completion_tokens=anthropic_request.max_tokens,
-            stop=anthropic_request.stop_sequences,
-            temperature=anthropic_request.temperature,
-            top_p=anthropic_request.top_p,
-            top_k=anthropic_request.top_k,
-            kv_transfer_params=anthropic_request.kv_transfer_params,
-            chat_template_kwargs=anthropic_request.chat_template_kwargs,
-        )
+        # opt22: fix=2 强制 JSON / fix=3 强制 XML——模板格式与 parser 路由对齐
+        from vllm.envs import VLLM_QWEN3X_TOOL_FIX
+
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            req.chat_template_kwargs = {
+                **(req.chat_template_kwargs or {}),
+                "tool_call_format": "json",
+            }
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            req.chat_template_kwargs = {
+                **(req.chat_template_kwargs or {}),
+                "tool_call_format": "xml",
+            }
+        return req
 
     @classmethod
     def _handle_output_config(
@@ -503,11 +518,19 @@ class AnthropicServingMessages(OpenAIServingChat):
     ) -> AnthropicMessagesResponse:
         result = AnthropicMessagesResponse(
             id=generator.id,
+            type="message",
+            role="assistant",
             content=[],
             model=generator.model,
             usage=AnthropicUsage(
                 input_tokens=generator.usage.prompt_tokens,
                 output_tokens=generator.usage.completion_tokens,
+                cache_read_input_tokens=(
+                    generator.usage.prompt_tokens_details.cached_tokens
+                    if generator.usage.prompt_tokens_details
+                    and generator.usage.prompt_tokens_details.cached_tokens
+                    else None
+                ),
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -655,6 +678,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
                                     id=origin_chunk.id,
+                                    type="message",
+                                    role="assistant",
                                     content=[],
                                     model=origin_chunk.model,
                                     stop_reason=None,
@@ -664,6 +689,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                                         if origin_chunk.usage
                                         else 0,
                                         output_tokens=0,
+                                        cache_read_input_tokens=(
+                                            origin_chunk.usage.prompt_tokens_details.cached_tokens
+                                            if origin_chunk.usage
+                                            and origin_chunk.usage.prompt_tokens_details
+                                            and origin_chunk.usage.prompt_tokens_details.cached_tokens
+                                            else None
+                                        ),
                                     ),
                                 ),
                             )
@@ -689,6 +721,13 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     output_tokens=origin_chunk.usage.completion_tokens
                                     if origin_chunk.usage
                                     else 0,
+                                    cache_read_input_tokens=(
+                                        origin_chunk.usage.prompt_tokens_details.cached_tokens
+                                        if origin_chunk.usage
+                                        and origin_chunk.usage.prompt_tokens_details
+                                        and origin_chunk.usage.prompt_tokens_details.cached_tokens
+                                        else None
+                                    ),
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)

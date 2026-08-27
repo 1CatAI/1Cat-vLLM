@@ -66,7 +66,7 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import CompletionOutput, RequestOutput, STREAM_KEEPALIVE
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
@@ -246,6 +246,20 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        # opt22: fix=2/3 时注入 tool_call_format → 模板渲染对应分支
+        from vllm.envs import VLLM_QWEN3X_TOOL_FIX
+
+        if VLLM_QWEN3X_TOOL_FIX == 2:
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "tool_call_format": "json",
+            }
+        elif VLLM_QWEN3X_TOOL_FIX == 3:
+            request.chat_template_kwargs = {
+                **(request.chat_template_kwargs or {}),
+                "tool_call_format": "xml",
+            }
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
@@ -495,8 +509,17 @@ class OpenAIServingChat(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        last_server_send_time = time.time()
         try:
             async for res in result_generator:
+                # opt21: ignore engine keepalive (15s), handle server keepalive (120s)
+                if res is STREAM_KEEPALIVE:
+                    now = time.time()
+                    if now - last_server_send_time >= 120:
+                        yield ": keepalive\n\n"
+                        last_server_send_time = now
+                    continue
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:

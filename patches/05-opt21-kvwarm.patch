@@ -1,0 +1,276 @@
+From 0124dad56fa1252b607e0aa7d5e691240557c1d1 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 19:35:34 +0800
+Subject: [PATCH] =?UTF-8?q?feat(opt21):=20KV=20=E7=BC=93=E5=AD=98=E6=97=B6?=
+ =?UTF-8?q?=E9=99=90=E4=BC=98=E5=8C=96=EF=BC=88Warm=20Block=20=E6=97=B6?=
+ =?UTF-8?q?=E9=97=B4=E5=80=92=E6=8E=92=E5=9B=9E=E6=94=B6=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+原 opt22 独立设计重新纳入 opt21 基础项。唯一改动 block_pool.py（10 处）：
+- __init__: warm_blocks FIFO + _warm_freed_at 时间戳 + _retention_tiers 压力阶梯
+- free_blocks: 带 hash block 进 warm（保留 hash+时间戳），无 hash 直接回收
+- get_new_blocks: free queue 不足先 _promote_warm_blocks(shortage)
+- _get_retention_seconds: usage=(allocated+warm)/total 查阶梯（12h/6h/3h/1h/30m/即刻）
+- _promote_warm_blocks: Phase1 过期回收 + Phase2 无视时限冷→热
+- touch: in_warm 标记防 free_block_queue.remove() 崩溃（Bug#1）
+- get_num_free_blocks: free + warm
+- warm_block_count property
+- reset_prefix_cache: drain warm 到 free queue
+
+环境变量: VLLM_KV_RETENTION_P25~P80（os.environ 直读，不经 envs.py）
+---
+ v1/core/block_pool.py | 176 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 168 insertions(+), 8 deletions(-)
+
+diff --git a/v1/core/block_pool.py b/v1/core/block_pool.py
+index 513e4bf..c817882 100644
+--- a/v1/core/block_pool.py
++++ b/v1/core/block_pool.py
+@@ -1,5 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++import time
++from collections import OrderedDict
+ from collections.abc import Iterable, Sequence
+ from typing import Any
+ 
+@@ -181,6 +184,47 @@ class BlockPool:
+ 
+         self.metrics_collector = metrics_collector
+ 
++        # --- Warm-block retention (opt21: cold→hot time-based reclaim) ---
++        # Blocks freed while still holding a valid hash are placed here
++        # instead of the free queue.  They stay in the prefix-cache hash
++        # table so that a subsequent request with the same prefix can
++        # touch() them without eviction.
++        #
++        # Each warm block carries a freed_at monotonic timestamp.
++        # Blocks are ordered FIFO (oldest freed → newest freed).
++        # When the free queue is empty, blocks are promoted (hash evicted,
++        # moved to free queue) oldest-first (cold→hot), governed by a
++        # pressure-gated retention time:
++        #
++        #   usage < 25 %  →  retain 12 hours
++        #   usage < 35 %  →  retain  6 hours
++        #   usage < 50 %  →  retain  3 hours
++        #   usage < 65 %  →  retain  1 hour
++        #   usage < 80 %  →  retain 30 minutes
++        #   usage ≥ 80 %  →  immediate reclaim (cold→hot)
++        #
++        # This naturally keeps ~25-35 % of blocks hot: frequently-hit
++        # blocks are touched, removed from warm, and re-freed with a
++        # fresh timestamp at the *back* of the queue, so they survive
++        # many reclamation cycles while cold blocks age out first.
++        #
++        # OrderedDict provides FIFO ordering and O(1) removal on touch().
++        self.warm_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
++        # Parallel map: block_id → freed_at (time.monotonic seconds).
++        self._warm_freed_at: dict[int, float] = {}
++
++        # Retention tiers: (max_usage, retention_seconds), cold→hot order.
++        # At ≥80% retention is 0: immediate cold→hot reclaim.
++        _p25 = int(os.environ.get("VLLM_KV_RETENTION_P25", "43200"))   # 12h
++        _p35 = int(os.environ.get("VLLM_KV_RETENTION_P35", "21600"))   #  6h
++        _p50 = int(os.environ.get("VLLM_KV_RETENTION_P50", "10800"))   #  3h
++        _p65 = int(os.environ.get("VLLM_KV_RETENTION_P65", "3600"))    #  1h
++        _p80 = int(os.environ.get("VLLM_KV_RETENTION_P80", "1800"))    # 30m
++        self._retention_tiers: list[tuple[float, int]] = [
++            (0.25, _p25), (0.35, _p35), (0.50, _p50),
++            (0.65, _p65), (0.80, _p80),
++        ]
++
+     def get_cached_block(
+         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+     ) -> list[KVCacheBlock] | None:
+@@ -344,6 +388,13 @@ class BlockPool:
+         if num_blocks > self.get_num_free_blocks():
+             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+ 
++        # Promote warm blocks if the free queue alone is insufficient.
++        # Promotion is time-based: only blocks whose age exceeds the
++        # current retention window are eligible (coldest first).
++        shortage = num_blocks - self.free_block_queue.num_free_blocks
++        if shortage > 0 and self.warm_blocks:
++            self._promote_warm_blocks(shortage)
++
+         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+ 
+         # In order to only iterate the list once, we duplicated code a bit
+@@ -401,16 +452,23 @@ class BlockPool:
+ 
+     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+         """Touch a block increases its reference count by 1, and may remove
+-        the block from the free queue. This is used when a block is hit by
+-        another request with the same prefix.
++        the block from the free queue or warm list. This is used when a
++        block is hit by another request with the same prefix.
+ 
+         Args:
+             blocks: A list of blocks to touch.
+         """
+         for block in blocks:
++            # Remove from warm list if the block was retained there.
++            # This avoids hash eviction — the block is reused directly.
++            in_warm = block.block_id in self.warm_blocks
++            if in_warm:
++                del self.warm_blocks[block.block_id]
++                self._warm_freed_at.pop(block.block_id, None)
+             # ref_cnt=0 means this block is in the free list (i.e. eviction
+-            # candidate), so remove it.
+-            if block.ref_cnt == 0 and not block.is_null:
++            # candidate), so remove it.  Skip if the block was in warm_blocks
++            # — warm blocks are NOT in the free queue.
++            if block.ref_cnt == 0 and not block.is_null and not in_warm:
+                 self.free_block_queue.remove(block)
+             block.ref_cnt += 1
+             if self.metrics_collector:
+@@ -420,6 +478,13 @@ class BlockPool:
+         """Free a list of blocks. The blocks should be ordered by their
+         eviction priority, where the first block will be evicted first.
+ 
++        Blocks that still hold a valid hash (were previously cached) are
++        placed in the *warm* list rather than the free queue.  This keeps
++        them in the hash table so subsequent requests with the same prefix
++        can ``touch()`` them without eviction.  They are only promoted to
++        the free queue (and their hashes evicted) when a new allocation
++        exhausts the free queue.
++
+         Args:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
+@@ -428,9 +493,19 @@ class BlockPool:
+         blocks_list = list(ordered_blocks)
+         for block in blocks_list:
+             block.ref_cnt -= 1
+-        self.free_block_queue.append_n(
+-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+-        )
++
++        free_list: list[KVCacheBlock] = []
++        now = time.monotonic()
++        for block in blocks_list:
++            if block.ref_cnt != 0 or block.is_null:
++                continue
++            if block.block_hash is not None and self.enable_caching:
++                # Retain hash: place in warm list with a timestamp.
++                self.warm_blocks[block.block_id] = block
++                self._warm_freed_at[block.block_id] = now
++            else:
++                free_list.append(block)
++        self.free_block_queue.append_n(free_list)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+@@ -469,6 +544,13 @@ class BlockPool:
+             )
+             return False
+ 
++        # Drain warm blocks to the free queue (evicting their hashes).
++        while self.warm_blocks:
++            _, block = self.warm_blocks.popitem(last=False)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++        self._warm_freed_at.clear()
++
+         # Remove all hashes so that no new blocks will hit.
+         self.cached_block_hash_to_block = BlockHashToBlockMap()
+ 
+@@ -486,13 +568,91 @@ class BlockPool:
+ 
+         return True
+ 
++    @property
++    def warm_block_count(self) -> int:
++        """Number of blocks currently retained in the warm list."""
++        return len(self.warm_blocks)
++
++    def _get_retention_seconds(self) -> float:
++        """Return retention time (seconds) for the current cache pressure.
++
++        Hot blocks (recently freed / frequently hit) are at the back of
++        the FIFO queue and survive longer; cold blocks (old, unused) are
++        at the front and age out first.  At ≥80 % usage, retention is 0
++        — immediate cold→hot reclaim.
++        """
++        total = self.num_gpu_blocks - 1  # exclude null block
++        free = self.free_block_queue.num_free_blocks
++        warm = len(self.warm_blocks)
++        allocated = max(total - free - warm, 0)
++        usage = (allocated + warm) / max(total, 1)
++
++        for threshold, retention in self._retention_tiers:
++            if usage < threshold:
++                return float(retention)
++        return 0.0  # ≥80%: immediate reclaim
++
++    def _promote_warm_blocks(self, num_blocks: int) -> int:
++        """Promote *num_blocks* warm blocks to the free queue.
++
++        Blocks are always reclaimed oldest-first (cold → hot).
++        Phase 1: promote blocks whose age exceeds the current retention
++        time.  Phase 2: if still short, promote the oldest remaining
++        blocks regardless of age.
++
++        Frequently-hit blocks are naturally protected: each cache hit
++        removes the block from warm via ``touch()``; when re-freed it
++        gets a fresh timestamp at the *back* of the queue, so it
++        survives many reclamation cycles.
++
++        Returns the number of blocks actually promoted.
++        """
++        now = time.monotonic()
++        retention = self._get_retention_seconds()
++
++        promoted = 0
++        # Phase 1: promote blocks whose retention has expired (oldest first).
++        expired: list[int] = []
++        for block_id in self.warm_blocks:
++            if promoted >= num_blocks:
++                break
++            freed_at = self._warm_freed_at.get(block_id, 0.0)
++            if freed_at <= 0.0 or (now - freed_at) >= retention:
++                expired.append(block_id)
++                promoted += 1
++
++        for block_id in expired:
++            block = self.warm_blocks.pop(block_id)
++            self._warm_freed_at.pop(block_id, None)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++
++        # Phase 2: still need blocks → promote oldest remaining (cold→hot).
++        while promoted < num_blocks and self.warm_blocks:
++            block_id, block = next(iter(self.warm_blocks.items()))
++            del self.warm_blocks[block_id]
++            self._warm_freed_at.pop(block_id, None)
++            self._maybe_evict_cached_block(block)
++            self.free_block_queue.append_n([block])
++            promoted += 1
++
++        if promoted:
++            logger.debug(
++                "Promoted %d warm blocks (retention=%.0fs, %d remain).",
++                promoted, retention, len(self.warm_blocks),
++            )
++        return promoted
++
+     def get_num_free_blocks(self) -> int:
+         """Get the number of free blocks in the pool.
+ 
++        Includes warm blocks (freed but hash-retained) since they can be
++        promoted to the free queue on demand.
++
+         Returns:
+             The number of free blocks.
+         """
+-        return self.free_block_queue.num_free_blocks
++        return self.free_block_queue.num_free_blocks + len(self.warm_blocks)
+ 
+     def get_usage(self) -> float:
+         """Get the KV cache usage.
+-- 
+2.43.0
+

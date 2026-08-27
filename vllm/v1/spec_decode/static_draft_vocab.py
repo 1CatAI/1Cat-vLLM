@@ -15,6 +15,10 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -65,6 +69,7 @@ def resolve_mtp_draft_vocab_config(
     tensor_parallel_size: int = 2,
     model_architecture: str | None = None,
     model_name_or_path: str | None = None,
+    num_speculative_tokens: int | None = 4,
 ) -> MTPDraftVocabConfig:
     """Resolve explicit controls or the model-specific default MTP vocabulary."""
     config = MTPDraftVocabConfig(
@@ -108,13 +113,27 @@ def resolve_mtp_draft_vocab_config(
         raise FileNotFoundError(
             f"Default MTP dynamic-vocabulary ranking asset is missing: {ranking_path}"
         )
+    # opt23: fused proposal 优先（MTP1/2/3/4 共用参数化 kernel）；
+    # fused kernel 不可用时按原设计理念降级 non-fused 标准 dynamic-vocab 路径。
+    nst = num_speculative_tokens or 4
+    fused_ok = (
+        nst in (1, 2, 3, 4)
+        and hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out")
+    )
+    if not fused_ok:
+        logger.warning_once(
+            "Fused proposal unavailable for num_speculative_tokens=%d "
+            "(kernel missing or unsupported). Falling back to non-fused "
+            "standard dynamic-vocab path.",
+            nst,
+        )
     return MTPDraftVocabConfig(
         ranking_path=str(ranking_path),
         shortlist_size=98_304,
         dynamic_tail_size=512,
         full_refresh_interval=0,
-        fused_proposal_enabled=True,
-        gpu_lru_enabled=True,
+        fused_proposal_enabled=fused_ok,
+        gpu_lru_enabled=fused_ok,
         prefill_topk=2048,
         using_defaults=True,
     )
@@ -854,11 +873,24 @@ def initialize_dynamic_draft_vocab(
             raise ValueError(
                 "Dynamic GPU LRU is validated only with fused TP2/TP4 proposal."
             )
-        if base_size != 98_304 or tail_size != 512:
+        if base_size != 98_304:
             raise ValueError(
-                "Dynamic GPU LRU requires the validated 98,304 base plus "
-                "512 shard-local tail rows per rank."
+                "Dynamic GPU LRU requires the validated 98,304 base."
             )
+        if tail_size != 512:
+            if envs.VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT:
+                if tail_size > 512:
+                    raise ValueError(
+                        "GPU LRU multi-concurrent tail_size exceeds "
+                        "compiled kernel limit (512 per rank)."
+                    )
+            else:
+                raise ValueError(
+                    "Dynamic GPU LRU requires the validated 512 "
+                    "shard-local tail rows per rank (got %d). "
+                    "Set VLLM_SM70_MTP_GPU_LRU_MULTI_CONCURRENT=1 "
+                    "for dynamic tail sizing." % tail_size
+                )
         if target_lm_head.weight.dtype != torch.float16:
             raise ValueError("Dynamic GPU LRU currently requires an FP16 LM-head.")
         if full_refresh_interval != 0:
@@ -977,8 +1009,11 @@ def initialize_dynamic_draft_vocab(
         sm70_ops = _get_sm70_ops()
         if tp_size not in (2, 4):
             raise ValueError("Dynamic fused proposal currently requires TP2 or TP4.")
-        if num_speculative_tokens != 4:
-            raise ValueError("Dynamic fused proposal currently requires MTP4.")
+        if num_speculative_tokens not in (1, 2, 3, 4):
+            raise ValueError(
+                "Dynamic fused proposal currently requires MTP1/2/3/4 "
+                "(MTP=0 disables speculation before reaching this point)."
+            )
         if not hasattr(torch.ops._C, "sm70_f16_lm_head_top20_tc_out"):
             raise RuntimeError("Dynamic fused proposal SM70 ops are not built.")
         if gpu_lru_enabled and (

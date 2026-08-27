@@ -1,0 +1,66 @@
+From 042b658efde0974517fcefffbda4a91f13e14bd1 Mon Sep 17 00:00:00 2001
+From: Zeaxion <zeaxion@zeaxion-UB24>
+Date: Tue, 18 Aug 2026 21:37:34 +0800
+Subject: [PATCH] =?UTF-8?q?feat(opt21):=20anthropic=20=E7=AB=AF=E7=82=B9?=
+ =?UTF-8?q?=20usage=20=E8=A1=A5=20cache=5Fread=5Finput=5Ftokens=EF=BC=88?=
+ =?UTF-8?q?=E7=9C=9F=E5=AE=9E=E7=BC=93=E5=AD=98=E5=91=BD=E4=B8=AD=E6=95=B0?=
+ =?UTF-8?q?=E6=8D=AE=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- anthropic/serving.py: 非流式 messages_full_converter + 流式 message_start/message_delta
+  三处从 usage.prompt_tokens_details.cached_tokens 填充 cache_read_input_tokens
+- 前端 cc-haha 可直接从 /v1/messages 获取真实缓存命中数据（替代固定常量修正）
+---
+ entrypoints/anthropic/serving.py | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/entrypoints/anthropic/serving.py b/entrypoints/anthropic/serving.py
+index f0379af..8d3571c 100644
+--- a/entrypoints/anthropic/serving.py
++++ b/entrypoints/anthropic/serving.py
+@@ -525,6 +525,12 @@ class AnthropicServingMessages(OpenAIServingChat):
+             usage=AnthropicUsage(
+                 input_tokens=generator.usage.prompt_tokens,
+                 output_tokens=generator.usage.completion_tokens,
++                cache_read_input_tokens=(
++                    generator.usage.prompt_tokens_details.cached_tokens
++                    if generator.usage.prompt_tokens_details
++                    and generator.usage.prompt_tokens_details.cached_tokens
++                    else None
++                ),
+             ),
+             kv_transfer_params=generator.kv_transfer_params,
+         )
+@@ -683,6 +689,13 @@ class AnthropicServingMessages(OpenAIServingChat):
+                                         if origin_chunk.usage
+                                         else 0,
+                                         output_tokens=0,
++                                        cache_read_input_tokens=(
++                                            origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                            if origin_chunk.usage
++                                            and origin_chunk.usage.prompt_tokens_details
++                                            and origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                            else None
++                                        ),
+                                     ),
+                                 ),
+                             )
+@@ -708,6 +721,13 @@ class AnthropicServingMessages(OpenAIServingChat):
+                                     output_tokens=origin_chunk.usage.completion_tokens
+                                     if origin_chunk.usage
+                                     else 0,
++                                    cache_read_input_tokens=(
++                                        origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                        if origin_chunk.usage
++                                        and origin_chunk.usage.prompt_tokens_details
++                                        and origin_chunk.usage.prompt_tokens_details.cached_tokens
++                                        else None
++                                    ),
+                                 ),
+                             )
+                             data = chunk.model_dump_json(exclude_unset=True)
+-- 
+2.43.0
+

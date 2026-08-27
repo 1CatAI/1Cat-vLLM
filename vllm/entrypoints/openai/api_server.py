@@ -179,6 +179,13 @@ def build_app(
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
 
+    # opt25: global HEAD handler for CC-HAHA preconnect probe
+    @app.head("/")
+    @app.head("/{path:path}")
+    async def handle_head_probe():
+        from fastapi.responses import Response
+        return Response(status_code=200)
+
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
     register_vllm_serve_api_routers(app)
@@ -707,6 +714,10 @@ if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
     # entrypoints.
+    from vllm.logger import _StartupLogHandler
+
+    _StartupLogHandler.truncate()
+    _StartupLogHandler.install()
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server."
