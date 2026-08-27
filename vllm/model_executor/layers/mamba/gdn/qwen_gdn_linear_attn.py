@@ -105,6 +105,29 @@ _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 _DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
+def _warmup_sm70_qwen_gdn_causal_conv1d(
+    forward_context: dict[str, object],
+) -> bool:
+    """Warm one bound Qwen GDN layer using its production cache layout.
+
+    MRV2 owns the cache on the modules registered in ``forward_context``.
+    Scanning ``model.modules()`` therefore misses the bound cache and leaves
+    the non-speculative causal-conv variant to JIT on the first structured
+    request.
+    """
+    if (
+        not envs.VLLM_SM70_AUX_KERNEL_WARMUP
+        or not current_platform.is_device_capability(70)
+    ):
+        return False
+
+    for layer in forward_context.values():
+        warmup = getattr(layer, "_warmup_sm70_causal_conv1d_real_state", None)
+        if warmup is not None and warmup():
+            return True
+    return False
+
+
 @triton.jit
 def _sm70_pack_qwen_gdn_qkv_kernel(
     mixed_qkv,

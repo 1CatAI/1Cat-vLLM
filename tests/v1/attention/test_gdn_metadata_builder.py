@@ -49,6 +49,29 @@ BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
 
 
+def test_sm70_qwen_gdn_warmup_uses_bound_forward_context(monkeypatch):
+    calls: list[str] = []
+
+    class BoundGDNLayer:
+        def _warmup_sm70_causal_conv1d_real_state(self) -> bool:
+            calls.append("bound")
+            return True
+
+    monkeypatch.setattr(
+        qwen_gdn.envs, "VLLM_SM70_AUX_KERNEL_WARMUP", True, raising=False
+    )
+    monkeypatch.setattr(
+        qwen_gdn.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+
+    assert qwen_gdn._warmup_sm70_qwen_gdn_causal_conv1d(
+        {"unrelated": object(), "model.layers.0.linear_attn": BoundGDNLayer()}
+    )
+    assert calls == ["bound"]
+
+
 def test_disabled_gdn_core_dump_avoids_cuda_runtime_query(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_DUMP_GDN_CORE_DIR", raising=False)
     monkeypatch.delenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS", raising=False)

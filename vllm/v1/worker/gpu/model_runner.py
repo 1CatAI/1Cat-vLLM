@@ -502,6 +502,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
+    def _warmup_sm70_aux_kernels(self) -> None:
+        """Warm SM70 kernels whose production cache exists only in MRV2."""
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            _warmup_sm70_qwen_gdn_causal_conv1d,
+        )
+
+        if _warmup_sm70_qwen_gdn_causal_conv1d(
+            self.compilation_config.static_forward_context
+        ):
+            logger.info_once("SM70 MRV2 GDN causal-conv warmup finished.")
+
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
