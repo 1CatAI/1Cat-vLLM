@@ -15,7 +15,13 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    CrossAttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -29,6 +35,12 @@ def _reserved_block_count(
     max_encoder_len: int,
 ) -> int:
     """Match the scheduler's block reservation in hand-built warmup batches."""
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        specs = tuple(kv_cache_spec.kv_cache_specs.values())
+        assert specs
+        kv_cache_spec = specs[0]
+    if isinstance(kv_cache_spec, CircularBufferSpec):
+        return 1
     if isinstance(kv_cache_spec, CrossAttentionSpec):
         return cdiv(max_encoder_len, kv_cache_spec.block_size)
     num_speculative_blocks = 0

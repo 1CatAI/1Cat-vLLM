@@ -570,6 +570,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # Does this backend/builder support updating the block table in existing
     # metadata
     supports_update_block_table: bool = False
+    requires_block_table_width: ClassVar[bool] = False
 
     @abstractmethod
     def __init__(

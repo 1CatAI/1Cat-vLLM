@@ -3,6 +3,7 @@
 
 import itertools
 from abc import abstractmethod
+from collections.abc import Iterable
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -369,6 +370,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if not current_platform.is_cuda_alike():
             return
 
+        from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+            maybe_prepare_online_qpn8,
+        )
+
+        if maybe_prepare_online_qpn8(layer):
+            return
+
         if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
             layer, "_sm70_dsv4_fp13_gemv", False
         ):
@@ -434,6 +442,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
+            maybe_apply_online_qpn8,
+        )
+
+        online_qpn8_out = maybe_apply_online_qpn8(layer, x, bias)
+        if online_qpn8_out is not None:
+            return online_qpn8_out
         sm70_out = _maybe_sm70_dense_forward(layer, x, bias)
         if sm70_out is not None:
             return sm70_out
@@ -1215,6 +1230,31 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_rank=self.tp_rank,
         )
 
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, None)
+            else:
+                param = getattr(self, name, None)
+            if param is None and name == "bias":
+                continue
+            if param is None:
+                raise ValueError(f"Unknown parameter {name!r} for {self.prefix}")
+            param.weight_loader(param, loaded_weight, shard_id)
+            logger.debug(
+                "Loaded shard %s with shape %s into %s.%s",
+                shard_id,
+                loaded_weight.shape,
+                self.prefix,
+                name,
+            )
+            yield name
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
@@ -1312,6 +1352,32 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
             return
         raise ValueError("This line should not be reached")
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """Load separately serialized Q/K/V shards through AutoWeightsLoader."""
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, None)
+            else:
+                param = getattr(self, name, None)
+            if param is None and name == "bias":
+                continue
+            if param is None:
+                raise ValueError(f"Unknown parameter {name!r} for {self.prefix}")
+            param.weight_loader(param, loaded_weight, shard_id)
+            logger.debug(
+                "Loaded shard %s with shape %s into %s.%s",
+                shard_id,
+                loaded_weight.shape,
+                self.prefix,
+                name,
+            )
+            yield name
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {

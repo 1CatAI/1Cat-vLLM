@@ -71,7 +71,15 @@ else:
 
 logger = init_logger(__name__)
 
-DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
+DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
+    {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Qwen3ForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
 
@@ -698,10 +706,17 @@ class VllmConfig:
             return False
 
         architectures = getattr(model_config, "architectures", [])
-        if not any(
+        is_default_v2_architecture = any(
             arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures
-        ):
+        )
+        if not is_default_v2_architecture:
             return False
+
+        # Qwen4Exp is a hybrid MoE model whose QSA ring cache and PLE raw-token
+        # inputs are implemented by Model Runner V2. Its quantized checkpoint
+        # is therefore an explicit V2 route rather than a generic fallback.
+        if any(arch.startswith("Qwen4ExpFor") for arch in architectures):
+            return True
 
         return not model_config.is_moe and not model_config.is_quantized
 

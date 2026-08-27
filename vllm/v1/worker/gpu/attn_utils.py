@@ -199,7 +199,9 @@ def _reshape_kv_cache(
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
-                num_blocks_per_kv_block = kv_cache_spec.block_size // kernel_block_size
+                num_blocks_per_kv_block = (
+                    kv_cache_spec.storage_block_size // kernel_block_size
+                )
                 kernel_num_blocks = num_blocks * num_blocks_per_kv_block
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,

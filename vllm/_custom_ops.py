@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -2963,13 +2964,30 @@ def get_max_shared_memory_per_block_device_attribute(device: int) -> int:
 
 
 # custom ar
+def _maybe_load_sm70_custom_ar_library() -> None:
+    library_path = os.getenv("VLLM_SM70_CUSTOM_AR_LIBRARY")
+    if library_path is not None:
+        torch.ops.load_library(library_path)
+
+
+_maybe_load_sm70_custom_ar_library()
+
+
+def _custom_ar_op(name: str):
+    """Prefer an opt-in SM70 sidecar while retaining main-op fallbacks."""
+    sidecar = torch.ops._C_custom_ar_flashnext
+    if hasattr(sidecar, name):
+        return getattr(sidecar, name)
+    return getattr(torch.ops._C_custom_ar, name)
+
+
 def init_custom_ar(
     ipc_tensors: list[torch.Tensor],
     rank_data: torch.Tensor,
     rank: int,
     fully_connected: bool,
 ) -> int:
-    return torch.ops._C_custom_ar.init_custom_ar(
+    return _custom_ar_op("init_custom_ar")(
         ipc_tensors, rank_data, rank, fully_connected
     )
 
@@ -2981,7 +2999,7 @@ def all_reduce(
     reg_buffer: int,
     reg_buffer_sz_bytes: int,
 ) -> None:
-    torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
+    _custom_ar_op("all_reduce")(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
 def sm70_tp2_all_reduce_gemma_rms_norm(
@@ -2995,7 +3013,7 @@ def sm70_tp2_all_reduce_gemma_rms_norm(
     reg_buffer_sz_bytes: int,
     epsilon: float,
 ) -> None:
-    torch.ops._C_custom_ar.sm70_tp2_all_reduce_gemma_rms_norm(
+    _custom_ar_op("sm70_tp2_all_reduce_gemma_rms_norm")(
         fa,
         inp,
         residual,
@@ -3019,7 +3037,7 @@ def sm70_tp4_all_reduce_gemma_rms_norm(
     reg_buffer_sz_bytes: int,
     epsilon: float,
 ) -> None:
-    torch.ops._C_custom_ar.sm70_tp4_all_reduce_gemma_rms_norm(
+    _custom_ar_op("sm70_tp4_all_reduce_gemma_rms_norm")(
         fa,
         inp,
         residual,
@@ -3044,7 +3062,7 @@ def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
     reg_buffer_sz_bytes: int,
     epsilon: float,
 ) -> None:
-    torch.ops._C_custom_ar.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+    _custom_ar_op("sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather")(
         fa,
         inp,
         residual,
@@ -3064,7 +3082,7 @@ def all_reduce_sum2(
     inp_b: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    torch.ops._C_custom_ar.all_reduce_sum2(fa, inp_a, inp_b, out)
+    _custom_ar_op("all_reduce_sum2")(fa, inp_a, inp_b, out)
 
 
 def top1_argmax(
@@ -3074,9 +3092,7 @@ def top1_argmax(
     reg_buffer: int,
     reg_buffer_sz_bytes: int,
 ) -> None:
-    torch.ops._C_custom_ar.top1_argmax(
-        fa, input_pair, out, reg_buffer, reg_buffer_sz_bytes
-    )
+    _custom_ar_op("top1_argmax")(fa, input_pair, out, reg_buffer, reg_buffer_sz_bytes)
 
 
 def tile_runtime_all_reduce(
@@ -3089,7 +3105,7 @@ def tile_runtime_all_reduce(
     engine_blocks: int,
     compute_iters: int,
 ) -> None:
-    torch.ops._C_custom_ar.tile_runtime_all_reduce(
+    _custom_ar_op("tile_runtime_all_reduce")(
         fa,
         inp,
         out,
@@ -3112,7 +3128,7 @@ def tile_runtime_all_reduce_engine(
     reducer_blocks: int,
     compute_iters: int,
 ) -> None:
-    torch.ops._C_custom_ar.tile_runtime_all_reduce_engine(
+    _custom_ar_op("tile_runtime_all_reduce_engine")(
         fa,
         inp,
         out,
@@ -3132,7 +3148,7 @@ def tile_runtime_wait_reduce(
     tile_numel: int,
     reducer_blocks: int,
 ) -> None:
-    torch.ops._C_custom_ar.tile_runtime_wait_reduce(
+    _custom_ar_op("tile_runtime_wait_reduce")(
         fa,
         staging,
         out,
@@ -3142,54 +3158,54 @@ def tile_runtime_wait_reduce(
 
 
 def dispose(fa: int) -> None:
-    torch.ops._C_custom_ar.dispose(fa)
+    _custom_ar_op("dispose")(fa)
 
 
 def meta_size() -> int:
-    return torch.ops._C_custom_ar.meta_size()
+    return _custom_ar_op("meta_size")()
 
 
 def sm70_tp4_push_allreduce_buffer_size() -> int:
-    return torch.ops._C_custom_ar.sm70_tp4_push_allreduce_buffer_size()
+    return _custom_ar_op("sm70_tp4_push_allreduce_buffer_size")()
 
 
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
-    return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
+    return _custom_ar_op("register_buffer")(fa, ipc_tensors)
 
 
 def register_sm70_tp4_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> None:
-    torch.ops._C_custom_ar.register_sm70_tp4_push_allreduce_buffer(fa, ipc_tensors)
+    _custom_ar_op("register_sm70_tp4_push_allreduce_buffer")(fa, ipc_tensors)
 
 
 def get_graph_buffer_ipc_meta(fa: int) -> tuple[list[int], list[int]]:
-    return torch.ops._C_custom_ar.get_graph_buffer_ipc_meta(fa)
+    return _custom_ar_op("get_graph_buffer_ipc_meta")(fa)
 
 
 def register_graph_buffers(
     fa: int, handles: list[list[int]], offsets: list[list[int]]
 ) -> None:
-    torch.ops._C_custom_ar.register_graph_buffers(fa, handles, offsets)
+    _custom_ar_op("register_graph_buffers")(fa, handles, offsets)
 
 
 def allocate_shared_buffer_and_handle(size: int) -> tuple[int, torch.Tensor]:
-    return torch.ops._C_custom_ar.allocate_shared_buffer_and_handle(size)
+    return _custom_ar_op("allocate_shared_buffer_and_handle")(size)
 
 
 def open_mem_handle(mem_handle: torch.Tensor):
-    return torch.ops._C_custom_ar.open_mem_handle(mem_handle)
+    return _custom_ar_op("open_mem_handle")(mem_handle)
 
 
 def free_shared_buffer(ptr: int) -> None:
-    torch.ops._C_custom_ar.free_shared_buffer(ptr)
+    _custom_ar_op("free_shared_buffer")(ptr)
 
 
 # quick all reduce
 def init_custom_qr(rank: int, world_size: int, qr_max_size: int | None = None) -> int:
-    return torch.ops._C_custom_ar.init_custom_qr(rank, world_size, qr_max_size)
+    return _custom_ar_op("init_custom_qr")(rank, world_size, qr_max_size)
 
 
 def qr_destroy(fa: int) -> None:
-    torch.ops._C_custom_ar.qr_destroy(fa)
+    _custom_ar_op("qr_destroy")(fa)
 
 
 def qr_all_reduce(
@@ -3199,19 +3215,19 @@ def qr_all_reduce(
     quant_level: int,
     cast_bf2half: bool = False,
 ) -> None:
-    torch.ops._C_custom_ar.qr_all_reduce(fa, inp, out, quant_level, cast_bf2half)
+    _custom_ar_op("qr_all_reduce")(fa, inp, out, quant_level, cast_bf2half)
 
 
 def qr_get_handle(fa: int) -> torch.Tensor:
-    return torch.ops._C_custom_ar.qr_get_handle(fa)
+    return _custom_ar_op("qr_get_handle")(fa)
 
 
 def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None:
-    return torch.ops._C_custom_ar.qr_open_handles(fa, handles)
+    return _custom_ar_op("qr_open_handles")(fa, handles)
 
 
 def qr_max_size() -> int:
-    return torch.ops._C_custom_ar.qr_max_size()
+    return _custom_ar_op("qr_max_size")()
 
 
 def get_flash_mla_metadata(

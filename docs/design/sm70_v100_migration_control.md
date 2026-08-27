@@ -24,6 +24,112 @@ Goal:
   sampling, and normal MoE architecture wherever possible.
 - Do not carry unsafe quality-regressing routes into the main path.
 
+## Qwen3.8 Flash Next NVFP4 prefill acceptance, 2026-08-27
+
+- Review scope: Draft PR #23 on
+  `codex/v100-qwen38-flash-next-prefill-20260827-000848`, stacked on the
+  Qwen3.8 Flash Next bring-up branch. This scope is prefill-only; decode and
+  MTP acceptance remain separate work.
+- Frozen route: four V100-SXM2-32GB GPUs, TP4/PP1, V2 engine, ModelOpt NVFP4,
+  FP16 activations and KV cache, MTP off, `FLASH_ATTN_V100`, FlashQLA-SM70 GDN
+  prefill, pinned-host PLE, prefix caching off, chunked prefill on, and
+  `VLLM_COMPILE` with PIECEWISE CUDA graphs.
+- The matched 8192-token candidate has mean pure prefill time `2.315786s`, or
+  `3537.46 tok/s`, and mean TTFT `2.322317s`. The earlier same-route baseline
+  has mean pure prefill time `21.339760s`, or `383.88 tok/s`: a `9.2149x`
+  speedup and `89.15%` latency reduction. The baseline generated 512 tokens
+  and used FULL_AND_PIECEWISE while the candidate generated 16 tokens and used
+  PIECEWISE; only request-metric prefill time is compared, and prefill uses the
+  PIECEWISE dispatch in both runs.
+- The accepted change admits the two real 512-expert Flash Next prefill GEMM
+  contracts to grouped TurboMind NVFP4 execution, uses four QSA sparse-kernel
+  warps for exact SM70 prefill shapes, and permits an absolute prebuilt
+  FlashQLA-SM70 extension path so all TP ranks avoid redundant JIT builds.
+  Focused validation is `15 passed, 5 skipped`; exact QSA probes are bitwise
+  equal and improve the 8192-token kernel profile from `1320.204ms` to
+  `85.261ms`.
+- Long-context pure-prefill results from one guarded model startup are:
+  32768 tokens `10.740389s` / `3050.91 tok/s`, 65536 tokens `25.020538s` /
+  `2619.29 tok/s`, and 131000 tokens `63.960919s` / `2048.13 tok/s`. The 32K
+  and 64K repeat token hashes are stable, and the arithmetic and Chinese
+  quality outputs match the accepted 8K run exactly.
+- A follow-up SM70-only QSA tile reduction from 64 to 32 columns passed the
+  matched long-context gate. Pure-prefill time is `9.044346s` at 32K,
+  `21.517608s` at 64K, and `56.609353s` at 131K, corresponding to
+  `3623.04`, `3045.69`, and `2314.11 tok/s`. Relative to the preceding
+  candidate this is a `1.1875x`, `1.1628x`, and `1.1299x` speedup, with
+  latency reductions of `15.79%`, `14.00%`, and `11.49%` respectively. All
+  five quality/performance case token hashes remain exactly equal to the
+  matched baseline.
+- Exact-shape QSA microbenchmarks explain the end-to-end change. At 8192 rows,
+  the 32-column tile measures `56.723ms` versus `92.730ms` for 64 columns
+  (`1.6348x`); at 512 rows with four splits it measures `4.397ms` versus
+  `6.385ms` (`1.4520x`). Both have maximum FP16 difference `0.0001220703125`
+  and no non-finite values. A 128-column tile is rejected before execution
+  because its `139264`-byte shared-memory requirement exceeds V100's
+  `98304`-byte limit.
+- The next hotspot audit inspected the cached SM70 PTX instead of screening
+  more launch shapes blindly. Both QSA scoring kernels contain no `mma`/`wmma`
+  instructions: selected attention compiles to roughly 1026 static FP32 FMA
+  instructions, and the four-head D128 index scorer compiles to roughly 2048.
+  The latter grows with all visible compressed blocks and explains most of the
+  additional 131K decay.
+- A D256 selected-attention WMMA prototype is rejected. It has real SM70 HMMA,
+  no local-memory spill, and passes the resource gate, but measures only
+  `51.808ms` versus `55.682ms` at 8192 rows (`1.0748x`) and its output relative
+  L2 is `0.5627`. At 512 rows it is only `1.2532x`. It is neither correct nor
+  fast enough to justify a production integration or model restart.
+- The retained long-indexer candidate gathers one request's paged FP16 MQA
+  keys once, applies a cuBLAS FP16-input/FP32-output Tensor Core GEMM in a
+  bounded workspace, and fuses per-head ReLU, head sum, visibility and scale
+  into one Triton epilogue. At 1024 rows and 131K context, scoring including
+  paged gather moves from `35.767ms` to `2.108ms` (`16.964x`), with maximum
+  absolute error `8.11e-6` and relative L2 `2.90e-7`. The complete
+  score/top-k/expand path moves from `38.792ms` to `3.118ms` (`12.441x`).
+  Random stress selection sets are exact for 1023/1024 rows; the sole mismatch
+  is a boundary near-tie, and final sparse-attention cosine is `0.9999992`.
+  Production admission is limited to exact SM70, FP16 `[rows,4,128]`, FP16
+  `[pages,page,1,128]`, one request, at least 512 rows, and at least 1,048,576
+  row-column score elements; decode, short work and generic batches retain the
+  paged Triton route. The measured crossover is `0.733x` at 1K context,
+  `2.164x` at 2K, `4.900x` at 8K, `8.064x` at 16K and `11.102x` at 32K. A real
+  TP4 token-hash and quality gate remains required before this candidate is
+  accepted or reported as an endpoint improvement.
+- Raising the NVFP4 MoE tuning limit is rejected independently of the model
+  gate. Real layer-0 weights and the exact 8192-token/top-10 routing shape
+  measure default W13/W2 at `4.320/2.382ms` (`31.07/28.18 TFLOP/s`) and the
+  measured policy at `4.343/2.381ms`; combined tuning is `0.9966x`. The real
+  router distribution is highly skewed (0/58/160/2150 minimum/median/mean/
+  maximum rows per expert), but TurboMind's measured dispatch does not improve
+  it. Do not spend another startup autotuning this same shape.
+- No new GDN candidate is claimed by this follow-up. A cold standalone 8192
+  token original-TileLang probe under `/usr` CUDA attempted to rebuild the
+  TileLang cumsum kernel and failed in the installed TileLang BF16 fallback
+  headers. The guarded full-model run reused the accepted production cache and
+  route successfully. Do not treat the standalone failure as a GDN runtime
+  regression or repeat it without the source-matched TileLang toolchain/cache.
+- At `gpu_memory_utilization=0.85` and `max_model_len=140000`, vLLM reports
+  `3.09 GiB` available KV cache, `250028` token capacity, and `1.79x` 140K
+  concurrency. Measured peak device use is `29090 MiB` (`28.408 GiB`) per
+  rank; minimum host `MemAvailable` is `47.912 GiB`, with `247.921 GiB` swap
+  still free.
+- Do not repeat the rejected `gpu_memory_utilization=0.82` 140K startup. It
+  fails cleanly before requests because `1.08 GiB` KV cache is below the
+  required `1.73 GiB`, with an estimated maximum length of 86800 tokens. The
+  single `0.85` retry passed the capacity gate and all planned 32K/64K/131K
+  cases, so no third startup is needed.
+- Retained local evidence is under
+  `.artifacts/qwen38_flash_next_prefill_20260827/results/`, notably
+  `grouped-v1-piecewise-8192x16.json` and
+  `grouped-v1-piecewise-longctx-u085.json`. The QSA follow-up is retained as
+  `grouped-v2-qsa-bn32-longctx-u085.json`, with microbenchmarks in
+  `qsa-blockn-sweep-{8192,512-split4}.json`. The corresponding PR evidence is
+  recorded in the
+  [8K result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5436515073)
+  and
+  [long-context result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5437096030)
+  comments.
+
 ## Active MRV2 DFlash2 campaign, 2026-08-20
 
 - Integration base: `onecat/main@7aede2cf010d92815c9d7bff25867b4fa009b6cb`.
@@ -42335,6 +42441,74 @@ Interpretation:
   formatter changes from current main and keep large C/CUDA formatter work
   separate from accepted kernel repairs. Small policy substitutions still need
   their own current-source static/argument-equivalence checks before merge.
+
+## 2026-08-27 GLM-5.3-Flash NVFP4 SM70 bring-up
+
+- Pinned `LibertAIDAI/GLM-5.3-Flash-NVFP4` at revision
+  `9e0d74e3cef17f634e84fb8e2223707e02616290`. The acceptance topology is eight
+  V100s arranged as TP4/PP2, FP16 activations, no MTP, batch one, exact
+  1024-input/256-output measurement, and at least 70 steady pure-decode tok/s.
+- Audited vLLM PR 53906 and SGLang PRs 36507/36513. Their GLM architecture and
+  scheduler semantics were used as references, but their Hopper/Blackwell FP8
+  validation is not an SM70 performance baseline. The conflicting broad vLLM
+  PR was ported by required surface instead of merged wholesale.
+- Added `glm5_next`, KDA bounded-gate support, mHC PP state, sparse MLA/DSA
+  indexer and KPool ownership, hybrid-cache grouping, GLM processor/config,
+  stacked weight mapping, and exact-SM70 ModelOpt NVFP4 MoE admission.
+- V100 cannot perform the KPool writer's native FP8 conversion. Exact SM70 now
+  emits software E4M3 bytes through `uint8` pointers and performs FWHT query
+  rotation plus sparse scoring in FP16 through the established SM70 HMMA
+  indexer. The 28-test GPU KPool suite is byte-exact against the reference.
+- A full local source build completed and registered the NVFP4 SM70 and MoE
+  custom operators. Focused CPU integration reports 64 passing tests. An exact
+  eight-rank TP4/PP2 `meta` construction smoke reports stage sizes 23/22,
+  selects `ModelOptNvFp4SM70MoEMethod` on all ranks, and preserves all four mHC
+  PP tensors.
+- These are route and construction results, not an accepted model result. Keep
+  the real checkpoint load, three-request output identity, sampling quality,
+  CUDA Graph route hit, and matched pure-decode benchmark open until an
+  uncontended eight-GPU run supplies retained logs and JSON.
+- The checkpoint download is now complete: all 120 shards are present at the
+  pinned revision (about 181 GiB). Exact eight-V100 TP4/PP2 dummy-weight eager
+  requests pass with both FP16 KV and `fp8_e4m3` KV. The FP16 run reports
+  66,355 cache tokens; packed E4M3FN reports 111,957 tokens (about 1.69x).
+- Added a GLM-specific 520-byte latent-KV format: 512 software-E4M3FN data
+  bytes plus eight UE8M0 scales per token. `_sm70_glm5_fp8_kv_insert_kernel`
+  writes it. B1 decode keeps the cache packed, gathers/dequantizes the selected
+  rows into a fixed-width FP16 workspace, then uses two Tensor Core GEMMs. This
+  replaced the direct scalar sparse kernel on the accepted decode route.
+- Fixed the upstream GLM KDA state contract to match its merged Q/K/V
+  convolution implementation. Each layer now exposes two states and two copy
+  functions: merged FP16 convolution plus FP32 recurrent state. The original
+  four-state declaration failed at the first real model call after cache
+  allocation.
+- Replaced the exact GLM mHC SM70 PyTorch fallbacks. M=1 fused decode uses the
+  existing DeepSeek-V4-style FP32 staging path plus a native CUDA
+  Sinkhorn/residual-mix/RMSNorm final stage;
+  standalone pre/post and M>16 fused prefill use dedicated SM70 Triton
+  reductions/post mapping. A direct M=17 probe reproduces the rejected generic
+  TileLang path's 33 SM70 BF16-header compile errors. The replacement passes
+  17 focused V100 tests and a full input-17/output-2 TP4/PP2 FP8-KV request.
+  Retained route log:
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/dummy_fp8_tp4pp2_i17_o2_fast_mhc.log`.
+- Layer-zero mHC now pre-sums the four identical initial-stream weights. A
+  V100 M=1 microbenchmark including the required residual expansion measures
+  about 0.155 ms for the expanded path and 0.140 ms for the broadcast path.
+  This is a local kernel result, not an end-to-end speed claim.
+- The first real no-compile CUDA Graph baseline measured 5.35 steady decode
+  tok/s. Replacing scalar packed-FP8 sparse attention with bounded gather/
+  dequant plus Tensor Core GEMMs raised the retained short benchmark to
+  45.83 tok/s (21.82 ms TPOT), with the same 16-token hash
+  `70007811d61c68bb6ec6b4ac5758744f2d4c6b64b51b6b1352f380091c990902`.
+  Nsight Systems reports 95.09% graph-node coverage and no remaining sparse
+  attention hotspot. This 16-input/16-output result is an optimization
+  checkpoint, not the required 1024/256 acceptance result.
+- Added a graph-safe exact-SM70 TP4/B1 CUDA kernel that fuses KDA's two local
+  `128 -> 2048` f/g projections. It measures 6.28 us versus 23.02 us for two
+  cuBLAS launches (3.66x) and preserves FP32 accumulation with FP16 output.
+  Focused mHC/KDA graph and numerical coverage passes 20 tests with one skipped;
+  the next real checkpoint run must confirm its end-to-end gain and unchanged
+  greedy token hash.
 
 ## 2026-08-22 Qwen3.6-35B-A3B ModelOpt NVFP4 TurboMind route
 

@@ -1338,6 +1338,7 @@ class FusedMoE(PluggableLayer):
         ckpt_up_proj_name: str,
         num_experts: int,
         num_redundant_experts: int = 0,
+        include_fused: bool = False,
     ) -> list[tuple[str, str, int, str]]:
         num_physical_experts = num_experts + num_redundant_experts
 
@@ -1357,7 +1358,48 @@ class FusedMoE(PluggableLayer):
             else ""
         )
 
-        return [
+        fused_mapping: list[tuple[str, str, int, str]] = []
+        if include_fused:
+            gate_up_name = None
+            if ckpt_gate_proj_name == "gate_proj" and ckpt_up_proj_name == "up_proj":
+                gate_up_name = "gate_up_proj"
+            elif ckpt_gate_proj_name == "w1" and ckpt_up_proj_name == "w3":
+                gate_up_name = "w13"
+            else:
+                logger.warning(
+                    "Unexpected gate/up projection names: %s, %s. "
+                    "Fused gate/up mapping will be skipped.",
+                    ckpt_gate_proj_name,
+                    ckpt_up_proj_name,
+                )
+
+            if gate_up_name is not None:
+                # Some checkpoints store every expert in one 3D tensor and
+                # concatenate gate/up along dim 1. FusedMoE.load_weights
+                # already knows how to split and TP-shard that layout; these
+                # aliases make the checkpoint names reachable.
+                fused_mapping = [
+                    (
+                        f"experts.{base_layer}w13_weight",
+                        f"experts.{gate_up_name}",
+                        0,
+                        "w1",
+                    ),
+                    (
+                        f"experts.{base_layer}w13_weight",
+                        f"experts.{gate_up_name}",
+                        1,
+                        "w3",
+                    ),
+                    (
+                        f"experts.{base_layer}w2_weight",
+                        f"experts.{ckpt_down_proj_name}",
+                        0,
+                        "w2",
+                    ),
+                ]
+
+        per_expert_mapping = [
             # (param_name, weight_name, expert_id, shard_id)
             (
                 f"experts.{base_layer}w13_"
@@ -1374,6 +1416,7 @@ class FusedMoE(PluggableLayer):
                 ("w3", ckpt_up_proj_name),
             ]
         ]
+        return fused_mapping + per_expert_mapping
 
     @property
     def hidden_size(self) -> int:
@@ -1404,6 +1447,7 @@ def fused_moe_make_expert_params_mapping(
     ckpt_up_proj_name: str,
     num_experts: int,
     num_redundant_experts: int = 0,
+    include_fused: bool = False,
 ) -> list[tuple[str, str, int, str]]:
     return FusedMoE.make_expert_params_mapping(
         model,
@@ -1412,6 +1456,7 @@ def fused_moe_make_expert_params_mapping(
         ckpt_up_proj_name,
         num_experts,
         num_redundant_experts,
+        include_fused,
     )
 
 

@@ -126,13 +126,16 @@ def _get_backend_priorities(
                 *sparse_backends,
             ]
         else:
-            return [
+            backends = [
                 AttentionBackendEnum.FLASH_ATTN_MLA,
                 AttentionBackendEnum.FLASHMLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
+            if device_capability.major == 7 and device_capability.minor == 0:
+                backends.insert(0, AttentionBackendEnum.GLM5_SM70_SPARSE)
+            return backends
     else:
         if device_capability.major == 10:
             return [
@@ -304,6 +307,18 @@ class CudaPlatformBase(Platform):
                 valid_backends_priorities.append((backend, priority))
 
         return valid_backends_priorities, invalid_reasons
+
+    @classmethod
+    def _get_indexer_block_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        index_kpool = getattr(
+            vllm_config.model_config.hf_text_config, "index_kpool", None
+        )
+        if not index_kpool or index_kpool <= 1:
+            return None
+
+        from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
+
+        return index_kpool * min(PAGED_MQA_PAGE_SIZES)
 
     @classmethod
     def get_attn_backend_cls(

@@ -5,13 +5,94 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
+
+
+@triton.jit
+def _sm70_qwen38_router_topk_kernel(
+    gating_ptr,
+    topk_weights_ptr,
+    topk_ids_ptr,
+    token_expert_indices_ptr,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+) -> None:
+    """Sort the exact Qwen3.8 decode router in one SM70 program."""
+
+    offsets = tl.arange(0, BLOCK_E)
+    valid = offsets < E
+    logits = tl.load(gating_ptr + offsets, mask=valid, other=-float("inf")).to(
+        tl.float32
+    )
+    max_logit = tl.max(logits, axis=0)
+
+    # Match topk_softmax's degenerate-row behavior: NaN, +Inf, or all -Inf
+    # produces the first K expert IDs with zero weights.
+    has_nan = tl.max((logits != logits).to(tl.int32), axis=0) != 0
+    invalid_row = has_nan | (max_logit == float("inf")) | (max_logit == -float("inf"))
+    sort_logits = tl.where(invalid_row, -offsets.to(tl.float32), logits)
+    # Numeric ties use the lower expert ID in the generic CUDA op. Canonicalize
+    # signed zero before bit packing so -0.0 and +0.0 remain one tie class.
+    sort_logits = tl.where(sort_logits == 0.0, 0.0, sort_logits)
+
+    # Transform float32 into an ascending-sortable key. Packing the expert ID
+    # into the low bits preserves the generic kernel's lower-ID tie break.
+    min_i32: tl.constexpr = -2147483648
+    logit_bits = sort_logits.to(tl.int32, bitcast=True)
+    sign = logit_bits >> 31
+    key = tl.where(sign == 0, logit_bits ^ -1, logit_bits ^ min_i32)
+    key = tl.where(valid, key, 0x7FFFFFFF)
+    packed = ((key.to(tl.int64) & 0xFFFFFFFF) << 32) | offsets.to(tl.int64)
+    sorted_packed = tl.sort(packed, descending=False)
+
+    sorted_keys = ((sorted_packed >> 32) & 0xFFFFFFFF).to(tl.int32)
+    sorted_ids = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
+    sorted_sign = sorted_keys >> 31
+    sorted_bits = tl.where(sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32)
+    sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
+
+    raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
+    raw_weights = tl.where(invalid_row, 0.0, raw_weights)
+    top_mask = offsets < K
+    denominator = tl.sum(tl.where(top_mask, raw_weights, 0.0), axis=0)
+    denominator = tl.where(denominator > 0.0, denominator, 1.0)
+    weights = raw_weights / denominator
+
+    tl.store(topk_ids_ptr + offsets, sorted_ids, mask=top_mask)
+    tl.store(topk_weights_ptr + offsets, weights, mask=top_mask)
+    # The generic op stores rank-major source rows. M is exactly one here.
+    tl.store(token_expert_indices_ptr + offsets, offsets, mask=top_mask)
+
+
+def _sm70_qwen38_router_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+) -> None:
+    _sm70_qwen38_router_topk_kernel[(1,)](
+        gating_output,
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        E=512,
+        K=10,
+        BLOCK_E=512,
+        num_warps=8,
+    )
 
 
 def vllm_topk_softmax(
@@ -92,6 +173,26 @@ def fused_topk(
     )
 
     if scoring_func == "softmax":
+        if (
+            envs.VLLM_SM70_QWEN38_ROUTER_TOPK
+            and M == 1
+            and gating_output.shape == (1, 512)
+            and gating_output.dtype == torch.float16
+            and gating_output.is_contiguous()
+            and topk == 10
+            and renormalize
+            and topk_ids.dtype == torch.int32
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info_once("SM70 Qwen3.8 E512/K10 router top-k path enabled.")
+            _sm70_qwen38_router_topk(
+                topk_weights,
+                topk_ids,
+                token_expert_indices,
+                gating_output,
+            )
+            return topk_weights, topk_ids, token_expert_indices
+
         topk_func = dispatch_topk_softmax_func(
             use_rocm_aiter=rocm_aiter_ops.is_fused_moe_enabled()
         )

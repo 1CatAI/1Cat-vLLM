@@ -3,7 +3,7 @@
 
 import types
 
-from benchmarks import benchmark_sm70_decode
+from benchmarks import benchmark_sm70_decode, benchmark_sm70_model_tokens
 
 
 def test_sm70_fa2_d256_prefill_status_reports_import_error(monkeypatch):
@@ -74,3 +74,33 @@ def test_sm70_fa2_d256_prefill_status_accepts_explicit_sidecar(monkeypatch):
     assert status["available"] is True
     assert status["extension_file"] == "/tmp/stable-fa2.so"
     assert loaded == ["/tmp/stable-fa2.so"]
+
+
+def test_spec_decoding_delta_reports_one_sequential_prompt():
+    before = [
+        {"name": "vllm:spec_decode_num_drafts", "value": 10},
+        {"name": "vllm:spec_decode_num_draft_tokens", "value": 30},
+        {"name": "vllm:spec_decode_num_accepted_tokens", "value": 20},
+        {
+            "name": "vllm:spec_decode_num_accepted_tokens_per_pos",
+            "values": [8, 7, 5],
+        },
+    ]
+    after = [
+        {"name": "vllm:spec_decode_num_drafts", "value": 14},
+        {"name": "vllm:spec_decode_num_draft_tokens", "value": 42},
+        {"name": "vllm:spec_decode_num_accepted_tokens", "value": 27},
+        {
+            "name": "vllm:spec_decode_num_accepted_tokens_per_pos",
+            "values": [11, 9, 7],
+        },
+    ]
+
+    metrics = benchmark_sm70_model_tokens._spec_decoding_delta(before, after)
+
+    assert metrics is not None
+    assert metrics["num_drafts"] == 4
+    assert metrics["num_draft_tokens"] == 12
+    assert metrics["num_accepted_tokens"] == 7
+    assert metrics["accepted_tokens_per_pos"] == [3, 2, 2]
+    assert metrics["mean_acceptance_length"] == 2.75

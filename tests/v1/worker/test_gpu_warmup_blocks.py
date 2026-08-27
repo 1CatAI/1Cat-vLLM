@@ -7,7 +7,12 @@ import torch
 
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    FullAttentionSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu.warmup import _reserved_block_count
 
 BLOCK_SIZE = 16
@@ -73,10 +78,26 @@ def _mamba_spec(mode: str) -> MambaSpec:
     )
 
 
+def _circular_spec() -> CircularBufferSpec:
+    return CircularBufferSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+
+
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
         (_full_attention_spec(), 2),
+        (_circular_spec(), 1),
+        (
+            UniformTypeKVCacheSpecs(
+                block_size=4, kv_cache_specs={"compressor_state": _circular_spec()}
+            ),
+            1,
+        ),
         (_mamba_spec("align"), 8),
         (_mamba_spec("none"), 9),
         (_mamba_spec("all"), 9),

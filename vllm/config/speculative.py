@@ -45,6 +45,7 @@ MTPModelTypes = Literal[
     "exaone_moe_mtp",
     "exaone4_5_mtp",
     "qwen3_next_mtp",
+    "qwen4_exp_mtp",
     "qwen3_5_mtp",
     "longcat_flash_mtp",
     "mtp",
@@ -175,6 +176,9 @@ class SpeculativeConfig:
     """The specific revision to use for the draft model code on Hugging Face
     Hub. It can be a branch name, a tag name, or a commit id. If unspecified,
     will use the default version."""
+    index_share_for_mtp_iteration: bool | None = None
+    """Override whether MTP iterations reuse the first step's sparse indices.
+    If ``None``, use the value from the draft model's Hugging Face config."""
 
     # Advanced control
     disable_padded_drafter_batch: bool = False
@@ -406,6 +410,15 @@ class SpeculativeConfig:
                 )
             )
 
+        if self.method == "mtp" and self.draft_model_config is not None:
+            factors.append(
+                getattr(
+                    self.draft_model_config.hf_config,
+                    "index_share_for_mtp_iteration",
+                    False,
+                )
+            )
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -553,6 +566,26 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]}
+            )
+
+        if hf_config.model_type in {"qwen4_exp", "qwen4_exp_text"}:
+            hf_config.model_type = "qwen4_exp_mtp"
+        if hf_config.model_type == "qwen4_exp_mtp":
+            text_config = get_hf_text_config(hf_config)
+            n_predict = getattr(
+                text_config,
+                "mtp_num_hidden_layers",
+                getattr(text_config, "num_nextn_predict_layers", None),
+            )
+            hf_config.update(
+                {
+                    "hc_mult": int(text_config.hc_count),
+                    "n_predict": n_predict,
+                    "architectures": ["Qwen4ExpMTP"],
+                    "index_share_for_mtp_iteration": getattr(
+                        text_config, "index_share_for_mtp_iteration", True
+                    ),
+                }
             )
 
         if hf_config.model_type == "exaone_moe":
@@ -1007,6 +1040,15 @@ class SpeculativeConfig:
                         ),
                     )
                 )
+
+        if self.index_share_for_mtp_iteration is not None:
+            if self.method != "mtp" or self.draft_model_config is None:
+                raise ValueError(
+                    "index_share_for_mtp_iteration is only supported with method='mtp'"
+                )
+            self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
+                self.index_share_for_mtp_iteration
+            )
         return self
 
     def _verify_dspark_final_stage_ownership(self) -> None:
@@ -1321,6 +1363,15 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "step3p5_mtp"
+        )
+
+    def use_qwen4_exp_mtp(self) -> bool:
+        """Return whether Qwen4Exp needs its dedicated proposer."""
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "qwen4_exp_mtp"
         )
 
     def use_eagle(self) -> bool:

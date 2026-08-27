@@ -240,6 +240,66 @@ def _spec_decoding_summary(
     }
 
 
+def _spec_decoding_delta(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return speculative-decoding counters added between two snapshots."""
+
+    before_summary = _spec_decoding_summary(before)
+    after_summary = _spec_decoding_summary(after)
+    if after_summary is None:
+        return None
+
+    before_drafts = int(before_summary["num_drafts"]) if before_summary else 0
+    before_draft_tokens = (
+        int(before_summary["num_draft_tokens"]) if before_summary else 0
+    )
+    before_accepted = (
+        int(before_summary["num_accepted_tokens"]) if before_summary else 0
+    )
+    after_drafts = int(after_summary["num_drafts"])
+    after_draft_tokens = int(after_summary["num_draft_tokens"])
+    after_accepted = int(after_summary["num_accepted_tokens"])
+
+    num_drafts = after_drafts - before_drafts
+    num_draft_tokens = after_draft_tokens - before_draft_tokens
+    num_accepted_tokens = after_accepted - before_accepted
+    if num_drafts <= 0:
+        return None
+    if num_draft_tokens < 0 or num_accepted_tokens < 0:
+        raise RuntimeError("Speculative-decoding counters moved backwards")
+
+    before_per_pos = (
+        list(before_summary["accepted_tokens_per_pos"]) if before_summary else []
+    )
+    after_per_pos = list(after_summary["accepted_tokens_per_pos"])
+    width = max(len(before_per_pos), len(after_per_pos))
+    before_per_pos.extend([0] * (width - len(before_per_pos)))
+    after_per_pos.extend([0] * (width - len(after_per_pos)))
+    accepted_tokens_per_pos = [
+        end - start for start, end in zip(before_per_pos, after_per_pos, strict=True)
+    ]
+    if any(value < 0 for value in accepted_tokens_per_pos):
+        raise RuntimeError("Per-position speculative counters moved backwards")
+
+    avg_accepted_tokens = num_accepted_tokens / num_drafts
+    return {
+        "num_drafts": num_drafts,
+        "num_draft_tokens": num_draft_tokens,
+        "num_accepted_tokens": num_accepted_tokens,
+        "avg_accepted_tokens_no_bonus": avg_accepted_tokens,
+        "mean_acceptance_length": 1 + avg_accepted_tokens,
+        "draft_acceptance_rate": (
+            num_accepted_tokens / num_draft_tokens if num_draft_tokens else None
+        ),
+        "accepted_tokens_per_pos": accepted_tokens_per_pos,
+        "per_position_acceptance_rate": [
+            value / num_drafts for value in accepted_tokens_per_pos
+        ],
+    }
+
+
 def _load_prompts(args: argparse.Namespace) -> list[Any]:
     if args.input_lens is not None:
         if args.input_len is not None or args.prompt or args.prompts_json is not None:
@@ -1713,6 +1773,7 @@ def _dump(args: argparse.Namespace) -> int:
         torch.accelerator.synchronize()
         torch.cuda.cudart().cudaProfilerStart()
     generate_seconds_by_repeat: list[float] = []
+    sequential_prompt_metrics: list[dict[str, Any]] = []
     outputs = []
     try:
         for repeat_index in range(args.repeat_count):
@@ -1724,8 +1785,24 @@ def _dump(args: argparse.Namespace) -> int:
                 raise RuntimeError("Failed to reset the idle prefix cache")
             generate_start = time.perf_counter()
             if args.sequential_prompts:
-                for prompt in prompts:
+                metrics_before_prompt = _metric_snapshot(llm)
+                for prompt_index, prompt in enumerate(prompts):
+                    prompt_start = time.perf_counter()
                     outputs.extend(llm.generate([prompt], sampling_params))
+                    prompt_seconds = time.perf_counter() - prompt_start
+                    metrics_after_prompt = _metric_snapshot(llm)
+                    sequential_prompt_metrics.append(
+                        {
+                            "repeat_index": repeat_index,
+                            "prompt_index": prompt_index,
+                            "generate_seconds": prompt_seconds,
+                            "spec_decoding_metrics": _spec_decoding_delta(
+                                metrics_before_prompt,
+                                metrics_after_prompt,
+                            ),
+                        }
+                    )
+                    metrics_before_prompt = metrics_after_prompt
             else:
                 outputs.extend(llm.generate(prompts, sampling_params))
             generate_seconds_by_repeat.append(time.perf_counter() - generate_start)
@@ -1831,6 +1908,7 @@ def _dump(args: argparse.Namespace) -> int:
         "eos_token_ids": eos_token_ids,
         "metrics_snapshot": metrics_snapshot,
         "spec_decoding_metrics": _spec_decoding_summary(metrics_snapshot),
+        "sequential_prompt_metrics": sequential_prompt_metrics,
         "sampling_params": {
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,

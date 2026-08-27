@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.models.common.ops import fused_q_kv_rmsnorm
 
 
 @dataclass
@@ -16,7 +17,7 @@ class MLAModules:
 
     kv_a_layernorm: torch.nn.Module
     kv_b_proj: torch.nn.Module
-    rotary_emb: torch.nn.Module
+    rotary_emb: torch.nn.Module | None
     o_proj: torch.nn.Module
     fused_qkv_a_proj: torch.nn.Module | None
     kv_a_proj_with_mqa: torch.nn.Module | None
@@ -65,6 +66,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         skip_topk: bool = False,
+        fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -93,6 +95,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # the topk_tokens buffer written by a previous layer in the same pass.
         # Refer: https://arxiv.org/abs/2603.12201 for more details.
         self.skip_topk = skip_topk
+        self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
         if self.indexer is not None:
             assert hasattr(self.indexer, "topk_tokens")
             self.topk_tokens = self.indexer.topk_tokens
@@ -141,8 +144,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            if not self.fuse_qkv_rmsnorm:
+                q_c = self.q_a_layernorm(q_c)
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -154,7 +157,21 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             q = self.q_proj(hidden_states)[0]
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        if self.fuse_qkv_rmsnorm and q_c is not None:
+            assert self.q_a_layernorm is not None
+            q_c, kv_c_normed = fused_q_kv_rmsnorm(
+                q_c,
+                kv_c,
+                self.q_a_layernorm.weight.data,
+                self.kv_a_layernorm.weight.data,
+                self.q_a_layernorm.variance_epsilon,
+            )
+        else:
+            kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        if self.q_lora_rank is not None:
+            assert q_c is not None and self.q_b_proj is not None
+            q = self.q_b_proj(q_c)[0]
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe

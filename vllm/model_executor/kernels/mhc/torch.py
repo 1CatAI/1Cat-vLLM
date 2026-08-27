@@ -14,12 +14,14 @@ def mhc_pre_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
 
     Args:
-        residual: shape (..., hc_mult, hidden_size), dtype torch.bfloat16
+        residual: shape (..., hc_mult, hidden_size), dtype bfloat16 or float16
         fn: shape (hc_mult3, hc_mult * hidden_size), dtype torch.float32
         hc_scale: shape (3,), dtype torch.float32
         hc_base: shape (hc_mult3,), dtype torch.float32
@@ -33,11 +35,11 @@ def mhc_pre_torch(
     Returns:
         post_mix: shape (..., hc_mult), dtype torch.float32
         comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
-        layer_input: shape (..., hidden_size), dtype torch.bfloat16
+        layer_input: shape (..., hidden_size), dtype matching residual
     """
 
     # Validate shapes
-    assert residual.dtype == torch.bfloat16
+    assert residual.dtype in (torch.bfloat16, torch.float16)
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
     assert hc_base.dtype == torch.float32
@@ -83,7 +85,16 @@ def mhc_pre_torch(
 
     layer_input = torch.sum(
         pre_mix.unsqueeze(-1) * residual_flat.to(torch.float32), dim=1
-    ).to(torch.bfloat16)
+    )
+    if norm_weight is not None:
+        assert norm_weight.shape == (hidden_size,)
+        variance = layer_input.square().mean(dim=-1, keepdim=True)
+        layer_input = (
+            layer_input
+            * torch.rsqrt(variance + norm_eps)
+            * norm_weight.to(torch.float32)
+        )
+    layer_input = layer_input.to(residual.dtype)
     return (
         post_mix.view(*outer_shape, hc_mult, 1),
         comb_mix.view(*outer_shape, hc_mult, hc_mult),
@@ -104,3 +115,40 @@ def mhc_post_torch(
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
+
+
+def mhc_fused_post_pre_torch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    tile_n: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del tile_n
+    residual_cur = mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+    post_mix, comb_mix, layer_input = mhc_pre_torch(
+        residual_cur,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+        norm_weight,
+        norm_eps,
+    )
+    return residual_cur, post_mix, comb_mix, layer_input

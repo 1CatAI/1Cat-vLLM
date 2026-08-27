@@ -32,11 +32,15 @@ from typing_extensions import Self, TypeIs
 from vllm.config import ModelConfig, SpeechToTextConfig, SpeechToTextParams
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncsByType,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.tasks import ScoreType
 from vllm.utils.collection_utils import common_prefix
 from vllm.utils.func_utils import supports_kw
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from .interfaces_base import VllmModel
 
@@ -836,6 +840,14 @@ class IsHybrid(Protocol):
             caching in align mode.
         """
         ...
+
+    @classmethod
+    def get_mamba_state_copy_funcs(
+        cls,
+        mamba_types: set[MambaAttentionBackendEnum],
+    ) -> MambaStateCopyFuncsByType:
+        copy_funcs = cls.get_mamba_state_copy_func()
+        return {mamba_type: copy_funcs for mamba_type in mamba_types}
 
 
 @overload

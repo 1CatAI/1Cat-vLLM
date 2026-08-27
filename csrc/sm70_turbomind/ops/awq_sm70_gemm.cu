@@ -1817,6 +1817,290 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
   return val;
 }
 
+__device__ __forceinline__ float warp_group4_sum(float value) {
+  constexpr unsigned kSinkhornMask = 0x0000ffff;
+  value += __shfl_xor_sync(kSinkhornMask, value, 1);
+  value += __shfl_xor_sync(kSinkhornMask, value, 2);
+  return value;
+}
+
+__device__ __forceinline__ float warp_group4_max(float value) {
+  constexpr unsigned kSinkhornMask = 0x0000ffff;
+  value = fmaxf(value, __shfl_xor_sync(kSinkhornMask, value, 1));
+  value = fmaxf(value, __shfl_xor_sync(kSinkhornMask, value, 2));
+  return value;
+}
+
+__device__ __forceinline__ float warp_stride4_sum(float value) {
+  constexpr unsigned kSinkhornMask = 0x0000ffff;
+  value += __shfl_xor_sync(kSinkhornMask, value, 4);
+  value += __shfl_xor_sync(kSinkhornMask, value, 8);
+  return value;
+}
+
+__device__ __forceinline__ float sm70_sigmoid(float value) {
+  return 1.f / (1.f + __expf(-value));
+}
+
+template <int kHiddenSize, int kStreams, int kThreads>
+__global__ void sm70_glm_mhc_pre_norm_kernel(
+    const float* gemm_mul, const float* gemm_sqrsum, const float* hc_scale,
+    const float* hc_base, const half* residual, float* post_mix,
+    float* comb_mix, half* layer_input, const half* norm_weight, int num_splits,
+    float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult,
+    int sinkhorn_repeat, float norm_eps) {
+  static_assert(kStreams == 4);
+  static_assert(kThreads % 32 == 0);
+  __shared__ float pre_shared[kStreams];
+  __shared__ float warp_sums[kThreads / 32];
+  __shared__ float norm_scale_shared;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  if (warp == 0) {
+    float sqrsum = 0.f;
+    for (int split = 0; split < num_splits; ++split) {
+      sqrsum += gemm_sqrsum[split];
+    }
+    const float input_rsqrt =
+        rsqrtf(sqrsum / static_cast<float>(kStreams * kHiddenSize) + rms_eps);
+
+    if (lane < kStreams) {
+      float pre_logit = 0.f;
+      float post_logit = 0.f;
+      for (int split = 0; split < num_splits; ++split) {
+        const float* row = gemm_mul + split * 24;
+        pre_logit += row[lane];
+        post_logit += row[kStreams + lane];
+      }
+      const float pre =
+          sm70_sigmoid(pre_logit * input_rsqrt * hc_scale[0] + hc_base[lane]) +
+          hc_pre_eps;
+      pre_shared[lane] = pre;
+      post_mix[lane] = sm70_sigmoid(post_logit * input_rsqrt * hc_scale[1] +
+                                    hc_base[kStreams + lane]) *
+                       hc_post_mult;
+    }
+
+    if (lane < kStreams * kStreams) {
+      float logit = 0.f;
+      for (int split = 0; split < num_splits; ++split) {
+        logit += gemm_mul[split * 24 + 2 * kStreams + lane];
+      }
+      logit = logit * input_rsqrt * hc_scale[2] + hc_base[2 * kStreams + lane];
+      const float row_max = warp_group4_max(logit);
+      float value = __expf(logit - row_max);
+      value = value / warp_group4_sum(value) + hc_sinkhorn_eps;
+      value /= warp_stride4_sum(value) + hc_sinkhorn_eps;
+      for (int iter = 1; iter < sinkhorn_repeat; ++iter) {
+        value /= warp_group4_sum(value) + hc_sinkhorn_eps;
+        value /= warp_stride4_sum(value) + hc_sinkhorn_eps;
+      }
+      comb_mix[lane] = value;
+    }
+  }
+  __syncthreads();
+
+  constexpr int kHiddenPairs = kHiddenSize / 2;
+  constexpr int kPairsPerThread = kHiddenPairs / kThreads;
+  static_assert(kHiddenPairs % kThreads == 0);
+  const half2* residual2 = reinterpret_cast<const half2*>(residual);
+  half2* layer_input2 = reinterpret_cast<half2*>(layer_input);
+  half2 staged_values[kPairsPerThread];
+  float local_sqrsum = 0.f;
+#pragma unroll
+  for (int item = 0; item < kPairsPerThread; ++item) {
+    const int hidden2 = tid + item * kThreads;
+    float2 value = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int stream = 0; stream < kStreams; ++stream) {
+      const float2 residual_value =
+          __half22float2(residual2[stream * kHiddenPairs + hidden2]);
+      value.x += pre_shared[stream] * residual_value.x;
+      value.y += pre_shared[stream] * residual_value.y;
+    }
+    local_sqrsum += value.x * value.x + value.y * value.y;
+    staged_values[item] = __floats2half2_rn(value.x, value.y);
+  }
+  local_sqrsum = warp_reduce_sum(local_sqrsum);
+  if (lane == 0) {
+    warp_sums[warp] = local_sqrsum;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float block_sum = lane < (kThreads / 32) ? warp_sums[lane] : 0.f;
+    block_sum = warp_reduce_sum(block_sum);
+    if (lane == 0) {
+      norm_scale_shared =
+          rsqrtf(block_sum / static_cast<float>(kHiddenSize) + norm_eps);
+    }
+  }
+  __syncthreads();
+
+  const float norm_scale = norm_scale_shared;
+  const half2* norm_weight2 = reinterpret_cast<const half2*>(norm_weight);
+#pragma unroll
+  for (int item = 0; item < kPairsPerThread; ++item) {
+    const int hidden2 = tid + item * kThreads;
+    const float2 staged = __half22float2(staged_values[item]);
+    const float2 weight = __half22float2(norm_weight2[hidden2]);
+    layer_input2[hidden2] = __floats2half2_rn(staged.x * norm_scale * weight.x,
+                                              staged.y * norm_scale * weight.y);
+  }
+}
+
+template <int kRows, int kCols, int kWarps>
+__global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
+                                         const half* f_input,
+                                         const half* g_input,
+                                         const half* f_weight,
+                                         const half* g_weight) {
+  constexpr int kThreads = kWarps * WARP_SIZE;
+  constexpr int kCols2 = kCols / 2;
+  static_assert(kThreads <= 1024);
+  static_assert(kCols % 2 == 0);
+
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int combined_row = blockIdx.x * kWarps + warp;
+  if (combined_row >= 2 * kRows) {
+    return;
+  }
+
+  const bool is_g = combined_row >= kRows;
+  const int row = is_g ? combined_row - kRows : combined_row;
+  const half2* input = reinterpret_cast<const half2*>(is_g ? g_input : f_input);
+  const half2* weight = reinterpret_cast<const half2*>(
+      (is_g ? g_weight : f_weight) + row * kCols);
+
+  float dot = 0.f;
+  for (int col2 = lane; col2 < kCols2; col2 += WARP_SIZE) {
+    const float2 input_value = __half22float2(input[col2]);
+    const float2 weight_value = __half22float2(weight[col2]);
+    dot = fmaf(input_value.x, weight_value.x, dot);
+    dot = fmaf(input_value.y, weight_value.y, dot);
+  }
+  dot = warp_reduce_sum(dot);
+  if (lane == 0) {
+    (is_g ? g_out : f_out)[row] = __float2half_rn(dot);
+  }
+}
+
+void sm70_glm_mhc_pre_norm_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps) {
+  TORCH_CHECK(
+      gemm_mul.is_cuda() && gemm_sqrsum.is_cuda() && hc_scale.is_cuda() &&
+          hc_base.is_cuda() && residual.is_cuda() && post_mix.is_cuda() &&
+          comb_mix.is_cuda() && layer_input.is_cuda() && norm_weight.is_cuda(),
+      "sm70_glm_mhc_pre_norm_out: all tensors must be CUDA.");
+  TORCH_CHECK(gemm_mul.scalar_type() == torch::kFloat32 &&
+                  gemm_sqrsum.scalar_type() == torch::kFloat32 &&
+                  hc_scale.scalar_type() == torch::kFloat32 &&
+                  hc_base.scalar_type() == torch::kFloat32 &&
+                  post_mix.scalar_type() == torch::kFloat32 &&
+                  comb_mix.scalar_type() == torch::kFloat32,
+              "sm70_glm_mhc_pre_norm_out: mix tensors must be float32.");
+  TORCH_CHECK(residual.scalar_type() == torch::kFloat16 &&
+                  layer_input.scalar_type() == torch::kFloat16 &&
+                  norm_weight.scalar_type() == torch::kFloat16,
+              "sm70_glm_mhc_pre_norm_out: activations must be float16.");
+  TORCH_CHECK(gemm_mul.is_contiguous() && gemm_sqrsum.is_contiguous() &&
+                  hc_scale.is_contiguous() && hc_base.is_contiguous() &&
+                  residual.is_contiguous() && post_mix.is_contiguous() &&
+                  comb_mix.is_contiguous() && layer_input.is_contiguous() &&
+                  norm_weight.is_contiguous(),
+              "sm70_glm_mhc_pre_norm_out: tensors must be contiguous.");
+  TORCH_CHECK(gemm_mul.dim() == 3,
+              "sm70_glm_mhc_pre_norm_out: gemm_mul must be rank 3.");
+  const int64_t num_splits = gemm_mul.size(0);
+  TORCH_CHECK(gemm_mul.size(1) == 1 && gemm_mul.size(2) == 24 &&
+                  gemm_sqrsum.dim() == 2 && gemm_sqrsum.size(0) == num_splits &&
+                  gemm_sqrsum.size(1) == 1,
+              "sm70_glm_mhc_pre_norm_out: invalid staging shape.");
+  TORCH_CHECK(residual.dim() == 3 && residual.size(0) == 1 &&
+                  residual.size(1) == 4 && residual.size(2) == 4096 &&
+                  post_mix.numel() == 4 && comb_mix.numel() == 16 &&
+                  layer_input.dim() == 2 && layer_input.size(0) == 1 &&
+                  layer_input.size(1) == 4096 && norm_weight.numel() == 4096 &&
+                  hc_scale.numel() == 3 && hc_base.numel() == 24,
+              "sm70_glm_mhc_pre_norm_out: invalid GLM mHC shape.");
+  const auto device = residual.device();
+  TORCH_CHECK(gemm_mul.device() == device && gemm_sqrsum.device() == device &&
+                  hc_scale.device() == device && hc_base.device() == device &&
+                  post_mix.device() == device && comb_mix.device() == device &&
+                  layer_input.device() == device &&
+                  norm_weight.device() == device,
+              "sm70_glm_mhc_pre_norm_out: all tensors must share one device.");
+  TORCH_CHECK(num_splits >= 1 && num_splits <= 8 && sinkhorn_repeat >= 1,
+              "sm70_glm_mhc_pre_norm_out: invalid reduction configuration.");
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(residual));
+  constexpr int kThreads = 128;
+  sm70_glm_mhc_pre_norm_kernel<4096, 4, kThreads>
+      <<<1, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          gemm_mul.data_ptr<float>(), gemm_sqrsum.data_ptr<float>(),
+          hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
+          reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),
+          post_mix.data_ptr<float>(), comb_mix.data_ptr<float>(),
+          reinterpret_cast<half*>(layer_input.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(norm_weight.data_ptr<at::Half>()),
+          static_cast<int>(num_splits), static_cast<float>(rms_eps),
+          static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps),
+          static_cast<float>(hc_post_mult), static_cast<int>(sinkhorn_repeat),
+          static_cast<float>(norm_eps));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
+                           torch::Tensor f_input, torch::Tensor g_input,
+                           torch::Tensor f_weight, torch::Tensor g_weight) {
+  TORCH_CHECK(f_out.is_cuda() && g_out.is_cuda() && f_input.is_cuda() &&
+                  g_input.is_cuda() && f_weight.is_cuda() && g_weight.is_cuda(),
+              "sm70_glm_kda_fg_b_out: all tensors must be CUDA.");
+  TORCH_CHECK(f_out.scalar_type() == torch::kFloat16 &&
+                  g_out.scalar_type() == torch::kFloat16 &&
+                  f_input.scalar_type() == torch::kFloat16 &&
+                  g_input.scalar_type() == torch::kFloat16 &&
+                  f_weight.scalar_type() == torch::kFloat16 &&
+                  g_weight.scalar_type() == torch::kFloat16,
+              "sm70_glm_kda_fg_b_out: all tensors must be float16.");
+  TORCH_CHECK(f_out.is_contiguous() && g_out.is_contiguous() &&
+                  f_input.is_contiguous() && g_input.is_contiguous() &&
+                  f_weight.is_contiguous() && g_weight.is_contiguous(),
+              "sm70_glm_kda_fg_b_out: all tensors must be contiguous.");
+  TORCH_CHECK(f_out.sizes() == torch::IntArrayRef({1, 2048}) &&
+                  g_out.sizes() == torch::IntArrayRef({1, 2048}) &&
+                  f_input.sizes() == torch::IntArrayRef({1, 128}) &&
+                  g_input.sizes() == torch::IntArrayRef({1, 128}) &&
+                  f_weight.sizes() == torch::IntArrayRef({2048, 128}) &&
+                  g_weight.sizes() == torch::IntArrayRef({2048, 128}),
+              "sm70_glm_kda_fg_b_out: requires the GLM TP4 B1 shape.");
+  const auto device = f_out.device();
+  TORCH_CHECK(g_out.device() == device && f_input.device() == device &&
+                  g_input.device() == device && f_weight.device() == device &&
+                  g_weight.device() == device,
+              "sm70_glm_kda_fg_b_out: all tensors must share one device.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(f_out));
+  constexpr int kWarps = 8;
+  constexpr int kThreads = kWarps * WARP_SIZE;
+  constexpr int kBlocks = (2 * 2048 + kWarps - 1) / kWarps;
+  sm70_glm_kda_fg_b_kernel<2048, 128, kWarps>
+      <<<kBlocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<half*>(f_out.data_ptr<at::Half>()),
+          reinterpret_cast<half*>(g_out.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(f_input.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(g_input.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <int THREADS>
 __global__ void sm70_f16_gate_mul_kernel(half* out, const half* in_feats,
                                          const half* gate_weight, int out_rows,
@@ -5659,6 +5943,26 @@ void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
   vllm::awq_sm70::sm70_f16_gemm_out(out, _in_feats, _kernel, k_ld, gated_silu);
 }
 
+void sm70_glm_mhc_pre_norm_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps) {
+  vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
+      gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
+      layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+      hc_post_mult, sinkhorn_repeat, norm_eps);
+}
+
+void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
+                           torch::Tensor f_input, torch::Tensor g_input,
+                           torch::Tensor f_weight, torch::Tensor g_weight) {
+  vllm::awq_sm70::sm70_glm_kda_fg_b_out(f_out, g_out, f_input, g_input,
+                                        f_weight, g_weight);
+}
+
 void sm70_f16_indexed_rerank_out(torch::Tensor out, torch::Tensor _in_feats,
                                  torch::Tensor _kernel,
                                  torch::Tensor candidate_ids,
@@ -8585,8 +8889,11 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 256 &&
       ((k == 2048 && (n == 1024 || n == 512 || n == 256)) ||
        (n == 2048 && (k == 512 || k == 256 || k == 128)));
+  const bool exact_qwen4_exp_prefill_shape =
+      input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 512 &&
+      ((k == 2560 && n == 320) || (k == 160 && n == 2560));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
-      exact_qwen36_prefill_shape) {
+      (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
     static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
         logged_nvfp4_grouped_prefill,

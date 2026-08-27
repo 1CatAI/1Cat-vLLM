@@ -1821,12 +1821,9 @@ struct GroupedVerifyTraits {
   static_assert(MAX_QUERY_TOKENS == kGroupedVerifyQ8MaxQ ||
                     MAX_QUERY_TOKENS == kGroupedVerifyQ16MaxQ,
                 "grouped verifier supports q8 and q16 workspaces only");
-  static constexpr int kHeadsPerCta =
-      kGroupedVerifyRows / MAX_QUERY_TOKENS;
-  static constexpr int kHeadGroups =
-      kGroupedVerifyHeads / kHeadsPerCta;
-  static constexpr int kSplits =
-      kGroupedVerifyWorkspaceRows / MAX_QUERY_TOKENS;
+  static constexpr int kHeadsPerCta = kGroupedVerifyRows / MAX_QUERY_TOKENS;
+  static constexpr int kHeadGroups = kGroupedVerifyHeads / kHeadsPerCta;
+  static constexpr int kSplits = kGroupedVerifyWorkspaceRows / MAX_QUERY_TOKENS;
   static_assert(MAX_QUERY_TOKENS * kHeadsPerCta == kGroupedVerifyRows,
                 "grouped verifier CTA must retain 48 rows");
   static_assert(kGroupedVerifyHeads % kHeadsPerCta == 0,
@@ -1928,8 +1925,7 @@ __device__ __forceinline__ void grouped_verify_scale_output_fragment(
 }
 
 template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
-          bool SINGLE_QUERY = false,
-          bool CONTIGUOUS_HKV1_LAYOUT = false,
+          bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool STAGE_PARTITION_PAGE_IDS = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_e5m2_partial_kernel(
@@ -3550,8 +3546,7 @@ at::Tensor flash_attention_grouped_verify_paged(
   const bool wide_query = q.size(0) > kGroupedVerifyQ8MaxQ;
   const int max_query_tokens =
       wide_query ? kGroupedVerifyQ16MaxQ : kGroupedVerifyQ8MaxQ;
-  const int grouped_splits =
-      kGroupedVerifyWorkspaceRows / max_query_tokens;
+  const int grouped_splits = kGroupedVerifyWorkspaceRows / max_query_tokens;
   const int heads_per_cta = kGroupedVerifyRows / max_query_tokens;
   const int head_groups = kGroupedVerifyHeads / heads_per_cta;
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 &&
@@ -3576,10 +3571,10 @@ at::Tensor flash_attention_grouped_verify_paged(
                                    kGroupedVerifyHeads, kGroupedVerifyHeadDim}),
               "partial_out must have shape [80, 8, 6, 256] or "
               "[40, 16, 6, 256]");
-  TORCH_CHECK(partial_lse.sizes() ==
-                  at::IntArrayRef({grouped_splits, max_query_tokens,
-                                   kGroupedVerifyHeads}),
-              "partial_lse must have shape [80, 8, 6] or [40, 16, 6]");
+  TORCH_CHECK(
+      partial_lse.sizes() == at::IntArrayRef({grouped_splits, max_query_tokens,
+                                              kGroupedVerifyHeads}),
+      "partial_lse must have shape [80, 8, 6] or [40, 16, 6]");
   TORCH_CHECK(k_scale > 0.0f && v_scale > 0.0f,
               "grouped verify E5M2 K/V scales must be positive");
 
@@ -3604,7 +3599,7 @@ at::Tensor flash_attention_grouped_verify_paged(
 
   const dim3 partial_grid(head_groups, grouped_splits, 1);
   const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
-#define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,  \
+#define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
                                       STAGE_PAGE_IDS)                          \
   do {                                                                         \
@@ -3640,43 +3635,43 @@ at::Tensor flash_attention_grouped_verify_paged(
   } while (0)
 
 #define DISPATCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS,           \
-                                        SINGLE_QUERY)                          \
-  do {                                                                         \
-    const int64_t page_size = k_cache.size(1);                                 \
-    const int64_t fixed_block_stride = 2 * page_size * kGroupedVerifyHeadDim;  \
-    const bool fixed_interleaved_layout =                                      \
-        dflash2_grouped_fixed_interleaved_enabled() &&                         \
-        (page_size == 1648 || page_size == 3296) &&                            \
-        k_cache.stride(0) == fixed_block_stride &&                             \
-        v_cache.stride(0) == fixed_block_stride &&                             \
-        k_cache.stride(1) == kGroupedVerifyHeadDim &&                          \
-        v_cache.stride(1) == kGroupedVerifyHeadDim &&                          \
-        k_cache.stride(2) == kGroupedVerifyHeadDim &&                          \
-        v_cache.stride(2) == kGroupedVerifyHeadDim;                            \
-    const bool stage_page_ids =                                                \
-        fixed_interleaved_layout && dflash2_grouped_stage_page_ids_enabled();  \
-    if (stage_page_ids && page_size == 1648) {                                 \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,          \
-                                    SINGLE_QUERY, true, true);                  \
-    } else if (stage_page_ids) {                                               \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,          \
-                                    SINGLE_QUERY, true, true);                  \
-    } else if (fixed_interleaved_layout && page_size == 1648) {                \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,          \
-                                    SINGLE_QUERY, true, false);                 \
-    } else if (fixed_interleaved_layout) {                                     \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,          \
-                                    SINGLE_QUERY, true, false);                 \
-    } else if (page_size == 1648) {                                            \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,          \
-                                    SINGLE_QUERY, false, false);                \
-    } else if (page_size == 3296) {                                            \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,          \
-                                    SINGLE_QUERY, false, false);                \
-    } else {                                                                   \
-      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0,             \
-                                    SINGLE_QUERY, false, false);                \
-    }                                                                          \
+                                        SINGLE_QUERY)                         \
+  do {                                                                        \
+    const int64_t page_size = k_cache.size(1);                                \
+    const int64_t fixed_block_stride = 2 * page_size * kGroupedVerifyHeadDim; \
+    const bool fixed_interleaved_layout =                                     \
+        dflash2_grouped_fixed_interleaved_enabled() &&                        \
+        (page_size == 1648 || page_size == 3296) &&                           \
+        k_cache.stride(0) == fixed_block_stride &&                            \
+        v_cache.stride(0) == fixed_block_stride &&                            \
+        k_cache.stride(1) == kGroupedVerifyHeadDim &&                         \
+        v_cache.stride(1) == kGroupedVerifyHeadDim &&                         \
+        k_cache.stride(2) == kGroupedVerifyHeadDim &&                         \
+        v_cache.stride(2) == kGroupedVerifyHeadDim;                           \
+    const bool stage_page_ids =                                               \
+        fixed_interleaved_layout && dflash2_grouped_stage_page_ids_enabled(); \
+    if (stage_page_ids && page_size == 1648) {                                \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
+                                    SINGLE_QUERY, true, true);                \
+    } else if (stage_page_ids) {                                              \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
+                                    SINGLE_QUERY, true, true);                \
+    } else if (fixed_interleaved_layout && page_size == 1648) {               \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
+                                    SINGLE_QUERY, true, false);               \
+    } else if (fixed_interleaved_layout) {                                    \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
+                                    SINGLE_QUERY, true, false);               \
+    } else if (page_size == 1648) {                                           \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
+                                    SINGLE_QUERY, false, false);              \
+    } else if (page_size == 3296) {                                           \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
+                                    SINGLE_QUERY, false, false);              \
+    } else {                                                                  \
+      LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0,            \
+                                    SINGLE_QUERY, false, false);              \
+    }                                                                         \
   } while (0)
 
   const bool single_query = q.size(0) == 1;
@@ -3697,13 +3692,13 @@ at::Tensor flash_attention_grouped_verify_paged(
 #undef LAUNCH_GROUPED_VERIFY_PARTIAL
   const dim3 combine_grid(static_cast<unsigned>(q.size(0)), kGroupedVerifyHeads,
                           1);
-#define LAUNCH_GROUPED_VERIFY_COMBINE(MAX_QUERY_TOKENS, SINGLE_QUERY)        \
-  flash_attention_grouped_verify_e5m2_combine_kernel<MAX_QUERY_TOKENS,       \
-                                                      SINGLE_QUERY>          \
-      <<<combine_grid, kGroupedVerifyThreads, 0, stream>>>(                  \
-          reinterpret_cast<const __half*>(partial_out.data_ptr()),           \
-          partial_lse.data_ptr<float>(), seq_lens.data_ptr<int>(),           \
-          reinterpret_cast<__half*>(out.data_ptr()),                         \
+#define LAUNCH_GROUPED_VERIFY_COMBINE(MAX_QUERY_TOKENS, SINGLE_QUERY)  \
+  flash_attention_grouped_verify_e5m2_combine_kernel<MAX_QUERY_TOKENS, \
+                                                     SINGLE_QUERY>     \
+      <<<combine_grid, kGroupedVerifyThreads, 0, stream>>>(            \
+          reinterpret_cast<const __half*>(partial_out.data_ptr()),     \
+          partial_lse.data_ptr<float>(), seq_lens.data_ptr<int>(),     \
+          reinterpret_cast<__half*>(out.data_ptr()),                   \
           static_cast<int>(q.size(0)))
   if (wide_query) {
     LAUNCH_GROUPED_VERIFY_COMBINE(kGroupedVerifyQ16MaxQ, false);

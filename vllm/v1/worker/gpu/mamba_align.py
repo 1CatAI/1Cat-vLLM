@@ -261,8 +261,7 @@ def run_mamba_align_precopy(
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
-    total_states = ctx.num_layers * ctx.num_state_types
-    grid = (num_reqs, total_states, _TEMPORAL_TILES)
+    grid = (num_reqs, ctx.num_states, _TEMPORAL_TILES)
     _precopy_mamba_align_kernel[grid](
         state_idx,
         src_col,
@@ -296,8 +295,7 @@ def run_mamba_align_postprocess(
     # output count while programs copying other state tensors still read it.
     snapshot = ctx.num_accepted_tokens_out
     snapshot.copy_(num_accepted_tokens)
-    total_states = ctx.num_layers * ctx.num_state_types
-    grid = (num_reqs, total_states, _TEMPORAL_TILES)
+    grid = (num_reqs, ctx.num_states, _TEMPORAL_TILES)
     _postprocess_mamba_align_kernel[grid](
         snapshot,
         num_accepted_tokens,

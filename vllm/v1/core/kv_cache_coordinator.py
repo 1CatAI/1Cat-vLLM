@@ -433,9 +433,14 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # different KV cache groups have different block sizes, the actual block size
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
+        participating_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if group.kv_cache_spec.prefix_cacheable
+        ]
         assert all(
-            g.kv_cache_spec.block_size % hash_block_size == 0
-            for g in kv_cache_config.kv_cache_groups
+            block_size % hash_block_size == 0
+            for block_size in participating_block_sizes
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
@@ -451,6 +456,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ] = []
 
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
+            # Skip groups that opt out of prefix caching (e.g. GLM-5.3-Flash
+            # kpool tail): their blocks are per-request scratch, never
+            # shareable, so they must not participate in hit lookup (their
+            # manager-level hooks already no-op). Their slot in the per-group
+            # hit tuple stays empty.
+            if not g.kv_cache_spec.prefix_cacheable:
+                continue
             manager_cls = self.single_type_managers[i].__class__
             spec = g.kv_cache_spec
 
@@ -465,8 +477,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             else:
                 attention_groups.append((spec, [i], manager_cls))
 
-        assert len(attention_groups) > 1, (
-            "HybridKVCacheCoordinator requires at least two attention groups."
+        assert attention_groups, (
+            "HybridKVCacheCoordinator requires at least one cacheable group."
         )
 
         # Put full attention first: its efficient left-to-right scan provides

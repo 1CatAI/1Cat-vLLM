@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 from pathlib import Path
 
@@ -15,6 +16,7 @@ _EXT_LOAD_ERROR: Exception | None = None
 _PREBUILT_EXTENSION = (
     "flash_qla.ops.gated_delta_rule.chunk.sm70.flash_qla_sm70_gdn_strided"
 )
+_PREBUILT_EXTENSION_PATH_ENV = "FLASH_QLA_SM70_PREBUILT_EXTENSION_PATH"
 
 # Avoid CUDA-device auto-detection while distributed workers are initializing.
 # The fallback JIT supports both architectures implemented by this source file.
@@ -35,6 +37,25 @@ def _load_ext():
         ) from _EXT_LOAD_ERROR
     if not torch.cuda.is_available():
         raise RuntimeError("SM70 FlashQLA backend requires CUDA.")
+
+    prebuilt_path = os.environ.get(_PREBUILT_EXTENSION_PATH_ENV)
+    if prebuilt_path:
+        path = Path(prebuilt_path).expanduser()
+        try:
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            spec = importlib.util.spec_from_file_location(_PREBUILT_EXTENSION, path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load extension spec from {path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _EXT = module
+            return _EXT
+        except Exception as exc:
+            _EXT_LOAD_ERROR = exc
+            raise RuntimeError(
+                f"Failed to load {_PREBUILT_EXTENSION_PATH_ENV}={path}."
+            ) from exc
 
     try:
         _EXT = importlib.import_module(_PREBUILT_EXTENSION)

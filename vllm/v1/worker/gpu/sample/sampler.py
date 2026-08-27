@@ -62,6 +62,24 @@ class Sampler:
         self.bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
 
+    def can_use_sm70_greedy_token_fastpath(self, input_batch: InputBatch) -> bool:
+        """Whether TP-local argmax is equivalent to the full MRv2 sampler."""
+        if not envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH or self.compute_nans:
+            return False
+
+        req_indices = input_batch.idx_mapping_np
+        if not np.all(self.sampling_states.temperature.np[req_indices] == 0.0):
+            return False
+        if self.sampling_states.max_num_logprobs(req_indices) != NO_LOGPROBS:
+            return False
+        if self.logprob_token_ids_state.max_num_token_ids(req_indices) != 0:
+            return False
+        if np.any(self.logit_bias_state.use_logit_bias[req_indices]):
+            return False
+        if np.any(self.penalties_state.use_penalty[req_indices]):
+            return False
+        return not np.any(self.bad_words_state.num_bad_words.np[req_indices])
+
     def __call__(
         self,
         logits: torch.Tensor,

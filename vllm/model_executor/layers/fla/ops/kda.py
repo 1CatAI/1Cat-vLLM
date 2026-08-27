@@ -42,6 +42,12 @@ def fused_recurrent_kda_fwd(
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
+    sigmoid_beta: bool = False,
+    a_log: torch.Tensor | None = None,
+    g_bias: torch.Tensor | None = None,
+    compute_gate: bool = False,
+    lower_bound: float | None = -5.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -52,7 +58,24 @@ def fused_recurrent_kda_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = torch.empty_like(k)
+    if compute_gate:
+        assert a_log is not None and g_bias is not None, (
+            "compute_gate requires a_log and g_bias"
+        )
+        assert lower_bound is not None, (
+            "compute_gate implements the bounded (safe_gate) branch only"
+        )
+        a_log = a_log.reshape(-1).contiguous()
+        g_bias = g_bias.reshape(-1).contiguous()
+
+    if out is None:
+        o = torch.empty_like(k)
+    else:
+        # Caller-provided output buffer; must be layout-compatible with the
+        # tensor the kernel indexes (contiguous, same shape/dtype as k).
+        assert out.shape == k.shape and out.dtype == k.dtype
+        assert out.is_contiguous()
+        o = out
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -99,6 +122,12 @@ def fused_recurrent_kda_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=True,
+        SIGMOID_BETA=sigmoid_beta,
+        a_log=a_log,
+        g_bias=g_bias,
+        COMPUTE_GATE=compute_gate,
+        SAFE_GATE=True,
+        LOWER_BOUND=lower_bound if lower_bound is not None else -5.0,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -118,6 +147,13 @@ def fused_recurrent_kda(
     use_qk_l2norm_in_kernel: bool = True,
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.LongTensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    sigmoid_beta: bool = False,
+    a_log: torch.Tensor | None = None,
+    g_bias: torch.Tensor | None = None,
+    compute_gate: bool = False,
+    lower_bound: float | None = -5.0,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cu_seqlens is not None and q.shape[0] != 1:
@@ -139,8 +175,14 @@ def fused_recurrent_kda(
         inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
-        num_accepted_tokens=None,
+        num_accepted_tokens=num_accepted_tokens,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        out=out,
+        sigmoid_beta=sigmoid_beta,
+        a_log=a_log,
+        g_bias=g_bias,
+        compute_gate=compute_gate,
+        lower_bound=lower_bound,
     )
     return o, final_state
 
@@ -1189,6 +1231,8 @@ def kda_gate_cumsum_fwd_kernel(
     cumsum_scale,
     beta,
     threshold,
+    SAFE_GATE: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
     T,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -1235,14 +1279,20 @@ def kda_gate_cumsum_fwd_kernel(
         b_bias = tl.load(g_bias + i_h * D + o_d, mask=o_d < D, other=0.0).to(tl.float32)
         b_g = b_g + b_bias[None, :]
 
-    b_a = -tl.exp(tl.load(A + i_h).to(tl.float32))
-    b_g_scaled = b_g * beta
-    b_softplus = tl.where(
-        b_g_scaled > threshold,
-        b_g,
-        (1.0 / beta) * log(1.0 + tl.exp(b_g_scaled)),
-    )
-    b_gate = b_a * b_softplus
+    b_a = tl.load(A + i_h).to(tl.float32)
+    b_a = tl.exp(b_a) if SAFE_GATE else -tl.exp(b_a)
+    if SAFE_GATE:
+        # y = lower_bound * sigmoid(exp(A) * (g + g_bias)), bounded to
+        # (lower_bound, 0) for safe-gate checkpoints.
+        b_gate = LOWER_BOUND / (1.0 + tl.exp(-(b_a * b_g)))
+    else:
+        b_g_scaled = b_g * beta
+        b_softplus = tl.where(
+            b_g_scaled > threshold,
+            b_g,
+            (1.0 / beta) * log(1.0 + tl.exp(b_g_scaled)),
+        )
+        b_gate = b_a * b_softplus
 
     # Out-of-bounds rows (load returns 0, but softplus/bias can still make
     # b_gate non-zero) participate in the dot product. They only contribute to
@@ -1264,6 +1314,8 @@ def fused_kda_gate_chunk_cumsum(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     output_dtype: torch.dtype | None = torch.float,
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
 ) -> torch.Tensor:
     if cu_seqlens is not None:
         assert raw_g.shape[0] == 1, (
@@ -1295,6 +1347,8 @@ def fused_kda_gate_chunk_cumsum(
         cumsum_scale=RCP_LN2,
         beta=beta,
         threshold=threshold,
+        SAFE_GATE=safe_gate,
+        LOWER_BOUND=lower_bound,
         T=T,
         H=H,
         D=D,
@@ -1425,6 +1479,8 @@ def chunk_kda_with_fused_gate_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -1439,6 +1495,8 @@ def chunk_kda_with_fused_gate_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
     )
     return _chunk_kda_fwd_with_cumulative_g(
         q=q,
@@ -1502,6 +1560,8 @@ def chunk_kda_with_fused_gate(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    safe_gate: bool = False,
+    lower_bound: float = -5.0,
     **kwargs,
 ):
     """Run chunk KDA from raw gate projection using fused gate+cumsum."""
@@ -1524,6 +1584,8 @@ def chunk_kda_with_fused_gate(
         initial_state=initial_state.contiguous() if initial_state is not None else None,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
     )
     return o, final_state
 
@@ -1545,6 +1607,8 @@ def kda_gate_fwd_kernel(
     g_bias,
     beta: tl.constexpr,
     threshold: tl.constexpr,
+    SAFE_GATE: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
     T,
     H,
     D: tl.constexpr,
@@ -1556,7 +1620,7 @@ def kda_gate_fwd_kernel(
     n_t = i_t * BT
 
     b_a = tl.load(A + i_h).to(tl.float32)
-    b_a = -tl.exp(b_a)
+    b_a = tl.exp(b_a) if SAFE_GATE else -tl.exp(b_a)
 
     stride_row = H * D
     stride_col = 1
@@ -1589,13 +1653,18 @@ def kda_gate_fwd_kernel(
         )
         b_g = b_g + b_bias[None, :]
 
-    # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
-    # When beta * x > threshold, use linear approximation x
-    # Use threshold to switch to linear when beta*x > threshold
-    g_scaled = b_g * beta
-    use_linear = g_scaled > threshold
-    sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
-    b_y = b_a * sp
+    if SAFE_GATE:
+        # y = lower_bound * sigmoid(exp(A) * (g + g_bias)), bounded to
+        # (lower_bound, 0) for safe-gate checkpoints.
+        b_y = LOWER_BOUND / (1.0 + tl.exp(-(b_a * b_g)))
+    else:
+        # softplus(x, beta) = (1/beta) * log(1 + exp(beta * x))
+        # When beta * x > threshold, use linear approximation x
+        # Use threshold to switch to linear when beta*x > threshold
+        g_scaled = b_g * beta
+        use_linear = g_scaled > threshold
+        sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
+        b_y = b_a * sp
 
     tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
 
@@ -1607,13 +1676,18 @@ def fused_kda_gate(
     g_bias: torch.Tensor | None = None,
     beta: float = 1.0,
     threshold: float = 20.0,
+    safe_gate: bool = False,
+    lower_bound: float | None = -5.0,
 ) -> torch.Tensor:
     """
     Forward pass for KDA gate:
       input g: [..., H*D]
       param A: [H] or [1, 1, H, 1]
-      beta: softplus beta parameter
-      threshold: softplus threshold parameter
+      beta: softplus beta parameter (softplus branch only)
+      threshold: softplus threshold parameter (softplus branch only)
+      safe_gate: when False (default) compute y = -exp(A)*softplus(g+g_bias);
+        when True compute the bounded y = lower_bound*sigmoid(exp(A)*(g+g_bias))
+      lower_bound: floor for the safe_gate branch (default -5.0)
       return  : [..., H, D]
     """
     orig_shape = g.shape[:-1]
@@ -1636,6 +1710,8 @@ def fused_kda_gate(
         g_bias,
         beta,
         threshold,
+        safe_gate,
+        lower_bound if lower_bound is not None else -5.0,
         T,
         H,
         head_k_dim,

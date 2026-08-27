@@ -339,7 +339,8 @@ class CustomAllreduce:
             )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
-                "FP16 80-KiB verifier and 8-KiB decode payloads."
+                "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
+                "payloads."
             )
 
     @contextmanager
@@ -379,6 +380,8 @@ class CustomAllreduce:
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
+            return False
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16

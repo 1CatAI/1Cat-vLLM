@@ -38,6 +38,7 @@ def _sm70_sparse_gathered_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -87,12 +88,16 @@ def _sm70_sparse_gathered_kernel(
         running_sum = running_sum * alpha + tl.sum(probs, axis=1)
         running_max = new_max
 
-    sink = tl.load(sink_ptr + head_offsets, mask=head_mask, other=neg_large).to(
-        tl.float32
-    )
-    final_max = tl.maximum(running_max, sink)
-    alpha = tl.exp(running_max - final_max)
-    final_sum = running_sum * alpha + tl.exp(sink - final_max)
+    if HAS_SINK:
+        sink = tl.load(sink_ptr + head_offsets, mask=head_mask, other=neg_large).to(
+            tl.float32
+        )
+        final_max = tl.maximum(running_max, sink)
+        alpha = tl.exp(running_max - final_max)
+        final_sum = running_sum * alpha + tl.exp(sink - final_max)
+    else:
+        alpha = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+        final_sum = running_sum
     denom = tl.maximum(final_sum, 1.0e-30)
     result = tl.where(
         final_sum[:, None] > 0.0,
@@ -836,7 +841,7 @@ def sm70_sparse_attention_gathered(
     indices: torch.Tensor,
     lengths: torch.Tensor,
     scale: float,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     out: torch.Tensor,
 ) -> None:
     """Sparse FP16 attention over a contiguous gathered KV workspace."""
@@ -848,12 +853,13 @@ def sm70_sparse_attention_gathered(
     assert indices_2d.shape[0] == q.shape[0] == lengths.shape[0]
 
     block_h = 8
+    sink_arg = q if attn_sink is None else attn_sink.contiguous()
     _sm70_sparse_gathered_kernel[(q.shape[0], triton.cdiv(q.shape[1], block_h))](
         q,
         kv_2d,
         indices_2d,
         lengths,
-        attn_sink.contiguous(),
+        sink_arg,
         out,
         q.stride(0),
         q.stride(1),
@@ -868,6 +874,7 @@ def sm70_sparse_attention_gathered(
         BLOCK_H=block_h,
         BLOCK_K=16,
         BLOCK_D=_HEAD_DIM,
+        HAS_SINK=attn_sink is not None,
         num_warps=4,
     )
 

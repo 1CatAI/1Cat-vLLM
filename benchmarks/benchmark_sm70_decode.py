@@ -1195,6 +1195,8 @@ def _sm70_gdn_fla_policy() -> dict[str, Any]:
 
 def _sm70_moe_policy() -> dict[str, Any]:
     add_allreduce = _env_bool("VLLM_SM70_MOE_ADD_ALLREDUCE", False)
+    qwen38_router_topk = _env_bool("VLLM_SM70_QWEN38_ROUTER_TOPK", True)
+    qwen38_nvfp4_qpn_m1 = _env_bool("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", True)
     single_token_fastpath = _env_bool("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH", False)
     single_token_permute = _env_bool(
         "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH", False
@@ -1226,6 +1228,12 @@ def _sm70_moe_policy() -> dict[str, Any]:
     return {
         "VLLM_SM70_MOE_ADD_ALLREDUCE": os.environ.get("VLLM_SM70_MOE_ADD_ALLREDUCE"),
         "moe_add_allreduce_effective": add_allreduce,
+        "VLLM_SM70_QWEN38_ROUTER_TOPK": os.environ.get("VLLM_SM70_QWEN38_ROUTER_TOPK"),
+        "qwen38_router_topk_effective": qwen38_router_topk,
+        "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE": os.environ.get(
+            "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE"
+        ),
+        "qwen38_nvfp4_qpn_m1_effective": qwen38_nvfp4_qpn_m1,
         "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH": os.environ.get(
             "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH"
         ),
@@ -1272,8 +1280,16 @@ def _sm70_moe_policy() -> dict[str, Any]:
         ),
         "profile_trace_effective": profile_trace,
         "expected_default": False,
+        "qwen38_router_topk_expected_default": True,
+        "qwen38_nvfp4_qpn_m1_expected_default": True,
         "single_token_unpermute_expected_default": True,
         "route_hit_oracle": (
+            "The exact Qwen3.8 E512/K10 lane requires "
+            "qwen38_router_topk_effective=true and the "
+            "`SM70 Qwen3.8 E512/K10 router top-k path enabled` marker. "
+            "The accepted routed-expert lane additionally requires "
+            "qwen38_nvfp4_qpn_m1_effective=true and the `SM70 Qwen3.8 "
+            "NVFP4 direct QPN-M1 expert path enabled` marker. "
             "For CUDA-graph fast-path acceptance, require the C++ trace "
             "`SM70 custom all_reduce_sum2 op reached ... capture=active`; "
             "the Python MoERunner candidate log alone is not a custom-op hit. "
@@ -1290,6 +1306,7 @@ def _sm70_moe_policy() -> dict[str, Any]:
 
 
 def _sm70_sampling_policy() -> dict[str, Any]:
+    use_v2_model_runner = _env_bool("VLLM_USE_V2_MODEL_RUNNER", False)
     flash_0dot3_compile = _env_bool(
         "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
         False,
@@ -1302,6 +1319,8 @@ def _sm70_sampling_policy() -> dict[str, Any]:
     full_lm_head = _env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
     dense_f16 = _env_bool("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", False)
     return {
+        "VLLM_USE_V2_MODEL_RUNNER": os.environ.get("VLLM_USE_V2_MODEL_RUNNER"),
+        "use_v2_model_runner_effective": use_v2_model_runner,
         "VLLM_SM70_GREEDY_TOKEN_FASTPATH": os.environ.get(
             "VLLM_SM70_GREEDY_TOKEN_FASTPATH"
         ),
@@ -1342,6 +1361,14 @@ def _sm70_sampling_policy() -> dict[str, Any]:
             and not full_lm_head
             and not custom_top1_ar
         ),
+        "v2_greedy_tp_local_pair_policy": (
+            use_v2_model_runner
+            and greedy_fastpath
+            and not lm_head_top1
+            and not lm_head_top1_tc
+            and not full_lm_head
+            and not custom_top1_ar
+        ),
         "route_hit_oracle": (
             "Accepted default greedy decode requires "
             "`SM70 LM head top1 layout prepared` plus "
@@ -1349,7 +1376,10 @@ def _sm70_sampling_policy() -> dict[str, Any]:
             "The SM70 Flash-V100 compile-graph quality lane instead requires "
             "VLLM_SM70_LM_HEAD_TOP1=0 and "
             "compile_graph_local_logits_top1_policy=true, preserving greedy "
-            "pair-gather while avoiding the fused top1 epilogue. "
+            "pair-gather while avoiding the fused top1 epilogue. The MRv2 "
+            "single-token lane additionally requires "
+            "v2_greedy_tp_local_pair_policy=true and the "
+            "`SM70 MRv2 greedy TP-local pair path enabled` log marker. "
             "`SM70 dense fp16 fast path enabled for LM head` is expected only "
             "when the explicit full LM-head fast path gate is enabled. "
             "The 0.0.3 LM-head baseline lane requires full LM-head fast path "

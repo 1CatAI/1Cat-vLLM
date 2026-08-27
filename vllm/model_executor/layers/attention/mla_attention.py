@@ -669,7 +669,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
+        if (
+            fp8_attention
+            and self.kv_cache_dtype != "fp8_ds_mla"
+            and self.attn_backend.get_name() != "GLM5_SM70_SPARSE"
+        ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         # Sparse MLA impls only support forward_mqa (decode-style attention)
@@ -961,12 +965,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        model_version = (
+            "glm5_next"
+            if self.attn_backend.get_name() == "GLM5_SM70_SPARSE"
+            and self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
+            else None
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            model_version=model_version,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):

@@ -7,10 +7,10 @@ import hashlib
 import math
 import os
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NewType, TypeAlias, cast, overload
+from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -21,8 +21,10 @@ from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -880,18 +882,14 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
+    num_blocks_per_request = sum(
+        cdiv(
+            group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+            group.kv_cache_spec.page_size_bytes,
+        )
+        for group in kv_cache_config.kv_cache_groups
     )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
-    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
+    max_concurrency = kv_cache_config.num_blocks / num_blocks_per_request
     return max_concurrency
 
 
@@ -916,6 +914,11 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
+    if (glm5 := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5
+        return len(mla_names) * mla_page + len(idx_names) * idx_page
+    if layout := _get_csa_linear_tensor_layout(kv_cache_groups):
+        return layout.bytes_per_block
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
@@ -1127,7 +1130,8 @@ def _prefer_padding_sliding_window_layers(
         if not isinstance(spec, (SlidingWindowSpec, SlidingWindowMLASpec))
     ]
     if (
-        not sliding_window_counts
+        group_size <= 1
+        or not sliding_window_counts
         or not other_counts
         or min(sliding_window_counts) != group_size
     ):
@@ -1233,9 +1237,7 @@ def _get_kv_cache_groups_uniform_page_size(
     # sw, where the group size should be 10).
     layer_counts = [len(layers) for layers in same_type_layers.values()]
     group_size = _select_hybrid_kv_cache_group_size(layer_counts)
-    group_size = _prefer_padding_sliding_window_layers(
-        same_type_layers, group_size
-    )
+    group_size = _prefer_padding_sliding_window_layers(same_type_layers, group_size)
     if group_size != min(layer_counts):
         logger.info(
             "Using hybrid KV cache group size %d for layer counts %s",
@@ -1325,6 +1327,244 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _pp_balanced_mamba_group_count(
+    vllm_config: VllmConfig,
+    mamba_layer_names: list[str],
+    mla_layer_names: list[str],
+) -> int | None:
+    """Mamba group count for `_get_kv_cache_groups_glm5_next`.
+
+    Under PP, each stage's largest projected Mamba group must fit its local MLA
+    count. Returns the smallest group count that satisfies every stage, or
+    ``None`` when a stage has Mamba layers but no MLA layer.
+    """
+    num_groups = cdiv(len(mamba_layer_names), len(mla_layer_names))
+    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+    if pp_size == 1:
+        return num_groups
+
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+    mamba_indices = [extract_layer_index(name) for name in mamba_layer_names]
+    mla_indices = [extract_layer_index(name) for name in mla_layer_names]
+    for rank in range(pp_size):
+        start, end = get_pp_indices(total_layers, rank, pp_size)
+        num_mamba = sum(start <= i < end for i in mamba_indices)
+        num_mla = sum(start <= i < end for i in mla_indices)
+        if not num_mamba:
+            continue
+        if not num_mla:
+            return None
+        # A stage's mamba layers are contiguous in round-robin order, so its
+        # largest slice under `count` groups is exactly cdiv(num_mamba, count),
+        # which fits num_mla slots iff count >= cdiv(num_mamba, num_mla).
+        num_groups = max(num_groups, cdiv(num_mamba, num_mla))
+    return num_groups
+
+
+def _get_kv_cache_groups_glm5_next(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Groups for GLM-5.3-Flash hybrids: MLA(+kpool indexer) + mamba.
+
+    Mamba layers share the MLA layers' KV cache tensors. Indexer layers get
+    their own KV cache tensors as indexer blocks are small.
+    """
+    mamba_specs = {k: v for k, v in kv_cache_spec.items() if isinstance(v, MambaSpec)}
+    tail_specs = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, KpoolTailSpec)
+    }
+    attn_specs = {
+        k: v
+        for k, v in kv_cache_spec.items()
+        if not isinstance(v, (MambaSpec, KpoolTailSpec))
+    }
+    if not mamba_specs or not all(
+        type(s) is MLAAttentionSpec for s in attn_specs.values()
+    ):
+        return None
+    mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
+    idx_pages = {s.page_size_bytes for s in mla_specs.values() if s.compress_ratio > 1}
+    if not idx_pages:
+        return None
+
+    assert all(s.page_size_padded is None for s in mla_specs.values())
+    assert len(idx_pages) == 1
+    mla_names = [n for n, s in mla_specs.items() if s.compress_ratio == 1]
+    mla_pages = {mla_specs[n].page_size_bytes for n in mla_names}
+    assert len(mla_pages) == 1
+    mla_page = mla_pages.pop()
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
+    assert uniform_spec is not None
+
+    # Keep all indexer tails in one group and pad their pages to the indexer
+    # page size so each tail can share its sibling indexer's storage.
+    tail_group = None
+    if tail_specs:
+        idx_page = next(iter(idx_pages))
+        padded_tail_specs: dict[str, KVCacheSpec] = {
+            name: replace(s, page_size_padded=idx_page)
+            for name, s in tail_specs.items()
+        }
+        tail_uniform = UniformTypeKVCacheSpecs.from_specs(padded_tail_specs)
+        assert tail_uniform is not None
+        tail_group = KVCacheGroupSpec(list(padded_tail_specs), tail_uniform)
+
+    any_mamba = next(iter(mamba_specs.values()))
+    assert all(spec == any_mamba for spec in mamba_specs.values())
+    if any_mamba.real_page_size_bytes > mla_page:
+        raise ValueError(
+            f"the mamba state page ({any_mamba.real_page_size_bytes} bytes) "
+            f"does not fit the MLA page ({mla_page} bytes); increase tensor "
+            "parallelism or use a wider KV cache dtype"
+        )
+    padded_specs: dict[str, KVCacheSpec] = {
+        name: replace(any_mamba, page_size_padded=mla_page) for name in mamba_specs
+    }
+    num_groups = _pp_balanced_mamba_group_count(
+        vllm_config, list(mamba_specs), mla_names
+    )
+    if num_groups is None:
+        raise ValueError(
+            "a pipeline stage has mamba layers but no MLA layer to share "
+            "slots with; realign the stage boundaries (VLLM_PP_LAYER_PARTITION)"
+        )
+    mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
+    for k, name in enumerate(mamba_specs):
+        mamba_grouped_names[k % num_groups].append(name)
+    return (
+        [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+        + ([tail_group] if tail_group is not None else [])
+        + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+    )
+
+
+def _glm5_next_tensor_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> (
+    tuple[
+        KVCacheGroupSpec,
+        list[KVCacheGroupSpec],
+        list[str],
+        list[str],
+        int,
+        int,
+        list[str],
+        int,
+    ]
+    | None
+):
+    """Detect the `_get_kv_cache_groups_glm5_next` layout from the
+    (possibly PP-projected) groups, so tensor emission and the accounting
+    paths can never disagree.
+
+    Returns:
+      - (attn_group, mamba_groups, mla_names, idx_names, mla_page, idx_page,
+         tail_names, tail_page)
+      - None if the group config is invalid
+    """
+    uniform_groups = [
+        g
+        for g in kv_cache_groups
+        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+    ]
+    mamba_groups = [
+        g for g in kv_cache_groups if isinstance(g.kv_cache_spec, MambaSpec)
+    ]
+    # Both the MLA(+indexer) attn group and the kpool tail group are
+    # UniformTypeKVCacheSpecs; distinguish by the inner spec type.
+    attn_group: KVCacheGroupSpec | None = None
+    tail_group: KVCacheGroupSpec | None = None
+    for g in uniform_groups:
+        group_inner = cast(UniformTypeKVCacheSpecs, g.kv_cache_spec).kv_cache_specs
+        if all(type(s) is MLAAttentionSpec for s in group_inner.values()):
+            attn_group = g
+        elif all(isinstance(s, KpoolTailSpec) for s in group_inner.values()):
+            tail_group = g
+    if attn_group is None or not mamba_groups:
+        return None
+    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+        return None
+    attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+    if not all(
+        type(s) is MLAAttentionSpec and s.page_size_padded is None
+        for s in attn_uniform.kv_cache_specs.values()
+    ):
+        return None
+    inner = cast(dict[str, MLAAttentionSpec], attn_uniform.kv_cache_specs)
+    mla_names = [n for n in attn_group.layer_names if inner[n].compress_ratio == 1]
+    idx_names = [n for n in attn_group.layer_names if inner[n].compress_ratio > 1]
+    mla_pages = {inner[n].page_size_bytes for n in mla_names}
+    idx_pages = {inner[n].page_size_bytes for n in idx_names}
+    if len(mla_pages) != 1 or len(idx_pages) != 1:
+        return None
+    mla_page = mla_pages.pop()
+    if any(g.kv_cache_spec.page_size_bytes != mla_page for g in mamba_groups):
+        return None
+    tail_names: list[str] = []
+    tail_page = 0
+    if tail_group is not None:
+        tail_names = list(tail_group.layer_names)
+        # The tail spec is padded to idx_page (co-owns the indexer tensor), so
+        # page_size_bytes returns idx_page. Callers need the *logical* tail page
+        # (2048 B) for transfer sizing and accounting; use unpadded.
+        tail_pages = {
+            cast(KpoolTailSpec, s).real_page_size_bytes
+            for s in cast(
+                UniformTypeKVCacheSpecs, tail_group.kv_cache_spec
+            ).kv_cache_specs.values()
+        }
+        if len(tail_pages) != 1:
+            return None
+        tail_page = tail_pages.pop()
+    return (
+        attn_group,
+        mamba_groups,
+        mla_names,
+        idx_names,
+        mla_page,
+        idx_pages.pop(),
+        tail_names,
+        tail_page,
+    )
+
+
+def _get_kv_cache_config_csa_linear(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]] | None:
+    layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    if layout is None:
+        return None
+
+    num_blocks = available_memory // layout.bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    kv_cache_tensors = [
+        KVCacheTensor(
+            size=layout.main_kv_page_size * num_blocks,
+            shared_by=[main_kv_name]
+            + [
+                group.layer_names[index]
+                for group in layout.mamba_groups
+                if index < len(group.layer_names)
+            ],
+        )
+        for index, main_kv_name in enumerate(layout.main_kv_names)
+    ]
+    kv_cache_tensors.extend(
+        KVCacheTensor(
+            size=layout.compressed_page_size * num_blocks,
+            shared_by=[compressed_name, layout.compressor_state_names[index]],
+        )
+        for index, compressed_name in enumerate(layout.compressed_names)
+    )
+    return num_blocks, kv_cache_tensors
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1369,6 +1609,43 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+    elif (glm5n := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        (
+            _,
+            mamba_groups,
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            tail_names,
+            _tail_page,
+        ) = glm5n
+        if tail_names:
+            assert len(idx_names) == len(tail_names)
+        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        num_blocks = may_override_num_blocks(vllm_config, available_memory // per_block)
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=mla_page * num_blocks,
+                shared_by=[mla_name]
+                + [
+                    group.layer_names[i]
+                    for group in mamba_groups
+                    if i < len(group.layer_names)
+                ],
+            )
+            for i, mla_name in enumerate(mla_names)
+        ] + [
+            KVCacheTensor(
+                size=idx_page * num_blocks,
+                shared_by=([idx_name, tail_names[i]] if tail_names else [idx_name]),
+            )
+            for i, idx_name in enumerate(idx_names)
+        ]
+    elif csa_config := _get_kv_cache_config_csa_linear(
+        vllm_config, kv_cache_groups, available_memory
+    ):
+        num_blocks, kv_cache_tensors = csa_config
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
@@ -1545,6 +1822,303 @@ def group_and_unify_kv_cache_specs(
         swa_uniform_specs.append(uniform_spec)
 
     return [mla_uniform_spec, *swa_uniform_specs]
+
+
+class _CSALinearCacheTuple(NamedTuple):
+    """Three cache owners attached to one compressed-sparse layer."""
+
+    layer_index: int
+    main_kv: tuple[str, FullAttentionSpec]
+    compressed: tuple[str, MLAAttentionSpec]
+    compressor_state: tuple[str, CircularBufferSpec]
+
+
+@dataclass(frozen=True)
+class _CSALinearTensorLayout:
+    main_kv_names: list[str]
+    compressed_names: list[str]
+    compressor_state_names: list[str]
+    mamba_groups: list[KVCacheGroupSpec]
+    main_kv_page_size: int
+    compressed_page_size: int
+
+    @property
+    def bytes_per_block(self) -> int:
+        return len(self.main_kv_names) * (
+            self.main_kv_page_size + self.compressed_page_size
+        )
+
+
+class _CSALinearRoles(NamedTuple):
+    main_kv: dict[str, FullAttentionSpec]
+    compressed: dict[str, MLAAttentionSpec]
+    compressor_state: dict[str, CircularBufferSpec]
+    mamba: dict[str, MambaSpec]
+
+
+def _classify_csa_linear_specs(
+    kv_cache_spec: Mapping[str, KVCacheSpec],
+) -> _CSALinearRoles | None:
+    if not any(type(spec) is CircularBufferSpec for spec in kv_cache_spec.values()):
+        return None
+
+    roles = _CSALinearRoles(main_kv={}, compressed={}, compressor_state={}, mamba={})
+    unsupported: list[str] = []
+    for name, spec in kv_cache_spec.items():
+        if type(spec) is FullAttentionSpec:
+            roles.main_kv[name] = spec
+        elif type(spec) is MLAAttentionSpec and spec.compress_ratio > 1:
+            roles.compressed[name] = spec
+        elif type(spec) is CircularBufferSpec:
+            roles.compressor_state[name] = spec
+        elif type(spec) is MambaSpec:
+            roles.mamba[name] = spec
+        else:
+            unsupported.append(name)
+    if unsupported:
+        raise ValueError(f"CSA+linear unsupported cache owners: {unsupported}.")
+    if not roles.main_kv or not roles.compressed or not roles.mamba:
+        raise ValueError(
+            "CSA+linear requires main KV, compressed, compressor-state, and "
+            "Mamba cache owners."
+        )
+    return roles
+
+
+def _get_csa_linear_cache_tuples(
+    roles: _CSALinearRoles,
+) -> list[_CSALinearCacheTuple]:
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    def by_layer_index(
+        specs: Mapping[str, KVCacheSpec], role: str
+    ) -> dict[int, tuple[str, KVCacheSpec]]:
+        indexed: dict[int, tuple[str, KVCacheSpec]] = {}
+        for name, spec in specs.items():
+            try:
+                layer_index = extract_layer_index(name)
+            except (AssertionError, ValueError) as exc:
+                raise ValueError(
+                    f"CSA+linear {role} owner {name!r} does not identify "
+                    "exactly one transformer layer."
+                ) from exc
+            if layer_index in indexed:
+                other_name = indexed[layer_index][0]
+                raise ValueError(
+                    f"CSA+linear layer {layer_index} has duplicate {role} "
+                    f"owners: {other_name!r} and {name!r}."
+                )
+            indexed[layer_index] = (name, spec)
+        return indexed
+
+    main_kv = by_layer_index(roles.main_kv, "main-KV")
+    compressed = by_layer_index(roles.compressed, "compressed")
+    compressor_state = by_layer_index(roles.compressor_state, "compressor-state")
+    layer_indices = set(main_kv)
+    if set(compressed) != layer_indices or set(compressor_state) != layer_indices:
+        raise ValueError(
+            "CSA+linear main-KV, compressed, and compressor-state owners must "
+            "have matching transformer-layer indices."
+        )
+
+    return [
+        _CSALinearCacheTuple(
+            layer_index,
+            cast(tuple[str, FullAttentionSpec], main_kv[layer_index]),
+            cast(tuple[str, MLAAttentionSpec], compressed[layer_index]),
+            cast(tuple[str, CircularBufferSpec], compressor_state[layer_index]),
+        )
+        for layer_index in sorted(layer_indices)
+    ]
+
+
+def _get_csa_linear_mamba_group_count(
+    vllm_config: VllmConfig,
+    mamba_names: list[str],
+    main_kv_names: list[str],
+) -> int | None:
+    num_groups = cdiv(len(mamba_names), len(main_kv_names))
+    pp_size = vllm_config.parallel_config.pipeline_parallel_size
+    if pp_size == 1:
+        return num_groups
+
+    from vllm.distributed.utils import get_pp_indices
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    total_layers = vllm_config.model_config.get_total_num_hidden_layers()
+    mamba_indices = [extract_layer_index(name) for name in mamba_names]
+    main_kv_indices = [extract_layer_index(name) for name in main_kv_names]
+    for rank in range(pp_size):
+        start, end = get_pp_indices(total_layers, rank, pp_size)
+        num_mamba = sum(start <= index < end for index in mamba_indices)
+        num_main_kv = sum(start <= index < end for index in main_kv_indices)
+        if not num_mamba:
+            continue
+        if not num_main_kv:
+            return None
+        num_groups = max(num_groups, cdiv(num_mamba, num_main_kv))
+    return num_groups
+
+
+def _get_kv_cache_groups_csa_linear(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Build Qwen4Exp's main/compressed/ring/recurrent cache groups."""
+
+    roles = _classify_csa_linear_specs(kv_cache_spec)
+    if roles is None:
+        return None
+    tuples = _get_csa_linear_cache_tuples(roles)
+
+    expected_local_kv_heads = vllm_config.model_config.get_num_kv_heads(
+        vllm_config.parallel_config
+    )
+    if any(
+        cache.main_kv[1].num_kv_heads != expected_local_kv_heads for cache in tuples
+    ):
+        raise ValueError(
+            "CSA+linear main-KV specs do not match the TP-local KV-head geometry."
+        )
+
+    for cache in tuples:
+        _, main_kv = cache.main_kv
+        _, compressed = cache.compressed
+        _, compressor_state = cache.compressor_state
+        if not (
+            main_kv.block_size == compressed.block_size
+            and compressor_state.real_page_size_bytes <= compressed.page_size_bytes
+            and all(
+                spec.page_size_padded is None
+                for spec in (main_kv, compressed, compressor_state)
+            )
+        ):
+            raise ValueError(
+                f"CSA+linear layer {cache.layer_index} violates cache geometry."
+            )
+
+    shapes = {
+        (
+            cache.compressed[1].compress_ratio,
+            cache.main_kv[1].block_size,
+            cache.main_kv[1].page_size_bytes,
+            cache.compressed[1].page_size_bytes,
+        )
+        for cache in tuples
+    }
+    if len(shapes) != 1:
+        raise ValueError(
+            "CSA+linear layers must share one block size, compression ratio, "
+            "and main/compressed page geometry."
+        )
+    _, _, main_kv_page, compressed_page = next(iter(shapes))
+
+    padded_compressor_specs: dict[str, KVCacheSpec] = {
+        cache.compressor_state[0]: replace(
+            cache.compressor_state[1], page_size_padded=compressed_page
+        )
+        for cache in tuples
+    }
+    compressed_sparse_specs: dict[str, KVCacheSpec] = {
+        name: spec
+        for cache in tuples
+        for name, spec in (cache.main_kv, cache.compressed)
+    }
+    compressed_sparse_uniform = UniformTypeKVCacheSpecs.from_specs(
+        compressed_sparse_specs
+    )
+    compressor_uniform = UniformTypeKVCacheSpecs.from_specs(padded_compressor_specs)
+    if compressed_sparse_uniform is None or compressor_uniform is None:
+        raise ValueError("CSA+linear cache owners have incompatible lifetimes.")
+
+    groups = [
+        KVCacheGroupSpec(list(compressed_sparse_specs), compressed_sparse_uniform),
+        KVCacheGroupSpec(list(padded_compressor_specs), compressor_uniform),
+    ]
+    main_kv_names = [cache.main_kv[0] for cache in tuples]
+    for tp_replicated in (False, True):
+        names = [
+            name
+            for name, spec in roles.mamba.items()
+            if spec.tp_replicated is tp_replicated
+        ]
+        if not names:
+            continue
+        representative = roles.mamba[names[0]]
+        if any(roles.mamba[name] != representative for name in names[1:]):
+            policy = "replicated" if tp_replicated else "sharded"
+            raise ValueError(
+                f"CSA+linear {policy} Mamba owners must use one cache spec."
+            )
+        unpadded_page = replace(representative, page_size_padded=None).page_size_bytes
+        if unpadded_page > main_kv_page:
+            raise ValueError(
+                f"CSA+linear Mamba owner {names[0]!r} needs {unpadded_page} "
+                f"bytes, but a main-KV page has {main_kv_page} bytes."
+            )
+        num_groups = _get_csa_linear_mamba_group_count(
+            vllm_config, names, main_kv_names
+        )
+        if num_groups is None:
+            raise ValueError(
+                "CSA+linear pipeline stage has Mamba owners but no main-KV slots."
+            )
+        padded_spec = replace(representative, page_size_padded=main_kv_page)
+        grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
+        for index, name in enumerate(names):
+            grouped_names[index % num_groups].append(name)
+        groups.extend(
+            KVCacheGroupSpec(group_names, padded_spec) for group_names in grouped_names
+        )
+    return groups
+
+
+def _get_csa_linear_tensor_layout(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> _CSALinearTensorLayout | None:
+    compressed_sparse: Mapping[str, KVCacheSpec] | None = None
+    compressor_state: Mapping[str, KVCacheSpec] | None = None
+    mamba_groups: list[KVCacheGroupSpec] = []
+    for group in kv_cache_groups:
+        if not group.layer_names:
+            continue
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            mamba_groups.append(group)
+            continue
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            return None
+        member = next(iter(spec.kv_cache_specs.values()))
+        if type(member) is CircularBufferSpec:
+            compressor_state = spec.kv_cache_specs
+        elif type(member) is FullAttentionSpec:
+            compressed_sparse = spec.kv_cache_specs
+        else:
+            return None
+    if compressed_sparse is None or compressor_state is None:
+        return None
+
+    main_kv_names = [
+        name
+        for name, spec in compressed_sparse.items()
+        if type(spec) is FullAttentionSpec
+    ]
+    compressed_names = [
+        name
+        for name, spec in compressed_sparse.items()
+        if type(spec) is MLAAttentionSpec
+    ]
+    if not main_kv_names or not compressed_names:
+        return None
+
+    return _CSALinearTensorLayout(
+        main_kv_names=main_kv_names,
+        compressed_names=compressed_names,
+        compressor_state_names=list(compressor_state),
+        mamba_groups=mamba_groups,
+        main_kv_page_size=compressed_sparse[main_kv_names[0]].page_size_bytes,
+        compressed_page_size=compressed_sparse[compressed_names[0]].page_size_bytes,
+    )
 
 
 def _select_deepseek_v4_tuple_width(
@@ -1740,6 +2314,12 @@ def get_kv_cache_groups(
         )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
+    elif glm5_groups := _get_kv_cache_groups_glm5_next(vllm_config, kv_cache_spec):
+        # GLM-5.3-Flash case: one uniform MLA(+kpool indexer) attention group
+        # plus mamba groups whose layers share the MLA layers' slot tensors.
+        return glm5_groups
+    elif csa_groups := _get_kv_cache_groups_csa_linear(vllm_config, kv_cache_spec):
+        return csa_groups
 
     # Pull HiddenStateCacheSpec layers out before the general multi-group
     # path so they don't affect page-size unification or grouping.
@@ -1847,6 +2427,16 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    elif layout := _get_csa_linear_tensor_layout(kv_cache_groups):
+        blocks_needed = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_groups
+            if group.layer_names
+        )
+        return layout.bytes_per_block * blocks_needed
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
@@ -1872,6 +2462,36 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
+
+    elif (glm5n := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+        # GLM-5.3-Flash hybrid slot sharing: every block id — attention-, mamba-,
+        # or tail-owned — is charged the full per-block byte sum (mla + idx).
+        # The tail co-owns the indexer tensor (1 block/req via KpoolTailManager),
+        # so it adds to the shared block-id demand like mamba, not as a separate
+        # tensor.
+        (
+            attn_group,
+            mamba_groups,
+            mla_names,
+            idx_names,
+            mla_page,
+            idx_page,
+            tail_names,
+            _tail_page,
+        ) = glm5n
+        uniform_spec = attn_group.kv_cache_spec
+        assert isinstance(uniform_spec, UniformTypeKVCacheSpecs)
+        blocks_needed = uniform_spec.max_memory_usage_pages(vllm_config)
+        for group in mamba_groups:
+            spec = group.kv_cache_spec
+            blocks_needed += cdiv(
+                spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+            )
+        if tail_names:
+            # Tail: 1 block/req (KpoolTailSpec.max_admission_blocks_per_request
+            # == 1), drawn from the shared pool.
+            blocks_needed += 1
+        return blocks_needed * (len(mla_names) * mla_page + len(idx_names) * idx_page)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

@@ -8,10 +8,14 @@ Run `pytest tests/kernels/moe/test_fused_topk.py`.
 import pytest
 import torch
 
+import vllm._custom_ops as ops
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
-from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_topk
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    _sm70_qwen38_router_topk,
+    fused_topk,
+)
 from vllm.platforms import current_platform
 
 
@@ -42,6 +46,54 @@ def torch_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(70),
+    reason="Qwen3.8 router specialization requires SM70",
+)
+@pytest.mark.parametrize(
+    "case", ["random", "ties", "signed_zero", "nan", "inf", "negative_inf"]
+)
+def test_sm70_qwen38_router_topk(case: str):
+    torch.manual_seed(0)
+    gating_output = torch.randn(1, 512, dtype=torch.float16, device="cuda")
+    if case == "ties":
+        gating_output[:, :16] = 1.0
+    elif case == "signed_zero":
+        gating_output.zero_()
+        gating_output[:, 1::2] = -0.0
+    elif case == "nan":
+        gating_output[:, 0] = float("nan")
+    elif case == "inf":
+        gating_output[:, 0] = float("inf")
+    elif case == "negative_inf":
+        gating_output.fill_(-float("inf"))
+
+    expected_weights = torch.empty(1, 10, dtype=torch.float32, device="cuda")
+    expected_ids = torch.empty(1, 10, dtype=torch.int32, device="cuda")
+    expected_rows = torch.empty_like(expected_ids)
+    ops.topk_softmax(
+        expected_weights,
+        expected_ids,
+        expected_rows,
+        gating_output,
+        True,
+    )
+
+    actual_weights = torch.empty_like(expected_weights)
+    actual_ids = torch.empty_like(expected_ids)
+    actual_rows = torch.empty_like(expected_rows)
+    _sm70_qwen38_router_topk(
+        actual_weights,
+        actual_ids,
+        actual_rows,
+        gating_output,
+    )
+
+    torch.testing.assert_close(actual_ids, expected_ids, atol=0, rtol=0)
+    torch.testing.assert_close(actual_rows, expected_rows, atol=0, rtol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, atol=1e-7, rtol=1e-7)
 
 
 @pytest.mark.skipif(

@@ -6,9 +6,22 @@ import torch
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+
+
+def _use_sm70_fp16_mhc_fallback(residual: torch.Tensor, *, prefill_only: bool) -> bool:
+    del prefill_only
+    if residual.dtype != torch.float16 or not current_platform.is_cuda():
+        return False
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.to_int() != 70:
+        return False
+    # GLM-5.3's exact mHC4/H4096 contract has dedicated SM70 kernels for
+    # standalone pre/post, small-M fused decode, and large-M fused prefill.
+    return residual.shape[-2:] != (4, 4096)
 
 
 # --8<-- [start:mhc_pre]
@@ -41,6 +54,21 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _use_sm70_fp16_mhc_fallback(residual, prefill_only=False):
+            return mhc_kernels.mhc_pre_torch(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -170,6 +198,8 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if _use_sm70_fp16_mhc_fallback(residual, prefill_only=False):
+            return mhc_kernels.mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -335,6 +365,25 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _use_sm70_fp16_mhc_fallback(residual, prefill_only=True):
+            return mhc_kernels.mhc_fused_post_pre_torch(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,
@@ -396,3 +445,13 @@ class MHCFusedPostPreOp(CustomOp):
         raise NotImplementedError(
             "Native implementation of mhc_fused_post_pre is not available"
         )
+
+
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Expand ``[tokens, hidden]`` into residual streams."""
+    return x.unsqueeze(1).expand(-1, n, -1).contiguous()
+
+
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    """Contract residual streams by averaging them."""
+    return x.mean(dim=1)

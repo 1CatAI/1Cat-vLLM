@@ -70,18 +70,19 @@ def test_sm70_gdn_qpn8_ba_split_accepts_complete_contract(monkeypatch) -> None:
     assert gdn._sm70_gdn_qpn8_ba_split_enabled()
 
 
-def test_sm70_gdn_qpn8_ba_weight_contract_is_layout_based() -> None:
+@pytest.mark.parametrize("input_width", [2560, 5120])
+def test_sm70_gdn_qpn8_ba_weight_contract_is_layout_based(input_width) -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
     qkvz = SimpleNamespace(
         sm70_fp8_qpn8=True,
         sm70_fp8_prefill_exact_dense_workspace_ptr=42,
-        weight=torch.empty((5120, 4096), dtype=torch.uint8, device="meta"),
+        weight=torch.empty((input_width, 4096), dtype=torch.uint8, device="meta"),
         weight_scale_inv=torch.empty((1, 4096), dtype=torch.float16, device="meta"),
         bias=None,
     )
     ba = SimpleNamespace(
-        weight=torch.empty((24, 5120), dtype=torch.float16, device="meta"),
+        weight=torch.empty((24, input_width), dtype=torch.float16, device="meta"),
         bias=None,
     )
     layer = SimpleNamespace(
@@ -95,7 +96,7 @@ def test_sm70_gdn_qpn8_ba_weight_contract_is_layout_based() -> None:
     qkvz.bias = object()
     assert not gdn._sm70_gdn_qpn8_ba_weight_contract(layer)
     qkvz.bias = None
-    qkvz.weight = torch.empty((4096, 5120), dtype=torch.uint8, device="meta")
+    qkvz.weight = torch.empty((4096, input_width), dtype=torch.uint8, device="meta")
     assert not gdn._sm70_gdn_qpn8_ba_weight_contract(layer)
 
 

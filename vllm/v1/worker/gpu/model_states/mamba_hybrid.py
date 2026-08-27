@@ -31,6 +31,9 @@ from vllm.v1.attention.backends.gdn_attn import (
     prepare_dflash2_gdn_group_metadata,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -49,7 +52,11 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
-from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+from vllm.v1.worker.mamba_utils import (
+    MambaSpecDecodeGPUContext,
+    get_mamba_groups,
+    get_mamba_types,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -90,7 +97,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             }
         if not isinstance(
             attn_metadata_builder,
-            (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
+            (
+                Mamba2AttentionMetadataBuilder,
+                GDNAttentionMetadataBuilder,
+                PleShortConvAttentionMetadataBuilder,
+            ),
         ):
             return {}
         kwargs = {
@@ -187,16 +198,7 @@ class MambaHybridModelState(DefaultModelState):
         self, kv_cache_config: KVCacheConfig
     ) -> tuple[list[int], MambaSpec]:
         if self._mamba_spec is None:
-            group_ids: list[int] = []
-            specs: list[MambaSpec] = []
-            for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, MambaSpec):
-                    group_ids.append(group_id)
-                    specs.append(group.kv_cache_spec)
-            assert specs, "no mamba layers in the model"
-            assert all(specs[0] == spec for spec in specs)
-            self._mamba_group_ids = group_ids
-            self._mamba_spec = specs[0]
+            self._mamba_group_ids, self._mamba_spec = get_mamba_groups(kv_cache_config)
         return self._mamba_group_ids, self._mamba_spec
 
     def _ensure_align_ctx(
@@ -205,12 +207,18 @@ class MambaHybridModelState(DefaultModelState):
         mamba_group_ids: list[int],
         block_tables: tuple[torch.Tensor, ...],
     ) -> MambaSpecDecodeGPUContext:
+        copy_funcs = None
         if self._mamba_ctx is None:
-            copy_funcs = self.model.get_mamba_state_copy_func()
+            copy_funcs = self.model.get_mamba_state_copy_funcs(
+                get_mamba_types(kv_cache_config)
+            )
             # This V100 closure intentionally retains the tree's default SD
             # layout. The official DS-row extension is unrelated to Qwen3.8's
             # configured path and would expand the DDTree-sensitive closure.
-            if get_conv_copy_spec in copy_funcs and is_conv_state_dim_first():
+            if (
+                any(get_conv_copy_spec in funcs for funcs in copy_funcs.values())
+                and is_conv_state_dim_first()
+            ):
                 raise ValueError(
                     "MRV2 align prefix caching with speculative decoding requires "
                     "the default SD Mamba conv-state layout on this V100 path."
@@ -218,7 +226,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx = MambaSpecDecodeGPUContext.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=kv_cache_config,
-                num_state_types=len(copy_funcs),
+                mamba_state_copy_funcs=copy_funcs,
                 device=self.device,
                 make_buffer=lambda n, dtype: CpuGpuBuffer(
                     n,
@@ -229,11 +237,15 @@ class MambaHybridModelState(DefaultModelState):
             )
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
+            if copy_funcs is None:
+                copy_funcs = self.model.get_mamba_state_copy_funcs(
+                    get_mamba_types(kv_cache_config)
+                )
             forward_context = self.vllm_config.compilation_config.static_forward_context
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
-                self.model.get_mamba_state_copy_func(),
+                copy_funcs,
                 [block_tables[group_id] for group_id in mamba_group_ids],
             )
         return ctx

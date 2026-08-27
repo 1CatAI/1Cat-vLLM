@@ -28,6 +28,10 @@ _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES: set[str] = {
     "qwen3_5_moe_text",
 }
 
+# Cache-entry page sizes accepted by the paged MQA-logits kernels. Compressed
+# indexer storage blocks are virtually split into one of these sizes.
+PAGED_MQA_PAGE_SIZES = (32, 64)
+
 
 def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     """Check if DeepGemm should be auto-disabled for this model on Blackwell.

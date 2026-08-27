@@ -597,7 +597,422 @@ void launch_fp8_qpn8_gated_pair_sm70(const uint8_t* codes,
           codes, group_scales, input, output, hidden, k, m, channel_scales);
 }
 
+template <int SplitK, int NAcc>
+__global__ void fp8_qpn8_split_cta_m1_stage1_sm70_kernel(
+    const uint8_t* __restrict__ codes, const half* __restrict__ channel_scales,
+    const half* __restrict__ input, float* __restrict__ partials, int n,
+    int k) {
+  const int lane = threadIdx.x;
+  const int tile = blockIdx.x;
+  const int split = blockIdx.y;
+  const int quadpair = (lane >> 2) & 3;
+  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int groups_k16 = k >> 4;
+  const int groups_per_split = groups_k16 / SplitK;
+  const int group_begin = split * groups_per_split;
+  const uint4* code_ptr = reinterpret_cast<const uint4*>(codes) +
+                          static_cast<size_t>(tile) * groups_k16 * 32 + lane;
+  const half scale =
+      __ldg(channel_scales + tile * 32 + qpn8_col_from_lane(lane));
+  const half2 scale2 = __halves2half2(scale, scale);
+
+  float accum[NAcc][8];
+#pragma unroll
+  for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      accum[chain][index] = 0.0f;
+    }
+  }
+
+#pragma unroll 4
+  for (int group = group_begin; group < group_begin + groups_per_split;
+       ++group) {
+    const uint4 packed = __ldcs(code_ptr + static_cast<size_t>(group) * 32);
+    half2 weights[8];
+    fp8x8_to_half2x4_fast(make_uint2(packed.x, packed.y), weights);
+    fp8x8_to_half2x4_fast(make_uint2(packed.z, packed.w), weights + 4);
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      weights[index] = __hmul2(weights[index], scale2);
+    }
+
+    uint4 input01 = make_uint4(0, 0, 0, 0);
+    uint4 input23 = make_uint4(0, 0, 0, 0);
+    if (row == 0) {
+      input01 = *reinterpret_cast<const uint4*>(input + group * 16);
+      input23 = *reinterpret_cast<const uint4*>(input + group * 16 + 8);
+    }
+    const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+    const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+    const unsigned* b = reinterpret_cast<const unsigned*>(weights);
+    VLLM_SM70_MMA_8N8K4(accum[0], a0[0], a0[1], b[0], b[1]);
+    VLLM_SM70_MMA_8N8K4(accum[1 % NAcc], a0[2], a0[3], b[2], b[3]);
+    VLLM_SM70_MMA_8N8K4(accum[2 % NAcc], a1[0], a1[1], b[4], b[5]);
+    VLLM_SM70_MMA_8N8K4(accum[3 % NAcc], a1[2], a1[3], b[6], b[7]);
+  }
+
+#pragma unroll
+  for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      accum[0][index] += accum[chain][index];
+    }
+  }
+
+  if ((lane & 17) == 0) {
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+      for (int offset = 0; offset < 2; ++offset) {
+        const int index = pair * 4 + offset;
+        const int output_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+        const int column = tile * 32 + quadpair * 8 + output_col;
+        partials[static_cast<size_t>(split) * n + column] = accum[0][index];
+      }
+    }
+  }
+}
+
+template <int SplitK>
+__global__ void fp8_qpn8_split_cta_m1_reduce_sm70_kernel(
+    half* __restrict__ output, const float* __restrict__ partials, int n) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  if (column >= n) {
+    return;
+  }
+  float value = 0.0f;
+#pragma unroll
+  for (int split = 0; split < SplitK; ++split) {
+    value += partials[static_cast<size_t>(split) * n + column];
+  }
+  output[column] = __float2half(value);
+}
+
+template <int SplitK>
+__global__ void fp8_qpn8_hc_down_silu_reduce_sm70_kernel(
+    half* __restrict__ lora, half* __restrict__ injection,
+    const float* __restrict__ partials, int n) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  if (column >= 324) {
+    return;
+  }
+  float value = 0.0f;
+#pragma unroll
+  for (int split = 0; split < SplitK; ++split) {
+    value += partials[static_cast<size_t>(split) * n + column];
+  }
+  const half rounded = __float2half(value);
+  if (column < 320) {
+    const float scaled = __half2float(rounded) * 0.25f;
+    lora[column] = __float2half(scaled / (1.0f + __expf(-scaled)));
+  } else {
+    injection[column - 320] = rounded;
+  }
+}
+
+template <int SplitK, int NAcc>
+__global__ void fp8_qpn8_hc_up_gate_mix_sm70_kernel(
+    const uint8_t* __restrict__ codes, const half* __restrict__ channel_scales,
+    const half* __restrict__ lora, const half* __restrict__ xn,
+    half* __restrict__ output) {
+  constexpr int kHC = 4;
+  constexpr int kHidden = 2560;
+  constexpr int kK = 320;
+  constexpr int kGroupsK16 = kK / 16;
+  constexpr int kGroupsPerSplit = kGroupsK16 / SplitK;
+  constexpr int kHiddenTiles = kHidden / 32;
+  __shared__ float partials[kHC][SplitK][32];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int stream = warp / SplitK;
+  const int split = warp - stream * SplitK;
+  const int tile = blockIdx.x + stream * kHiddenTiles;
+  const int quadpair = (lane >> 2) & 3;
+  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int group_begin = split * kGroupsPerSplit;
+  const uint4* code_ptr = reinterpret_cast<const uint4*>(codes) +
+                          static_cast<size_t>(tile) * kGroupsK16 * 32 + lane;
+  const half scale =
+      __ldg(channel_scales + tile * 32 + qpn8_col_from_lane(lane));
+  const half2 scale2 = __halves2half2(scale, scale);
+
+  float accum[NAcc][8];
+#pragma unroll
+  for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      accum[chain][index] = 0.0f;
+    }
+  }
+
+#pragma unroll
+  for (int group = group_begin; group < group_begin + kGroupsPerSplit;
+       ++group) {
+    const uint4 packed = __ldcs(code_ptr + static_cast<size_t>(group) * 32);
+    half2 weights[8];
+    fp8x8_to_half2x4_fast(make_uint2(packed.x, packed.y), weights);
+    fp8x8_to_half2x4_fast(make_uint2(packed.z, packed.w), weights + 4);
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      weights[index] = __hmul2(weights[index], scale2);
+    }
+
+    uint4 input01 = make_uint4(0, 0, 0, 0);
+    uint4 input23 = make_uint4(0, 0, 0, 0);
+    if (row == 0) {
+      input01 = *reinterpret_cast<const uint4*>(lora + group * 16);
+      input23 = *reinterpret_cast<const uint4*>(lora + group * 16 + 8);
+    }
+    const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+    const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+    const unsigned* b = reinterpret_cast<const unsigned*>(weights);
+    VLLM_SM70_MMA_8N8K4(accum[0], a0[0], a0[1], b[0], b[1]);
+    VLLM_SM70_MMA_8N8K4(accum[1 % NAcc], a0[2], a0[3], b[2], b[3]);
+    VLLM_SM70_MMA_8N8K4(accum[2 % NAcc], a1[0], a1[1], b[4], b[5]);
+    VLLM_SM70_MMA_8N8K4(accum[3 % NAcc], a1[2], a1[3], b[6], b[7]);
+  }
+
+#pragma unroll
+  for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      accum[0][index] += accum[chain][index];
+    }
+  }
+  if ((lane & 17) == 0) {
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+      for (int offset = 0; offset < 2; ++offset) {
+        const int index = pair * 4 + offset;
+        const int output_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+        partials[stream][split][quadpair * 8 + output_col] = accum[0][index];
+      }
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < 32) {
+    const int inner = blockIdx.x * 32 + threadIdx.x;
+    float mixed = 0.0f;
+#pragma unroll
+    for (int hc_stream = 0; hc_stream < kHC; ++hc_stream) {
+      float gate = 0.0f;
+#pragma unroll
+      for (int k_split = 0; k_split < SplitK; ++k_split) {
+        gate += partials[hc_stream][k_split][threadIdx.x];
+      }
+      gate = __half2float(__float2half(gate));
+      const float normalized = __half2float(xn[hc_stream * kHidden + inner]);
+      mixed += normalized / (1.0f + __expf(-gate));
+    }
+    output[inner] = __float2half(mixed * 0.25f);
+  }
+}
+
+__global__ void fp8_qpn8_hc_down_transform_sm70_kernel(
+    const half* __restrict__ down, half* __restrict__ lora,
+    half* __restrict__ injection, int m, int down_stride) {
+  constexpr int kLora = 320;
+  constexpr int kInjection = 4;
+  constexpr int kLogicalN = kLora + kInjection;
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= m * kLogicalN) {
+    return;
+  }
+  const int row = index / kLogicalN;
+  const int column = index - row * kLogicalN;
+  const half value = down[static_cast<size_t>(row) * down_stride + column];
+  if (column < kLora) {
+    const float scaled = __half2float(value) * 0.25f;
+    lora[static_cast<size_t>(row) * kLora + column] =
+        __float2half(scaled / (1.0f + __expf(-scaled)));
+  } else {
+    injection[static_cast<size_t>(row) * kInjection + column - kLora] = value;
+  }
+}
+
+__global__ void fp8_qpn8_hc_gate_mix_sm70_kernel(const half* __restrict__ xn,
+                                                 const half* __restrict__ gate,
+                                                 half* __restrict__ output,
+                                                 int m) {
+  constexpr int kHC = 4;
+  constexpr int kHidden = 2560;
+  constexpr int kN = kHC * kHidden;
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= m * kHidden) {
+    return;
+  }
+  const int row = index / kHidden;
+  const int inner = index - row * kHidden;
+  float mixed = 0.0f;
+#pragma unroll
+  for (int stream = 0; stream < kHC; ++stream) {
+    const size_t offset =
+        static_cast<size_t>(row) * kN + stream * kHidden + inner;
+    const float gate_value = __half2float(gate[offset]);
+    const float normalized = __half2float(xn[offset]);
+    mixed += normalized / (1.0f + __expf(-gate_value));
+  }
+  output[index] = __float2half(mixed * 0.25f);
+}
+
 }  // namespace
+
+void fp8_qpn8_split_cta_m1_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor codes,
+                                    torch::Tensor channel_scales,
+                                    torch::Tensor partials, int64_t split_k,
+                                    int64_t accumulator_chains) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && codes.is_cuda() &&
+                  channel_scales.is_cuda() && partials.is_cuda(),
+              "fp8_qpn8_split_cta_m1_sm70_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  codes.scalar_type() == torch::kUInt8 &&
+                  channel_scales.scalar_type() == torch::kFloat16 &&
+                  partials.scalar_type() == torch::kFloat32,
+              "fp8_qpn8_split_cta_m1_sm70_out: dtype mismatch");
+  TORCH_CHECK(out.is_contiguous() && input.is_contiguous() &&
+                  codes.is_contiguous() && channel_scales.is_contiguous() &&
+                  partials.is_contiguous(),
+              "fp8_qpn8_split_cta_m1_sm70_out: tensors must be contiguous");
+  const int64_t n = out.size(1);
+  const int64_t k = input.size(1);
+  TORCH_CHECK(out.dim() == 2 && input.dim() == 2 && out.size(0) == 1 &&
+                  input.size(0) == 1 && n > 0 && n % 32 == 0 && k > 0 &&
+                  k % 16 == 0,
+              "fp8_qpn8_split_cta_m1_sm70_out: shape mismatch");
+  TORCH_CHECK(codes.numel() == n * k && channel_scales.numel() == n &&
+                  partials.numel() >= split_k * n,
+              "fp8_qpn8_split_cta_m1_sm70_out: workspace mismatch");
+  TORCH_CHECK(split_k == 8 || split_k == 16 || split_k == 32,
+              "fp8_qpn8_split_cta_m1_sm70_out: unsupported split_k");
+  TORCH_CHECK((k / 16) % split_k == 0,
+              "fp8_qpn8_split_cta_m1_sm70_out: invalid split_k");
+  TORCH_CHECK(accumulator_chains == 1 || accumulator_chains == 2,
+              "fp8_qpn8_split_cta_m1_sm70_out: invalid accumulator chains");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(static_cast<unsigned>(n / 32),
+                  static_cast<unsigned>(split_k));
+  auto launch = [&](auto split, auto chains) {
+    constexpr int kSplit = decltype(split)::value;
+    constexpr int kChains = decltype(chains)::value;
+    fp8_qpn8_split_cta_m1_stage1_sm70_kernel<kSplit, kChains>
+        <<<grid, 32, 0, stream>>>(
+            codes.data_ptr<uint8_t>(),
+            reinterpret_cast<const half*>(channel_scales.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+            partials.data_ptr<float>(), static_cast<int>(n),
+            static_cast<int>(k));
+    constexpr int kThreads = 256;
+    fp8_qpn8_split_cta_m1_reduce_sm70_kernel<kSplit>
+        <<<(n + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+            partials.data_ptr<float>(), static_cast<int>(n));
+  };
+
+  if (split_k == 8 && accumulator_chains == 1) {
+    launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+  } else if (split_k == 8) {
+    launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 2>{});
+  } else if (split_k == 16 && accumulator_chains == 1) {
+    launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 1>{});
+  } else if (split_k == 16) {
+    launch(std::integral_constant<int, 16>{}, std::integral_constant<int, 2>{});
+  } else if (accumulator_chains == 1) {
+    launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 1>{});
+  } else {
+    launch(std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{});
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fp8_qpn8_hc_down_silu_sm70_out(torch::Tensor lora, torch::Tensor injection,
+                                    torch::Tensor input, torch::Tensor codes,
+                                    torch::Tensor channel_scales,
+                                    torch::Tensor partials) {
+  TORCH_CHECK(lora.is_cuda() && injection.is_cuda() && input.is_cuda() &&
+                  codes.is_cuda() && channel_scales.is_cuda() &&
+                  partials.is_cuda(),
+              "fp8_qpn8_hc_down_silu_sm70_out: tensors must be CUDA");
+  TORCH_CHECK(lora.scalar_type() == torch::kFloat16 &&
+                  injection.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  codes.scalar_type() == torch::kUInt8 &&
+                  channel_scales.scalar_type() == torch::kFloat16 &&
+                  partials.scalar_type() == torch::kFloat32,
+              "fp8_qpn8_hc_down_silu_sm70_out: dtype mismatch");
+  TORCH_CHECK(lora.is_contiguous() && injection.is_contiguous() &&
+                  input.is_contiguous() && codes.is_contiguous() &&
+                  channel_scales.is_contiguous() && partials.is_contiguous(),
+              "fp8_qpn8_hc_down_silu_sm70_out: tensors must be contiguous");
+  constexpr int64_t kN = 352;
+  constexpr int64_t kK = 10240;
+  constexpr int64_t kSplitK = 32;
+  TORCH_CHECK(lora.numel() == 320 && injection.numel() == 4 &&
+                  input.dim() == 2 && input.size(0) == 1 &&
+                  input.size(1) == kK && codes.numel() >= kN * kK &&
+                  channel_scales.numel() >= kN &&
+                  partials.numel() >= kSplitK * kN,
+              "fp8_qpn8_hc_down_silu_sm70_out: shape mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fp8_qpn8_split_cta_m1_stage1_sm70_kernel<32, 1>
+      <<<dim3(kN / 32, kSplitK), 32, 0, stream>>>(
+          codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const half*>(channel_scales.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+          partials.data_ptr<float>(), kN, kK);
+  constexpr int kThreads = 256;
+  fp8_qpn8_hc_down_silu_reduce_sm70_kernel<32><<<2, kThreads, 0, stream>>>(
+      reinterpret_cast<half*>(lora.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(injection.data_ptr<at::Half>()),
+      partials.data_ptr<float>(), kN);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void fp8_qpn8_hc_up_gate_mix_sm70_out(torch::Tensor out, torch::Tensor lora,
+                                      torch::Tensor xn, torch::Tensor codes,
+                                      torch::Tensor channel_scales) {
+  TORCH_CHECK(out.is_cuda() && lora.is_cuda() && xn.is_cuda() &&
+                  codes.is_cuda() && channel_scales.is_cuda(),
+              "fp8_qpn8_hc_up_gate_mix_sm70_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  lora.scalar_type() == torch::kFloat16 &&
+                  xn.scalar_type() == torch::kFloat16 &&
+                  codes.scalar_type() == torch::kUInt8 &&
+                  channel_scales.scalar_type() == torch::kFloat16,
+              "fp8_qpn8_hc_up_gate_mix_sm70_out: dtype mismatch");
+  TORCH_CHECK(out.is_contiguous() && lora.is_contiguous() &&
+                  xn.is_contiguous() && codes.is_contiguous() &&
+                  channel_scales.is_contiguous(),
+              "fp8_qpn8_hc_up_gate_mix_sm70_out: tensors must be contiguous");
+  constexpr int64_t kHC = 4;
+  constexpr int64_t kHidden = 2560;
+  constexpr int64_t kK = 320;
+  constexpr int64_t kN = kHC * kHidden;
+  TORCH_CHECK(out.numel() == kHidden && lora.numel() == kK &&
+                  xn.numel() == kN && codes.numel() == kN * kK &&
+                  channel_scales.numel() == kN,
+              "fp8_qpn8_hc_up_gate_mix_sm70_out: shape mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(lora));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fp8_qpn8_hc_up_gate_mix_sm70_kernel<4, 2>
+      <<<kHidden / 32, kHC * 4 * 32, 0, stream>>>(
+          codes.data_ptr<uint8_t>(),
+          reinterpret_cast<const half*>(channel_scales.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(lora.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(xn.data_ptr<at::Half>()),
+          reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales) {
@@ -616,12 +1031,13 @@ std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
 
   const int64_t n = qweight.size(0);
   const int64_t k = qweight.size(1);
-  TORCH_CHECK(n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0,
-              "fp8_qpn8_prepare_sm70: N and K must be positive multiples of "
-              "128");
   const bool channel_scales = scales.size(0) == n && scales.size(1) == 1;
   const bool block_scales =
       scales.size(0) == n / 128 && scales.size(1) == k / 128;
+  TORCH_CHECK(channel_scales ? (n > 0 && n % 32 == 0 && k > 0 && k % 16 == 0)
+                             : (n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0),
+              "fp8_qpn8_prepare_sm70: channel scales require N%32=K%16=0; "
+              "block scales require N%128=K%128=0");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_prepare_sm70: expected channel scales [N, 1] or "
               "block scales [N/128, K/128]");
@@ -682,14 +1098,16 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
 
   const int64_t k = out.size(0);
   const int64_t n = out.size(1);
-  TORCH_CHECK(k > 0 && k % 128 == 0 && n > 0 && n % 128 == 0,
-              "fp8_qpn8_dequantize_sm70_out: K and N alignment mismatch");
-  TORCH_CHECK(codes.numel() == k * n,
-              "fp8_qpn8_dequantize_sm70_out: packed code size mismatch");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
   const bool block_scales =
       group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
+  TORCH_CHECK(channel_scales ? (n > 0 && n % 32 == 0 && k > 0 && k % 16 == 0)
+                             : (n > 0 && n % 128 == 0 && k > 0 && k % 128 == 0),
+              "fp8_qpn8_dequantize_sm70_out: channel scales require "
+              "N%32=K%16=0; block scales require N%128=K%128=0");
+  TORCH_CHECK(codes.numel() == k * n,
+              "fp8_qpn8_dequantize_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_dequantize_sm70_out: scale shape mismatch");
 
@@ -776,14 +1194,15 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(out.size(0) == m, "fp8_qpn8_gemm_sm70_out: output M mismatch");
   TORCH_CHECK(n > 0 && n % 32 == 0,
               "fp8_qpn8_gemm_sm70_out: N must be a positive multiple of 32");
-  TORCH_CHECK(k > 0 && k % 128 == 0,
-              "fp8_qpn8_gemm_sm70_out: K must be a positive multiple of 128");
-  TORCH_CHECK(codes.numel() == n * k,
-              "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
   const bool block_scales =
       group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
+  TORCH_CHECK(channel_scales ? (k > 0 && k % 16 == 0) : (k > 0 && k % 128 == 0),
+              "fp8_qpn8_gemm_sm70_out: channel scales require K%16=0; "
+              "block scales require K%128=0");
+  TORCH_CHECK(codes.numel() == n * k,
+              "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
@@ -926,18 +1345,19 @@ void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
                   qkv_out.get_device() == ba_weight.get_device(),
               "fp8_qpn8_gemm_ba_split_sm70_out: tensors must share one device");
 
-  constexpr int64_t k = 5120;
+  const int64_t k = input.size(1);
   constexpr int64_t n = 4096;
   constexpr int64_t qkv_n = 2560;
   constexpr int64_t z_n = n - qkv_n;
   constexpr int64_t ba_n = 24;
-  TORCH_CHECK(input.dim() == 2 && input.size(0) == 1 && input.size(1) == k,
-              "fp8_qpn8_gemm_ba_split_sm70_out: expected input [1, 5120]");
+  TORCH_CHECK(
+      input.dim() == 2 && input.size(0) == 1 && (k == 2560 || k == 5120),
+      "fp8_qpn8_gemm_ba_split_sm70_out: expected K=2560 or 5120");
   TORCH_CHECK(qkv_out.numel() == qkv_n && z_out.numel() == z_n &&
                   b_out.numel() == ba_n / 2 && a_out.numel() == ba_n / 2,
               "fp8_qpn8_gemm_ba_split_sm70_out: output shape mismatch");
   TORCH_CHECK(codes.dim() == 2 && codes.size(0) == k && codes.size(1) == n,
-              "fp8_qpn8_gemm_ba_split_sm70_out: expected codes [5120, 4096]");
+              "fp8_qpn8_gemm_ba_split_sm70_out: code shape mismatch");
   TORCH_CHECK(group_scales.dim() == 2 && group_scales.size(0) == 1 &&
                   group_scales.size(1) == n,
               "fp8_qpn8_gemm_ba_split_sm70_out: expected channel scales");
@@ -972,13 +1392,13 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
     torch::Tensor a_out, torch::Tensor qkvz_staging, torch::Tensor ba_staging,
     int64_t dense_weight_ptr, torch::Tensor input, torch::Tensor codes,
     torch::Tensor group_scales, torch::Tensor ba_weight) {
-  constexpr int64_t k = 5120;
+  const int64_t k = input.size(1);
   constexpr int64_t n = 4096;
   constexpr int64_t qkv_n = 2560;
   constexpr int64_t z_n = n - qkv_n;
   constexpr int64_t ba_n = 24;
   const int64_t m = input.size(0);
-  TORCH_CHECK(input.dim() == 2 && input.size(1) == k && m >= 1,
+  TORCH_CHECK(input.dim() == 2 && (k == 2560 || k == 5120) && m >= 1,
               "fp8_qpn8_dispatch_ba_split_sm70_out: bad input shape");
   TORCH_CHECK(qkv_out.is_cuda() && z_out.is_cuda() && b_out.is_cuda() &&
                   a_out.is_cuda() && qkvz_staging.is_cuda() &&
@@ -1035,7 +1455,7 @@ void fp8_qpn8_dispatch_ba_split_sm70_out(
     static std::once_flag route_log_once;
     std::call_once(route_log_once, []() {
       std::fprintf(stderr,
-                   "SM70 GDN QPN8 K5120/N4096 + FP16 b/a N24 split C++ route "
+                   "SM70 GDN QPN8 N4096 + FP16 b/a N24 split C++ route "
                    "enabled.\n");
       std::fflush(stderr);
     });
@@ -1091,14 +1511,17 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t n = hidden * 2;
   TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m,
               "fp8_qpn8_gated_pair_sm70_out: M must be in [1, 8]");
-  TORCH_CHECK(hidden > 0 && hidden % 32 == 0 && k > 0 && k % 128 == 0,
-              "fp8_qpn8_gated_pair_sm70_out: shape alignment mismatch");
-  TORCH_CHECK(codes.numel() == n * k,
-              "fp8_qpn8_gated_pair_sm70_out: packed code size mismatch");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
   const bool block_scales =
       group_scales.size(0) == k / 128 && group_scales.size(1) == n / 32;
+  TORCH_CHECK(
+      hidden > 0 && hidden % 32 == 0 &&
+          (channel_scales ? (k > 0 && k % 16 == 0) : (k > 0 && k % 128 == 0)),
+      "fp8_qpn8_gated_pair_sm70_out: channel scales require K%16=0; "
+      "block scales require K%128=0");
+  TORCH_CHECK(codes.numel() == n * k,
+              "fp8_qpn8_gated_pair_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gated_pair_sm70_out: scale shape mismatch");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 16,
@@ -1203,11 +1626,89 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                             gated_silu);
 }
 
+void fp8_qpn8_hc_dispatch_sm70_out(
+    torch::Tensor block_out, torch::Tensor injection_out,
+    torch::Tensor down_staging, torch::Tensor lora_staging,
+    torch::Tensor gate_staging, torch::Tensor partials,
+    int64_t dense_weight_ptr, torch::Tensor xn, torch::Tensor down_codes,
+    torch::Tensor down_scales, torch::Tensor up_codes,
+    torch::Tensor up_scales) {
+  constexpr int64_t kHC = 4;
+  constexpr int64_t kHidden = 2560;
+  constexpr int64_t kHyperHidden = kHC * kHidden;
+  constexpr int64_t kLora = 320;
+  constexpr int64_t kDownComputeN = 352;
+  constexpr int64_t kDownSplit = 32;
+  const int64_t m = xn.size(0);
+  const int64_t kDownN = down_codes.size(1);
+  TORCH_CHECK(m >= 1 && xn.dim() == 2 && xn.size(1) == kHyperHidden,
+              "fp8_qpn8_hc_dispatch_sm70_out: expected xn [M, 10240]");
+  TORCH_CHECK(block_out.dim() == 2 && block_out.size(0) == m &&
+                  block_out.size(1) == kHidden && injection_out.dim() == 2 &&
+                  injection_out.size(0) == m && injection_out.size(1) == kHC &&
+                  down_staging.dim() == 2 && down_staging.size(0) == m &&
+                  down_staging.size(1) == kDownN && lora_staging.dim() == 2 &&
+                  lora_staging.size(0) == m && lora_staging.size(1) == kLora &&
+                  gate_staging.dim() == 2 && gate_staging.size(0) == m &&
+                  gate_staging.size(1) == kHyperHidden,
+              "fp8_qpn8_hc_dispatch_sm70_out: staging shape mismatch");
+  TORCH_CHECK(down_codes.numel() == kHyperHidden * kDownN &&
+                  down_scales.numel() == kDownN &&
+                  up_codes.numel() == kLora * kHyperHidden &&
+                  up_scales.numel() == kHyperHidden &&
+                  partials.scalar_type() == torch::kFloat32 &&
+                  kDownN >= kDownComputeN && kDownN % 32 == 0 &&
+                  partials.numel() >= kDownSplit * kDownComputeN,
+              "fp8_qpn8_hc_dispatch_sm70_out: weight/workspace mismatch");
+  TORCH_CHECK(block_out.scalar_type() == torch::kFloat16 &&
+                  injection_out.scalar_type() == torch::kFloat16 &&
+                  down_staging.scalar_type() == torch::kFloat16 &&
+                  lora_staging.scalar_type() == torch::kFloat16 &&
+                  gate_staging.scalar_type() == torch::kFloat16 &&
+                  xn.scalar_type() == torch::kFloat16,
+              "fp8_qpn8_hc_dispatch_sm70_out: activation dtype mismatch");
+
+  if (m == 1) {
+    fp8_qpn8_hc_down_silu_sm70_out(lora_staging, injection_out, xn, down_codes,
+                                   down_scales, partials);
+    fp8_qpn8_hc_up_gate_mix_sm70_out(block_out, lora_staging, xn, up_codes,
+                                     up_scales);
+    return;
+  }
+
+  fp8_qpn8_dispatch_sm70_out(down_staging, dense_weight_ptr, xn, down_codes,
+                             down_scales, 32, 1, false, false);
+  constexpr int kThreads = 256;
+  const int down_elements = static_cast<int>(m * (kLora + kHC));
+  fp8_qpn8_hc_down_transform_sm70_kernel<<<
+      (down_elements + kThreads - 1) / kThreads, kThreads, 0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half*>(down_staging.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(lora_staging.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(injection_out.data_ptr<at::Half>()),
+      static_cast<int>(m), static_cast<int>(kDownN));
+  fp8_qpn8_dispatch_sm70_out(gate_staging, dense_weight_ptr, lora_staging,
+                             up_codes, up_scales, 4, 2, false, false);
+  const int block_elements = static_cast<int>(m * kHidden);
+  fp8_qpn8_hc_gate_mix_sm70_kernel<<<(block_elements + kThreads - 1) / kThreads,
+                                     kThreads, 0,
+                                     at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half*>(xn.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(gate_staging.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(block_out.data_ptr<at::Half>()),
+      static_cast<int>(m));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 #ifdef VLLM_QPN8_STANDALONE
-// Lets the exact same source file be compiled as an operator-race harness
-// before paying for a complete vLLM rebuild. Production builds register the
-// operator centrally in torch_bindings.cpp and do not define this macro.
+  // Lets the exact same source file be compiled as an operator-race harness
+  // before paying for a complete vLLM rebuild. Production builds register the
+  // operator centrally in torch_bindings.cpp and do not define this macro.
+  #ifdef VLLM_QPN8_STANDALONE_QWEN38_NAMESPACE
+TORCH_LIBRARY_FRAGMENT(_C_qwen38, ops) {
+  #else
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
+  #endif
   ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
   ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
   ops.def(
@@ -1251,5 +1752,30 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int accumulator_chains, bool fast_decoder, bool prefetch_codes) -> ()");
   ops.impl("fp8_qpn8_gated_pair_sm70_out", torch::kCUDA,
            &fp8_qpn8_gated_pair_sm70_out);
+  ops.def(
+      "fp8_qpn8_split_cta_m1_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor channel_scales, Tensor partials, int split_k, "
+      "int accumulator_chains) -> ()");
+  ops.impl("fp8_qpn8_split_cta_m1_sm70_out", torch::kCUDA,
+           &fp8_qpn8_split_cta_m1_sm70_out);
+  ops.def(
+      "fp8_qpn8_hc_down_silu_sm70_out(Tensor(a!) lora, Tensor(b!) "
+      "injection, Tensor input, Tensor codes, Tensor channel_scales, "
+      "Tensor partials) -> ()");
+  ops.impl("fp8_qpn8_hc_down_silu_sm70_out", torch::kCUDA,
+           &fp8_qpn8_hc_down_silu_sm70_out);
+  ops.def(
+      "fp8_qpn8_hc_up_gate_mix_sm70_out(Tensor(a!) out, Tensor lora, "
+      "Tensor xn, Tensor codes, Tensor channel_scales) -> ()");
+  ops.impl("fp8_qpn8_hc_up_gate_mix_sm70_out", torch::kCUDA,
+           &fp8_qpn8_hc_up_gate_mix_sm70_out);
+  ops.def(
+      "fp8_qpn8_hc_dispatch_sm70_out(Tensor(a!) block_out, Tensor(b!) "
+      "injection_out, Tensor(c!) down_staging, Tensor(d!) lora_staging, "
+      "Tensor(e!) gate_staging, Tensor(f!) partials, int dense_weight_ptr, "
+      "Tensor xn, Tensor down_codes, Tensor down_scales, Tensor up_codes, "
+      "Tensor up_scales) -> ()");
+  ops.impl("fp8_qpn8_hc_dispatch_sm70_out", torch::kCUDA,
+           &fp8_qpn8_hc_dispatch_sm70_out);
 }
 #endif

@@ -70,6 +70,7 @@ constexpr int kSm70Tp4PushAllreduceSentinelByte = 0x7f;
 constexpr size_t kSm70Tp4PushAllreduceBytes =
     8 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
     ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
@@ -81,7 +82,10 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
   if (bytes == kSm70Tp4PushAllreduceBytes) {
     return kSm70Tp4PushAllreduceBlocks;
   }
-  return bytes == kSm70Tp4PushAllreduce8KiBBytes ? 4 : 0;
+  if (bytes == kSm70Tp4PushAllreduce8KiBBytes) {
+    return 4;
+  }
+  return bytes == kSm70Tp4PushAllreduceQwen4ExpBytes ? 3 : 0;
 }
 
 inline int sm70_gemma_rms_norm_threads() {

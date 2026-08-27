@@ -213,6 +213,21 @@ def test_sliding_window_padding_heuristic_rejects_excessive_padding():
     assert max(len(group.layer_names) for group in groups) == 3
 
 
+def test_sliding_window_padding_preserves_generic_singleton_grouping():
+    kv_cache_specs: dict[str, KVCacheSpec] = {}
+    full_spec = new_kv_cache_spec()
+    mamba_spec = new_mamba_spec(page_size_padded=full_spec.page_size_bytes)
+    sliding_spec = new_sliding_window_spec(sliding_window=2048)
+    kv_cache_specs.update({f"full.{i}": full_spec for i in range(15)})
+    kv_cache_specs.update({f"mamba.{i}": mamba_spec for i in range(45)})
+    kv_cache_specs.update({"draft.0": sliding_spec})
+
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(kv_cache_specs)
+
+    assert len(groups) == 13
+    assert [len(group.layer_names) for group in groups] == [5] * 12 + [1]
+
+
 def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
     """Aligned Mamba keeps fine-grained hashes after page-size unification."""
     kv_cache_config = KVCacheConfig(

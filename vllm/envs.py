@@ -165,6 +165,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = True
+    VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
@@ -177,6 +179,9 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
+    VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
+    VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -216,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
+    VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -1696,6 +1702,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a mixed NVFP4 checkpoint may select its separately validated default in
     # the compressed-tensors scheme. Explicit 0 disables both routes.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1"))
+    ),
+    # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
+    # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
+    # retaining the checkpoint's FP16 accumulation and output rounding.
+    "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION", "1"))
+    ),
     # Experimental QPN8 route for the serialized PP2 x TP4 contract. It is
     # default-off after matched model-level quality regressions. An explicit
     # opt-in still requires exact operator shapes/layouts, B1, no speculative
@@ -1809,6 +1824,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR", "1"))
+    ),
+    # Direct ten-route M=1 expert GEMMs for Qwen3.8 Flash Next NVFP4 TP4.
+    # This consumes the existing TurboMind-packed weights while skipping the
+    # replicated-input prepare kernel. The fixed TP4 8192x512 acceptance run
+    # reached 82.274 tokens/s with unchanged arithmetic and Chinese hashes.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1"))
+    ),
+    "VLLM_SM70_NVFP4_QPN_M1_LIBRARY": lambda: os.getenv(
+        "VLLM_SM70_NVFP4_QPN_M1_LIBRARY"
+    ),
+    # Exact single-token E=512, K=10 softmax router used by Qwen3.8 Flash
+    # Next. All other shapes and scoring modes retain the generic CUDA op.
+    "VLLM_SM70_QWEN38_ROUTER_TOPK": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_ROUTER_TOPK", "1"))
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))
@@ -2007,6 +2037,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))
     ),
+    # Optional task-built custom-AR fragment. Operators present in the sidecar
+    # override the production namespace; every other operator falls back.
+    "VLLM_SM70_CUSTOM_AR_LIBRARY": lambda: os.getenv("VLLM_SM70_CUSTOM_AR_LIBRARY"),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
     # or custom logits processing. It still computes local logits with the

@@ -1161,6 +1161,28 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.bfloat16, torch.half, torch.float8_e4m3fn]
 
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if (
+            isinstance(layer, RoutedExperts)
+            and not self.is_layer_excluded(prefix)
+            and sm70_tm.is_exact_sm70_cuda_platform()
+        ):
+            if not sm70_tm.should_use_nvfp4_moe_turbomind():
+                raise NotImplementedError(
+                    "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
+                )
+            from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                ModelOptNvFp4SM70MoEMethod,
+            )
+
+            return ModelOptNvFp4SM70MoEMethod(
+                quant_config=self,
+                moe_config=layer.moe_config,
+            )
+        return super().get_quant_method(layer, prefix)
+
     @classmethod
     def get_min_capability(cls) -> int:
         # Do not unconditionally lower the class-wide gate to 70. W4A4
@@ -2548,6 +2570,19 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     moe_config=layer.moe_config,
                 )
             if quant_algo == "NVFP4":
+                if sm70_tm.is_exact_sm70_cuda_platform():
+                    if not sm70_tm.should_use_nvfp4_moe_turbomind():
+                        raise NotImplementedError(
+                            "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
+                        )
+                    from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                        ModelOptNvFp4SM70MoEMethod,
+                    )
+
+                    return ModelOptNvFp4SM70MoEMethod(
+                        quant_config=self.nvfp4_config,
+                        moe_config=layer.moe_config,
+                    )
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.nvfp4_config,
                     moe_config=layer.moe_config,

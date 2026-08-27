@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
+
 import numpy as np
 import torch
 
@@ -13,6 +15,28 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+
+
+def get_block_table_width(
+    max_num_blocks: int,
+    block_size: int,
+    kernel_block_size: int | None = None,
+    *,
+    token_alignment: int | None = 128,
+) -> int:
+    if kernel_block_size is None:
+        kernel_block_size = block_size
+    if block_size % kernel_block_size != 0:
+        raise ValueError(
+            f"kernel_block_size {kernel_block_size} must divide "
+            f"block_size {block_size} evenly"
+        )
+    if token_alignment is not None:
+        if token_alignment <= 0:
+            raise ValueError("token_alignment must be positive")
+        alignment = token_alignment // math.gcd(token_alignment, block_size)
+        max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
+    return max_num_blocks * block_size // kernel_block_size
 
 
 class BlockTable:

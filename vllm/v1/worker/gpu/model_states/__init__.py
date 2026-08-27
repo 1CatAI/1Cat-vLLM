@@ -13,6 +13,11 @@ def init_model_state(
     encoder_cache: EncoderCache | None,
     device: torch.device,
 ):
+    get_model_state_cls = getattr(model, "get_model_state_cls", None)
+    if callable(get_model_state_cls):
+        model_state_cls = get_model_state_cls()
+        return model_state_cls(vllm_config, model, encoder_cache, device)
+
     if "WhisperForConditionalGeneration" in vllm_config.model_config.architectures:
         from vllm.v1.worker.gpu.model_states.whisper import WhisperModelState
 
