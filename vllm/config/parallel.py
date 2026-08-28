@@ -16,7 +16,7 @@ import vllm.envs as envs
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.network_utils import get_open_ports_list
+from vllm.utils.network_utils import get_open_ports_list, get_open_zmq_ipc_path
 
 if TYPE_CHECKING:
     from ray.runtime_env import RuntimeEnv
@@ -318,6 +318,9 @@ class ParallelConfig:
     """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
 
+    _ple_offload_ipc_path: str = ""
+    """Node-local ZMQ IPC address for the PLE offload worker."""
+
     decode_context_parallel_size: int = 1
     """Number of decode context parallel groups, because the world size does
     not change by dcp, it simply reuse the GPUs of TP group, and tp_size
@@ -427,6 +430,9 @@ class ParallelConfig:
                 f"Expected to be `-1` or `[0, {self._api_process_count})`, "
                 f"but found: {self._api_process_rank}"
             )
+
+        if envs.VLLM_PLE_CPU_OFFLOAD and not self._ple_offload_ipc_path:
+            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
 
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
@@ -754,6 +760,7 @@ class ParallelConfig:
             "worker_extension_cls",
             "_api_process_count",
             "_api_process_rank",
+            "_ple_offload_ipc_path",
             # NUMA binding is per-rank host-side memory locality; it does
             # not affect collective-communication semantics. When numa_bind
             # is enabled with auto-detection, each DP rank stores its own

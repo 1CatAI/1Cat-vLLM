@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Qwen4Exp position-learning enhancement layers."""
+"""GPU-resident Qwen4Exp position-learning enhancement layers."""
 
 import math
 from collections.abc import Iterable, Sequence
-from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -21,42 +18,14 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.ple_offload_layer import (
-    PleOffloadLayer,
-    is_offload_process,
-)
-from vllm.model_executor.layers.quantization.base_config import (
-    QuantizationConfig,
-    QuantizeMethodBase,
-)
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-    create_fp8_scale_parameter,
-    create_fp8_weight_parameter,
-    is_fp8,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    is_layer_skipped,
-)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.model_executor.parameter import (
-    ModelWeightParameter,
-    PerTensorScaleParameter,
-)
-from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.triton_utils import tl, triton
-from vllm.utils.mem_utils import format_gib
-from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.utils.torch_utils import (
-    direct_register_custom_op,
-    get_accelerator_view_from_cpu_tensor,
-)
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
@@ -71,61 +40,6 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
-
-logger = init_logger(__name__)
-
-
-@triton.jit
-def _apply_float32_sign_bit(value, sign_bit):
-    """Apply an FP8 sign bit without canonicalizing negative zero."""
-
-    value_bits = tl.cast(value, tl.uint32, bitcast=True)
-    signed_bits = value_bits | (sign_bit.to(tl.uint32) << 31)
-    return tl.cast(signed_bits, tl.float32, bitcast=True)
-
-
-@triton.jit
-def _e4m3fn_byte_to_float(raw):
-    """Decode E4M3FN bytes without requiring native FP8 on SM70."""
-
-    raw_i32 = raw.to(tl.int32)
-    sign_bit = (raw_i32 >> 7) & 1
-    exponent = (raw_i32 >> 3) & 0x0F
-    mantissa = raw_i32 & 0x07
-    mantissa_f32 = mantissa.to(tl.float32)
-    normal = (1.0 + mantissa_f32 * 0.125) * tl.exp2(exponent.to(tl.float32) - 7.0)
-    subnormal = mantissa_f32 * 0.001953125  # 2**-9
-    value = _apply_float32_sign_bit(
-        tl.where(exponent == 0, subnormal, normal), sign_bit
-    )
-    is_nan = (exponent == 0x0F) & (mantissa == 0x07)
-    return tl.where(is_nan, float("nan"), value)
-
-
-@triton.jit
-def _gather_ple_fp8_from_pinned_kernel(
-    weight_ptr,
-    ids_ptr,
-    scale_ptr,
-    output_ptr,
-    embedding_dim: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """Gather and dequantize one PLE row per program from pinned host memory."""
-
-    row_idx = tl.program_id(0)
-    local_idx = tl.load(ids_ptr + row_idx)
-    offsets = tl.arange(0, BLOCK_D)
-    mask = offsets < embedding_dim
-    byte_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
-    raw = tl.load(
-        byte_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0,
-    )
-    scale = tl.load(scale_ptr).to(tl.float32)
-    values = _e4m3fn_byte_to_float(raw) * scale
-    tl.store(output_ptr + row_idx * embedding_dim + offsets, values, mask=mask)
 
 
 def _splitmix64(value: int) -> int:
@@ -209,228 +123,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
-class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
-    """FP8 PLE embedding with one global checkpoint scale."""
-
-    def create_weights(
-        self,
-        layer: nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        del input_size, output_size
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        weight = create_fp8_weight_parameter(
-            sum(output_partition_sizes), input_size_per_partition, weight_loader
-        )
-        layer.register_parameter("weight", weight)
-
-        weight_scale = create_fp8_scale_parameter(
-            PerTensorScaleParameter,
-            output_partition_sizes,
-            input_size_per_partition,
-            None,
-            weight_loader,
-            # Keep graph inputs in the requested model dtype. In particular,
-            # an otherwise-FP16 graph cannot retain a BF16 scale parameter on
-            # SM70 because Inductor rejects BF16 graph inputs there.
-            scale_dtype=params_dtype,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
-
-    def apply(
-        self,
-        layer: nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError("PLE FP8 weights only support embedding lookup")
-
-    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        pinned_lookup = getattr(layer, "embedding_lookup", None)
-        if pinned_lookup is not None:
-            return pinned_lookup(input_)
-        get_accelerator_weight = getattr(layer, "get_accelerator_weight", None)
-        weight = (
-            get_accelerator_weight(input_.device)
-            if get_accelerator_weight is not None
-            else layer.weight
-        )
-        return F.embedding(input_, weight)
-
-    def process_weights_after_loading(self, layer: nn.Module) -> None:
-        prepare_accelerator_weight = getattr(layer, "prepare_accelerator_weight", None)
-        if prepare_accelerator_weight is not None:
-            prepare_accelerator_weight()
-
-
-def _get_ple_embedding_quant_method(
-    quant_config: QuantizationConfig | None,
-    prefix: str,
-    *,
-    force_fp8_storage: bool = False,
-) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
-
-    if force_fp8_storage:
-        return Qwen4ExpPLEFp8EmbeddingMethod()
-    if not isinstance(quant_config, Fp8Config):
-        return None
-    if not quant_config.is_checkpoint_fp8_serialized:
-        return None
-
-    ignored_layers = quant_config.ignored_layers
-    if is_layer_skipped(
-        prefix,
-        ignored_layers,
-        quant_config.packed_modules_mapping,
-    ):
-        return None
-    # PLE checkpoint shards form one runtime embedding parameter.
-    shard_prefix = f"{prefix}.shard_"
-    if any(name.startswith(shard_prefix) for name in ignored_layers):
-        return None
-    return Qwen4ExpPLEFp8EmbeddingMethod()
-
-
-def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
-    # The dedicated CPU-offload process owns and executes the embedding table
-    # directly. The UVA pinned-host implementation is only for GPU execution.
-    if is_offload_process():
-        return False
-    explicit = getattr(config, "ple_offload_embedding", None)
-    if explicit is not None:
-        return bool(explicit)
-    capability = current_platform.get_device_capability()
-    return capability is not None and capability.to_int() == 70
-
-
-class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
-    """TP-sharded FP8 PLE table backed directly by pinned host memory.
-
-    The base embedding is constructed on the meta device, so the full shard is
-    never allocated on a GPU. Checkpoint shards copy directly into the pinned
-    CPU parameter. A stable UVA view is created after loading and used only for
-    embedding gathers.
-    """
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        params_dtype: torch.dtype | None,
-        padding_size: int,
-        prefix: str,
-        quant_method: QuantizeMethodBase,
-    ) -> None:
-        if not is_pin_memory_available():
-            raise RuntimeError("Qwen4Exp PLE host offload requires pinned host memory")
-        if not isinstance(quant_method, Qwen4ExpPLEFp8EmbeddingMethod):
-            raise NotImplementedError(
-                "Qwen4Exp pinned-host PLE currently requires FP8 checkpoint storage"
-            )
-
-        with torch.device("meta"):
-            super().__init__(
-                num_embeddings,
-                embedding_dim,
-                params_dtype=params_dtype,
-                padding_size=padding_size,
-                prefix=prefix,
-                quant_method=quant_method,
-            )
-
-        meta_weight = self._parameters.get("weight")
-        if not isinstance(meta_weight, torch.Tensor):
-            raise RuntimeError("Qwen4Exp PLE meta weight was not initialized")
-        host_weight = ModelWeightParameter(
-            data=torch.empty(
-                tuple(meta_weight.shape),
-                dtype=meta_weight.dtype,
-                device="cpu",
-                pin_memory=True,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=self.weight_loader,
-        )
-        host_weight._vllm_keep_on_cpu = True
-        self.weight = host_weight
-        self.weight_scale = create_fp8_scale_parameter(
-            PerTensorScaleParameter,
-            [self.num_embeddings_per_partition],
-            self.embedding_dim,
-            None,
-            self.weight_loader,
-            scale_dtype=params_dtype,
-        )
-        self._accelerator_weight_views: dict[int, torch.Tensor] = {}
-        self._accelerator_weight_ptrs: dict[int, int] = {}
-        self._output_dtype = self.weight_scale.dtype
-        logger.info(
-            "Qwen4Exp PLE shard allocated in pinned host memory: %s",
-            format_gib(self.weight.numel() * self.weight.element_size()),
-        )
-
-    def get_accelerator_weight(self, device: torch.device) -> torch.Tensor:
-        if device.type != "cuda":
-            raise RuntimeError(
-                f"Qwen4Exp pinned-host PLE requires a CUDA input, got {device}"
-            )
-        device_index = (
-            torch.accelerator.current_device_index()
-            if device.index is None
-            else device.index
-        )
-        view = self._accelerator_weight_views.get(device_index)
-        if view is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Qwen4Exp PLE UVA view must be prepared before CUDA graph capture"
-                )
-            with torch.accelerator.device_index(device_index):
-                view = get_accelerator_view_from_cpu_tensor(self.weight)
-            self._accelerator_weight_views[device_index] = view
-            self._accelerator_weight_ptrs[device_index] = view.data_ptr()
-        return view
-
-    def prepare_accelerator_weight(self) -> None:
-        self.get_accelerator_weight(
-            torch.device("cuda", torch.accelerator.current_device_index())
-        )
-
-    def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
-        """Gather FP8 UVA rows and emit scaled model-dtype values."""
-
-        device_index = (
-            torch.accelerator.current_device_index()
-            if input_.device.index is None
-            else input_.device.index
-        )
-        weight_ptr = self._accelerator_weight_ptrs.get(device_index)
-        if weight_ptr is None:
-            self.get_accelerator_weight(input_.device)
-            weight_ptr = self._accelerator_weight_ptrs[device_index]
-        output = torch.empty(
-            (*input_.shape, self.embedding_dim),
-            dtype=self._output_dtype,
-            device=input_.device,
-        )
-        torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-            input_.reshape(-1),
-            output.reshape(-1, self.embedding_dim),
-            self.weight_scale,
-            weight_ptr,
-            self.embedding_dim,
-        )
-        return output
-
-
-class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+class Qwen4ExpNGramEmbedding(nn.Module):
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -439,11 +132,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         max_total_tokens: int,
         max_num_reqs: int,
         prefix: str,
-        quant_config: QuantizationConfig | None = None,
-        params_dtype: torch.dtype | None = None,
+        layer_name: str,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.layer_name = layer_name
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
@@ -465,7 +158,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         max_multiplier = ((1 << 63) - 1) // self.unigram_vocab_size
         half_bound = max(1, max_multiplier // 2)
-        seed = int(getattr(config, "seed", None) or 1234)
+        seed = int(getattr(config, "seed", 1234))
         base_seed = seed + _PLE_LAYER_PRIME * ple_dense_layer_id
         multipliers = []
         for index in range(self.ngram_size):
@@ -499,37 +192,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
-        embedding_prefix = f"{prefix}.ngram_embedding"
-        ple_storage_dtype = str(
-            getattr(config, "ple_embedding_dtype", "")
-        ).removeprefix("torch.")
-        quant_method = _get_ple_embedding_quant_method(
-            quant_config,
-            embedding_prefix,
-            force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
+        self.ngram_embedding = VocabParallelEmbedding(
+            padded_vocab_size,
+            self.head_dim,
+            padding_size=divisor,
+            prefix=f"{prefix}.ngram_embedding",
         )
-        if _should_use_pinned_host_ple(config):
-            if quant_method is None:
-                raise NotImplementedError(
-                    "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"
-                )
-            self.ngram_embedding = Qwen4ExpPinnedHostEmbedding(
-                padded_vocab_size,
-                self.head_dim,
-                params_dtype=params_dtype,
-                padding_size=divisor,
-                prefix=embedding_prefix,
-                quant_method=quant_method,
-            )
-        else:
-            self.ngram_embedding = VocabParallelEmbedding(
-                padded_vocab_size,
-                self.head_dim,
-                params_dtype=params_dtype,
-                padding_size=divisor,
-                prefix=embedding_prefix,
-                quant_method=quant_method,
-            )
         self.register_buffer(
             "positions_buffer",
             torch.arange(max_total_tokens, dtype=torch.int64),
@@ -580,64 +248,39 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward_impl(  # type: ignore[override]
+    def forward(
         self,
-        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
-        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del hidden_states
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
+        num_reqs = query_start_loc.numel() - 1
         num_tokens = input_ids.shape[0]
-
-        if is_offload_process():
-            num_reqs = query_start_loc.numel() - 1
-            if num_tokens > self.positions_buffer.numel():
-                raise ValueError(
-                    f"PLE received {num_tokens} tokens, but its workspace supports "
-                    f"at most {self.positions_buffer.numel()}"
-                )
-            if num_reqs > self.padded_buffer.shape[0]:
-                raise ValueError(
-                    f"PLE received {num_reqs} requests, but its workspace supports "
-                    f"at most {self.padded_buffer.shape[0]}"
-                )
-            if num_reqs <= 0:
-                raise ValueError("PLE CPU offload requires at least one request")
-            max_seq_len = max(
-                1,
-                int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
+        if num_tokens > self.positions_buffer.numel():
+            raise ValueError(
+                f"PLE received {num_tokens} tokens, but its workspace supports "
+                f"at most {self.positions_buffer.numel()}"
             )
-            # CUDA-graph batches can include padded token IDs while
-            # query_start_loc describes only real tokens. Do not let those
-            # padded IDs overwrite the final real token after index clamping.
-            num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
-        else:
-            # Preserve MRV2's dynamic-shape contract: scheduler limits already
-            # bound these symbolic dimensions, so avoid Python shape tests.
-            num_reqs = ngram_context.shape[0]
-            max_seq_len = self.padded_buffer.shape[1]
-            num_valid_tokens = num_tokens
+        if num_reqs > self.padded_buffer.shape[0]:
+            raise ValueError(
+                f"PLE received {num_reqs} requests, but its workspace supports "
+                f"at most {self.padded_buffer.shape[0]}"
+            )
 
         positions = self.positions_buffer[:num_tokens]
-        packed = self.padded_buffer[:num_reqs, :max_seq_len]
+        packed = self.padded_buffer[:num_reqs]
         packed.fill_(self.eos_token_id)
         request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
         request_indices.clamp_(max=num_reqs - 1)
         columns = (positions - query_start_loc[request_indices]).clamp(
             0, packed.shape[1] - 1
         )
-        if is_offload_process():
-            packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
-                input_ids[:num_valid_tokens]
-            )
-            ngram_context = ngram_context[:num_reqs]
-        else:
-            packed[request_indices, columns] = input_ids
-        ngram_context = ngram_context.to(device=input_ids.device, dtype=torch.long)
+        packed[request_indices, columns] = input_ids
+        ngram_context = ngram_context[:num_reqs].to(
+            device=input_ids.device, dtype=torch.long
+        )
 
         context = torch.cat([ngram_context, packed], dim=-1)
         positions_2d, position_in_segment = self._shift_precompute(
@@ -669,45 +312,19 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
-        if output_buffer is not None:
-            output = output_buffer[:num_tokens, : self.embedding_dim]
-            torch.index_select(
-                self.ngram_embedding.weight,
-                0,
-                ngram_ids.reshape(-1),
-                out=output.reshape(-1, self.head_dim),
-            )
-            return output
-        return self.ngram_embedding(ngram_ids).flatten(-2)
-
-    def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
-        """Keep quantized lookup results in their embedding storage dtype."""
-        embedding = getattr(self, "ngram_embedding", None)
-        weight = getattr(embedding, "weight", None)
-        if weight is not None:
-            return weight.dtype
-        if hasattr(self, "_offload_weight_scale"):
-            return torch.float8_e4m3fn
-        return default_dtype
+        output = ngram_ids.new_empty(
+            (ngram_ids.shape[0], self.embedding_dim),
+            dtype=self.ngram_embedding.params_dtype,
+        )
+        torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
+            ngram_ids,
+            output,
+            self.layer_name,
+        )
+        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
-
-        # GPU workers keep only the scale required to dequantize the FP8 rows
-        # returned by the CPU process. The embedding weights live exclusively
-        # in that process.
-        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
-            retained: set[str] = set()
-            for name, loaded_weight in weights:
-                if name != "ngram_embedding.weight_scale":
-                    continue
-                self.register_buffer(
-                    "_offload_weight_scale",
-                    loaded_weight.to(device=torch.accelerator.current_accelerator()),
-                    persistent=False,
-                )
-                retained.add(name)
-            return retained
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -805,25 +422,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
-        # The offload subprocess constructs the surrounding model on meta, but
-        # its N-gram table must own real CPU storage. With offload disabled,
-        # preserve the caller's existing device context (including SM70 UVA).
-        ple_device = (
-            torch.device(PleOffloadLayer.get_target_device())
-            if envs.VLLM_PLE_CPU_OFFLOAD
-            else nullcontext()
+        self.ple_embedding: nn.Module = Qwen4ExpNGramEmbedding(
+            config,
+            int(config.ple_embed_dim),
+            self.ple_dense_layer_id,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_seqs,
+            f"{prefix}.ple_embedding",
+            prefix,
         )
-        with ple_device:
-            self.ple_embedding: nn.Module = Qwen4ExpNGramEmbedding(
-                config,
-                int(config.ple_embed_dim),
-                self.ple_dense_layer_id,
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                vllm_config.scheduler_config.max_num_seqs,
-                f"{prefix}.ple_embedding",
-                quant_config=quant_config,
-                params_dtype=model_config.dtype,
-            )
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -864,29 +471,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-
-    def _get_embedding_weight_scale(self) -> torch.Tensor | None:
-        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
-        weight_scale = getattr(embedding, "weight_scale", None)
-        if weight_scale is not None:
-            return weight_scale
-        return getattr(self.ple_embedding, "_offload_weight_scale", None)
-
-    def _dequantize_embeddings(
-        self,
-        embeddings: torch.Tensor,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Dequantize PLE lookup output."""
-
-        if not is_fp8(embeddings):
-            return embeddings
-        weight_scale = self._get_embedding_weight_scale()
-        if weight_scale is None:
-            raise RuntimeError("FP8 PLE embedding is missing its global scale")
-        if weight_scale.device != embeddings.device:
-            raise RuntimeError("FP8 PLE embedding scale must be on the output device")
-        return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
@@ -1433,13 +1017,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(
-            hidden_states,
-            input_ids,
-            query_start_loc,
-            ngram_context,
-        )
-        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1460,6 +1038,31 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return gated_value.flatten(-2) + conv_output
 
 
+def qwen4_exp_amd_ple_ngram_embedding(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run the large PLE embedding lookup outside Inductor's FX graph.
+
+    Keeping the embedding weight in ``static_forward_context`` prevents AOT
+    compile-time autotuning from materializing a synthetic copy of the weight.
+    """
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
+    output.copy_(result)
+
+
+def qwen4_exp_amd_ple_ngram_embedding_fake(
+    ngram_ids: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1478,42 +1081,11 @@ def qwen4_exp_ple_short_conv_fake(
     return
 
 
-def qwen4_exp_ple_pinned_gather(
-    input_ids: torch.Tensor,
-    output: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_ptr: int,
-    embedding_dim: int,
-) -> None:
-    if input_ids.numel() == 0:
-        return
-    block_d = triton.next_power_of_2(embedding_dim)
-    _gather_ple_fp8_from_pinned_kernel[(input_ids.numel(),)](
-        weight_ptr,
-        input_ids,
-        weight_scale,
-        output,
-        embedding_dim=embedding_dim,
-        BLOCK_D=block_d,
-        num_warps=4,
-    )
-
-
-def qwen4_exp_ple_pinned_gather_fake(
-    input_ids: torch.Tensor,
-    output: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_ptr: int,
-    embedding_dim: int,
-) -> None:
-    return
-
-
 direct_register_custom_op(
-    op_name="qwen4_exp_ple_pinned_gather",
-    op_func=qwen4_exp_ple_pinned_gather,
+    op_name="qwen4_exp_amd_ple_ngram_embedding",
+    op_func=qwen4_exp_amd_ple_ngram_embedding,
     mutates_args=["output"],
-    fake_impl=qwen4_exp_ple_pinned_gather_fake,
+    fake_impl=qwen4_exp_amd_ple_ngram_embedding_fake,
 )
 
 

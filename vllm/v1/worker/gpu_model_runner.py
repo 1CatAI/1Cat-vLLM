@@ -1407,6 +1407,7 @@ class GPUModelRunner(
             raise ValueError("N-gram embedding requires context length >= 1")
         if self.uses_ngram_embedding and parallel_config.pipeline_parallel_size > 1:
             raise RuntimeError("N-gram PLE embedding requires pipeline_parallel_size=1")
+        self._ple_offload_connector: Any | None = None
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
@@ -6685,6 +6686,22 @@ class GPUModelRunner(
         self._copy_buffer_to_gpu(self.ngram_context, num_reqs_padded)
         return self.ngram_context.gpu[:num_reqs_padded]
 
+    def _setup_ple_offload(self, ipc_addr: str) -> None:
+        """Attach the shared CPU PLE worker to address-stable MRV1 inputs."""
+        from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+        if not self.uses_ngram_embedding:
+            raise RuntimeError("PLE offload requires PLE model inputs")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.get_model(),
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_ids.cpu,
+            query_start_loc_source=self.query_start_loc.cpu,
+            ngram_context_source=self.ngram_context.cpu,
+        )
+
     def _maybe_add_ngram_kwargs(
         self,
         model_kwargs: dict[str, Any],
@@ -8750,6 +8767,12 @@ class GPUModelRunner(
         ) = ([]) if self._sm70_mtp_profile_enabled() else None
         mtp_forward_start = self._sm70_mtp_profile_start(mtp_profile_events)
         trace_forward_t0 = time.perf_counter() if trace_log else 0.0
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                num_reqs,
+                num_tokens_padded,
+                dummy_run=False,
+            )
         with (
             self._dflash_ddtree_target_forward_profile_scope(
                 use_spec_decode=use_spec_decode,
@@ -8781,6 +8804,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
         if trace_log:
             trace_forward_submit_ms = (time.perf_counter() - trace_forward_t0) * 1000.0
         self._sm70_mtp_profile_finish(
@@ -11001,6 +11026,13 @@ class GPUModelRunner(
                 num_scheduled_tokens=num_scheduled_tokens,
             )
 
+            if self._ple_offload_connector is not None:
+                self._ple_offload_connector.prepare_forward(
+                    num_reqs,
+                    num_tokens_padded,
+                    dummy_run=True,
+                )
+
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
             elif self.uses_xdrope_dim > 0:
@@ -11070,6 +11102,8 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
                 _sm70_profile_trace("_dummy_run model forward exit")
+            if self._ple_offload_connector is not None:
+                self._ple_offload_connector.release_outputs()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -11523,6 +11557,10 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
