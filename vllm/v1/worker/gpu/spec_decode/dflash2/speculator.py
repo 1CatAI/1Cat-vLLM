@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from typing import Any
 
 import numpy as np
@@ -284,6 +285,20 @@ def _prepare_lookup_controller_flags_kernel(
     tl.store(out_ptr + offsets, wants_long.to(tl.int32), mask=mask)
 
 
+@triton.jit
+def _prepare_chain_entry_flags_kernel(
+    match_len_ptr,
+    out_ptr,
+    min_match,
+    num_reqs,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_reqs
+    match_len = tl.load(match_len_ptr + offsets, mask=mask, other=0)
+    tl.store(out_ptr + offsets, (match_len >= min_match).to(tl.int32), mask=mask)
+
+
 def _advance_lookup_controller(
     *,
     want: bool | None,
@@ -317,6 +332,30 @@ def _advance_lookup_controller(
             long_active = False
             sticky_remaining = 0
     return want, want_streak, sticky_remaining, long_active
+
+
+def _advance_chain_controller(
+    *,
+    active: bool,
+    previous_was_chain: bool,
+    rejected: bool | None,
+    entry_evidence: bool | None,
+) -> tuple[bool, bool, bool]:
+    """Advance a single-request drafter-free chain.
+
+    A missing asynchronous verdict preserves an active chain. After the first
+    rejection, one normal draft step is required before fresh lookup evidence
+    may start another chain.
+    """
+    if active:
+        if rejected:
+            return False, True, False
+        return True, True, True
+    if previous_was_chain:
+        return False, False, False
+    if entry_evidence:
+        return True, True, True
+    return False, False, False
 
 
 class DFlash2Speculator(DFlashSpeculator):
@@ -455,6 +494,13 @@ class DFlash2Speculator(DFlashSpeculator):
         self._lookup_current_req_key: tuple[int, ...] = ()
         self._lookup_current_eligible = False
         self._lookup_last_emitted: torch.Tensor | None = None
+        self._sampling_states = None
+        self._chain_enabled = False
+        self._chain_active = False
+        self._chain_previous_was_chain = False
+        self._chain_req_key: tuple[int, ...] = ()
+        self._chain_steps_total = 0
+        self._chain_steps_engaged = 0
         if self._lookup_enabled:
             if device.type != "cuda":
                 raise ValueError("Lookup-augmented DFlash2 requires a CUDA device")
@@ -500,6 +546,30 @@ class DFlash2Speculator(DFlashSpeculator):
                 device="cpu",
                 pin_memory=True,
             )
+            self._chain_enabled = envs.VLLM_DFLASH2_CHAIN
+            if self._chain_enabled:
+                self._chain_min_match = envs.VLLM_DFLASH2_CHAIN_MINMATCH
+                self._chain_greedy_only = envs.VLLM_DFLASH2_CHAIN_GREEDY_ONLY
+                self._chain_log_sec = envs.VLLM_DFLASH2_CHAIN_LOG_SEC
+                self._chain_entry_flags = torch.zeros_like(self._lookup_match_len)
+                self._chain_entry_flags_cpu = torch.zeros(
+                    self.max_num_reqs,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._chain_rejected = torch.zeros_like(self._lookup_match_len)
+                self._chain_rejected_cpu = torch.zeros(
+                    self.max_num_reqs,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self._chain_reject_stream = torch.cuda.Stream(device=device)
+                self._chain_reject_event = torch.cuda.Event()
+                self._chain_reject_pending = False
+                self._chain_reject_req_key: tuple[int, ...] = ()
+                self._chain_last_log = time.monotonic()
             self._lookup_copy_pending = False
             self._lookup_pending_req_key: tuple[int, ...] = ()
             self._lookup_pending_num_reqs = 0
@@ -520,6 +590,19 @@ class DFlash2Speculator(DFlashSpeculator):
                 self._lookup_nmax,
                 self._lookup_adaptive,
             )
+            if self._chain_enabled:
+                logger.info(
+                    "Enabled drafter-free DFlash2 chains "
+                    "(min_match=%d, greedy_only=%s).",
+                    self._chain_min_match,
+                    self._chain_greedy_only,
+                )
+        elif envs.VLLM_DFLASH2_CHAIN:
+            logger.warning(
+                "VLLM_DFLASH2_CHAIN=1 requires lookup-augmented DFlash2 "
+                "(ngram_assist=true and a verifier wider than the checkpoint); "
+                "chains are disabled."
+            )
 
     @property
     def requires_host_token_state(self) -> bool:
@@ -529,6 +612,10 @@ class DFlash2Speculator(DFlashSpeculator):
     def set_req_states(self, req_states) -> None:
         """Expose the request token history used by the device lookup."""
         self._req_states = req_states
+
+    def set_sampling_states(self, sampling_states) -> None:
+        """Expose the host sampling view for the zero-sync chain gate."""
+        self._sampling_states = sampling_states
 
     def _reset_lookup_controller(self, req_key: tuple[int, ...]) -> None:
         self._lookup_controller_req_key = req_key
@@ -615,12 +702,25 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK=block,
             num_warps=1,
         )
+        if self._chain_enabled:
+            _prepare_chain_entry_flags_kernel[(1,)](
+                self._lookup_match_len,
+                self._chain_entry_flags,
+                self._chain_min_match,
+                num_reqs,
+                BLOCK=block,
+                num_warps=1,
+            )
         current_stream = torch.cuda.current_stream(self.device)
         self._lookup_copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self._lookup_copy_stream):
             self._lookup_flags_cpu[:num_reqs].copy_(
                 self._lookup_controller_flags[:num_reqs], non_blocking=True
             )
+            if self._chain_enabled:
+                self._chain_entry_flags_cpu[:num_reqs].copy_(
+                    self._chain_entry_flags[:num_reqs], non_blocking=True
+                )
             self._lookup_copy_event.record(self._lookup_copy_stream)
         self._lookup_pending_req_key = self._lookup_current_req_key
         self._lookup_pending_num_reqs = num_reqs
@@ -630,6 +730,15 @@ class DFlash2Speculator(DFlashSpeculator):
         """Choose q8 or q16 for the next target verification step."""
         if not self._lookup_enabled:
             return self.num_speculative_steps
+
+        if getattr(self, "_chain_enabled", False) and self._chain_active:
+            # Clear the normal-step feedback that admitted the chain. Chain
+            # steps do not run the neural lookup graph and therefore publish
+            # no new adaptive q8/q16 feedback.
+            self._consume_lookup_flags()
+            return self._record_lookup_width(
+                self.num_speculative_steps, "drafter-free-chain"
+            )
 
         num_reqs = len(self._lookup_current_req_key)
         if num_reqs == 0 or not self._lookup_current_eligible:
@@ -670,6 +779,133 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         reason = "strong-copy" if self._lookup_long_active else "adaptive-default"
         return self._record_lookup_width(width, reason)
+
+    def _chain_entry_evidence(self) -> bool | None:
+        if not self._lookup_copy_pending or not self._lookup_copy_event.query():
+            return None
+        if (
+            self._lookup_pending_req_key != self._lookup_current_req_key
+            or self._lookup_pending_num_reqs != 1
+        ):
+            return False
+        return bool(self._chain_entry_flags_cpu[0])
+
+    def _consume_chain_rejection(self) -> bool | None:
+        if not self._chain_reject_pending or not self._chain_reject_event.query():
+            return None
+        self._chain_reject_pending = False
+        if self._chain_reject_req_key != self._lookup_current_req_key:
+            return False
+        return bool(self._chain_rejected_cpu[0])
+
+    def _queue_chain_rejection(self, num_rejected: torch.Tensor) -> None:
+        if self._chain_reject_pending:
+            return
+        self._chain_rejected[:1].copy_(num_rejected[:1])
+        current_stream = torch.cuda.current_stream(self.device)
+        self._chain_reject_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._chain_reject_stream):
+            self._chain_rejected_cpu[:1].copy_(
+                self._chain_rejected[:1], non_blocking=True
+            )
+            self._chain_reject_event.record(self._chain_reject_stream)
+        self._chain_reject_req_key = self._lookup_current_req_key
+        self._chain_reject_pending = True
+
+    def _reset_chain(self, req_key: tuple[int, ...]) -> None:
+        self._chain_req_key = req_key
+        self._chain_active = False
+        self._chain_previous_was_chain = False
+
+    def _chain_is_eligible(self, input_batch) -> bool:
+        if (
+            not self._chain_enabled
+            or self.dp_size != 1
+            or input_batch.num_reqs != 1
+            or not self._lookup_current_eligible
+            or self._req_states is None
+        ):
+            return False
+        if not self._chain_greedy_only:
+            return True
+        if self._sampling_states is None:
+            return False
+        req_state = int(input_batch.idx_mapping_np[0])
+        return float(self._sampling_states.temperature.np[req_state]) == 0.0
+
+    def _prepare_draftless_proposal(
+        self,
+        input_batch,
+        num_rejected: torch.Tensor,
+        *,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> bool:
+        if not self._chain_enabled:
+            return False
+
+        req_key = self._lookup_current_req_key
+        if req_key != self._chain_req_key:
+            self._reset_chain(req_key)
+        if dummy_run or is_profile or not self._chain_is_eligible(input_batch):
+            self._reset_chain(req_key)
+            return False
+
+        self._chain_steps_total += 1
+        rejected = self._consume_chain_rejection()
+        self._queue_chain_rejection(num_rejected)
+        (
+            self._chain_active,
+            self._chain_previous_was_chain,
+            engage,
+        ) = _advance_chain_controller(
+            active=self._chain_active,
+            previous_was_chain=self._chain_previous_was_chain,
+            rejected=rejected,
+            entry_evidence=self._chain_entry_evidence(),
+        )
+        if not engage:
+            return False
+
+        self._chain_steps_engaged += 1
+        self._generate_chain_proposal(input_batch.num_reqs)
+        now = time.monotonic()
+        if (
+            self._chain_log_sec > 0
+            and now - self._chain_last_log >= self._chain_log_sec
+        ):
+            logger.info(
+                "DFlash2 chain engaged %d/%d eligible steps.",
+                self._chain_steps_engaged,
+                self._chain_steps_total,
+            )
+            self._chain_last_log = now
+        return True
+
+    def _generate_chain_proposal(self, num_reqs: int) -> None:
+        """Fill the verifier block from request history without draft forward."""
+        assert self._req_states is not None
+        self._lookup_tokens[:num_reqs].zero_()
+        tokens, _, _ = suffix_lookup(
+            self._req_states.all_token_ids.gpu,
+            self._req_states.total_len.gpu,
+            self.sample_idx_mapping,
+            self._lookup_eligible,
+            num_reqs,
+            self.num_speculative_steps,
+            idx_mapping_stride=self.draft_block,
+            nmax=self._lookup_nmax,
+            nmin=self._lookup_nmin,
+            search_max=self._lookup_search,
+            out_tokens=self._lookup_tokens,
+            out_len=self._lookup_match_len,
+            out_valid=self._lookup_valid,
+        )
+        # A missing continuation becomes token zero and is rejected by the
+        # target. That exact miss is the exit signal for the next host step.
+        self.draft_tokens[:num_reqs].copy_(tokens[:num_reqs])
+        self._lookup_use[:num_reqs].fill_(1)
+        self._rewrite_lookup_point_masses(num_reqs)
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # The selector walk and rejection sampler must consume identical scores.
@@ -910,6 +1146,9 @@ class DFlash2Speculator(DFlashSpeculator):
             take_flags=self._lookup_take_flags,
         )
 
+        self._rewrite_lookup_point_masses(num_reqs)
+
+    def _rewrite_lookup_point_masses(self, num_reqs: int) -> None:
         draft_logits = self.draft_logits
         if draft_logits is None:
             return

@@ -8,8 +8,13 @@ from collections.abc import Callable
 
 import torch
 
+from vllm.triton_utils import triton
 from vllm.v1.worker.gpu.buffer_utils import UvaBuffer
-from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import fuse_draft, suffix_lookup
+from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
+    _point_mass_draft_logits_kernel,
+    fuse_draft,
+    suffix_lookup,
+)
 
 
 def _time_ms(fn: Callable[[], None], repeats: int, warmup: int) -> float:
@@ -29,8 +34,8 @@ def _time_ms(fn: Callable[[], None], repeats: int, warmup: int) -> float:
 def _make_history(batch_size: int, context_len: int) -> UvaBuffer:
     history = UvaBuffer((batch_size, context_len + 32), torch.int32)
     history.cpu.random_(1000, 200000)
-    suffix = torch.arange(700001, 700013, dtype=torch.int32)
-    continuation = torch.arange(800001, 800016, dtype=torch.int32)
+    suffix = torch.arange(220001, 220013, dtype=torch.int32)
+    continuation = torch.arange(230001, 230016, dtype=torch.int32)
     match_start = max(0, context_len // 2 - suffix.numel())
     for row in range(batch_size):
         history.cpu[row, match_start : match_start + suffix.numel()].copy_(suffix)
@@ -51,7 +56,7 @@ def _benchmark_case(
     warmup: int,
 ) -> dict[str, float | int]:
     device = torch.device("cuda")
-    k, draft_block = 15, 7
+    k, draft_block, top_k, vocab_size = 15, 7, 16, 248320
     history = _make_history(batch_size, context_len)
     total_len = torch.full((batch_size,), context_len, dtype=torch.int32, device=device)
     idx_mapping = torch.arange(
@@ -67,6 +72,18 @@ def _benchmark_case(
     use = torch.zeros((batch_size, k), dtype=torch.int32, device=device)
     hits = torch.zeros((), dtype=torch.int64, device=device)
     take_flags = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    cached_ids = torch.arange(top_k, dtype=torch.int64, device=device).view(1, 1, top_k)
+    cached_ids = cached_ids.expand(batch_size, k, top_k).clone()
+    cached_scores = torch.zeros(
+        (batch_size, k, top_k), dtype=torch.float32, device=device
+    )
+    draft_logits = torch.full(
+        (batch_size, k, vocab_size),
+        -float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    draft_logits.scatter_(2, cached_ids, cached_scores)
 
     def lookup_only() -> None:
         suffix_lookup(
@@ -106,7 +123,33 @@ def _benchmark_case(
             take_flags=take_flags,
         )
 
+    def draftless_chain() -> None:
+        lookup_tokens.zero_()
+        lookup_only()
+        drafted.copy_(lookup_tokens)
+        use.fill_(1)
+        _point_mass_draft_logits_kernel[(batch_size * k,)](
+            draft_logits,
+            cached_ids,
+            cached_scores,
+            drafted,
+            drafted.stride(0),
+            use,
+            idx_mapping,
+            draft_block,
+            cached_ids.stride(0),
+            cached_ids.stride(1),
+            draft_logits.stride(0),
+            draft_logits.stride(1),
+            num_steps=k,
+            top_k=top_k,
+            BLOCK_K=triton.next_power_of_2(top_k),
+            CACHE_SCORES=True,
+            num_warps=1,
+        )
+
     eager_ms = _time_ms(lookup_and_fuse, repeats, warmup)
+    chain_eager_ms = _time_ms(draftless_chain, repeats, warmup)
     graph = torch.cuda.CUDAGraph()
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
@@ -127,6 +170,7 @@ def _benchmark_case(
         "context_len": context_len,
         "uva_lookup_fuse_eager_ms": eager_ms,
         "uva_lookup_fuse_graph_ms": graph_ms,
+        "uva_draftless_chain_eager_ms": chain_eager_ms,
     }
 
 

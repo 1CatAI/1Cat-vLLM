@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -11,6 +13,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
     suffix_lookup,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+    DFlash2Speculator,
     _prepare_lookup_controller_flags_kernel,
 )
 
@@ -215,3 +218,75 @@ def test_point_mass_rewrite_preserves_sparse_cache_invariant() -> None:
         assert int(cached_ids[1, step, 0]) == token
         assert float(cached_scores[1, step, 0]) == 0.0
         assert torch.isneginf(cached_scores[1, step, 1:]).all()
+
+
+def test_drafter_free_chain_fills_block_and_clears_a_miss() -> None:
+    device = torch.device("cuda")
+    num_steps, draft_block, top_k, vocab_size = 15, 7, 16, 64
+    speculator = object.__new__(DFlash2Speculator)
+    speculator.num_speculative_steps = num_steps
+    speculator.draft_block = draft_block
+    speculator.selector_top_k = top_k
+    speculator._lookup_nmin = 6
+    speculator._lookup_nmax = 12
+    speculator._lookup_search = 1 << 30
+    speculator.sample_idx_mapping = torch.zeros(
+        draft_block, dtype=torch.int32, device=device
+    )
+    speculator._lookup_eligible = torch.ones(1, dtype=torch.int32, device=device)
+    speculator._lookup_tokens = torch.zeros(
+        (1, num_steps), dtype=torch.int32, device=device
+    )
+    speculator._lookup_match_len = torch.zeros(1, dtype=torch.int32, device=device)
+    speculator._lookup_valid = torch.zeros(1, dtype=torch.int32, device=device)
+    speculator._lookup_use = torch.zeros(
+        (1, num_steps), dtype=torch.int32, device=device
+    )
+    speculator.draft_tokens = torch.zeros(
+        (1, num_steps), dtype=torch.int64, device=device
+    )
+    speculator.draft_logits = torch.full(
+        (1, num_steps, vocab_size),
+        -float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    speculator._cached_candidate_ids = torch.zeros(
+        (1, num_steps, top_k), dtype=torch.int64, device=device
+    )
+    speculator._cached_candidate_scores = torch.full(
+        (1, num_steps, top_k),
+        -float("inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    speculator._selector_scores = torch.empty(
+        (1, draft_block, top_k), dtype=torch.float32, device=device
+    )
+
+    suffix = list(range(1, 9))
+    continuation = list(range(20, 35))
+    history = suffix + continuation + suffix
+    all_ids = torch.zeros((1, 64), dtype=torch.int32, device=device)
+    all_ids[0, : len(history)] = torch.tensor(history, device=device)
+    total_len = torch.tensor([len(history)], dtype=torch.int32, device=device)
+    speculator._req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=all_ids),
+        total_len=SimpleNamespace(gpu=total_len),
+    )
+
+    speculator._generate_chain_proposal(1)
+    assert speculator.draft_tokens[0].tolist() == continuation
+    assert torch.all(speculator._lookup_use == 1)
+    for step, token in enumerate(continuation):
+        finite = torch.where(torch.isfinite(speculator.draft_logits[0, step]))[0]
+        assert finite.tolist() == [token]
+
+    # A miss must not replay the prior continuation from the persistent lookup
+    # buffer. Token zero is the deliberate rejected-tail sentinel.
+    no_match = list(range(40, 50))
+    all_ids.zero_()
+    all_ids[0, : len(no_match)] = torch.tensor(no_match, device=device)
+    total_len.fill_(len(no_match))
+    speculator._generate_chain_proposal(1)
+    assert torch.count_nonzero(speculator.draft_tokens) == 0

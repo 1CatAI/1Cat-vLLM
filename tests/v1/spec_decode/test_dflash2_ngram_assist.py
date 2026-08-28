@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import (
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     DFlash2Speculator,
+    _advance_chain_controller,
     _advance_lookup_controller,
     _apply_ngram_draft_kernel,
 )
@@ -260,6 +261,49 @@ def test_lookup_controller_never_coasts_a_multi_request_batch() -> None:
     )
 
     assert values == (False, 0, 0, False)
+
+
+def test_chain_controller_exits_on_rejection_and_requires_normal_step() -> None:
+    active, previous, engage = _advance_chain_controller(
+        active=False,
+        previous_was_chain=False,
+        rejected=False,
+        entry_evidence=True,
+    )
+    assert (active, previous, engage) == (True, True, True)
+
+    # An unavailable asynchronous verdict must not tear down a live chain.
+    active, previous, engage = _advance_chain_controller(
+        active=active,
+        previous_was_chain=previous,
+        rejected=None,
+        entry_evidence=None,
+    )
+    assert (active, previous, engage) == (True, True, True)
+
+    active, previous, engage = _advance_chain_controller(
+        active=active,
+        previous_was_chain=previous,
+        rejected=True,
+        entry_evidence=True,
+    )
+    assert (active, previous, engage) == (False, True, False)
+
+    # Stale pre-chain evidence cannot immediately re-enter after a miss.
+    active, previous, engage = _advance_chain_controller(
+        active=active,
+        previous_was_chain=previous,
+        rejected=False,
+        entry_evidence=True,
+    )
+    assert (active, previous, engage) == (False, False, False)
+
+    assert _advance_chain_controller(
+        active=active,
+        previous_was_chain=previous,
+        rejected=False,
+        entry_evidence=True,
+    ) == (True, True, True)
 
 
 def test_lookup_controller_selects_q8_before_two_strong_hits(monkeypatch) -> None:

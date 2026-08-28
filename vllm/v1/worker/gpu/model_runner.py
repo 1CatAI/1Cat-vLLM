@@ -253,6 +253,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.num_speculative_steps + 1,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
             )
+            if self.speculator is not None and hasattr(
+                self.speculator, "set_sampling_states"
+            ):
+                self.speculator.set_sampling_states(self.sampler.sampling_states)
             if self.speculative_config is not None:
                 self.rejection_sampler = RejectionSampler(
                     self.sampler,

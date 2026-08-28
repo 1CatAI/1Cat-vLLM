@@ -2925,6 +2925,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": lambda: max(
         0, int(os.getenv("VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT", "0"))
     ),
+    # Drafter-free continuation chains layered on top of DFlash2 LABD. The
+    # default gate is deliberately conservative: point-mass context proposals
+    # are exact under rejection sampling, but can be less efficient than the
+    # neural proposal when temperature sampling is active.
+    "VLLM_DFLASH2_CHAIN": lambda: bool(int(os.getenv("VLLM_DFLASH2_CHAIN", "0"))),
+    "VLLM_DFLASH2_CHAIN_MINMATCH": lambda: max(
+        1, int(os.getenv("VLLM_DFLASH2_CHAIN_MINMATCH", "8"))
+    ),
+    "VLLM_DFLASH2_CHAIN_GREEDY_ONLY": lambda: bool(
+        int(os.getenv("VLLM_DFLASH2_CHAIN_GREEDY_ONLY", "1"))
+    ),
+    "VLLM_DFLASH2_CHAIN_LOG_SEC": lambda: max(
+        0.0, float(os.getenv("VLLM_DFLASH2_CHAIN_LOG_SEC", "30"))
+    ),
     "VLLM_DFLASH_DUMP_FIRST_PASS": lambda: bool(
         int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))
     ),

@@ -359,6 +359,17 @@ class DFlashSpeculator(DraftModelSpeculator):
     def _apply_ngram_assist(self, num_reqs: int) -> None:
         """Override model proposals for ngram-hit rows, if configured."""
 
+    def _prepare_draftless_proposal(
+        self,
+        input_batch: InputBatch,
+        num_rejected: torch.Tensor,
+        *,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> bool:
+        """Fill a complete proposal without running the draft query model."""
+        return False
+
     @torch.inference_mode()
     def propose(
         self,
@@ -504,6 +515,14 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self._speculator_name,
                 )
                 self._context_only_prefill_logged = True
+            return self.draft_tokens[:num_reqs]
+
+        if self._prepare_draftless_proposal(
+            input_batch,
+            num_rejected,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+        ):
             return self.draft_tokens[:num_reqs]
 
         if self._prepare_ngram_assist(

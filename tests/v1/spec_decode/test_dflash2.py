@@ -101,6 +101,23 @@ def test_dflash2_grouped_verify_is_default_on_with_rollback(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_dflash2_chain_is_opt_in_and_greedy_only_by_default(monkeypatch):
+    names = (
+        "VLLM_DFLASH2_CHAIN",
+        "VLLM_DFLASH2_CHAIN_GREEDY_ONLY",
+        "VLLM_DFLASH2_CHAIN_MINMATCH",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert not envs.VLLM_DFLASH2_CHAIN
+        assert envs.VLLM_DFLASH2_CHAIN_GREEDY_ONLY
+        assert envs.VLLM_DFLASH2_CHAIN_MINMATCH == 8
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_sm70_tp4_push_allreduce_is_default_on_with_rollback(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", raising=False)
     envs.disable_envs_cache()
