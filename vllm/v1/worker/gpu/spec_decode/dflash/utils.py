@@ -3,9 +3,9 @@
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
@@ -76,18 +76,20 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
-    # Skip embedding sharing under PP — each rank owns its own embedding.
-    if get_pp_group().world_size == 1:
-        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-            target_inner, "embedding", None
-        )
-        draft_embed = getattr(draft_inner, "embed_tokens", None)
-        if target_embed is not None and _should_share(
+    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+        target_inner, "embedding", None
+    )
+    draft_embed = getattr(draft_inner, "embed_tokens", None)
+    if (
+        target_embed is not None
+        and not isinstance(target_embed, PPMissingLayer)
+        and _should_share(
             dflash_model, "has_own_embed_tokens", draft_embed, target_embed
-        ):
-            if draft_embed is not None:
-                del draft_inner.embed_tokens
-            draft_inner.embed_tokens = target_embed
+        )
+    ):
+        if draft_embed is not None:
+            del draft_inner.embed_tokens
+        draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)

@@ -50,6 +50,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
+        # Keep token embedding outside the compiled drafter forward. This
+        # avoids data-dependent embedding-index symbols during AOT tracing and
+        # gives CUDA Graph replay an address-stable input buffer.
+        self.inputs_embeds = torch.zeros(
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+        )
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
@@ -260,10 +266,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
+            self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                self.input_buffers.input_ids[:num_tokens]
+            )
             last_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
+                input_ids=None,
                 positions=self.input_buffers.positions[:num_tokens],
-                inputs_embeds=None,
+                inputs_embeds=self.inputs_embeds[:num_tokens],
             )
         return last_hidden_states
 

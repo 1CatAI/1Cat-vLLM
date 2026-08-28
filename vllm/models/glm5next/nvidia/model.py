@@ -59,9 +59,11 @@ from vllm.model_executor.models.glm4_1v import (
     Glm4vForConditionalGeneration,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -601,7 +603,14 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
 
-class Glm5NextModel(nn.Module):
+_DFLASH_AUX_HIDDEN_STATE_PREFIX = "dflash_aux_hidden_state_"
+
+
+def _dflash_aux_hidden_state_key(layer_boundary: int) -> str:
+    return f"{_DFLASH_AUX_HIDDEN_STATE_PREFIX}{layer_boundary}"
+
+
+class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -645,12 +654,25 @@ class Glm5NextModel(nn.Module):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        speculative_config = vllm_config.speculative_config
+        replicate_dflash_embedding = bool(
+            speculative_config is not None
+            and speculative_config.method == "dflash"
+            and pp_group.world_size > 1
+            and pp_group.is_last_rank
+        )
+        if pp_group.is_first_rank or replicate_dflash_embedding:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 prefix=f"{prefix}.embed_tokens",
             )
+            if replicate_dflash_embedding:
+                logger.info_once(
+                    "Replicating the TP-sharded target embedding on the final "
+                    "pipeline stage for DFlash2 weight sharing."
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -687,6 +709,39 @@ class Glm5NextModel(nn.Module):
             "num_attention_heads must be divisible by world_size"
         )
 
+    def _materialize_aux_hidden_state(
+        self,
+        layer: Glm5NextDecoderLayer,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Materialize the completed layer output used by DFlash2.
+
+        The optimized mHC path defers a layer's hc_post into the next layer's
+        fused post/pre kernel. DFlash2 needs the completed output at selected
+        layer boundaries, so materialize a snapshot without changing the
+        deferred state consumed by the next target layer.
+        """
+        if not self.config.mhc or residual is None:
+            return hidden_states.clone()
+
+        assert post is not None and comb is not None
+        streams = layer.hc_post(hidden_states, residual, post, comb)
+        return hc_contract(streams, self.config.mhc_num_residual_streams)
+
+    def _incoming_aux_hidden_states(
+        self, intermediate_tensors: IntermediateTensors
+    ) -> dict[int, torch.Tensor]:
+        return {
+            layer_boundary: intermediate_tensors[
+                _dflash_aux_hidden_state_key(layer_boundary)
+            ]
+            for layer_boundary in self.aux_hidden_state_layers
+            if layer_boundary <= self.start_layer
+        }
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -706,22 +761,27 @@ class Glm5NextModel(nn.Module):
             tensors["residual"] = torch.zeros(
                 (batch_size, hidden), dtype=dtype, device=device
             )
-            return IntermediateTensors(tensors)
+        else:
+            n = self.config.mhc_num_residual_streams
+            tensors.update(
+                {
+                    "residual": torch.zeros(
+                        (batch_size, n, hidden), dtype=dtype, device=device
+                    ),
+                    "post": torch.zeros(
+                        (batch_size, n, 1), dtype=torch.float32, device=device
+                    ),
+                    "comb": torch.zeros(
+                        (batch_size, n, n), dtype=torch.float32, device=device
+                    ),
+                }
+            )
 
-        n = self.config.mhc_num_residual_streams
-        tensors.update(
-            {
-                "residual": torch.zeros(
-                    (batch_size, n, hidden), dtype=dtype, device=device
-                ),
-                "post": torch.zeros(
-                    (batch_size, n, 1), dtype=torch.float32, device=device
-                ),
-                "comb": torch.zeros(
-                    (batch_size, n, n), dtype=torch.float32, device=device
-                ),
-            }
-        )
+        for layer_boundary in self.aux_hidden_state_layers:
+            if layer_boundary <= self.start_layer:
+                tensors[_dflash_aux_hidden_state_key(layer_boundary)] = torch.zeros(
+                    (batch_size, hidden), dtype=dtype, device=device
+                )
         return IntermediateTensors(tensors)
 
     def forward(
@@ -731,7 +791,7 @@ class Glm5NextModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -747,6 +807,12 @@ class Glm5NextModel(nn.Module):
             post = intermediate_tensors.tensors.get("post")
             comb = intermediate_tensors.tensors.get("comb")
 
+        aux_hidden_states = (
+            {}
+            if intermediate_tensors is None
+            else self._incoming_aux_hidden_states(intermediate_tensors)
+        )
+
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel and get_pp_group().is_first_rank:
             hidden_states = sp_shard(hidden_states)
@@ -755,6 +821,11 @@ class Glm5NextModel(nn.Module):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
             )
+            layer_boundary = layer.layer_idx + 1
+            if layer_boundary in self.aux_hidden_state_layers:
+                aux_hidden_states[layer_boundary] = self._materialize_aux_hidden_state(
+                    layer, hidden_states, residual, post, comb
+                )
 
         if not get_pp_group().is_last_rank:
             assert residual is not None
@@ -762,12 +833,26 @@ class Glm5NextModel(nn.Module):
             if self.config.mhc:
                 assert post is not None and comb is not None
                 tensors.update({"post": post, "comb": comb})
+            for layer_boundary in self.aux_hidden_state_layers:
+                if layer_boundary <= self.end_layer:
+                    tensors[_dflash_aux_hidden_state_key(layer_boundary)] = (
+                        aux_hidden_states[layer_boundary]
+                    )
             return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            aux_hidden_states = {
+                layer_boundary: sp_all_gather(value)[:full_num_tokens]
+                for layer_boundary, value in aux_hidden_states.items()
+            }
 
         hidden_states = self.norm(hidden_states)
+        if self.aux_hidden_state_layers:
+            return hidden_states, [
+                aux_hidden_states[layer_boundary]
+                for layer_boundary in self.aux_hidden_state_layers
+            ]
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -932,7 +1017,12 @@ class Glm5NextModel(nn.Module):
 
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
+    nn.Module,
+    HasInnerState,
+    SupportsPP,
+    MixtureOfExperts,
+    IsHybrid,
+    SupportsEagle3,
 ):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1050,7 +1140,7 @@ class Glm5NextForCausalLM(
     dummy_inputs=Glm4vDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid
+    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, SupportsEagle3
 ):
     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
     # multimodal wrapper must declare the same interfaces so vLLM treats it as

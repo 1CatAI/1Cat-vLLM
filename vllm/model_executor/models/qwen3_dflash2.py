@@ -263,7 +263,8 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    successors = successor_table[candidate_ids]
+    vocab_size = successor_table.shape[0]
+    successors = successor_table[candidate_ids.clamp(0, vocab_size - 1)]
     predecessor_ids = torch.cat(
         (
             anchor_token_ids[:, None, None].expand(-1, 1, top_k),
@@ -271,7 +272,7 @@ def _score_edges(
         ),
         dim=1,
     )
-    predecessors = predecessor_table[predecessor_ids]
+    predecessors = predecessor_table[predecessor_ids.clamp(0, vocab_size - 1)]
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
     )
@@ -342,8 +343,11 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
             and vllm_config.parallel_config.tensor_parallel_size == 4
-            and input_size == 25600
-            and output_size == 5120
+            and (input_size, output_size)
+            in {
+                (25600, 5120),
+                (20480, 4096),
+            }
         )
         if not use_sharded_fc:
             return super()._make_context_projection(
@@ -370,7 +374,9 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         projection._sm70_f16_max_m = 64
         logger.info_once(
             "Using TP4 output-sharded DFlash2 target-hidden projection on SM70 "
-            "(25600->5120 plus compact all-gather)."
+            "(%d->%d plus compact all-gather).",
+            input_size,
+            output_size,
         )
         return projection
 

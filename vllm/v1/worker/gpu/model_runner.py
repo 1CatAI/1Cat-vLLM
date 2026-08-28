@@ -192,7 +192,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in ("eagle3", "dflash"):
                 # EAGLE3 and DFlash may require auxiliary target hidden states.
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
+                if self.use_pp and self.speculative_config.method == "eagle3":
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."

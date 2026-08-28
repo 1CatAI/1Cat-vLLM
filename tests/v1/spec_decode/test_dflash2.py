@@ -205,7 +205,12 @@ def test_context_k_norm_falls_back_for_stale_stable_binary(monkeypatch):
     assert torch.equal(repeated, expected)
 
 
-def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(monkeypatch):
+@pytest.mark.parametrize(
+    ("input_size", "output_size"), [(25600, 5120), (20480, 4096)]
+)
+def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(
+    monkeypatch, input_size, output_size
+):
     model = _bare_dflash2_model()
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=4),
@@ -232,14 +237,14 @@ def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(monkeypatch)
 
     projection = model._make_context_projection(
         vllm_config=config,
-        input_size=25600,
-        output_size=5120,
+        input_size=input_size,
+        output_size=output_size,
         prefix="model.fc",
     )
 
     assert created["gather_output"] is True
-    assert created["input_size"] == 25600
-    assert created["output_size"] == 5120
+    assert created["input_size"] == input_size
+    assert created["output_size"] == output_size
     assert projection._sm70_f16_force_enable is True
     assert projection._sm70_f16_max_m == 64
 

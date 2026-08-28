@@ -2728,12 +2728,6 @@ class VllmConfig:
                 and self.parallel_config.pipeline_parallel_size > 1
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
-            if (
-                speculative_config.method == "dflash"
-                and self.parallel_config.pipeline_parallel_size > 1
-            ):
-                unsupported.append("DFlash with pipeline parallelism")
-
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 
