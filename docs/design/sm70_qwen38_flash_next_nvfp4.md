@@ -19,7 +19,11 @@
   current direct-NVFP4 MTP5 verifier route raises the matched HumanEval8 result
   to 150.17 tokens/s with 4.8125 mean accepted length, 95.3125% draft
   acceptance, and 8/8 semantic executions. Its steady verifier wall is 23.409
-  ms, passing the 20% reduction gate below.
+  ms, passing the 20% reduction gate below. A separate single-start,
+  official-thinking 64-prompt audit reaches 82.13 weighted pure decode
+  tokens/s, 2.671 global MTP4 mean accepted length, and 40/48 strict passes on
+  the three benchmark-valid suites. Its long-reasoning results are recorded
+  separately below and do not replace the matched greedy HumanEval8 control.
 - Integration line: public `main`; Qwen3.8 bring-up
   [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345) and initial decode work
   [#361](https://github.com/1CatAI/1Cat-vLLM/pull/361) are merged. The compact
@@ -647,6 +651,89 @@ split/reshape/concatenate work but not the dense projections, while its QSA
 indexer fuses Q normalization/RoPE/store and K compression/store. Those are
 small follow-ups only if the TP4 reduction and real endpoint still leave a
 measured gap; they are not justification for speculative model restarts.
+
+### Single-start mixed quality and long-output audit
+
+The unprofiled mixed audit at source `1caa4b0112` uses one engine startup for
+one warmup followed by 64 sequential prompts: GSM8K, MATH500, HumanEval, and
+MBPP suite indices 8--23 in round-robin order. It keeps TP4/PP1, V2, native
+MTP4, the five-row verifier, prefix caching, FP16 activations and KV cache,
+checkpoint-native NVFP4 routed weights, FlashAttention-V100/FlashQLA, and
+FULL+PIECEWISE CUDA graphs. Online QPN8 and the verifier profiler are disabled.
+Generation follows the model's sampling configuration with thinking enabled
+at `xhigh`: temperature 1.0, top-p 0.95, top-k 20, fixed sampling seed
+20260828, natural EOS enabled, and a 4096-token ceiling. The exact prompt set
+has SHA-256
+`641bc719ec195537115ee0eb2b3e8e88f38fca83c238f160739aa246c6c02c99`.
+
+The 64 scored requests emit 80,730 tokens in 1000.412 seconds. Weighted pure
+decode, calculated from per-request steady decode tokens and decode time, is
+82.132 tokens/s. The unweighted mean request rate is 95.955 tokens/s and the
+endpoint rate including prefill and request overhead is 80.697 tokens/s.
+Median/p90 TTFT are 200.86/230.75 ms and median/p90 prefill time is
+176.44/203.97 ms. The loaded extension predates the fused-SwiGLU prefill op,
+so these TTFT figures retain the standalone activation route and are not a
+final prefill baseline. Pure decode excludes that startup/prefill difference.
+
+| suite | output tokens | weighted pure decode | mean request decode | MTP4 mean accepted length | draft acceptance | natural EOS | strict quality |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GSM8K | 10,329 | 89.25 tok/s | 109.64 tok/s | 2.925 | 48.12% | 15/16 | 14/16 |
+| MATH500 | 28,434 | 85.63 tok/s | 97.54 tok/s | 2.778 | 44.46% | 12/16 | 12/16 |
+| HumanEval | 18,367 | 75.74 tok/s | 84.89 tok/s | 2.457 | 36.43% | 14/16 | 14/16 |
+| MBPP diagnostic | 23,600 | 80.64 tok/s | 91.75 tok/s | 2.627 | 40.68% | 13/16 | 12/16 semantic |
+| all | 80,730 | 82.13 tok/s | 95.95 tok/s | 2.671 | 41.78% | 54/64 | see protocol note |
+
+The strict gate requires both the task oracle and natural EOS; every
+`finish_reason=length` result fails even if a partial answer happens to pass.
+On the three valid benchmark protocols, 40/48 pass strictly. Among their 41
+naturally stopped outputs, 40 pass; the sole natural-stop error is a GSM8K
+off-by-one interpretation. MATH500's 12 natural completions and HumanEval's 14
+natural completions all pass their exact-answer or executable-test oracles.
+Ten requests reach 4096 tokens; nine remain inside `<think>`, so merely doubling
+the ceiling would risk extending runaway reasoning rather than establishing a
+better quality result.
+
+The frozen MBPP mixture exposes only its natural-language prompt while its
+hidden tests require undisclosed historical names such as `subject_marks` and
+`get_equal`. Exact-name `0/16` is therefore protocol-invalid and must not be
+reported as an MBPP benchmark score. A resource-limited diagnostic aliases
+each generated top-level callable to the hidden entrypoint and executes the
+original tests: 12/16 pass strictly, three fail the 4096-token gate, and one
+naturally stopped implementation incorrectly returns a string instead of the
+required integer. Any future accepted MBPP run must expose the required
+assertions or entrypoint in its prompt; the alias diagnostic remains explicitly
+non-official.
+
+Across all four suites, global MTP4 mean accepted length is 2.671 and draft
+acceptance is 41.777%; per-position acceptance is
+63.56%/44.38%/33.29%/25.88%. The 54 natural completions aggregate to 2.888
+accepted length, 47.207% draft acceptance, and 88.69 weighted pure decode
+tokens/s. The ten capped requests fall to 2.489, 37.228%, and 76.64 tokens/s
+and account for more verifier rounds than all natural requests combined. At
+request level, accepted length and pure decode rate have Pearson correlation
+0.995. Long stochastic reasoning therefore exposes a real acceptance-limited
+path: this 82.13-token/s result does not meet 100 tokens/s and must not be
+interchanged with the 150.17-token/s no-thinking greedy HumanEval8 contract.
+
+Prefix caching is enabled, but this round-robin workload records 2,066 queries
+and zero hits because every prompt is different and the shared ChatML prefix
+is shorter than one aligned cache block. The run hits V2, FlashAttention-V100,
+FlashQLA GDN, exact M=5 routing, direct NVFP4 experts, local draft argmax,
+MTP index sharing, and the 25-KiB TP4 push all-reduce route. Four runtime Triton
+JIT warnings occur only in the warmup request; no later quality request adds a
+JIT warning.
+
+Peak sampled device memory is 30,473 MiB on each GPU. Minimum host
+`MemAvailable` is 45.195 GiB and minimum free swap is 246.376 GiB. After exit,
+all eight GPUs are at 5 MiB, host available memory is about 119 GiB, free swap
+is about 254 GiB, and no engine or worker remains. Python reports four
+semaphore and two shared-memory objects to the resource tracker at shutdown,
+but it cleans them during exit; the post-run resource check shows no retained
+host or device leak.
+
+The complete result, contract, one-second GPU/host samples, strict audit, and
+per-case hashes are under
+`.artifacts/qwen38_mtp4_verifier_m5/mtp5_direct_mixed64_s8_23_official_xhigh_max4096_gpu0123*`.
 
 ## Acceptance gates
 
