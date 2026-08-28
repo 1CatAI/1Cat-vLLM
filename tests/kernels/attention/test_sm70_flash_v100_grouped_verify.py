@@ -128,16 +128,19 @@ def _reference(
         (16, 6, 506, False),
         (16, 8, 1016, False),
         (16, 16, 1008, True),
+        (16, 32, 992, True),
         (16, 3, 1025, True),
         (784, 5, 2049, True),
         (1648, 8, 4097, True),
         (1648, 16, 4089, True),
         (1728, 8, 4097, True),
         (1728, 16, 4089, True),
+        (1888, 32, 4073, True),
         (3296, 8, 8193, True),
         (3296, 16, 8185, True),
         (3456, 8, 8193, True),
         (3456, 16, 8185, True),
+        (3776, 32, 8169, True),
     ],
 )
 @torch.inference_mode()
@@ -224,7 +227,7 @@ def test_grouped_verify_matches_fp32_reference_with_random_pages(
     torch.testing.assert_close(one_pass, two_pass, atol=6.2e-5, rtol=2.0e-3)
 
 
-@pytest.mark.parametrize("query_len", [8, 16])
+@pytest.mark.parametrize("query_len", [8, 16, 32])
 @torch.inference_mode()
 def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len(
     query_len: int,

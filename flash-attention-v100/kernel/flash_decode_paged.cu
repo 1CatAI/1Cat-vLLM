@@ -1777,16 +1777,17 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
 // It remains a numerical oracle for the production one-pass register-rescale
 // variant, which loads K once and preserves the same online-softmax/PV result.
 //
-// The verifier shape has one KV head and six query heads. Keep each CTA at 48
-// rows for both supported widths: q8 packs six heads in one CTA, while q16
-// packs three heads in each of two CTAs. The q16 route halves the number of
-// context splits, preserving eighty CTAs and the q8 workspace byte count.
+// The verifier shape has one KV head and six query heads. Keep each q8/q16 CTA
+// at 48 rows: q8 packs six heads in one CTA, while q16 packs three heads in
+// each of two CTAs. q32 uses 64 rows (two heads per CTA) and three head groups.
+// Its 27 context splits launch 81 CTAs, preserving one wave across V100's 80
+// SMs without reloading K/V independently for all 32 verifier rows.
 constexpr int kGroupedVerifyQ8MaxQ = 8;
 constexpr int kGroupedVerifyQ16MaxQ = 16;
-constexpr int kGroupedVerifyMaxSupportedQ = kGroupedVerifyQ16MaxQ;
+constexpr int kGroupedVerifyQ32MaxQ = 32;
+constexpr int kGroupedVerifyMaxSupportedQ = kGroupedVerifyQ32MaxQ;
 constexpr int kGroupedVerifyHeads = 6;
 constexpr int kGroupedVerifyHeadDim = 256;
-constexpr int kGroupedVerifyRows = 48;
 constexpr int kGroupedVerifyBlockN = 32;
 constexpr int kGroupedVerifyQStride = 264;
 constexpr int kGroupedVerifyKVStride = 264;
@@ -1797,8 +1798,8 @@ constexpr int kGroupedVerifyPageIdsCapacity = 16;
 // each of V100's eighty SMs. Short sequences still reduce active_splits using
 // kGroupedVerifyMinTokensPerSplit inside the captured graph.
 constexpr int kGroupedVerifyQ8Splits = 80;
-constexpr int kGroupedVerifyWorkspaceRows =
-    kGroupedVerifyQ8MaxQ * kGroupedVerifyQ8Splits;
+constexpr int kGroupedVerifyQ16Splits = 40;
+constexpr int kGroupedVerifyQ32Splits = 27;
 // A packed CTA replaces two 256-thread head-group CTAs and can occupy only one
 // SM. Use 64-token chunks to expose enough short-context parallelism without
 // paying one split reduction per N32 tile; longer contexts saturate at the
@@ -1809,49 +1810,56 @@ constexpr int kGroupedVerifySingleQueryMinTokensPerSplit = 128;
 constexpr int kGroupedVerifyShortContextMaxTokens = 128;
 constexpr int kGroupedVerifyThreads = 512;
 constexpr int kGroupedVerifyWarps = kGroupedVerifyThreads / kWarpSize;
-constexpr int kGroupedVerifyQKWarps =
-    (kGroupedVerifyRows / 16) * (kGroupedVerifyBlockN / 16);
-constexpr int kGroupedVerifyOutputTiles =
-    (kGroupedVerifyRows / 16) * (kGroupedVerifyHeadDim / 16);
-constexpr int kGroupedVerifyOutputTilesPerWarp =
-    kGroupedVerifyOutputTiles / kGroupedVerifyWarps;
 
 template <int MAX_QUERY_TOKENS>
 struct GroupedVerifyTraits {
   static_assert(MAX_QUERY_TOKENS == kGroupedVerifyQ8MaxQ ||
-                    MAX_QUERY_TOKENS == kGroupedVerifyQ16MaxQ,
-                "grouped verifier supports q8 and q16 workspaces only");
-  static constexpr int kHeadsPerCta = kGroupedVerifyRows / MAX_QUERY_TOKENS;
+                    MAX_QUERY_TOKENS == kGroupedVerifyQ16MaxQ ||
+                    MAX_QUERY_TOKENS == kGroupedVerifyQ32MaxQ,
+                "grouped verifier supports q8, q16, and q32 workspaces only");
+  static constexpr int kRows =
+      MAX_QUERY_TOKENS == kGroupedVerifyQ32MaxQ ? 64 : 48;
+  static constexpr int kHeadsPerCta = kRows / MAX_QUERY_TOKENS;
   static constexpr int kHeadGroups = kGroupedVerifyHeads / kHeadsPerCta;
-  static constexpr int kSplits = kGroupedVerifyWorkspaceRows / MAX_QUERY_TOKENS;
-  static_assert(MAX_QUERY_TOKENS * kHeadsPerCta == kGroupedVerifyRows,
-                "grouped verifier CTA must retain 48 rows");
+  static constexpr int kSplits =
+      MAX_QUERY_TOKENS == kGroupedVerifyQ8MaxQ
+          ? kGroupedVerifyQ8Splits
+          : (MAX_QUERY_TOKENS == kGroupedVerifyQ16MaxQ
+                 ? kGroupedVerifyQ16Splits
+                 : kGroupedVerifyQ32Splits);
+  static constexpr int kOutputTiles =
+      (kRows / 16) * (kGroupedVerifyHeadDim / 16);
+  static constexpr int kOutputTilesPerWarp =
+      kOutputTiles / kGroupedVerifyWarps;
+  static_assert(MAX_QUERY_TOKENS * kHeadsPerCta == kRows,
+                "grouped verifier CTA rows must contain whole query heads");
   static_assert(kGroupedVerifyHeads % kHeadsPerCta == 0,
                 "query heads must divide evenly across grouped CTAs");
-  static_assert(kSplits * MAX_QUERY_TOKENS == kGroupedVerifyWorkspaceRows,
-                "q8 and q16 workspaces must have equal element counts");
+  static_assert(kOutputTiles % kGroupedVerifyWarps == 0,
+                "output tiles must divide evenly across warps");
 };
 
+template <int ROWS>
 struct alignas(256) GroupedVerifySmem {
   union {
     struct {
-      alignas(16) __half q[kGroupedVerifyRows * kGroupedVerifyQStride];
+      alignas(16) __half q[ROWS * kGroupedVerifyQStride];
       alignas(16) __half kv[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
-      alignas(16) float scores[kGroupedVerifyRows * kGroupedVerifyScoreStride];
-      alignas(16) __half probs[kGroupedVerifyRows * kGroupedVerifyProbStride];
+      alignas(16) float scores[ROWS * kGroupedVerifyScoreStride];
+      alignas(16) __half probs[ROWS * kGroupedVerifyProbStride];
     } compute;
-    alignas(16) float output[kGroupedVerifyRows * kGroupedVerifyHeadDim];
+    alignas(16) float output[ROWS * kGroupedVerifyHeadDim];
   } storage;
-  alignas(16) float row_max[kGroupedVerifyRows];
-  alignas(16) float row_sum[kGroupedVerifyRows];
-  alignas(16) float row_scale[kGroupedVerifyRows];
+  alignas(16) float row_max[ROWS];
+  alignas(16) float row_sum[ROWS];
+  alignas(16) float row_scale[ROWS];
   alignas(16) int page_ids[kGroupedVerifyPageIdsCapacity];
 };
 
-static_assert(sizeof(GroupedVerifySmem) <= 64 * 1024,
-              "packed grouped verifier must fit Volta's 64 KiB opt-in budget");
-static_assert(kGroupedVerifyOutputTiles % kGroupedVerifyWarps == 0,
-              "output tiles must divide evenly across warps");
+static_assert(sizeof(GroupedVerifySmem<48>) <= 64 * 1024,
+              "q8/q16 verifier must fit Volta's 64 KiB opt-in budget");
+static_assert(sizeof(GroupedVerifySmem<64>) <= 96 * 1024,
+              "q32 verifier must fit Volta's 96 KiB opt-in budget");
 
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
 __device__ __forceinline__ int grouped_verify_active_splits(
@@ -1869,11 +1877,14 @@ __device__ __forceinline__ int grouped_verify_active_splits(
   return total_kv <= kGroupedVerifyShortContextMaxTokens ? 1 : active_splits;
 }
 
+template <int ROWS>
 __device__ __forceinline__ void grouped_verify_qk(
     const __half* __restrict__ shared_q, const __half* __restrict__ shared_k,
     float* __restrict__ shared_scores, const float qk_scale) {
   const int warp_id = threadIdx.x / kWarpSize;
-  if (warp_id >= kGroupedVerifyQKWarps) {
+  constexpr int kQKWarps =
+      (ROWS / 16) * (kGroupedVerifyBlockN / 16);
+  if (warp_id >= kQKWarps) {
     return;
   }
 
@@ -1973,8 +1984,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   const int lane_id = tid % kWarpSize;
 
   extern __shared__ char grouped_verify_smem_raw[];
-  GroupedVerifySmem& smem =
-      *reinterpret_cast<GroupedVerifySmem*>(grouped_verify_smem_raw);
+  GroupedVerifySmem<Traits::kRows>& smem =
+      *reinterpret_cast<GroupedVerifySmem<Traits::kRows>*>(
+          grouped_verify_smem_raw);
   __half* shared_q = smem.storage.compute.q;
   __half* shared_kv = smem.storage.compute.kv;
   float* shared_scores = smem.storage.compute.scores;
@@ -2006,7 +2018,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   constexpr int kSharedQVecsPerRow = kGroupedVerifyQStride / 8;
   const uint4* q_vec = reinterpret_cast<const uint4*>(q);
   uint4* shared_q_vec = reinterpret_cast<uint4*>(shared_q);
-  for (int idx = tid; idx < kGroupedVerifyRows * kVecsPerRow;
+  for (int idx = tid; idx < Traits::kRows * kVecsPerRow;
        idx += kGroupedVerifyThreads) {
     const int row = idx / kVecsPerRow;
     const int vec_col = idx % kVecsPerRow;
@@ -2021,7 +2033,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       shared_q_vec[row * kSharedQVecsPerRow + vec_col] = make_uint4(0, 0, 0, 0);
     }
   }
-  if (tid < kGroupedVerifyRows) {
+  if (tid < Traits::kRows) {
     smem.row_max[tid] = kXQANegInf;
     smem.row_sum[tid] = 0.0f;
     smem.row_scale[tid] = 1.0f;
@@ -2033,9 +2045,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
 
   volta::fragment<volta::accumulator, 16, 16, 16, float>
-      output_fragments[kGroupedVerifyOutputTilesPerWarp];
+      output_fragments[Traits::kOutputTilesPerWarp];
 #pragma unroll
-  for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp;
+  for (int fragment_idx = 0; fragment_idx < Traits::kOutputTilesPerWarp;
        ++fragment_idx) {
     volta::fill_fragment(output_fragments[fragment_idx], 0.0f);
   }
@@ -2063,11 +2075,12 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       }
       __syncthreads();
 
-      grouped_verify_qk(shared_q, shared_kv, shared_scores, qk_scale);
+      grouped_verify_qk<Traits::kRows>(shared_q, shared_kv, shared_scores,
+                                       qk_scale);
       __syncthreads();
 
 #pragma unroll
-      for (int row = warp_id; row < kGroupedVerifyRows;
+      for (int row = warp_id; row < Traits::kRows;
            row += kGroupedVerifyWarps) {
         const int token_idx = row / Traits::kHeadsPerCta;
         const int local_head = row % Traits::kHeadsPerCta;
@@ -2121,11 +2134,12 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     }
     __syncthreads();
 
-    grouped_verify_qk(shared_q, shared_kv, shared_scores, qk_scale);
+    grouped_verify_qk<Traits::kRows>(shared_q, shared_kv, shared_scores,
+                                     qk_scale);
     __syncthreads();
 
     if constexpr (TWO_PASS) {
-      for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyBlockN;
+      for (int idx = tid; idx < Traits::kRows * kGroupedVerifyBlockN;
            idx += kGroupedVerifyThreads) {
         const int row = idx / kGroupedVerifyBlockN;
         const int col = idx % kGroupedVerifyBlockN;
@@ -2149,7 +2163,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       __syncthreads();
     } else {
 #pragma unroll
-      for (int row = warp_id; row < kGroupedVerifyRows;
+      for (int row = warp_id; row < Traits::kRows;
            row += kGroupedVerifyWarps) {
         const int token_idx = row / Traits::kHeadsPerCta;
         const int local_head = row % Traits::kHeadsPerCta;
@@ -2184,7 +2198,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       __syncthreads();
 #pragma unroll
       for (int fragment_idx = 0;
-           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+           fragment_idx < Traits::kOutputTilesPerWarp; ++fragment_idx) {
         const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
         const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
         grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
@@ -2206,7 +2220,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     __syncthreads();
 
 #pragma unroll
-    for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp;
+    for (int fragment_idx = 0; fragment_idx < Traits::kOutputTilesPerWarp;
          ++fragment_idx) {
       const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
       const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
@@ -2237,7 +2251,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   __syncthreads();
   float* shared_output = smem.storage.output;
 #pragma unroll
-  for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp;
+  for (int fragment_idx = 0; fragment_idx < Traits::kOutputTilesPerWarp;
        ++fragment_idx) {
     const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
     const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
@@ -2249,7 +2263,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   }
   __syncthreads();
 
-  for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyHeadDim;
+  for (int idx = tid; idx < Traits::kRows * kGroupedVerifyHeadDim;
        idx += kGroupedVerifyThreads) {
     const int row = idx / kGroupedVerifyHeadDim;
     const int d = idx % kGroupedVerifyHeadDim;
@@ -2268,7 +2282,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       partial_out[output_idx] = __float2half_rn(shared_output[idx] * scale);
     }
   }
-  if (tid < kGroupedVerifyRows) {
+  if (tid < Traits::kRows) {
     const int token_idx = tid / Traits::kHeadsPerCta;
     const int local_head = tid % Traits::kHeadsPerCta;
     const int head_idx = head_start + local_head;
@@ -3542,12 +3556,19 @@ at::Tensor flash_attention_grouped_verify_paged(
                   q.size(0) <= kGroupedVerifyMaxSupportedQ &&
                   q.size(1) == kGroupedVerifyHeads &&
                   q.size(2) == kGroupedVerifyHeadDim,
-              "grouped verify q must have shape [1..16, 6, 256]");
-  const bool wide_query = q.size(0) > kGroupedVerifyQ8MaxQ;
+              "grouped verify q must have shape [1..32, 6, 256]");
+  const bool q32_query = q.size(0) > kGroupedVerifyQ16MaxQ;
+  const bool q16_query = q.size(0) > kGroupedVerifyQ8MaxQ && !q32_query;
   const int max_query_tokens =
-      wide_query ? kGroupedVerifyQ16MaxQ : kGroupedVerifyQ8MaxQ;
-  const int grouped_splits = kGroupedVerifyWorkspaceRows / max_query_tokens;
-  const int heads_per_cta = kGroupedVerifyRows / max_query_tokens;
+      q32_query ? kGroupedVerifyQ32MaxQ
+                : (q16_query ? kGroupedVerifyQ16MaxQ
+                             : kGroupedVerifyQ8MaxQ);
+  const int grouped_splits =
+      q32_query ? kGroupedVerifyQ32Splits
+                : (q16_query ? kGroupedVerifyQ16Splits
+                             : kGroupedVerifyQ8Splits);
+  const int grouped_rows = q32_query ? 64 : 48;
+  const int heads_per_cta = grouped_rows / max_query_tokens;
   const int head_groups = kGroupedVerifyHeads / heads_per_cta;
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 &&
                   k_cache.sizes() == v_cache.sizes() && k_cache.size(1) > 0 &&
@@ -3570,11 +3591,12 @@ at::Tensor flash_attention_grouped_verify_paged(
                   at::IntArrayRef({grouped_splits, max_query_tokens,
                                    kGroupedVerifyHeads, kGroupedVerifyHeadDim}),
               "partial_out must have shape [80, 8, 6, 256] or "
-              "[40, 16, 6, 256]");
+              "[40, 16, 6, 256] or [27, 32, 6, 256]");
   TORCH_CHECK(
       partial_lse.sizes() == at::IntArrayRef({grouped_splits, max_query_tokens,
                                               kGroupedVerifyHeads}),
-      "partial_lse must have shape [80, 8, 6] or [40, 16, 6]");
+      "partial_lse must have shape [80, 8, 6], [40, 16, 6], or "
+      "[27, 32, 6]");
   TORCH_CHECK(k_scale > 0.0f && v_scale > 0.0f,
               "grouped verify E5M2 K/V scales must be positive");
 
@@ -3598,11 +3620,13 @@ at::Tensor flash_attention_grouped_verify_paged(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const dim3 partial_grid(head_groups, grouped_splits, 1);
-  const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
 #define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
                                       STAGE_PAGE_IDS)                          \
   do {                                                                         \
+    constexpr size_t partial_shared_mem =                                      \
+        sizeof(GroupedVerifySmem<                                              \
+               GroupedVerifyTraits<MAX_QUERY_TOKENS>::kRows>);                 \
     auto partial_kernel =                                                      \
         (void*)flash_attention_grouped_verify_e5m2_partial_kernel<             \
             MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,               \
@@ -3675,9 +3699,17 @@ at::Tensor flash_attention_grouped_verify_paged(
   } while (0)
 
   const bool single_query = q.size(0) == 1;
-  if (wide_query && one_pass) {
+  if (q32_query && one_pass) {
+    // q32 is admitted only by the lookup-chain path and currently uses the
+    // runtime-stride layout. Avoid compiling irrelevant legacy page variants.
+    LAUNCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ32MaxQ, false, 0, false,
+                                  false, false);
+  } else if (q32_query) {
+    LAUNCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ32MaxQ, true, 0, false, false,
+                                  false);
+  } else if (q16_query && one_pass) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, false, false);
-  } else if (wide_query) {
+  } else if (q16_query) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, true, false);
   } else if (one_pass && single_query) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, false, true);
@@ -3700,7 +3732,9 @@ at::Tensor flash_attention_grouped_verify_paged(
           partial_lse.data_ptr<float>(), seq_lens.data_ptr<int>(),     \
           reinterpret_cast<__half*>(out.data_ptr()),                   \
           static_cast<int>(q.size(0)))
-  if (wide_query) {
+  if (q32_query) {
+    LAUNCH_GROUPED_VERIFY_COMBINE(kGroupedVerifyQ32MaxQ, false);
+  } else if (q16_query) {
     LAUNCH_GROUPED_VERIFY_COMBINE(kGroupedVerifyQ16MaxQ, false);
   } else if (single_query) {
     LAUNCH_GROUPED_VERIFY_COMBINE(kGroupedVerifyQ8MaxQ, true);

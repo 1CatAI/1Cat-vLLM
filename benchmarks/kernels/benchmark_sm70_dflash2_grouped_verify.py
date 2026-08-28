@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Microbenchmark the SM70 q8/q16 grouped DFlash2 verifier."""
+"""Microbenchmark the SM70 q8/q16/q32 grouped DFlash2 verifier."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def _capture(fn: Callable[[], object]) -> torch.cuda.CUDAGraph:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query-lens", type=int, nargs="+", default=[8, 16])
+    parser.add_argument("--query-lens", type=int, nargs="+", default=[8, 16, 32])
     parser.add_argument(
         "--prefix-lens", type=int, nargs="+", default=[1024, 32768, 128000]
     )

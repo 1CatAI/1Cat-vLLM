@@ -3053,6 +3053,14 @@ def _build_ddtree_visibility_mask(
     return visible
 
 
+def _dflash2_grouped_target_width_supported(
+    num_speculative_tokens: int | None,
+    draft_model_tokens: int,
+) -> bool:
+    """Return whether the selector target has a native grouped graph width."""
+    return draft_model_tokens == 7 and num_speculative_tokens in (7, 15, 31)
+
+
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     """Attach CPU metadata for the dense prefill path."""
 
@@ -3100,8 +3108,10 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._is_dflash_selector_target = bool(
             use_dflash
             and not self._is_speculative_draft_model
-            and getattr(spec_config, "num_speculative_tokens", None) in (7, 15)
-            and get_dflash_model_draft_tokens(spec_config) == 7
+            and _dflash2_grouped_target_width_supported(
+                getattr(spec_config, "num_speculative_tokens", None),
+                get_dflash_model_draft_tokens(spec_config),
+            )
             and selector_engine
         )
         self._use_sm70_dflash2_fused_smallq_metadata = bool(
@@ -5180,7 +5190,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and num_query_tokens in (8, 16)
+            and num_query_tokens in (8, 16, 32)
             and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
@@ -5188,10 +5198,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.ndim == 4
             and key_cache.device == query.device
             and value_cache.device == query.device
-            # q15 LABD increases the aligned hybrid-cache page from the
-            # block-8 service's 1648/3296 layout to 1728/3456. The grouped
-            # operator's runtime-stride implementation is exact for both.
-            and key_cache.shape[1] in (1648, 1728, 3296, 3456)
+            # Wider LABD graphs increase the aligned hybrid-cache page from
+            # block-8's 1648/3296 layout to q16's 1728/3456 and q32's
+            # 1888/3776 layouts. The grouped operator is exact for all three.
+            and key_cache.shape[1] in (1648, 1728, 1888, 3296, 3456, 3776)
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
             and key_cache.dtype == torch.uint8

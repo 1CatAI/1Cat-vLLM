@@ -517,12 +517,12 @@ def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
     if workspace is None:
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
-                (80, 8, 6, 256),
+                (27 * 32, 6, 256),
                 dtype=torch.float16,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (80, 8, 6),
+                (27 * 32, 6),
                 dtype=torch.float32,
                 device=q.device,
             ),
@@ -1036,12 +1036,13 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
 ) -> torch.Tensor:
-    """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
+    """Exact grouped q8/q16/q32 H6/D256 DFlash2 verifier for SM70.
 
     The native entry keeps all causal verifier rows together and reuses each
     paged-KV scan across a packed GQA group. q8 uses one six-head group and q16
-    uses two three-head groups, retaining 48 rows per CTA and the same workspace
-    byte count. Workspaces are stream-local and CUDA-graph safe.
+    uses two three-head groups, retaining 48 rows per CTA. q32 uses three
+    two-head groups with 64 rows per CTA. Workspaces are stream-local and
+    CUDA-graph safe.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1050,12 +1051,19 @@ def flash_attn_grouped_verify_paged(
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
     workspace = _get_grouped_verify_workspace(q)
-    if q.shape[0] > 8:
-        partial_out = workspace.partial_out.view(40, 16, 6, 256)
-        partial_lse = workspace.partial_lse.view(40, 16, 6)
+    if q.shape[0] > 16:
+        splits, max_query_tokens = 27, 32
+    elif q.shape[0] > 8:
+        splits, max_query_tokens = 40, 16
     else:
-        partial_out = workspace.partial_out
-        partial_lse = workspace.partial_lse
+        splits, max_query_tokens = 80, 8
+    workspace_rows = splits * max_query_tokens
+    partial_out = workspace.partial_out[:workspace_rows].view(
+        splits, max_query_tokens, 6, 256
+    )
+    partial_lse = workspace.partial_lse[:workspace_rows].view(
+        splits, max_query_tokens, 6
+    )
     return flash_attn_v100_cuda.grouped_verify_paged_fwd(
         q,
         k_cache,

@@ -1703,8 +1703,10 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
     assert torch.all(output == 1)
 
 
-@pytest.mark.parametrize("query_len", [8, 16])
-@pytest.mark.parametrize("page_size", [3296, 3456])
+@pytest.mark.parametrize(
+    ("query_len", "page_size"),
+    [(8, 3296), (16, 3456), (32, 3776)],
+)
 def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     query_len: int, page_size: int
 ):
@@ -1788,6 +1790,34 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
     assert captured["one_pass"] is True
     assert torch.all(output == 1)
+
+
+@pytest.mark.parametrize(
+    ("num_speculative_tokens", "draft_model_tokens", "expected"),
+    [
+        (7, 7, True),
+        (15, 7, True),
+        (31, 7, True),
+        (8, 7, False),
+        (31, 15, False),
+    ],
+)
+def test_flash_v100_dflash2_grouped_target_width_supported(
+    num_speculative_tokens: int,
+    draft_model_tokens: int,
+    expected: bool,
+) -> None:
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _dflash2_grouped_target_width_supported,
+    )
+
+    assert (
+        _dflash2_grouped_target_width_supported(
+            num_speculative_tokens,
+            draft_model_tokens,
+        )
+        is expected
+    )
 
 
 def test_flash_v100_decode_forwards_shape_hints():
