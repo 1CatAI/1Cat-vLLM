@@ -57,6 +57,19 @@ at::Tensor flash_attention_grouped_verify_paged(
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool one_pass);
 
+at::Tensor flash_attention_grouped_sparse_page4(
+    const at::Tensor& q, const at::Tensor& k_cache,
+    const at::Tensor& v_cache, std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table, const at::Tensor& token_masks,
+    const at::Tensor& seq_lens, at::Tensor& lse,
+    const float softmax_scale);
+
+at::Tensor flash_attention_grouped_sparse_page4_plan(
+    const at::Tensor& logical_indices, const at::Tensor& block_table,
+    const at::Tensor& token_to_req, at::Tensor& output_blocks,
+    at::Tensor& output_masks, at::Tensor& output_seq_lens,
+    const int page_size, const int physical_page_stride);
+
 at::Tensor flash_attention_decode_paged_wmma(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,

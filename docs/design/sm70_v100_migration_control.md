@@ -130,6 +130,66 @@ Goal:
   [long-context result](https://github.com/yangzhuxinyzx/1Cat-vLLM-private/pull/23#issuecomment-5437096030)
   comments.
 
+### Grouped Page4 QSA follow-up, 2026-08-28
+
+- Review scope is public Draft PR #378 on
+  `codex/v100-qwen38-qsa-paged-prefill-20260828-041420`, based on public
+  `main@0ca71115639bb4ddad7c7a818825c1261cd7433e`. The frozen endpoint route
+  remains TP4/V2/ModelOpt NVFP4/FP16 activations and KV/no MTP, with 8192-token
+  chunked prefill. The retained BN16 endpoint baseline is
+  `4532.07/4446.64/4108.16 tok/s` at 32K/64K/131K; do not compare short route
+  probes or TTFT-inclusive numbers against it.
+- The retained 8192-token Nsight Systems capture makes selected QSA the first
+  optimization target: `55.151 ms` per layer/rank and `36.42%` of kernel time.
+  GEMM is about `35.8%`, TP collectives about `12.8%`, and the main GDN kernel
+  `3.11%`. Nsight Compute counters remain unavailable to this user with
+  `ERR_NVGPUCTRPERM`; do not repeat the counter attempt or change host policy
+  for this campaign.
+- Upstream audits found no drop-in SM70 kernel. FlashInfer PRs
+  [#4474](https://github.com/flashinfer-ai/flashinfer/pull/4474) and
+  [#4689](https://github.com/flashinfer-ai/flashinfer/pull/4689) provide the
+  useful BSR/KV256 and weight-stationary scheduling ideas, but target SM75+
+  and assume one semantic query block shares one sparse row. SGLang PR
+  [#36497](https://github.com/sgl-project/sglang/pull/36497) and vLLM PR
+  [#53896](https://github.com/vllm-project/vllm/pull/53896) retain a direct
+  per-row Triton QSA prefill kernel. Qwen TP4 has six query heads, D256, and
+  different top-k sets per row, so exact cross-query masks are required.
+- The retained production-layout Page4 partition sweep admits P1024 without
+  changing the 192-thread/two-CTA-per-SM resource contract. P256/P512/P1024
+  measure `30.742/29.361/28.769 ms`; P1024 is `6.4%` faster than P256 with
+  maximum absolute error `0.000244140625` and relative L2 about `3.95e-4`.
+  This is the fallback for large rows that cannot use grouped planning.
+- The grouped candidate assigns one CTA to eight adjacent query rows and six
+  heads, reusing each unioned FP16 K/V Page4 block. A 32-bit mask carries four
+  token bits for each of eight queries, preserving different top-k sets and
+  causal tails exactly. Real retained selection diagnostics are `81.92%`
+  adjacent-row overlap and `54.88%` at gap four; the admission microbenchmark
+  uses a 1163-page union matching both values, rather than assuming one common
+  set across all eight rows.
+- The GPU planner uses a per-group 8192-entry shared-memory hash table. It
+  resolves physical pages for every request independently, unions all rows,
+  and groups output by the seven possible active WMMA row-tile masks. Category
+  boundaries are padded to eight Page4 blocks so a 32-token kernel tile never
+  mixes categories. A deterministic block-wide prefix orders entries by hash
+  slot; four replays produce bitwise-identical tables and outputs. The earlier
+  shared-atomic ordering is rejected despite a slightly lower median because
+  it varied by one FP16 ULP across replays.
+- The final isolated route, including Python dispatch, GPU planning, padding,
+  and grouped attention, measures `16.132 ms` median (`15.588 ms` minimum)
+  versus Triton `55.940 ms`, a `3.468x` speedup. Maximum absolute error is
+  `0.0001220703125`, relative L2 `3.535e-4`, and cosine
+  `0.9999998807907104`. The standalone planner is about `0.32 ms`; its exact
+  group-0 block/mask dictionary matches the reference. Focused Python tests
+  are `10 passed`, and the SM70 extension builds successfully with zero local
+  memory for the grouped kernel.
+- These are kernel-admission results, not an endpoint claim. One guarded TP4
+  startup must still run the matching quality and 32K/64K/131K cases, then
+  selectively capture only one warmed 8192-token repeat. Re-rank all hotspots
+  after that trace: the next optimization target may be NVFP4 MoE/GEMM, TP
+  communication, GDN, or launch gaps rather than QSA. The benchmark harness
+  accepts `--cuda-profile-case` so endpoint cases can run outside the profiler
+  range in the same loaded engine.
+
 ## Active MRV2 DFlash2 campaign, 2026-08-20
 
 - Integration base: `onecat/main@7aede2cf010d92815c9d7bff25867b4fa009b6cb`.

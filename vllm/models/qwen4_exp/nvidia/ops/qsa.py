@@ -31,12 +31,27 @@ _SM70_QSA_XQA_PAGE4 = os.getenv("VLLM_SM70_QSA_XQA_PAGE4", "1") == "1"
 _SM70_QSA_XQA_PAGE4_MIN_ROWS = int(
     os.getenv("VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS", "4096")
 )
-_SM70_QSA_XQA_PAGE4_PARTITION = 256
+_SM70_QSA_XQA_PAGE4_PARTITION = 1024
 _SM70_QSA_XQA_PAGE4_PAGES = 513
 _SM70_QSA_XQA_PAGE4_MARKER = 1 << 30
+_SM70_QSA_GROUPED_PAGE4 = os.getenv("VLLM_SM70_QSA_GROUPED_PAGE4", "1") == "1"
+_SM70_QSA_GROUPED_PAGE4_QUERIES = 8
+_SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES = (
+    _SM70_QSA_XQA_PAGE4_PAGES * _SM70_QSA_GROUPED_PAGE4_QUERIES + 56
+)
 _SM70_QSA_XQA_PAGE4_WORKSPACES: dict[
     tuple[int, int, int, int, int],
     tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+_SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
+    tuple[int, int],
+    tuple[
+        int,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
 ] = {}
 
 
@@ -1427,6 +1442,126 @@ def _qsa_xqa_page4_workspace(
     )
 
 
+def _qsa_grouped_page4_workspace(
+    q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    groups = q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
+    key = (device_index, stream_id)
+    workspace = _SM70_QSA_GROUPED_PAGE4_WORKSPACES.get(key)
+    if workspace is None or workspace[0] < groups:
+        capacity = 1 << (groups - 1).bit_length()
+        grouped_pages = torch.empty(
+            (capacity, _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        token_masks = torch.empty(
+            (capacity, _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES),
+            dtype=torch.uint32,
+            device=q.device,
+        )
+        grouped_sequence_lengths = torch.empty(
+            (capacity,), dtype=torch.int32, device=q.device
+        )
+        lse = torch.empty(
+            (capacity * _SM70_QSA_GROUPED_PAGE4_QUERIES, q.shape[1]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        workspace = (
+            capacity,
+            grouped_pages,
+            token_masks,
+            grouped_sequence_lengths,
+            lse,
+        )
+        _SM70_QSA_GROUPED_PAGE4_WORKSPACES[key] = workspace
+    _, grouped_pages, token_masks, grouped_sequence_lengths, lse = workspace
+    return (
+        grouped_pages[:groups],
+        token_masks[:groups],
+        grouped_sequence_lengths[:groups],
+        lse[: q.shape[0]],
+    )
+
+
+def _qsa_xqa_page4_physical_kv(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    microblock_stride = 4 * q.shape[2]
+    if k_cache.stride(0) == k_cache.shape[1] * q.shape[2]:
+        microblocks_per_cache_block = k_cache.shape[1] // 4
+        physical_k_cache = k_cache.view(
+            k_cache.shape[0] * microblocks_per_cache_block,
+            4,
+            1,
+            q.shape[2],
+        )
+        physical_v_cache = v_cache.view_as(physical_k_cache)
+    else:
+        # The local FlashAttention ABI interleaves K and V inside every
+        # physical cache block. The virtual page IDs carry that doubled block
+        # stride, while this narrow view exposes a four-token page stride.
+        physical_shape = (k_cache.shape[0], 4, 1, q.shape[2])
+        physical_strides = (
+            microblock_stride,
+            q.shape[2],
+            q.shape[2],
+            1,
+        )
+        physical_k_cache = k_cache.as_strided(physical_shape, physical_strides)
+        physical_v_cache = v_cache.as_strided(physical_shape, physical_strides)
+    return physical_k_cache, physical_v_cache
+
+
+def _qsa_sparse_paged_attention_sm70_grouped_page4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor,
+    flash_attn_v100_cuda,
+) -> torch.Tensor:
+    grouped_pages, token_masks, grouped_sequence_lengths, lse = (
+        _qsa_grouped_page4_workspace(q)
+    )
+    physical_page_stride = k_cache.stride(0) // (4 * q.shape[2])
+    flash_attn_v100_cuda.grouped_sparse_page4_plan_fwd(
+        logical_indices,
+        block_table,
+        token_to_req,
+        grouped_pages,
+        token_masks,
+        grouped_sequence_lengths,
+        k_cache.shape[1],
+        physical_page_stride,
+    )
+    physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
+    flash_attn_v100_cuda.grouped_sparse_page4_fwd(
+        q,
+        physical_k_cache,
+        physical_v_cache,
+        out,
+        grouped_pages,
+        token_masks,
+        grouped_sequence_lengths,
+        lse,
+        q.shape[2] ** -0.5,
+    )
+    logger.info_once(
+        "Using SM70 grouped QSA Flash-V100 page4 prefill route (rows=%d, groups=%d).",
+        q.shape[0],
+        q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES,
+    )
+    return out
+
+
 def _qsa_sparse_paged_attention_sm70_xqa_page4(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1453,6 +1588,25 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         )
         return None
 
+    grouped_bindings_available = hasattr(
+        flash_attn_v100_cuda, "grouped_sparse_page4_plan_fwd"
+    ) and hasattr(flash_attn_v100_cuda, "grouped_sparse_page4_fwd")
+    if (
+        _SM70_QSA_GROUPED_PAGE4
+        and q.shape[0] % _SM70_QSA_GROUPED_PAGE4_QUERIES == 0
+        and grouped_bindings_available
+    ):
+        return _qsa_sparse_paged_attention_sm70_grouped_page4(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            flash_attn_v100_cuda,
+        )
+
     virtual_block_table, xqa_sequence_lengths = _qsa_xqa_page4_block_table(
         logical_indices,
         block_table,
@@ -1467,30 +1621,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     temporary_output, max_logits, exp_sums, active_num_partitions = (
         _qsa_xqa_page4_workspace(q, num_partitions)
     )
-    microblock_stride = 4 * q.shape[2]
-    if k_cache.stride(0) == k_cache.shape[1] * q.shape[2]:
-        microblocks_per_cache_block = k_cache.shape[1] // 4
-        physical_k_cache = k_cache.view(
-            k_cache.shape[0] * microblocks_per_cache_block,
-            4,
-            1,
-            q.shape[2],
-        )
-        physical_v_cache = v_cache.view_as(physical_k_cache)
-    else:
-        # The local FlashAttention ABI interleaves K and V inside every
-        # physical cache block. The virtual page IDs carry that doubled block
-        # stride, while this narrow view exposes a four-token page stride to
-        # XQA. No cache data is copied or rearranged.
-        physical_shape = (k_cache.shape[0], 4, 1, q.shape[2])
-        physical_strides = (
-            microblock_stride,
-            q.shape[2],
-            q.shape[2],
-            1,
-        )
-        physical_k_cache = k_cache.as_strided(physical_shape, physical_strides)
-        physical_v_cache = v_cache.as_strided(physical_shape, physical_strides)
+    physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
     flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
         physical_k_cache,
