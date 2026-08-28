@@ -44498,3 +44498,60 @@ Interpretation:
   long-context limiter. The next trace must be taken at 256K and separate the
   context-growing QSA indexer/attention work from the now-fixed MoE projection
   cost; 128K-only traces are no longer sufficient acceptance evidence.
+
+## 2026-08-28 Qwen3.8 NVFP4 prefill output-quality audit
+
+- Public Draft PR #393 source `472e06f4461ff8cf9fe37063dc954eb0dfa1d301`
+  passed a matched TP4 V2 candidate/control audit on four V100-SXM2-32GB GPUs.
+  Model, source, weights, FP16 KV, no-MTP state, PLE CPU offload, chunk size,
+  prompts, seeds, sampling parameters, CUDA Graph state, MoE routes, and cuBLAS
+  QSA indexer were identical. The only environment differences were
+  `VLLM_SM70_QSA_GROUPED_PAGE4=1/0` and
+  `VLLM_SM70_QSA_XQA_PAGE4=1/0`. Candidate logs hit the grouped Flash-V100
+  page4 route at both 8,192-row chunks and the 8,128-row 256K tail; control
+  logs retained the selected-attention fallback and contain no page4 hit.
+- The quality set contains three official-sampling corruption/repetition
+  probes at temperature 1, top-p 0.95, top-k 20, and `ignore_eos=false`; an
+  exact 32,768-token four-needle prompt with facts crossing the 8,192,
+  16,384, and 24,576 chunk boundaries; and a 262,080-token prompt whose
+  generation budget reaches the exact 262,144-token model limit. The latter
+  places facts at token 4,096, across 131,072, across 253,952, and at 261,760.
+  Greedy 32K runs are repeated twice with top-5 logprobs, and the same 32K
+  prompt also runs with official sampling. Short official probes are text-
+  health smokes: all reach their 512-token cap inside coherent reasoning and
+  are not presented as natural-termination task scores.
+- Candidate and control both report `completed=true`, metrics available for
+  every request, zero corrupted requests, zero text-health failures, and
+  complete code recall. Across seven records and 1,704 generated tokens,
+  every prompt hash, output token ID, output hash, finish reason, and decoded
+  text is exactly equal between routes. Both 32K repeats, the 32K official-
+  sampling request, and the exact-limit request return
+  `ALPHA=R7K2-ZEPHYR; BETA=M4Q9-ORCHID; GAMMA=T8V3-LANTERN;`
+  `DELTA=C6P1-HARBOR` and terminate normally. The 32K repeat hashes are also
+  exact within each route.
+- The 126 greedy long-context generation steps have identical top-1 tokens in
+  candidate and control. Maximum chosen-token logprob difference is
+  `0.0024374` at 32K and `0.0010699` at 262,080 tokens; the minimum observed
+  top-1 margin is still `5.0156` nats for candidate and `4.8125` for control.
+  Mean top-5 token overlap is 4.64-4.76 of five. A low-probability common
+  top-5 tail value differs by as much as `2.2810` nats at 262,080 tokens, but
+  same-route 32K repeats already show tail drift up to `1.2031` for candidate
+  and `0.7422` for control, while control's same-route chosen-logprob drift
+  (`0.0031536`) exceeds the matched route difference. This tail variation did
+  not alter a top-1 token, sampled output, recall result, or corruption gate.
+- The end-to-end result is consistent with the page4 operator audit: maximum
+  FP16 difference `6.104e-5`, relative L2 `2.845e-4`, cosine `0.99999994`,
+  finite outputs, correct causal tails, and bitwise-stable CUDA Graph replay.
+  The attempted full-vocabulary dump produced no evidence file because the
+  active V2 runner uses the MRv2 sampler while the existing diagnostic hook
+  is in the legacy V1 sampler. Do not claim full-vocabulary logit equality
+  from this run; adding an MRv2-only diagnostic hook or a bounded
+  `logprobs=-1` one-token probe is the correct future test if that evidence is
+  required.
+- Matched warm 32K prefill improves from `4,744.62` to `6,493.38 token/s`
+  (`1.3686x`); the 32K official-sampling request improves from `4,762.95` to
+  `6,526.09 token/s` (`1.3702x`); and 262,080-token prefill improves from
+  `4,131.06` to `5,185.43 token/s` (`1.2552x`). The performance gain therefore
+  accompanies exact observed output parity rather than a changed prompt or
+  sampling contract. PR #393 passes this prefill quality gate; the two page4
+  environment variables remain its immediate rollback.
