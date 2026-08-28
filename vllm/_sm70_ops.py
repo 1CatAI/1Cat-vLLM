@@ -38,7 +38,9 @@ _maybe_load_fp8_qpn8_library()
 def _maybe_load_nvfp4_qpn_m1_library() -> None:
     """Load the narrow Qwen3.8 NVFP4 experiment in spawned TP workers."""
     library_path = os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY")
-    route_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    m1_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    mtp5_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0") != "0"
+    route_enabled = m1_enabled or mtp5_enabled
     if library_path is not None and route_enabled:
         torch.ops.load_library(library_path)
 

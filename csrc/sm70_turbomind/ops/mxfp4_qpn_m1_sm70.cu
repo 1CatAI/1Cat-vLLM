@@ -176,8 +176,11 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   const size_t scales_per_expert = static_cast<size_t>(k >> 4) * n;
   const half* expert_scales =
       scales + static_cast<size_t>(expert) * scales_per_expert;
-  const half* input_row =
-      input + static_cast<size_t>(broadcast_input ? 0 : route) * k;
+  // Qwen3.8 routes ten experts per token. The broadcast form accepts either
+  // B1's single input row or MTP4's five verifier rows without materializing
+  // the 10x routed-input expansion.
+  const int input_route = broadcast_input ? route / 10 : route;
+  const half* input_row = input + static_cast<size_t>(input_route) * k;
 
   float accum[8] = {};
 #pragma unroll 4
@@ -261,8 +264,10 @@ void launch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
                          torch::Tensor expert_ids, bool broadcast_input) {
   const int n = static_cast<int>(out.size(1));
   const int k = static_cast<int>(input.size(1));
+  const int routes = static_cast<int>(expert_ids.numel());
   nvfp4_qpn_m1_sm70_kernel<kSplitK>
-      <<<dim3(n / 32, 10), 32 * kSplitK, 0, at::cuda::getCurrentCUDAStream()>>>(
+      <<<dim3(n / 32, routes), 32 * kSplitK, 0,
+         at::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
           reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
           reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
@@ -366,9 +371,11 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(out.dim() == 2 && input.dim() == 2 && weights.dim() == 3 &&
                   scales.dim() == 3 && expert_ids.dim() == 1,
               "nvfp4_moe_qpn_m1_sm70_out: rank mismatch");
-  TORCH_CHECK(out.size(0) == 10 && expert_ids.numel() == 10 &&
+  const int64_t routes = expert_ids.numel();
+  TORCH_CHECK((routes == 10 || routes == 50) && out.size(0) == routes &&
                   weights.size(0) == 512 && scales.size(0) == 512,
-              "nvfp4_moe_qpn_m1_sm70_out: expected ten routes and 512 experts");
+              "nvfp4_moe_qpn_m1_sm70_out: expected 10 or 50 routes and 512 "
+              "experts");
   TORCH_CHECK(input.get_device() == out.get_device() &&
                   input.get_device() == weights.get_device() &&
                   input.get_device() == scales.get_device() &&
@@ -379,15 +386,19 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t groups_k16 = input.size(1) / 16;
   TORCH_CHECK(split_k > 0 && split_k <= 32 && groups_k16 % split_k == 0,
               "nvfp4_moe_qpn_m1_sm70_out: split_k must divide K/16");
-  if (broadcast_input) {
-    TORCH_CHECK(input.sizes() == torch::IntArrayRef({1, 2560}) &&
-                    out.sizes() == torch::IntArrayRef({10, 320}) &&
-                    weights.sizes() == torch::IntArrayRef({512, 2560, 40}) &&
-                    scales.sizes() == torch::IntArrayRef({512, 160, 320}),
-                "nvfp4_moe_qpn_m1_sm70_out: W13 tensor contract mismatch");
+  const bool is_w13 = input.size(1) == 2560 && out.size(1) == 320;
+  if (is_w13) {
+    const int64_t expected_input_rows = broadcast_input ? routes / 10 : routes;
+    TORCH_CHECK(
+        input.sizes() == torch::IntArrayRef({expected_input_rows, 2560}) &&
+            out.sizes() == torch::IntArrayRef({routes, 320}) &&
+            weights.sizes() == torch::IntArrayRef({512, 2560, 40}) &&
+            scales.sizes() == torch::IntArrayRef({512, 160, 320}),
+        "nvfp4_moe_qpn_m1_sm70_out: W13 tensor contract mismatch");
   } else {
-    TORCH_CHECK(input.sizes() == torch::IntArrayRef({10, 160}) &&
-                    out.sizes() == torch::IntArrayRef({10, 2560}) &&
+    TORCH_CHECK(!broadcast_input &&
+                    input.sizes() == torch::IntArrayRef({routes, 160}) &&
+                    out.sizes() == torch::IntArrayRef({routes, 2560}) &&
                     weights.sizes() == torch::IntArrayRef({512, 160, 320}) &&
                     scales.sizes() == torch::IntArrayRef({512, 10, 2560}),
                 "nvfp4_moe_qpn_m1_sm70_out: W2 tensor contract mismatch");
