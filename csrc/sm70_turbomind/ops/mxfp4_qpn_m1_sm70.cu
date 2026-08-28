@@ -265,15 +265,13 @@ void launch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
   const int n = static_cast<int>(out.size(1));
   const int k = static_cast<int>(input.size(1));
   const int routes = static_cast<int>(expert_ids.numel());
-  nvfp4_qpn_m1_sm70_kernel<kSplitK>
-      <<<dim3(n / 32, routes), 32 * kSplitK, 0,
-         at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-          reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
-          reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
-          expert_ids.data_ptr<int32_t>(),
-          reinterpret_cast<half*>(out.data_ptr<at::Half>()), n, k,
-          broadcast_input);
+  nvfp4_qpn_m1_sm70_kernel<kSplitK><<<dim3(n / 32, routes), 32 * kSplitK, 0,
+                                      at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+      reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+      expert_ids.data_ptr<int32_t>(),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()), n, k, broadcast_input);
 }
 
 void dispatch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,

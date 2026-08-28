@@ -719,10 +719,11 @@ __global__ void __launch_bounds__(1024, 1)
 
 template <int ngpus>
 __global__ void __launch_bounds__(1024, 1)
-    sm70_cross_device_reduce_sum2_1stage_push(
-        RankData push_buffers, const half* __restrict__ input_a,
-        const half* __restrict__ input_b, half* __restrict__ output, int rank,
-        int packed_size) {
+    sm70_cross_device_reduce_sum2_1stage_push(RankData push_buffers,
+                                              const half* __restrict__ input_a,
+                                              const half* __restrict__ input_b,
+                                              half* __restrict__ output,
+                                              int rank, int packed_size) {
   static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;

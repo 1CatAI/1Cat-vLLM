@@ -589,7 +589,7 @@ def main() -> None:
                     include_lossy_qpn8=args.include_lossy_qpn8,
                 )
             )
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
     baseline_weighted_us = sum(
         row["count_per_verifier"] * row["torch_latency_us"] for row in rows

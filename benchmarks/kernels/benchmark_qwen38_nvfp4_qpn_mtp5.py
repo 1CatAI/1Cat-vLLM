@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: B023
 """Screen native-NVFP4 direct 50-route MoE kernels for Qwen3.8 MTP4.
 
@@ -86,14 +88,14 @@ def mtp_weighted_reduce(
 def graph_us(fn: Callable[[], None], *, unroll: int = 32, replays: int = 100) -> float:
     for _ in range(8):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(unroll):
             fn()
     for _ in range(5):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples = []
     for _ in range(7):
         start = torch.cuda.Event(enable_timing=True)
@@ -113,7 +115,7 @@ def cold_us(
     for _ in range(8):
         l2_flush.zero_()
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples = []
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -293,7 +295,7 @@ def main() -> None:
             )
 
         baseline_stage2()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         pattern: dict[str, object] = {
             "unique_experts": int(token_order_ids.unique().numel()),
             "baseline_us": {
@@ -320,7 +322,7 @@ def main() -> None:
                 )
 
             candidate_stage13()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             pattern["candidate_w13"].append(
                 {
                     "split_k": split_k,
@@ -352,7 +354,7 @@ def main() -> None:
             False,
             4,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         pattern["broadcast_vs_expanded_w13_split4"] = error(
             candidate_w13, expanded_candidate_w13
         )
@@ -374,7 +376,7 @@ def main() -> None:
                 baseline_intermediate.index_select(0, inverse_index)
             )
             candidate_stage2()
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             pattern["candidate_w2"].append(
                 {
                     "split_k": split_k,
@@ -502,7 +504,7 @@ def main() -> None:
 
         baseline_full_path()
         candidate_full_path()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         full_error = error(candidate_output, baseline_output)
         baseline_warm = graph_us(baseline_full_path)
         candidate_warm = graph_us(candidate_full_path)
