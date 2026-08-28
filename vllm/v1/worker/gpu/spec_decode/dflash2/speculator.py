@@ -324,6 +324,7 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
         self._anchor_indices = (
@@ -979,6 +980,16 @@ class DFlash2Speculator(DFlashSpeculator):
         self.draft_tokens[:num_reqs, : self.draft_block].copy_(
             self._selector_tokens[:num_reqs]
         )
+        if self._debug_proposal_stages and self._debug_token_dump_count < 2:
+            logger.info(
+                "DFlash2 token diagnostic: finite_hidden=%s max_abs_hidden=%s "
+                "candidate_ids=%s draft_tokens=%s",
+                bool(torch.isfinite(hidden_states).all().item()),
+                float(hidden_states.abs().max().item()),
+                candidate_ids[0].tolist(),
+                self.draft_tokens[0, : self.draft_block].tolist(),
+            )
+            self._debug_token_dump_count += 1
         if self.draft_block < self.num_speculative_steps:
             self.draft_tokens[:num_reqs, self.draft_block :].zero_()
         if self.draft_logits is not None:

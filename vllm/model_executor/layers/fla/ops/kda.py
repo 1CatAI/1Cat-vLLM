@@ -71,9 +71,12 @@ def fused_recurrent_kda_fwd(
     if out is None:
         o = torch.empty_like(k)
     else:
-        # Caller-provided output buffer; must be layout-compatible with the
-        # tensor the kernel indexes (contiguous, same shape/dtype as k).
-        assert out.shape == k.shape and out.dtype == k.dtype
+        # The recurrent math accumulates in fp32. SM70 GLM keeps that precision
+        # through its following RMSNorm to avoid an otherwise lossy fp16
+        # round-trip (and possible overflow) between the two kernels.
+        assert out.shape == k.shape
+        assert out.dtype in (k.dtype, torch.float32)
+        assert out.device == k.device
         assert out.is_contiguous()
         o = out
     if inplace_final_state:
@@ -446,6 +449,7 @@ def rms_norm_gated(
     prenorm: bool = False,
     residual_in_fp32: bool = False,
     eps: float = 1e-6,
+    out_dtype: torch.dtype | None = None,
 ):
     x_shape_og = x.shape
     # reshape input data into 2D tensor
@@ -467,6 +471,7 @@ def rms_norm_gated(
         activation=activation,
         eps=eps,
         residual=residual,
+        out_dtype=out_dtype,
         residual_dtype=residual_dtype,
         is_rms_norm=True,
     )
@@ -509,13 +514,16 @@ class FusedRMSNormGated(CustomOp):
         residual: torch.Tensor | None = None,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Decomposed PyTorch ops for torch.compile/inductor fusion."""
         # TODO(https://github.com/vllm-project/vllm/issues/36175): implement
         # native residual/prenorm path and unify with RMSNormGated.
         # For now, fall back to the triton kernel.
         if residual is not None or prenorm:
-            return self.forward_cuda(x, g, residual, prenorm, residual_in_fp32)
+            return self.forward_cuda(
+                x, g, residual, prenorm, residual_in_fp32, out_dtype
+            )
         x_float = x.float()
         variance = x_float.pow(2).mean(dim=-1, keepdim=True)
         x_normed = x_float * torch.rsqrt(variance + self.eps)
@@ -526,7 +534,7 @@ class FusedRMSNormGated(CustomOp):
             out = x_normed * g_float * torch.sigmoid(g_float)
         else:  # sigmoid
             out = x_normed * torch.sigmoid(g_float)
-        return out.to(x.dtype)
+        return out.to(out_dtype or x.dtype)
 
     def forward_cuda(
         self,
@@ -535,6 +543,7 @@ class FusedRMSNormGated(CustomOp):
         residual: torch.Tensor | None = None,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         return rms_norm_gated(
             x,
@@ -546,6 +555,7 @@ class FusedRMSNormGated(CustomOp):
             eps=self.eps,
             prenorm=prenorm,
             residual_in_fp32=residual_in_fp32,
+            out_dtype=out_dtype,
         )
 
 

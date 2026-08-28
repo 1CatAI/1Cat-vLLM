@@ -1167,6 +1167,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
         )
+        if input_batch.num_draft_tokens > 0 and getattr(
+            self.speculator, "_debug_proposal_stages", False
+        ):
+            logger.info(
+                "DFlash target verification diagnostic: draft_input=%s "
+                "sampled=%s num_sampled=%s num_rejected=%s "
+                "finite_hidden=%s",
+                input_batch.input_ids[input_batch.logits_indices].tolist(),
+                sampler_output.sampled_token_ids.tolist(),
+                num_sampled.tolist(),
+                num_rejected.tolist(),
+                bool(torch.isfinite(sample_hidden_states).all().item()),
+            )
         return sampler_output, num_sampled, num_rejected
 
     def postprocess(
@@ -1474,7 +1487,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_pp:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
+            pp_broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                max_sample_len=self.num_speculative_steps + 1,
+            )
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(

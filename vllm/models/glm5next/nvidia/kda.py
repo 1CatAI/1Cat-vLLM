@@ -48,6 +48,48 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
 
+_DEBUG_DFLASH_TARGET_FINITE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
+)
+
+
+def _debug_dflash_kda_finite(
+    prefix: str, stage: str, tensor: torch.Tensor | None
+) -> None:
+    if (
+        not _DEBUG_DFLASH_TARGET_FINITE
+        or tensor is None
+        or tensor.shape[-2 if tensor.ndim >= 2 else 0] <= 1
+    ):
+        return
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return
+    finite_values = tensor[finite]
+    finite_max = (
+        float(finite_values.abs().max().item()) if finite_values.numel() else 0.0
+    )
+    if tensor.ndim >= 2:
+        token_dim = 1 if tensor.ndim >= 3 else 0
+        moved = (~finite).movedim(token_dim, 0).reshape(tensor.shape[token_dim], -1)
+        bad_by_token = moved.sum(dim=1).tolist()
+    else:
+        bad_by_token = [int((~finite).sum().item())]
+    logger.error(
+        "DFlash target KDA nonfinite: prefix=%s stage=%s shape=%s "
+        "nonfinite=%d nan=%d posinf=%d neginf=%d finite_max=%s "
+        "bad_by_token=%s",
+        prefix,
+        stage,
+        tuple(tensor.shape),
+        int((~finite).sum().item()),
+        int(torch.isnan(tensor).sum().item()),
+        int(torch.isposinf(tensor).sum().item()),
+        int(torch.isneginf(tensor).sum().item()),
+        finite_max,
+        bad_by_token,
+    )
+
 
 def _sm70_exact_kda_gemv_enabled() -> bool:
     return os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "1") != "0"
@@ -219,6 +261,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and self.hidden_size == 4096
             and _sm70_exact_kda_gemv_enabled()
         )
+        self._use_sm70_fp32_recurrent_output = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.head_dim == 128
+        )
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
@@ -369,6 +416,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             logger.info_once("SM70 GLM KDA exact FP16 GEMV decode path enabled.")
         else:
             projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        _debug_dflash_kda_finite(self.prefix, "projection", projected)
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,
@@ -409,14 +457,29 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         else:
             g1 = self.f_b_proj(f_a)[0]
             g_proj_states = self.g_b_proj(g_a)[0]
+        _debug_dflash_kda_finite(self.prefix, "gates", g1)
+        _debug_dflash_kda_finite(self.prefix, "output_gate", g_proj_states)
         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
+        is_recurrent_step = num_tokens <= self.num_spec + 1
+        attn_metadata_raw = get_forward_context().attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            layer_metadata = attn_metadata_raw.get(self.prefix)
+            if isinstance(layer_metadata, GDNAttentionMetadata):
+                is_recurrent_step = layer_metadata.num_prefills == 0
+        core_output_dtype = (
+            torch.float32
+            if self._use_sm70_fp32_recurrent_output
+            and hidden_states.dtype == torch.float16
+            and is_recurrent_step
+            else hidden_states.dtype
+        )
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
+            dtype=core_output_dtype,
             device=hidden_states.device,
         )
         # Call the decorated eager break directly so host-side prefill branches
@@ -427,7 +490,17 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
-        core_attn_out = self.o_norm(core_attn_out, g2)
+        if core_output_dtype != hidden_states.dtype:
+            core_attn_out = self.o_norm(
+                core_attn_out,
+                g2,
+                out_dtype=hidden_states.dtype,
+            )
+            logger.info_once(
+                "SM70 GLM KDA keeps recurrent output in FP32 through RMSNorm."
+            )
+        else:
+            core_attn_out = self.o_norm(core_attn_out, g2)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         return self.o_proj(core_attn_out)[0]
 
@@ -546,6 +619,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc,
                 max_query_len=conv_mql,
             )
+            _debug_dflash_kda_finite(self.prefix, "spec_conv", qkv_spec)
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
@@ -618,6 +692,38 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 compute_gate=True,
                 lower_bound=lower_bound,
             )
+            if _DEBUG_DFLASH_TARGET_FINITE and not bool(
+                torch.isfinite(core_attn_out_spec).all().item()
+            ):
+                state_rows = torch.arange(
+                    num_spec_decodes,
+                    dtype=torch.long,
+                    device=spec_state_indices_tensor.device,
+                )
+                accepted_offsets = (
+                    num_accepted_tokens[:num_spec_decodes].to(torch.long) - 1
+                )
+                state_slots = spec_state_indices_tensor[
+                    state_rows, accepted_offsets
+                ].to(torch.long)
+                selected_state = recurrent_state.index_select(0, state_slots)
+                logger.error(
+                    "DFlash target KDA state diagnostic: prefix=%s "
+                    "accepted=%s state_slots=%s state_finite=%s "
+                    "state_max=%s q_max=%s k_max=%s v_max=%s g_max=%s "
+                    "beta_max=%s",
+                    self.prefix,
+                    num_accepted_tokens[:num_spec_decodes].tolist(),
+                    state_slots.tolist(),
+                    bool(torch.isfinite(selected_state).all().item()),
+                    float(selected_state.abs().max().item()),
+                    float(q_spec.abs().max().item()),
+                    float(k_spec.abs().max().item()),
+                    float(v_spec.abs().max().item()),
+                    float(g1_spec.abs().max().item()),
+                    float(beta_spec.abs().max().item()),
+                )
+            _debug_dflash_kda_finite(self.prefix, "spec_recurrent", core_attn_out_spec)
 
         # --- core attention: non-spec path (prefill or plain decode) ---
         core_attn_out_non_spec = None

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
@@ -94,6 +95,36 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+
+_DEBUG_DFLASH_TARGET_FINITE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
+)
+
+
+def _debug_dflash_target_finite(
+    stage: str,
+    layer_idx: int,
+    positions: torch.Tensor,
+    **tensors: torch.Tensor | None,
+) -> None:
+    if not _DEBUG_DFLASH_TARGET_FINITE or positions.numel() <= 1:
+        return
+    for name, tensor in tensors.items():
+        if tensor is None:
+            continue
+        finite = torch.isfinite(tensor)
+        if bool(finite.all().item()):
+            continue
+        logger.error(
+            "DFlash target nonfinite: layer=%d kind=%s stage=%s tensor=%s "
+            "shape=%s nonfinite=%d",
+            layer_idx,
+            "unknown",
+            stage,
+            name,
+            tuple(tensor.shape),
+            int((~finite).sum().item()),
+        )
 
 
 def _get_moe_router_dtype(config: Glm5NextConfig) -> torch.dtype | None:
@@ -424,6 +455,16 @@ class Glm5NextDecoderLayer(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        _debug_dflash_target_finite(
+            "layer_input",
+            self.layer_idx,
+            positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+        )
+
         # 70B or MTP layers: KDA + MoE without HC.
         if not self.mhc or self.is_mtp_layer:
             residual = hidden_states
@@ -496,6 +537,16 @@ class Glm5NextDecoderLayer(nn.Module):
                 norm_eps=self.input_layernorm.variance_epsilon,
             )
 
+        _debug_dflash_target_finite(
+            "attn_mhc_pre",
+            self.layer_idx,
+            positions,
+            residual=residual,
+            post=post,
+            comb=comb,
+            x=x,
+        )
+
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
@@ -504,6 +555,13 @@ class Glm5NextDecoderLayer(nn.Module):
         x = self.self_attn(
             hidden_states=x,
             positions=positions,
+        )
+
+        _debug_dflash_target_finite(
+            "attention_output",
+            self.layer_idx,
+            positions,
+            x=x,
         )
 
         if self.is_sequence_parallel:
@@ -522,11 +580,28 @@ class Glm5NextDecoderLayer(nn.Module):
             norm_eps=self.post_attention_layernorm.variance_epsilon,
         )
 
+        _debug_dflash_target_finite(
+            "ffn_mhc_pre",
+            self.layer_idx,
+            positions,
+            residual=residual,
+            post=post,
+            comb=comb,
+            x=x,
+        )
+
         # Fully Connected
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+
+        _debug_dflash_target_finite(
+            "mlp_output",
+            self.layer_idx,
+            positions,
+            x=x,
+        )
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to

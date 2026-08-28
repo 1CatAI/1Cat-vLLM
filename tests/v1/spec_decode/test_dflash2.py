@@ -16,6 +16,7 @@ import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm import envs
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _is_dflash2_spec_config,
@@ -45,9 +46,10 @@ from vllm.model_executor.models.qwen3_dflash2 import (
     _grouped_conv,
     _score_edges,
 )
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -118,6 +120,46 @@ def _bare_dflash2_model() -> DFlash2Qwen3Model:
     torch.nn.Module.__init__(model)
     model.quant_config = None
     return model
+
+
+def test_dflash2_local_argmax_delegates_to_vocab_parallel_processor():
+    model = DFlash2Qwen3ForCausalLM.__new__(DFlash2Qwen3ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.lm_head = Mock()
+    model.logits_processor = Mock()
+    hidden_states = torch.randn(3, 8)
+    expected = torch.tensor([7, 11, 13])
+    model.logits_processor.get_top_tokens.return_value = expected
+
+    actual = model.get_top_tokens(hidden_states)
+
+    assert actual is expected
+    model.logits_processor.get_top_tokens.assert_called_once_with(
+        model.lm_head, hidden_states
+    )
+
+
+def test_dflash_sliding_kv_spec_uses_draft_attention_contract_with_mla_target():
+    attn = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attn)
+    attn.attn_type = AttentionType.DECODER
+    attn.kv_cache_dtype = "auto"
+    attn.kv_cache_torch_dtype = torch.float16
+    attn.sliding_window = 2048
+    attn.num_kv_heads = 1
+    attn.head_size = 256
+    attn.head_size_v = 256
+    attn.is_dflash_draft_attn = True
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16),
+        attention_config=SimpleNamespace(prefix_anchored_decode_window=None),
+        model_config=SimpleNamespace(use_mla=True),
+    )
+
+    spec = attn.get_kv_cache_spec(config)
+
+    assert isinstance(spec, SlidingWindowSpec)
+    assert spec.sliding_window == 2048
 
 
 def _fake_rms_norm(
@@ -205,9 +247,7 @@ def test_context_k_norm_falls_back_for_stale_stable_binary(monkeypatch):
     assert torch.equal(repeated, expected)
 
 
-@pytest.mark.parametrize(
-    ("input_size", "output_size"), [(25600, 5120), (20480, 4096)]
-)
+@pytest.mark.parametrize(("input_size", "output_size"), [(25600, 5120), (20480, 4096)])
 def test_sm70_tp4_shards_only_compatible_dflash2_context_projection(
     monkeypatch, input_size, output_size
 ):
@@ -1110,11 +1150,15 @@ def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
     target_model_config = object()
     draft_model_config = object()
     attention_config = object()
+    target_parallel_config = object()
+    draft_parallel_config = object()
     speculator = SimpleNamespace(
         vllm_config=SimpleNamespace(
             model_config=target_model_config,
             attention_config=attention_config,
+            parallel_config=target_parallel_config,
         ),
+        speculative_config=SimpleNamespace(draft_parallel_config=draft_parallel_config),
         draft_model_config=draft_model_config,
         requires_non_causal=True,
     )
@@ -1122,6 +1166,7 @@ def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
     config = DFlashSpeculator.attn_vllm_config.fget(speculator)
 
     assert config.model_config is draft_model_config
+    assert config.parallel_config is draft_parallel_config
     assert config.attention_config.source is attention_config
     assert config.attention_config.use_non_causal is True
 

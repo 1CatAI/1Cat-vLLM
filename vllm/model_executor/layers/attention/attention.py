@@ -679,9 +679,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 decode_sliding_window=anchored_window,
             )
         if self.sliding_window is not None:
-            assert not vllm_config.model_config.use_mla, (
-                "MLA is not supported for slidingwindow"
-            )
+            assert getattr(self, "is_dflash_draft_attn", False) or not (
+                vllm_config.model_config.use_mla
+            ), "MLA is not supported for slidingwindow"
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

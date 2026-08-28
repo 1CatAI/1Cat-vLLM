@@ -446,6 +446,9 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.final_logit_softcapping = softcap if softcap > 0 else None
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -128,6 +129,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
         self._context_only_prefill_logged = False
+        self._debug_proposal_stages = bool(
+            int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
+        )
+
+    def _debug_proposal_stage(self, stage: str) -> None:
+        if getattr(self, "_debug_proposal_stages", False):
+            logger.info("DFlash proposal stage: %s", stage)
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -135,6 +143,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         return replace(
             self.vllm_config,
             model_config=self.draft_model_config,
+            parallel_config=self.speculative_config.draft_parallel_config,
             attention_config=replace(
                 self.vllm_config.attention_config,
                 use_non_causal=self.requires_non_causal,
@@ -285,6 +294,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        self._debug_proposal_stage("draft forward begin")
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -292,10 +302,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        self._debug_proposal_stage("draft forward end")
         num_sample = num_reqs * self.draft_block
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
+        self._debug_proposal_stage("draft sampling begin")
         draft_tokens = self.sample_draft(
             sample_hidden_states,
             self.sample_pos[:num_sample] - 2,
@@ -305,6 +317,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.sample_col[:num_sample],
             self.draft_logits,
         )
+        self._debug_proposal_stage("draft sampling end")
         self.draft_tokens[:num_reqs, : self.draft_block] = draft_tokens.view(
             num_reqs, self.draft_block
         )
@@ -493,12 +506,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        self._debug_proposal_stage("context kv begin")
         with record_function_or_nullcontext("dflash: materialize context kv"):
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
                 context_slots,
             )
+        self._debug_proposal_stage("context kv end")
 
         if not dummy_run and _is_context_only_prefill(input_batch):
             # Intermediate chunked-prefill steps only need to materialize the
@@ -525,6 +540,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._apply_ngram_assist(num_reqs)
             return self.draft_tokens[:num_reqs]
 
+        self._debug_proposal_stage("query preparation begin")
         with record_function_or_nullcontext("dflash: query and selector"):
             # Every DFlash step has exactly num_query_per_req tokens, so we can
             # use FULL CUDA graphs.
@@ -556,6 +572,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.kv_cache_config,
             )
 
+            self._debug_proposal_stage("query preparation end")
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.query_cudagraph_manager is not None
                 self.query_cudagraph_manager.run_fullgraph(batch_desc)
@@ -569,6 +586,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
 
+        self._debug_proposal_stage("query and selector end")
         self._apply_ngram_assist(num_reqs)
 
         return self.draft_tokens[:num_reqs]

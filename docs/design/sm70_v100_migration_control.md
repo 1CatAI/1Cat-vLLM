@@ -44418,6 +44418,59 @@ Interpretation:
   real-model token/logit audit, and same-contract unprofiled TP4/PP2 A/B before
   a new per-token trace is accepted.
 
+## 2026-08-28 GLM-5.3 DFlash2 TP4/PP2 bring-up
+
+- Development is isolated in worktree
+  `v100-glm53-dflash2-20260828-125830`, branch
+  `codex/v100-glm53-dflash2-20260828-125830`, from public-main base
+  `62ad1e02693f4c857f3b7547cef1860ee54e8053`; Draft PR #404 is the owned
+  review boundary. The target contract is
+  `LibertAIDAI/GLM-5.3-Flash-NVFP4`, official
+  `incoai/GLM-5.3-Flash-DFlash2`, TP4/PP2 on eight V100s, seven draft tokens,
+  greedy lossless validation, target E4M3 KV, draft FP16 KV, and CUDA Graphs.
+- The GLM target now exposes completed mHC-contracted auxiliary hidden states
+  at boundaries `6,15,25,34,43`, transports PP0 captures to PP1, and shares a
+  replicated target embedding with the final-stage-local DFlash draft. The
+  capture mapping matches the SGLang GLM DFlash adapter and its follow-up mHC
+  residual correction. The draft uses an independent SWA KV group and its own
+  final-stage parallel config rather than inheriting target MLA/PP metadata.
+- The first TP4/PP2 route attempt reached proposal generation but hung after
+  verification. NCCL diagnostics reduced this to a PP token broadcast count
+  mismatch: the last stage sent the first prefill result as `[B,1]` while the
+  receiving stage always posted `[B,8]`. PP broadcast now pads the sender to
+  the fixed `num_speculative_steps + 1` width; focused PP tests cover both
+  single-token and multi-token sends. Do not classify this wait as target
+  compute or TP/PP service time in a latency table.
+- After the PP fix, DFlash candidates and selector outputs were finite and in
+  range, but target verification returned vocabulary sentinel `154880` with
+  zero acceptance. Layer probes found the first real-request corruption in
+  layer 41 KDA: projection, gate, and short-conv outputs were finite; only
+  `fused_recurrent_kda` produced two nonfinite FP16 elements on TP0. The
+  following FP16 `o_proj` and TP all-reduce spread that one-token corruption
+  to every rank. Packed E4M3 sparse MLA, DFlash capture, selector, and PP
+  transport are therefore ruled out as the first source.
+- A production-shape V100 microbenchmark (`T8/H16/K128/V128`) proves the
+  caller-provided output buffer is bitwise identical to kernel allocation, so
+  aliasing is also ruled out. Scaling the FP32 recurrent state to `5e5`
+  makes the old FP16 staging produce three nonfinite values with the largest
+  finite value at `63680`; FP32 staging remains finite at `78023.71`, and the
+  existing fused RMSNorm+sigmoid gate writes a fully finite FP16 result.
+- The retained SM70 GLM route therefore keeps recurrent output in FP32 only
+  through the immediately following fused gate-norm, which writes FP16 for
+  `o_proj`. It adds no kernel launch and no clamp or per-token fallback. The
+  paired microbenchmark moves recurrent+norm from `120.279` to `121.188 us`
+  at T1 and `115.090` to `119.721 us` at T8. The T8 cost is about
+  `0.157 ms` across all 34 KDA layers per verifier round. The mixed-dtype norm
+  suite passes 25 tests; the SM70 KDA suite passes 10, including forced FP16
+  overflow and bitwise-stable CUDA Graph replay.
+- Full-model validation remains open. Required next gates are: rerun the short
+  eager TP4/PP2 smoke with no nonfinite target hidden state; compare target-only
+  and DFlash greedy token IDs on the retained six-prompt quality set; then run
+  same-contract graph `input=1024/output=256/repeats=3` and report emitted-token
+  decode throughput plus mean acceptance length. GPU0-3 are currently held by
+  the separately owned `qwen38-flash-next` service, so that service must be
+  explicitly released before the eight-GPU gate; do not terminate it implicitly.
+
 ## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
 
 - Public Draft PR #390 is stacked on grouped-QSA PR #387. The retained clean
