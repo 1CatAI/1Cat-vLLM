@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
@@ -40,7 +41,11 @@ def _vllm_config():
     return SimpleNamespace(
         model_config=_ModelConfig(),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_batched_tokens=8192,
+            max_num_seqs=2,
+        ),
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=None,
             mamba_cache_mode="none",
@@ -212,3 +217,53 @@ def test_qwen4_exp_compressed_qsa_reshape_uses_storage_block_size() -> None:
 
     assert caches["compressed"].shape == (num_blocks, 4, 1, 128)
     assert caches["compressed"].untyped_storage().data_ptr() == raw.data_ptr()
+
+
+@pytest.mark.skip_global_cleanup
+def test_qwen4_exp_qsa_metadata_canonicalizes_expanded_block_table() -> None:
+    spec = MLAAttentionSpec(
+        block_size=784,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=8,
+    )
+    group = AttentionGroup(
+        QSAStateBackend,
+        ["compressed"],
+        spec,
+        kv_cache_group_id=0,
+    )
+    group.create_metadata_builders(
+        _vllm_config(), torch.device("cpu"), kernel_block_size=16
+    )
+    builder = group.get_metadata_builder()
+
+    # The QSA builder must retain the actual 98-row cache page rather than the
+    # generic 32-row paged-MQA virtualization used by other compressed backends.
+    assert builder.kv_cache_spec.block_size == 784
+    assert builder.kv_cache_spec.storage_block_size == 98
+
+    expansion = 784 // 16
+    # The legacy block-table path pads 11 physical pages to 16 for its
+    # 128-token alignment. The persistent QSA buffer must cover that width as
+    # well as the unpadded V2 table.
+    physical_pages = torch.arange(16, dtype=torch.int32).mul(3).add(7)
+    expanded = (
+        physical_pages[:, None] * expansion + torch.arange(expansion, dtype=torch.int32)
+    ).reshape(1, -1)
+
+    canonical = builder._canonical_block_table(expanded)
+    first_ptr = canonical.data_ptr()
+    assert torch.equal(canonical, physical_pages[None])
+
+    physical_pages.add_(5)
+    expanded.copy_(
+        (
+            physical_pages[:, None] * expansion
+            + torch.arange(expansion, dtype=torch.int32)
+        ).reshape(1, -1)
+    )
+    canonical = builder._canonical_block_table(expanded)
+    assert canonical.data_ptr() == first_ptr
+    assert torch.equal(canonical, physical_pages[None])

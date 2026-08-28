@@ -53,6 +53,8 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
     logical_indices = torch.zeros(1, 4, dtype=torch.int32)
     block_table = torch.zeros(1, 1, dtype=torch.int32)
     token_to_req = torch.zeros(1, dtype=torch.int32)
+    query_positions = torch.zeros(1, dtype=torch.int64)
+    sequence_lengths = torch.ones(1, dtype=torch.int32)
     captured = {}
 
     def fake_sparse_attention(
@@ -63,6 +65,9 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
         block_table_arg,
         token_to_req_arg,
         output_arg,
+        *,
+        query_positions,
+        sequence_lengths,
     ):
         captured["key_cache"] = key_cache_arg
         captured["value_cache"] = value_cache_arg
@@ -70,6 +75,8 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
         assert torch.equal(logical_indices_arg, logical_indices)
         assert torch.equal(block_table_arg, block_table)
         assert torch.equal(token_to_req_arg, token_to_req)
+        captured["query_positions"] = query_positions
+        captured["sequence_lengths"] = sequence_lengths
         output_arg.fill_(1)
         return output_arg
 
@@ -89,10 +96,14 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
         SimpleNamespace(num_actual_tokens=1, block_table=block_table),
         output,
         token_to_req,
+        query_positions=query_positions,
+        sequence_lengths=sequence_lengths,
     )
 
     expected_key, expected_value = kv_cache.unbind(1)
     assert torch.equal(captured["key_cache"], expected_key)
     assert torch.equal(captured["value_cache"], expected_value)
+    assert torch.equal(captured["query_positions"], query_positions)
+    assert torch.equal(captured["sequence_lengths"], sequence_lengths)
     assert result is output
     assert torch.equal(output, torch.ones_like(output))

@@ -371,7 +371,13 @@ class AttentionGroup:
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
     ):
-        if kernel_block_size is None:
+        builder_cls = self.backend.get_builder_cls()
+        uses_physical_block_table = (
+            isinstance(self.kv_cache_spec, AttentionSpec)
+            and self.kv_cache_spec.storage_block_size != self.kv_cache_spec.block_size
+            and builder_cls.uses_physical_block_table
+        )
+        if kernel_block_size is None or (uses_physical_block_table):
             kv_cache_spec_builder = self.kv_cache_spec
         elif (
             isinstance(self.kv_cache_spec, AttentionSpec)
@@ -387,14 +393,20 @@ class AttentionGroup:
             kv_cache_spec_builder = self.kv_cache_spec.copy_with_new_block_size(
                 kernel_block_size
             )
-        builder_cls = self.backend.get_builder_cls()
         builder_kwargs = {}
         if builder_cls.requires_block_table_width:
             max_num_blocks = self.kv_cache_spec.max_num_blocks_per_req(
                 vllm_config, vllm_config.model_config.max_model_len
             )
+            metadata_block_size = (
+                self.kv_cache_spec.block_size
+                if uses_physical_block_table
+                else kernel_block_size
+            )
             builder_kwargs["block_table_width"] = get_block_table_width(
-                max_num_blocks, self.kv_cache_spec.block_size, kernel_block_size
+                max_num_blocks,
+                self.kv_cache_spec.block_size,
+                metadata_block_size,
             )
         self.metadata_builders = [
             builder_cls(

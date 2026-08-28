@@ -6,9 +6,11 @@
   prefix-cache configuration are implemented; focused CPU/configuration gates
   pass and the local ModelScope snapshot is fully verified. The current
   accepted no-MTP TP4 candidate reaches 82.274 steady decode tokens/s on the
-  8192x512 contract, with exact arithmetic and Chinese quality gates. Its
-  direct NVFP4 ten-route QPN-M1 MoE route is now the default for the exact
-  SM70/TP4/B1 contract. The preceding 77.370-token/s graph-node trace remains
+  8192x512 contract. A matched 96-request GSM8K screen keeps 96/96 answers
+  correct with online QPN8 both off and on while QPN8 raises mean steady decode
+  by 16.97%. The direct NVFP4 ten-route QPN-M1 MoE and online QPN8 routes are
+  therefore default-on for the exact SM70/TP4/B1 contract, with explicit
+  diagnostic opt-outs. The preceding 77.370-token/s graph-node trace remains
   the detailed optimization control. Native MTP4 also completes TP4 model
   load, graph
   capture, warmup, and two 1024x256 requests; its separate acceptance and
@@ -126,9 +128,9 @@ graphs, workspaces, NCCL, allocator fragmentation, and loader transients. This
 explains why TP4 is plausible, but it is not evidence that the maximum context
 will load safely.
 
-## No-MTP TP4 decode control and architecture audit
+## No-MTP TP4 decode performance and quality audit
 
-The current unprofiled control is
+The retained performance candidate is
 `.artifacts/qwen38_flash_next_nvfp4_20260826/results/target80-qpn-m1-mtp-off-8192x512.json`.
 It uses one request, TP4/PP1, FP16 activations, MTP off, V2, CUDA graphs, the
 direct QPN-M1 NVFP4 experts, online channel-QPN8 attention/GR projections,
@@ -176,8 +178,54 @@ microseconds. A second screen spans expert IDs 0 through 470 and 16 random
 inputs; the final weighted MoE output differs by at most 4.768e-7. Together
 with removal of the traced 0.107-ms input-prepare work, the trace projection is
 about 12.36 ms/token, or 80.9 tokens/s. The fixed resident-model measurement
-above exceeds that projection at 82.274 tokens/s and is the acceptance
+above exceeds that projection at 82.274 tokens/s and is the performance
 evidence; no MTP or speculative decoding is enabled in this result.
+
+### Decode output-quality A/B (2026-08-28)
+
+The published NVFP4 checkpoint quantizes only the routed experts. Online QPN8
+also converts six dense projection roles to row-wise FP8 E4M3 at model load.
+A retained real-weight screen reports 2.44% to 2.75% relative L2 error against
+the original FP16 projections across mHC, GDN, and QSA. That is useful
+numerical diagnostics, but it is not by itself a model-output quality result.
+
+The matched model-level gate uses 32 fixed GSM8K questions with three indexed
+sampling seeds per question (96 sequential requests), temperature 0.6,
+top-p 0.95, top-k 20, natural EOS, and an 8192-token output limit. Both arms
+run source `f4040b8f`, TP4/PP1, V2, no MTP, FP16 activation/KV,
+FlashAttention-V100/FlashQLA, and FULL+PIECEWISE graphs; only online QPN8 and
+its dependent GDN BA split differ. A boxed-first scorer gives 96/96 for both
+arms, with zero invalid, replacement-character, NUL, or non-`stop` outputs.
+QPN8 raises mean steady decode from 67.627 to 79.105 tokens/s (+16.97%) and
+median steady decode from 67.640 to 79.369 tokens/s (+17.34%).
+
+Only 8/96 token hashes match, which is expected for a sampled low-precision
+route and is not a rejection criterion. The mean absolute output-length delta
+is 133.5 tokens and the maximum is 4477. One ambiguous-interest sample remains
+correct but grows from 1653 tokens and a repeated-4-gram ratio of 0.199 with
+QPN8 off to 3626 tokens and 0.507 with QPN8 on. Aggregate mean repetition is
+nearly unchanged (0.0394 versus 0.0410), so the evidence identifies a single
+long-output outlier rather than a task-accuracy or aggregate-quality
+regression. Under the performance-default policy, the 16.97% mean decode gain
+and unchanged 96/96 task result keep QPN8 default-on. Operators can set
+`VLLM_SM70_QWEN4_EXP_ONLINE_QPN8=0` for diagnosis while broader long-output
+quality monitoring continues.
+
+The fixed A/B execution SHA predates the compressed-QSA zeroing repair merged
+as PR #373 (`ddd8c0b601`). A compressed QSA scheduler block is logically 784
+tokens but stores one 98-row physical page. The old zeroer multiplied the
+compression ratio a second time and could clear the wrong range when a block
+was reused. Current main derives zeroing from `storage_block_size`, clears
+exactly the selected physical page, and is covered by a real V100 page test
+and a TP4 1K/4K generation smoke. Both A/B arms intentionally use the same old
+binary to isolate QPN8, while this branch includes the QSA repair.
+
+The checkpoint also carries multimodal `mrope_section` and
+`mrope_interleaved` fields in its text config. The initial SM70 route requires
+`language_model_only` and removes those fields before constructing text RoPE.
+For text-only positions the three MRoPE axes are identical, so this reduces to
+the same one-dimensional rotation; warnings emitted while the raw config is
+first validated do not indicate an unknown runtime RoPE implementation.
 
 ### Upstream methods and SM70 decisions
 

@@ -44210,3 +44210,100 @@ Interpretation:
   `337.107 -> 359.770 tok/s` (`+6.72%`). Cold wall time is prefill dominated;
   an identical-prefix rerun records `1.114 s` TTFT and `2.535 s` total. Chain
   remains opt-in and greedy-only rather than a universal chat default.
+## 2026-08-28 GLM-5.3 NVFP4 selector audit
+
+- The exact TP4/B1 grouped W13 shape is eight routed slots with local
+  `N=1024`, `K=4096`, and group size 16. A same-GPU random-data screen on one
+  V100 measures the default split-8 median at `51.200 us` and the measured
+  split-12 route at `48.128 us`, a 6.0% stage-latency reduction.
+- The two FP16 outputs differ in 37 of 8192 elements with maximum absolute
+  difference 0.125, relative L2 `1.642e-5`, and cosine `0.99999917`. This is a
+  small accumulation-order difference rather than task-quality regression
+  evidence, so the faster dynamic W13 selector remains enabled.
+- The exact TP4/B1 W2 shape is eight routed slots with local `N=4096`, `K=512`,
+  and group size 16. Across five random seeds, the measured split-1 policy is
+  only 2.8%-3.5% faster than default split-2 in the materialized grouped-MoE
+  screen. It changes 52-70 of 32768 FP16 outputs per seed with maximum absolute
+  difference 0.0625, relative L2 `1.34e-5`-`2.01e-5`, and cosine
+  `0.9999972`-`0.9999981`. With no task-quality regression evidence, the
+  dynamic W2 selector also remains enabled.
+  `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=0` remains the common
+  stable-accumulation rollback for both shapes.
+- The grouped-MoE benchmark now supports random inputs, output hashes, tensor
+  dumps, and the real eight-slot GLM shape. Seed 17 reproduces output hash
+  `47836839b542fb73494caa64adc14cd660e38c535c4a5e67e16d3a763196dac7`
+  across repeated runs. The W2 audit evidence is rooted at
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/`
+  `nvfp4_selector_main_20260828/`. A separate FP16 Dense/Indexer candidate
+  screen remains benchmark-only and does not alter production dispatch.
+
+## 2026-08-28 Qwen3.8 QSA page4 XQA prefill audit
+
+- The SM70-only route converts each selected four-token QSA block into a
+  virtual Flash-V100 page, sorts physical microblocks for cache locality, and
+  keeps a marked causal tail last. It is restricted to FP16 Hq6/Hkv1/D256,
+  the 2051-token QSA selection layout, compatible contiguous or interleaved
+  KV strides, and at least 4096 query rows. The route remains default-on and
+  retains `VLLM_SM70_QSA_XQA_PAGE4=0` as an operational escape hatch.
+- A production-shaped interleaved-KV V100 A/B at 4096 rows measures the
+  established Triton route at `27.8303 ms` and page4 XQA, including table
+  construction and sort, at `8.84736 ms` (`3.1456x`). Across 6,291,456 FP16
+  outputs, maximum absolute difference is `6.104e-5`, relative L2 is
+  `2.845e-4`, cosine is `0.99999994`, and all outputs are finite.
+- A separate nonmonotonic contiguous-page A/B passes with maximum absolute
+  difference `3.815e-6`, relative L2 `3.645e-4`, and cosine `1.0`. Causal
+  tails of one, two, and three tokens each remain below relative L2 `3.64e-4`
+  with cosine at least `0.99999988`. The 4095-row boundary takes the Triton
+  fallback and is bitwise identical with or without the newly forwarded
+  metadata.
+- The hybrid 784-token scheduler / 16-token kernel geometry is also exercised
+  with a nonmonotonic 128-entry virtual page table after the physical-page
+  correction. Page4 XQA passes at maximum absolute difference `3.815e-6`,
+  relative L2 `3.631e-4`, and cosine `0.99999994`; its CUDA Graph replay is
+  bitwise equal to eager output.
+- Prewarmed CUDA Graph capture succeeds on V100; two replays are bitwise
+  identical to eager page4 XQA with output hash
+  `9b4c76f8420d6e349dc7d552c72d6f0a861332e7e8e8f62459a1c48f0faf278f`.
+  The table kernel now clamps padded or stale query positions to the live
+  request length and admits a partial tail only when the expanded QSA indices
+  contain that exact token, preventing an invalid synthetic tail page.
+- Raising the shared page-ID capacity from 8 to 32 does not reduce the
+  declared two-block V100 occupancy: the page4 padded kernel uses 45,568
+  bytes per CTA (`91,136 < 98,304` bytes for two CTAs), and the pipeline
+  variant uses 47,616 bytes (`95,232 < 98,304`). Existing FP16 page-16 and
+  page-784 XQA-to-scalar smokes pass at relative L2 `3.03e-5` and `4.10e-5`,
+  respectively.
+
+## 2026-08-28 exact shared-gate prescaled M=1 audit
+
+- The earlier rejected PP2/TP4 shared-gate candidate forced a dedicated
+  prescaled tactic and changed the control split/reduction tree. The repaired
+  selector instead inherits the ordinary per-rank measured kernel family,
+  CTA, split-K, and swizzle for only `M=1`, `N=1024`, `K=4096`; other M=1
+  roles retain their existing selectors. If a reused or imported cache holds
+  a different family, the selector restores the audited ordinary
+  `8x128x64`, split-K-7, swizzle-0 launch before selecting its prescaled pair;
+  it fails closed only when that compiled kernel pair is unavailable.
+- The locked SM70 artifact for source
+  `3897ac3d45667e4746dd7c87d18280173b607db6` uses the same
+  `8x128x64`, split-K-7, swizzle-0 launch in both arms. On the real layer-0
+  TP4-rank-0 shared gate/up weight, 64 changing inputs are bitwise equal both
+  before and after the external clamp-SwiGLU; both CUDA Graphs are stable.
+  Same-GPU A/B/B/A timing moves `62.229` to `20.793 us/layer` (`2.99x`).
+- A focused rebuild after the latest-main cache repair has extension SHA256
+  `7006136ef008f49663dad71f212aec3f2dc8adf369fc4f5c26800ae5f2eef05a`.
+  A fresh exclusive-V100 run selected the same ordinary and prescaled family,
+  split-K-7, and swizzle-3 in both arms. All 64 raw and activated patterns are
+  bitwise equal, CUDA Graph replay is stable, and A/B/B/A timing moves
+  `62.594` to `20.728 us/layer` (`3.02x`). Evidence is under
+  `/data/models/v100-pr347-cache-fallback-operator-screen-20260828-r1/`.
+- The subsequent source narrowing changes only the guard from every M=1
+  descriptor to the exact measured `M1/N1024/K4096` descriptor, so the tested
+  body is unchanged. Exhaustive simulation over every E4M3 byte and all
+  checkpoint UE8M0 scale codes also finds zero dequantized FP16 differences
+  for the reversible exponent shift.
+- This exact tensor/runtime route defaults on without checkpoint or model
+  identity checks. A missing operator, an incompatible runtime topology, or
+  non-reversible scales retain the ordinary TurboMind transform; explicit
+  incompatible opt-in fails closed. `VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE=0`
+  is the rollback.

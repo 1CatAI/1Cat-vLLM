@@ -567,6 +567,8 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    requires_block_table_width: ClassVar[bool] = True
+    uses_physical_block_table: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -574,6 +576,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
+        block_table_width: int,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.is_circular_buffer = isinstance(kv_cache_spec, CircularBufferSpec)
@@ -594,6 +597,16 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         )
         max_requests = vllm_config.scheduler_config.max_num_seqs
         self.request_capacity = max_requests
+        if isinstance(kv_cache_spec, MLAAttentionSpec) and self.compress_ratio != 1:
+            self.block_table_buffer = torch.empty(
+                (max_requests, block_table_width),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            self.block_table_buffer = torch.empty(
+                (0, 0), dtype=torch.int32, device=device
+            )
         if not self.is_circular_buffer and self.compress_ratio != 1:
             max_k_work = (
                 max_tokens + (self.compress_ratio - 1) * max_requests
@@ -606,6 +619,53 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
                 0, 2, dtype=torch.int32, device=device
             )
 
+    def _canonical_block_table(self, block_table: torch.Tensor) -> torch.Tensor:
+        """Return physical QSA page IDs in a pointer-stable buffer.
+
+        A hybrid KV group exposes one common block table in units of its
+        smallest attention kernel block. For example, a 784-token scheduler
+        block with a 16-token main-attention kernel appears as 49 consecutive
+        entries whose values are ``physical_block * 49 + sub_block``. QSA's
+        compressed cache stores that same scheduler block as one physical
+        98-row page, so it must consume one canonical page ID rather than the
+        expanded main-attention entries.
+        """
+
+        if not self.block_table_buffer.numel():
+            return block_table
+        kernel_block_size = getattr(
+            self, "kernel_block_size", self.kv_cache_spec.block_size
+        )
+        if self.kv_cache_spec.block_size % kernel_block_size:
+            raise RuntimeError(
+                "QSA scheduler block size must be divisible by the KV-group "
+                "kernel block size"
+            )
+        expansion = self.kv_cache_spec.block_size // kernel_block_size
+        if expansion == 1:
+            return block_table
+        if block_table.shape[1] % expansion:
+            raise RuntimeError(
+                "QSA common block-table width does not match its virtual "
+                "kernel-block expansion"
+            )
+        rows = block_table.shape[0]
+        columns = block_table.shape[1] // expansion
+        if (
+            rows > self.block_table_buffer.shape[0]
+            or columns > (self.block_table_buffer.shape[1])
+        ):
+            raise RuntimeError("QSA canonical block-table buffer is too small")
+        canonical = self.block_table_buffer[:rows, :columns]
+        expanded_first = block_table[:, : columns * expansion : expansion]
+        torch.div(
+            expanded_first,
+            expansion,
+            rounding_mode="floor",
+            out=canonical,
+        )
+        return canonical
+
     def build(
         self,
         common_prefix_len: int,
@@ -614,6 +674,9 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     ) -> QSAForwardMetadata:
         del common_prefix_len, fast_build
         num_tokens = common_attn_metadata.num_actual_tokens
+        block_table = self._canonical_block_table(
+            common_attn_metadata.block_table_tensor
+        )
         build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
         k_work_metadata = self.k_work_metadata_buffer
         request_capacity = None
@@ -625,7 +688,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             ) // self.compress_ratio
             k_work_metadata = self.k_work_metadata_buffer[:max_num_work]
         token_to_req, logical_positions, slot_mapping = build_qsa_metadata(
-            common_attn_metadata,
+            common_attn_metadata.replace(block_table_tensor=block_table),
             self.token_to_req_buffer,
             self.logical_positions_buffer,
             self.slot_mapping_buffer,
@@ -638,7 +701,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             request_capacity=request_capacity,
         )
         return QSAForwardMetadata(
-            block_table=common_attn_metadata.block_table_tensor,
+            block_table=block_table,
             slot_mapping=slot_mapping,
             seq_lens=common_attn_metadata.seq_lens,
             query_start_loc=common_attn_metadata.query_start_loc,
@@ -690,10 +753,6 @@ class QSAStateBackend(AttentionBackend):
         if num_kv_heads != 1:
             raise ValueError("QSA side caches require exactly one KV head")
         return (num_blocks, block_size, num_kv_heads, head_size)
-
-    @classmethod
-    def indexes_kv_by_block_stride(cls) -> bool:
-        return True
 
     @staticmethod
     def get_kv_cache_stride_order(

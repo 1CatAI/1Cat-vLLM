@@ -698,6 +698,33 @@ def test_fp8_prescaled_m1_decode_admission_is_exact():
     assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
 
 
+def test_fp8_prescaled_m1_shared_gate_defaults_on_with_rollback(monkeypatch):
+    layer = SimpleNamespace(
+        prefix="model.layers.2.mlp.shared_experts.gate_up_proj",
+        tp_size=4,
+        weight_block_size=[128, 128],
+        input_size_per_partition=4096,
+        output_size_per_partition=1024,
+        output_partition_sizes=[512, 512],
+        weight=torch.empty((1024, 4096), device="meta"),
+    )
+    monkeypatch.delenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+
+        monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "0")
+        envs.disable_envs_cache()
+        assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+
+        monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "1")
+        envs.disable_envs_cache()
+        layer.prefix = "model.layers.2.mlp.gate_up_proj"
+        assert not _is_sm70_fp8_prescaled_m1_decode_layer(layer)
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_fp8_prescaled_m1_decode_scale_gate_is_reversible():
     scales = torch.tensor([2**-12, 2**-11, 0.0], dtype=torch.float16)
     prescaled = _try_sm70_fp8_prescaled_decode_scales(scales)

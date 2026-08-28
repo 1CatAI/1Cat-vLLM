@@ -126,6 +126,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        query_positions: torch.Tensor | None = None,
+        sequence_lengths: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -160,6 +162,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         from .ops.qsa import qsa_sparse_paged_attention
 
+        qsa_metadata: dict[str, torch.Tensor] = {}
+        if query_positions is not None:
+            qsa_metadata["query_positions"] = query_positions[:num_tokens]
+        if sequence_lengths is not None:
+            qsa_metadata["sequence_lengths"] = sequence_lengths
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -168,6 +175,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            **qsa_metadata,
         )
         return output
 
@@ -424,6 +432,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            query_positions=side_metadata.logical_positions,
+            sequence_lengths=side_metadata.seq_lens,
         )
 
     def forward(

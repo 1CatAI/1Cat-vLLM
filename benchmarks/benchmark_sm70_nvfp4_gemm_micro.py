@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import statistics
@@ -57,13 +58,43 @@ def _require_sm70(device: torch.device) -> None:
         raise RuntimeError(f"Expected SM70, got sm_{capability[0]}{capability[1]}.")
 
 
-def _make_input(m: int, k: int, device: torch.device) -> torch.Tensor:
+def _make_input(
+    m: int,
+    k: int,
+    device: torch.device,
+    *,
+    data_pattern: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if data_pattern == "random":
+        return torch.randn(
+            (m, k),
+            dtype=torch.float16,
+            device=device,
+            generator=generator,
+        )
     values = torch.arange(m * k, device=device, dtype=torch.int32)
     values = ((values % 1024).to(torch.float32) / 512.0) - 1.0
     return values.reshape(m, k).to(torch.float16)
 
 
-def _make_qweight(k: int, n: int, device: torch.device) -> torch.Tensor:
+def _make_qweight(
+    k: int,
+    n: int,
+    device: torch.device,
+    *,
+    data_pattern: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if data_pattern == "random":
+        return torch.randint(
+            0,
+            16,
+            (k, n),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
     values = torch.arange(k * n, device=device, dtype=torch.int32)
     return (values.reshape(k, n) & 15).to(torch.uint8).contiguous()
 
@@ -82,8 +113,27 @@ def _pack_qweight_u4(qweight: torch.Tensor) -> torch.Tensor:
     return packed.contiguous()
 
 
-def _make_scales(k: int, n: int, group_size: int, device: torch.device) -> torch.Tensor:
+def _make_scales(
+    k: int,
+    n: int,
+    group_size: int,
+    device: torch.device,
+    *,
+    data_pattern: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
     groups = k // group_size
+    if data_pattern == "random":
+        return (
+            torch.rand(
+                (groups, n),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 0.9921875
+            + 0.0078125
+        ).to(torch.float16)
     values = torch.arange(groups * n, device=device, dtype=torch.int32)
     values = ((values % 127).to(torch.float32) + 1.0) / 128.0
     return values.reshape(groups, n).to(torch.float16).contiguous()
@@ -163,12 +213,35 @@ def _run_case(
     mode: str,
     gemv_split_k: int,
     gated_silu: bool,
+    num_experts: int,
+    tensor_out: Path | None,
+    data_pattern: str,
+    generator: torch.Generator,
 ) -> dict[str, Any]:
     if case.k % group_size != 0:
         raise ValueError(f"{case.label}: K={case.k} not divisible by {group_size}.")
-    qweight = _make_qweight(case.k, case.n, device)
-    scales = _make_scales(case.k, case.n, group_size, device)
-    x = _make_input(case.m, case.k, device)
+    qweight = _make_qweight(
+        case.k,
+        case.n,
+        device,
+        data_pattern=data_pattern,
+        generator=generator,
+    )
+    scales = _make_scales(
+        case.k,
+        case.n,
+        group_size,
+        device,
+        data_pattern=data_pattern,
+        generator=generator,
+    )
+    x = _make_input(
+        case.m,
+        case.k,
+        device,
+        data_pattern=data_pattern,
+        generator=generator,
+    )
     if gated_silu and case.n % 2 != 0:
         raise ValueError(f"{case.label}: gated-SiLU requires even N, got {case.n}.")
     output_size = case.n // 2 if gated_silu else case.n
@@ -183,6 +256,12 @@ def _run_case(
     dense_weight = None
     qweight_packed = None
     partials = None
+    grouped_weights = None
+    grouped_scales = None
+    ptrs_w = None
+    ptrs_s = None
+    expert_offsets = None
+    expert_ids = None
     if mode == "gemm":
         tm_weight, tm_scales, meta = ops.nvfp4_sm70_prepare(
             qweight, scales, group_size, gated_silu
@@ -214,6 +293,40 @@ def _run_case(
             0.0,
             False,
             gated_silu,
+        )
+    elif mode == "grouped-moe":
+        if gated_silu:
+            raise ValueError("grouped-moe selector screens require --gated-silu off.")
+        if num_experts <= 0 or case.m != num_experts:
+            raise ValueError("grouped-moe M must equal --num-experts.")
+        tm_weight, tm_scales, meta = ops.nvfp4_sm70_prepare(
+            qweight, scales, group_size, False
+        )
+        k_ld = int(meta[0].item())
+        q_ld = int(meta[1].item())
+        grouped_weights = tm_weight.unsqueeze(0).repeat(num_experts, 1, 1)
+        grouped_scales = tm_scales.unsqueeze(0).repeat(num_experts, 1, 1)
+        ptrs_w, ptrs_s = ops.awq_moe_build_strided_ptrs(
+            grouped_weights,
+            grouped_scales,
+            k_ld,
+            q_ld,
+            num_experts,
+        )
+        expert_offsets = torch.arange(num_experts + 1, dtype=torch.int32, device=device)
+        expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
+        run = partial(
+            ops.nvfp4_moe_dense_stage_sm70_out,
+            out,
+            x,
+            expert_offsets,
+            expert_ids,
+            ptrs_w,
+            ptrs_s,
+            num_experts,
+            case.k,
+            case.n,
+            group_size,
         )
     elif mode in ("raw-gemv", "raw-gemv-warp", "raw-gemv-h2"):
         if case.m != 1:
@@ -268,6 +381,13 @@ def _run_case(
         raise ValueError(f"Unsupported mode: {mode}")
 
     timing = _time_cuda_call(run, device, warmup, iters, use_cuda_graph)
+    output_cpu = out.detach().contiguous().cpu()
+    output_sha256 = hashlib.sha256(
+        output_cpu.view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
+    if tensor_out is not None:
+        tensor_out.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(output_cpu, tensor_out)
     weighted_mean_ms = float(case.count) * timing["mean_us"] / 1000.0
     row = {
         "mode": mode,
@@ -278,6 +398,7 @@ def _run_case(
         "k": case.k,
         "group_size": group_size,
         "gated_silu": gated_silu,
+        "num_experts": num_experts if mode == "grouped-moe" else 1,
         "gemv_split_k": gemv_split_k if mode in ("raw-gemv", "raw-gemv-h2") else 0,
         "k_ld": k_ld,
         "q_ld": q_ld,
@@ -293,12 +414,18 @@ def _run_case(
                     else (
                         f"qpn4_prefill_{case.m}x{case.n}x{case.k}"
                         if mode == "qpn4-prefill"
-                        else f"sm70_f16_nvfp4k{group_size}_f16_tnt_fff_"
-                        f"{case.m}x{case.n}x{case.k}_1"
+                        else (
+                            f"grouped_moe_e{num_experts}_{case.m}x{case.n}x{case.k}"
+                            if mode == "grouped-moe"
+                            else f"sm70_f16_nvfp4k{group_size}_f16_tnt_fff_"
+                            f"{case.m}x{case.n}x{case.k}_1"
+                        )
                     )
                 )
             )
         ),
+        "output_sha256": output_sha256,
+        "tensor_out": str(tensor_out) if tensor_out is not None else None,
         **timing,
         "weighted_mean_ms": weighted_mean_ms,
     }
@@ -312,6 +439,12 @@ def _run_case(
         dense_weight,
         qweight_packed,
         partials,
+        grouped_weights,
+        grouped_scales,
+        ptrs_w,
+        ptrs_s,
+        expert_offsets,
+        expert_ids,
         x,
         out,
     )
@@ -330,10 +463,13 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "k",
         "group_size",
         "gated_silu",
+        "num_experts",
         "gemv_split_k",
         "k_ld",
         "q_ld",
         "desc_hint",
+        "output_sha256",
+        "tensor_out",
         "mean_us",
         "min_us",
         "p50_us",
@@ -355,6 +491,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--m", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--data-pattern",
+        choices=("periodic", "random"),
+        default="periodic",
+        help="Synthetic tensor pattern; random is intended for numerical A/B gates.",
+    )
     parser.add_argument(
         "--cuda-graph",
         action="store_true",
@@ -364,6 +507,7 @@ def _parse_args() -> argparse.Namespace:
         "--mode",
         choices=(
             "gemm",
+            "grouped-moe",
             "qpn4-prefill",
             "raw-gemv",
             "raw-gemv-warp",
@@ -377,6 +521,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Fuse gate/up SiLU and emit N/2 output columns.",
     )
+    parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument(
         "--gemv-split-k",
         type=int,
@@ -391,6 +536,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--csv-out", type=Path)
+    parser.add_argument(
+        "--tensor-out",
+        type=Path,
+        help="Save the exact output tensor; requires exactly one --case.",
+    )
     return parser.parse_args()
 
 
@@ -413,6 +563,10 @@ def main() -> int:
         ]
         if missing_qpn4_ops:
             raise RuntimeError(f"Missing QPN4 operators: {missing_qpn4_ops}.")
+    if args.mode == "grouped-moe" and not hasattr(
+        torch.ops._C, "nvfp4_moe_dense_stage_sm70_out"
+    ):
+        raise RuntimeError("Missing _C::nvfp4_moe_dense_stage_sm70_out.")
     if args.mode == "raw-gemv" and not hasattr(torch.ops._C, "nvfp4_gemv_sm70_raw_out"):
         raise RuntimeError("Missing _C::nvfp4_gemv_sm70_raw_out.")
     if args.mode == "raw-gemv-warp" and not hasattr(
@@ -429,6 +583,9 @@ def main() -> int:
         if args.case
         else _default_cases(args.m)
     )
+    if args.tensor_out is not None and len(cases) != 1:
+        raise ValueError("--tensor-out requires exactly one benchmark case.")
+    generator = torch.Generator(device=device).manual_seed(args.seed)
     rows = [
         _run_case(
             ops=ops,
@@ -441,6 +598,10 @@ def main() -> int:
             mode=args.mode,
             gemv_split_k=args.gemv_split_k,
             gated_silu=args.gated_silu,
+            num_experts=args.num_experts,
+            tensor_out=args.tensor_out,
+            data_pattern=args.data_pattern,
+            generator=generator,
         )
         for case in cases
     ]
@@ -454,6 +615,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "group_size": args.group_size,
+        "num_experts": args.num_experts if args.mode == "grouped-moe" else 1,
         "mode": args.mode,
         "gated_silu": args.gated_silu,
         "gemv_split_k": (
@@ -462,6 +624,8 @@ def main() -> int:
         "warmup": args.warmup,
         "iters": args.iters,
         "cuda_graph": args.cuda_graph,
+        "data_pattern": args.data_pattern,
+        "seed": args.seed,
         "total_weighted_mean_ms": total_ms,
         "stage1_target_ms": 10.0,
         "cases": rows,

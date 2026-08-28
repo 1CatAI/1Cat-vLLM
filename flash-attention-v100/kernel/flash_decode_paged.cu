@@ -38,7 +38,9 @@ constexpr int kThreadsPerBlock = 256;
 constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
 constexpr int kXQATCBlockN = 128;
 constexpr int kXQATCStride = 128;
-constexpr int kXQATCPageIdsCapacity = kXQATCBlockN / 16;
+// QSA exposes selected four-token microblocks as virtual paged KV. Keep enough
+// page slots for one full XQA tile at that minimum supported granularity.
+constexpr int kXQATCPageIdsCapacity = kXQATCBlockN / 4;
 constexpr int kXQATC256WideWarpCount = 8;
 constexpr int kXQATC256WideThreads = kXQATC256WideWarpCount * kWarpSize;
 constexpr int kXQATC256WideBlockM = 8;
@@ -742,9 +744,10 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   const int row = copy_idx / panel_d_stride_uint4;
   const int vec_col = copy_idx % panel_d_stride_uint4;
   const int token_offset = tile_page_offset + kv_tile_start + row;
-  static_assert(BLOCK_SIZE == 0 || BLOCK_SIZE == 16 || BLOCK_SIZE == 784 ||
-                    BLOCK_SIZE == 800 || BLOCK_SIZE == 1568 ||
-                    BLOCK_SIZE == 1648 || BLOCK_SIZE == 3296,
+  static_assert(BLOCK_SIZE == 0 || BLOCK_SIZE == 4 || BLOCK_SIZE == 16 ||
+                    BLOCK_SIZE == 784 || BLOCK_SIZE == 800 ||
+                    BLOCK_SIZE == 1568 || BLOCK_SIZE == 1648 ||
+                    BLOCK_SIZE == 3296,
                 "Unsupported paged-KV block-size specialization");
   static_assert(!CONTIGUOUS_HKV1_LAYOUT || BLOCK_SIZE == 16 ||
                     BLOCK_SIZE == 800 || BLOCK_SIZE == 1568 ||
@@ -752,7 +755,10 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
                 "The fixed-stride Hkv=1 layout requires a specialized page");
   int logical_block;
   int block_offset;
-  if constexpr (BLOCK_SIZE == 16) {
+  if constexpr (BLOCK_SIZE == 4) {
+    logical_block = token_offset >> 2;
+    block_offset = token_offset & 3;
+  } else if constexpr (BLOCK_SIZE == 16) {
     logical_block = token_offset >> 4;
     block_offset = token_offset & 15;
   } else if constexpr (BLOCK_SIZE == 784) {
@@ -840,7 +846,10 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       const int token_offset = tile_page_offset + kv_tile_start + row;
       int logical_block;
       int block_offset;
-      if constexpr (BLOCK_SIZE == 16) {
+      if constexpr (BLOCK_SIZE == 4) {
+        logical_block = token_offset >> 2;
+        block_offset = token_offset & 3;
+      } else if constexpr (BLOCK_SIZE == 16) {
         logical_block = token_offset >> 4;
         block_offset = token_offset & 15;
       } else if constexpr (BLOCK_SIZE == 784) {
@@ -4490,9 +4499,13 @@ at::Tensor flash_attention_decode_paged_xqa(
       (batch_context_route == XQABatchContextRoute::kDualCta ||
        batch_context_route == XQABatchContextRoute::kDualCtaSplit) &&
       xqa_e5m2_batch_wide_load_enabled();
+  const bool use_qsa_page4 =
+      q.size(0) >= 4096 && q_per_kv == 6 && partition_size == 256 &&
+      k_cache.size(1) == 4 && k_cache.size(2) == 1 &&
+      k_cache.scalar_type() == at::kHalf && block_table.size(1) == 513;
   const bool use_g6_dual_cta =
-      use_g6_p1024_auto || use_g6_p1024_sawtooth || use_mtp5_dual_cta ||
-      use_e5m2_g6_dual_cta ||
+      use_qsa_page4 || use_g6_p1024_auto || use_g6_p1024_sawtooth ||
+      use_mtp5_dual_cta || use_e5m2_g6_dual_cta ||
       batch_context_route == XQABatchContextRoute::kDualCta ||
       batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
       (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
@@ -4501,6 +4514,8 @@ at::Tensor flash_attention_decode_paged_xqa(
       batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
       (use_g6_dual_cta && xqa_split_reduce_enabled());
   const bool supports_block16_index = use_g6_dual_cta && k_cache.size(1) == 16;
+  const bool use_block4_index =
+      use_g6_dual_cta && partition_size == 256 && k_cache.size(1) == 4;
   const bool supports_block16_contiguous_layout =
       supports_block16_index && k_cache.size(2) == 1 &&
       k_cache.stride(0) == 4096 && k_cache.stride(1) == 256 &&
@@ -4842,6 +4857,13 @@ at::Tensor flash_attention_decode_paged_xqa(
             v_scale, launch_num_partitions, use_split_reduce,
             split_reduce_dim_tile, stream);
       }
+    } else if (use_block4_index) {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          256, 6, true, kXQATCG6DualCtaThreads, 2, 4, false>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, use_split_reduce, split_reduce_dim_tile,
+          stream);
     } else if (block16_layout_mode == 2) {
       launch_flash_attention_decode_paged_xqa_tc_256_wide<
           256, 6, true, kXQATCG6DualCtaThreads, 2, 16, true>(

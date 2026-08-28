@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_PREFILL_PRESCALED: bool = True
     VLLM_SM70_FP8_PRESCALED_M1_DECODE: bool = True
+    VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE: bool = True
     VLLM_SM70_FP8_PREFILL_CUTLASS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
@@ -1811,6 +1812,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_FP8_PRESCALED_M1_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))
+    ),
+    # Exact prescaled route for the measured PP2 x TP4 shared-expert gate/up
+    # tensor. Missing operators or non-reversible scales fall back safely.
+    "VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", "1"))
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))

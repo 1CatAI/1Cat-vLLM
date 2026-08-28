@@ -27,6 +27,17 @@ _SM70_INDEXER_CUBLAS_MIN_ROWS = int(
 _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = int(
     os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS", str(1024**2))
 )
+_SM70_QSA_XQA_PAGE4 = os.getenv("VLLM_SM70_QSA_XQA_PAGE4", "1") == "1"
+_SM70_QSA_XQA_PAGE4_MIN_ROWS = int(
+    os.getenv("VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS", "4096")
+)
+_SM70_QSA_XQA_PAGE4_PARTITION = 256
+_SM70_QSA_XQA_PAGE4_PAGES = 513
+_SM70_QSA_XQA_PAGE4_MARKER = 1 << 30
+_SM70_QSA_XQA_PAGE4_WORKSPACES: dict[
+    tuple[int, int, int, int, int],
+    tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
 
 
 @triton.jit
@@ -318,6 +329,113 @@ def _expand_qsa_indices_kernel(
         output_ptr + row * stride_output_row + columns * stride_output_column,
         tl.where(valid, token, -1),
         mask=(row < rows) & (columns < OUTPUT_WIDTH),
+    )
+
+
+@triton.jit
+def _qsa_xqa_page4_table_kernel(
+    indices_ptr,
+    block_table_ptr,
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    encoded_pages_ptr,
+    xqa_sequence_lengths_ptr,
+    stride_indices_row,
+    stride_table_req,
+    stride_encoded_row,
+    rows,
+    num_cache_blocks,
+    num_requests,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    COMPLETE_PAGES: tl.constexpr,
+    OUTPUT_PAGES: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+    PHYSICAL_PAGE_STRIDE: tl.constexpr,
+    TAIL_MARKER: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    slots = tl.arange(0, BLOCK_PAGES)
+    request = tl.load(token_to_req_ptr + row)
+    request_is_valid = (request >= 0) & (request < num_requests)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    query_position = tl.load(query_positions_ptr + row)
+    sequence_length = tl.load(
+        sequence_lengths_ptr + safe_request,
+        mask=request_is_valid,
+        other=0,
+    )
+    # Padded graph rows use position -1. Clamp malformed or stale positions to
+    # the request's live sequence so they cannot expose a synthetic tail page.
+    visible_tokens = tl.minimum(
+        tl.maximum(query_position + 1, 0),
+        sequence_length,
+    )
+    complete_pages = tl.minimum(
+        tl.minimum(visible_tokens // 4, sequence_length // 4),
+        COMPLETE_PAGES,
+    )
+    tail_count = visible_tokens - (visible_tokens // 4) * 4
+    is_complete = slots < complete_pages
+    selected_token = tl.load(
+        indices_ptr + row * stride_indices_row + slots * 4,
+        mask=(row < rows) & is_complete,
+        other=-1,
+    )
+    tail_token = (visible_tokens // 4) * 4
+    selected_tail_token = tl.load(
+        indices_ptr + row * stride_indices_row + complete_pages * 4,
+        mask=(row < rows) & (tail_count > 0),
+        other=-1,
+    )
+    tail_is_valid = (
+        (tail_count > 0)
+        & (selected_tail_token == tail_token)
+        & (selected_tail_token < sequence_length)
+    )
+    is_tail = (slots == complete_pages) & tail_is_valid
+    logical_token = tl.where(is_tail, selected_tail_token, selected_token)
+    safe_token = tl.maximum(logical_token, 0)
+    logical_page = safe_token // PAGE_SIZE
+    page_offset = safe_token - logical_page * PAGE_SIZE
+    valid = (
+        (row < rows)
+        & request_is_valid
+        & (logical_token >= 0)
+        & (logical_token < sequence_length)
+        & (logical_page < PAGE_TABLE_WIDTH)
+        & (is_complete | is_tail)
+    )
+    physical_page = tl.load(
+        block_table_ptr
+        + safe_request * stride_table_req
+        + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+        mask=valid,
+        other=-1,
+    )
+    valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+    physical_microblock = (
+        tl.maximum(physical_page, 0) * PHYSICAL_PAGE_STRIDE + page_offset // 4
+    )
+    encoded = tl.where(
+        valid & is_complete,
+        physical_microblock,
+        tl.where(
+            valid & is_tail,
+            physical_microblock + TAIL_MARKER,
+            2147483647,
+        ),
+    )
+    tl.store(
+        encoded_pages_ptr + row * stride_encoded_row + slots,
+        encoded,
+        mask=(row < rows) & (slots < OUTPUT_PAGES),
+    )
+    tl.store(
+        xqa_sequence_lengths_ptr + row,
+        complete_pages * 4 + tl.where(tail_is_valid, tail_count, 0),
+        mask=row < rows,
     )
 
 
@@ -1134,6 +1252,274 @@ def qsa_select_paged_tokens(
     return out
 
 
+def _qsa_xqa_page4_shape_supported(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    sequence_lengths: torch.Tensor | None,
+) -> bool:
+    return (
+        query_positions is not None
+        and sequence_lengths is not None
+        and q.dtype == torch.float16
+        and k_cache.dtype == v_cache.dtype == torch.float16
+        and q.device
+        == k_cache.device
+        == v_cache.device
+        == logical_indices.device
+        == block_table.device
+        == token_to_req.device
+        == query_positions.device
+        == sequence_lengths.device
+        and q.ndim == 3
+        and q.shape[1:] == (6, 256)
+        and q.stride(2) == 1
+        and k_cache.ndim == 4
+        and v_cache.shape == k_cache.shape
+        and k_cache.shape[2:] == (1, 256)
+        and k_cache.shape[1] % 4 == 0
+        and k_cache.stride(3) == v_cache.stride(3) == 1
+        and k_cache.stride(1) == v_cache.stride(1) == 256
+        and k_cache.stride(0) == v_cache.stride(0)
+        and k_cache.stride(0) in (k_cache.shape[1] * 256, 2 * k_cache.shape[1] * 256)
+        and logical_indices.shape == (q.shape[0], 2051)
+        and logical_indices.dtype == torch.int32
+        and logical_indices.stride(1) == 1
+        and block_table.ndim == 2
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1
+        and token_to_req.shape == (q.shape[0],)
+        and token_to_req.dtype == torch.int32
+        and token_to_req.stride(0) == 1
+        and query_positions.shape == (q.shape[0],)
+        and query_positions.dtype == torch.int64
+        and query_positions.stride(0) == 1
+        and sequence_lengths.shape == (block_table.shape[0],)
+        and sequence_lengths.dtype == torch.int32
+        and sequence_lengths.stride(0) == 1
+        and k_cache.shape[0] * (k_cache.stride(0) // (4 * 256))
+        < _SM70_QSA_XQA_PAGE4_MARKER
+    )
+
+
+def _use_sm70_qsa_xqa_page4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    sequence_lengths: torch.Tensor | None,
+) -> bool:
+    return (
+        _SM70_QSA_XQA_PAGE4
+        and current_platform.is_device_capability(70)
+        and q.shape[0] >= _SM70_QSA_XQA_PAGE4_MIN_ROWS
+        and _qsa_xqa_page4_shape_supported(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+        )
+    )
+
+
+def _qsa_xqa_page4_block_table(
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    num_cache_blocks: int,
+    page_size: int,
+    physical_page_stride: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if physical_page_stride is None:
+        physical_page_stride = page_size // 4
+    rows = logical_indices.shape[0]
+    encoded_pages = torch.empty(
+        (rows, _SM70_QSA_XQA_PAGE4_PAGES),
+        dtype=torch.int32,
+        device=logical_indices.device,
+    )
+    xqa_sequence_lengths = torch.empty(
+        (rows,), dtype=torch.int32, device=logical_indices.device
+    )
+    _qsa_xqa_page4_table_kernel[(rows,)](
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        encoded_pages,
+        xqa_sequence_lengths,
+        logical_indices.stride(0),
+        block_table.stride(0),
+        encoded_pages.stride(0),
+        rows,
+        num_cache_blocks,
+        block_table.shape[0],
+        PAGE_SIZE=page_size,
+        PAGE_TABLE_WIDTH=block_table.shape[1],
+        COMPLETE_PAGES=2048 // 4,
+        OUTPUT_PAGES=_SM70_QSA_XQA_PAGE4_PAGES,
+        BLOCK_PAGES=1024,
+        PHYSICAL_PAGE_STRIDE=physical_page_stride,
+        TAIL_MARKER=_SM70_QSA_XQA_PAGE4_MARKER,
+        num_warps=4,
+    )
+    sorted_pages = torch.sort(encoded_pages, dim=1).values
+    physical_pages = torch.bitwise_and(
+        sorted_pages,
+        _SM70_QSA_XQA_PAGE4_MARKER - 1,
+    )
+    return physical_pages, xqa_sequence_lengths
+
+
+def _qsa_xqa_page4_workspace(
+    q: torch.Tensor,
+    num_partitions: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device_index = q.device.index if q.device.index is not None else -1
+    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
+    key = (device_index, stream_id, q.shape[1], q.shape[2], num_partitions)
+    workspace = _SM70_QSA_XQA_PAGE4_WORKSPACES.get(key)
+    rows = q.shape[0]
+    if workspace is None or workspace[0] < rows:
+        capacity = 1 << (rows - 1).bit_length()
+        temporary_output = torch.empty(
+            (capacity, q.shape[1], num_partitions, q.shape[2]),
+            dtype=torch.float16,
+            device=q.device,
+        )
+        max_logits = torch.empty(
+            (capacity, q.shape[1], num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        exp_sums = torch.empty_like(max_logits)
+        active_num_partitions = torch.tensor(
+            [num_partitions], dtype=torch.int32, device=q.device
+        )
+        workspace = (
+            capacity,
+            temporary_output,
+            max_logits,
+            exp_sums,
+            active_num_partitions,
+        )
+        _SM70_QSA_XQA_PAGE4_WORKSPACES[key] = workspace
+    _, temporary_output, max_logits, exp_sums, active_num_partitions = workspace
+    return (
+        temporary_output[:rows],
+        max_logits[:rows],
+        exp_sums[:rows],
+        active_num_partitions,
+    )
+
+
+def _qsa_sparse_paged_attention_sm70_xqa_page4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor | None:
+    try:
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+    except ImportError:
+        logger.warning_once(
+            "SM70 QSA page4 XQA route is unavailable because Flash-V100 "
+            "could not be imported; using Triton sparse attention."
+        )
+        return None
+    if not hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd"):
+        logger.warning_once(
+            "SM70 QSA page4 XQA route is unavailable in this Flash-V100 build; "
+            "using Triton sparse attention."
+        )
+        return None
+
+    virtual_block_table, xqa_sequence_lengths = _qsa_xqa_page4_block_table(
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        k_cache.shape[0],
+        k_cache.shape[1],
+        k_cache.stride(0) // (4 * q.shape[2]),
+    )
+    num_partitions = math.ceil(logical_indices.shape[1] / _SM70_QSA_XQA_PAGE4_PARTITION)
+    temporary_output, max_logits, exp_sums, active_num_partitions = (
+        _qsa_xqa_page4_workspace(q, num_partitions)
+    )
+    microblock_stride = 4 * q.shape[2]
+    if k_cache.stride(0) == k_cache.shape[1] * q.shape[2]:
+        microblocks_per_cache_block = k_cache.shape[1] // 4
+        physical_k_cache = k_cache.view(
+            k_cache.shape[0] * microblocks_per_cache_block,
+            4,
+            1,
+            q.shape[2],
+        )
+        physical_v_cache = v_cache.view_as(physical_k_cache)
+    else:
+        # The local FlashAttention ABI interleaves K and V inside every
+        # physical cache block. The virtual page IDs carry that doubled block
+        # stride, while this narrow view exposes a four-token page stride to
+        # XQA. No cache data is copied or rearranged.
+        physical_shape = (k_cache.shape[0], 4, 1, q.shape[2])
+        physical_strides = (
+            microblock_stride,
+            q.shape[2],
+            q.shape[2],
+            1,
+        )
+        physical_k_cache = k_cache.as_strided(physical_shape, physical_strides)
+        physical_v_cache = v_cache.as_strided(physical_shape, physical_strides)
+    flash_attn_v100_cuda.decode_paged_xqa_fwd(
+        q,
+        physical_k_cache,
+        physical_v_cache,
+        out,
+        virtual_block_table,
+        xqa_sequence_lengths,
+        temporary_output,
+        max_logits,
+        exp_sums,
+        active_num_partitions,
+        q.shape[2] ** -0.5,
+        _SM70_QSA_XQA_PAGE4_PARTITION,
+        num_partitions,
+        "auto",
+        1.0,
+        1.0,
+        -1,
+        -1,
+        0,
+    )
+    logger.info_once(
+        "Using SM70 QSA Flash-V100 XQA page4 prefill route (rows=%d, partitions=%d).",
+        q.shape[0],
+        num_partitions,
+    )
+    return out
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1142,6 +1528,8 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    query_positions: torch.Tensor | None = None,
+    sequence_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged FP16/BF16 K/V caches."""
 
@@ -1179,6 +1567,31 @@ def qsa_sparse_paged_attention(
     assert out.stride(2) == 1
     if not q.shape[0]:
         return out
+
+    if _use_sm70_qsa_xqa_page4(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+    ):
+        assert query_positions is not None and sequence_lengths is not None
+        xqa_output = _qsa_sparse_paged_attention_sm70_xqa_page4(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            out,
+        )
+        if xqa_output is not None:
+            return xqa_output
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)

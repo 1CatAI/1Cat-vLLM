@@ -352,3 +352,84 @@ def test_pp2_tp4_qpn8_shared_gate_retains_external_activation(monkeypatch) -> No
     assert layer.sm70_fp8_qpn8_nacc == 2
     assert not layer.sm70_fp8_qpn8_prefetch
     assert not getattr(layer, "sm70_fp8_gated_silu", False)
+
+
+def test_pp2_tp4_shared_gate_prescaled_defaults_to_turbomind_layout(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE", "0")
+    monkeypatch.setenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1")
+    monkeypatch.delenv("VLLM_SM70_FP8_PRESCALED_M1_SHARED_GATE", raising=False)
+    monkeypatch.setenv("VLLM_SM70_FP8_DENSE_GATED_SILU", "1")
+    monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_FAST_SELECTOR", "0")
+    monkeypatch.setenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "0")
+    envs.disable_envs_cache()
+
+    layer = torch.nn.Module()
+    layer.prefix = "arbitrary.layers.7.mlp.shared_experts.gate_up_proj"
+    layer.tp_size = 4
+    layer.input_size_per_partition = 4096
+    layer.output_size_per_partition = 1024
+    layer.output_partition_sizes = [512, 512]
+    layer.weight_block_size = [128, 128]
+    layer.weight = torch.empty((1024, 4096), device="meta")
+    layer.weight_scale_inv = torch.empty((8, 32), device="meta")
+    layer.orig_dtype = torch.float16
+    layer.is_bmm = False
+
+    method = fp8.Fp8LinearMethod.__new__(fp8.Fp8LinearMethod)
+    method.use_marlin = False
+    method.use_sm70_fp8_turbomind = True
+    method.weight_block_size = [128, 128]
+    method.is_scale_e8m0 = True
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            tensor_parallel_size=4,
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        speculative_config=None,
+    )
+    tm_scales = torch.full((32, 1024), 2**-12, dtype=torch.float16)
+    prepare_calls: list[bool] = []
+
+    def fake_prepare(weight, scales, group_size, gated_silu):
+        del weight, scales
+        assert group_size == 128
+        prepare_calls.append(gated_silu)
+        return (
+            torch.empty((4096, 1024), dtype=torch.uint8, device="meta"),
+            tm_scales,
+            torch.tensor([4096, 1024]),
+        )
+
+    monkeypatch.setattr(
+        torch.ops._C, "fp8_gemm_sm70_prescaled_m1_out", object(), raising=False
+    )
+    try:
+        with (
+            patch.object(fp8, "get_current_vllm_config", return_value=config),
+            patch.object(
+                fp8,
+                "process_fp8_weight_block_strategy",
+                side_effect=lambda weight, scales: (weight, scales),
+            ),
+            patch.object(fp8.sm70_ops, "fp8_sm70_prepare", side_effect=fake_prepare),
+            patch.object(fp8, "replace_parameter"),
+        ):
+            method.process_weights_after_loading(layer)
+    finally:
+        envs.disable_envs_cache()
+
+    assert prepare_calls == [True]
+    assert layer.sm70_fp8_turbomind
+    assert not getattr(layer, "sm70_fp8_qpn8", False)
+    assert layer.sm70_fp8_gated_silu_primary
+    torch.testing.assert_close(
+        layer.sm70_fp8_decode_prescaled_scales,
+        tm_scales * 256,
+        rtol=0,
+        atol=0,
+    )
