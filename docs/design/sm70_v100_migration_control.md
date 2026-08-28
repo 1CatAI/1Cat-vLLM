@@ -44172,3 +44172,24 @@ Interpretation:
   `docs/design/sm70_dflash2_quality_audit.md`. Do not cite acceptance length as
   intelligence: it explains throughput, while official executable scores and
   natural termination are the quality gates.
+
+## 2026-08-28 DFlash2 drafter-free lookup chain
+
+- Public integration starts from `onecat/main` in isolated worktree
+  `v100-dflash2-labd-chain-20260828-031506`. The opt-in chain keeps the existing
+  LABD q8/q16 scheduler and all target verification, but skips the neural
+  DFlash2 query/selector graph while a greedy B1 request continuously copies
+  its own context. The first rejection exits to a normal DFlash2 step.
+- The targeted DFlash2 suite passes `128` tests. A paired TP4 V100 copy request
+  is token-identical for all 512 output tokens and moves `359.76 -> 363.69
+  token/s` (`+1.09%`). About 25 of 36 rounds chain; measured saving is roughly
+  `0.59 ms` per engaged round. The ordinary request never chains and diverges
+  at a near tie, so its apparent throughput movement is not attributed to the
+  feature.
+- The upstream `381 token/s` result is a 25K verbatim-document workload at
+  `14.97` tokens per q16 round, not a universal chat rate. Its implied q16
+  round cost is about `39.3 ms`, essentially the local control's `39.5 ms`.
+  The remaining gap in the current short sample is acceptance/transition
+  behavior, not a missing 30% verifier kernel speedup.
+- Full provenance, contracts, artifacts, and the next trace/concurrency gates
+  are recorded in `docs/design/sm70_dflash2_drafter_free_chain.md`.
