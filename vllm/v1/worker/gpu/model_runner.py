@@ -34,6 +34,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    is_global_first_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -278,9 +279,116 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
         self._ple_offload_connector: Any | None = None
+        self._sm70_v2_mtp_profile_pending: dict[str, Any] | None = None
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+    def _sm70_v2_mtp_profile_enabled(self) -> bool:
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.is_last_pp_rank
+            and self.device.type == "cuda"
+            and envs.VLLM_SM70_MTP_PROFILE
+        )
+
+    @staticmethod
+    def _sm70_v2_mtp_profile_start(
+        ctx: dict[str, Any] | None,
+    ) -> torch.cuda.Event | None:
+        if ctx is None:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    @staticmethod
+    def _sm70_v2_mtp_profile_finish(
+        ctx: dict[str, Any] | None,
+        name: str,
+        start: torch.cuda.Event | None,
+    ) -> None:
+        if ctx is None or start is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        ctx["events"].append((name, start, end))
+
+    def _sm70_v2_mtp_profile_report(self, ctx: dict[str, Any] | None) -> None:
+        if ctx is None:
+            return
+        events = ctx["events"]
+        if events:
+            events[-1][2].synchronize()
+
+        timings: dict[str, float] = {}
+        for name, start, end in events:
+            timings[name] = timings.get(name, 0.0) + start.elapsed_time(end)
+        timings["target_verifier_gpu"] = sum(
+            timings.get(name, 0.0)
+            for name in ("target_forward", "target_sample", "target_state_update")
+        )
+        timings["target_verifier_wall_cpu"] = ctx["target_verifier_wall_cpu"]
+        timings["total_wall_cpu"] = (
+            time.perf_counter() - ctx["total_wall_start"]
+        ) * 1000.0
+
+        totals = getattr(self, "_sm70_v2_mtp_profile_totals", None)
+        if totals is None:
+            totals = {}
+            self._sm70_v2_mtp_profile_totals = totals
+        calls = getattr(self, "_sm70_v2_mtp_profile_calls", 0) + 1
+        self._sm70_v2_mtp_profile_calls = calls
+        for name, value in timings.items():
+            totals[name] = totals.get(name, 0.0) + value
+
+        interval = envs.VLLM_SM70_MTP_PROFILE_INTERVAL
+        if calls != 1 and calls % interval != 0:
+            return
+        if not is_global_first_rank():
+            return
+
+        preferred = (
+            "target_verifier_wall_cpu",
+            "target_verifier_gpu",
+            "target_forward",
+            "target_sample",
+            "target_state_update",
+            "draft_total",
+            "total_gpu",
+            "total_wall_cpu",
+        )
+        keys = [name for name in preferred if name in totals]
+        summary = " ".join(f"{name}={totals[name] / calls:.3f}" for name in keys)
+        logger.info(
+            "SM70 V2 MTP profile avg_ms calls=%d tokens=%d drafts=%d %s",
+            calls,
+            ctx["num_tokens"],
+            ctx["num_draft_tokens"],
+            summary,
+        )
+
+        last_totals = getattr(self, "_sm70_v2_mtp_profile_last_totals", {})
+        last_calls = getattr(self, "_sm70_v2_mtp_profile_last_calls", 0)
+        interval_calls = calls - last_calls
+        if interval_calls > 0:
+            interval_summary = " ".join(
+                f"{name}="
+                f"{(totals[name] - last_totals.get(name, 0.0)) / interval_calls:.3f}"
+                for name in keys
+            )
+            logger.info(
+                "SM70 V2 MTP profile interval_avg_ms calls=%d "
+                "interval_calls=%d tokens=%d drafts=%d %s",
+                calls,
+                interval_calls,
+                ctx["num_tokens"],
+                ctx["num_draft_tokens"],
+                interval_summary,
+            )
+        self._sm70_v2_mtp_profile_last_totals = dict(totals)
+        self._sm70_v2_mtp_profile_last_calls = calls
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1376,6 +1484,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             del intermediate_tensors
 
+        # Profile only real MTP verification steps. Prefill, non-spec decode,
+        # warmup, and ordinary production runs keep the event path disabled.
+        mtp_profile_ctx: dict[str, Any] | None = None
+        if (
+            not dummy_run
+            and input_batch.num_draft_tokens > 0
+            and self._sm70_v2_mtp_profile_enabled()
+        ):
+            mtp_profile_ctx = {
+                "events": [],
+                "num_tokens": input_batch.num_tokens,
+                "num_draft_tokens": input_batch.num_draft_tokens,
+                "target_wall_start": time.perf_counter(),
+                "total_wall_start": time.perf_counter(),
+            }
+            mtp_profile_ctx["total_gpu_start"] = self._sm70_v2_mtp_profile_start(
+                mtp_profile_ctx
+            )
+        mtp_target_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1406,6 +1534,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
+        self._sm70_v2_mtp_profile_finish(
+            mtp_profile_ctx, "target_forward", mtp_target_start
+        )
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1431,6 +1562,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
         )
+        self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1453,6 +1585,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         self.execute_model_state = None
+        mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
+        self._sm70_v2_mtp_profile_pending = None
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
@@ -1468,8 +1602,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
+        mtp_sample_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
+        )
+        self._sm70_v2_mtp_profile_finish(
+            mtp_profile_ctx, "target_sample", mtp_sample_start
         )
 
         if self.use_pp:
@@ -1529,9 +1667,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
+        mtp_state_update_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
         self.postprocess(
             input_batch, sampler_output.sampled_token_ids, num_sampled, num_rejected
         )
+        self._sm70_v2_mtp_profile_finish(
+            mtp_profile_ctx, "target_state_update", mtp_state_update_start
+        )
+        if mtp_profile_ctx is not None:
+            # Profiling is explicit and diagnostic-only. This fence turns the
+            # target phase into a directly comparable wall measurement while
+            # ordinary inference remains fence-free.
+            mtp_profile_ctx["events"][-1][2].synchronize()
+            mtp_profile_ctx["target_verifier_wall_cpu"] = (
+                time.perf_counter() - mtp_profile_ctx["target_wall_start"]
+            ) * 1000.0
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1546,6 +1696,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            mtp_draft_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1578,6 +1729,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else None
                 ),
             )
+            self._sm70_v2_mtp_profile_finish(
+                mtp_profile_ctx, "draft_total", mtp_draft_start
+            )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             num_draft_tokens = None
             if hasattr(self.speculator, "next_num_draft_tokens"):
@@ -1591,6 +1745,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+
+        self._sm70_v2_mtp_profile_finish(
+            mtp_profile_ctx,
+            "total_gpu",
+            None if mtp_profile_ctx is None else mtp_profile_ctx["total_gpu_start"],
+        )
+        self._sm70_v2_mtp_profile_report(mtp_profile_ctx)
 
         if self.use_async_scheduling:
             return async_output

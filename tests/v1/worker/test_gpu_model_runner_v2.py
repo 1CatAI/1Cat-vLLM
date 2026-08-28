@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,59 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu import model_runner as mrv2
+
+
+def test_sm70_v2_mtp_profile_gate(monkeypatch):
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.is_last_pp_rank = True
+    runner.device = torch.device("cuda")
+
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE", "1")
+    assert runner._sm70_v2_mtp_profile_enabled()
+
+    runner.speculative_config = SimpleNamespace(method="dflash")
+    assert not runner._sm70_v2_mtp_profile_enabled()
+    runner.speculative_config = SimpleNamespace(method="mtp")
+    runner.is_last_pp_rank = False
+    assert not runner._sm70_v2_mtp_profile_enabled()
+
+
+def test_sm70_v2_mtp_profile_composes_target_verifier(monkeypatch):
+    class FakeEvent:
+        def __init__(self, elapsed_ms: float = 0.0):
+            self.elapsed_ms = elapsed_ms
+
+        def elapsed_time(self, end: "FakeEvent") -> float:
+            del end
+            return self.elapsed_ms
+
+        def synchronize(self) -> None:
+            pass
+
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "1")
+    monkeypatch.setattr(mrv2, "is_global_first_rank", lambda: True)
+    ctx = {
+        "events": [
+            ("target_forward", FakeEvent(10.0), FakeEvent()),
+            ("target_sample", FakeEvent(2.0), FakeEvent()),
+            ("target_state_update", FakeEvent(1.0), FakeEvent()),
+            ("draft_total", FakeEvent(5.0), FakeEvent()),
+            ("total_gpu", FakeEvent(20.0), FakeEvent()),
+        ],
+        "num_tokens": 5,
+        "num_draft_tokens": 4,
+        "target_verifier_wall_cpu": 14.0,
+        "total_wall_start": time.perf_counter(),
+    }
+
+    runner._sm70_v2_mtp_profile_report(ctx)
+
+    assert runner._sm70_v2_mtp_profile_totals["target_verifier_gpu"] == 13.0
+    assert runner._sm70_v2_mtp_profile_totals["target_verifier_wall_cpu"] == 14.0
+    assert runner._sm70_v2_mtp_profile_totals["draft_total"] == 5.0
+    assert runner._sm70_v2_mtp_profile_totals["total_gpu"] == 20.0
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):

@@ -55,17 +55,28 @@ def _capture_round(
     os.environ[_MTP5_ENV] = "1" if push else "0"
     torch.accelerator.synchronize()
     dist.barrier()
+    regular_outputs = [torch.empty_like(input_a) for _ in range(_LAYERS)]
+    sum2_outputs = [torch.empty_like(input_a) for _ in range(_LAYERS)]
     graph = torch.cuda.CUDAGraph()
     with communicator.capture(), torch.cuda.graph(graph):
-        outputs: list[torch.Tensor] = []
-        for _ in range(_LAYERS):
-            regular = communicator.custom_all_reduce(input_a)
-            sum2 = communicator.custom_all_reduce_sum2(input_a, input_b)
-            if regular is None or sum2 is None:
-                raise RuntimeError("custom all-reduce rejected the MTP5 graph input")
-            outputs.extend((regular, sum2))
+        for layer in range(_LAYERS):
+            communicator.all_reduce(
+                input_a,
+                out=regular_outputs[layer],
+                registered=True,
+            )
+            communicator.all_reduce_sum2(
+                input_a,
+                input_b,
+                out=sum2_outputs[layer],
+            )
     torch.accelerator.synchronize()
     dist.barrier()
+    outputs = [
+        output
+        for pair in zip(regular_outputs, sum2_outputs, strict=True)
+        for output in pair
+    ]
     return graph, outputs
 
 
@@ -208,12 +219,18 @@ def main() -> None:
             raise RuntimeError("SM70 TP4 push buffer was not registered")
 
         input_a, input_b = _make_inputs(rank)
+        if rank == 0:
+            print("[tp4-mtp5-ar] capture baseline pull graph", flush=True)
         baseline_graph, baseline_outputs = _capture_round(
             communicator, input_a, input_b, push=False
         )
+        if rank == 0:
+            print("[tp4-mtp5-ar] capture candidate push graph", flush=True)
         candidate_graph, candidate_outputs = _capture_round(
             communicator, input_a, input_b, push=True
         )
+        if rank == 0:
+            print("[tp4-mtp5-ar] compare dynamic graph outputs", flush=True)
 
         comparisons: dict[str, dict[str, Any]] = {}
         for pattern in ("exact_int", "signed_zero", "model_small"):

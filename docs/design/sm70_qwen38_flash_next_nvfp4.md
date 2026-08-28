@@ -15,7 +15,11 @@
   11-request TP4 transition run, and the no-thinking HumanEval8 gate reaches
   4.747 mean accepted length, 93.676% draft acceptance, 126.81 warmed pure
   decode tokens/s, and 8/8 standard semantic executions. The V2 M16 plus
-  M5/M1 warmup also removes the first-request MTP `fused_moe_kernel` JIT.
+  M5/M1 warmup also removes the first-request MTP `fused_moe_kernel` JIT. The
+  current direct-NVFP4 MTP5 verifier route raises the matched HumanEval8 result
+  to 150.17 tokens/s with 4.8125 mean accepted length, 95.3125% draft
+  acceptance, and 8/8 semantic executions. Its steady verifier wall is 23.409
+  ms, passing the 20% reduction gate below.
 - Integration line: public `main`; Qwen3.8 bring-up
   [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345) and initial decode work
   [#361](https://github.com/1CatAI/1Cat-vLLM/pull/361) are merged. The compact
@@ -522,6 +526,127 @@ critical GPU service in the remaining draft/sampling passes. Further MTP speed
 work should reduce verifier cost without trading away the now-validated
 acceptance or code quality. The separate no-MTP final target remains at least
 100 tokens/s; its last accepted control is 82.274 tokens/s.
+
+### MTP4 verifier-cost reduction campaign
+
+Draft PR [#398](https://github.com/1CatAI/1Cat-vLLM/pull/398) isolates the
+five-row target-verifier work on public `main`. Its hard gate is a 20% reduction
+from the retained 30.040-ms verifier wall, or at most 24.032 ms, while retaining
+TP4, V2, MTP4, prefix caching, FP16 activations/KV, checkpoint-native NVFP4
+routed weights, FlashAttention-V100/FlashQLA, and the HumanEval acceptance and
+quality gates above. Online QPN8 and any new activation or weight quantization
+are explicitly disabled for this campaign.
+
+The first admitted operator pair is bounded to the exact verifier shape rather
+than changing generic inference:
+
+- A native NVFP4 direct-MTP5 MoE consumes the existing packed W13/W2 weights
+  and 50 routed rows directly. It skips input expansion, expert sorting, and
+  final unpermute, uses W13 split-K four and bitwise-equal W2 split-K one, and
+  performs the weighted reduction in the direct kernel. Across the complete
+  path, maximum final-output error is `4.768e-7`; relative L2 is `7.773e-5`
+  with ten overlapping experts and `1.051e-4` with 50 distinct experts.
+- Warm-cache projection saves 2.259 ms and 1.695 ms per 48-layer verifier for
+  those two routing patterns. The corresponding cold-weight projections save
+  5.505 ms and 4.964 ms. The cold figures are the relevant planning range:
+  each real verifier advances through 48 different layer/expert weight sets,
+  and one selected layer's weight working set already exceeds V100 L2. Only
+  the full-model gate may convert this projection into an endpoint claim.
+- The exact M=5, E=512, top-10 router falls from 0.635 to 0.254 ms per 48
+  layers, saving 0.381 ms (`2.496x`). Dynamic captured inputs preserve routed
+  rows and IDs exactly and keep weights within `1e-7` tolerance.
+
+Together, the cold direct-MoE and router screens project 5.345--5.886 ms of the
+required 6.008-ms saving. The exact TP4 25-KiB MTP5 push all-reduce is
+graph-only, SM70-only, opt-in, and tested through a full-lifecycle sidecar so
+communicator construction, buffer registration, graph IPC metadata, and
+disposal all come from the same implementation. A prior partial sidecar is
+invalid evidence: mixing its `all_reduce` methods with the installed
+extension's object lifecycle produced zero registered graph addresses and a
+process crash. The repaired sidecar is built against the same Torch
+2.10.0+cu128 ABI as the runtime.
+
+The final TP4 collective A/B captures 48 ordinary plus 48 shared/routed sum2
+reductions per replay. Pull takes 1.1326 ms and push takes 0.3637 ms, saving
+0.7689 ms (`3.114x`, `67.89%`). All four ranks are bitwise equal for dynamic
+integer, signed-zero, and model-scale random inputs. Combining this result with
+the conservative 50-distinct-expert cold direct-MoE result and router gives
+`4.9644 + 0.3805 + 0.7689 = 6.1138 ms`, projecting the retained 30.040-ms
+verifier to 23.926 ms (`20.352%` lower). This closes the operator budget. The
+direct V2 verifier measurement below supersedes the composition as the final
+acceptance result.
+
+One guarded HumanEval8 endpoint startup then validates the combined route. It
+hits the M=5 router, direct NVFP4 expert path, 25-KiB custom-AR registration,
+FlashAttention-V100/FlashQLA, and V2 FULL+PIECEWISE graphs with online QPN8
+disabled. Weighted pure decode is 150.17 tokens/s over all eight requests and
+150.12 tokens/s excluding the first, versus the retained 129.28/126.81
+controls (`+16.16%/+18.38%`). Mean accepted length is 4.8125, draft acceptance
+is 95.3125%, and per-position acceptance is
+99.31%/97.92%/93.75%/90.28%; none regress from the retained quality run. Six
+outputs are token-exact, and the two shorter alternate implementations also
+pass the official HumanEval tests, giving 8/8 semantic execution.
+
+The endpoint's aggregate decode time per verification round falls from 35.899
+to 31.214 ms (`13.05%`). That statistic contains proposal, sampling, state
+updates, and bookkeeping and therefore is not the target-verifier wall; it
+must not be presented as either passing or failing the separate 20% verifier
+gate.
+
+The original profiler lived only in the legacy V1 runner, while this route
+uses the new V2 `vllm.v1.worker.gpu.model_runner.GPUModelRunner`. An opt-in V2
+profiler now measures only real five-token MTP verification steps and remains
+completely disabled in ordinary inference. Its diagnostic-only target fence
+makes the verifier wall directly comparable without adding a production
+synchronization. The first profiled call is excluded because it contains the
+one-time QSA/Triton JIT, visible in the same log. Across the last eight steady
+rounds, verifier wall is 23.409 ms versus the retained 30.040-ms control, a
+22.07% reduction that passes the required 24.032-ms ceiling. The final
+four-round interval reaches 23.187 ms (`22.81%` lower). Steady GPU service is
+23.332 ms: 22.543 ms target forward, 0.762 ms sampling, and 0.027 ms state
+update. That GPU-service figure is 17.71% below the separate 28.352-ms control
+and is deliberately not relabeled as a 20% GPU-service result. The short
+profile keeps MTP4 acceptance at 4.846 mean accepted length / 96.154% draft
+acceptance and emits the same correct HumanEval/0 implementation. No additional
+Nsight or model startup is needed to close the wall-cost gate.
+
+Peak device memory is 30,435/30,433/30,433/30,433 MiB across TP4. Minimum host
+`MemAvailable` is 25.397 GiB and minimum free swap is 205.096 GiB during the
+load/capture/run. After exit, every GPU returns to 5 MiB, host available memory
+returns to about 117 GiB, swap use returns to about 1.7 GiB, and no worker
+remains. This is high transient swap traffic but not a retained host-memory
+leak.
+
+The shorter V2 profiler run peaks at 30,433 MiB on each of GPU 0--3, with
+30.093 GiB minimum host `MemAvailable` and 188.077 GiB minimum free swap. After
+exit, GPU 0--3 again return to 5 MiB and no process from this worktree remains;
+GPU 4--7 are occupied by a separate prefill audit and are outside this run.
+
+Several plausible imports have already failed the exact-shape gate and must not
+trigger another model startup:
+
+- The current Triton QSA verifier is 0.0921 ms per layer. Grouped Page4
+  FlashAttention-V100 takes 0.6816 ms and XQA Flash takes 0.2317 ms, so the
+  five-row verifier remains on Triton. FlashAttention-V100 and FlashQLA remain
+  active for the target/draft attention and recurrent paths where they win.
+- Replacing the dense FP16 verifier projections without online quantization
+  projects only 0.190 ms (`2.77%`) total saving and cannot close this gate.
+- A V100 port of SGLang PR #36497's persistent HC-mix kernel takes 1191.1 us
+  versus 29.41 us for the existing FP16 path (`40.5x` slower), a projected
+  111.5-ms regression over 96 calls. SGLang's newer HC split-K implementation
+  is FlashInfer/SM100-specific and is not a V100 kernel.
+
+The latest upstream audit uses vLLM PRs
+[#53896](https://github.com/vllm-project/vllm/pull/53896) and
+[#53899](https://github.com/vllm-project/vllm/pull/53899), plus SGLang PR
+[#36497](https://github.com/sgl-project/sglang/pull/36497). vLLM's stable fused
+GDN-MTP CUDA path is guarded for SM80+ and uses `cp.async`; PR #53899 mainly
+adds PLE-offload metadata and cross-process host-offload support, not a V100
+verifier kernel. SGLang's Triton GDN projection helper fuses
+split/reshape/concatenate work but not the dense projections, while its QSA
+indexer fuses Q normalization/RoPE/store and K compression/store. Those are
+small follow-ups only if the TP4 reduction and real endpoint still leave a
+measured gap; they are not justification for speculative model restarts.
 
 ## Acceptance gates
 
