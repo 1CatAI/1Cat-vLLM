@@ -88,7 +88,7 @@ from vllm.model_executor.kernels.linear.mxfp8.marlin import (
     MarlinMxfp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8.xpu import (
-    XPUMxFp8LinearKernel,
+    XPUMxfp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4 import (
     NvFp4LinearKernel,
@@ -368,7 +368,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
         EmulationMxfp8LinearKernel,
     ],
     PlatformEnum.XPU: [
-        XPUMxFp8LinearKernel,
+        XPUMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
     ],
 }
@@ -674,6 +674,9 @@ def choose_mp_linear_kernel(
 
         can_implement, failure_reason = kernel.can_implement(config)
         if can_implement:
+            logger.info_once(
+                "Using %s for mixed-precision linear", kernel.__name__
+            )
             return kernel
         else:
             failure_reasons.append(
@@ -1046,7 +1049,7 @@ __all__ = [
     "MarlinMxFp4LinearKernel",
     "FlashInferCutlassMxfp8LinearKernel",
     "MarlinMxfp8LinearKernel",
-    "XPUMxFp8LinearKernel",
+    "XPUMxfp8LinearKernel",
     "EmulationMxfp8LinearKernel",
     "CutlassNvFp4LinearKernel",
     "EmulationNvFp4LinearKernel",
