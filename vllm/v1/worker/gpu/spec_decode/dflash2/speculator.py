@@ -358,6 +358,22 @@ def _advance_chain_controller(
     return False, False, False
 
 
+def _chain_rejection_for_controller(
+    verdict: tuple[bool, bool] | None,
+) -> bool | None:
+    """Filter an async rejection verdict by the proposal that produced it.
+
+    The D2H copy completes one host decision later. A rejection from the
+    normal neural-draft step that admitted a chain must not be applied to the
+    first drafter-free proposal. Only a verdict tagged as coming from a chain
+    proposal may terminate an active chain.
+    """
+    if verdict is None:
+        return None
+    rejected, proposal_was_chain = verdict
+    return rejected if proposal_was_chain else None
+
+
 class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
 
@@ -491,14 +507,14 @@ class DFlash2Speculator(DFlashSpeculator):
             ngram_assist and self.draft_block < self.num_speculative_steps
         )
         self._req_states = None
-        self._lookup_current_req_key: tuple[int, ...] = ()
+        self._lookup_current_req_key: tuple[str, ...] = ()
         self._lookup_current_eligible = False
         self._lookup_last_emitted: torch.Tensor | None = None
         self._sampling_states = None
         self._chain_enabled = False
         self._chain_active = False
         self._chain_previous_was_chain = False
-        self._chain_req_key: tuple[int, ...] = ()
+        self._chain_req_key: tuple[str, ...] = ()
         self._chain_steps_total = 0
         self._chain_steps_engaged = 0
         if self._lookup_enabled:
@@ -568,16 +584,18 @@ class DFlash2Speculator(DFlashSpeculator):
                 self._chain_reject_stream = torch.cuda.Stream(device=device)
                 self._chain_reject_event = torch.cuda.Event()
                 self._chain_reject_pending = False
-                self._chain_reject_req_key: tuple[int, ...] = ()
+                self._chain_reject_req_key: tuple[str, ...] = ()
+                self._chain_reject_pending_was_chain = False
+                self._chain_last_proposal_was_chain = False
                 self._chain_last_log = time.monotonic()
             self._lookup_copy_pending = False
-            self._lookup_pending_req_key: tuple[int, ...] = ()
+            self._lookup_pending_req_key: tuple[str, ...] = ()
             self._lookup_pending_num_reqs = 0
             self._lookup_last_want = False
             self._lookup_want_streak = 0
             self._lookup_sticky_remaining = 0
             self._lookup_long_active = False
-            self._lookup_controller_req_key: tuple[int, ...] = ()
+            self._lookup_controller_req_key: tuple[str, ...] = ()
             self._lookup_last_verify_tokens = 0
             self._lookup_q8_rounds = 0
             self._lookup_q16_rounds = 0
@@ -617,7 +635,7 @@ class DFlash2Speculator(DFlashSpeculator):
         """Expose the host sampling view for the zero-sync chain gate."""
         self._sampling_states = sampling_states
 
-    def _reset_lookup_controller(self, req_key: tuple[int, ...]) -> None:
+    def _reset_lookup_controller(self, req_key: tuple[str, ...]) -> None:
         self._lookup_controller_req_key = req_key
         self._lookup_last_want = False
         self._lookup_want_streak = 0
@@ -658,7 +676,12 @@ class DFlash2Speculator(DFlashSpeculator):
             return
 
         num_reqs = input_batch.num_reqs
-        req_key = tuple(int(index) for index in input_batch.idx_mapping_np[:num_reqs])
+        # A request-state slot is reused after a request finishes.  Keying the
+        # asynchronous lookup/chain controllers by slot alone lets a completed
+        # request's pending flags admit a drafter-free proposal for the next
+        # request that lands in the same slot.  Request IDs are stable across
+        # TP ranks and uniquely identify the controller lifetime.
+        req_key = tuple(input_batch.req_ids[:num_reqs])
         self._lookup_current_req_key = req_key
         self._lookup_last_emitted = num_sampled[:num_reqs]
 
@@ -781,8 +804,16 @@ class DFlash2Speculator(DFlashSpeculator):
         return self._record_lookup_width(width, reason)
 
     def _chain_entry_evidence(self) -> bool | None:
-        if not self._lookup_copy_pending or not self._lookup_copy_event.query():
+        if not self._lookup_copy_pending:
             return None
+        # Every TP rank must make the same host-side branch.  Merely querying
+        # an asynchronous D2H event can return ready on one rank and pending on
+        # another, causing only a subset of ranks to skip the draft graph and
+        # corrupting its TP collectives.  The copy was queued in the preceding
+        # proposal step, so this is normally already complete and the fence is
+        # only a correctness backstop for the drafter-free path.
+        if not self._lookup_copy_event.query():
+            self._lookup_copy_event.synchronize()
         if (
             self._lookup_pending_req_key != self._lookup_current_req_key
             or self._lookup_pending_num_reqs != 1
@@ -790,15 +821,27 @@ class DFlash2Speculator(DFlashSpeculator):
             return False
         return bool(self._chain_entry_flags_cpu[0])
 
-    def _consume_chain_rejection(self) -> bool | None:
-        if not self._chain_reject_pending or not self._chain_reject_event.query():
+    def _consume_chain_rejection(self) -> tuple[bool, bool] | None:
+        if not self._chain_reject_pending:
             return None
+        # See _chain_entry_evidence: a TP-local event readiness race must not
+        # choose different draft/skip collective sequences across ranks.
+        if not self._chain_reject_event.query():
+            self._chain_reject_event.synchronize()
         self._chain_reject_pending = False
         if self._chain_reject_req_key != self._lookup_current_req_key:
-            return False
-        return bool(self._chain_rejected_cpu[0])
+            return None
+        return (
+            bool(self._chain_rejected_cpu[0]),
+            self._chain_reject_pending_was_chain,
+        )
 
-    def _queue_chain_rejection(self, num_rejected: torch.Tensor) -> None:
+    def _queue_chain_rejection(
+        self,
+        num_rejected: torch.Tensor,
+        *,
+        proposal_was_chain: bool,
+    ) -> None:
         if self._chain_reject_pending:
             return
         self._chain_rejected[:1].copy_(num_rejected[:1])
@@ -810,12 +853,14 @@ class DFlash2Speculator(DFlashSpeculator):
             )
             self._chain_reject_event.record(self._chain_reject_stream)
         self._chain_reject_req_key = self._lookup_current_req_key
+        self._chain_reject_pending_was_chain = proposal_was_chain
         self._chain_reject_pending = True
 
-    def _reset_chain(self, req_key: tuple[int, ...]) -> None:
+    def _reset_chain(self, req_key: tuple[str, ...]) -> None:
         self._chain_req_key = req_key
         self._chain_active = False
         self._chain_previous_was_chain = False
+        self._chain_last_proposal_was_chain = False
 
     def _chain_is_eligible(self, input_batch) -> bool:
         if (
@@ -852,8 +897,12 @@ class DFlash2Speculator(DFlashSpeculator):
             return False
 
         self._chain_steps_total += 1
-        rejected = self._consume_chain_rejection()
-        self._queue_chain_rejection(num_rejected)
+        verdict = self._consume_chain_rejection()
+        self._queue_chain_rejection(
+            num_rejected,
+            proposal_was_chain=self._chain_last_proposal_was_chain,
+        )
+        rejected = _chain_rejection_for_controller(verdict)
         (
             self._chain_active,
             self._chain_previous_was_chain,
@@ -864,6 +913,7 @@ class DFlash2Speculator(DFlashSpeculator):
             rejected=rejected,
             entry_evidence=self._chain_entry_evidence(),
         )
+        self._chain_last_proposal_was_chain = engage
         if not engage:
             return False
 

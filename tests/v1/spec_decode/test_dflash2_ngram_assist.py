@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     _advance_chain_controller,
     _advance_lookup_controller,
     _apply_ngram_draft_kernel,
+    _chain_rejection_for_controller,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     dflash2_sparse_topk_rejection_sample,
@@ -89,6 +90,11 @@ class _CopyEvent:
 
     def synchronize(self) -> None:
         self.synchronized = True
+
+
+class _PendingEvent(_CopyEvent):
+    def query(self) -> bool:
+        return self.synchronized
 
 
 def _host_only_speculator() -> DFlash2Speculator:
@@ -304,6 +310,65 @@ def test_chain_controller_exits_on_rejection_and_requires_normal_step() -> None:
         rejected=False,
         entry_evidence=True,
     ) == (True, True, True)
+
+
+def test_chain_rejection_ignores_stale_normal_proposal_verdict() -> None:
+    assert _chain_rejection_for_controller(None) is None
+    assert _chain_rejection_for_controller((True, False)) is None
+    assert _chain_rejection_for_controller((False, False)) is None
+    assert _chain_rejection_for_controller((True, True)) is True
+    assert _chain_rejection_for_controller((False, True)) is False
+
+
+def test_chain_controller_waits_for_tp_local_async_flags() -> None:
+    speculator = object.__new__(DFlash2Speculator)
+    speculator._lookup_current_req_key = ("request-a",)
+    speculator._lookup_pending_req_key = ("request-a",)
+    speculator._lookup_pending_num_reqs = 1
+    speculator._lookup_copy_pending = True
+    speculator._lookup_copy_event = _PendingEvent()
+    speculator._chain_entry_flags_cpu = torch.ones(1, dtype=torch.int32)
+
+    assert speculator._chain_entry_evidence() is True
+    assert speculator._lookup_copy_event.synchronized
+
+    speculator._chain_reject_pending = True
+    speculator._chain_reject_event = _PendingEvent()
+    speculator._chain_reject_req_key = ("request-a",)
+    speculator._chain_rejected_cpu = torch.ones(1, dtype=torch.int32)
+    speculator._chain_reject_pending_was_chain = True
+
+    assert speculator._consume_chain_rejection() == (True, True)
+    assert speculator._chain_reject_event.synchronized
+
+
+def test_lookup_controller_keys_request_lifetime_not_reused_slot() -> None:
+    speculator = object.__new__(DFlash2Speculator)
+    speculator._lookup_enabled = True
+    speculator._lookup_eligible = torch.zeros(1, dtype=torch.int32)
+    speculator._lookup_current_req_key = ()
+    speculator._lookup_controller_req_key = ("request-a",)
+    speculator._lookup_last_want = True
+    speculator._lookup_want_streak = 2
+    speculator._lookup_sticky_remaining = 3
+    speculator._lookup_long_active = True
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["request-b"],
+        idx_mapping_np=np.array([0], dtype=np.int32),
+        is_prefilling_np=np.array([False]),
+        has_structured_output_reqs=False,
+    )
+
+    speculator._prepare_proposal_runtime(
+        batch,
+        torch.ones(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+    )
+
+    assert speculator._lookup_current_req_key == ("request-b",)
+    assert speculator._lookup_controller_req_key == ("request-b",)
+    assert not speculator._lookup_long_active
 
 
 def test_lookup_controller_selects_q8_before_two_strong_hits(monkeypatch) -> None:

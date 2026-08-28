@@ -44193,3 +44193,20 @@ Interpretation:
   behavior, not a missing 30% verifier kernel speedup.
 - Full provenance, contracts, artifacts, and the next trace/concurrency gates
   are recorded in `docs/design/sm70_dflash2_drafter_free_chain.md`.
+- The q31 LABD continuation now has a native exact q32 grouped Flash-V100
+  verifier. At production page 3,776 it is `2.71x/3.90x` faster than the
+  row-wise baseline at 1K/32K context and stays within `1.53e-5` maximum
+  absolute error. The frozen syv 25K document moves from q16
+  `222.734 tok/s` to q32 `337.107 tok/s` (`+51.35%`) before chain, with the
+  same output.
+- A TP4 selector crash was traced to reused request-slot controller keys and
+  rank-local asynchronous event readiness. Pending controller state now keys
+  on request ID, rejection feedback is tagged by proposal origin, and TP ranks
+  fence the event before choosing a drafter-free collective sequence. No
+  selector clamp was added. The cleaned chain completes an 18-turn/8,325-token
+  iterative stress without an assert or HTTP 500.
+- On the frozen 25K verbatim task, cleaned chain-on keeps all 512 output tokens,
+  mean acceptance `18.75`, and text SHA256 unchanged while pure decode moves
+  `337.107 -> 359.770 tok/s` (`+6.72%`). Cold wall time is prefill dominated;
+  an identical-prefix rerun records `1.114 s` TTFT and `2.535 s` total. Chain
+  remains opt-in and greedy-only rather than a universal chat default.
