@@ -174,6 +174,15 @@ Goal:
   slot; four replays produce bitwise-identical tables and outputs. The earlier
   shared-atomic ordering is rejected despite a slightly lower median because
   it varied by one FP16 ULP across replays.
+- After the latest-main repair and QSA cache-table canonicalization, grouped
+  planning also consumes per-row query positions and per-request live sequence
+  lengths. It truncates early prompt rows, validates partial tails, request and
+  logical-page bounds, and rejects stale physical pages before hashing. A
+  4096-row hybrid Page16/Page4 test spans 1/2/3/4-token early rows, the
+  2048/2049/2050/2051 boundaries, mature rows, and a nonmonotonic physical page
+  table; it matches Triton at relative L2 `2.434e-4` and cosine `1.0`. An all
+  invalid/padded-group test produces bitwise-equal zero output instead of
+  leaving the caller's output buffer untouched.
 - The final isolated route, including Python dispatch, GPU planning, padding,
   and grouped attention, measures `16.132 ms` median (`15.588 ms` minimum)
   versus Triton `55.940 ms`, a `3.468x` speedup. Maximum absolute error is

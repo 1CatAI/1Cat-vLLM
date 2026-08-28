@@ -1989,6 +1989,23 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 
   const int total_kv = seq_lens[SPARSE_PAGE4 ? group_idx : 0];
   if (total_kv <= 0) {
+    if constexpr (SPARSE_PAGE4) {
+      constexpr int kGroupOutputElements =
+          kGroupedVerifyQ8MaxQ * kGroupedVerifyHeads *
+          kGroupedVerifyHeadDim;
+      const int64_t group_output_offset =
+          static_cast<int64_t>(group_idx) * kGroupOutputElements;
+      for (int idx = threadIdx.x; idx < kGroupOutputElements;
+           idx += kGroupedVerifyThreads) {
+        partial_out[group_output_offset + idx] = __float2half_rn(0.0f);
+      }
+      constexpr int kGroupLseElements =
+          kGroupedVerifyQ8MaxQ * kGroupedVerifyHeads;
+      if (threadIdx.x < kGroupLseElements) {
+        partial_lse[static_cast<int64_t>(group_idx) * kGroupLseElements +
+                    threadIdx.x] = kXQANegInf;
+      }
+    }
     return;
   }
   const int active_splits =
@@ -3675,20 +3692,26 @@ __device__ __forceinline__ void grouped_sparse_hash_insert(
 }
 
 __device__ __forceinline__ int grouped_sparse_physical_microblock(
-    const int token, const int row, const int* __restrict__ request_block_table,
-    const int* __restrict__ token_to_req,
-    const int64_t request_block_table_stride, const int page_size,
-    const int physical_page_stride) {
+    const int token, const int request_idx,
+    const int* __restrict__ request_block_table,
+    const int64_t request_block_table_stride, const int block_table_width,
+    const int page_size, const int physical_page_stride,
+    const int num_cache_blocks) {
   if (token < 0) {
     return -1;
   }
-  const int request_idx = __ldg(token_to_req + row);
   const int logical_page = token / page_size;
+  if (logical_page < 0 || logical_page >= block_table_width) {
+    return -1;
+  }
   const int page_offset = token - logical_page * page_size;
   const int physical_page = __ldg(
       request_block_table +
       static_cast<int64_t>(request_idx) * request_block_table_stride +
       logical_page);
+  if (physical_page < 0 || physical_page >= num_cache_blocks) {
+    return -1;
+  }
   return physical_page * physical_page_stride + page_offset / 4;
 }
 
@@ -3711,11 +3734,15 @@ __global__ __launch_bounds__(kGroupedSparsePlannerThreads, 1)
 void grouped_sparse_page4_plan_kernel(
     const int* __restrict__ logical_indices,
     const int* __restrict__ request_block_table,
-    const int* __restrict__ token_to_req, int* __restrict__ output_blocks,
-    uint32_t* __restrict__ output_masks, int* __restrict__ output_seq_lens,
-    const int selection_width, const int64_t logical_indices_stride,
-    const int64_t request_block_table_stride, const int output_width,
-    const int page_size, const int physical_page_stride) {
+    const int* __restrict__ token_to_req,
+    const int64_t* __restrict__ query_positions,
+    const int* __restrict__ sequence_lengths,
+    int* __restrict__ output_blocks, uint32_t* __restrict__ output_masks,
+    int* __restrict__ output_seq_lens, const int selection_width,
+    const int64_t logical_indices_stride,
+    const int64_t request_block_table_stride, const int num_requests,
+    const int block_table_width, const int output_width, const int page_size,
+    const int physical_page_stride, const int num_cache_blocks) {
   const int group_idx = blockIdx.x;
   const int tid = threadIdx.x;
   __shared__ int category_counts[8];
@@ -3736,6 +3763,24 @@ void grouped_sparse_page4_plan_kernel(
 #pragma unroll
     for (int query = 0; query < kGroupedSparseQueries; ++query) {
       const int row = group_idx * kGroupedSparseQueries + query;
+      const int request_idx = __ldg(token_to_req + row);
+      if (request_idx < 0 || request_idx >= num_requests) {
+        continue;
+      }
+      const int sequence_length = __ldg(sequence_lengths + request_idx);
+      const int64_t query_visible_tokens = __ldg(query_positions + row) + 1;
+      const int visible_tokens =
+          query_visible_tokens <= 0
+              ? 0
+              : (query_visible_tokens < sequence_length
+                     ? static_cast<int>(query_visible_tokens)
+                     : max(sequence_length, 0));
+      const int row_complete_page4_count =
+          min(min(visible_tokens / 4, sequence_length / 4),
+              full_page4_count);
+      if (selected_page >= row_complete_page4_count) {
+        continue;
+      }
       const int* selected =
           logical_indices + static_cast<int64_t>(row) * logical_indices_stride +
           selected_page * 4;
@@ -3747,21 +3792,23 @@ void grouped_sparse_page4_plan_kernel(
           __ldg(selected + 1) == first_token + 1 &&
           __ldg(selected + 2) == first_token + 2 &&
           __ldg(selected + 3) == first_token + 3 &&
-          (first_token & 3) == 0;
+          (first_token & 3) == 0 && first_token + 3 < sequence_length;
       if (full_page4) {
         const int physical_microblock = grouped_sparse_physical_microblock(
-            first_token, row, request_block_table, token_to_req,
-            request_block_table_stride, page_size, physical_page_stride);
+            first_token, request_idx, request_block_table,
+            request_block_table_stride, block_table_width, page_size,
+            physical_page_stride, num_cache_blocks);
         grouped_sparse_hash_insert(hash_table, physical_microblock,
                                    0xFu << (query * 4));
       } else {
 #pragma unroll
         for (int token_offset = 0; token_offset < 4; ++token_offset) {
           const int token = __ldg(selected + token_offset);
-          if (token >= 0) {
+          if (token >= 0 && token < sequence_length) {
             const int physical_microblock = grouped_sparse_physical_microblock(
-                token, row, request_block_table, token_to_req,
-                request_block_table_stride, page_size, physical_page_stride);
+                token, request_idx, request_block_table,
+                request_block_table_stride, block_table_width, page_size,
+                physical_page_stride, num_cache_blocks);
             grouped_sparse_hash_insert(
                 hash_table, physical_microblock,
                 1u << (query * 4 + (token & 3)));
@@ -3770,21 +3817,40 @@ void grouped_sparse_page4_plan_kernel(
       }
     }
   }
-  const int tail_start = full_page4_count * 4;
-  if (tid < selection_width - tail_start) {
-#pragma unroll
-    for (int query = 0; query < kGroupedSparseQueries; ++query) {
-      const int row = group_idx * kGroupedSparseQueries + query;
-      const int token = __ldg(
-          logical_indices + static_cast<int64_t>(row) * logical_indices_stride +
-          tail_start + tid);
-      if (token >= 0) {
+  if (tid < kGroupedSparseQueries) {
+    const int query = tid;
+    const int row = group_idx * kGroupedSparseQueries + query;
+    const int request_idx = __ldg(token_to_req + row);
+    if (request_idx >= 0 && request_idx < num_requests) {
+      const int sequence_length = __ldg(sequence_lengths + request_idx);
+      const int64_t query_visible_tokens = __ldg(query_positions + row) + 1;
+      const int visible_tokens =
+          query_visible_tokens <= 0
+              ? 0
+              : (query_visible_tokens < sequence_length
+                     ? static_cast<int>(query_visible_tokens)
+                     : max(sequence_length, 0));
+      const int complete_page4_count =
+          min(min(visible_tokens / 4, sequence_length / 4),
+              full_page4_count);
+      const int tail_count = visible_tokens & 3;
+      const int tail_index = complete_page4_count * 4;
+      const int selected_tail_token =
+          tail_index < selection_width
+              ? __ldg(logical_indices +
+                      static_cast<int64_t>(row) * logical_indices_stride +
+                      tail_index)
+              : -1;
+      const int expected_tail_token = (visible_tokens / 4) * 4;
+      if (tail_count > 0 && selected_tail_token == expected_tail_token &&
+          selected_tail_token < sequence_length) {
         const int physical_microblock = grouped_sparse_physical_microblock(
-            token, row, request_block_table, token_to_req,
-            request_block_table_stride, page_size, physical_page_stride);
-        grouped_sparse_hash_insert(
-            hash_table, physical_microblock,
-            1u << (query * 4 + (token & 3)));
+            selected_tail_token, request_idx, request_block_table,
+            request_block_table_stride, block_table_width, page_size,
+            physical_page_stride, num_cache_blocks);
+        const uint32_t tail_mask =
+            ((1u << tail_count) - 1) << (query * 4);
+        grouped_sparse_hash_insert(hash_table, physical_microblock, tail_mask);
       }
     }
   }
@@ -3890,16 +3956,20 @@ void grouped_sparse_page4_plan_kernel(
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
     const at::Tensor& logical_indices, const at::Tensor& block_table,
-    const at::Tensor& token_to_req, at::Tensor& output_blocks,
-    at::Tensor& output_masks, at::Tensor& output_seq_lens,
-    const int page_size, const int physical_page_stride) {
+    const at::Tensor& token_to_req, const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths, at::Tensor& output_blocks,
+    at::Tensor& output_masks, at::Tensor& output_seq_lens, const int page_size,
+    const int physical_page_stride, const int num_cache_blocks) {
   TORCH_CHECK(logical_indices.is_cuda() && block_table.is_cuda() &&
-                  token_to_req.is_cuda() && output_blocks.is_cuda() &&
+                  token_to_req.is_cuda() && query_positions.is_cuda() &&
+                  sequence_lengths.is_cuda() && output_blocks.is_cuda() &&
                   output_masks.is_cuda() && output_seq_lens.is_cuda(),
               "grouped sparse page4 planner tensors must be CUDA tensors");
   TORCH_CHECK(logical_indices.dtype() == torch::kInt32 &&
                   block_table.dtype() == torch::kInt32 &&
                   token_to_req.dtype() == torch::kInt32 &&
+                  query_positions.dtype() == torch::kInt64 &&
+                  sequence_lengths.dtype() == torch::kInt32 &&
                   output_blocks.dtype() == torch::kInt32 &&
                   output_masks.scalar_type() == at::ScalarType::UInt32 &&
                   output_seq_lens.dtype() == torch::kInt32,
@@ -3914,21 +3984,31 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
                                                at::IntArrayRef(
                                                    {logical_indices.size(0)}),
               "grouped sparse page4 planner request metadata is invalid");
+  TORCH_CHECK(
+      query_positions.sizes() ==
+              at::IntArrayRef({logical_indices.size(0)}) &&
+          sequence_lengths.sizes() == at::IntArrayRef({block_table.size(0)}),
+      "grouped sparse page4 planner visibility metadata is invalid");
   TORCH_CHECK(output_blocks.dim() == 2 && output_blocks.size(0) == num_groups &&
                   output_blocks.size(1) >= 4160 &&
                   output_masks.sizes() == output_blocks.sizes() &&
                   output_seq_lens.sizes() == at::IntArrayRef({num_groups}),
               "grouped sparse page4 planner outputs must be [groups, >=4160]");
   TORCH_CHECK(logical_indices.is_contiguous() && block_table.is_contiguous() &&
-                  token_to_req.is_contiguous() && output_blocks.is_contiguous() &&
+                  token_to_req.is_contiguous() &&
+                  query_positions.is_contiguous() &&
+                  sequence_lengths.is_contiguous() &&
+                  output_blocks.is_contiguous() &&
                   output_masks.is_contiguous() &&
                   output_seq_lens.is_contiguous(),
               "grouped sparse page4 planner metadata must be contiguous");
   TORCH_CHECK(page_size > 0 && page_size % 4 == 0 &&
-                  physical_page_stride > 0,
+                  physical_page_stride > 0 && num_cache_blocks > 0,
               "grouped sparse page4 planner requires page_size divisible by 4");
   TORCH_CHECK(logical_indices.device() == block_table.device() &&
                   logical_indices.device() == token_to_req.device() &&
+                  logical_indices.device() == query_positions.device() &&
+                  logical_indices.device() == sequence_lengths.device() &&
                   logical_indices.device() == output_blocks.device() &&
                   logical_indices.device() == output_masks.device() &&
                   logical_indices.device() == output_seq_lens.device(),
@@ -3951,11 +4031,14 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
       <<<static_cast<unsigned>(num_groups), kGroupedSparsePlannerThreads,
          kPlannerSharedMemory, stream>>>(
           logical_indices.data_ptr<int>(), block_table.data_ptr<int>(),
-          token_to_req.data_ptr<int>(), output_blocks.data_ptr<int>(),
+          token_to_req.data_ptr<int>(), query_positions.data_ptr<int64_t>(),
+          sequence_lengths.data_ptr<int>(), output_blocks.data_ptr<int>(),
           output_masks.data_ptr<uint32_t>(), output_seq_lens.data_ptr<int>(),
           static_cast<int>(logical_indices.size(1)), logical_indices.stride(0),
-          block_table.stride(0), static_cast<int>(output_blocks.size(1)),
-          page_size, physical_page_stride);
+          block_table.stride(0), static_cast<int>(block_table.size(0)),
+          static_cast<int>(block_table.size(1)),
+          static_cast<int>(output_blocks.size(1)), page_size,
+          physical_page_stride, num_cache_blocks);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output_blocks;
 }

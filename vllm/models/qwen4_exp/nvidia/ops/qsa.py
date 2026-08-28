@@ -1525,6 +1525,8 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     logical_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
     out: torch.Tensor,
     flash_attn_v100_cuda,
 ) -> torch.Tensor:
@@ -1536,11 +1538,14 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         logical_indices,
         block_table,
         token_to_req,
+        query_positions,
+        sequence_lengths,
         grouped_pages,
         token_masks,
         grouped_sequence_lengths,
         k_cache.shape[1],
         physical_page_stride,
+        k_cache.shape[0],
     )
     physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
     flash_attn_v100_cuda.grouped_sparse_page4_fwd(
@@ -1603,6 +1608,8 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
             logical_indices,
             block_table,
             token_to_req,
+            query_positions,
+            sequence_lengths,
             out,
             flash_attn_v100_cuda,
         )

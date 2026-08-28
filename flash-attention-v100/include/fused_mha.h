@@ -66,9 +66,10 @@ at::Tensor flash_attention_grouped_sparse_page4(
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
     const at::Tensor& logical_indices, const at::Tensor& block_table,
-    const at::Tensor& token_to_req, at::Tensor& output_blocks,
-    at::Tensor& output_masks, at::Tensor& output_seq_lens,
-    const int page_size, const int physical_page_stride);
+    const at::Tensor& token_to_req, const at::Tensor& query_positions,
+    const at::Tensor& sequence_lengths, at::Tensor& output_blocks,
+    at::Tensor& output_masks, at::Tensor& output_seq_lens, const int page_size,
+    const int physical_page_stride, const int num_cache_blocks);
 
 at::Tensor flash_attention_decode_paged_wmma(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
