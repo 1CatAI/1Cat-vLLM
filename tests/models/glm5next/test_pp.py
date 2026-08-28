@@ -76,9 +76,7 @@ class _FakeGlmBoundaryLayer(nn.Module):
 
 def test_glm53_dflash_aux_hidden_states_cross_pp_boundary(monkeypatch):
     group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
-    monkeypatch.setattr(
-        "vllm.models.glm5next.nvidia.model.get_pp_group", lambda: group
-    )
+    monkeypatch.setattr("vllm.models.glm5next.nvidia.model.get_pp_group", lambda: group)
 
     stage0 = Glm5NextModel.__new__(Glm5NextModel)
     nn.Module.__init__(stage0)
