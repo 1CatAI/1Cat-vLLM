@@ -18,6 +18,7 @@ from vllm.models.glm5next.sm70.fp8_kv import (
     GLM5_FP8_KV_SLOT_BYTES,
     sm70_glm5_fp8_kv_insert,
     sm70_glm5_sparse_attention_paged_fp8,
+    sm70_glm5_sparse_attention_paged_fp8_batched_gemm,
     sm70_glm5_sparse_attention_paged_fp8_gemm,
 )
 from vllm.platforms.interface import DeviceCapability
@@ -40,6 +41,7 @@ _DEBUG_DFLASH_SPARSE_INDICES = bool(
     int(os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE", "0"))
 )
 _DFLASH_SPARSE_INDICES_SEEN = False
+_FP8_GEMM_MAX_TOKENS = 8
 
 
 class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
@@ -158,22 +160,40 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         if config is None:
             raise RuntimeError("GLM-5.3 SM70 sparse MLA requires VllmConfig.")
         max_tokens = config.scheduler_config.max_num_batched_tokens
+        self.fp8_gemm_max_tokens = min(max_tokens, _FP8_GEMM_MAX_TOKENS)
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
         if self.use_fp8_cache:
             workspace_specs.extend(
                 (
-                    ((self.index_width, self.kv_lora_rank), torch.float16),
-                    ((num_heads, self.index_width), torch.float16),
-                    ((num_heads, self.index_width), torch.float16),
+                    (
+                        (
+                            self.fp8_gemm_max_tokens,
+                            self.index_width,
+                            self.kv_lora_rank,
+                        ),
+                        torch.float16,
+                    ),
+                    (
+                        (self.fp8_gemm_max_tokens, num_heads, self.index_width),
+                        torch.float16,
+                    ),
+                    (
+                        (self.fp8_gemm_max_tokens, num_heads, self.index_width),
+                        torch.float16,
+                    ),
                 )
             )
         current_workspace_manager().get_simultaneous(*workspace_specs)
         logger.info_once(
             "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
             "packed E4M3FN" if self.use_fp8_cache else "FP16",
-            (" and B1 dequant + tensor-core GEMM decode" if self.use_fp8_cache else ""),
+            (
+                " and B1/M2-M8 dequant + tensor-core GEMM decode"
+                if self.use_fp8_cache
+                else ""
+            ),
         )
 
     def do_kv_cache_update(
@@ -257,15 +277,9 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     "DFLASH_TARGET_SPARSE_INDICES req_ids=%s valid_counts=%s "
                     "slot_mapping=%s logical_min=%s logical_max=%s logical_sum=%s "
                     "logical_prefix=%s block_table_prefix=%s global_prefix=%s",
-                    attn_metadata.req_id_per_token[:num_tokens]
-                    .detach()
-                    .cpu()
-                    .tolist(),
+                    attn_metadata.req_id_per_token[:num_tokens].detach().cpu().tolist(),
                     valid.sum(dim=1).detach().cpu().tolist(),
-                    attn_metadata.slot_mapping[:num_tokens]
-                    .detach()
-                    .cpu()
-                    .tolist(),
+                    attn_metadata.slot_mapping[:num_tokens].detach().cpu().tolist(),
                     logical_min.detach().cpu().tolist(),
                     logical_max.detach().cpu().tolist(),
                     torch.where(valid, topk_indices, 0)
@@ -288,6 +302,36 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     ((self.num_heads, self.index_width), torch.float16),
                 )
                 sm70_glm5_sparse_attention_paged_fp8_gemm(
+                    q,
+                    kv_c_and_k_pe_cache.view(torch.uint8),
+                    global_indices,
+                    valid_counts,
+                    self.softmax_scale,
+                    out,
+                    gathered_kv,
+                    scores,
+                    probs,
+                )
+            elif num_tokens <= self.fp8_gemm_max_tokens:
+                out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(
+                    (
+                        (num_tokens, self.num_heads, self.kv_lora_rank),
+                        torch.float16,
+                    ),
+                    (
+                        (num_tokens, self.index_width, self.kv_lora_rank),
+                        torch.float16,
+                    ),
+                    (
+                        (num_tokens, self.num_heads, self.index_width),
+                        torch.float16,
+                    ),
+                    (
+                        (num_tokens, self.num_heads, self.index_width),
+                        torch.float16,
+                    ),
+                )
+                sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
                     q,
                     kv_c_and_k_pe_cache.view(torch.uint8),
                     global_indices,
