@@ -174,3 +174,64 @@ The exact 1024-input/256-output, three-repeat speed gate and broader Chinese and
 English quality gate remain open. Retain all JSON, logs, and profiles under
 `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827`; a route-hit smoke or
 short quality completion must not be reported as the 70-token/s result.
+
+## DFlash2 Acceptance Qualification (2026-08-31)
+
+The DFlash2 draft is `incoai/GLM-5.3-Flash-DFlash2`, with its release revision
+`7d74cdd881ed7e32c31175984a67823127b66cfe` retained as the first comparison
+arm. The hard admission gate is token-weighted mean acceptance length at least
+`4.85`. This matches the real-checkpoint 5-shot GSM8K result reported in
+SGLang PR [#36755](https://github.com/sgl-project/sglang/pull/36755) at both
+parallel one and parallel 32. A short route smoke, first-token hit rate, or a
+four-token sample does not satisfy this gate.
+
+SGLang's accepted result is TP8 without pipeline parallelism. Its GLM target
+captures completed outputs of layers `5,14,24,33,42` immediately before layers
+`6,15,25,34,43`, contracts the four mHC streams, and runs the five-layer
+non-causal DFlash2 draft. SGLang only enables capture on the last PP rank, so
+it is not evidence for PP support. The TP4/PP2 V100 route therefore transports
+the first two auxiliary states explicitly and replicates the TP-sharded target
+embedding on PP1 for draft weight sharing.
+
+Historical TP4/PP2 smokes produced target-correct output but only `1.0-1.6`
+mean acceptance length. They are rejected evidence. The following causes have
+now been excluded independently:
+
+- exact GLM draft attention at sequence lengths 181 and 4096 matches dense and
+  paged references with maximum absolute error at most `2.44140625e-4`;
+- draft FC, MLP, RMSNorm, grouped convolution, selector weights, and checkpoint
+  fingerprints match their reference computations;
+- the SM70 mHC suite passes `22` GPU tests (one unrelated case skipped),
+  including the layer-zero broadcast path and FP32 staging;
+- target KDA/MoE/mHC batch-eight versus batch-one localization is nearly exact;
+- experimental small-query metadata, sharded context FC, grouped verification,
+  and selector QPN8 are all disabled in the qualification launch.
+
+The remaining localization surface is now captured by
+`VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR`. A real request records all five target
+auxiliary states, the projected context, draft embeddings, context/query slot
+mappings, backbone hidden states, top-16 candidates, unary logits, the full
+`7 x 16 x 16` selector lattice, and emitted tokens. PP0 sender and PP1 receiver
+also save their raw auxiliary tensors per TP rank. The analyzer
+`benchmarks/compare_sm70_dflash2_tensor_dump.py` reports exact sender/receiver
+identity, maximum error, cosine, tensor statistics, and the greedy selector
+path.
+
+Two qualification-only A/B switches isolate the last architecture-specific
+risks without changing production defaults:
+
+- `VLLM_SM70_DFLASH2_BF16_EMULATION=0` compares ordinary FP16 draft execution
+  with the default range-preserving BF16-semantics SM70 path;
+- `VLLM_GLM53_PP_MHC_MATERIALIZE=1` completes `hc_post` at the PP boundary and
+  sends four materialized residual streams instead of deferred `x/residual/`
+  `post/comb` state. This matches SGLang's inter-layer representation and
+  reduces the base mHC PP payload from approximately five hidden-state widths
+  to four.
+
+The focused GLM PP and DFlash2 suite passes `113` tests. Once all eight V100s
+are available, the next run order is: correctness-first eager TP4/PP2 with all
+optional fast paths off and full tensor capture; deferred versus materialized
+PP mHC on the identical prompt; BF16-semantics versus ordinary FP16 draft on
+the identical prompt; then release/latest draft-revision comparison. Only an
+arm that passes exact PP transport, finite tensor checks, target-only output
+quality, and the `4.85` GSM8K gate proceeds to CUDA Graph and speed tuning.

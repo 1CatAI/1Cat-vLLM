@@ -14,6 +14,7 @@ import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
+import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers.attention import Attention
@@ -32,6 +33,7 @@ from vllm.model_executor.models.dflash_sm70 import (
     DFLASH_SM70_GATE_UP_INPUT_SCALE,
     DFLASH_SM70_WIDE_OUTPUT_SCALE,
     DFlashSM70RMSNorm,
+    dflash_layered_rms_norm_sm70,
     dflash_scale_output_sm70,
     dflash_silu_and_mul_sm70,
 )
@@ -39,6 +41,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
     _dflash_layer_causal,
+    dflash_target_rope_is_neox_style,
 )
 from vllm.model_executor.models.qwen3_dflash2 import (
     DFlash2Qwen3ForCausalLM,
@@ -62,6 +65,54 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     _requires_sm70_tail,
     _selector_walk_kernel,
 )
+
+
+@pytest.mark.parametrize(
+    ("has_own_embed", "has_own_head", "shared_embed", "shared_head"),
+    [
+        (False, False, True, True),
+        (True, True, False, False),
+    ],
+)
+def test_dflash_final_pp_stage_accepts_valid_shared_weight_contract(
+    monkeypatch,
+    has_own_embed,
+    has_own_head,
+    shared_embed,
+    shared_head,
+):
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    model = SimpleNamespace(
+        has_own_embed_tokens=has_own_embed,
+        has_own_lm_head=has_own_head,
+    )
+
+    dflash_utils._validate_dflash_shared_weights(model, shared_embed, shared_head)
+
+
+@pytest.mark.parametrize(
+    ("shared_embed", "shared_head", "message"),
+    [
+        (False, True, "no embedding"),
+        (True, False, "no lm_head"),
+    ],
+)
+def test_dflash_final_pp_stage_rejects_missing_shared_weight(
+    monkeypatch, shared_embed, shared_head, message
+):
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    model = SimpleNamespace(has_own_embed_tokens=False, has_own_lm_head=False)
+
+    with pytest.raises(RuntimeError, match=message):
+        dflash_utils._validate_dflash_shared_weights(model, shared_embed, shared_head)
 
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
@@ -115,6 +166,21 @@ def test_sm70_tp4_push_allreduce_is_default_on_with_rollback(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_sm70_dflash2_bf16_emulation_has_explicit_ab_switch(monkeypatch):
+    config = SimpleNamespace(dtype=torch.bfloat16)
+    monkeypatch.setattr(dflash2_model.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        dflash2_model.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+    monkeypatch.delenv("VLLM_SM70_DFLASH2_BF16_EMULATION", raising=False)
+    assert dflash2_model._use_sm70_bf16_emulation(config)
+
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "0")
+    assert not dflash2_model._use_sm70_bf16_emulation(config)
+
+
 def _bare_dflash2_model() -> DFlash2Qwen3Model:
     model = DFlash2Qwen3Model.__new__(DFlash2Qwen3Model)
     torch.nn.Module.__init__(model)
@@ -160,6 +226,37 @@ def test_dflash_sliding_kv_spec_uses_draft_attention_contract_with_mla_target():
 
     assert isinstance(spec, SlidingWindowSpec)
     assert spec.sliding_window == 2048
+
+
+def _target_with_rotary_style(config, is_neox_style: bool):
+    language_model = torch.nn.Module()
+    language_model.config = config
+    language_model.rotary_emb = torch.nn.Module()
+    language_model.rotary_emb.is_neox_style = is_neox_style
+    return SimpleNamespace(get_language_model=lambda: language_model)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(mla_nope=True),
+        SimpleNamespace(mla_use_nope=True),
+        SimpleNamespace(mla=True, qk_rope_head_dim=0),
+    ],
+)
+def test_dflash_target_rope_style_ignores_nope_indexer(config):
+    target = _target_with_rotary_style(config, is_neox_style=False)
+
+    assert dflash_target_rope_is_neox_style(target) is None
+
+
+@pytest.mark.parametrize("is_neox_style", [False, True])
+def test_dflash_target_rope_style_matches_real_target_rope(is_neox_style):
+    target = _target_with_rotary_style(
+        SimpleNamespace(mla=False), is_neox_style=is_neox_style
+    )
+
+    assert dflash_target_rope_is_neox_style(target) is is_neox_style
 
 
 def _fake_rms_norm(
@@ -245,6 +342,27 @@ def test_context_k_norm_falls_back_for_stale_stable_binary(monkeypatch):
     repeated = model._normalize_context_k(all_k)
     assert calls == [1, 1, 1]
     assert torch.equal(repeated, expected)
+
+
+def test_sm70_layered_context_k_norm_uses_each_weight_row():
+    input_ = torch.tensor(
+        [
+            [[[1.0, 2.0, 3.0, 4.0]], [[4.0, 3.0, 2.0, 1.0]]],
+            [[[2.0, 1.0, 4.0, 3.0]], [[3.0, 4.0, 1.0, 2.0]]],
+        ],
+        dtype=torch.float16,
+    )
+    weight = torch.tensor(
+        [[1.0, 1.0, 1.0, 1.0], [0.5, 1.5, 0.75, 1.25]],
+        dtype=torch.float16,
+    )
+
+    actual = dflash_layered_rms_norm_sm70(input_, weight, 1e-6)
+    expected = torch.empty_like(input_)
+    for layer_idx in range(input_.shape[0]):
+        _fake_rms_norm(expected[layer_idx], input_[layer_idx], weight[layer_idx], 1e-6)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(("input_size", "output_size"), [(25600, 5120), (20480, 4096)])
@@ -649,6 +767,7 @@ def test_probabilistic_cache_respects_column_stride():
         seed=torch.tensor([123], dtype=torch.int64, device=device),
         pos=torch.tensor([7], dtype=torch.int64, device=device),
         apply_temperature=True,
+        is_drafting=True,
         output_processed_logits=cache,
         output_processed_logits_col=torch.tensor(1, device=device),
     )

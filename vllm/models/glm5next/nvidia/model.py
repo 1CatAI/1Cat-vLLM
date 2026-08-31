@@ -43,6 +43,9 @@ from vllm.model_executor.layers.mhc import (
     hc_contract,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+    arm_dflash_nvfp4_trace,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
@@ -87,7 +90,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
 from .attention import Glm5NextMLAAttention
-from .kda import Glm5NextLinearAttention
+from .kda import Glm5NextLinearAttention, arm_dflash_target_kda_trace
 from .multimodal import (
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
@@ -99,6 +102,13 @@ logger = init_logger(__name__)
 _DEBUG_DFLASH_TARGET_FINITE = bool(
     int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
 )
+_DEBUG_DFLASH_TARGET_TRACE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
+)
+_DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION = int(
+    os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
+)
+_DFLASH_TARGET_TRACE_SEEN: set[tuple[int, str]] = set()
 
 
 def _debug_dflash_target_finite(
@@ -124,6 +134,47 @@ def _debug_dflash_target_finite(
             name,
             tuple(tensor.shape),
             int((~finite).sum().item()),
+        )
+
+
+def _debug_dflash_target_trace(
+    stage: str,
+    layer_idx: int,
+    positions: torch.Tensor,
+    **tensors: torch.Tensor | None,
+) -> None:
+    if (
+        not _DEBUG_DFLASH_TARGET_TRACE
+        or positions.numel() > 8
+        or get_tensor_model_parallel_rank() != 0
+        or int(positions[-1].item()) < _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
+    ):
+        return
+    key = (layer_idx, stage)
+    if key in _DFLASH_TARGET_TRACE_SEEN:
+        return
+    _DFLASH_TARGET_TRACE_SEEN.add(key)
+    token_index = int(
+        torch.nonzero(
+            positions >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION, as_tuple=False
+        )[0].item()
+    )
+    for name, tensor in tensors.items():
+        if tensor is None or tensor.numel() == 0:
+            continue
+        row = tensor[token_index].detach().float().reshape(-1)
+        logger.warning(
+            "DFLASH_TARGET_LAYER_TRACE layer=%d stage=%s tensor=%s "
+            "positions=%s shape=%s sum=%.9g sqsum=%.9g absmax=%.9g sample=%s",
+            layer_idx,
+            stage,
+            name,
+            positions.detach().cpu().tolist(),
+            tuple(tensor.shape),
+            float(row.sum().item()),
+            float((row * row).sum().item()),
+            float(row.abs().max().item()),
+            row[:8].cpu().tolist(),
         )
 
 
@@ -455,7 +506,30 @@ class Glm5NextDecoderLayer(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        if (
+            _DEBUG_DFLASH_TARGET_TRACE
+            and positions.numel() <= 8
+            and get_tensor_model_parallel_rank() == 0
+            and int(positions[-1].item()) >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
+            and isinstance(self.self_attn, Glm5NextLinearAttention)
+        ):
+            trace_token_index = int(
+                torch.nonzero(
+                    positions >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION,
+                    as_tuple=False,
+                )[0].item()
+            )
+            arm_dflash_target_kda_trace(self.self_attn.prefix, trace_token_index)
         _debug_dflash_target_finite(
+            "layer_input",
+            self.layer_idx,
+            positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+        )
+        _debug_dflash_target_trace(
             "layer_input",
             self.layer_idx,
             positions,
@@ -546,6 +620,15 @@ class Glm5NextDecoderLayer(nn.Module):
             comb=comb,
             x=x,
         )
+        _debug_dflash_target_trace(
+            "attn_mhc_pre",
+            self.layer_idx,
+            positions,
+            residual=residual,
+            post=post,
+            comb=comb,
+            x=x,
+        )
 
         # Attention needs the full token sequence; mHC above ran on the SP
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
@@ -558,6 +641,12 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         _debug_dflash_target_finite(
+            "attention_output",
+            self.layer_idx,
+            positions,
+            x=x,
+        )
+        _debug_dflash_target_trace(
             "attention_output",
             self.layer_idx,
             positions,
@@ -589,14 +678,36 @@ class Glm5NextDecoderLayer(nn.Module):
             comb=comb,
             x=x,
         )
+        _debug_dflash_target_trace(
+            "ffn_mhc_pre",
+            self.layer_idx,
+            positions,
+            residual=residual,
+            post=post,
+            comb=comb,
+            x=x,
+        )
 
         # Fully Connected
+        if (
+            _DEBUG_DFLASH_TARGET_TRACE
+            and self.layer_idx == 3
+            and positions.numel() > 1
+            and int(positions[0].item()) >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
+        ):
+            arm_dflash_nvfp4_trace()
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
 
         _debug_dflash_target_finite(
+            "mlp_output",
+            self.layer_idx,
+            positions,
+            x=x,
+        )
+        _debug_dflash_target_trace(
             "mlp_output",
             self.layer_idx,
             positions,
@@ -779,9 +890,74 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             vllm_config.parallel_config.use_sequence_parallel_moe
         )
 
+        self._materialize_pp_mhc_boundary = bool(
+            getattr(config, "mhc", False)
+            and pp_group.world_size > 1
+            and os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if self._materialize_pp_mhc_boundary:
+            logger.info_once(
+                "Materializing the completed GLM-5.3 mHC streams at PP "
+                "boundaries instead of transporting deferred post/comb state."
+            )
+
         world_size = get_tensor_model_parallel_world_size()
         assert config.num_attention_heads % world_size == 0, (
             "num_attention_heads must be divisible by world_size"
+        )
+        self._debug_pp_aux_dump_dir = os.getenv(
+            "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR", ""
+        ).strip()
+        self._debug_pp_aux_dump_count = 0
+        self._debug_pp_aux_dump_limit = max(
+            0, int(os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT", "2"))
+        )
+
+    def _debug_dump_pp_aux_hidden_states(
+        self,
+        role: str,
+        positions: torch.Tensor,
+        aux_hidden_states: dict[int, torch.Tensor],
+    ) -> None:
+        """Persist PP boundary tensors so sender and receiver can be exact-matched."""
+        if (
+            not getattr(self, "_debug_pp_aux_dump_dir", "")
+            or not aux_hidden_states
+            or getattr(self, "_debug_pp_aux_dump_count", 0)
+            >= getattr(self, "_debug_pp_aux_dump_limit", 0)
+            or positions.numel() <= 1
+        ):
+            return
+        min_position = int(
+            os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
+        )
+        if int(positions.max().item()) < min_position:
+            return
+
+        pp_group = get_pp_group()
+        tp_rank = get_tensor_model_parallel_rank()
+        payload = {
+            "role": role,
+            "pp_rank": pp_group.rank_in_group,
+            "tp_rank": tp_rank,
+            "positions": positions.detach().cpu().clone(),
+            "aux_hidden_states": {
+                int(boundary): hidden.detach().cpu().clone()
+                for boundary, hidden in sorted(aux_hidden_states.items())
+            },
+        }
+        os.makedirs(self._debug_pp_aux_dump_dir, exist_ok=True)
+        dump_index = self._debug_pp_aux_dump_count
+        dump_path = os.path.join(
+            self._debug_pp_aux_dump_dir,
+            f"pp_aux_{dump_index:02d}_{role}_pp{pp_group.rank_in_group}_"
+            f"tp{tp_rank}_pid{os.getpid()}.pt",
+        )
+        torch.save(payload, dump_path)
+        self._debug_pp_aux_dump_count += 1
+        logger.warning(
+            "Saved DFlash PP auxiliary hidden states (%s) to %s", role, dump_path
         )
 
     def _materialize_aux_hidden_state(
@@ -827,16 +1003,26 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         device: torch.device,
     ) -> IntermediateTensors:
         hidden = self.config.hidden_size
-        tensors = {
-            "hidden_states": torch.zeros(
-                (batch_size, hidden), dtype=dtype, device=device
-            ),
-        }
-        if not getattr(self.config, "mhc", False):
+        mhc = getattr(self.config, "mhc", False)
+        materialize_mhc = mhc and getattr(self, "_materialize_pp_mhc_boundary", False)
+        if materialize_mhc:
+            n = self.config.mhc_num_residual_streams
+            tensors = {
+                "hidden_states": torch.zeros(
+                    (batch_size, n, hidden), dtype=dtype, device=device
+                )
+            }
+        else:
+            tensors = {
+                "hidden_states": torch.zeros(
+                    (batch_size, hidden), dtype=dtype, device=device
+                ),
+            }
+        if not mhc:
             tensors["residual"] = torch.zeros(
                 (batch_size, hidden), dtype=dtype, device=device
             )
-        else:
+        elif not materialize_mhc:
             n = self.config.mhc_num_residual_streams
             tensors.update(
                 {
@@ -878,15 +1064,22 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            post = intermediate_tensors.tensors.get("post")
-            comb = intermediate_tensors.tensors.get("comb")
+            if self.config.mhc and getattr(self, "_materialize_pp_mhc_boundary", False):
+                residual = None
+                post = None
+                comb = None
+            else:
+                residual = intermediate_tensors["residual"]
+                post = intermediate_tensors.tensors.get("post")
+                comb = intermediate_tensors.tensors.get("comb")
 
         aux_hidden_states = (
             {}
             if intermediate_tensors is None
             else self._incoming_aux_hidden_states(intermediate_tensors)
         )
+        if intermediate_tensors is not None and aux_hidden_states:
+            self._debug_dump_pp_aux_hidden_states("recv", positions, aux_hidden_states)
 
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel and get_pp_group().is_first_rank:
@@ -904,15 +1097,35 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             assert residual is not None
-            tensors = {"hidden_states": hidden_states, "residual": residual}
-            if self.config.mhc:
+            materialize_mhc = self.config.mhc and getattr(
+                self, "_materialize_pp_mhc_boundary", False
+            )
+            if materialize_mhc:
                 assert post is not None and comb is not None
-                tensors.update({"post": post, "comb": comb})
+                boundary_layer = self._active_layers[-1]
+                hidden_states = boundary_layer.hc_post(
+                    hidden_states, residual, post, comb
+                )
+                tensors = {"hidden_states": hidden_states}
+            else:
+                tensors = {"hidden_states": hidden_states, "residual": residual}
+                if self.config.mhc:
+                    assert post is not None and comb is not None
+                    tensors.update({"post": post, "comb": comb})
             for layer_boundary in self.aux_hidden_state_layers:
                 if layer_boundary <= self.end_layer:
                     tensors[_dflash_aux_hidden_state_key(layer_boundary)] = (
                         aux_hidden_states[layer_boundary]
                     )
+            self._debug_dump_pp_aux_hidden_states(
+                "send",
+                positions,
+                {
+                    boundary: value
+                    for boundary, value in aux_hidden_states.items()
+                    if boundary <= self.end_layer
+                },
+            )
             return IntermediateTensors(tensors)
 
         if self.is_sequence_parallel:

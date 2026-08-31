@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -1133,6 +1134,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
             logits = self.model.compute_logits(sample_hidden_states)
+            if (
+                input_batch.num_draft_tokens > 0
+                and os.getenv("VLLM_DFLASH_DEBUG_TARGET_LOGITS", "0") == "1"
+            ):
+                debug_positions = input_batch.positions[input_batch.logits_indices]
+                min_position = int(
+                    os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
+                )
+                if int(debug_positions[0].item()) >= min_position:
+                    top_values, top_ids = torch.topk(logits.float(), 2, dim=-1)
+                    logger.warning(
+                        "DFLASH_TARGET_LOGITS_TRACE inputs=%s positions=%s "
+                        "top1=%s top1_margin=%s",
+                        input_batch.input_ids[input_batch.logits_indices].tolist(),
+                        debug_positions.tolist(),
+                        top_ids[:, 0].tolist(),
+                        (top_values[:, 0] - top_values[:, 1]).tolist(),
+                    )
             if grammar_output is not None:
                 # Apply grammar bitmask to the logits in-place.
                 assert self.structured_outputs_worker is not None
@@ -1471,10 +1490,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
-            sampled, num_sampled, num_rejected = pp_receive(
-                input_batch.num_reqs, max_sample_len=self.num_speculative_steps + 1
+            sampled, num_sampled, num_rejected, draft_tokens = pp_receive(
+                input_batch.num_reqs,
+                max_sample_len=self.num_speculative_steps + 1,
+                max_draft_len=self.num_speculative_steps,
             )
             self.postprocess(input_batch, sampled, num_sampled, num_rejected)
+            if draft_tokens is not None:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
@@ -1484,15 +1507,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
-
-        if self.use_pp:
-            # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            pp_broadcast(
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                max_sample_len=self.num_speculative_steps + 1,
-            )
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
@@ -1604,6 +1618,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 draft_tokens,
                 num_draft_tokens=num_draft_tokens,
+            )
+
+        if self.use_pp:
+            # The drafter only runs on the last PP rank. Send its device-side
+            # proposals with the sampled outputs so the first rank embeds the
+            # actual drafts during the next target verification pass.
+            pp_broadcast(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                max_sample_len=self.num_speculative_steps + 1,
+                draft_token_ids=(
+                    self.req_states.draft_tokens[input_batch.idx_mapping]
+                    if self.num_speculative_steps
+                    else None
+                ),
+                max_draft_len=self.num_speculative_steps,
             )
 
         # Post-step KV connector related operations.

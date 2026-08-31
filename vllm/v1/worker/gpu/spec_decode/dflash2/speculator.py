@@ -78,7 +78,7 @@ def _selector_walk_kernel(
             other=0,
         )
 
-        # Candidate token IDs key the noise, matching the target sampler.
+        # Candidate token IDs key an independent draft-noise stream.
         position = tl.load(sample_pos_ptr + flat) - 1
         _, index = gumbel_noised_argmax(
             scores,
@@ -87,6 +87,7 @@ def _selector_walk_kernel(
             seed,
             position,
             temperature if SAMPLE_PROBABILISTIC else 0.0,
+            IS_DRAFTING=True,
             USE_FP64=USE_FP64,
             APPLY_TEMPERATURE=False,
         )
@@ -151,6 +152,7 @@ def _selector_walk_tail_kernel(
         mask=mask & valid,
         other=0,
     )
+    # Candidate token IDs key an independent draft-noise stream.
     position = tl.load(sample_pos_ptr + flat) - 1
     _, index = gumbel_noised_argmax(
         scores,
@@ -159,6 +161,7 @@ def _selector_walk_tail_kernel(
         seed,
         position,
         temperature if SAMPLE_PROBABILISTIC else 0.0,
+        IS_DRAFTING=True,
         USE_FP64=USE_FP64,
         APPLY_TEMPERATURE=False,
     )
@@ -365,6 +368,34 @@ class DFlash2Speculator(DFlashSpeculator):
         self._selector_path_state = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self._debug_backbone_hidden_states: torch.Tensor | None = None
+        self._debug_candidate_ids: torch.Tensor | None = None
+        self._debug_unary_logits: torch.Tensor | None = None
+        self._debug_lattice_scores: torch.Tensor | None = None
+        if getattr(self, "_debug_tensor_dump_dir", ""):
+            packed_shape = (
+                self.max_num_reqs,
+                self.draft_block,
+                self.selector_top_k,
+            )
+            self._debug_backbone_hidden_states = torch.empty(
+                self.max_num_reqs,
+                self.draft_block,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+            self._debug_candidate_ids = torch.empty(
+                packed_shape, dtype=torch.int64, device=device
+            )
+            self._debug_unary_logits = torch.empty(
+                packed_shape, dtype=torch.float32, device=device
+            )
+            self._debug_lattice_scores = torch.empty(
+                (*packed_shape, self.selector_top_k),
+                dtype=torch.float32,
+                device=device,
+            )
         self._alignment_candidate_ids: torch.Tensor | None = None
         self._alignment_unary_logits: torch.Tensor | None = None
         self._alignment_lattice_scores: torch.Tensor | None = None
@@ -970,6 +1001,14 @@ class DFlash2Speculator(DFlashSpeculator):
             hidden_states,
             anchor_token_ids,
         )
+        if self._debug_candidate_ids is not None:
+            assert self._debug_backbone_hidden_states is not None
+            assert self._debug_unary_logits is not None
+            assert self._debug_lattice_scores is not None
+            self._debug_backbone_hidden_states[:num_reqs].copy_(hidden_states)
+            self._debug_candidate_ids[:num_reqs].copy_(candidate_ids)
+            self._debug_unary_logits[:num_reqs].copy_(unary_logits)
+            self._debug_lattice_scores[:num_reqs].copy_(scores)
         if self._alignment_candidate_ids is not None:
             assert self._alignment_unary_logits is not None
             assert self._alignment_lattice_scores is not None
@@ -980,13 +1019,41 @@ class DFlash2Speculator(DFlashSpeculator):
         self.draft_tokens[:num_reqs, : self.draft_block].copy_(
             self._selector_tokens[:num_reqs]
         )
-        if self._debug_proposal_stages and self._debug_token_dump_count < 2:
+        if (
+            getattr(self, "_debug_proposal_stages", False)
+            and getattr(self, "_debug_real_proposal", False)
+            and self._debug_token_dump_count < 2
+        ):
+            first_scores = scores[0, 0, 0]
+            first_unary = unary_logits[0, 0]
+            first_bilinear = first_scores - first_unary
+            greedy_path = []
+            predecessor = 0
+            for step in range(self.draft_block):
+                score_row = scores[0, step, predecessor]
+                successor = int(score_row.argmax().item())
+                greedy_path.append(
+                    (
+                        successor,
+                        int(candidate_ids[0, step, successor].item()),
+                        float(score_row[successor].item()),
+                    )
+                )
+                predecessor = successor
             logger.info(
                 "DFlash2 token diagnostic: finite_hidden=%s max_abs_hidden=%s "
-                "candidate_ids=%s draft_tokens=%s",
+                "query_input_ids=%s anchor_token_id=%s candidate_ids=%s "
+                "unary_logits=%s first_bilinear=%s first_total=%s "
+                "greedy_path=%s draft_tokens=%s",
                 bool(torch.isfinite(hidden_states).all().item()),
                 float(hidden_states.abs().max().item()),
+                self.input_buffers.input_ids[: self.num_query_per_req].tolist(),
+                int(anchor_token_ids[0].item()),
                 candidate_ids[0].tolist(),
+                unary_logits[0].tolist(),
+                first_bilinear.tolist(),
+                first_scores.tolist(),
+                greedy_path,
                 self.draft_tokens[0, : self.draft_block].tolist(),
             )
             self._debug_token_dump_count += 1

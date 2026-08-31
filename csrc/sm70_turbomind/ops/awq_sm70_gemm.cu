@@ -1950,12 +1950,14 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
   }
 }
 
-template <int kRows, int kCols, int kWarps>
+template <int kRows, int kCols, int kWarps, int kBatch>
 __global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
                                          const half* f_input,
                                          const half* g_input,
                                          const half* f_weight,
-                                         const half* g_weight) {
+                                         const half* g_weight,
+                                         int64_t f_input_stride,
+                                         int64_t g_input_stride) {
   constexpr int kThreads = kWarps * WARP_SIZE;
   constexpr int kCols2 = kCols / 2;
   static_assert(kThreads <= 1024);
@@ -1970,20 +1972,29 @@ __global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
 
   const bool is_g = combined_row >= kRows;
   const int row = is_g ? combined_row - kRows : combined_row;
-  const half2* input = reinterpret_cast<const half2*>(is_g ? g_input : f_input);
   const half2* weight = reinterpret_cast<const half2*>(
       (is_g ? g_weight : f_weight) + row * kCols);
 
-  float dot = 0.f;
+  float dot[kBatch] = {};
   for (int col2 = lane; col2 < kCols2; col2 += WARP_SIZE) {
-    const float2 input_value = __half22float2(input[col2]);
     const float2 weight_value = __half22float2(weight[col2]);
-    dot = fmaf(input_value.x, weight_value.x, dot);
-    dot = fmaf(input_value.y, weight_value.y, dot);
+#pragma unroll
+    for (int batch = 0; batch < kBatch; ++batch) {
+      const int64_t input_stride = is_g ? g_input_stride : f_input_stride;
+      const half2* input = reinterpret_cast<const half2*>(
+          (is_g ? g_input : f_input) + batch * input_stride);
+      const float2 input_value = __half22float2(input[col2]);
+      dot[batch] = fmaf(input_value.x, weight_value.x, dot[batch]);
+      dot[batch] = fmaf(input_value.y, weight_value.y, dot[batch]);
+    }
   }
-  dot = warp_reduce_sum(dot);
-  if (lane == 0) {
-    (is_g ? g_out : f_out)[row] = __float2half_rn(dot);
+#pragma unroll
+  for (int batch = 0; batch < kBatch; ++batch) {
+    dot[batch] = warp_reduce_sum(dot[batch]);
+    if (lane == 0) {
+      (is_g ? g_out : f_out)[batch * kRows + row] =
+          __float2half_rn(dot[batch]);
+    }
   }
 }
 
@@ -2070,16 +2081,19 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
                   g_weight.scalar_type() == torch::kFloat16,
               "sm70_glm_kda_fg_b_out: all tensors must be float16.");
   TORCH_CHECK(f_out.is_contiguous() && g_out.is_contiguous() &&
-                  f_input.is_contiguous() && g_input.is_contiguous() &&
+                  f_input.stride(1) == 1 && g_input.stride(1) == 1 &&
                   f_weight.is_contiguous() && g_weight.is_contiguous(),
-              "sm70_glm_kda_fg_b_out: all tensors must be contiguous.");
-  TORCH_CHECK(f_out.sizes() == torch::IntArrayRef({1, 2048}) &&
-                  g_out.sizes() == torch::IntArrayRef({1, 2048}) &&
-                  f_input.sizes() == torch::IntArrayRef({1, 128}) &&
-                  g_input.sizes() == torch::IntArrayRef({1, 128}) &&
+              "sm70_glm_kda_fg_b_out: outputs/weights must be contiguous and "
+              "inputs must have contiguous inner dimensions.");
+  const int64_t num_tokens = f_input.size(0);
+  TORCH_CHECK(f_input.dim() == 2 && num_tokens >= 1 && num_tokens <= 8 &&
+                  f_input.size(1) == 128 &&
+                  g_input.sizes() == f_input.sizes() && f_out.dim() == 2 &&
+                  f_out.size(0) == num_tokens && f_out.size(1) == 2048 &&
+                  g_out.sizes() == f_out.sizes() &&
                   f_weight.sizes() == torch::IntArrayRef({2048, 128}) &&
                   g_weight.sizes() == torch::IntArrayRef({2048, 128}),
-              "sm70_glm_kda_fg_b_out: requires the GLM TP4 B1 shape.");
+              "sm70_glm_kda_fg_b_out: requires the GLM TP4 B1-B8 shape.");
   const auto device = f_out.device();
   TORCH_CHECK(g_out.device() == device && f_input.device() == device &&
                   g_input.device() == device && f_weight.device() == device &&
@@ -2090,14 +2104,29 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
   constexpr int kWarps = 8;
   constexpr int kThreads = kWarps * WARP_SIZE;
   constexpr int kBlocks = (2 * 2048 + kWarps - 1) / kWarps;
-  sm70_glm_kda_fg_b_kernel<2048, 128, kWarps>
-      <<<kBlocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<half*>(f_out.data_ptr<at::Half>()),
-          reinterpret_cast<half*>(g_out.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(f_input.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(g_input.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>()),
-          reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>()));
+#define VLLM_LAUNCH_GLM_KDA_FG_B(batch)                                   \
+  case batch:                                                             \
+    sm70_glm_kda_fg_b_kernel<2048, 128, kWarps, batch>                    \
+        <<<kBlocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(     \
+            reinterpret_cast<half*>(f_out.data_ptr<at::Half>()),          \
+            reinterpret_cast<half*>(g_out.data_ptr<at::Half>()),          \
+            reinterpret_cast<const half*>(f_input.data_ptr<at::Half>()),  \
+            reinterpret_cast<const half*>(g_input.data_ptr<at::Half>()),  \
+            reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>()), \
+            reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>()), \
+            f_input.stride(0), g_input.stride(0));                         \
+    break
+  switch (num_tokens) {
+    VLLM_LAUNCH_GLM_KDA_FG_B(1);
+    VLLM_LAUNCH_GLM_KDA_FG_B(2);
+    VLLM_LAUNCH_GLM_KDA_FG_B(3);
+    VLLM_LAUNCH_GLM_KDA_FG_B(4);
+    VLLM_LAUNCH_GLM_KDA_FG_B(5);
+    VLLM_LAUNCH_GLM_KDA_FG_B(6);
+    VLLM_LAUNCH_GLM_KDA_FG_B(7);
+    VLLM_LAUNCH_GLM_KDA_FG_B(8);
+  }
+#undef VLLM_LAUNCH_GLM_KDA_FG_B
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

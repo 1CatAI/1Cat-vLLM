@@ -72,3 +72,92 @@ def test_pp_broadcast_rejects_tokens_wider_than_receive_buffer(monkeypatch) -> N
             torch.zeros(1, dtype=torch.int32),
             max_sample_len=2,
         )
+
+
+def test_pp_broadcast_packs_next_drafts_with_sampled_tokens(monkeypatch) -> None:
+    broadcasts: list[torch.Tensor] = []
+
+    monkeypatch.setattr(pp_utils, "get_pp_group", lambda: _FakePPGroup())
+    monkeypatch.setattr(
+        torch.distributed,
+        "broadcast",
+        lambda tensor, **_kwargs: broadcasts.append(tensor.clone()),
+    )
+
+    pp_utils.pp_broadcast(
+        torch.tensor([[42, 43]], dtype=torch.int64),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([6], dtype=torch.int32),
+        max_sample_len=8,
+        draft_token_ids=torch.tensor([[101, 102, 103]], dtype=torch.int64),
+        max_draft_len=7,
+    )
+
+    assert len(broadcasts) == 2
+    torch.testing.assert_close(
+        broadcasts[0],
+        torch.tensor(
+            [[42, 43, -1, -1, -1, -1, -1, -1, 101, 102, 103, -1, -1, -1, -1]]
+        ),
+    )
+    torch.testing.assert_close(
+        broadcasts[1], torch.tensor([[2], [6]], dtype=torch.int32)
+    )
+
+
+class _FakeReceivePPGroup:
+    is_last_rank = False
+    last_rank = 4
+    device_group = object()
+    device = torch.device("cpu")
+
+
+def test_pp_receive_unpacks_next_drafts(monkeypatch) -> None:
+    payloads = iter(
+        (
+            torch.tensor(
+                [
+                    [
+                        42,
+                        43,
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                        101,
+                        102,
+                        103,
+                        -1,
+                        -1,
+                        -1,
+                        -1,
+                    ]
+                ],
+                dtype=torch.int64,
+            ),
+            torch.tensor([[2], [6]], dtype=torch.int32),
+        )
+    )
+
+    monkeypatch.setattr(pp_utils, "get_pp_group", lambda: _FakeReceivePPGroup())
+
+    def fake_broadcast(tensor, **_kwargs) -> None:
+        tensor.copy_(next(payloads))
+
+    monkeypatch.setattr(torch.distributed, "broadcast", fake_broadcast)
+
+    sampled, num_sampled, num_rejected, drafts = pp_utils.pp_receive(
+        1, max_sample_len=8, max_draft_len=7
+    )
+
+    torch.testing.assert_close(
+        sampled, torch.tensor([[42, 43, -1, -1, -1, -1, -1, -1]])
+    )
+    assert drafts is not None
+    torch.testing.assert_close(
+        drafts, torch.tensor([[101, 102, 103, -1, -1, -1, -1]])
+    )
+    torch.testing.assert_close(num_sampled, torch.tensor([2], dtype=torch.int32))
+    torch.testing.assert_close(num_rejected, torch.tensor([6], dtype=torch.int32))

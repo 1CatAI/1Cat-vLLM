@@ -10,6 +10,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -36,6 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal.inputs import NestedTensors
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
@@ -45,6 +47,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
+from .dflash_sm70 import dflash_layered_rms_norm_sm70
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -92,6 +95,18 @@ def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
         if hasattr(target_model, "get_language_model")
         else target_model
     )
+    config = getattr(language_model, "config", None)
+    if config is not None:
+        uses_nope = bool(
+            getattr(config, "mla_nope", False)
+            or getattr(config, "mla_use_nope", False)
+        )
+        has_zero_dim_mla_rope = bool(
+            getattr(config, "mla", False)
+            and getattr(config, "qk_rope_head_dim", None) == 0
+        )
+        if uses_nope or has_zero_dim_mla_rope:
+            return None
     for module in language_model.modules():
         style = getattr(module, "is_neox_style", None)
         if isinstance(style, bool):
@@ -518,6 +533,23 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+        if (
+            envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
+            and get_tensor_model_parallel_rank() == 0
+        ):
+            row_diffs = (
+                self._k_norm_weights.float()
+                .sub(self._k_norm_weights[0].float())
+                .abs()
+                .amax(dim=-1)
+                .tolist()
+            )
+            logger.warning(
+                "DFlash loaded context K-norm weight diagnostics: shape=%s "
+                "max_diff_from_layer0=%s",
+                tuple(self._k_norm_weights.shape),
+                row_diffs,
+            )
         # The grouped call below relies on the stable-ABI RMSNorm extension
         # selecting one weight row per outer (layer) index. Older binaries
         # silently accepted the 2-D tensor but applied row zero to every
@@ -525,6 +557,7 @@ class DFlashQwen3Model(nn.Module):
         # target-only output quality. Verify the loaded binary once before
         # trusting its grouped result.
         self._batched_k_norm_runtime_verified: bool | None = None
+        self._sm70_context_k_debugged = False
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -639,6 +672,36 @@ class DFlashQwen3Model(nn.Module):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
+        if (
+            all_k.is_cuda
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info_once(
+                "Using the fused per-layer DFlash context K RMSNorm fast path "
+                "on SM70."
+            )
+            grouped = dflash_layered_rms_norm_sm70(
+                all_k, self._k_norm_weights, self._rms_norm_eps
+            )
+            if (
+                envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
+                and not self._sm70_context_k_debugged
+                and get_tensor_model_parallel_rank() == 0
+                and bool(torch.count_nonzero(all_k).item())
+            ):
+                reference = self._normalize_context_k_per_layer(all_k)
+                diff = grouped.float().sub(reference.float()).abs()
+                logger.warning(
+                    "DFlash fused SM70 context K-norm diagnostics: "
+                    "input_shape=%s max_diff=%.9g mean_diff=%.9g",
+                    tuple(all_k.shape),
+                    float(diff.max().item()),
+                    float(diff.mean().item()),
+                )
+                self._sm70_context_k_debugged = True
+            return grouped
+
         runtime_verified = getattr(self, "_batched_k_norm_runtime_verified", None)
         if runtime_verified is None:
             # This one-time comparison is normally consumed by model profiling

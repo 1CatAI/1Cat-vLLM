@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from functools import cache
 
@@ -54,8 +55,11 @@ def _use_sm70_bf16_emulation(config) -> bool:
         "bf16",
         "torch.bfloat16",
     }
+    enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
+    enabled = enabled in ("1", "true", "yes", "on")
     return (
-        is_bf16
+        enabled
+        and is_bf16
         and current_platform.is_cuda()
         and current_platform.is_device_capability(70)
     )

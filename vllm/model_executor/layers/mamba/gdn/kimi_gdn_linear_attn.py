@@ -96,7 +96,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
         return MambaStateShapeCalculator.kda_state_shape(
-            self.tp_size, self.num_heads, self.head_dim, conv_kernel_size=self.conv_size
+            self.tp_size,
+            self.num_heads,
+            self.head_dim,
+            conv_kernel_size=self.conv_size,
+            num_spec=self.num_spec,
         )
 
     def __init__(

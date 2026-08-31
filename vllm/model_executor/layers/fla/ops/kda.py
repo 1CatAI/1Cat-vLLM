@@ -9,6 +9,8 @@
 # ruff: noqa: E501
 
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -27,6 +29,54 @@ from .utils import FLA_CHUNK_SIZE, is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+
+def _is_sm70() -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 7
+        and torch.cuda.get_device_capability()[1] == 0
+    )
+
+
+_use_sm70_kda_prefill_schedule = (
+    os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE", "1") == "1" and _is_sm70()
+)
+_recompute_w_u_configs = (
+    [
+        triton.Config({}, num_warps=num_warps, num_stages=2)
+        for num_warps in [4, 8]
+    ]
+    if _use_sm70_kda_prefill_schedule
+    else [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+)
+_chunk_gla_o_configs = (
+    [
+        triton.Config(
+            {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=2
+        )
+        for BK in [32, 64]
+        for BV in [64, 128]
+        for num_warps in [4, 8]
+        if BV == 64 or num_warps == 8
+    ]
+    if _use_sm70_kda_prefill_schedule
+    else [
+        triton.Config(
+            {"BK": BK, "BV": BV},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for BK in [32, 64]
+        for BV in [64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+)
 
 
 def fused_recurrent_kda_fwd(
@@ -858,11 +908,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_recompute_w_u_configs,
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -1058,13 +1104,7 @@ def recompute_w_u_fwd(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_chunk_gla_o_configs,
     key=["BT"],
 )
 @triton.jit(do_not_specialize=["T"])

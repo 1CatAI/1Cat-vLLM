@@ -39,14 +39,22 @@ def test_sm70_exact_kda_gemv_gate(
     ),
     reason="native NVIDIA V100/SM70 GLM KDA CUDA op required",
 )
-def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph(
+    num_tokens: int,
+) -> None:
     torch.manual_seed(20260827)
     device = current_platform.device_type
-    f_input = torch.randn((1, 128), device=device, dtype=torch.float16).mul_(0.1)
-    g_input = torch.randn((1, 128), device=device, dtype=torch.float16).mul_(0.1)
+    projected = torch.randn(
+        (num_tokens, 6416), device=device, dtype=torch.float16
+    ).mul_(0.1)
+    f_input = projected[:, -256:-128]
+    g_input = projected[:, -128:]
+    assert f_input.stride() == (6416, 1)
+    assert g_input.stride() == (6416, 1)
     f_weight = torch.randn((2048, 128), device=device, dtype=torch.float16).mul_(0.01)
     g_weight = torch.randn((2048, 128), device=device, dtype=torch.float16).mul_(0.01)
-    f_out = torch.empty((1, 2048), device=device, dtype=torch.float16)
+    f_out = torch.empty((num_tokens, 2048), device=device, dtype=torch.float16)
     g_out = torch.empty_like(f_out)
 
     def run() -> None:
@@ -57,6 +65,23 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph() -> None:
     run()
     torch.accelerator.synchronize()
     expected = (F.linear(f_input, f_weight), F.linear(g_input, g_weight))
+    rowwise_f = []
+    rowwise_g = []
+    for token_idx in range(num_tokens):
+        f_row = torch.empty((1, 2048), device=device, dtype=torch.float16)
+        g_row = torch.empty_like(f_row)
+        sm70_ops.sm70_glm_kda_fg_b_out(
+            f_row,
+            g_row,
+            f_input[token_idx : token_idx + 1],
+            g_input[token_idx : token_idx + 1],
+            f_weight,
+            g_weight,
+        )
+        rowwise_f.append(f_row)
+        rowwise_g.append(g_row)
+    assert torch.equal(f_out, torch.cat(rowwise_f))
+    assert torch.equal(g_out, torch.cat(rowwise_g))
     torch.testing.assert_close(f_out, expected[0], rtol=2e-3, atol=2e-4)
     torch.testing.assert_close(g_out, expected[1], rtol=2e-3, atol=2e-4)
     eager = (f_out.clone(), g_out.clone())
@@ -79,24 +104,43 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph() -> None:
     ),
     reason="native NVIDIA V100/SM70 GLM-5.3 exact FP16 GEMV op required",
 )
-@pytest.mark.parametrize("seed", range(5))
-def test_sm70_glm53_fp16_gemv_matches_cublas_and_graph(seed: int) -> None:
+@pytest.mark.parametrize("seed", range(2))
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_sm70_glm53_fp16_gemv_matches_cublas_and_graph(
+    seed: int, num_tokens: int
+) -> None:
     torch.manual_seed(seed)
     device = current_platform.device_type
-    input = torch.randn((1, 4096), device=device, dtype=torch.float16)
+    input = torch.randn((num_tokens, 4096), device=device, dtype=torch.float16)
     weight = torch.randn((6416, 4096), device=device, dtype=torch.float16)
-    output = torch.empty((1, 6416), device=device, dtype=torch.float16)
+    output = torch.empty((num_tokens, 6416), device=device, dtype=torch.float16)
 
     sm70_ops.sm70_glm53_fp16_gemv_out(output, input, weight)
     torch.accelerator.synchronize()
-    expected = F.linear(input, weight)
+    expected_rows = []
+    for token_idx in range(num_tokens):
+        expected_row = torch.empty((1, 6416), device=device, dtype=torch.float16)
+        sm70_ops.sm70_glm53_fp16_gemv_out(
+            expected_row, input[token_idx : token_idx + 1], weight
+        )
+        expected_rows.append(expected_row)
+    expected = torch.cat(expected_rows)
     assert torch.equal(output, expected)
+    if num_tokens == 1:
+        assert torch.equal(output, F.linear(input, weight))
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         sm70_ops.sm70_glm53_fp16_gemv_out(output, input, weight)
     input.copy_(torch.randn_like(input))
-    expected = F.linear(input, weight)
+    expected_rows = []
+    for token_idx in range(num_tokens):
+        expected_row = torch.empty((1, 6416), device=device, dtype=torch.float16)
+        sm70_ops.sm70_glm53_fp16_gemv_out(
+            expected_row, input[token_idx : token_idx + 1], weight
+        )
+        expected_rows.append(expected_row)
+    expected = torch.cat(expected_rows)
     graph.replay()
     torch.accelerator.synchronize()
     assert torch.equal(output, expected)
