@@ -1,14 +1,16 @@
+# 1Cat-vLLM
+
+<!-- markdownlint-disable MD025 -->
+
 <p align="center">
   <img src="./assets/1cat-vllm-logo.png" alt="1Cat-vLLM logo" width="420">
 </p>
 
-# 1Cat-vLLM
+## Make Volta Fast Again
 
-## Make Volta Fast Again.
+### Modern LLM inference for NVIDIA Tesla V100 / SM70
 
-### Modern LLM inference for NVIDIA Tesla V100 / SM70.
-
-**4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s**
+<p align="center"><strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong></p>
 
 > Tesla V100 was released in 2017.
 >
@@ -356,7 +358,7 @@ Representative gates include:
 
 ## We are not just “making FlashAttention compile on V100.”
 
-## We are rebuilding the dataflow for Volta.
+## We are rebuilding the dataflow for Volta
 
 FlashAttention is fundamentally an **IO and scheduling problem**:
 
@@ -468,33 +470,33 @@ After reducing data-movement overhead, the Attention body itself is restructured
 
 Key components include:
 
-### D256 Split-D
+## D256 Split-D
 
 Split D=256 into four D64 slices.
 
 Paired warps share QK probability work while increasing PV parallelism without recomputing the same QK work.
 
-### N32 Online Softmax
+## N32 Online Softmax
 
 Retain causal online-softmax and FP32 accumulation contracts without materializing a full score matrix.
 
-### K-stage Ping-Pong
+## K-stage Ping-Pong
 
 Alternate K/D64 panels across Shared Memory stages to reduce barrier and wait pressure.
 
-### Split-KV3
+## Split-KV3
 
 Split long-prefix KV work into three partitions where useful, then merge FP32 partial state.
 
-### GQA Multi-Head Packing
+## GQA Multi-Head Packing
 
 Pack six GQA query heads into wider Tensor-Core work.
 
-### Wide QK / PV
+## Wide QK / PV
 
 Turn many fragmented small Tensor-Core operations into larger, more regular QK/PV GEMM-style work.
 
-### Prefix / Causal-Tail Separation
+## Prefix / Causal-Tail Separation
 
 Schedule the fully visible long prefix separately from the exact causal tail and merge the online-softmax state.
 
