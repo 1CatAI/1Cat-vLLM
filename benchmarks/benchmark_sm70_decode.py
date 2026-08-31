@@ -185,6 +185,7 @@ def _tracked_env() -> dict[str, str]:
         "VLLM_USE_",
         "VLLM_DISABLE_",
         "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE",
+        "VLLM_GLM53_",
         "VLLM_QWEN3NEXT_",
         "VLLM_QWEN3_NEXT_",
         "VLLM_ATTENTION_BACKEND",

@@ -152,6 +152,7 @@ def test_ngram_embedding_accepts_checkpoint_seed_none(
             max_total_tokens=8,
             max_num_reqs=2,
             prefix="model.layers.2.ple.ple_embedding",
+            layer_name="model.layers.2.ple",
             params_dtype=torch.float16,
         )
 
@@ -450,6 +451,51 @@ def test_ple_fp8_embedding_respects_checkpoint_shard_exclusions() -> None:
 
     quant_config.ignored_layers = [f"{prefix}.shard_0"]
     assert _get_ple_embedding_quant_method(quant_config, prefix) is None
+
+
+def test_ple_ngram_ids_custom_op_uses_current_request_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RuntimeNGramEmbedding(nn.Module):
+        def compute_ngram_ids(
+            self,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor,
+        ) -> torch.Tensor:
+            del input_ids, ngram_context
+            num_reqs = query_start_loc.numel() - 1
+            return torch.full((4, 2), num_reqs, dtype=torch.long)
+
+    layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(layer)
+    layer.ple_embedding = RuntimeNGramEmbedding()
+    monkeypatch.setattr(
+        ple_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+    )
+    input_ids = torch.arange(4)
+    ngram_context = torch.zeros(2, 2, dtype=torch.long)
+    output = torch.empty(4, 2, dtype=torch.long)
+
+    ple_module.qwen4_exp_compute_ple_ngram_ids(
+        input_ids,
+        torch.tensor([0, 4]),
+        ngram_context,
+        output,
+        "ple",
+    )
+    assert torch.equal(output, torch.ones_like(output))
+
+    ple_module.qwen4_exp_compute_ple_ngram_ids(
+        input_ids,
+        torch.tensor([0, 2, 4]),
+        ngram_context,
+        output,
+        "ple",
+    )
+    assert torch.equal(output, torch.full_like(output, 2))
 
 
 def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(

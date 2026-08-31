@@ -102,6 +102,24 @@ def test_qwen4_exp_defaults_to_v2_even_when_quantized_moe(
     assert VllmConfig._is_default_v2_model_runner_model(vllm_config)
 
 
+def test_qwen4_exp_rejects_explicit_v1_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.config.vllm.envs.VLLM_USE_V2_MODEL_RUNNER",
+        False,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            architectures=["Qwen4ExpForCausalLM"],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires Model Runner V2"):
+        VllmConfig.use_v2_model_runner.fget(vllm_config)
+
+
 def test_initial_sm70_v2_route_accepts_native_mtp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

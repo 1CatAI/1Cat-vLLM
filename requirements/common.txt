@@ -17,7 +17,8 @@ openai >= 2.0.0  # For Responses API with reasoning content
 pydantic >= 2.13.4, < 2.14.0
 prometheus_client >= 0.26.0
 pillow  # Required for image processing
-prometheus-fastapi-instrumentator >= 7.0.0, < 8.0.0
+# v8.0.1+ supports FastAPI's _IncludedRouter; v8.1 fixes nested-route resolution.
+prometheus-fastapi-instrumentator >= 8.1.0, < 9.0.0
 tiktoken >= 0.14.0  # Required for DBRX tokenizer
 lm-format-enforcer == 0.11.3
 llguidance >= 1.7.0, < 1.8.0; platform_machine == "x86_64" or platform_machine == "arm64" or platform_machine == "aarch64" or platform_machine == "ppc64le"

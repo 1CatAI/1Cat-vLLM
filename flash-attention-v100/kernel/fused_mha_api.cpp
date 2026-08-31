@@ -24,6 +24,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Staged FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("grouped_verify_paged_fwd", &flash_attention_grouped_verify_paged,
         "Exact grouped DFlash2 verification over paged KV cache (Volta)");
+  m.def("grouped_verify_max_query_tokens",
+        &flash_attention_grouped_verify_max_query_tokens,
+        "Maximum query length supported by grouped DFlash2 verification");
   m.def("grouped_sparse_page4_fwd", &flash_attention_grouped_sparse_page4,
         "Grouped exact QSA page4 attention over paged KV cache (Volta)");
   m.def("grouped_sparse_page4_plan_fwd",

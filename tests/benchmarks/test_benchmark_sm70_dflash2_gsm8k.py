@@ -32,6 +32,14 @@ def acceptance_gate(monkeypatch):
     return module._acceptance_gate
 
 
+@pytest.fixture
+def tracked_env(monkeypatch):
+    benchmark_dir = Path(__file__).resolve().parents[2] / "benchmarks"
+    monkeypatch.syspath_prepend(str(benchmark_dir))
+    module = importlib.import_module("benchmark_sm70_dflash2_gsm8k")
+    return module._tracked_env
+
+
 @pytest.mark.parametrize(
     ("request_seed", "request_seeds", "expected"),
     [
@@ -108,3 +116,10 @@ def test_acceptance_gate_uses_its_named_metric(
         "observed": observed,
         "passed": passed,
     }
+
+
+def test_runtime_contract_tracks_glm53_environment(tracked_env, monkeypatch):
+    name = "VLLM_GLM53_PP_MHC_MATERIALIZE"
+    monkeypatch.setenv(name, "1")
+
+    assert tracked_env()[name] == "1"

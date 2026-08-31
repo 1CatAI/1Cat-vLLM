@@ -36,15 +36,29 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 elseif(VLLM_FLASH_ATTN_SM70)
+  set(VLLM_FLASH_ATTN_SM70_COMMIT c2eda5e6115b98c3ba4bfd181570668742eece22)
+  find_package(Git REQUIRED)
   find_program(PATCH_EXECUTABLE patch REQUIRED)
   FetchContent_Declare(
           vllm-flash-attn
           GIT_REPOSITORY https://github.com/zhinianqin/flash-attention-v100.git
-          GIT_TAG c2eda5e6115b98c3ba4bfd181570668742eece22
+          GIT_TAG ${VLLM_FLASH_ATTN_SM70_COMMIT}
           GIT_PROGRESS TRUE
           GIT_SUBMODULES csrc/cutlass
           GIT_SUBMODULES_RECURSE TRUE
           PATCH_COMMAND
+            # FetchContent can rerun PATCH_COMMAND on reconfigure. Restore the
+            # pinned dependency first so an incremental wheel rebuild is
+            # deterministic instead of trying to patch an already-patched tree.
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR> reset --hard
+            ${VLLM_FLASH_ATTN_SM70_COMMIT}
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR> clean -fd
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR>/csrc/cutlass reset --hard
+          COMMAND
+            ${GIT_EXECUTABLE} -C <SOURCE_DIR>/csrc/cutlass clean -fd
+          COMMAND
             ${PATCH_EXECUTABLE} --batch --forward -p1 -l
             -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_pipeline.patch
           COMMAND

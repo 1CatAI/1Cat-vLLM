@@ -10,14 +10,14 @@ import vllm.envs as envs
 from vllm.model_executor.layers.quantization import sm70_online_qpn8 as online_qpn8
 
 
-def test_qwen4_exp_online_qpn8_defaults_on_and_can_be_disabled(monkeypatch):
+def test_qwen4_exp_online_qpn8_defaults_off_and_can_be_enabled(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", raising=False)
     envs.disable_envs_cache()
     try:
-        assert envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
-        monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
-        envs.disable_envs_cache()
         assert not envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+        monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1")
+        envs.disable_envs_cache()
+        assert envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
     finally:
         envs.disable_envs_cache()
 
@@ -34,7 +34,7 @@ def test_qwen3next_shared_gate_fusion_defaults_on_and_can_be_disabled(monkeypatc
         envs.disable_envs_cache()
 
 
-def test_default_on_qpn_sidecars_load_without_enable_overrides(monkeypatch):
+def test_qpn_sidecars_respect_safe_online_default(monkeypatch):
     calls: list[str] = []
     monkeypatch.setenv("VLLM_SM70_FP8_QPN8_LIBRARY", "/tmp/qpn8.so")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY", "/tmp/qpn-m1.so")
@@ -45,7 +45,12 @@ def test_default_on_qpn_sidecars_load_without_enable_overrides(monkeypatch):
     online_qpn8.sm70_ops._maybe_load_fp8_qpn8_library()
     online_qpn8.sm70_ops._maybe_load_nvfp4_qpn_m1_library()
 
-    assert calls == ["/tmp/qpn8.so", "/tmp/qpn-m1.so"]
+    assert calls == ["/tmp/qpn-m1.so"]
+
+    calls.clear()
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1")
+    online_qpn8.sm70_ops._maybe_load_fp8_qpn8_library()
+    assert calls == ["/tmp/qpn8.so"]
 
 
 @pytest.mark.parametrize(

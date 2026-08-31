@@ -101,8 +101,9 @@ class TokenspeedMLABackend(MLACommonBackend):
             import tokenspeed_mla  # noqa: F401
         except ImportError:
             return (
-                "tokenspeed_mla package is not installed. "
-                "Install it with: `uv pip install tokenspeed-mla`"
+                "tokenspeed_mla is an optional package and is not installed. "
+                "Its apache-tvm-ffi requirement must be compatible with the "
+                "installed TileLang version."
             )
 
         # tokenspeed_mla CuTe DSL kernel is shape-specialized for DeepSeek R1

@@ -4,15 +4,17 @@
 
 - Status: source bring-up, pinned-host PLE, native Qwen4Exp MTP, and
   prefix-cache configuration are implemented; focused CPU/configuration gates
-  pass and the local ModelScope snapshot is fully verified. The current
-  accepted no-MTP TP4 candidate reaches 82.274 steady decode tokens/s on the
-  8192x512 contract. A matched 96-request GSM8K screen keeps 96/96 answers
-  correct with online QPN8 both off and on while QPN8 raises mean steady decode
-  by 16.97%. The direct NVFP4 ten-route QPN-M1 MoE and online QPN8 routes are
-  therefore default-on for the exact SM70/TP4/B1 contract, with explicit
-  diagnostic opt-outs. The preceding 77.370-token/s graph-node trace remains
-  the detailed optimization control. Corrected native MTP4 is stable across an
-  11-request TP4 transition run, and the no-thinking HumanEval8 gate reaches
+  pass and the local ModelScope snapshot is fully verified. The historical
+  no-MTP TP4 online-QPN8 candidate reaches 82.274 steady decode tokens/s on the
+  8192x512 contract, but online QPN8 requantizes dense checkpoint weights and
+  is now experimental opt-in. Its matched 96-request GSM8K screen keeps 96/96
+  answers correct in both arms but changes 88/96 token sequences and contains
+  a large long-output/repetition outlier. The exact, byte-preserving NVFP4
+  ten-route QPN-M1 MoE remains default-on; online QPN8 is default-off. The
+  precision-preserving no-MTP control is about 67.6 tokens/s, so reaching 80
+  tokens/s without online QPN8 remains an open optimization target. Corrected
+  native MTP4 is stable across an 11-request TP4 transition run, and the
+  no-thinking HumanEval8 gate reaches
   4.747 mean accepted length, 93.676% draft acceptance, 126.81 warmed pure
   decode tokens/s, and 8/8 standard semantic executions. The V2 M16 plus
   M5/M1 warmup also removes the first-request MTP `fused_moe_kernel` JIT.
@@ -20,7 +22,8 @@
   [#345](https://github.com/1CatAI/1Cat-vLLM/pull/345) and initial decode work
   [#361](https://github.com/1CatAI/1Cat-vLLM/pull/361) are merged. The compact
   MTP loader, exact SM70 MTP tile, and V2 warmup are the current follow-up.
-- Base SHA: `03c04da68e72bf26271de4986364a72141a7601f`.
+- Current correctness-audit base SHA:
+  `62ad1e02693f4c857f3b7547cef1860ee54e8053`.
 - Model: `RadixArk/Qwen3.8-Flash-Next-NVFP4` at revision
   `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Model download: `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`.
@@ -133,7 +136,7 @@ will load safely.
 
 ## No-MTP TP4 decode performance and quality audit
 
-The retained performance candidate is
+The retained experimental online-QPN8 performance candidate is
 `.artifacts/qwen38_flash_next_nvfp4_20260826/results/target80-qpn-m1-mtp-off-8192x512.json`.
 It uses one request, TP4/PP1, FP16 activations, MTP off, V2, CUDA graphs, the
 direct QPN-M1 NVFP4 experts, online channel-QPN8 attention/GR projections,
@@ -202,17 +205,15 @@ arms, with zero invalid, replacement-character, NUL, or non-`stop` outputs.
 QPN8 raises mean steady decode from 67.627 to 79.105 tokens/s (+16.97%) and
 median steady decode from 67.640 to 79.369 tokens/s (+17.34%).
 
-Only 8/96 token hashes match, which is expected for a sampled low-precision
-route and is not a rejection criterion. The mean absolute output-length delta
-is 133.5 tokens and the maximum is 4477. One ambiguous-interest sample remains
-correct but grows from 1653 tokens and a repeated-4-gram ratio of 0.199 with
-QPN8 off to 3626 tokens and 0.507 with QPN8 on. Aggregate mean repetition is
-nearly unchanged (0.0394 versus 0.0410), so the evidence identifies a single
-long-output outlier rather than a task-accuracy or aggregate-quality
-regression. Under the performance-default policy, the 16.97% mean decode gain
-and unchanged 96/96 task result keep QPN8 default-on. Operators can set
-`VLLM_SM70_QWEN4_EXP_ONLINE_QPN8=0` for diagnosis while broader long-output
-quality monitoring continues.
+Only 8/96 token hashes match. The mean absolute output-length delta is 133.5
+tokens and the maximum is 4477. One sample remains correct but grows from 1653
+tokens and a repeated-4-gram ratio of 0.199 with QPN8 off to 3626 tokens and
+0.507 with QPN8 on. A short GSM8K score therefore does not establish that
+requantizing the checkpoint's dense BF16 projections preserves general output
+quality. Online QPN8 is default-off and requires the explicit experimental
+opt-in `VLLM_SM70_QWEN4_EXP_ONLINE_QPN8=1`; accepted no-MTP quality and speed
+baselines must report the flag and must not attribute an opt-in QPN8 result to
+the precision-preserving default route.
 
 The fixed A/B execution SHA predates the compressed-QSA zeroing repair merged
 as PR #373 (`ddd8c0b601`). A compressed QSA scheduler block is logically 784
@@ -222,6 +223,48 @@ was reused. Current main derives zeroing from `storage_block_size`, clears
 exactly the selected physical page, and is covered by a real V100 page test
 and a TP4 1K/4K generation smoke. Both A/B arms intentionally use the same old
 binary to isolate QPN8, while this branch includes the QSA repair.
+
+### Upstream correctness sync (2026-08-29)
+
+The correctness audit starts from public `main` at
+`62ad1e02693f4c857f3b7547cef1860ee54e8053` in the isolated branch
+`codex/v100-qwen38-correctness-upstream-20260828-152418`. It adapts the
+request-layout fix from vLLM PR #53896, the Mamba state-grid fixes from vLLM
+PRs #53802 and #54076, and the EAGLE cache-drop fix from vLLM PR #48375. The
+local adaptations also reject the unvalidated Qwen4Exp V1 runner override,
+stop QSA from claiming batch-invariant split-K reductions, and make online
+QPN8 experimental opt-in.
+
+The retained source/unit evidence is:
+
+- 124 focused Qwen4Exp, hybrid-cache, prefix-cache, QSA, and QPN policy tests
+  passed; one separately executed native QPN operator test also passed.
+- Seven V100 packed-GDN tests passed, including an exact FP32-beta state check.
+- Changed-file pre-commit passed every applicable hook, including Ruff,
+  markdownlint, mypy, SPDX, forbidden-import, configuration, and API checks.
+- The downloaded RadixArk safetensors index assigns 296,475 tensors across 206
+  files; comparing every file's actual keys found zero extra or missing keys,
+  so vLLM PR #54230 does not affect this checkpoint and was not duplicated.
+- vLLM PR #51599's async Mamba accepted-count race is already covered by the
+  local MRV2 runner-owned snapshots and request-ID remapping; `InputBatch` is
+  not an asynchronous D2H destination on this path.
+- vLLM PR #53520 fixes prompt-logprob lifetime in the legacy runner. Qwen4Exp
+  now rejects that runner, while MRV2 computes prompt logprobs before invoking
+  its padded model drafter, so the vulnerable ordering is absent.
+- vLLM PR #53122 configures quantized standalone DFlash draft models. Native
+  Qwen4Exp MTP already calls `configure_quant_config` with `Qwen4ExpMTP`, so
+  importing the DFlash guard would not change this checkpoint's route.
+- vLLM issue #53982's narrow circular-table read is avoided in both local
+  runners: QSA circular groups skip the generic slot-mapping kernel and build
+  ring slots from logical positions in their metadata builder.
+
+Two separate risks remain explicit. 1Cat PR #406 owns the independent
+`KVBlockZeroer` asynchronous H2D staging-lifetime fix and should merge before a
+high-concurrency prefix-cache acceptance run. Upstream issue #54199 still has
+no proven fix for a donor-lifecycle overlap in Mamba prefix-cache precopy; a
+bounds-only workaround would trade a crash for silent recurrent-state
+corruption and is therefore not accepted without a reproducer and state
+oracle.
 
 The checkpoint also carries multimodal `mrope_section` and
 `mrope_interleaved` fields in its text config. The initial SM70 route requires
@@ -251,12 +294,12 @@ unrelated upstream platform changes. The
 describes the production HC strategy more precisely: low-M Mix uses split-K
 GEMMs with SiLU in the down epilogue and sigmoid/four-stream reduction in the
 up epilogue, while Combine splits the hidden dimension to expose more CTAs.
-The accepted QPN8 HC route already mirrors those two epilogue fusions and the
-SM70 Combine kernel already partitions the hidden dimension; importing the
+The experimental QPN8 HC route already mirrors those two epilogue fusions and
+the SM70 Combine kernel already partitions the hidden dimension; importing the
 SM100-only CuTeDSL implementation from
 [FlashInfer PR 4266](https://github.com/flashinfer-ai/flashinfer/pull/4266)
 would therefore add no V100 kernel. The exact V100 screen also rejects
-collapsing the accepted two-QPN8-kernel path into one persistent launch. The
+collapsing the two-QPN8-kernel experiment into one persistent launch. The
 [SGLang day-zero HC kernel](https://github.com/sgl-project/sglang/blob/02d38b77db92699e5d4f1a78226bf711e9cc762a/python/sglang/srt/layers/hc_mix_triton.py)
 replaces the FP16 down-GEMV, SiLU, up-GEMV, sigmoid, and four-branch mean with
 one persistent kernel. A V100 form preserves the existing QPN8 weights and
@@ -307,8 +350,8 @@ The currently admitted candidates are deliberately narrow:
   `SM70 Qwen3.8 E512/K10 router top-k path enabled` marker.
 - GR/HC persistent launch: rejected despite bitwise output and clean replay
   state because it is 3.072 microseconds slower per call in the checkpoint-
-  shape cold-cache screen, a projected 0.298-ms/token regression. The accepted
-  split-QPN8 down/reduce/up implementation remains unchanged.
+  shape cold-cache screen, a projected 0.298-ms/token regression. The
+  experimental split-QPN8 down/reduce/up implementation remains unchanged.
 - MRv2 greedy sampling: the active V2 runner always materialized globally
   gathered logits and then launched Gumbel sampling, even for the exact
   temperature-zero single-request decode used here. The new SM70-only route
@@ -319,12 +362,11 @@ The currently admitted candidates are deliberately narrow:
   kernel and 0.044-ms full-logit all-gather before accounting for the local
   argmax cost.
 
-The QSA scorer, router, and V2 greedy projections together expose about
-0.90-1.01 ms/token of gross trace cost, which is enough on paper to cross the
-immediate 80 tokens/s gate after allowing for the pair-gather argmax overhead.
-A single resident-model run will validate them together; the model will not be
-restarted separately for each micro-optimization. The rejected persistent GR
-candidate is not included in that run.
+The QSA scorer, router, and V2 greedy projections expose about 0.90-1.01
+ms/token in the historical online-QPN8 trace. That trace is useful for kernel
+ranking but no longer proves the precision-preserving 80 tokens/s target; the
+next optimization cycle must use a fresh no-QPN8 trace and retain the exact
+checkpoint weights. The rejected persistent GR candidate is not included.
 
 ## Native MTP4 TP4 validation snapshot
 

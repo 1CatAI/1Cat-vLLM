@@ -24,8 +24,8 @@ fastsafetensors >= 0.3.3
 nvidia-cutlass-dsl[cu13]==4.7.0
 quack-kernels>=0.3.3
 
-# Tokenspeed_MLA for faster mla with spec decode
-tokenspeed-mla==0.2.5
+# TokenSpeed MLA is optional. Version 0.2.5 pins apache-tvm-ffi==0.1.13,
+# which cannot coexist with the TileLang version pinned above.
 
 # Humming kernels for quantization gemm
 humming-kernels[cu13]==0.1.2

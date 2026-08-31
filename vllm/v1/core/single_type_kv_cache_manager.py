@@ -1170,6 +1170,13 @@ class MambaManager(SingleTypeKVCacheManager):
 
         block_size = kv_cache_spec.block_size
         max_num_blocks = max_length // block_size
+        if use_eagle and max_num_blocks > 0:
+            # EAGLE/MTP must recompute the final matched page because its
+            # recurrent snapshot may include draft tokens later rejected by
+            # verification. Mamba returns a null-padded list whose only real
+            # state is the rightmost block, so popping the result would remove
+            # the state itself; search one page earlier instead.
+            max_num_blocks -= 1
         # Search from right to left and early stop when a match is found.
         for i in range(max_num_blocks - 1, -1, -1):
             if cached_block := block_pool.get_cached_block(

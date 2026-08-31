@@ -18,6 +18,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -168,9 +169,6 @@ class KVBlockZeroer:
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
-        self._id_cap: int = 0
-        self._ids_pinned: torch.Tensor | None = None
-        self._ids_gpu: torch.Tensor | None = None
 
     def init_meta(
         self,
@@ -291,13 +289,6 @@ class KVBlockZeroer:
             device=self.device,
         )
 
-        self._id_cap = 8192
-        self._ids_pinned = torch.empty(
-            self._id_cap,
-            dtype=torch.int64,
-            pin_memory=self.pin_memory,
-        )
-        self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             seg_block_strides,
@@ -320,20 +311,17 @@ class KVBlockZeroer:
             n_segs,
         ) = self._meta
         n_blocks = len(block_ids)
-        if n_blocks > self._id_cap:
-            self._id_cap = n_blocks * 2
-            self._ids_pinned = torch.empty(
-                self._id_cap,
-                dtype=torch.int64,
-                pin_memory=self.pin_memory,
-            )
-            self._ids_gpu = torch.empty(
-                self._id_cap, dtype=torch.int64, device=self.device
-            )
-        assert self._ids_pinned is not None and self._ids_gpu is not None
-        self._ids_pinned[:n_blocks].numpy()[:] = block_ids
-        idx = self._ids_gpu[:n_blocks]
-        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
+        # Each nonblocking H2D copy needs its own pinned source allocation.
+        # Reusing one host buffer lets a later scheduler step overwrite block
+        # IDs while an earlier DMA is still in flight, which can clear the
+        # wrong KV pages. The pinned allocator keeps this temporary source
+        # alive until its transfer completes.
+        idx = async_tensor_h2d(
+            block_ids,
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
         grid = (n_blocks, n_segs, max_chunks)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,

@@ -1720,6 +1720,7 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
         kv_cache_dtype="fp8_e5m2",
     )
     impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
     captured: dict[str, object] = {}
 
     def grouped_verify(
@@ -1787,6 +1788,83 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     assert captured_block_table.data_ptr() == original_block_table.data_ptr()
     assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
     assert captured["one_pass"] is True
+    assert torch.all(output == 1)
+
+
+def test_flash_v100_dflash2_q16_falls_back_for_q8_native_binary():
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e5m2",
+    )
+    impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 8
+    impl.flash_attn_grouped_verify_paged = lambda *args, **kwargs: pytest.fail(
+        "q16 must not enter a legacy q8 grouped-verifier binary"
+    )
+    impl.flash_attn_decode_paged_xqa = None
+    captured: dict[str, torch.Tensor] = {}
+
+    def decode(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        captured["block_table"] = block_table
+        captured["seq_lens"] = seq_lens
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_decode_paged = decode  # type: ignore[method-assign]
+    persistent_block_table = torch.zeros((16, 2), dtype=torch.int32)
+    persistent_seq_lens = torch.arange(2041, 2057, dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=16,
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=32768,
+        query_start_loc=torch.tensor([0, 16], dtype=torch.int32),
+        seq_lens=torch.tensor([2056], dtype=torch.int32),
+        block_table=torch.tensor([[7, 3]], dtype=torch.int32),
+        smallq_decode_block_table=persistent_block_table,
+        smallq_decode_seq_lens=persistent_seq_lens,
+        smallq_query_start_loc=torch.tensor([0, 16], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=2.0)
+    query = torch.zeros((16, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((2, 3456, 1, 256), dtype=torch.uint8)
+    value_cache = torch.zeros_like(key_cache)
+
+    assert not impl._dflash2_grouped_verify_allowed(
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        num_query_tokens=16,
+    )
+    result = impl._flash_v100_small_query_prefill_as_decode(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        attn_metadata.query_start_loc,
+        attn_metadata.seq_lens,
+    )
+
+    assert result is output
+    assert captured["block_table"].data_ptr() == persistent_block_table.data_ptr()
+    assert captured["seq_lens"].data_ptr() == persistent_seq_lens.data_ptr()
     assert torch.all(output == 1)
 
 

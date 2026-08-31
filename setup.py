@@ -280,9 +280,11 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
 def remove_rpath(path: Path) -> None:
     patchelf = which("patchelf")
     if patchelf is None:
-        logger.warning("patchelf not found; leaving RPATH unchanged for %s", path)
-        return
-    subprocess.run([patchelf, "--remove-rpath", str(path)], check=False)
+        raise RuntimeError(
+            "patchelf is required to build a portable 1Cat SM70 wheel; "
+            f"refusing to leave a build-host RPATH in {path}"
+        )
+    subprocess.run([patchelf, "--remove-rpath", str(path)], check=True)
 
 
 class CMakeExtension(Extension):

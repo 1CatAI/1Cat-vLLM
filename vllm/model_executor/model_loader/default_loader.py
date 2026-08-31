@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_quant_config,
+    get_safetensors_index_weights_by_file,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
     multi_thread_pt_weights_iterator,
@@ -101,7 +102,7 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-    ) -> tuple[str, list[str], bool]:
+    ) -> tuple[str, list[str], bool, dict[str, set[str]] | None]:
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
@@ -206,14 +207,29 @@ class DefaultModelLoader(BaseModelLoader):
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
-        return hf_folder, hf_weights_files, use_safetensors
+        indexed_weights_by_file = (
+            get_safetensors_index_weights_by_file(hf_folder, index_file)
+            if use_safetensors
+            else None
+        )
+        return (
+            hf_folder,
+            hf_weights_files,
+            use_safetensors,
+            indexed_weights_by_file,
+        )
 
     def _get_weights_iterator(
         self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
-        hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+        (
+            hf_folder,
+            hf_weights_files,
+            use_safetensors,
+            indexed_weights_by_file,
+        ) = self._prepare_weights(
             source.model_or_path,
             source.subfolder,
             source.revision,
@@ -231,12 +247,27 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            if self.load_config.load_format == "fastsafetensors":
+            # fastsafetensors/instanttensor iterators cannot filter tensors
+            # inside a reused shard, so indexed-subset checkpoints must take
+            # the standard filtered iterator to honor the index assignments.
+            use_special_format = self.load_config.load_format in (
+                "fastsafetensors",
+                "instanttensor",
+            )
+            if use_special_format and indexed_weights_by_file is not None:
+                logger.warning(
+                    "Checkpoint index assigns a subset of stored tensors; "
+                    "falling back from %s to the filtered safetensors "
+                    "iterator.",
+                    self.load_config.load_format,
+                )
+                use_special_format = False
+            if use_special_format and self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                 )
-            elif self.load_config.load_format == "instanttensor":
+            elif use_special_format and self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
@@ -249,6 +280,7 @@ class DefaultModelLoader(BaseModelLoader):
                         max_workers=extra_config.get(
                             "num_threads", self.DEFAULT_NUM_THREADS
                         ),
+                        indexed_weights_by_file=indexed_weights_by_file,
                     )
                 else:
                     weights_iterator = safetensors_weights_iterator(
@@ -256,6 +288,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        indexed_weights_by_file=indexed_weights_by_file,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),

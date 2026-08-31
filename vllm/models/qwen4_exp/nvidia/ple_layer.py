@@ -457,10 +457,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         max_total_tokens: int,
         max_num_reqs: int,
         prefix: str,
+        layer_name: str,
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self.layer_name = layer_name
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
@@ -598,33 +600,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward_impl(  # type: ignore[override]
+    def compute_ngram_ids(
         self,
-        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
-        output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del hidden_states
+        """Compute PLE indices for the current, unpadded request layout."""
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
+        num_reqs = query_start_loc.numel() - 1
         num_tokens = input_ids.shape[0]
 
+        if num_tokens > self.positions_buffer.numel():
+            raise ValueError(
+                f"PLE received {num_tokens} tokens, but its workspace supports "
+                f"at most {self.positions_buffer.numel()}"
+            )
+        if num_reqs > self.padded_buffer.shape[0]:
+            raise ValueError(
+                f"PLE received {num_reqs} requests, but its workspace supports "
+                f"at most {self.padded_buffer.shape[0]}"
+            )
+        if num_reqs <= 0:
+            raise ValueError("PLE requires at least one request")
+
         if is_offload_process():
-            num_reqs = query_start_loc.numel() - 1
-            if num_tokens > self.positions_buffer.numel():
-                raise ValueError(
-                    f"PLE received {num_tokens} tokens, but its workspace supports "
-                    f"at most {self.positions_buffer.numel()}"
-                )
-            if num_reqs > self.padded_buffer.shape[0]:
-                raise ValueError(
-                    f"PLE received {num_reqs} requests, but its workspace supports "
-                    f"at most {self.padded_buffer.shape[0]}"
-                )
-            if num_reqs <= 0:
-                raise ValueError("PLE CPU offload requires at least one request")
             max_seq_len = max(
                 1,
                 int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
@@ -634,10 +635,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             # padded IDs overwrite the final real token after index clamping.
             num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
         else:
-            # Preserve MRV2's dynamic-shape contract: scheduler limits already
-            # bound these symbolic dimensions, so avoid Python shape tests.
-            num_reqs = ngram_context.shape[0]
-            max_seq_len = self.padded_buffer.shape[1]
+            # This method runs behind a splitting custom op on GPU, so request
+            # dimensions are evaluated for every replay instead of being
+            # specialized into a PIECEWISE graph keyed only by token count.
+            max_seq_len = num_tokens
             num_valid_tokens = num_tokens
 
         positions = self.positions_buffer[:num_tokens]
@@ -652,10 +653,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
                 input_ids[:num_valid_tokens]
             )
-            ngram_context = ngram_context[:num_reqs]
         else:
             packed[request_indices, columns] = input_ids
-        ngram_context = ngram_context.to(device=input_ids.device, dtype=torch.long)
+        ngram_context = ngram_context[:num_reqs].to(
+            device=input_ids.device, dtype=torch.long
+        )
 
         context = torch.cat([ngram_context, packed], dim=-1)
         positions_2d, position_in_segment = self._shift_precompute(
@@ -686,7 +688,37 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
+        return torch.cat(id_blocks, dim=-1)
+
+    def forward_impl(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        output_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del hidden_states
+        input_ids = input_ids.reshape(-1)
+        num_tokens = input_ids.shape[0]
+        if is_offload_process():
+            ngram_ids = self.compute_ngram_ids(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
+        else:
+            ngram_ids = input_ids.new_empty(
+                (num_tokens, self.ngram_heads),
+                dtype=torch.long,
+            )
+            torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids(
+                input_ids,
+                query_start_loc,
+                ngram_context,
+                ngram_ids,
+                self.layer_name,
+            )
         if output_buffer is not None:
             output = output_buffer[:num_tokens, : self.embedding_dim]
             # Cross-process FP8 results travel as raw bytes. Keeping the IPC
@@ -856,7 +888,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 self.ple_dense_layer_id,
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 vllm_config.scheduler_config.max_num_seqs,
-                f"{prefix}.ple_embedding",
+                prefix=f"{prefix}.ple_embedding",
+                layer_name=prefix,
                 quant_config=quant_config,
                 params_dtype=model_config.dtype,
             )
@@ -1533,6 +1566,33 @@ def qwen4_exp_ple_short_conv_fake(
     return
 
 
+def qwen4_exp_compute_ple_ngram_ids(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Compute request-dependent PLE IDs outside PIECEWISE CUDA graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    ngram_ids = layer.ple_embedding.compute_ngram_ids(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
+    output.copy_(ngram_ids)
+
+
+def qwen4_exp_compute_ple_ngram_ids_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_pinned_gather(
     input_ids: torch.Tensor,
     output: torch.Tensor,
@@ -1592,6 +1652,14 @@ def qwen4_exp_ple_fp8_bytes_dequant_fake(
     output: torch.Tensor,
 ) -> None:
     return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_compute_ple_ngram_ids",
+    op_func=qwen4_exp_compute_ple_ngram_ids,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_compute_ple_ngram_ids_fake,
+)
 
 
 direct_register_custom_op(

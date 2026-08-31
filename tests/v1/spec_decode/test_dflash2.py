@@ -18,10 +18,17 @@ import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative import (
+    SpeculativeConfig,
+    _get_dflash2_checkpoint_draft_tokens,
+)
 from vllm.config.vllm import (
+    _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS,
+    _apply_sm70_nvfp4_dflash2_practical_defaults,
     _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path,
     _configure_sm70_glm5_dflash_tp4_push_allreduce,
+    _is_compressed_tensors_nvfp4,
+    _is_sm70_nvfp4_dflash2_practical_contract,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -178,6 +185,113 @@ def test_flash_v100_rejects_glm53_dflash_attention_contract_mismatch(
 
     with pytest.raises(RuntimeError, match=message):
         impl._validate_dflash_attention_contract(layer, metadata)
+
+
+def _sm70_nvfp4_dflash2_practical_contract_args():
+    model_config = SimpleNamespace(
+        architectures=("Qwen3_5ForConditionalGeneration",),
+        quantization="compressed-tensors",
+        dtype=torch.float16,
+        model_arch_config=SimpleNamespace(
+            quantization_config={
+                "format": "mixed-precision",
+                "config_groups": {
+                    "nvfp4": {"format": "nvfp4-pack-quantized"},
+                    "fp8": {"format": "float-quantized"},
+                },
+            }
+        ),
+        hf_text_config=SimpleNamespace(
+            hidden_size=5120,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            head_dim=256,
+        ),
+    )
+    speculative_config = SimpleNamespace(
+        method="dflash",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(dflash_config={"selector_top_k": 16})
+        ),
+    )
+    parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=4,
+        enable_dbo=False,
+        ubatch_size=0,
+    )
+    scheduler_config = SimpleNamespace(
+        max_num_seqs=1,
+        max_num_batched_tokens=4096,
+    )
+    cache_config = SimpleNamespace(cache_dtype="fp8_e5m2")
+    return (
+        model_config,
+        speculative_config,
+        parallel_config,
+        scheduler_config,
+        cache_config,
+    )
+
+
+def test_dflash2_checkpoint_draft_tokens_follow_block_contract():
+    hf_config = SimpleNamespace(dflash_config={"block_size": 8, "selector_top_k": 16})
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) == 7
+
+    hf_config.dflash_config["selector_top_k"] = 0
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
+
+    hf_config.dflash_config = {"block_size": 1, "selector_top_k": 16}
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
+
+
+def test_nvfp4_practical_contract_requires_nvfp4_quantization_group():
+    args = _sm70_nvfp4_dflash2_practical_contract_args()
+    assert _is_compressed_tensors_nvfp4(args[0])
+
+    args[0].model_arch_config.quantization_config = {"format": "float-quantized"}
+    assert not _is_compressed_tensors_nvfp4(args[0])
+    assert not _is_sm70_nvfp4_dflash2_practical_contract(*args)
+
+
+def test_sm70_nvfp4_dflash2_practical_contract_is_narrow():
+    args = _sm70_nvfp4_dflash2_practical_contract_args()
+    assert _is_sm70_nvfp4_dflash2_practical_contract(*args)
+
+    for config_index, attribute, incompatible_value in (
+        (0, "quantization", "fp8"),
+        (1, "num_speculative_tokens", 5),
+        (2, "tensor_parallel_size", 2),
+        (3, "max_num_seqs", 2),
+        (3, "max_num_batched_tokens", 8192),
+        (4, "cache_dtype", "auto"),
+    ):
+        incompatible_args = _sm70_nvfp4_dflash2_practical_contract_args()
+        setattr(incompatible_args[config_index], attribute, incompatible_value)
+        assert not _is_sm70_nvfp4_dflash2_practical_contract(*incompatible_args)
+
+    incompatible_args = _sm70_nvfp4_dflash2_practical_contract_args()
+    incompatible_args[1].draft_model_config.hf_config.dflash_config[
+        "selector_top_k"
+    ] = 8
+    assert not _is_sm70_nvfp4_dflash2_practical_contract(*incompatible_args)
+
+
+def test_sm70_nvfp4_dflash2_practical_defaults_preserve_overrides(monkeypatch):
+    for name in _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    overridden_name = "VLLM_SM70_DFLASH2_QPN8_RERANK"
+    monkeypatch.setenv(overridden_name, "0")
+
+    applied = _apply_sm70_nvfp4_dflash2_practical_defaults()
+
+    assert overridden_name not in applied
+    assert os.environ[overridden_name] == "0"
+    for name, expected_value in _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS.items():
+        if name != overridden_name:
+            assert name in applied
+            assert os.environ[name] == expected_value
 
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):

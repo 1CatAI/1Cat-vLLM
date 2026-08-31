@@ -1,6 +1,6 @@
 # SM70 Qwen3.8-27B-NVFP4 Decode Recovery
 
-Date: 2026-08-23; acceptance updated 2026-08-24
+Date: 2026-08-23; acceptance updated 2026-08-29
 
 ## Decision
 
@@ -709,3 +709,110 @@ Primary retained evidence is:
 - `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_packed_lut/`
 - `.artifacts/qwen38_e4m3_xqa_long_route/results/page_ids_fast_address/`
 - `.artifacts/qwen38_e4m3_xqa_long_route/profiles/e4m3_xqa_final_merged_wave_p1664_l262144_nsys.nsys-rep`
+
+## 2026-08-29 Flash-Next Checkpoint-Native FP16-KV Decode
+
+This result is a separate contract from the 2026-08-24 80 tok/s acceptance
+above. The earlier result used input 1,024/output 256, E4M3 KV, admitted QPN8
+projections, and a sampler sidecar. The current
+`/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4` target keeps FP16 KV and
+checkpoint-native NVFP4 experts, explicitly disables online QPN8 and the
+top1-only LM-head shortcut, and measures input 8,192/output 512. The two
+numbers must not be compared as though they were the same baseline.
+
+### Matched contract and trace decision
+
+The locked endpoint uses four V100-SXM2-32GB GPUs, TP4/PP1, the V2 runner,
+FP16 activation and KV, ModelOpt FP4, Flash-V100, prefix caching with aligned
+Mamba state, chunked prefill, `max_model_len=262144`,
+`max_num_batched_tokens=2048`, `max_num_seqs=1`, and full CUDA Graph.
+The speed request is deterministic greedy decode with input 8,192, output 512,
+five repetitions, prefix-cache reset between repetitions, and `ignore_eos`
+so every sample contributes the same 511 steady intervals. Pure decode
+excludes TTFT and prefill. Natural-EOS official sampling is a separate quality
+gate below.
+
+The matched control is 65.853-65.882 tok/s across five repetitions, with mean
+**65.864 tok/s** and **15.183 ms** TPOT. Its Nsight Systems graph-node trace
+shows dense GEMV/GEMM and compressor service at 7.502 ms/rank/token and 812
+launches/rank/token. The two largest cuBLAS GEMV families alone contribute
+3.656 and 2.254 ms/rank/token. That evidence selected projection and
+HyperConnection work instead of another attention or sampler experiment.
+
+The retained exact-topology route is default-off and contains:
+
+- checkpoint-FP16 SM70 row GEMV for the eight audited Qwen3.8 projection
+  roles; 288 projections are prepared in the base model;
+- a two-launch HyperConnection projection/mix route for the exact
+  `hc_count=4`, hidden 2,560, low-rank 320 shape; 96 modules are marked;
+- exact QSA lexicographic top-k using four score-radix passes followed by
+  increasing-index pivot-tie compaction, replacing the redundant four index
+  radix passes while retaining score-descending/index-ascending semantics;
+- a single GDN input launch that computes QKVZ and b/a and writes the consumed
+  qkv/z/b/a splits directly for the 36 exact non-interleaved TP4 GDN modules.
+
+The final GDN operator screen uses 256 changing real-weight inputs. QKV and z
+are bitwise equal in all 256 cases; b and a are bitwise equal in 253 and 254
+cases, with worst absolute differences 0.00024414 and 0.00003052. The fused
+launch measures 35.840 us versus 39.936 us for two GEMVs plus the split,
+projecting 0.147 ms/token over 36 layers. QSA exactness, dense ties,
+prefill-batch behavior, and CUDA Graph replay were also covered by the three
+focused GPU tests.
+
+### Endpoint result
+
+| Route | Five steady decode samples (tok/s) | Mean TPOT | Mean speed |
+|---|---|---:|---:|
+| checkpoint-native control | 65.872, 65.882, 65.856, 65.855, 65.853 | 15.183 ms | 65.864 tok/s |
+| retained FP16/QSA/GDN/HC route | 80.367, 80.451, 80.463, 81.560, 80.822 | **12.387 ms** | **80.732 tok/s** |
+
+The gain is 14.869 tok/s, or **22.57%**, while TPOT falls **18.41%**. Every
+candidate repetition exceeds 80 tok/s, population standard deviation is
+0.442 tok/s, and all five 512-token sequences are identical. The first EOS is
+at index 8 in every forced-length sample; the repeated chat markers after that
+point are expected `ignore_eos` behavior and are not used as quality
+evidence. Warm 8K prefill median is 2,766.4 ms versus 2,777.6 ms for control,
+so the decode route does not show a material warm-prefill regression.
+
+### Natural-output quality
+
+The quality contract freezes GSM8K indices 8-23 with the official xhigh chat
+template, temperature 1.0, top-p 0.95, top-k 20, seed 20260828, output cap
+4,096, and natural EOS. It uses the same TP4 model route with MTP off.
+Results are **15/16 raw and 15/16 strict**, 16/16 natural stops, 16/16 closed
+thinking sections, zero length caps, and zero structurally invalid outputs.
+The frozen same-prompt MTP4 reference is 15/16 raw and 14/16 strict. The only
+candidate miss is the same reference miss: GSM8K item 12 predicts 12 instead
+of 13, so it is not a new corruption signature.
+
+Repository long-output health checks pass all 16 candidate responses: zero
+replacement characters or bad markers, longest same-token run 3, longest
+same-line run 1, and maximum repeated 50-character window count 6 against the
+failure threshold of 40. The quality run itself reports weighted pure decode
+at 80.935 tok/s and mean request decode at 81.017 tok/s.
+
+The three feature switches are
+`VLLM_SM70_QWEN38_FP16_GEMV`,
+`VLLM_SM70_QWEN38_FUSED_HC_FP16`, and
+`VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16`; all default to false and require
+the exact SM70, TP4, no-speculation, FP16 Qwen3.8 topology. Unsupported shapes,
+prefill, other dtypes, online QPN8, and speculative decoding retain the
+ordinary path.
+
+Rejected work is intentionally absent from the retained source. An opaque
+whole-GDN projection route fell to 73.277 tok/s; one-pass GDN RMSNorm was
+neutral and changed output; CUB and sort-compaction QSA variants were slower;
+the fused shared-expert screen was neutral; and the unaccepted fused W13
+prototype was removed. Online QPN8 reached about 82.27 tok/s but changed token
+trajectories and produced a repetition outlier. The top1-only LM-head shortcut
+also changed long output and remains off.
+
+Primary evidence is:
+
+- `.artifacts/qwen38_exact_decode80/control/control_i8192_o512_r5.json`
+- `.artifacts/qwen38_exact_decode80/trace_control_matched/control_i8192_o32_per_token.md`
+- `.artifacts/qwen38_exact_decode80/trace_gemv_router_ba_index_hc_gate_overlap_matched/trace_gemv_router_ba_index_hc_gate_overlap_matched_i8192_o32_per_token.md`
+- `.artifacts/qwen38_exact_decode80/operator_fp16_gdn_dual.json`
+- `.artifacts/qwen38_exact_decode80/gemv_router_ba_index_hc_bk256_qsa4_gdndual_gate_overlap_full/gemv_router_ba_index_hc_bk256_qsa4_gdndual_gate_overlap_full_i8192_o512_r5.json`
+- `.artifacts/qwen38_exact_decode80/gsm16_exact_decode80_official_xhigh/audit.json`
+- `.artifacts/qwen38_exact_decode80/gsm16_exact_decode80_official_xhigh/health.json`

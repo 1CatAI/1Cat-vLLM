@@ -7,8 +7,15 @@ from typing import Any
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import QSAKeyStateCache
-from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionImpl
+from vllm.models.qwen4_exp.nvidia.qsa import (
+    Qwen4ExpQSAFlashAttentionBackend,
+    Qwen4ExpQSAFlashAttentionImpl,
+)
 from vllm.v1.worker.utils import bind_kv_cache
+
+
+def test_qsa_does_not_claim_batch_invariant_reductions() -> None:
+    assert not Qwen4ExpQSAFlashAttentionBackend.supports_batch_invariance()
 
 
 def test_bind_qsa_key_cache_builds_key_and_mrope_views() -> None:

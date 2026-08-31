@@ -8,7 +8,6 @@
 #include <cuda_runtime.h>
 #include <cub/block/block_scan.cuh>
 #include <cstdint>
-#include <limits>
 
 namespace vllm::qsa {
 
@@ -23,25 +22,19 @@ __device__ __forceinline__ uint32_t ordered_float_bits(float value) {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-__device__ __forceinline__ uint64_t lexicographic_key(float score,
-                                                      uint32_t index) {
-  // Larger keys win. Scores are ordered first; equal scores prefer the lower
-  // block index. The resulting key is unique for every element in a row.
-  return (static_cast<uint64_t>(ordered_float_bits(score)) << 32) |
-         (std::numeric_limits<uint32_t>::max() - index);
-}
-
 template <int TopK>
 struct LexicographicTopKShared {
-  using BlockScan = cub::BlockScan<uint32_t, kLexicographicTopKThreads>;
+  using BlockScan = cub::BlockScan<uint64_t, kLexicographicTopKThreads>;
 
   uint32_t histogram[kLexicographicTopKBins];
   typename BlockScan::TempStorage scan;
-  uint64_t prefix;
-  uint64_t pivot;
+  uint32_t prefix;
+  uint32_t pivot;
   uint32_t remaining;
-  uint32_t output_base;
-  uint32_t chunk_base;
+  uint32_t greater_seen;
+  uint32_t equal_seen;
+  uint32_t chunk_greater_base;
+  uint32_t chunk_equal_base;
 };
 
 template <int TopK>
@@ -75,23 +68,24 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
   }
   __syncthreads();
 
-  // Select the exact k-th (score descending, index ascending) key. Eight
-  // byte-wide radix passes cover the full 64-bit composite key without a
-  // bounded candidate buffer, so dense ties cannot overflow or race.
+  // Select the exact k-th score with four byte-wide radix passes. The prior
+  // implementation also radix-selected the 32-bit index tie-break, requiring
+  // eight full scans. We only need the score pivot: the final increasing-index
+  // compaction can admit exactly `remaining` values from the pivot bucket.
 #pragma unroll
-  for (int pass = 0; pass < 8; ++pass) {
+  for (int pass = 0; pass < 4; ++pass) {
     for (uint32_t bin = tx; bin < kLexicographicTopKBins;
          bin += kLexicographicTopKThreads) {
       shared.histogram[bin] = 0;
     }
     __syncthreads();
 
-    const int shift = 56 - pass * 8;
-    const uint64_t prefix = shared.prefix;
-    const uint64_t prefix_mask = pass == 0 ? 0 : (~uint64_t{0} << (shift + 8));
+    const int shift = 24 - pass * 8;
+    const uint32_t prefix = shared.prefix;
+    const uint32_t prefix_mask = pass == 0 ? 0 : (~uint32_t{0} << (shift + 8));
     for (uint32_t index = tx; index < length;
          index += kLexicographicTopKThreads) {
-      const uint64_t key = lexicographic_key(row_logits[index], index);
+      const uint32_t key = ordered_float_bits(row_logits[index]);
       if ((key & prefix_mask) == prefix) {
         atomicAdd(&shared.histogram[(key >> shift) & 0xffu], 1u);
       }
@@ -105,7 +99,7 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
         if (remaining > count) {
           remaining -= count;
         } else {
-          shared.prefix |= static_cast<uint64_t>(bin) << shift;
+          shared.prefix |= static_cast<uint32_t>(bin) << shift;
           shared.remaining = remaining;
           break;
         }
@@ -116,32 +110,44 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
 
   if (tx == 0) {
     shared.pivot = shared.prefix;
-    shared.output_base = 0;
+    shared.greater_seen = 0;
+    shared.equal_seen = 0;
   }
   __syncthreads();
 
-  // Compact in increasing index order. This is both the deterministic tie
-  // contract and QSA's canonical accumulation order, so no repair or second
-  // sorting pass is needed.
+  // Compact in increasing index order. A packed 64-bit scan tracks counts of
+  // greater and pivot-equal scores at once. Every greater score is selected;
+  // only the first `remaining` pivot ties are admitted, preserving the exact
+  // lower-index tie break and QSA's canonical accumulation order.
   using BlockScan = typename LexicographicTopKShared<TopK>::BlockScan;
   for (uint32_t base = 0; base < length; base += kLexicographicTopKThreads) {
     const uint32_t index = base + tx;
-    const uint32_t selected =
-        index < length &&
-                lexicographic_key(row_logits[index], index) >= shared.pivot
-            ? 1u
-            : 0u;
-    uint32_t offset = 0;
-    uint32_t aggregate = 0;
-    BlockScan(shared.scan).ExclusiveSum(selected, offset, aggregate);
+    const uint32_t key =
+        index < length ? ordered_float_bits(row_logits[index]) : 0;
+    const uint32_t greater = index < length && key > shared.pivot ? 1u : 0u;
+    const uint32_t equal = index < length && key == shared.pivot ? 1u : 0u;
+    const uint64_t counts = (static_cast<uint64_t>(greater) << 32) | equal;
+    uint64_t prefix_counts = 0;
+    uint64_t aggregate_counts = 0;
+    BlockScan(shared.scan)
+        .ExclusiveSum(counts, prefix_counts, aggregate_counts);
     __syncthreads();
     if (tx == 0) {
-      shared.chunk_base = shared.output_base;
-      shared.output_base += aggregate;
+      shared.chunk_greater_base = shared.greater_seen;
+      shared.chunk_equal_base = shared.equal_seen;
+      shared.greater_seen += static_cast<uint32_t>(aggregate_counts >> 32);
+      shared.equal_seen += static_cast<uint32_t>(aggregate_counts);
     }
     __syncthreads();
+    const uint32_t greater_before =
+        shared.chunk_greater_base + static_cast<uint32_t>(prefix_counts >> 32);
+    const uint32_t equal_before =
+        shared.chunk_equal_base + static_cast<uint32_t>(prefix_counts);
+    const bool selected = greater || (equal && equal_before < shared.remaining);
     if (selected) {
-      row_output[shared.chunk_base + offset] = static_cast<int32_t>(index);
+      const uint32_t offset =
+          greater_before + min(equal_before, shared.remaining);
+      row_output[offset] = static_cast<int32_t>(index);
     }
     __syncthreads();
   }

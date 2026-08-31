@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -678,6 +678,31 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
+def get_safetensors_index_weights_by_file(
+    hf_folder: str, index_file: str
+) -> dict[str, set[str]] | None:
+    """Return the exact tensor names assigned to each indexed shard.
+
+    A safetensors shard can contain tensors that are not referenced by the
+    checkpoint index (for example, when a checkpoint reuses part of another
+    model's shard).  The index is authoritative in that case: loading every
+    tensor from an otherwise referenced file can inject stale or incompatible
+    weights into the model.
+    """
+    index_file_name = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_file_name):
+        return None
+
+    with open(index_file_name) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    weights_by_file: dict[str, set[str]] = defaultdict(set)
+    for weight_name, filename in weight_map.items():
+        shard_path = os.path.normpath(os.path.join(hf_folder, filename))
+        weights_by_file[shard_path].add(weight_name)
+    return dict(weights_by_file)
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """
     Exclude files that are not needed for inference.
@@ -901,6 +926,7 @@ def safetensors_weights_iterator(
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
     *,
+    indexed_weights_by_file: Mapping[str, set[str]] | None = None,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -914,6 +940,14 @@ def safetensors_weights_iterator(
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    if indexed_weights_by_file is not None:
+        logger.info_once(
+            "Restricting safetensors loading to %d tensor entries assigned "
+            "by the checkpoint index across %d shards.",
+            sum(len(names) for names in indexed_weights_by_file.values()),
+            len(indexed_weights_by_file),
+        )
 
     fs_type = _get_fs_type(sorted_files)
     is_net_fs = fs_type in ("nfs", "nfs4", "lustre")
@@ -986,10 +1020,20 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
+        indexed_weights = None
+        if indexed_weights_by_file is not None:
+            indexed_weights = indexed_weights_by_file.get(os.path.normpath(st_file))
+            if indexed_weights is None:
+                raise ValueError(
+                    f"Safetensors shard {st_file!r} is not present in the "
+                    "checkpoint index"
+                )
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
+                if indexed_weights is not None and name not in indexed_weights:
+                    continue
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
@@ -1007,6 +1051,8 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
+                    if indexed_weights is not None and name not in indexed_weights:
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     state_dict[name] = f.get_tensor(name)
@@ -1025,6 +1071,8 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
+                    if indexed_weights is not None and name not in indexed_weights:
+                        continue
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)
@@ -1035,11 +1083,22 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     max_workers: int = 4,
+    indexed_weights_by_file: Mapping[str, set[str]] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
 
     def _load_file(st_file: str):
         result = load_file(st_file, device="cpu")
+        if indexed_weights_by_file is not None:
+            indexed_weights = indexed_weights_by_file.get(os.path.normpath(st_file))
+            if indexed_weights is None:
+                raise ValueError(
+                    f"Safetensors shard {st_file!r} is not present in the "
+                    "checkpoint index"
+                )
+            for name in list(result):
+                if name not in indexed_weights:
+                    del result[name]
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

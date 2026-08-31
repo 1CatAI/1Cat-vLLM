@@ -1746,11 +1746,15 @@ class EngineArgs:
         usage_context: UsageContext | None,
         model_config: ModelConfig,
     ) -> None:
-        """Apply the 1Cat SM70 MTP baseline knobs that affect decode speed."""
-        if (
+        """Apply the 1Cat SM70 speculative serving defaults."""
+        mtp_defaults_disabled = (
             envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
             or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
-        ):
+        )
+        explicit_dflash = isinstance(self.speculative_config, dict) and (
+            self.speculative_config.get("method") == "dflash"
+        )
+        if mtp_defaults_disabled and not explicit_dflash:
             return
         if not current_platform.is_cuda_alike():
             return
@@ -1758,7 +1762,7 @@ class EngineArgs:
             cap = current_platform.get_device_capability()
         except Exception:
             return
-        if cap is None or cap.major != 7:
+        if cap is None or (cap.major, cap.minor) != (7, 0):
             return
 
         text_config = model_config.hf_text_config
@@ -1827,9 +1831,25 @@ class EngineArgs:
                 f"speculative_config.draft_sample_method={draft_sample_method}"
             )
 
-        if spec_method != "mtp":
+        if "attention_backend" not in self.speculative_config:
+            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
+            profile_updates.append(
+                "speculative_config.attention_backend=FLASH_ATTN_V100"
+            )
+
+        if spec_method == "dflash":
+            # The quality-audited Qwen3.8 DFlash2 latency profile is B1 with a
+            # 4096-token prefill chunk. Apply it only when the user explicitly
+            # asks for interactivity and has not supplied either capacity knob.
+            if self.performance_mode == "interactivity":
+                if self.max_num_seqs is None:
+                    self.max_num_seqs = 1
+                    profile_updates.append("max_num_seqs=1")
+                if self.max_num_batched_tokens is None:
+                    self.max_num_batched_tokens = 4096
+                    profile_updates.append("max_num_batched_tokens=4096")
             if profile_updates:
-                logger.info(
+                logger.info_once(
                     "Applied SM70 speculative defaults: %s",
                     ", ".join(profile_updates),
                 )
@@ -1838,12 +1858,6 @@ class EngineArgs:
         if "use_local_argmax_reduction" not in self.speculative_config:
             self.speculative_config["use_local_argmax_reduction"] = True
             profile_updates.append("speculative_config.use_local_argmax_reduction=True")
-
-        if "attention_backend" not in self.speculative_config:
-            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
-            profile_updates.append(
-                "speculative_config.attention_backend=FLASH_ATTN_V100"
-            )
 
         if self.max_num_seqs is None:
             self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1

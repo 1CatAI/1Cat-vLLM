@@ -36,6 +36,97 @@ def test_nvfp4_qpn2_is_default_off_with_explicit_on(monkeypatch):
         envs.disable_envs_cache()
 
 
+def _runtime_config(
+    *, method="dflash", draft_tokens=7, selector_top_k=16, tp=4, max_num_seqs=1
+):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            tensor_parallel_size=tp,
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        speculative_config=(
+            None
+            if method is None
+            else SimpleNamespace(
+                method=method,
+                num_speculative_tokens=draft_tokens,
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        dflash_config={"selector_top_k": selector_top_k}
+                    )
+                ),
+            )
+        ),
+    )
+
+
+def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QPN2", raising=False)
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QPN2_PREFILL", raising=False)
+    monkeypatch.setattr(
+        nvfp4_scheme, "get_current_vllm_config", lambda: _runtime_config()
+    )
+    envs.disable_envs_cache()
+    try:
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(method=None),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(draft_tokens=5),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(selector_top_k=0),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(tp=2),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+
+        monkeypatch.setattr(
+            nvfp4_scheme,
+            "get_current_vllm_config",
+            lambda: _runtime_config(max_num_seqs=2),
+        )
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_nvfp4_qpn2_dflash2_explicit_rollback(monkeypatch):
+    monkeypatch.setattr(
+        nvfp4_scheme, "get_current_vllm_config", lambda: _runtime_config()
+    )
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "0")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0")
+    envs.disable_envs_cache()
+    try:
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     layer = SimpleNamespace(
         tp_size=4,
@@ -99,12 +190,6 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
     monkeypatch.setattr(nvfp4_scheme, "_is_qpn2_layer", lambda layer: True)
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_ops", lambda: [])
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_prefill_ops", lambda: [])
-    workspace = torch.empty((1,), dtype=torch.float16)
-    monkeypatch.setattr(
-        nvfp4_scheme.sm70_tm,
-        "get_nvfp4_qpn4_dense_workspace",
-        lambda _weight: workspace,
-    )
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, False), (8, 2))
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, True), (8, 2))
     monkeypatch.setattr(
@@ -138,16 +223,16 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
     monkeypatch.setattr(
         nvfp4_scheme.sm70_ops, "nvfp4_qpn2_dispatch_sm70_out", fake_dispatch
     )
-    prefill_calls = []
+    combined_calls = []
 
-    def fake_prefill(*args):
-        prefill_calls.append(args)
-        args[0].fill_(5)
+    def fake_combined_dispatch(*args):
+        combined_calls.append(args)
+        args[0].fill_(5 if args[1].shape[0] >= args[-1] else 3)
 
     monkeypatch.setattr(
         nvfp4_scheme.sm70_ops,
-        "nvfp4_qpn4_prefill_sm70_out",
-        fake_prefill,
+        "nvfp4_qpn2_prefill_dispatch_sm70_out",
+        fake_combined_dispatch,
     )
 
     try:
@@ -155,17 +240,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert layer.sm70_nvfp4_qpn2
         assert layer.sm70_nvfp4_qpn2_gated_silu
         assert layer.sm70_nvfp4_qpn2_global_scale == 0.5
-        assert layer.sm70_nvfp4_qpn2_prefill_dense_weight_ptr == workspace.data_ptr()
-        assert layer.sm70_nvfp4_qpn2_prefill_codes.shape == (64, 32)
-        assert layer.sm70_nvfp4_qpn2_prefill_scales.shape == (4, 64)
-        assert (
-            layer.sm70_nvfp4_qpn2_prefill_codes.data_ptr()
-            == layer.sm70_nvfp4_qpn2_codes.data_ptr()
-        )
-        assert (
-            layer.sm70_nvfp4_qpn2_prefill_scales.data_ptr()
-            == layer.sm70_nvfp4_qpn2_scales.data_ptr()
-        )
+        assert layer.sm70_nvfp4_qpn2_prefill_enabled
         assert layer.weight.numel() == 0
         assert layer.weight_scale.numel() == 0
 
@@ -176,8 +251,9 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert fused is not None and fused.shape == (8, 32)
         assert torch.equal(raw, torch.full_like(raw, 3))
         assert torch.equal(fused, torch.full_like(fused, 3))
-        assert calls[0][-1] is False
-        assert calls[1][-1] is True
+        assert not calls
+        assert combined_calls[0][-2:] == (False, 9)
+        assert combined_calls[1][-2:] == (True, 9)
 
         large_x = torch.ones((9, 64), dtype=torch.float16)
         large_raw = scheme.apply_weights(layer, large_x)
@@ -185,9 +261,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert torch.equal(large_raw, torch.full_like(large_raw, 5))
         assert large_fused is not None
         assert torch.equal(large_fused, torch.full_like(large_fused, 5))
-        assert prefill_calls[0][-2:] == (True, False)
-        assert prefill_calls[1][-2:] == (True, True)
-        assert prefill_calls[0][3].shape == (64, 32)
-        assert prefill_calls[0][4].shape == (4, 64)
+        assert combined_calls[2][-2:] == (False, 9)
+        assert combined_calls[3][-2:] == (True, 9)
     finally:
         envs.disable_envs_cache()
