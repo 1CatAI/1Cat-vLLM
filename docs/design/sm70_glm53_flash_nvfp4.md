@@ -179,11 +179,16 @@ short quality completion must not be reported as the 70-token/s result.
 
 The DFlash2 draft is `incoai/GLM-5.3-Flash-DFlash2`, with its release revision
 `7d74cdd881ed7e32c31175984a67823127b66cfe` retained as the first comparison
-arm. The hard admission gate is token-weighted mean acceptance length at least
-`4.85`. This matches the real-checkpoint 5-shot GSM8K result reported in
-SGLang PR [#36755](https://github.com/sgl-project/sglang/pull/36755) at both
-parallel one and parallel 32. A short route smoke, first-token hit rate, or a
-four-token sample does not satisfy this gate.
+arm. There are two deliberately separate gates. The deterministic implementation
+gate is token-weighted mean acceptance length at least `4.85`; this matches the
+real-checkpoint 5-shot GSM8K result reported in SGLang PR
+[#36755](https://github.com/sgl-project/sglang/pull/36755). Final qualification
+uses the release card's official GSM8K contract: temperature `1.0`, top-p
+`0.95`, probabilistic draft sampling with standard rejection, Max reasoning,
+128 sequential requests, at most 4096 new tokens, and mean per-request
+completion tokens divided by verification steps at least `5.78`. A short route
+smoke, first-token hit rate, four-token sample, greedy-draft sampling, or merely
+passing the `4.85` localization gate is not final acceptance.
 
 SGLang's accepted result is TP8 without pipeline parallelism. Its GLM target
 captures completed outputs of layers `5,14,24,33,42` immediately before layers
@@ -204,8 +209,30 @@ now been excluded independently:
 - the SM70 mHC suite passes `22` GPU tests (one unrelated case skipped),
   including the layer-zero broadcast path and FP32 staging;
 - target KDA/MoE/mHC batch-eight versus batch-one localization is nearly exact;
+- a release-checkpoint load audit compared all 18 selector, codebook, FC,
+  normalization, convolution, fused QKV, and fused gate-up tensors after the
+  required BF16-to-FP16 conversion; every element matched the safetensors
+  source exactly;
 - experimental small-query metadata, sharded context FC, grouped verification,
   and selector QPN8 are all disabled in the qualification launch.
+
+vLLM PR [#54373](https://github.com/vllm-project/vllm/pull/54373) subsequently
+identified a failure with the same signature on GLM-5.3-Flash: copying the
+target's RoPE layout into the draft silently collapses acceptance to `1.0`,
+while taking the layout from the DFlash checkpoint restores approximately
+`5.5`. The target is NoPE and its indexer RoPE does not describe the draft's
+Q/K projections; the release draft omits the flag and therefore requires its
+trained default, neox `True`. The target-to-draft override has been removed.
+PR [#54374](https://github.com/vllm-project/vllm/pull/54374) is also carried so
+a sliding-window draft cannot inherit a FlashAttention AOT split schedule for
+the wrong geometry. The SM70 backend does not currently use that schedule, but
+the guard keeps backend changes from reintroducing the same corruption.
+
+The immediate rerun is intentionally smaller than either dataset gate: one
+real 64-token TP4/PP2 completion must first show that acceptance is no longer
+in the historical `1.0-1.6` failure regime, with runtime logs proving neox
+`True` and all five `causal=False`, 2048-window draft layers. Only then is a
+long dataset run useful.
 
 The remaining localization surface is now captured by
 `VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR`. A real request records all five target
@@ -228,10 +255,11 @@ risks without changing production defaults:
   reduces the base mHC PP payload from approximately five hidden-state widths
   to four.
 
-The focused GLM PP and DFlash2 suite passes `113` tests. Once all eight V100s
+The focused GLM PP and DFlash2 suite passes `116` tests. Once all eight V100s
 are available, the next run order is: correctness-first eager TP4/PP2 with all
 optional fast paths off and full tensor capture; deferred versus materialized
 PP mHC on the identical prompt; BF16-semantics versus ordinary FP16 draft on
-the identical prompt; then release/latest draft-revision comparison. Only an
-arm that passes exact PP transport, finite tensor checks, target-only output
-quality, and the `4.85` GSM8K gate proceeds to CUDA Graph and speed tuning.
+the identical prompt; then release/latest draft-revision comparison. The
+release checkpoint must pass the `4.85` deterministic localization gate and
+the `5.78` official GSM8K gate before CUDA Graph and speed tuning. The latest
+checkpoint is reported separately until its publisher posts revised numbers.
