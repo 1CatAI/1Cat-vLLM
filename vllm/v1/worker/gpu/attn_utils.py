@@ -182,7 +182,10 @@ def _reshape_kv_cache(
             continue
 
         kv_cache_spec = group.kv_cache_spec
-        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
+        if (
+            isinstance(kv_cache_spec, AttentionSpec)
+            and kv_cache_spec.storage_block_size != kv_cache_spec.block_size
+        ):
             uses_physical_block_table = (
                 group.backend.get_builder_cls().uses_physical_block_table
             )

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -331,7 +331,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 if getattr(builder, "aot_schedule", False) and getattr(
                     builder.kv_cache_spec, "sliding_window", None
                 ):
-                    builder.aot_schedule = False
+                    cast(Any, builder).aot_schedule = False
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
