@@ -379,6 +379,49 @@ def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int)
         )
 
 
+def test_calibrated_nucleus_draft_rejection_sample_is_unbiased():
+    """A sharpened, truncated proposal must still sample the target."""
+    torch.manual_seed(42)
+    device = "cuda"
+    num_speculative_steps = 3
+    target_logits_1d = torch.randn(
+        NARROW_VOCAB_SIZE, device=device, dtype=torch.float32
+    )
+    draft_logits_1d = (
+        torch.randn(NARROW_VOCAB_SIZE, device=device, dtype=torch.float32) / 0.8
+    )
+    sorted_logits, sorted_indices = draft_logits_1d.sort(descending=True)
+    sorted_probs = sorted_logits.softmax(dim=0)
+    remove_sorted = sorted_probs.cumsum(dim=0) - sorted_probs >= 0.8
+    remove = torch.zeros_like(remove_sorted).scatter(0, sorted_indices, remove_sorted)
+    draft_logits_1d.masked_fill_(remove, -float("inf"))
+
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=NARROW_NUM_TRIALS,
+    )
+    inputs["draft_sampled"] = _gumbel_drafted_tokens(
+        inputs,
+        draft_logits_1d,
+        NARROW_NUM_TRIALS,
+        num_speculative_steps,
+    )
+
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=num_speculative_steps
+    )
+
+    target_probs = torch.softmax(target_logits_1d, dim=0)
+    for pos in range(num_speculative_steps + 1):
+        accepted_mask = num_sampled >= pos + 1
+        _assert_distribution_match(
+            sampled[accepted_mask, pos], target_probs, device, label=f"position {pos}"
+        )
+
+
 @pytest.mark.parametrize("num_speculative_steps", [1, 3])
 def test_greedy_rejection_sample(num_speculative_steps: int):
     """

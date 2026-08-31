@@ -415,9 +415,9 @@ def _glm5_dflash_acceptance_config():
     )
 
 
-def test_glm5_dflash_tp4_pp2_auto_selects_accepted_proposal_path(monkeypatch):
+def test_glm5_dflash_tp4_pp2_auto_selects_quality_path(monkeypatch):
     expected = {
-        "VLLM_GLM53_PP_MHC_MATERIALIZE": "1",
+        "VLLM_PP_LAYER_PARTITION": "25,20",
         "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
         "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
     }
@@ -448,7 +448,7 @@ def test_glm5_dflash_acceptance_policy_does_not_change_other_routes(
     monkeypatch, field, value
 ):
     names = (
-        "VLLM_GLM53_PP_MHC_MATERIALIZE",
+        "VLLM_PP_LAYER_PARTITION",
         "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE",
         "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P",
     )
@@ -480,7 +480,7 @@ def test_glm5_dflash_acceptance_policy_does_not_change_other_routes(
 
 def test_glm5_dflash_acceptance_policy_preserves_explicit_overrides(monkeypatch):
     overrides = {
-        "VLLM_GLM53_PP_MHC_MATERIALIZE": "0",
+        "VLLM_PP_LAYER_PARTITION": "24,21",
         "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "1.0",
         "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "1.0",
     }
@@ -492,6 +492,19 @@ def test_glm5_dflash_acceptance_policy_preserves_explicit_overrides(monkeypatch)
     )
 
     assert {name: os.environ[name] for name in overrides} == overrides
+
+
+def test_glm5_dflash_acceptance_policy_preserves_materialize_diagnostic(
+    monkeypatch,
+):
+    name = "VLLM_GLM53_PP_MHC_MATERIALIZE"
+    monkeypatch.setenv(name, "1")
+
+    _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+        *_glm5_dflash_acceptance_config(), is_sm70=True
+    )
+
+    assert os.environ[name] == "1"
 
 
 def test_sm70_dflash2_bf16_emulation_has_explicit_ab_switch(monkeypatch):

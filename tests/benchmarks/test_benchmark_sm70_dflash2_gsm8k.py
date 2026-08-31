@@ -118,8 +118,16 @@ def test_acceptance_gate_uses_its_named_metric(
     }
 
 
-def test_runtime_contract_tracks_glm53_environment(tracked_env, monkeypatch):
-    name = "VLLM_GLM53_PP_MHC_MATERIALIZE"
-    monkeypatch.setenv(name, "1")
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("VLLM_GLM53_PP_MHC_MATERIALIZE", "1"),
+        ("VLLM_PP_LAYER_PARTITION", "25,20"),
+    ],
+)
+def test_runtime_contract_tracks_dflash_environment(
+    tracked_env, monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
 
-    assert tracked_env()[name] == "1"
+    assert tracked_env()[name] == value

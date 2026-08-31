@@ -265,7 +265,7 @@ def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
         return
 
     accepted_defaults = {
-        "VLLM_GLM53_PP_MHC_MATERIALIZE": "1",
+        "VLLM_PP_LAYER_PARTITION": "25,20",
         "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
         "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
     }
@@ -278,10 +278,14 @@ def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
         elif os.environ[name] != value:
             overrides.append(f"{name}={os.environ[name]}")
 
+    materialize = os.environ.get("VLLM_GLM53_PP_MHC_MATERIALIZE")
+    if materialize not in (None, "0"):
+        overrides.append(f"VLLM_GLM53_PP_MHC_MATERIALIZE={materialize}")
+
     if configured:
         logger.info_once(
-            "Auto-selecting the accepted SM70 GLM-5.3 DFlash2 TP4/PP2 "
-            "proposal path: %s.",
+            "Auto-selecting the quality-qualified SM70 GLM-5.3 DFlash2 "
+            "TP4/PP2 path: %s.",
             ", ".join(configured),
         )
     if overrides:
