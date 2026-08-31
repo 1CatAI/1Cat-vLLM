@@ -44463,13 +44463,40 @@ Interpretation:
   `0.157 ms` across all 34 KDA layers per verifier round. The mixed-dtype norm
   suite passes 25 tests; the SM70 KDA suite passes 10, including forced FP16
   overflow and bitwise-stable CUDA Graph replay.
-- Full-model validation remains open. Required next gates are: rerun the short
-  eager TP4/PP2 smoke with no nonfinite target hidden state; compare target-only
-  and DFlash greedy token IDs on the retained six-prompt quality set; then run
-  same-contract graph `input=1024/output=256/repeats=3` and report emitted-token
-  decode throughput plus mean acceptance length. GPU0-3 are currently held by
-  the separately owned `qwen38-flash-next` service, so that service must be
-  explicitly released before the eight-GPU gate; do not terminate it implicitly.
+- Subsequent correctness work removed two independent acceptance blockers.
+  The draft now keeps its trained NeoX RoPE instead of inheriting the NoPE
+  target/indexer layout, and the compressed MRV2 indexer cache is exposed as
+  real 64-token virtual pages rather than indexing 64-token metadata into
+  576-token physical blocks. A post-fix request accepts all seven proposed
+  tokens without an out-of-bounds cache access.
+- A target-only versus DFlash layer trace then found the first material quality
+  drift at sparse-attention layer 3. B1 decode used packed-E4M3 dequantization
+  plus FP16 Tensor Core GEMMs; M2-M8 verification used a numerically different
+  online-softmax kernel. Commit `494770be21` adds a small-batch hybrid route:
+  gather, QK, and softmax remain batched, while each PV uses the exact B1
+  Tensor Core GEMM reduction. The 2048-index-width V100 gate is bitwise equal
+  to eight B1 calls in eager and CUDA Graph replay. Strided-batched PV is
+  rejected because it changes the reduction order.
+- The retained exact-contract eager audit is
+  `.artifacts/glm53_dflash2_route_smoke/`
+  `gsm8k60_hybrid_fp8_gemm_release_eager_tp4pp2_20260901.json`. Across 60
+  sequential GSM8K questions it records `59/60` accuracy, zero invalid answers,
+  token-weighted acceptance length `5.5305228`, and no regression from the
+  independent target-only wrong-question set. The previous DFlash audit was
+  `58/60`; dataset index 16 improves to answer 230, while index 12 remains the
+  same target-only error. Per-position acceptance is
+  `0.9123/0.8148/0.7275/0.6320/0.5548/0.4766/0.4125`.
+- Eager steady decode averages `35.144 tok/s` (P50 `35.328`, P90 `39.655`),
+  versus `36.426 tok/s` before the exact PV correction and `14.597 tok/s`
+  target-only. The 3.5% quality cost retains a 2.41x target-only speedup.
+  Logical KV capacity is 10,406 tokens, 110 fewer than the prior DFlash audit.
+  The focused closure is 26 SM70 sparse/KDA GPU tests plus 170 CPU-side
+  DFlash, PP, and benchmark tests, with 21 environment-dependent skips; ruff,
+  format, compileall, and diff checks pass.
+- The deterministic `4.85` implementation gate is complete. Still open are
+  the release-card 128-request stochastic `5.78` gate and the same-contract
+  CUDA Graph `input=1024/output=256/repeats=3` speed gate. Do not mix the eager
+  quality-lane `35.14 tok/s` result with the final graph decode target.
 
 ## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
 

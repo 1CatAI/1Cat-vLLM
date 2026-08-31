@@ -228,11 +228,44 @@ a sliding-window draft cannot inherit a FlashAttention AOT split schedule for
 the wrong geometry. The SM70 backend does not currently use that schedule, but
 the guard keeps backend changes from reintroducing the same corruption.
 
-The immediate rerun is intentionally smaller than either dataset gate: one
-real 64-token TP4/PP2 completion must first show that acceptance is no longer
-in the historical `1.0-1.6` failure regime, with runtime logs proving neox
-`True` and all five `causal=False`, 2048-window draft layers. Only then is a
-long dataset run useful.
+The staged rerun is now complete. A second runtime failure was caused by the
+compressed MRV2 indexer exposing 64-token logical pages over 576-token physical
+storage while generic metadata treated every logical page as a physical block.
+The SM70 route now presents the compressed storage as real 64-token virtual
+pages. The retained one-request smoke accepts all seven draft tokens and no
+longer indexes outside the cache.
+
+The final quality drift was in target verification rather than the draft. B1
+target decode dequantized packed E4M3 KV and used FP16 Tensor Core GEMMs, while
+M2-M8 verification used a different online-softmax kernel. A layer trace found
+bitwise-equal layer-0 input and KDA state, followed by the first material
+difference at sparse-attention layer 3. The direct attention difference was
+only about `1.5e-5`, but repeated sparse output projections amplified it enough
+to reverse low-margin logits. Commit `494770be21` keeps batched KV gather, QK,
+and softmax for M2-M8, then issues each PV with the same FP16 Tensor Core GEMM
+arithmetic as B1. The 2048-index-width operator gate is bitwise equal to eight
+B1 calls in eager and CUDA Graph replay. A fully strided-batched PV is rejected
+because cuBLAS changes its reduction order once enough probabilities are
+nonzero.
+
+The retained deterministic audit is
+`gsm8k60_hybrid_fp8_gemm_release_eager_tp4pp2_20260901.json`: 60 sequential
+GSM8K requests, temperature zero, greedy draft, Max reasoning, 1024 output
+tokens, TP4/PP2, target E4M3 KV, FP16 target dense/KDA, and every optional
+DFlash fast path disabled. It reports `59/60` accuracy, zero invalid answers,
+token-weighted acceptance length `5.5305`, and per-request mean/P50 acceptance
+`5.7297/5.7617`. All seven per-position acceptance rates decrease normally
+from `0.9123` to `0.4125`. This passes the `4.85` implementation gate and
+matches the independent target-only audit's `59/60`; the only wrong question
+is also wrong under target-only. Compared with the prior DFlash audit, case 16
+improves from an extracted answer of 2 to 230 with no newly regressed question.
+
+The same eager audit averages `35.14 tok/s` steady decode (P50 `35.33`, P90
+`39.65`) versus `36.43 tok/s` before the arithmetic correction and target-only
+`14.60 tok/s`. The exact verifier is therefore about 3.5% slower than the old
+approximate verifier but remains about 2.41x target-only. Logical KV capacity
+is 10,406 tokens versus 10,516 before the larger workspace. These are
+quality-lane eager numbers, not the final CUDA Graph speed result.
 
 The remaining localization surface is now captured by
 `VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR`. A real request records all five target
@@ -255,11 +288,12 @@ risks without changing production defaults:
   reduces the base mHC PP payload from approximately five hidden-state widths
   to four.
 
-The focused GLM PP and DFlash2 suite passes `116` tests. Once all eight V100s
-are available, the next run order is: correctness-first eager TP4/PP2 with all
-optional fast paths off and full tensor capture; deferred versus materialized
-PP mHC on the identical prompt; BF16-semantics versus ordinary FP16 draft on
-the identical prompt; then release/latest draft-revision comparison. The
-release checkpoint must pass the `4.85` deterministic localization gate and
-the `5.78` official GSM8K gate before CUDA Graph and speed tuning. The latest
-checkpoint is reported separately until its publisher posts revised numbers.
+The focused closure passes 26 SM70 sparse/KDA GPU tests and 170 CPU-side
+DFlash, PP, and benchmark tests (21 environment-dependent skips). Case 16
+still reaches the 1024-token cap on one valid greedy branch, but an independent
+target-only replay diverges at the identical token 58 to the same `simple`
+branch. This is target greedy sensitivity rather than a DFlash-only regression.
+The official
+128-request, temperature-1.0, top-p-0.95, probabilistic-draft `5.78` gate
+remains open and must be reported separately. CUDA Graph end-to-end speed and
+the 1024-input/256-output three-repeat gate also remain open.
