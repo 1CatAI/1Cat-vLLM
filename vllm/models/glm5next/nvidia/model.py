@@ -848,6 +848,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             and pp_group.world_size > 1
             and pp_group.is_last_rank
         )
+        self._replicate_dflash_embedding = replicate_dflash_embedding
         if pp_group.is_first_rank or replicate_dflash_embedding:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -855,6 +856,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 prefix=f"{prefix}.embed_tokens",
             )
             if replicate_dflash_embedding:
+                # The final PP stage owns this extra copy solely so DFlash can
+                # borrow it. Mark it unready until load_weights observes the
+                # checkpoint tensor; sharing an initialized-but-unloaded table
+                # produces plausible tensors while collapsing acceptance.
+                self.embed_tokens._dflash_pp_replica_expected = True
+                self.embed_tokens._dflash_pp_replica_loaded = False
                 logger.info_once(
                     "Replicating the TP-sharded target embedding on the final "
                     "pipeline stage for DFlash2 weight sharing."
@@ -1301,6 +1308,18 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if self._replicate_dflash_embedding:
+            if "embed_tokens.weight" not in loaded_params:
+                raise RuntimeError(
+                    "The final pipeline stage created a DFlash target embedding "
+                    "replica, but embed_tokens.weight was not loaded from the "
+                    "target checkpoint."
+                )
+            self.embed_tokens._dflash_pp_replica_loaded = True
+            logger.info_once(
+                "Loaded the replicated DFlash target embedding on the final "
+                "pipeline stage."
+            )
         return loaded_params
 
 

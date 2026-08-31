@@ -322,6 +322,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             target_attn_groups,
         )
 
+        # FlashAttention's AOT split schedule is wrong for a windowed drafter,
+        # and the global window scan can leave it enabled depending on the
+        # target backend. Resolve the drafter's own builders explicitly.
+        for groups in self.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                if getattr(builder, "aot_schedule", False) and getattr(
+                    builder.kv_cache_spec, "sliding_window", None
+                ):
+                    builder.aot_schedule = False
+
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
         ]

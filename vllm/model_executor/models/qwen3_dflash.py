@@ -45,9 +45,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
+from .dflash_sm70 import dflash_layered_rms_norm_sm70
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
-from .dflash_sm70 import dflash_layered_rms_norm_sm70
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -80,38 +80,6 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
-
-
-def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
-    """The target's RoPE layout, from its first attention layer.
-
-    A DFlash head must rotate Q/K the way the target it was distilled against
-    does, and a mismatch is silent — acceptance collapses but nothing errors and
-    the output stays correct. Draft checkpoints do not carry this, so take it
-    from the target. None if the target uses no RoPE.
-    """
-    language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    config = getattr(language_model, "config", None)
-    if config is not None:
-        uses_nope = bool(
-            getattr(config, "mla_nope", False)
-            or getattr(config, "mla_use_nope", False)
-        )
-        has_zero_dim_mla_rope = bool(
-            getattr(config, "mla", False)
-            and getattr(config, "qk_rope_head_dim", None) == 0
-        )
-        if uses_nope or has_zero_dim_mla_rope:
-            return None
-    for module in language_model.modules():
-        style = getattr(module, "is_neox_style", None)
-        if isinstance(style, bool):
-            return style
-    return None
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -255,6 +223,11 @@ class DFlashQwen3Attention(nn.Module):
             is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
+        self.is_neox_style = bool(is_neox_style)
+        logger.info_once(
+            "DFlash draft RoPE layout resolved from its own config: neox=%s.",
+            self.is_neox_style,
+        )
 
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
@@ -278,6 +251,9 @@ class DFlashQwen3Attention(nn.Module):
         # The in-tree FlashAttention-V100 backend uses this marker to select
         # its DFlash-compatible non-causal paged-prefill fallback.
         self.attn.is_dflash_draft_attn = True
+        self.attn.dflash_expected_causal = causal
+        self.attn.dflash_expected_sliding_window = sliding_window
+        self.attn.dflash_rope_is_neox_style = self.is_neox_style
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -343,11 +319,10 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
-        # RoPE layout, copied off the target at load time by the draft loader
-        # (see `dflash_target_rope_is_neox_style`). Checkpoints do not carry it:
-        # a head distilled from an interleaved-RoPE target must rotate the way
-        # that target does, or every drafted Q/K is wrong and acceptance
-        # collapses with no error raised.
+        # RoPE layout. The rotation applies to the draft's own Q/K, so this is
+        # fixed by how the head was distilled, not by the target. A mismatch is
+        # silent and collapses acceptance, so an interleaved-trained checkpoint
+        # must declare it; released DFlash checkpoints otherwise use neox.
         is_neox_style = getattr(config, "is_neox_style", True)
 
         self.self_attn = self.attention_cls(
@@ -533,10 +508,7 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
-        if (
-            envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
-            and get_tensor_model_parallel_rank() == 0
-        ):
+        if envs.VLLM_DFLASH_DEBUG_CONTEXT_KV and get_tensor_model_parallel_rank() == 0:
             row_diffs = (
                 self._k_norm_weights.float()
                 .sub(self._k_norm_weights[0].float())
@@ -678,8 +650,7 @@ class DFlashQwen3Model(nn.Module):
             and current_platform.is_device_capability(70)
         ):
             logger.info_once(
-                "Using the fused per-layer DFlash context K RMSNorm fast path "
-                "on SM70."
+                "Using the fused per-layer DFlash context K RMSNorm fast path on SM70."
             )
             grouped = dflash_layered_rms_norm_sm70(
                 all_k, self._k_norm_weights, self._rms_norm_eps

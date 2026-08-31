@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -41,7 +42,6 @@ from vllm.model_executor.models.qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
     _dflash_layer_causal,
-    dflash_target_rope_is_neox_style,
 )
 from vllm.model_executor.models.qwen3_dflash2 import (
     DFlash2Qwen3ForCausalLM,
@@ -113,6 +113,66 @@ def test_dflash_final_pp_stage_rejects_missing_shared_weight(
 
     with pytest.raises(RuntimeError, match=message):
         dflash_utils._validate_dflash_shared_weights(model, shared_embed, shared_head)
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_dflash_final_pp_stage_validates_replicated_embedding_load(monkeypatch, loaded):
+    monkeypatch.setattr(
+        dflash_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    embed = SimpleNamespace(
+        _dflash_pp_replica_expected=True,
+        _dflash_pp_replica_loaded=loaded,
+    )
+    model = SimpleNamespace(
+        has_own_embed_tokens=False,
+        has_own_lm_head=False,
+        model=SimpleNamespace(embed_tokens=embed),
+    )
+
+    if loaded:
+        dflash_utils._validate_dflash_shared_weights(model, True, True)
+    else:
+        with pytest.raises(RuntimeError, match="embedding replica.*not loaded"):
+            dflash_utils._validate_dflash_shared_weights(model, True, True)
+
+
+def _dflash_attention_contract(causal=False, sliding_window=(2047, 0)):
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.sliding_window = sliding_window
+    layer = SimpleNamespace(
+        is_dflash_draft_attn=True,
+        dflash_expected_causal=False,
+        dflash_expected_sliding_window=2048,
+        dflash_rope_is_neox_style=True,
+        layer_name="draft.layers.0.attn",
+    )
+    metadata = SimpleNamespace(causal=causal)
+    return impl, layer, metadata
+
+
+def test_flash_v100_accepts_glm53_dflash_attention_contract():
+    impl, layer, metadata = _dflash_attention_contract()
+
+    impl._validate_dflash_attention_contract(layer, metadata)
+
+
+@pytest.mark.parametrize(
+    ("causal", "sliding_window", "message"),
+    [
+        (True, (2047, 0), "causality mismatch"),
+        (False, (1023, 0), "sliding-window mismatch"),
+    ],
+)
+def test_flash_v100_rejects_glm53_dflash_attention_contract_mismatch(
+    causal, sliding_window, message
+):
+    impl, layer, metadata = _dflash_attention_contract(causal, sliding_window)
+
+    with pytest.raises(RuntimeError, match=message):
+        impl._validate_dflash_attention_contract(layer, metadata)
 
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
@@ -228,35 +288,55 @@ def test_dflash_sliding_kv_spec_uses_draft_attention_contract_with_mla_target():
     assert spec.sliding_window == 2048
 
 
-def _target_with_rotary_style(config, is_neox_style: bool):
-    language_model = torch.nn.Module()
-    language_model.config = config
-    language_model.rotary_emb = torch.nn.Module()
-    language_model.rotary_emb.is_neox_style = is_neox_style
-    return SimpleNamespace(get_language_model=lambda: language_model)
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        SimpleNamespace(mla_nope=True),
-        SimpleNamespace(mla_use_nope=True),
-        SimpleNamespace(mla=True, qk_rope_head_dim=0),
-    ],
-)
-def test_dflash_target_rope_style_ignores_nope_indexer(config):
-    target = _target_with_rotary_style(config, is_neox_style=False)
-
-    assert dflash_target_rope_is_neox_style(target) is None
-
-
-@pytest.mark.parametrize("is_neox_style", [False, True])
-def test_dflash_target_rope_style_matches_real_target_rope(is_neox_style):
-    target = _target_with_rotary_style(
-        SimpleNamespace(mla=False), is_neox_style=is_neox_style
+@pytest.mark.parametrize("draft_style", [False, True])
+def test_dflash_loader_preserves_draft_rope_layout(monkeypatch, draft_style):
+    draft_hf_config = SimpleNamespace(
+        is_neox_style=draft_style,
+        is_causal=False,
+        num_hidden_layers=1,
+    )
+    draft_model_config = SimpleNamespace(hf_config=draft_hf_config)
+    speculative_config = SimpleNamespace(
+        draft_model_config=draft_model_config,
+        kv_cache_dtype=None,
+        attention_backend="FLASH_ATTN_V100",
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=speculative_config,
+        attention_config=SimpleNamespace(use_non_causal=False, backend=None),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
+    )
+    draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=None),
+        has_own_embed_tokens=True,
+        has_own_lm_head=True,
+        lm_head=None,
+    )
+    target_model = SimpleNamespace(
+        get_language_model=lambda: SimpleNamespace(
+            config=SimpleNamespace(is_neox_style=not draft_style)
+        )
     )
 
-    assert dflash_target_rope_is_neox_style(target) is is_neox_style
+    def fake_replace(value, **updates):
+        values = vars(value).copy()
+        values.update(updates)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(dflash_utils, "replace", fake_replace)
+    monkeypatch.setattr(dflash_utils, "get_model", lambda **_kwargs: draft_model)
+    monkeypatch.setattr(dflash_utils, "get_target_lm_head", lambda *_args: None)
+    monkeypatch.setattr(
+        dflash_utils, "_validate_dflash_shared_weights", lambda *_args: None
+    )
+    monkeypatch.setattr(dflash_model, "dflash_has_any_non_causal", lambda _config: True)
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag", lambda _tag: nullcontext()
+    )
+
+    dflash_utils.load_dflash_model(target_model, vllm_config)
+
+    assert draft_hf_config.is_neox_style is draft_style
 
 
 def _fake_rms_norm(
@@ -1290,6 +1370,41 @@ def test_dflash_attention_builders_receive_the_draft_model_config(monkeypatch):
     assert config.attention_config.use_non_causal is True
 
 
+def test_dflash_disables_aot_schedule_only_for_sliding_draft_groups(monkeypatch):
+    sliding_builder = SimpleNamespace(
+        aot_schedule=True,
+        kv_cache_spec=SimpleNamespace(sliding_window=2048),
+    )
+    full_builder = SimpleNamespace(
+        aot_schedule=True,
+        kv_cache_spec=SimpleNamespace(sliding_window=None),
+    )
+    groups = [
+        [SimpleNamespace(get_metadata_builder=lambda: sliding_builder)],
+        [SimpleNamespace(get_metadata_builder=lambda: full_builder)],
+    ]
+
+    def fake_base_set_attn(self, *_args):
+        self.attn_groups = groups
+
+    monkeypatch.setattr(
+        dflash_speculator.DraftModelSpeculator,
+        "set_attn",
+        fake_base_set_attn,
+    )
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.max_num_tokens = 8
+    speculator.device = torch.device("cpu")
+    speculator.requires_non_causal = True
+    speculator.model = SimpleNamespace()
+    kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+
+    speculator.set_attn(None, kv_cache_config, None, None, [])
+
+    assert sliding_builder.aot_schedule is False
+    assert full_builder.aot_schedule is True
+
+
 @pytest.mark.parametrize(
     ("mask", "expected"),
     [
@@ -1385,6 +1500,7 @@ def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
     paged_prefix = Mock(return_value=output)
     impl = SimpleNamespace(
         _supports_flash_v100_path=lambda: True,
+        _validate_dflash_attention_contract=lambda _layer, _metadata: None,
         _layer_debug_info=lambda _layer: {
             "layer_name": "draft",
             "is_dflash_draft_attn": True,
