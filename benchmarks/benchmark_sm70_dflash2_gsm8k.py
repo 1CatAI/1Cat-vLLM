@@ -95,7 +95,10 @@ def _parse_args() -> argparse.Namespace:
         "--draft-attention-backend",
         choices=("FLASH_ATTN_V100", "TRITON_ATTN"),
         default="FLASH_ATTN_V100",
-        help="Draft-only attention backend; the target remains on FLASH_ATTN_V100.",
+        help=(
+            "Draft-only attention backend. The target backend is selected "
+            "independently so MLA models keep their compatible fast path."
+        ),
     )
     parser.add_argument(
         "--reasoning-effort",
@@ -335,7 +338,6 @@ def main() -> int:
         "pipeline_parallel_size": args.pipeline_parallel_size,
         "dtype": "half",
         "kv_cache_dtype": args.target_kv_cache_dtype,
-        "attention_backend": "FLASH_ATTN_V100",
         "max_model_len": args.max_model_len,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_num_seqs": args.max_num_seqs,
