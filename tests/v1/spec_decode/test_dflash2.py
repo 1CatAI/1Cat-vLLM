@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -18,6 +19,7 @@ import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
 from vllm.config.speculative import SpeculativeConfig
+from vllm.config.vllm import _configure_sm70_glm5_dflash_tp4_push_allreduce
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -224,6 +226,61 @@ def test_sm70_tp4_push_allreduce_is_default_on_with_rollback(monkeypatch):
         assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
     finally:
         envs.disable_envs_cache()
+
+
+def test_glm5_dflash_tp4_push_allreduce_is_quality_safe_by_default(monkeypatch):
+    name = "VLLM_SM70_TP4_PUSH_ALLREDUCE"
+    monkeypatch.delenv(name, raising=False)
+    _configure_sm70_glm5_dflash_tp4_push_allreduce(
+        SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm5_next_text")),
+        SimpleNamespace(method="dflash"),
+        SimpleNamespace(tensor_parallel_size=4),
+        is_sm70=True,
+    )
+
+    envs.disable_envs_cache()
+    try:
+        assert os.environ[name] == "0"
+        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+    finally:
+        envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    ("model_type", "method", "tp_size", "is_sm70"),
+    [
+        ("qwen3", "dflash", 4, True),
+        ("glm5_next_text", "draft_model", 4, True),
+        ("glm5_next_text", "dflash", 2, True),
+        ("glm5_next_text", "dflash", 4, False),
+    ],
+)
+def test_glm5_dflash_tp4_policy_does_not_change_other_routes(
+    monkeypatch, model_type, method, tp_size, is_sm70
+):
+    name = "VLLM_SM70_TP4_PUSH_ALLREDUCE"
+    monkeypatch.delenv(name, raising=False)
+    _configure_sm70_glm5_dflash_tp4_push_allreduce(
+        SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type)),
+        SimpleNamespace(method=method),
+        SimpleNamespace(tensor_parallel_size=tp_size),
+        is_sm70=is_sm70,
+    )
+
+    assert name not in os.environ
+
+
+def test_glm5_dflash_tp4_push_allreduce_preserves_explicit_override(monkeypatch):
+    name = "VLLM_SM70_TP4_PUSH_ALLREDUCE"
+    monkeypatch.setenv(name, "1")
+    _configure_sm70_glm5_dflash_tp4_push_allreduce(
+        SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm5_next_text")),
+        SimpleNamespace(method="dflash"),
+        SimpleNamespace(tensor_parallel_size=4),
+        is_sm70=True,
+    )
+
+    assert os.environ[name] == "1"
 
 
 def test_sm70_dflash2_bf16_emulation_has_explicit_ab_switch(monkeypatch):

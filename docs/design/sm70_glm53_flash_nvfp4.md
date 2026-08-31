@@ -290,10 +290,33 @@ risks without changing production defaults:
 
 The focused closure passes 26 SM70 sparse/KDA GPU tests and 170 CPU-side
 DFlash, PP, and benchmark tests (21 environment-dependent skips). Case 16
-still reaches the 1024-token cap on one valid greedy branch, but an independent
-target-only replay diverges at the identical token 58 to the same `simple`
-branch. This is target greedy sensitivity rather than a DFlash-only regression.
-The official
-128-request, temperature-1.0, top-p-0.95, probabilistic-draft `5.78` gate
-remains open and must be reported separately. CUDA Graph end-to-end speed and
-the 1024-input/256-output three-repeat gate also remain open.
+still reaches the 1024-token cap on one valid eager greedy branch, but an
+independent target-only replay diverges at the identical token 58 to the same
+`simple` branch. This is target greedy sensitivity rather than a DFlash-only
+regression.
+
+The final production graph audit is
+`gsm8k60_hybrid_graph_fast_nopush_tp4pp2_20260901.json`. It enables CUDA Graph,
+grouped verification, fused small-query and grouped metadata, sharded context
+projection, verifier fast paths, and local draft argmax. The only rejected
+optimization is the SM70 TP4 push all-reduce. Across the same 60 deterministic
+GSM8K requests it records `59/60` accuracy, zero invalid answers, and `60/60`
+natural stops. No target-only-correct question regresses; case 16 now stops at
+443 tokens. Token-weighted acceptance length is `5.6119`, with per-request
+mean/P50/P90 `5.6908/5.7854/6.4004`.
+
+Steady decode averages `112.41 tok/s` (P50 `114.16`, P90 `126.32`) and aggregate
+output throughput is `77.50 tok/s`, so the no-MTP TP4/PP2 production graph
+exceeds the 75-token/s goal while preserving the retained target-only quality
+set. The separate 1024-input/256-output three-repeat graph checkpoint averages
+`154.57 tok/s`; its repeated low-entropy prompt accepts all eight target tokens,
+so it is speed evidence rather than an acceptance-quality estimate.
+
+The matched push-all-reduce graph audit is rejected: accuracy falls to `58/60`,
+case 20 first diverges at output token 14 and reaches the 1024-token cap, while
+the same case passes three repeated graph runs with the ordinary custom
+all-reduce. GLM5 DFlash2 TP4 therefore auto-sets
+`VLLM_SM70_TP4_PUSH_ALLREDUCE=0` when the variable is absent. Explicit `1`
+remains diagnostic-only and emits a quality warning; other model routes retain
+the global default. The official 128-request, temperature-1.0, top-p-0.95,
+probabilistic-draft `5.78` gate remains open and must be reported separately.

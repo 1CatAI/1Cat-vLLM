@@ -106,6 +106,45 @@ def _sm70_mtp_cudagraph_capture_sizes(
     return [decode_query_len * size for size in sorted(request_sizes)]
 
 
+def _configure_sm70_glm5_dflash_tp4_push_allreduce(
+    model_config: ModelConfig | None,
+    speculative_config: SpeculativeConfig | None,
+    parallel_config: ParallelConfig,
+    *,
+    is_sm70: bool,
+) -> None:
+    """Keep the rejected GLM5 DFlash TP4 push collective diagnostic-only."""
+    if (
+        not is_sm70
+        or model_config is None
+        or getattr(model_config.hf_text_config, "model_type", None)
+        not in ("glm5_next", "glm5_next_text")
+        or speculative_config is None
+        or speculative_config.method != "dflash"
+        or parallel_config.tensor_parallel_size != 4
+    ):
+        return
+
+    env_name = "VLLM_SM70_TP4_PUSH_ALLREDUCE"
+    if env_name not in os.environ:
+        os.environ[env_name] = "0"
+        logger.info_once(
+            "Auto-setting %s=0 for SM70 GLM5 DFlash2 TP4 because the push "
+            "collective failed the retained output-quality audit. The ordinary "
+            "custom all-reduce remains enabled; other model routes keep their "
+            "existing default.",
+            env_name,
+        )
+    elif os.environ[env_name] != "0":
+        logger.warning_once(
+            "%s=%s explicitly enables a diagnostic-only GLM5 DFlash2 TP4 "
+            "route that failed the retained output-quality audit. Remove the "
+            "override or set it to 0 for the accepted production contract.",
+            env_name,
+            os.environ[env_name],
+        )
+
+
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
 
@@ -1280,6 +1319,16 @@ class VllmConfig:
             )
 
         from vllm.platforms import current_platform
+
+        _configure_sm70_glm5_dflash_tp4_push_allreduce(
+            self.model_config,
+            self.speculative_config,
+            self.parallel_config,
+            is_sm70=(
+                current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+            ),
+        )
 
         if (
             self.model_config is not None

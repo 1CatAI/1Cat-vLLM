@@ -44493,10 +44493,31 @@ Interpretation:
   The focused closure is 26 SM70 sparse/KDA GPU tests plus 170 CPU-side
   DFlash, PP, and benchmark tests, with 21 environment-dependent skips; ruff,
   format, compileall, and diff checks pass.
-- The deterministic `4.85` implementation gate is complete. Still open are
-  the release-card 128-request stochastic `5.78` gate and the same-contract
-  CUDA Graph `input=1024/output=256/repeats=3` speed gate. Do not mix the eager
-  quality-lane `35.14 tok/s` result with the final graph decode target.
+- The final production graph audit is
+  `.artifacts/glm53_dflash2_route_smoke/`
+  `gsm8k60_hybrid_graph_fast_nopush_tp4pp2_20260901.json`. CUDA Graph and all
+  DFlash compute/metadata fast paths are enabled; only TP4 push all-reduce is
+  disabled. It records `59/60` accuracy, zero invalid answers, `60/60` natural
+  stops, and no target-only-correct regression. Token-weighted acceptance is
+  `5.6119455`; request mean/P50/P90 are `5.69076/5.78544/6.40038`.
+- The accepted graph averages `112.406 tok/s` steady decode (P50 `114.162`, P90
+  `126.322`, P99 `133.706`) and `77.496 tok/s` aggregate output throughput.
+  This closes the no-MTP TP4/PP2 75-token/s production goal. The separate
+  1024-input/256-output three-repeat checkpoint averages `154.57 tok/s`, with
+  identical outputs and full eight-token acceptance on its repeated
+  low-entropy prompt.
+- The matched all-fast graph with `VLLM_SM70_TP4_PUSH_ALLREDUCE=1` is rejected:
+  accuracy falls to `58/60`, case 20 becomes a new low-margin divergence and
+  reaches the 1024-token cap. Case 20 passes three repeated graph runs both with
+  all DFlash fast paths plus ordinary custom all-reduce (`108.934 tok/s`) and
+  with the conservative graph route (`103.530 tok/s`). The material quality
+  difference is therefore isolated to push all-reduce, not CUDA Graph or the
+  DFlash compute path.
+- For SM70 GLM5 DFlash2 TP4, config now auto-sets the push variable to `0` when
+  absent. Explicit `1` is preserved only for diagnostics and emits a warning;
+  Qwen and non-DFlash routes retain their existing global default. The
+  deterministic quality and graph speed gates are complete. The release-card
+  128-request stochastic `5.78` gate remains open and is reported separately.
 
 ## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
 
