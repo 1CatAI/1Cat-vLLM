@@ -224,6 +224,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
+    VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE: float = 1.0
+    VLLM_SM70_DFLASH2_PROPOSAL_TOP_P: float = 1.0
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
@@ -2058,6 +2060,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # production-weight TP4 microbenchmark.
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    ),
+    # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
+    # transformed q logits are cached for rejection sampling, so non-default
+    # values preserve the target distribution while changing acceptance.
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": lambda: float(
+        os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE", "1.0")
+    ),
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": lambda: float(
+        os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P", "1.0")
     ),
     # Default-on SGLang-style push collective for the validated FP16 80-KiB
     # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA

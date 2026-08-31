@@ -1433,6 +1433,17 @@ class Glm5NextForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    def get_topk_tokens_and_logits(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.logits_processor.get_topk_tokens_and_logits(
+            self.lm_head,
+            hidden_states,
+            top_k,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1533,6 +1544,13 @@ class Glm5NextForConditionalGeneration(
         config = super().get_encoder_cudagraph_config()
         config.buffer_keys = [k for k in config.buffer_keys if k != "pos_embeds"]
         return config
+
+    def get_topk_tokens_and_logits(
+        self,
+        hidden_states: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.language_model.get_topk_tokens_and_logits(hidden_states, top_k)
 
 
 def get_spec_layer_idx_from_weight_name(

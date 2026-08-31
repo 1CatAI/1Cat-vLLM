@@ -10,6 +10,7 @@ from torch import nn
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.models.glm5next.nvidia.kda import Glm5NextLinearAttention
 from vllm.models.glm5next.nvidia.model import (
+    Glm5NextForCausalLM,
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
     _dflash_aux_hidden_state_key,
@@ -83,6 +84,33 @@ def test_glm53_dflash_mhc_capture_materializes_completed_layer_output():
     )
 
     torch.testing.assert_close(captured, completed_streams.mean(dim=1))
+
+
+def test_glm53_models_expose_compact_topk_logits():
+    hidden_states = torch.randn(3, 8)
+    expected_ids = torch.arange(6).reshape(3, 2)
+    expected_logits = torch.randn(3, 2)
+
+    class FakeLogitsProcessor:
+        def get_topk_tokens_and_logits(self, lm_head, hidden, top_k):
+            assert lm_head is text_model.lm_head
+            assert hidden is hidden_states
+            assert top_k == 2
+            return expected_ids, expected_logits
+
+    text_model = Glm5NextForCausalLM.__new__(Glm5NextForCausalLM)
+    nn.Module.__init__(text_model)
+    text_model.lm_head = nn.Identity()
+    text_model.logits_processor = FakeLogitsProcessor()
+
+    wrapper = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.language_model = text_model
+
+    actual_ids, actual_logits = wrapper.get_topk_tokens_and_logits(hidden_states, 2)
+
+    assert actual_ids is expected_ids
+    assert actual_logits is expected_logits
 
 
 class _FakeGlmBoundaryLayer(nn.Module):

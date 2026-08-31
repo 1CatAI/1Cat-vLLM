@@ -33,6 +33,22 @@ def _requires_sm70_tail(device: torch.device, num_steps: int) -> bool:
 
 
 @triton.jit
+def _proposal_nucleus_logits(
+    scores,
+    mask,
+    top_p: tl.constexpr,
+):
+    sorted_scores = tl.sort(tl.where(mask, scores, float("-inf")), descending=True)
+    row_max = tl.max(sorted_scores, axis=0)
+    unnormalized = tl.exp(sorted_scores - row_max)
+    probs = unnormalized / tl.sum(unnormalized, axis=0)
+    cumulative_before = tl.cumsum(probs, axis=0) - probs
+    keep_sorted = cumulative_before < top_p
+    cutoff = tl.min(tl.where(keep_sorted, sorted_scores, float("inf")), axis=0)
+    return tl.where(mask & (scores >= cutoff), scores, float("-inf"))
+
+
+@triton.jit
 def _selector_walk_kernel(
     scores_ptr,
     candidate_ptr,
@@ -49,6 +65,8 @@ def _selector_walk_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
+    PROPOSAL_TOP_P: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -65,12 +83,15 @@ def _selector_walk_kernel(
             scores_ptr + score_base + offsets,
             mask=mask & valid,
             other=float("-inf"),
-        ).to(tl.float64 if USE_FP64 else tl.float32)
+        ).to(tl.float32)
         if SAMPLE_PROBABILISTIC and temperature != 0.0:
             # Cache the exact temperature-applied proposal scores expected by
             # the shared rejection sampler. This keeps Eagle/MTP's established
             # contract unchanged while matching the DFlash2 selector draw.
-            scores = scores / temperature
+            scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+            if PROPOSAL_TOP_P < 1.0:
+                scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+        scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
         candidate_base = flat * top_k
         candidates = tl.load(
             candidate_ptr + candidate_base + offsets,
@@ -121,6 +142,8 @@ def _selector_walk_tail_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
+    PROPOSAL_TOP_P: tl.constexpr,
 ):
     """Write the final dependent slot separately on SM70.
 
@@ -143,9 +166,12 @@ def _selector_walk_tail_kernel(
         scores_ptr + score_base + offsets,
         mask=mask & valid,
         other=float("-inf"),
-    ).to(tl.float64 if USE_FP64 else tl.float32)
+    ).to(tl.float32)
     if SAMPLE_PROBABILISTIC and temperature != 0.0:
-        scores = scores / temperature
+        scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+        if PROPOSAL_TOP_P < 1.0:
+            scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+    scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
     candidate_base = flat * top_k
     candidates = tl.load(
         candidate_ptr + candidate_base + offsets,
@@ -330,6 +356,23 @@ class DFlash2Speculator(DFlashSpeculator):
         self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
+        self.proposal_temperature_scale = (
+            envs.VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE
+        )
+        self.proposal_top_p = envs.VLLM_SM70_DFLASH2_PROPOSAL_TOP_P
+        if self.proposal_temperature_scale <= 0.0:
+            raise ValueError(
+                "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE must be positive"
+            )
+        if not 0.0 < self.proposal_top_p <= 1.0:
+            raise ValueError("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P must be in (0, 1]")
+        if self.proposal_temperature_scale != 1.0 or self.proposal_top_p != 1.0:
+            logger.info_once(
+                "Using DFlash2 proposal calibration: temperature_scale=%.3f, "
+                "top_p=%.3f. Cached q logits preserve exact rejection sampling.",
+                self.proposal_temperature_scale,
+                self.proposal_top_p,
+            )
         self._anchor_indices = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
@@ -737,6 +780,8 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
             USE_FP64=self.use_fp64_gumbel,
+            PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
+            PROPOSAL_TOP_P=self.proposal_top_p,
             num_warps=1,
         )
         if self._use_sm70_tail:
@@ -755,6 +800,8 @@ class DFlash2Speculator(DFlashSpeculator):
                 BLOCK_K=block_k,
                 SAMPLE_PROBABILISTIC=self.draft_logits is not None,
                 USE_FP64=self.use_fp64_gumbel,
+                PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
+                PROPOSAL_TOP_P=self.proposal_top_p,
                 num_warps=1,
             )
 

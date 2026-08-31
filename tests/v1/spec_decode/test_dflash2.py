@@ -19,7 +19,10 @@ import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
 from vllm.config.speculative import SpeculativeConfig
-from vllm.config.vllm import _configure_sm70_glm5_dflash_tp4_push_allreduce
+from vllm.config.vllm import (
+    _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path,
+    _configure_sm70_glm5_dflash_tp4_push_allreduce,
+)
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -281,6 +284,100 @@ def test_glm5_dflash_tp4_push_allreduce_preserves_explicit_override(monkeypatch)
     )
 
     assert os.environ[name] == "1"
+
+
+def _glm5_dflash_acceptance_config():
+    return (
+        SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm5_next_text"),
+            quantization="modelopt_fp4",
+        ),
+        SimpleNamespace(
+            method="dflash",
+            draft_sample_method="probabilistic",
+            num_speculative_tokens=7,
+        ),
+        SimpleNamespace(tensor_parallel_size=4, pipeline_parallel_size=2),
+    )
+
+
+def test_glm5_dflash_tp4_pp2_auto_selects_accepted_proposal_path(monkeypatch):
+    expected = {
+        "VLLM_GLM53_PP_MHC_MATERIALIZE": "1",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
+    }
+    for name in expected:
+        monkeypatch.delenv(name, raising=False)
+
+    _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+        *_glm5_dflash_acceptance_config(), is_sm70=True
+    )
+
+    assert {name: os.environ.get(name) for name in expected} == expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model_type", "qwen3"),
+        ("quantization", None),
+        ("method", "draft_model"),
+        ("draft_sample_method", "greedy"),
+        ("num_speculative_tokens", 6),
+        ("tensor_parallel_size", 2),
+        ("pipeline_parallel_size", 1),
+        ("is_sm70", False),
+    ],
+)
+def test_glm5_dflash_acceptance_policy_does_not_change_other_routes(
+    monkeypatch, field, value
+):
+    names = (
+        "VLLM_GLM53_PP_MHC_MATERIALIZE",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+
+    model_config, speculative_config, parallel_config = _glm5_dflash_acceptance_config()
+    is_sm70 = True
+    if field == "model_type":
+        model_config.hf_text_config.model_type = value
+    elif field == "is_sm70":
+        is_sm70 = value
+    elif hasattr(model_config, field):
+        setattr(model_config, field, value)
+    elif hasattr(speculative_config, field):
+        setattr(speculative_config, field, value)
+    else:
+        setattr(parallel_config, field, value)
+
+    _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+        model_config,
+        speculative_config,
+        parallel_config,
+        is_sm70=is_sm70,
+    )
+
+    assert not any(name in os.environ for name in names)
+
+
+def test_glm5_dflash_acceptance_policy_preserves_explicit_overrides(monkeypatch):
+    overrides = {
+        "VLLM_GLM53_PP_MHC_MATERIALIZE": "0",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "1.0",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "1.0",
+    }
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+
+    _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+        *_glm5_dflash_acceptance_config(), is_sm70=True
+    )
+
+    assert {name: os.environ[name] for name in overrides} == overrides
 
 
 def test_sm70_dflash2_bf16_emulation_has_explicit_ab_switch(monkeypatch):
@@ -871,6 +968,8 @@ def test_probabilistic_selector_caches_temperature_applied_scores():
         BLOCK_K=top_k,
         SAMPLE_PROBABILISTIC=True,
         USE_FP64=False,
+        PROPOSAL_TEMPERATURE_SCALE=1.0,
+        PROPOSAL_TOP_P=1.0,
         num_warps=1,
     )
 
@@ -879,6 +978,49 @@ def test_probabilistic_selector_caches_temperature_applied_scores():
     torch.testing.assert_close(
         realized[0, 1], scores[0, 1, first_index] / temperature[0]
     )
+
+
+def test_probabilistic_selector_applies_proposal_calibration():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the DFlash2 selector kernel")
+
+    device = torch.device("cuda")
+    top_k = 4
+    scores = torch.tensor(
+        [[[[4.0, 3.0, 2.0, 1.0]] * top_k]],
+        dtype=torch.float32,
+        device=device,
+    )
+    candidates = torch.arange(top_k, dtype=torch.int64, device=device).view(1, 1, top_k)
+    realized = torch.full(
+        (1, 1, top_k), float("nan"), dtype=torch.float32, device=device
+    )
+    tokens = torch.full((1,), -1, dtype=torch.int64, device=device)
+
+    _selector_walk_kernel[(1,)](
+        scores,
+        candidates,
+        torch.tensor([10], dtype=torch.int64, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.float32, device=device),
+        torch.tensor([123], dtype=torch.int64, device=device),
+        tokens,
+        realized,
+        torch.empty(1, dtype=torch.int32, device=device),
+        num_steps=1,
+        walk_steps=1,
+        top_k=top_k,
+        BLOCK_K=top_k,
+        SAMPLE_PROBABILISTIC=True,
+        USE_FP64=False,
+        PROPOSAL_TEMPERATURE_SCALE=0.8,
+        PROPOSAL_TOP_P=0.8,
+        num_warps=1,
+    )
+
+    expected = scores[0, 0, 0] / 0.8
+    torch.testing.assert_close(realized[0, 0, :2], expected[:2])
+    assert torch.isneginf(realized[0, 0, 2:]).all()
 
 
 def test_probabilistic_cache_respects_column_stride():

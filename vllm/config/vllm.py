@@ -145,6 +145,58 @@ def _configure_sm70_glm5_dflash_tp4_push_allreduce(
         )
 
 
+def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+    model_config: ModelConfig | None,
+    speculative_config: SpeculativeConfig | None,
+    parallel_config: ParallelConfig,
+    *,
+    is_sm70: bool,
+) -> None:
+    """Select the retained GLM-5.3 DFlash2 acceptance path on V100."""
+    if (
+        not is_sm70
+        or model_config is None
+        or getattr(model_config.hf_text_config, "model_type", None)
+        not in ("glm5_next", "glm5_next_text")
+        or getattr(model_config, "quantization", None) != "modelopt_fp4"
+        or speculative_config is None
+        or speculative_config.method != "dflash"
+        or speculative_config.draft_sample_method != "probabilistic"
+        or speculative_config.num_speculative_tokens != 7
+        or parallel_config.tensor_parallel_size != 4
+        or parallel_config.pipeline_parallel_size != 2
+    ):
+        return
+
+    accepted_defaults = {
+        "VLLM_GLM53_PP_MHC_MATERIALIZE": "1",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
+    }
+    configured = []
+    overrides = []
+    for name, value in accepted_defaults.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            configured.append(f"{name}={value}")
+        elif os.environ[name] != value:
+            overrides.append(f"{name}={os.environ[name]}")
+
+    if configured:
+        logger.info_once(
+            "Auto-selecting the accepted SM70 GLM-5.3 DFlash2 TP4/PP2 "
+            "proposal path: %s.",
+            ", ".join(configured),
+        )
+    if overrides:
+        logger.warning_once(
+            "Explicit SM70 GLM-5.3 DFlash2 overrides differ from the retained "
+            "TP4/PP2 acceptance contract: %s. Re-run the acceptance and "
+            "output-quality gates before production use.",
+            ", ".join(overrides),
+        )
+
+
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
 
@@ -1321,6 +1373,15 @@ class VllmConfig:
         from vllm.platforms import current_platform
 
         _configure_sm70_glm5_dflash_tp4_push_allreduce(
+            self.model_config,
+            self.speculative_config,
+            self.parallel_config,
+            is_sm70=(
+                current_platform.is_cuda()
+                and current_platform.is_device_capability((7, 0))
+            ),
+        )
+        _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
             self.model_config,
             self.speculative_config,
             self.parallel_config,
