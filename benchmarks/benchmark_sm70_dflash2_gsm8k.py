@@ -30,7 +30,8 @@ from benchmark_sm70_decode import (
 )
 
 INVALID_ANSWER = -9_999_999
-OFFICIAL_SGLANG_MIN_ACCEPTANCE_LENGTH = 4.85
+IMPLEMENTATION_MIN_ACCEPTANCE_LENGTH = 4.85
+RELEASE_CARD_GSM8K_MIN_ACCEPTANCE_LENGTH = 5.78
 _NUMBER_RE = re.compile(r"(?<![\w.])[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?![\w.])")
 _BOXED_RE = re.compile(r"\\boxed\{(?P<value>(?:[^{}]+|\{(?&value)\})*)\}")
 GSM8K_PROMPT_SUFFIX = (
@@ -217,6 +218,19 @@ def _distribution(values: list[float]) -> dict[str, float | int | None]:
         "p99": _percentile(values, 0.99),
         "min": min(values) if values else None,
         "max": max(values) if values else None,
+    }
+
+
+def _acceptance_gate(
+    observed: float | int | None,
+    minimum: float,
+    metric: str,
+) -> dict[str, float | str | bool | None]:
+    return {
+        "metric": metric,
+        "minimum": minimum,
+        "observed": observed,
+        "passed": float(observed) >= minimum if observed is not None else None,
     }
 
 
@@ -508,6 +522,10 @@ def main() -> int:
         if case["spec_decode_metrics"] is not None
         and case["spec_decode_metrics"].get("num_drafts", 0) > 0
     ]
+    per_request_acceptance_summary = _distribution(per_request_acceptance_lengths)
+    per_request_completion_summary = _distribution(
+        per_request_completion_tokens_per_verification_step
+    )
     c_extension = Path(vllm_c.__file__).resolve()
     c_stable_extension = Path(vllm_c_stable.__file__).resolve()
     aggregate_spec_metrics = _diff_spec_metrics(spec_before, spec_after)
@@ -581,7 +599,18 @@ def main() -> int:
                 "parallel_32_questions": 200,
                 "parallel_32_accuracy": 0.91,
                 "parallel_32_token_weighted_acceptance_length": 4.86,
-                "hard_min_acceptance_length": (OFFICIAL_SGLANG_MIN_ACCEPTANCE_LENGTH),
+                "hard_min_acceptance_length": IMPLEMENTATION_MIN_ACCEPTANCE_LENGTH,
+            },
+            "release_card_acceptance_reference": {
+                "workload": "GSM8K, temperature 1.0, top-p 0.95, Max reasoning",
+                "dataset_order": "zlab-shuffle42",
+                "explicit_request_seed": False,
+                "questions": 128,
+                "max_new_tokens": 4096,
+                "metric": (
+                    "mean per-request completion tokens divided by verification steps"
+                ),
+                "minimum": RELEASE_CARD_GSM8K_MIN_ACCEPTANCE_LENGTH,
             },
             "engine_kwargs": engine_kwargs,
         },
@@ -620,20 +649,19 @@ def main() -> int:
             ),
             "request_metrics": _summarize_requests(cases),
             "spec_decode_metrics": aggregate_spec_metrics,
-            "official_acceptance_gate": {
-                "minimum": OFFICIAL_SGLANG_MIN_ACCEPTANCE_LENGTH,
-                "observed": observed_acceptance_length,
-                "passed": (
-                    observed_acceptance_length >= OFFICIAL_SGLANG_MIN_ACCEPTANCE_LENGTH
-                    if observed_acceptance_length is not None
-                    else None
-                ),
-            },
-            "per_request_acceptance_length": _distribution(
-                per_request_acceptance_lengths
+            "implementation_acceptance_gate": _acceptance_gate(
+                observed_acceptance_length,
+                IMPLEMENTATION_MIN_ACCEPTANCE_LENGTH,
+                "token_weighted_mean_acceptance_length",
             ),
-            "per_request_completion_tokens_per_verification_step": _distribution(
-                per_request_completion_tokens_per_verification_step
+            "release_card_acceptance_gate": _acceptance_gate(
+                per_request_completion_summary["mean"],
+                RELEASE_CARD_GSM8K_MIN_ACCEPTANCE_LENGTH,
+                "mean_per_request_completion_tokens_per_verification_step",
+            ),
+            "per_request_acceptance_length": per_request_acceptance_summary,
+            "per_request_completion_tokens_per_verification_step": (
+                per_request_completion_summary
             ),
         },
         "cases": cases,
