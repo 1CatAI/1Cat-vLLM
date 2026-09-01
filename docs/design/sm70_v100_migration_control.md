@@ -44958,6 +44958,15 @@ Interpretation:
   scheduler/model-runner regression files pass another `25` tests. Ruff
   check/format, Python compilation, and `git diff --check` pass on the
   pre-publication worktree.
+- The post-merge source is `3129de7dcd5ccc3463158dca652a5dc4657bd5d5`.
+  Its retained 17-request sequential integration artifact is
+  `gsm8k17_deterministic_graph_pp24_21_slotring_postmerge_3129de7_tp4pp2_20260901.json`:
+  `16/17`, only the target-baseline item 12 miss, 17 natural stops, and item 16
+  at 230 with the same accepted token hash. Token-weighted acceptance length is
+  `5.481799`. Its `73.8594 tok/s` aggregate includes first-request JIT over a
+  small 17-request set and is a merge smoke, not a replacement for the formal
+  128-request `77.8477 tok/s` performance result.
+
 ## 2026-08-31 API failure and in-process cleanup gate
 
 - Draft PR #432 is based on `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`;
