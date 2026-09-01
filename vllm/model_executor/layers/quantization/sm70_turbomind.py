@@ -38,6 +38,11 @@ class SM70TurboMindLinearState:
 _nvfp4_qpn4_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
 
 
+def clear_sm70_turbomind_workspaces() -> None:
+    """Release process-global NVFP4 QPN4 dense workspaces."""
+    _nvfp4_qpn4_dense_workspaces.clear()
+
+
 def quant_backend() -> SM70QuantBackend:
     return envs.get_sm70_quant_backend()
 

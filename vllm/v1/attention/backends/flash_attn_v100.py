@@ -579,6 +579,15 @@ _prefill_dense_splitkv3_workspaces: dict[
 ] = {}
 
 
+def clear_flash_attn_v100_workspaces() -> None:
+    """Release process-global Flash-V100 tensors during engine shutdown."""
+    _sm70_fa2_cu_seqlens_cache.clear()
+    _fp8_prefill_bridge_workspaces.clear()
+    _fp8_prefill_bridge_tail_workspaces.clear()
+    _prefill_gather_dense_workspaces.clear()
+    _prefill_dense_splitkv3_workspaces.clear()
+
+
 def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
     # Newer vLLM resolves an explicit FP16 cache to "float16". The vendored
     # Flash-V100 extension uses "auto" for the same unquantized FP16 layout.

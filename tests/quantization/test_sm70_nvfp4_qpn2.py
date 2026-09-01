@@ -106,9 +106,10 @@ def test_nvfp4_qpn2_dflash2_default_contract(monkeypatch):
         monkeypatch.setattr(
             nvfp4_scheme,
             "get_current_vllm_config",
-            lambda: _runtime_config(max_num_seqs=2),
+            lambda: _runtime_config(max_num_seqs=256),
         )
-        assert not nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_enabled()
+        assert nvfp4_scheme._sm70_nvfp4_qpn2_prefill_enabled()
     finally:
         envs.disable_envs_cache()
 

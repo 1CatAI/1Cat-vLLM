@@ -53,10 +53,16 @@ def _is_sm70_nvfp4_qpn4_runtime_contract() -> bool:
 
 
 def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
-    """Admit the quality-audited single-request DFlash2 TP4 route."""
+    """Admit the quality-audited DFlash2 TP4 operator contract.
+
+    Scheduler capacity is intentionally not part of this model-load decision.
+    The opaque dispatcher selects QPN2 only from the live ``M <= 8`` shape and
+    retains the existing TurboMind path for larger dynamic M.  A server that
+    can hold many requests must therefore load the same small-M layout as a
+    server configured with ``max_num_seqs=1``.
+    """
     vllm_config = get_current_vllm_config()
     parallel_config = vllm_config.parallel_config
-    scheduler_config = vllm_config.scheduler_config
     speculative_config = getattr(vllm_config, "speculative_config", None)
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     draft_hf_config = getattr(draft_model_config, "hf_config", None)
@@ -72,7 +78,6 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
         and selector_top_k == 16
         and parallel_config.pipeline_parallel_size == 1
         and parallel_config.tensor_parallel_size == 4
-        and scheduler_config.max_num_seqs == 1
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
     )

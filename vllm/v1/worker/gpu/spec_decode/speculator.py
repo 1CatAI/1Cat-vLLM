@@ -131,19 +131,17 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.draft_logits: torch.Tensor | None = None
+        self._draft_logits_init: tuple[torch.dtype, float] | None = None
         if self.speculative_config.draft_sample_method == "probabilistic":
             # Temperature-applied logits, cached from the previous decode step.
-            dtype, fill = self.draft_logits_spec(vllm_config)
-            self.draft_logits = torch.full(
-                (
-                    self.max_num_reqs,
-                    self.num_speculative_steps,
-                    self.vocab_size,
-                ),
-                fill,
-                dtype=dtype,
-                device=device,
-            )
+            # Defer this potentially multi-GiB compatibility buffer into the
+            # model-loading memory profile. The compact DFlash2 rejection path
+            # does not read the dense tensor, but structured output and
+            # unsupported sampling contracts still need the exact dense
+            # fallback. Deferring allocation preserves that fallback while
+            # ensuring its capacity-scaled memory is deducted before KV cache
+            # sizing.
+            self._draft_logits_init = self.draft_logits_spec(vllm_config)
 
         self.supports_mm_inputs = False
 
@@ -164,6 +162,7 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        self._allocate_draft_logits()
         self._validate_local_argmax_reduction()
 
         all_attn_layers = set[str](
@@ -185,6 +184,21 @@ class DraftModelSpeculator(BaseSpeculator):
                 "Embeddings from the target model will not be passed to the "
                 "drafter; using text-only draft inputs instead.",
                 type(self.model).__name__,
+            )
+
+    def _allocate_draft_logits(self) -> None:
+        """Allocate the dense compatibility buffer after model weights."""
+        if self._draft_logits_init is not None and self.draft_logits is None:
+            dtype, fill = self._draft_logits_init
+            self.draft_logits = torch.full(
+                (
+                    self.max_num_reqs,
+                    self.num_speculative_steps,
+                    self.vocab_size,
+                ),
+                fill,
+                dtype=dtype,
+                device=self.device,
             )
 
     @property

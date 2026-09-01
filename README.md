@@ -1,16 +1,16 @@
-# 1Cat-vLLM
-
-<!-- markdownlint-disable MD025 -->
+<!-- markdownlint-disable MD041 -->
 
 <p align="center">
   <img src="./assets/1cat-vllm-logo.png" alt="1Cat-vLLM logo" width="420">
 </p>
 
+# 1Cat-vLLM
+
 ## Make Volta Fast Again
 
 ### Modern LLM inference for NVIDIA Tesla V100 / SM70
 
-<p align="center"><strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong></p>
+<strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
 
 > Tesla V100 was released in 2017.
 >
@@ -464,7 +464,7 @@ The corresponding operator gain reaches roughly **21%–26.5%** on representativ
 
 ---
 
-# Layer 2 — Rewrite D=256 Attention as a Volta-Native Pipeline
+## Layer 2 — Rewrite D=256 Attention as a Volta-Native Pipeline
 
 After reducing data-movement overhead, the Attention body itself is restructured.
 
@@ -952,7 +952,7 @@ PY
 
 # ▶ Qwen3.8-27B-NVFP4 + DFlash2
 
-## Recommended TP4 serving command
+## Example TP4 + E5M2 serving command
 
 ```bash
 vllm serve /path/to/Qwen3.8-27B-NVFP4 \
@@ -962,7 +962,6 @@ vllm serve /path/to/Qwen3.8-27B-NVFP4 \
   --attention-backend FLASH_ATTN_V100 \
   --kv-cache-dtype fp8_e5m2 \
   --max-model-len 262144 \
-  --performance-mode interactivity \
   --gpu-memory-utilization 0.80 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
@@ -981,10 +980,20 @@ Representative automatic values:
 official draft block size = 8
 draft width               = 7
 selector Top-K            = 16
-target KV                 = FP8 E5M2
+example target KV         = FP8 E5M2 (optional)
 draft attention backend   = FLASH_ATTN_V100
-performance mode          = interactivity
+verification fast paths   = automatic
 ```
+
+Enabling the SM70 DFlash2 verifier defaults is independent of target
+quantization, KV dtype, TP degree, and service capacity. Each operator then
+capability-checks its local dtype/shape and falls back independently. For
+example, the current one-pass grouped Attention operator is E5M2-specific and
+the compact LM-head rerank is TP4-specific; a different KV dtype or TP degree
+retains DFlash2 and only falls back for those operators. Set `--max-num-seqs`,
+`--max-num-batched-tokens`, or `--performance-mode` for the desired concurrency
+and prefill policy; these options do not opt a compatible single-request
+verifier out of its fast path.
 
 ---
 

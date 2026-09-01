@@ -674,6 +674,27 @@ def bind_kv_cache(
         forward_context[layer_name].bind_kv_cache(kv_cache)
 
 
+def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
+    """Detach KV/state tensors installed on model layers by ``bind_kv_cache``.
+
+    Models can outlive their runner through compilation hooks or external
+    references. Clearing only the runner-owned list would otherwise leave the
+    same allocations reachable from attention and Mamba layers.
+    """
+    for layer in layers:
+        if not hasattr(layer, "kv_cache"):
+            continue
+        kv_cache = layer.kv_cache
+        layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+
+        impl = getattr(layer, "impl", None)
+        if impl is not None:
+            if hasattr(impl, "_k_scale_cache"):
+                impl._k_scale_cache = None
+            if hasattr(impl, "_v_scale_cache"):
+                impl._v_scale_cache = None
+
+
 def is_residual_scattered_for_sp(
     vllm_config: VllmConfig, num_input_tokens: int
 ) -> bool:

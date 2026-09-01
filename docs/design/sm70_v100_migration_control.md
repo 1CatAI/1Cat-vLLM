@@ -44953,7 +44953,95 @@ Interpretation:
   changes to 170. Both remain diagnostic-only.
 - The selector retains the exact calibrated/nucleus-truncated q logits used for
   each draft draw, so standard p/q rejection corrects against the actual
-  proposal. The complete DFlash2 suite, including the multi-position
-  statistical test, passes `131` tests; PP scheduler/model-runner regression
-  files pass another `25` tests. Ruff check/format, Python compilation, and
-  `git diff --check` pass on the pre-publication worktree.
+  proposal. After merging current `onecat/main`, the complete DFlash2 suite,
+  including the multi-position statistical test, passes `143` tests; PP
+  scheduler/model-runner regression files pass another `25` tests. Ruff
+  check/format, Python compilation, and `git diff --check` pass on the
+  pre-publication worktree.
+## 2026-08-31 API failure and in-process cleanup gate
+
+- Draft PR #432 is based on `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`;
+  tested head is `011adcf8ce`. It changes no DFlash2 proposal, selector,
+  rejection, sampling, verifier, or attention arithmetic.
+- Historical assistant tool calls now preserve object arguments, decode valid
+  JSON objects, and coerce malformed, null, or non-object arguments to an empty
+  object. This prevents one truncated tool call from making every later turn
+  in the conversation fail during template rendering.
+- Async multimodal items are stored as deferred factories, so per-prompt limit
+  validation happens before a coroutine exists. Resolution gathers with
+  `return_exceptions=True`, drains sibling fetches, then re-raises the first
+  failure. The two-image-over-limit API probe returned the expected HTTP 400
+  and produced no `coroutine ... was never awaited` warning, including after
+  server shutdown.
+- MRV2 shutdown now drops the target and draft CUDA Graph managers, detaches
+  target and draft layer KV/state views, removes Dynamo bytecode hooks, releases
+  `model_state` and `speculator`, and clears process-global Flash-V100, FP8, and
+  NVFP4 workspace owners. The multimodal language-model lookup cache is weak
+  keyed so it no longer pins models for the interpreter lifetime.
+- Focused Python gates pass `15 passed`; changed-file Ruff formatting/checks
+  and `git diff --check` pass. The broader pre-existing multimodal suite was
+  stopped while downloading its external model/assets and is not counted.
+- Remote TP4 proof used four V100-SXM2-32GB GPUs, Qwen3.8-27B NVFP4 target,
+  FP8 E5M2 target KV, FP16 draft KV, q7 probabilistic DFlash2, 256K maximum
+  context, q4096 chunked prefill, prefix cache plus Mamba align, Flash-V100,
+  and target/draft CUDA Graphs. Startup hit exact grouped verification and the
+  quality-audited fast-path defaults.
+- A malformed historical tool call returned HTTP 200 and continued with `OK`;
+  forced `get_weather` returned valid Guangzhou arguments; JSON Schema returned
+  exactly `{"name":"Alice","age":30}`. A no-thinking coding smoke naturally
+  stopped with valid typed binary-search code and three assertions. Its 176
+  completion tokens took `0.889 s` wall time (about 198 completion token/s),
+  which is a route smoke rather than a new performance baseline.
+- Graceful termination removed the API, engine, and all four worker processes;
+  GPU 0-3 memory fell from `26,259 MiB` to `9 MiB` each. No recent `/dev/shm`
+  file, port listener, or unawaited-coroutine warning remained. Python's
+  multiprocessing resource tracker still reported semaphore/shared-memory
+  cleanup warnings while removing them; this is retained as a logging cleanup
+  follow-up, not evidence of a surviving process, file, or GPU allocation.
+- Retained remote log and request/response artifacts are under
+  `/home/ymzx/1cat-vllm-deploy/logs/`
+  `nvfp4-dflash2-pr432-011adcf8ce-256k.log` and
+  `/home/ymzx/1cat-vllm-deploy/test-artifacts/pr432-011adcf8ce/`.
+
+## 2026-09-01 DFlash2 default-capacity 17 ms root cause
+
+- A matched four-V100 audit held the model, TP4, q8 verifier, E5M2 target KV,
+  256K maximum length, prefix cache, Mamba align, tool/reasoning parsers, and
+  graph policy fixed. Changing only `max_num_seqs` from the source default 256
+  to 1 moved the steady complete round from about `18.52 ms` to
+  `17.39 ms`. Changing graph capture sizes, available KV memory, and dense
+  draft-logit allocation order did not recover the gap.
+- The CUDA Graph descriptor and attention metadata are not capacity-expanded.
+  For the single live q8 request both configurations capture `num_reqs=1` and
+  `num_tokens=8`; Mamba/GDN state indices and Flash-V100 metadata are sliced to
+  that descriptor. Node traces placed the difference inside the target q8
+  graph, while the DFlash graph remained unchanged.
+- The causal branch was a model-load predicate in the NVFP4 scheme. The
+  DFlash2 QPN2 contract required `scheduler_config.max_num_seqs == 1`, so a
+  default-capacity server retained TurboMind for every compatible target MLP
+  even when the live verifier width was eight. The old default-capacity log
+  had no QPN2 route hit; the B1 log reported `QPN2 M<=8 route enabled`.
+- Scheduler capacity is not an operator capability. The opaque C++ dispatcher
+  already selects the byte-preserving QPN2 layout only for live `M<=8` and
+  falls back to the retained TurboMind layout for larger dynamic M. The model-
+  load contract now keeps TP4, q7/top16, PP1, no-DBO, dtype, tensor-shape, and
+  operator-availability checks, but no longer reads `max_num_seqs`. Explicit
+  `VLLM_SM70_NVFP4_QPN2=0` and prefill rollback controls remain authoritative.
+- With source-default capacity 256, the repaired launch now reports both QPN2
+  decode and QPN2-packed prefill routes. After one first-request warmup at
+  `18.972 ms`, two independent steady requests measure `17.391 ms` and
+  `17.394 ms`; the historical B1 controls were `17.396 ms` and `17.386 ms`.
+  This recovers about `1.13 ms` without constraining service concurrency.
+- The probabilistic dense draft-logit fallback is about `1.66 GiB` per rank at
+  capacity 256. It was previously allocated before the model-loading memory
+  profile, allowing KV sizing to overcommit that already-resident memory. Its
+  allocation is now deferred until draft weights load, while the compact
+  rejection cache and dense compatibility semantics are unchanged. This is a
+  startup/OOM accounting fix, not a speed claim: its isolated latency result
+  remained about `18.52 ms` before the QPN2 admission repair.
+- The focused NVFP4 QPN2 module reports `5 passed`. A live forced-tool request
+  returns `get_weather` with `{"city":"北京"}`, and a JSON-schema request
+  returns exactly `{"name":"小明","age":18}`. The change introduces no new
+  arithmetic path: it makes default capacity select the same previously
+  quality-audited, checkpoint-code-preserving B1 operator path. Test services
+  were stopped after collection and all four V100s returned to idle memory.

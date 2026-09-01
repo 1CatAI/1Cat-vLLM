@@ -83,7 +83,11 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
 
-_SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS = {
+_SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # This is the target projection's memory-neutral FP8 layout, not the
+    # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
+    # original layout whenever the exact operator contract is unavailable.
+    "VLLM_SM70_FP8_QPN8": "1",
     "VLLM_SM70_DFLASH2_QPN8_RERANK": "1",
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "1",
     "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "0",
@@ -99,42 +103,24 @@ _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS = {
 }
 
 
-def _is_compressed_tensors_nvfp4(model_config: Any) -> bool:
-    """Recognize NVFP4, including mixed-precision config groups."""
-    if getattr(model_config, "quantization", None) != "compressed-tensors":
-        return False
-    model_arch_config = getattr(model_config, "model_arch_config", None)
-    quant_config = getattr(model_arch_config, "quantization_config", None)
-    if not isinstance(quant_config, Mapping):
-        return False
-
-    formats = [quant_config.get("format", "")]
-    config_groups = quant_config.get("config_groups", {})
-    if isinstance(config_groups, Mapping):
-        formats.extend(
-            group.get("format", "")
-            for group in config_groups.values()
-            if isinstance(group, Mapping)
-        )
-    return any("nvfp4" in str(format_name).lower() for format_name in formats)
-
-
-def _is_sm70_nvfp4_dflash2_practical_contract(
+def _is_sm70_dflash2_verifier_contract(
     model_config: Any,
     speculative_config: Any,
     parallel_config: Any,
-    scheduler_config: Any,
-    cache_config: Any,
 ) -> bool:
-    """Admit only the scored Qwen3.8 NVFP4 DFlash2 TP4/B1 contract."""
+    """Admit the quality-audited Qwen3.8 DFlash2 verifier contract.
+
+    Target quantization, KV dtype, TP degree, and service capacity are
+    intentionally not part of this admission. Each fast operator capability-
+    checks its local weight, cache dtype, and live batch shape, then falls back
+    independently when it cannot handle that contract.
+    """
     if any(
         config is None
         for config in (
             model_config,
             speculative_config,
             parallel_config,
-            scheduler_config,
-            cache_config,
         )
     ):
         return False
@@ -151,7 +137,6 @@ def _is_sm70_nvfp4_dflash2_practical_contract(
     architectures = set(getattr(model_config, "architectures", ()) or ())
     return bool(
         "Qwen3_5ForConditionalGeneration" in architectures
-        and _is_compressed_tensors_nvfp4(model_config)
         and getattr(model_config, "dtype", None) == torch.float16
         and getattr(hf_text_config, "hidden_size", None) == 5120
         and getattr(hf_text_config, "num_attention_heads", None) == 24
@@ -161,19 +146,15 @@ def _is_sm70_nvfp4_dflash2_practical_contract(
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
         and selector_top_k == 16
         and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
-        and getattr(parallel_config, "tensor_parallel_size", 0) == 4
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
-        and getattr(scheduler_config, "max_num_seqs", 0) == 1
-        and getattr(scheduler_config, "max_num_batched_tokens", 0) == 4096
-        and str(getattr(cache_config, "cache_dtype", "")).lower() == "fp8_e5m2"
     )
 
 
-def _apply_sm70_nvfp4_dflash2_practical_defaults() -> tuple[str, ...]:
+def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
-    for env_name, env_value in _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS.items():
+    for env_name, env_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
         if env_name not in os.environ:
             os.environ[env_name] = env_value
             applied.append(env_name)
@@ -1737,17 +1718,15 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
-            if _is_sm70_nvfp4_dflash2_practical_contract(
+            if _is_sm70_dflash2_verifier_contract(
                 self.model_config,
                 self.speculative_config,
                 self.parallel_config,
-                self.scheduler_config,
-                self.cache_config,
             ):
-                for env_name in _apply_sm70_nvfp4_dflash2_practical_defaults():
+                for env_name in _apply_sm70_dflash2_verifier_defaults():
                     logger.info_once(
                         "Auto-setting %s=%s for the quality-audited SM70 "
-                        "Qwen3.8 NVFP4 DFlash2 TP4/B1 practical baseline. "
+                        "Qwen3.8 DFlash2 verification baseline. "
                         "Set it explicitly to override.",
                         env_name,
                         os.environ[env_name],
