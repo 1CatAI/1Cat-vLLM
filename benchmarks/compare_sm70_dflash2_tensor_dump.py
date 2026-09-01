@@ -4,10 +4,10 @@
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Any
 
+import regex as re
 import torch
 import torch.nn.functional as F
 

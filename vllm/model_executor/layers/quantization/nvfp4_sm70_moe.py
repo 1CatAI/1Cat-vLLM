@@ -51,6 +51,7 @@ def arm_dflash_nvfp4_trace() -> None:
     if _DEBUG_DFLASH_NVFP4_TRACE:
         _DFLASH_NVFP4_TRACE_ARMED = True
 
+
 _SUPPORTED_CONTRACTS: Final = {
     # (hidden size, global expert intermediate size, experts, top-k)
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B

@@ -127,9 +127,9 @@ def expand_tail_region(dec_seq):
     pool_lens = (seq_lens // KPOOL).to(torch.int32)
     out = append_tail_to_topk(expanded, seq_lens, pool_lens, KPOOL)
     tail = torch.full((rows, KPOOL - 1), -1, dtype=torch.int32)
-    history_lens = torch.minimum(
-        pool_lens, torch.full_like(pool_lens, SELECT_K)
-    ) * KPOOL
+    history_lens = (
+        torch.minimum(pool_lens, torch.full_like(pool_lens, SELECT_K)) * KPOOL
+    )
     for row in range(rows):
         tail_count = int(seq_lens[row] % KPOOL)
         start = int(history_lens[row])
@@ -186,9 +186,7 @@ def test_append_tail_compacts_valid_prefix(seq_len):
     if seq_len <= TOPK_TOKENS:
         expected = list(range(seq_len))
     else:
-        expected = list(range(TOPK_TOKENS)) + list(
-            range(pool_len * KPOOL, seq_len)
-        )
+        expected = list(range(TOPK_TOKENS)) + list(range(pool_len * KPOOL, seq_len))
     assert out[:expected_valid].tolist() == expected
     assert torch.all(out[expected_valid:] == -1)
 
@@ -197,9 +195,7 @@ def test_append_tail_compacts_valid_prefix(seq_len):
 def test_fused_expand_tail_matches_compact_reference():
     seq_lens = torch.tensor([0, 2, 10, 16, 18, 21], dtype=torch.int32, device="cuda")
     pool_lens = seq_lens // KPOOL
-    valid_pool_counts = torch.minimum(
-        pool_lens, torch.full_like(pool_lens, SELECT_K)
-    )
+    valid_pool_counts = torch.minimum(pool_lens, torch.full_like(pool_lens, SELECT_K))
     pool_ids = torch.full(
         (seq_lens.shape[0], SELECT_K), -1, dtype=torch.int64, device="cuda"
     )
@@ -209,8 +205,6 @@ def test_fused_expand_tail_matches_compact_reference():
     )
     valid = pool_ids >= 0
     expanded = expand_pools_to_tokens(pool_ids, valid, TOPK_TOKENS, KPOOL)
-    expected = append_tail_to_topk(
-        expanded, seq_lens, pool_lens, KPOOL
-    )
+    expected = append_tail_to_topk(expanded, seq_lens, pool_lens, KPOOL)
     actual = expand_pools_and_append_tail(pool_ids, seq_lens, KPOOL)
     torch.testing.assert_close(actual, expected)

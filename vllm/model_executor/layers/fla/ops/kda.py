@@ -43,10 +43,7 @@ _use_sm70_kda_prefill_schedule = (
     os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE", "1") == "1" and _is_sm70()
 )
 _recompute_w_u_configs = (
-    [
-        triton.Config({}, num_warps=num_warps, num_stages=2)
-        for num_warps in [4, 8]
-    ]
+    [triton.Config({}, num_warps=num_warps, num_stages=2) for num_warps in [4, 8]]
     if _use_sm70_kda_prefill_schedule
     else [
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -56,9 +53,7 @@ _recompute_w_u_configs = (
 )
 _chunk_gla_o_configs = (
     [
-        triton.Config(
-            {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=2
-        )
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=2)
         for BK in [32, 64]
         for BV in [64, 128]
         for num_warps in [4, 8]

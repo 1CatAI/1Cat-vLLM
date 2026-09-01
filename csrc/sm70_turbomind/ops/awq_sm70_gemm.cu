@@ -1951,13 +1951,10 @@ __global__ void sm70_glm_mhc_pre_norm_kernel(
 }
 
 template <int kRows, int kCols, int kWarps, int kBatch>
-__global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
-                                         const half* f_input,
-                                         const half* g_input,
-                                         const half* f_weight,
-                                         const half* g_weight,
-                                         int64_t f_input_stride,
-                                         int64_t g_input_stride) {
+__global__ void sm70_glm_kda_fg_b_kernel(
+    half* f_out, half* g_out, const half* f_input, const half* g_input,
+    const half* f_weight, const half* g_weight, int64_t f_input_stride,
+    int64_t g_input_stride) {
   constexpr int kThreads = kWarps * WARP_SIZE;
   constexpr int kCols2 = kCols / 2;
   static_assert(kThreads <= 1024);
@@ -1992,8 +1989,7 @@ __global__ void sm70_glm_kda_fg_b_kernel(half* f_out, half* g_out,
   for (int batch = 0; batch < kBatch; ++batch) {
     dot[batch] = warp_reduce_sum(dot[batch]);
     if (lane == 0) {
-      (is_g ? g_out : f_out)[batch * kRows + row] =
-          __float2half_rn(dot[batch]);
+      (is_g ? g_out : f_out)[batch * kRows + row] = __float2half_rn(dot[batch]);
     }
   }
 }
@@ -2114,7 +2110,7 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
             reinterpret_cast<const half*>(g_input.data_ptr<at::Half>()),  \
             reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>()), \
             reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>()), \
-            f_input.stride(0), g_input.stride(0));                         \
+            f_input.stride(0), g_input.stride(0));                        \
     break
   switch (num_tokens) {
     VLLM_LAUNCH_GLM_KDA_FG_B(1);

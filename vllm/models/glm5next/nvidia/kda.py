@@ -116,10 +116,7 @@ def _debug_dflash_kda_trace(
         or get_tensor_model_parallel_rank() != 0
         or prefix not in _DFLASH_KDA_TRACE_ARMED_PREFIXES
         or tensor.shape[token_dim] > 8
-        or (
-            state_indices is not None
-            and not bool((state_indices >= 0).any().item())
-        )
+        or (state_indices is not None and not bool((state_indices >= 0).any().item()))
     ):
         return
     key = (prefix, stage)
@@ -507,9 +504,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 device=hidden_states.device,
             )
             sm70_ops.sm70_glm53_fp16_gemv_out(projected, hidden_states, weight)
-            logger.info_once(
-                "SM70 GLM KDA exact FP16 B1-B8 projection path enabled."
-            )
+            logger.info_once("SM70 GLM KDA exact FP16 B1-B8 projection path enabled.")
         else:
             projected = self.in_proj_qkvbfg_a(hidden_states)[0]
         _debug_dflash_kda_finite(self.prefix, "projection", projected)
@@ -604,9 +599,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             )
         else:
             core_attn_out = self.o_norm(core_attn_out, g2)
-        _debug_dflash_kda_trace(
-            self.prefix, "normalized", core_attn_out, 1, None, None
-        )
+        _debug_dflash_kda_trace(self.prefix, "normalized", core_attn_out, 1, None, None)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
         projected_output = self.o_proj(core_attn_out)[0]
         _debug_dflash_kda_trace(
@@ -664,14 +657,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             conv_state = conv_state.transpose(-1, -2)
 
         trace_state_indices = (
-            spec_state_indices_tensor
-            if use_spec
-            else non_spec_state_indices_tensor
+            spec_state_indices_tensor if use_spec else non_spec_state_indices_tensor
         )
-        if (
-            trace_state_indices is not None
-            and attn_metadata_narrowed.num_prefills == 0
-        ):
+        if trace_state_indices is not None and attn_metadata_narrowed.num_prefills == 0:
             _debug_dflash_kda_trace(
                 self.prefix,
                 "projection",
@@ -941,9 +929,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=debug_cu_seqlens,
                         ssm_state_indices=debug_state_indices,
-                        out=debug_spec_sequence_reference[
-                            :, token_idx : token_idx + 1
-                        ],
+                        out=debug_spec_sequence_reference[:, token_idx : token_idx + 1],
                         sigmoid_beta=True,
                         a_log=self.A_log,
                         g_bias=self.dt_bias,

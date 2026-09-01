@@ -140,18 +140,18 @@ def _dflash_layered_rmsnorm_sm70_kernel(
     for item in tl.static_range(0, VEC_SIZE):
         offsets = lanes * VEC_SIZE + item
         mask = offsets < n_cols
-        value = tl.load(
-            input_ptr + row_base + offsets, mask=mask, other=0.0
-        ).to(tl.float32)
+        value = tl.load(input_ptr + row_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
         variance += value * value
     variance = tl.sum(variance, axis=0) / n_cols
     inv_rms = tl.rsqrt(variance + eps)
     for item in tl.static_range(0, VEC_SIZE):
         offsets = lanes * VEC_SIZE + item
         mask = offsets < n_cols
-        value = tl.load(
-            input_ptr + row_base + offsets, mask=mask, other=0.0
-        ).to(tl.float32)
+        value = tl.load(input_ptr + row_base + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
         layer_weight = tl.load(
             weight_ptr + weight_base + offsets, mask=mask, other=0.0
         ).to(tl.float32)

@@ -890,16 +890,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._remove_request(req_id)
 
             prompt_len = len(new_req_data.prompt_token_ids)
+            sampling_params = new_req_data.sampling_params
+            max_tokens = 1 if sampling_params is None else sampling_params.max_tokens
+            assert max_tokens is not None
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                max_tokens=(
-                    new_req_data.sampling_params.max_tokens
-                    if new_req_data.sampling_params is not None
-                    else 1
-                ),
+                max_tokens=max_tokens,
             )
             req_index = self.req_states.req_id_to_index[req_id]
 

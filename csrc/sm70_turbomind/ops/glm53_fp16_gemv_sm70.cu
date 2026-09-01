@@ -116,12 +116,12 @@ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
               "sm70_glm53_fp16_gemv_out: requires SM70");
   const cudaStream_t stream =
       at::cuda::getCurrentCUDAStream(input.device().index());
-#define VLLM_LAUNCH_GLM53_GEMV(batch)                                      \
-  case batch:                                                              \
-    glm53_fp16_gemv_sm70_kernel<batch><<<kGlm53N, kThreads, 0, stream>>>(  \
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),              \
-        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),         \
-        reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));       \
+#define VLLM_LAUNCH_GLM53_GEMV(batch)                                     \
+  case batch:                                                             \
+    glm53_fp16_gemv_sm70_kernel<batch><<<kGlm53N, kThreads, 0, stream>>>( \
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),             \
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),        \
+        reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));      \
     break
   switch (input.size(0)) {
     VLLM_LAUNCH_GLM53_GEMV(1);
