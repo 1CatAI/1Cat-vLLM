@@ -417,7 +417,7 @@ def _glm5_dflash_acceptance_config():
 
 def test_glm5_dflash_tp4_pp2_auto_selects_quality_path(monkeypatch):
     expected = {
-        "VLLM_PP_LAYER_PARTITION": "25,20",
+        "VLLM_PP_LAYER_PARTITION": "24,21",
         "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
         "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
     }

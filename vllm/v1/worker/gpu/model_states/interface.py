@@ -68,8 +68,8 @@ class ModelState(ABC):
 
     def postprocess_state(
         self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         return None

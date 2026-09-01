@@ -318,5 +318,66 @@ the same case passes three repeated graph runs with the ordinary custom
 all-reduce. GLM5 DFlash2 TP4 therefore auto-sets
 `VLLM_SM70_TP4_PUSH_ALLREDUCE=0` when the variable is absent. Explicit `1`
 remains diagnostic-only and emits a quality warning; other model routes retain
-the global default. The official 128-request, temperature-1.0, top-p-0.95,
-probabilistic-draft `5.78` gate remains open and must be reported separately.
+the global default. At that checkpoint, the official 128-request,
+temperature-1.0, top-p-0.95, probabilistic-draft `5.78` gate remained open and
+had to be reported separately.
+
+### Official release-card closure (2026-09-01)
+
+The no-MTP eight-V100 TP4/PP2 graph route initially passed isolated prompts but
+failed after request-slot reuse. The scheduler could start request B while a
+sampled-token receive for request A was still in flight; the old packet then
+updated B's recycled request state. Dataset item 16 exposed this by changing
+the correct `230` answer to `170` only after 16 earlier requests.
+
+The retained implementation ports the V2 PP cadence and deferred slot-ring
+design from upstream vLLM PR #42187. Non-last stages consume sampled output one
+full pipeline traversal later on a dedicated sibling NCCL communicator and
+side stream. Per-slot generation counters reject stale receives after request
+free/reuse. For DFlash2, each collective packet contains the eight target
+sample slots and seven next-step draft tokens; Triton scatters valid rows and
+skips `-1` sentinels without a host gather. Query-position updates stay
+optimistic, while sampled and rejected-token updates are applied when the ring
+entry matures. The neutral Mamba update also accepts the V2 runner's native
+`int32` slot indices through a GPU kernel rather than an indexing fallback.
+
+The deterministic sequential artifact is
+`gsm8k60_deterministic_graph_pp24_21_slotring_dtypefix_tp4pp2_20260901.json`.
+It uses q7 greedy drafts, E4M3 target KV, CUDA Graph, and the retained `24,21`
+partition. Accuracy is `59/60`, zero answers are invalid, and all 60 requests
+stop naturally. The only miss is the target baseline's dataset item 12; all 60
+extracted answers match the target-only deterministic audit. Item 16 again
+returns `230` and its token hash matches the accepted isolated DFlash baseline.
+Token-weighted acceptance length is `5.615924`; aggregate output throughput is
+`75.9518 tok/s`, and mean steady decode is `109.1768 tok/s`.
+
+The official retained artifact is
+`gsm8k128_official_graph_slotring_auto_tp4pp2_20260901.json`. It uses the
+release-card `zlab-shuffle42` order, no explicit request seed, temperature
+`1.0`, top-p `0.95`, probabilistic q7 draft sampling, Max reasoning, a
+4096-token output limit, E4M3 target KV, and CUDA Graph. The runtime itself
+auto-selects `VLLM_PP_LAYER_PARTITION=24,21`, proposal temperature scale `0.8`,
+and proposal top-p `0.95`; the benchmark clears manual overrides before engine
+construction. All 128 requests stop naturally, zero answers are invalid, and
+accuracy is `122/128` (`95.3125%`). Mean completion tokens per verification
+step are `5.810047`, passing the `5.78` release-card gate. Token-weighted
+acceptance length is `5.585307`, passing the `4.85` implementation gate, with
+per-position acceptance decreasing normally from `0.921979` to `0.424104`.
+
+The same official run records `77.8477 tok/s` aggregate output throughput and
+`112.1869 tok/s` mean steady decode (P50 `111.3379`, P90 `127.3029`, P99
+`138.8517`). Mean TPOT is `9.0196 ms`, mean prefill is `89.4121 tok/s`, and FP8
+KV capacity is 18,064 logical tokens at 0.90 GPU-memory utilization.
+
+The faster/larger-KV `25,20` alternative is not the quality default. Its
+deterministic audit had one 1024-token length stop, and its official accuracy
+was `120/128`, below the retained `24,21` result. Explicit mHC boundary
+materialization remains rejected: the matched deterministic run fell to
+`58/60`, with item 16 ending at `170`. The diagnostic switch remains available
+with a quality warning.
+
+For the exact SM70 GLM5 NVFP4, probabilistic q7 DFlash2, TP4/PP2 contract, the
+runtime selects the retained `24,21` partition and proposal settings only when
+they are absent. Explicit overrides remain untouched and emit a warning. Other
+architectures, quantization formats, draft methods, q lengths, GPU
+capabilities, and TP/PP topologies do not receive these defaults.

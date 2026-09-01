@@ -44908,3 +44908,52 @@ Interpretation:
   `_prepare_dflash_inputs_kernel`, and `layer_norm_fwd_kernel`). The request
   remained correct and completed in `0.547 s`; this is a bounded cold-start
   warmup follow-up, not a steady-state or publication correctness blocker.
+
+## 2026-09-01 GLM-5.3 Flash DFlash2 official closure
+
+- Draft PR #404 closes the GLM-5.3-Flash-NVFP4 DFlash2 release-card gate on
+  eight V100-SXM2-32GB GPUs with TP4/PP2, no MTP, E4M3 target KV, q7
+  probabilistic draft sampling, and CUDA Graph. Integration base is
+  `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`; the owned branch is
+  `codex/v100-glm53-dflash2-20260828-125830`.
+- The remaining quality failure was cross-request PP state contamination, not
+  target or draft arithmetic. Immediate PP sampled-token receives could arrive
+  after a request slot was freed and then update the next request assigned to
+  that slot. Dataset item 16 reproduced the failure only after 16 preceding
+  requests: the isolated answer was 230, while the contaminated sequence
+  produced 170 and reached the output limit.
+- The fix adapts upstream vLLM #42187 to DFlash2: scheduler PP cadence, a
+  PP-depth deferred receive ring, a sibling NCCL communicator and side stream,
+  per-slot generation counters, optimistic position updates, and deferred
+  sampled/rejected updates. Sampled q8 and next-step draft q7 tokens share one
+  15-int64 packet. Triton scatters valid draft/state rows, skips negative
+  sentinels, and handles native int32 request indices without an indexing
+  fallback.
+- The retained deterministic artifact is
+  `gsm8k60_deterministic_graph_pp24_21_slotring_dtypefix_tp4pp2_20260901.json`.
+  It records `59/60` accuracy, zero invalid answers, 60 natural stops, and exact
+  extracted-answer parity with the target-only deterministic audit. Item 16 is
+  again 230. Token-weighted acceptance length is `5.615924`, aggregate output
+  throughput is `75.9518 tok/s`, and mean steady decode is `109.1768 tok/s`.
+- The official retained artifact is
+  `gsm8k128_official_graph_slotring_auto_tp4pp2_20260901.json`. The benchmark
+  clears manual acceptance-path overrides; the runtime then logs the production
+  defaults `PP=24,21`, proposal temperature scale `0.8`, and proposal top-p
+  `0.95`. The `zlab-shuffle42`, temperature-1.0/top-p-0.95, Max-reasoning run
+  records `122/128` accuracy, zero invalid answers, and 128 natural stops.
+- Mean completion tokens per verification step are `5.810047` (release gate
+  `5.78`) and token-weighted acceptance length is `5.585307` (implementation
+  gate `4.85`). Aggregate output throughput is `77.8477 tok/s`; mean steady
+  decode is `112.1869 tok/s` with P50/P90/P99
+  `111.3379/127.3029/138.8517`. Mean TPOT is `9.0196 ms`, mean prefill is
+  `89.4121 tok/s`, and FP8 KV capacity is 18,064 logical tokens.
+- The `25,20` alternative is not retained: its deterministic run has a length
+  stop and its official accuracy is `120/128`, below the accepted route.
+  Explicit mHC boundary materialization remains rejected at `58/60`; item 16
+  changes to 170. Both remain diagnostic-only.
+- The selector retains the exact calibrated/nucleus-truncated q logits used for
+  each draft draw, so standard p/q rejection corrects against the actual
+  proposal. The complete DFlash2 suite, including the multi-position
+  statistical test, passes `131` tests; PP scheduler/model-runner regression
+  files pass another `25` tests. Ruff check/format, Python compilation, and
+  `git diff --check` pass on the pre-publication worktree.
