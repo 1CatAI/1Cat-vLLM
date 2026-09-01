@@ -556,7 +556,8 @@ def _warmup_fp4_dense_layers(
         device = state.weight.device
         k_dim = int(state.weight.shape[0])
         gated_silu = bool(state.gated_silu)
-        n_dim = int(state.output_size) // (2 if gated_silu else 1)
+        kernel_output_size = int(state.padded_output_size or state.output_size)
+        n_dim = kernel_output_size // (2 if gated_silu else 1)
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
