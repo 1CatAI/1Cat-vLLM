@@ -47,10 +47,6 @@ class DFlashSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
-        self.hidden_states = torch.zeros(
-            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
-        )
-
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
@@ -59,6 +55,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         # remaining target-verification positions.
         self.draft_block = get_dflash_model_draft_tokens(self.speculative_config)
         self.num_query_per_req = 1 + self.draft_block
+        draft_query_capacity = self.max_num_reqs * self.num_query_per_req
+        if draft_query_capacity > self.max_num_tokens:
+            # The target's token budget and the draft query batch are disjoint.
+            # Size only the draft-owned buffers up for K+1 queries per request
+            # instead of reducing the target prefill budget.
+            self.max_num_tokens = draft_query_capacity
+            self.input_buffers = InputBuffers(
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                device=device,
+            )
+        self.hidden_states = torch.zeros(
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+        )
         if self.draft_block < self.num_speculative_steps:
             logger.info(
                 "%s emits %d model drafts and lookup may fill %d additional "
@@ -122,6 +132,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
         self._context_only_prefill_logged = False
+        self._query_slot_mappings: torch.Tensor | None = None
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -172,6 +183,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._generate_draft,
             self.input_buffers,
             self.block_tables,
+            self._require_query_slot_mappings(),
             self.attn_groups,
             self.kv_cache_config,
             self.max_model_len,
@@ -207,6 +219,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         assert self.draft_kv_cache_group_ids, "No draft attention groups found."
         self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+        self._query_slot_mappings = torch.full(
+            (len(kv_cache_config.kv_cache_groups), self.max_num_tokens),
+            PAD_SLOT_ID,
+            dtype=torch.int64,
+            device=self.device,
+        )
 
         # Per-group context slot buffers for the precompute (one row per group).
         self._context_slot_mappings = torch.zeros(
@@ -240,6 +258,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+
+    def _require_query_slot_mappings(self) -> torch.Tensor:
+        if self._query_slot_mappings is None:
+            raise RuntimeError("DFlash attention buffers have not been initialized.")
+        return self._query_slot_mappings
 
     @torch.inference_mode()
     def _run_model(
@@ -434,15 +457,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
             return self.draft_tokens[:num_reqs]
 
-        # The query slot mapping is written into the shared BlockTables slot_mappings.
-        # That buffer's address is what the captured CUDA graph reads from at replay.
+        # Query slots live in a DFlash-owned persistent buffer. Its address is
+        # captured by the draft CUDA graph and its capacity is independent of
+        # the target runner's max_num_batched_tokens allocation.
         assert self.draft_kv_cache_group_id >= 0
+        query_slot_mappings = self._require_query_slot_mappings()
         # Support multiple draft KV cache groups by preparing inputs once for each
         with record_function_or_nullcontext("dflash: prepare inputs"):
             for i, gid in enumerate(self.draft_kv_cache_group_ids):
                 prepare_dflash_inputs(
                     self.input_buffers,
-                    self.block_tables.slot_mappings[gid],
+                    query_slot_mappings[gid],
                     self.context_positions,
                     self._context_slot_mappings[i],
                     self.sample_indices,
@@ -543,7 +568,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 causal=self._group_causal,
             )
             draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                query_slot_mappings[:, :num_tokens_padded],
                 self.kv_cache_config,
             )
 

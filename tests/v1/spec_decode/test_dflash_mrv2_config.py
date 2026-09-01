@@ -15,9 +15,13 @@ from vllm.config.speculative import (
 )
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
+    _prepare_dflash_inputs_to_capture,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -49,8 +53,69 @@ def test_dflash_and_ddtree_routes_are_disjoint() -> None:
 
 def test_mrv2_dflash_reserves_all_mask_slots() -> None:
     assert _config("dflash").max_num_new_slots_for_drafting == 7
+    assert _config("dflash").max_num_new_target_slots_for_drafting == 0
     # The retained DDTree path keeps its existing flat-parallel slot contract.
     assert _config("dflash_ddtree").max_num_new_slots_for_drafting == 6
+    assert _config("dflash_ddtree").max_num_new_target_slots_for_drafting == 6
+
+
+def test_mrv2_dflash_preserves_target_scheduler_token_budget() -> None:
+    scheduler = SimpleNamespace(
+        max_num_seqs=512,
+        max_num_batched_tokens=4096,
+        max_num_scheduled_tokens=None,
+    )
+    config = SimpleNamespace(
+        speculative_config=_config("dflash"),
+        scheduler_config=scheduler,
+    )
+
+    VllmConfig._set_max_num_scheduled_tokens(config)
+
+    assert scheduler.max_num_scheduled_tokens == 4096
+
+
+def test_dflash_capture_uses_its_own_persistent_slot_mapping(monkeypatch) -> None:
+    query_slots = torch.zeros((2, 16), dtype=torch.int64)
+    seen: dict[str, torch.Tensor] = {}
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.dflash.cudagraph.InputBatch.make_dummy",
+        lambda *args: SimpleNamespace(),
+    )
+
+    def fake_build_slot_mappings(slot_mappings, kv_cache_config):
+        del kv_cache_config
+        seen["slot_mappings"] = slot_mappings
+        return {"draft.layer": slot_mappings[1]}
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.dflash.cudagraph.build_slot_mappings_by_layer",
+        fake_build_slot_mappings,
+    )
+    block_tables = SimpleNamespace(
+        cp_size=1,
+        get_dummy_block_tables=lambda num_reqs: (),
+    )
+
+    state = _prepare_dflash_inputs_to_capture(
+        num_reqs=1,
+        num_tokens=8,
+        input_buffers=object(),
+        block_tables=block_tables,
+        query_slot_mappings=query_slots,
+        attn_groups=[],
+        kv_cache_config=object(),
+        max_model_len=1024,
+        skip_attn=True,
+        causal=False,
+    )
+
+    captured = seen["slot_mappings"]
+    assert captured.shape == (2, 8)
+    assert captured.data_ptr() == query_slots.data_ptr()
+    assert torch.all(query_slots == PAD_SLOT_ID)
+    assert state.slot_mappings["draft.layer"].data_ptr() == query_slots[1].data_ptr()
 
 
 @pytest.mark.parametrize(
@@ -158,6 +223,7 @@ def test_adaptive_lookup_rejects_explicit_async_scheduling(monkeypatch) -> None:
 def test_dflash_forces_v2_and_rejects_explicit_v1(monkeypatch) -> None:
     fake = SimpleNamespace(
         speculative_config=SimpleNamespace(use_dflash=lambda: True),
+        model_config=None,
     )
     monkeypatch.setattr("vllm.config.vllm.envs.VLLM_USE_V2_MODEL_RUNNER", None)
     assert VllmConfig.use_v2_model_runner.fget(fake)

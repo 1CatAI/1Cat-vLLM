@@ -2355,7 +2355,7 @@ class VllmConfig:
         """
         if self.speculative_config is not None:
             scheduled_token_delta = (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             )
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -2373,7 +2373,10 @@ class VllmConfig:
                     " to accommodate the additional draft token slots, or decrease"
                     " num_speculative_tokens or max_num_seqs."
                 )
-            if self.scheduler_config.max_num_scheduled_tokens < 8192:
+            if (
+                scheduled_token_delta > 0
+                and self.scheduler_config.max_num_scheduled_tokens < 8192
+            ):
                 logger.warning_once(
                     "max_num_scheduled_tokens is set to"
                     f" {self.scheduler_config.max_num_scheduled_tokens} based on"
@@ -2385,7 +2388,7 @@ class VllmConfig:
 
             max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
             if max_num_batched_tokens < max_num_scheduled_tokens + (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             ):
                 raise ValueError(
