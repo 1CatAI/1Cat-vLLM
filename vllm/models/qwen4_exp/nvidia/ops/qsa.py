@@ -520,6 +520,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+    qk_scale_log2 = softmax_scale_log2
+    if KV_E4M3:
+        # Keep the exactly decoded E4M3 values in the dot inputs and apply the
+        # scalar K dequantization factor once to the accumulated QK scores.
+        qk_scale_log2 *= k_scale
 
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
@@ -569,11 +574,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             other=0.0,
         )
         if KV_E4M3:
-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * k_scale).to(query.dtype)
-            values = (fp8_e4m3fn_bits_to_fp32(values) * v_scale).to(query.dtype)
+            keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
+            values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
-        scores *= softmax_scale_log2
+        scores *= qk_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
@@ -596,6 +601,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
+        if KV_E4M3:
+            # V dequantization is linear, so apply its scalar after the
+            # normalized FP32 accumulation instead of to every loaded value.
+            normalized_output *= v_scale
         tl.store(
             output_ptr
             + row * stride_output_row
@@ -640,10 +649,12 @@ def _qsa_merge_splitk_kernel(
     stride_output_row,
     stride_output_head,
     num_rows,
+    v_scale,
     HEAD_DIM: tl.constexpr,
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
+    KV_E4M3: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     head = tl.program_id(1)
@@ -670,6 +681,10 @@ def _qsa_merge_splitk_kernel(
     )
     merged = tl.sum(partial_output * weights[:, None], axis=0)
     merged = tl.where(denominator > 0, merged / denominator, 0.0)
+    if KV_E4M3:
+        # Apply the V scale once after combining all independently normalized
+        # splits. Scaling partials earlier would repeat this work per split.
+        merged *= v_scale
     tl.store(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
         merged,
@@ -1971,10 +1986,12 @@ def qsa_sparse_paged_attention(
         out.stride(0),
         out.stride(1),
         q.shape[0],
+        v_scale,
         HEAD_DIM=q.shape[2],
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+        KV_E4M3=kv_e4m3,
         num_warps=2,
         num_stages=1,
     )
