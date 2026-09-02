@@ -416,7 +416,7 @@ def test_sm70_explicit_dflash_preserves_probabilistic_default(monkeypatch):
     assert args.max_num_batched_tokens is None
 
 
-def test_sm70_dflash_interactivity_defaults_to_audited_b1_profile(monkeypatch):
+def test_sm70_dflash_interactivity_preserves_capacity_defaults(monkeypatch):
     args = _apply_sm70_defaults(
         monkeypatch,
         speculative_config={"method": "dflash", "num_speculative_tokens": 7},
@@ -429,8 +429,8 @@ def test_sm70_dflash_interactivity_defaults_to_audited_b1_profile(monkeypatch):
         "draft_sample_method": "probabilistic",
         "attention_backend": "FLASH_ATTN_V100",
     }
-    assert args.max_num_seqs == 1
-    assert args.max_num_batched_tokens == 4096
+    assert args.max_num_seqs is None
+    assert args.max_num_batched_tokens is None
 
 
 def test_sm70_dflash_interactivity_preserves_capacity_overrides(monkeypatch):
@@ -456,8 +456,8 @@ def test_sm70_dflash_defaults_ignore_legacy_mtp_disable(monkeypatch):
 
     assert args.speculative_config["attention_backend"] == "FLASH_ATTN_V100"
     assert args.speculative_config["draft_sample_method"] == "probabilistic"
-    assert args.max_num_seqs == 1
-    assert args.max_num_batched_tokens == 4096
+    assert args.max_num_seqs is None
+    assert args.max_num_batched_tokens is None
 
 
 def test_sm70_speculative_defaults_do_not_apply_to_sm75(monkeypatch):

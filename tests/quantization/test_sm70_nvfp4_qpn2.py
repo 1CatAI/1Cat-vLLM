@@ -141,15 +141,85 @@ def test_nvfp4_qpn2_shape_gate_is_exact_tp4():
     layer.tp_size = 2
     assert not nvfp4_scheme._is_qpn2_layer(layer)
     layer.tp_size = 4
-    layer.prefix = "model.language_model.layers.0.self_attn.qkv_proj"
-    assert not nvfp4_scheme._is_qpn2_layer(layer)
-    layer.prefix = "model.language_model.layers.0.mlp.down_proj"
-    layer.input_size_per_partition = 4352
-    layer.output_size_per_partition = 5120
-    layer.weight = SimpleNamespace(shape=(5120, 2176))
-    assert nvfp4_scheme._is_qpn2_layer(layer)
+    compatible = (
+        ("linear_attn.in_proj_qkvz", 5120, 4120, (4120, 2560)),
+        ("linear_attn.out_proj", 1536, 5120, (5120, 768)),
+        ("self_attn.qkv_proj", 5120, 3584, (3584, 2560)),
+        ("self_attn.o_proj", 1536, 5120, (5120, 768)),
+        ("mlp.down_proj", 4352, 5120, (5120, 2176)),
+    )
+    for suffix, k, n, weight_shape in compatible:
+        layer.prefix = f"model.language_model.layers.0.{suffix}"
+        layer.input_size_per_partition = k
+        layer.output_size_per_partition = n
+        layer.weight = SimpleNamespace(shape=weight_shape)
+        assert nvfp4_scheme._is_qpn2_layer(layer)
+
     layer.input_size_per_partition = 4096
     assert not nvfp4_scheme._is_qpn2_layer(layer)
+
+
+def test_nvfp4_qpn2_output_padding_is_zero_filled():
+    weight = torch.full((56, 32), 7, dtype=torch.uint8)
+    scales = torch.full((56, 4), 2, dtype=torch.float8_e4m3fn)
+    padded_weight, padded_scales, physical_n = nvfp4_scheme._pad_qpn2_output_rows(
+        weight, scales
+    )
+    assert physical_n == 64
+    assert padded_weight.shape == (64, 32)
+    assert padded_scales.shape == (64, 4)
+    assert torch.equal(padded_weight[:56], weight)
+    assert torch.equal(padded_scales[:56], scales)
+    assert not torch.count_nonzero(padded_weight[56:])
+    assert not torch.count_nonzero(padded_scales[56:].float())
+
+
+def test_nvfp4_qpn2_dispatch_crops_padded_output_before_bias(monkeypatch):
+    layer = SimpleNamespace(
+        output_size_per_partition=56,
+        sm70_nvfp4_qpn2_output_size=64,
+        sm70_nvfp4_qpn2_split_k=8,
+        sm70_nvfp4_qpn2_nacc=2,
+        sm70_nvfp4_qpn2_global_scale=0.5,
+        sm70_nvfp4_qpn2_prefill_enabled=False,
+        sm70_nvfp4_qpn2_codes=torch.empty((64, 32), dtype=torch.uint8),
+        sm70_nvfp4_qpn2_scales=torch.empty((64, 4), dtype=torch.uint8),
+    )
+    setattr(
+        layer,
+        sm70_tm.STATE_ATTR,
+        sm70_tm.SM70TurboMindLinearState(
+            weight=torch.empty((1,), dtype=torch.int32),
+            scales=torch.empty((1,), dtype=torch.float16),
+            group_size=16,
+            k_ld=64,
+            q_ld=64,
+            output_size=56,
+            padded_output_size=64,
+            op_kind="nvfp4",
+        ),
+    )
+    seen_shapes = []
+
+    def fake_dispatch(*args):
+        seen_shapes.append(tuple(args[0].shape))
+        args[0].fill_(3)
+
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_ops, "nvfp4_qpn2_dispatch_sm70_out", fake_dispatch
+    )
+    bias = torch.arange(56, dtype=torch.float16)
+    output = CompressedTensorsW4A4Fp4._apply_qpn2(
+        layer, torch.ones((8, 64), dtype=torch.float16), bias, gated_silu=False
+    )
+    assert seen_shapes == [(8, 64)]
+    assert output.shape == (8, 56)
+    assert torch.equal(output[0], bias + 3)
+
+    empty = CompressedTensorsW4A4Fp4._apply_qpn2(
+        layer, torch.ones((0, 64), dtype=torch.float16), None, gated_silu=False
+    )
+    assert empty.shape == (0, 56)
 
 
 def _make_small_layer() -> torch.nn.Module:

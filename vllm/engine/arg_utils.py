@@ -1838,16 +1838,9 @@ class EngineArgs:
             )
 
         if spec_method == "dflash":
-            # The quality-audited Qwen3.8 DFlash2 latency profile is B1 with a
-            # 4096-token prefill chunk. Apply it only when the user explicitly
-            # asks for interactivity and has not supplied either capacity knob.
-            if self.performance_mode == "interactivity":
-                if self.max_num_seqs is None:
-                    self.max_num_seqs = 1
-                    profile_updates.append("max_num_seqs=1")
-                if self.max_num_batched_tokens is None:
-                    self.max_num_batched_tokens = 4096
-                    profile_updates.append("max_num_batched_tokens=4096")
+            # MRV2 owns a separate K+1 draft query batch, so DFlash does not
+            # require B1 or a reduced prefill chunk. Preserve the server's
+            # normal capacity defaults and every explicit user override.
             if profile_updates:
                 logger.info_once(
                     "Applied SM70 speculative defaults: %s",

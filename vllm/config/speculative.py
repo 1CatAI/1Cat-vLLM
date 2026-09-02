@@ -1365,6 +1365,19 @@ class SpeculativeConfig:
             slots_per_req += 1
         return slots_per_req
 
+    @property
+    def max_num_new_target_slots_for_drafting(self) -> int:
+        """Return extra slots inserted into the target runner's input batch.
+
+        MRV2 DFlash builds its K+1 query batch in a separate ``InputBuffers``
+        instance. Its K draft slots therefore consume draft-runner capacity,
+        not the target scheduler's prefill budget. Other proposers retain the
+        existing shared-batch accounting.
+        """
+        if self.use_dflash():
+            return 0
+        return self.max_num_new_slots_for_drafting
+
     def use_gemma4_mtp(self) -> bool:
         return (
             self.method == "mtp"
