@@ -76,13 +76,23 @@ def test_qsa_cache_write_uses_calibrated_e4m3_scale() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("page_size", "pages", "topk"),
+    [
+        pytest.param(8, 2, 10, id="single-split"),
+        pytest.param(40, 1, 33, id="split-k-merge"),
+    ],
+)
 @torch.inference_mode()
-def test_qsa_sparse_paged_attention_calibrated_e4m3() -> None:
+def test_qsa_sparse_paged_attention_calibrated_e4m3(
+    page_size: int,
+    pages: int,
+    topk: int,
+) -> None:
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("QSA E4M3 software conversion regression is SM70-only")
     torch.manual_seed(11)
     rows, heads, head_dim = 3, 6, 256
-    page_size, pages, topk = 8, 2, 10
     query = torch.randn(
         (rows, heads, head_dim), dtype=torch.float16, device="cuda"
     ).mul_(0.2)
