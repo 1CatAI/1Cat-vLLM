@@ -2146,6 +2146,35 @@ __global__ void sm70_glm_kda_fg_b_kernel(
   }
 }
 
+template <int kRows>
+void launch_sm70_glm_kda_fg_b(half* f_out, half* g_out, const half* f_input,
+                              const half* g_input, const half* f_weight,
+                              const half* g_weight, int64_t f_input_stride,
+                              int64_t g_input_stride, int64_t num_tokens,
+                              cudaStream_t stream) {
+  constexpr int kWarps = 8;
+  constexpr int kThreads = kWarps * WARP_SIZE;
+  constexpr int kBlocks = (2 * kRows + kWarps - 1) / kWarps;
+#define VLLM_LAUNCH_GLM_KDA_FG_B(batch)                                        \
+  case batch:                                                                  \
+    sm70_glm_kda_fg_b_kernel<kRows, 128, kWarps, batch>                        \
+        <<<kBlocks, kThreads, 0, stream>>>(f_out, g_out, f_input, g_input,     \
+                                           f_weight, g_weight, f_input_stride, \
+                                           g_input_stride);                    \
+    break
+  switch (num_tokens) {
+    VLLM_LAUNCH_GLM_KDA_FG_B(1);
+    VLLM_LAUNCH_GLM_KDA_FG_B(2);
+    VLLM_LAUNCH_GLM_KDA_FG_B(3);
+    VLLM_LAUNCH_GLM_KDA_FG_B(4);
+    VLLM_LAUNCH_GLM_KDA_FG_B(5);
+    VLLM_LAUNCH_GLM_KDA_FG_B(6);
+    VLLM_LAUNCH_GLM_KDA_FG_B(7);
+    VLLM_LAUNCH_GLM_KDA_FG_B(8);
+  }
+#undef VLLM_LAUNCH_GLM_KDA_FG_B
+}
+
 void sm70_glm_mhc_pre_norm_out(
     torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
     torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
@@ -2324,14 +2353,17 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
               "sm70_glm_kda_fg_b_out: outputs/weights must be contiguous and "
               "inputs must have contiguous inner dimensions.");
   const int64_t num_tokens = f_input.size(0);
+  const int64_t output_rows = f_out.size(1);
   TORCH_CHECK(f_input.dim() == 2 && num_tokens >= 1 && num_tokens <= 8 &&
                   f_input.size(1) == 128 &&
                   g_input.sizes() == f_input.sizes() && f_out.dim() == 2 &&
-                  f_out.size(0) == num_tokens && f_out.size(1) == 2048 &&
+                  f_out.size(0) == num_tokens &&
+                  (output_rows == 1024 || output_rows == 2048) &&
                   g_out.sizes() == f_out.sizes() &&
-                  f_weight.sizes() == torch::IntArrayRef({2048, 128}) &&
-                  g_weight.sizes() == torch::IntArrayRef({2048, 128}),
-              "sm70_glm_kda_fg_b_out: requires the GLM TP4 B1-B8 shape.");
+                  f_weight.sizes() == torch::IntArrayRef({output_rows, 128}) &&
+                  g_weight.sizes() == torch::IntArrayRef({output_rows, 128}),
+              "sm70_glm_kda_fg_b_out: requires the GLM TP4/TP8 B1-B8 "
+              "shape.");
   const auto device = f_out.device();
   TORCH_CHECK(g_out.device() == device && f_input.device() == device &&
                   g_input.device() == device && f_weight.device() == device &&
@@ -2339,32 +2371,26 @@ void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
               "sm70_glm_kda_fg_b_out: all tensors must share one device.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(f_out));
-  constexpr int kWarps = 8;
-  constexpr int kThreads = kWarps * WARP_SIZE;
-  constexpr int kBlocks = (2 * 2048 + kWarps - 1) / kWarps;
-#define VLLM_LAUNCH_GLM_KDA_FG_B(batch)                                   \
-  case batch:                                                             \
-    sm70_glm_kda_fg_b_kernel<2048, 128, kWarps, batch>                    \
-        <<<kBlocks, kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(     \
-            reinterpret_cast<half*>(f_out.data_ptr<at::Half>()),          \
-            reinterpret_cast<half*>(g_out.data_ptr<at::Half>()),          \
-            reinterpret_cast<const half*>(f_input.data_ptr<at::Half>()),  \
-            reinterpret_cast<const half*>(g_input.data_ptr<at::Half>()),  \
-            reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>()), \
-            reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>()), \
-            f_input.stride(0), g_input.stride(0));                        \
-    break
-  switch (num_tokens) {
-    VLLM_LAUNCH_GLM_KDA_FG_B(1);
-    VLLM_LAUNCH_GLM_KDA_FG_B(2);
-    VLLM_LAUNCH_GLM_KDA_FG_B(3);
-    VLLM_LAUNCH_GLM_KDA_FG_B(4);
-    VLLM_LAUNCH_GLM_KDA_FG_B(5);
-    VLLM_LAUNCH_GLM_KDA_FG_B(6);
-    VLLM_LAUNCH_GLM_KDA_FG_B(7);
-    VLLM_LAUNCH_GLM_KDA_FG_B(8);
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  auto* f_out_ptr = reinterpret_cast<half*>(f_out.data_ptr<at::Half>());
+  auto* g_out_ptr = reinterpret_cast<half*>(g_out.data_ptr<at::Half>());
+  const auto* f_input_ptr =
+      reinterpret_cast<const half*>(f_input.data_ptr<at::Half>());
+  const auto* g_input_ptr =
+      reinterpret_cast<const half*>(g_input.data_ptr<at::Half>());
+  const auto* f_weight_ptr =
+      reinterpret_cast<const half*>(f_weight.data_ptr<at::Half>());
+  const auto* g_weight_ptr =
+      reinterpret_cast<const half*>(g_weight.data_ptr<at::Half>());
+  if (output_rows == 1024) {
+    launch_sm70_glm_kda_fg_b<1024>(
+        f_out_ptr, g_out_ptr, f_input_ptr, g_input_ptr, f_weight_ptr,
+        g_weight_ptr, f_input.stride(0), g_input.stride(0), num_tokens, stream);
+  } else {
+    launch_sm70_glm_kda_fg_b<2048>(
+        f_out_ptr, g_out_ptr, f_input_ptr, g_input_ptr, f_weight_ptr,
+        g_weight_ptr, f_input.stride(0), g_input.stride(0), num_tokens, stream);
   }
-#undef VLLM_LAUNCH_GLM_KDA_FG_B
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

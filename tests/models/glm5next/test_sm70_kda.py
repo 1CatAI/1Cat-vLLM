@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fla.ops.kda import (
 from vllm.models.glm5next.nvidia.kda import (
     _sm70_exact_kda_gemv_enabled,
     _sm70_glm53_tp8_cublaslt_enabled,
+    _sm70_glm53_tp8_fused_fg_b_enabled,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -49,6 +50,22 @@ def test_sm70_glm53_tp8_cublaslt_gate(
         monkeypatch.setenv("VLLM_SM70_GLM53_TP8_CUBLASLT", value)
     expected = enabled and torch.version.cuda == "12.8"
     assert _sm70_glm53_tp8_cublaslt_enabled() is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [(None, False), ("1", True), ("0", False)],
+)
+def test_sm70_glm53_tp8_fused_fg_b_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    enabled: bool,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", value)
+    assert _sm70_glm53_tp8_fused_fg_b_enabled() is enabled
 
 
 @pytest.mark.skipif(
@@ -95,22 +112,29 @@ def test_sm70_glm53_tp8_cublaslt_matches_torch_and_graph(
     ),
     reason="native NVIDIA V100/SM70 GLM KDA CUDA op required",
 )
+@pytest.mark.parametrize("output_rows", [1024, 2048])
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
 def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph(
     num_tokens: int,
+    output_rows: int,
 ) -> None:
     torch.manual_seed(20260827)
     device = current_platform.device_type
+    projected_rows = 3336 if output_rows == 1024 else 6416
     projected = torch.randn(
-        (num_tokens, 6416), device=device, dtype=torch.float16
+        (num_tokens, projected_rows), device=device, dtype=torch.float16
     ).mul_(0.1)
     f_input = projected[:, -256:-128]
     g_input = projected[:, -128:]
-    assert f_input.stride() == (6416, 1)
-    assert g_input.stride() == (6416, 1)
-    f_weight = torch.randn((2048, 128), device=device, dtype=torch.float16).mul_(0.01)
-    g_weight = torch.randn((2048, 128), device=device, dtype=torch.float16).mul_(0.01)
-    f_out = torch.empty((num_tokens, 2048), device=device, dtype=torch.float16)
+    assert f_input.stride() == (projected_rows, 1)
+    assert g_input.stride() == (projected_rows, 1)
+    f_weight = torch.randn((output_rows, 128), device=device, dtype=torch.float16).mul_(
+        0.01
+    )
+    g_weight = torch.randn((output_rows, 128), device=device, dtype=torch.float16).mul_(
+        0.01
+    )
+    f_out = torch.empty((num_tokens, output_rows), device=device, dtype=torch.float16)
     g_out = torch.empty_like(f_out)
 
     def run() -> None:
@@ -124,7 +148,7 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph(
     rowwise_f = []
     rowwise_g = []
     for token_idx in range(num_tokens):
-        f_row = torch.empty((1, 2048), device=device, dtype=torch.float16)
+        f_row = torch.empty((1, output_rows), device=device, dtype=torch.float16)
         g_row = torch.empty_like(f_row)
         sm70_ops.sm70_glm_kda_fg_b_out(
             f_row,

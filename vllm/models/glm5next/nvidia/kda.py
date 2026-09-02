@@ -193,6 +193,10 @@ def _sm70_glm53_tp8_cublaslt_enabled() -> bool:
     )
 
 
+def _sm70_glm53_tp8_fused_fg_b_enabled() -> bool:
+    return os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0") != "0"
+
+
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with multiple replicated output shards.
 
@@ -347,12 +351,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
-        self._use_sm70_fused_fg_b_decode = (
+        use_sm70_tp4_fused_fg_b = (
             current_platform.is_cuda()
             and current_platform.get_device_capability() == (7, 0)
             and self.tp_size == 4
             and self.head_dim == 128
             and self.local_projection_size == 2048
+        )
+        use_sm70_tp8_fused_fg_b = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.tp_size == 8
+            and self.head_dim == 128
+            and self.local_projection_size == 1024
+            and _sm70_glm53_tp8_fused_fg_b_enabled()
+        )
+        self._use_sm70_fused_fg_b_decode = (
+            use_sm70_tp4_fused_fg_b or use_sm70_tp8_fused_fg_b
         )
         self._use_sm70_exact_kda_gemv = (
             self._use_sm70_fused_fg_b_decode

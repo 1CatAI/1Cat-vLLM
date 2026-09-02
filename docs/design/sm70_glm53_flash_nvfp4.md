@@ -456,3 +456,43 @@ GLM-shaped oracle, non-default tile sizes change the mask, and an eight-warp
 rejection-statistics schedule changes the accepted-token chain. Compact target
 rejection is not valid for this workload because the official target uses
 `top_k=-1`; enabling top-k 20 would change the target distribution.
+
+### TP8 fused KDA f_b/g_b closure (2026-09-02)
+
+The fixed-shape native KDA projection now also supports the TP8 output width:
+`B=1..8`, `N=1024`, and `K=128`. The existing TP4 `N=2048` specialization is
+unchanged. On the TP8 q8 operator benchmark, replacing the two FP16 linear
+launches with one native kernel reduces CUDA Graph service from `6.218 us` to
+`4.264 us` per layer (`1.458x`). The native output is CUDA Graph stable; versus
+the retained FP16 linear path, f/g differ in 8/10 of 8,192 elements with
+maximum absolute errors `1.526e-5` and `7.63e-6` respectively.
+
+After a full 128-token warmup, a matched ten-seed candidate/control pair
+measures `29.6850/29.9173 ms` per verification round. The fusion saves
+`0.2323 ms` (`0.78%`); dropping the first three requests still gives
+`29.7347/29.9182 ms`, a `0.1834 ms` gain. Short 32-token warmups are not valid
+for this comparison because lazy kernel loading produced one-time 31-56 ms
+request outliers.
+
+The matched seed-zero node traces preserve the output hash and all 23
+verification steps. Across 24 captured replay groups and eight ranks, the
+fusion removes 13,056 launches of the CUTLASS FP16 `32x32x64 TN` family and
+adds 6,528 native launches: exactly 68 removed and 34 added per rank/round.
+The removed launches cost `78.562 ms` TP GPU-sum and the native launches cost
+`33.705 ms`, a net `0.2336 ms` per-rank round reduction. This matches the
+low-overhead endpoint A/B; the previously suspected `16x16x128` family is not
+the f_b/g_b projection.
+
+The full no-request-seed 128-question audit passes the release gates with
+`123/128` accuracy (`96.09375%`), zero invalid answers, and 128 natural stops.
+Mean completion tokens per verification step are `5.827398`, and
+token-weighted acceptance is `5.585305`. Mean per-request steady decode is
+`196.012 tok/s`, weighted pure decode is `187.716 tok/s`, aggregate output
+throughput is `99.039 tok/s`, and mean TPOT is `5.1581 ms`. Total decode time
+divided by all 6,805 verification steps is `29.6639 ms/round`; stochastic
+output-length and context differences mean this long audit is quality evidence,
+not the matched `0.2323 ms` kernel speed claim.
+
+`VLLM_SM70_GLM53_TP8_FUSED_FG_B` remains globally off. The runtime enables it
+only inside the audited SM70, GLM-5.3 ModelOpt NVFP4, FP16, probabilistic q7
+DFlash2, TP8/PP1, no-DBO contract and preserves explicit rollback value `0`.

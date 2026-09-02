@@ -45138,3 +45138,33 @@ Interpretation:
   `q8_tp8pp1_gsm8k128_topponly8_source_default_prop09_top095_official_quality_20260902.json`,
   and
   `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_seed20260902_quality_20260902.json`.
+
+## 2026-09-02 GLM-5.3 TP8 fused KDA f_b/g_b closure
+
+- The native SM70 KDA f_b/g_b operator now admits the exact TP8
+  `B=1..8, N=1024, K=128` shape while retaining the existing TP4 `N=2048`
+  specialization. Its CUDA Graph replay is stable, and the focused V100
+  operator plus environment-gate suite reports 11 passed cases.
+- A 128-token-warm, ten-seed low-overhead A/B records `29.6850 ms/round` with
+  fusion and `29.9173 ms/round` without it, saving `0.2323 ms` or 0.78%.
+  Removing the first three requests still saves `0.1834 ms`. Earlier short-
+  warmup outliers are rejected as lazy-module startup measurements.
+- Same-seed node traces preserve the token hash and 23 verification steps.
+  Per rank/round they replace 68 CUTLASS `32x32x64 TN` projection launches with
+  34 native launches. The TP GPU-sum delta is `78.562 - 33.705 = 44.857 ms`
+  over 24 rounds and eight ranks, or `0.2336 ms/rank/round`, independently
+  explaining the endpoint result.
+- The official 128-question, 4096-token audit records `123/128` accuracy,
+  zero invalid answers, 128 natural stops, `5.827398` mean completion tokens
+  per verification step, and `5.585305` token-weighted acceptance. Both release
+  gates pass. Weighted pure decode is `187.716 tok/s`; the full long-output
+  audit averages `29.6639 ms` across 6,805 verification steps.
+- `VLLM_SM70_GLM53_TP8_FUSED_FG_B=1` is added only to the existing audited
+  SM70 GLM-5.3 NVFP4 DFlash2 TP8/PP1 default set. Its global default remains
+  off, explicit `0` remains the immediate rollback, and TP4/PP2 plus unrelated
+  model, quantization, topology, dtype, and draft routes are unchanged.
+- New raw evidence is under `.artifacts/glm53_dflash2_verifier30/`:
+  `q8_tp8pp1_10seed_topponly8_fusedfg1024_candidate3_warm128_20260902.json`,
+  `q8_tp8pp1_10seed_topponly8_fusedfg1024_control2_warm128_20260902.json`,
+  `q8_tp8pp1_fusedfg1024_topponly8_round_nodes.json`, and
+  `q8_tp8pp1_gsm8k128_topponly8_fusedfg1024_source_default_prop09_top095_official_quality_20260902.json`.

@@ -237,6 +237,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GLM_MHC_PRE_THREADS: int = 256
     VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS: int = -3
     VLLM_SM70_GLM53_TP8_CUBLASLT: bool = False
+    VLLM_SM70_GLM53_TP8_FUSED_FG_B: bool = False
     VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE: float = 1.0
     VLLM_SM70_DFLASH2_PROPOSAL_TOP_P: float = 1.0
     VLLM_GLM53_PP_MHC_MATERIALIZE: bool = False
@@ -2132,6 +2133,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_GLM53_TP8_CUBLASLT": lambda: bool(
         int(os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0"))
+    ),
+    # Fixed-shape TP8 KDA f_b/g_b fusion. The global default remains off;
+    # the quality-audited GLM-5.3 DFlash2 TP8/PP1 contract enables it.
+    "VLLM_SM70_GLM53_TP8_FUSED_FG_B": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0"))
     ),
     # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
     # transformed q logits are cached for rejection sampling, so non-default
