@@ -11,15 +11,17 @@ plus Flash-decode runs do not count as the final SM70 FlashAttention route.
 from __future__ import annotations
 
 import atexit
+import importlib
 import inspect
 import json
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 
@@ -36,7 +38,10 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
+from vllm.v1.kv_cache_interface import (
+    PrefixAnchoredSWASpec,
+    make_int8_block32_kv_cache_views,
+)
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 logger = init_logger(__name__)
@@ -512,6 +517,10 @@ _sm70_fa2_cu_seqlens_cache: dict[
 ] = {}
 _fp8_e5m2_paged_kv_to_fp16 = None
 _fp8_e5m2_paged_kv_to_fp16_checked = False
+_int8_block32_decode_paged = None
+_int8_block32_prefill_paged = None
+_int8_block32_reshape_and_cache = None
+_int8_block32_ops_checked = False
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
@@ -619,6 +628,37 @@ def _split_paged_kv_cache(
     raise ValueError(
         f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
         "expected dimension 2 at axis 0 or 1"
+    )
+
+
+def _split_int8_block32_kv_cache(
+    kv_cache: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    if kv_cache.dtype != torch.int8 or kv_cache.ndim != 2:
+        raise ValueError("INT8 block cache requires [pages,page_bytes] int8 storage")
+    channel_blocks = (head_size + 31) // 32
+    scale_bytes = 2 * num_kv_heads * channel_blocks * 2
+    owner_bytes = 4
+    payload_bytes = kv_cache.shape[1] - scale_bytes - owner_bytes
+    elements_per_token = 2 * num_kv_heads * head_size
+    block_size, remainder = divmod(payload_bytes, elements_per_token)
+    if block_size <= 0 or remainder:
+        raise ValueError("INT8 block cache page size does not match its head shape")
+    return make_int8_block32_kv_cache_views(
+        kv_cache.reshape(-1),
+        num_blocks=kv_cache.shape[0],
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
     )
 
 
@@ -1729,6 +1769,28 @@ def _try_sm70_fa2_d256_prefill(
     return None
 
 
+def _get_int8_block32_ops():
+    global _int8_block32_decode_paged, _int8_block32_prefill_paged
+    global _int8_block32_reshape_and_cache
+    global _int8_block32_ops_checked
+    if not _int8_block32_ops_checked:
+        _int8_block32_ops_checked = True
+        try:
+            extension = importlib.import_module("flash_attn_v100_cuda")
+            _int8_block32_decode_paged = extension.int8_block32_decode_paged
+            _int8_block32_prefill_paged = extension.int8_block32_prefill_paged
+            _int8_block32_reshape_and_cache = extension.int8_block32_reshape_and_cache
+        except (ImportError, AttributeError):
+            _int8_block32_decode_paged = None
+            _int8_block32_prefill_paged = None
+            _int8_block32_reshape_and_cache = None
+    return (
+        _int8_block32_decode_paged,
+        _int8_block32_prefill_paged,
+        _int8_block32_reshape_and_cache,
+    )
+
+
 def _get_fp8_e5m2_paged_kv_bridge_op():
     global _fp8_e5m2_paged_kv_to_fp16
     global _fp8_e5m2_paged_kv_to_fp16_checked
@@ -2042,8 +2104,8 @@ def flash_v100_dense_prefill_lse(
     k_off = cu_seqlens_k.tolist()
     if not q_off or q_off[0] != 0 or k_off[0] != 0:
         raise ValueError("Q/K sequence offsets must start at zero")
-    if any(a > b for a, b in zip(q_off, q_off[1:])) or any(
-        a > b for a, b in zip(k_off, k_off[1:])
+    if any(a > b for a, b in zip(q_off, q_off[1:], strict=False)) or any(
+        a > b for a, b in zip(k_off, k_off[1:], strict=False)
     ):
         raise ValueError("Q/K sequence offsets must be nondecreasing")
     if q_off[-1] != num_actual_tokens:
@@ -4336,7 +4398,9 @@ def prepare_dflash2_smallq_group_metadata(
             max_seq_len_hint=max_seq_len_hint,
             workspace_seq_capacity_hint=workspace_hint,
         )
-        for builder_id, workspace_hint in zip(builder_ids, workspace_hints)
+        for builder_id, workspace_hint in zip(
+            builder_ids, workspace_hints, strict=False
+        )
     }
     return prepared, descriptor
 
@@ -4367,6 +4431,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _flash_attn_grouped_verify_max_query_tokens
         )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
+        (
+            self.int8_block32_decode_paged,
+            self.int8_block32_prefill_paged,
+            self.int8_block32_reshape_and_cache,
+        ) = _get_int8_block32_ops()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
         self.supports_quant_query_input = False
@@ -4566,6 +4635,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_flash_v100_prefill_bfla = False
             self.use_flash_v100_prefill_contig_dense = False
             self.use_flash_v100_prefill_gather_dense = False
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if self.kv_cache_dtype != "int8_block32":
+            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            return
+        if self.int8_block32_reshape_and_cache is None:
+            raise RuntimeError("FLASH_ATTN_V100 INT8 block cache writer is unavailable")
+        (
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            page_owners,
+        ) = _split_int8_block32_kv_cache(
+            kv_cache,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+        )
+        self.int8_block32_reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            page_owners,
+            slot_mapping,
+        )
 
     def _reset_decode_cache(self) -> None:
         self._decode_cache_k = None
@@ -5093,9 +5197,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
-        supported_kv_dtype = not _uses_fp8_kv_cache(
-            self.kv_cache_dtype
-        ) or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        supported_kv_dtype = (
+            (not _uses_fp8_kv_cache(self.kv_cache_dtype))
+            or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        ) and (
+            self.kv_cache_dtype != "int8_block32"
+            or (
+                self.int8_block32_decode_paged is not None
+                and self.int8_block32_prefill_paged is not None
+                and self.int8_block32_reshape_and_cache is not None
+            )
+        )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
@@ -5557,7 +5669,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 f"has_sinks={self.sinks is not None}, "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}."
             )
-            if not (self.allow_triton_fallback or is_dflash_draft_attn):
+            if self.kv_cache_dtype == "int8_block32" or not (
+                self.allow_triton_fallback or is_dflash_draft_attn
+            ):
                 raise RuntimeError(message)
             if self.use_flash_v100 and not _warned_feature_fallback:
                 if is_dflash_draft_attn:
@@ -5644,6 +5758,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
 
         if is_prefill:
+            if self.kv_cache_dtype == "int8_block32" and is_capturing:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 INT8 block cache does not support "
+                    "small-query prefill graph capture"
+                )
             available_query_tokens = min(
                 int(query.shape[0]),
                 int(key.shape[0]),
@@ -5657,6 +5776,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 )
             )
             if self.use_triton_prefill:
+                if self.kv_cache_dtype == "int8_block32":
+                    raise RuntimeError(
+                        "FLASH_ATTN_V100 INT8 block cache cannot use the "
+                        "Triton prefill fallback"
+                    )
                 if not _logged_prefill_triton_safe:
                     logger.info(
                         "FLASH_ATTN_V100 prefill uses explicit Triton diagnostic "
@@ -5766,6 +5890,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             smallq_decode = has_prefix_context and self._small_query_decode_enabled(
                 attn_metadata
             )
+            if has_prefix_context and self.kv_cache_dtype == "int8_block32":
+                causal = bool(getattr(attn_metadata, "causal", True))
+                window_size = self._flash_v100_window_size(causal)
+                if (
+                    metadata_live_token_mismatch
+                    or not causal
+                    or window_size != (-1, -1)
+                    or self.int8_block32_prefill_paged is None
+                ):
+                    raise RuntimeError(
+                        "FLASH_ATTN_V100 INT8 block cache prefix prefill "
+                        "requires causal full attention and live query metadata"
+                    )
+                key_cache, value_cache, key_scales, value_scales, _ = (
+                    _split_int8_block32_kv_cache(
+                        kv_cache,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                    )
+                )
+                num_actual_tokens = int(attn_metadata.num_actual_tokens)
+                self.int8_block32_prefill_paged(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    key_scales,
+                    value_scales,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    attn_metadata.query_start_loc,
+                    output[:num_actual_tokens],
+                    self.scale,
+                )
+                _record_route("prefill_prefix_int8_block32_register")
+                return output
             if has_prefix_context:
                 if _draft_graph_debug_enabled():
                     _draft_graph_debug_log(
@@ -5847,7 +6006,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 )
                 _logged_prefill_flash = True
             self._reset_decode_cache()
-            if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
+            if (
+                self.kv_cache_dtype != "int8_block32"
+                and self.use_prefill_paged_cache
+                and self.use_flash_v100_prefill_paged
+            ):
                 _sm70_profile_trace(
                     "forward branch=prefill_no_prefix_paged_cache layer=%s",
                     layer_name,
@@ -5932,6 +6095,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output,
                 output_scale,
                 output_block_scale,
+            )
+
+        if self.kv_cache_dtype == "int8_block32":
+            _record_route("decode_int8_block32_register")
+            return self._flash_v100_decode(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
             )
 
         if (
@@ -6548,6 +6723,40 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         out_view = output[:num_actual_tokens]
 
         if query.shape[0] == 0:
+            return output
+
+        if self.kv_cache_dtype == "int8_block32":
+            if window_size != (-1, -1):
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 INT8 block cache does not support "
+                    "sliding-window decode"
+                )
+            if query.shape[0] != attn_metadata.seq_lens.shape[0]:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 INT8 block cache supports one query token "
+                    "per request"
+                )
+            if self.int8_block32_decode_paged is None:
+                raise RuntimeError("FLASH_ATTN_V100 INT8 block decoder is unavailable")
+            key_cache, value_cache, key_scales, value_scales, _ = (
+                _split_int8_block32_kv_cache(
+                    kv_cache,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                )
+            )
+            self.int8_block32_decode_paged(
+                query,
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                out_view,
+                self.scale,
+            )
+            _record_route("decode_int8_block32_register")
             return output
 
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
@@ -8291,9 +8500,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                                     tail_k_diff = (tail_k - key_input).abs()
                                     tail_v_diff = (tail_v - value_input).abs()
 
-                        dump_path = (
-                            f"/tmp/flash_v100_dflash_prefix_dump_pid{os.getpid()}"
-                            f"_seq{i}.pt"
+                        dump_path = os.path.join(
+                            tempfile.gettempdir(),
+                            f"flash_v100_dflash_prefix_dump_pid{os.getpid()}_seq{i}.pt",
                         )
                         torch.save(
                             {
@@ -8373,8 +8582,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         )
                         _logged_dflash_prefix_dump = True
                     if debug_compare and not _logged_prefill_compare and nan_count > 0:
-                        dump_path = (
-                            f"/tmp/flash_v100_prefill_nan_dump_pid{os.getpid()}.pt"
+                        dump_path = os.path.join(
+                            tempfile.gettempdir(),
+                            f"flash_v100_prefill_nan_dump_pid{os.getpid()}.pt",
                         )
                         torch.save(
                             {
@@ -8435,6 +8645,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
 class FlashAttnV100Backend(TritonAttentionBackend):
     """Flash Attention V100 Backend."""
+
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
+    supported_kv_cache_dtypes = [
+        *TritonAttentionBackend.supported_kv_cache_dtypes,
+        "int8_block32",
+    ]
 
     # Keep vLLM unified KV cache update path.
     forward_includes_kv_cache_update: bool = False

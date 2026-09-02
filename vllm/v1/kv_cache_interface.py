@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+INT8_BLOCK32_CHANNEL_SIZE = 32
+
 
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
@@ -41,6 +43,7 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
+    INT8_BLOCK32 = 5  # FP16 scales per page, head, and 32-channel block
 
     @property
     def is_per_token_head(self) -> bool:
@@ -55,11 +58,18 @@ class KVQuantMode(IntEnum):
         """True for NVFP4 packed quantization mode."""
         return self == KVQuantMode.NVFP4
 
+    @property
+    def is_int8_block32(self) -> bool:
+        """True for signed INT8 values with page-level 32-channel scales."""
+        return self == KVQuantMode.INT8_BLOCK32
+
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
+    if kv_cache_dtype == "int8_block32":
+        return KVQuantMode.INT8_BLOCK32
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
@@ -71,6 +81,82 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
+
+
+def make_int8_block32_kv_cache_views(
+    raw_cache: torch.Tensor,
+    *,
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Create page-local payload, scale, and publication-owner views."""
+    if raw_cache.dtype != torch.int8 or raw_cache.ndim != 1:
+        raise ValueError("INT8 block cache requires a one-dimensional int8 buffer")
+    if head_size % INT8_BLOCK32_CHANNEL_SIZE != 0:
+        raise ValueError("INT8 block cache requires a head size divisible by 32")
+
+    channel_blocks = head_size // INT8_BLOCK32_CHANNEL_SIZE
+    half_size = torch.empty([], dtype=torch.float16).element_size()
+    side_payload_bytes = block_size * num_kv_heads * head_size
+    side_scale_elements = num_kv_heads * channel_blocks
+    owner_size = torch.empty([], dtype=torch.int32).element_size()
+    page_bytes = (
+        2 * side_payload_bytes + 2 * side_scale_elements * half_size + owner_size
+    )
+    required_bytes = num_blocks * page_bytes
+    if raw_cache.numel() != required_bytes:
+        raise ValueError(
+            "INT8 block cache allocation has an invalid size: "
+            f"expected {required_bytes} bytes, got {raw_cache.numel()}"
+        )
+
+    payload_size = (num_blocks, block_size, num_kv_heads, head_size)
+    payload_stride = (page_bytes, num_kv_heads * head_size, head_size, 1)
+    key_cache = torch.as_strided(raw_cache, size=payload_size, stride=payload_stride)
+    value_cache = torch.as_strided(
+        raw_cache,
+        size=payload_size,
+        stride=payload_stride,
+        storage_offset=side_payload_bytes,
+    )
+
+    scale_base = torch.empty(0, dtype=torch.float16, device=raw_cache.device).set_(
+        raw_cache.untyped_storage()
+    )
+    scale_size = (num_blocks, num_kv_heads, channel_blocks)
+    scale_stride = (page_bytes // half_size, channel_blocks, 1)
+    key_scales = torch.as_strided(
+        scale_base,
+        size=scale_size,
+        stride=scale_stride,
+        storage_offset=2 * side_payload_bytes // half_size,
+    )
+    value_scales = torch.as_strided(
+        scale_base,
+        size=scale_size,
+        stride=scale_stride,
+        storage_offset=(2 * side_payload_bytes // half_size + side_scale_elements),
+    )
+
+    owner_base = torch.empty(0, dtype=torch.int32, device=raw_cache.device).set_(
+        raw_cache.untyped_storage()
+    )
+    page_owners = torch.as_strided(
+        owner_base,
+        size=(num_blocks,),
+        stride=(page_bytes // owner_size,),
+        storage_offset=(2 * side_payload_bytes + 2 * side_scale_elements * half_size)
+        // owner_size,
+    )
+    return key_cache, value_cache, key_scales, value_scales, page_owners
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
@@ -167,6 +253,13 @@ class AttentionSpec(KVCacheSpec):
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
+        elif self.kv_quant_mode.is_int8_block32:
+            if self.page_size_padded is not None:
+                raise ValueError("INT8 block cache does not support padded pages")
+            scale_blocks = cdiv(self.head_size, INT8_BLOCK32_CHANNEL_SIZE)
+            real_page_size += 2 * self.num_kv_heads * scale_blocks * get_dtype_size(
+                torch.float16
+            ) + get_dtype_size(torch.int32)
         if self.page_size_padded is not None:
             assert self.page_size_padded >= real_page_size
             return self.page_size_padded
@@ -215,6 +308,8 @@ class FullAttentionSpec(AttentionSpec):
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
+        if self.kv_quant_mode.is_int8_block32 and self.head_size_v != self.head_size:
+            raise ValueError("INT8 block cache requires equal key and value head sizes")
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -248,14 +343,14 @@ class FullAttentionSpec(AttentionSpec):
             "All attention layers in the same KV cache group must be FullAttentionSpec."
         )
 
-        sliding_window = set(
+        sliding_window = {
             spec.sliding_window for spec in specs if spec.sliding_window is not None
-        )
-        attention_chunk_size = set(
+        }
+        attention_chunk_size = {
             spec.attention_chunk_size
             for spec in specs
             if spec.attention_chunk_size is not None
-        )
+        }
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
@@ -276,12 +371,11 @@ class FullAttentionSpec(AttentionSpec):
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
                 )
-        assert (merged_spec.sliding_window is not None) + (
-            merged_spec.attention_chunk_size is not None
-        ) <= 1, (
-            "Model with both sliding window layers and chunked local attention "
-            "layers is not supported."
-        )
+        if merged_spec.sliding_window and merged_spec.attention_chunk_size:
+            raise ValueError(
+                "Model with both sliding window layers and chunked local attention "
+                "layers is not supported."
+            )
         return merged_spec
 
     @property
@@ -387,9 +481,9 @@ class MLAAttentionSpec(FullAttentionSpec):
         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
-        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-        compress_ratio_set = set(spec.compress_ratio for spec in specs)
-        model_version_set = set(spec.model_version for spec in specs)
+        cache_dtype_str_set = {spec.cache_dtype_str for spec in specs}
+        compress_ratio_set = {spec.compress_ratio for spec in specs}
+        model_version_set = {spec.model_version for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
@@ -414,8 +508,6 @@ class MLAAttentionSpec(FullAttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class HiddenStateCacheSpec(MLAAttentionSpec):
     """Marker for hidden-state cache layers used by extract_hidden_states."""
-
-    pass
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -615,10 +707,10 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             "All attention layers in the same KV cache group must be "
             "SlidingWindowMLASpec."
         )
-        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-        compress_ratio_set = set(spec.compress_ratio for spec in specs)
-        model_version_set = set(spec.model_version for spec in specs)
-        sliding_window_set = set(spec.sliding_window for spec in specs)
+        cache_dtype_str_set = {spec.cache_dtype_str for spec in specs}
+        compress_ratio_set = {spec.compress_ratio for spec in specs}
+        model_version_set = {spec.model_version for spec in specs}
+        sliding_window_set = {spec.sliding_window for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
@@ -680,7 +772,7 @@ class MambaSpec(KVCacheSpec):
     def real_page_size_bytes(self) -> int:
         return sum(
             prod(shape) * get_dtype_size(dtype)
-            for (shape, dtype) in zip(self.shapes, self.dtypes)
+            for (shape, dtype) in zip(self.shapes, self.dtypes, strict=False)
         )
 
     @property
@@ -737,14 +829,14 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be FullAttentionSpec."
         )
 
-        sliding_window = set(
+        sliding_window = {
             spec.sliding_window for spec in specs if spec.sliding_window is not None
-        )
-        attention_chunk_size = set(
+        }
+        attention_chunk_size = {
             spec.attention_chunk_size
             for spec in specs
             if spec.attention_chunk_size is not None
-        )
+        }
         assert not any(isinstance(spec, MLAAttentionSpec) for spec in specs), (
             "MLAAttentionSpec should be merged in MLAAttentionSpec.merge"
         )
@@ -766,12 +858,11 @@ class SinkFullAttentionSpec(FullAttentionSpec):
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
                 )
-        assert (merged_spec.sliding_window is not None) + (
-            merged_spec.attention_chunk_size is not None
-        ) <= 1, (
-            "Model with both sliding window layers and chunked local attention "
-            "layers is not supported."
-        )
+        if merged_spec.sliding_window and merged_spec.attention_chunk_size:
+            raise ValueError(
+                "Model with both sliding window layers and chunked local attention "
+                "layers is not supported."
+            )
         return merged_spec
 
 
@@ -806,7 +897,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         """
         Whether all layers have the same type of KV cache spec.
         """
-        block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+        block_sizes = {spec.block_size for spec in kv_cache_specs.values()}
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
@@ -871,7 +962,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 
     # NOTE: below util functions are only used by DeepseekV4 for now.
     def get_page_sizes(self) -> list[int]:
-        return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
+        return list({spec.page_size_bytes for spec in self.kv_cache_specs.values()})
 
     def get_num_layer_tuples(self) -> int:
         return Counter(

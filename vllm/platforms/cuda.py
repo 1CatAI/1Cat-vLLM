@@ -186,6 +186,7 @@ class CudaPlatformBase(Platform):
     ray_device_key: str = "GPU"
     dist_backend: str = "nccl"
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+    # pi-lens-ignore: python-mutable-class-attr
     ray_noset_device_env_vars: list[str] = [
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     ]
@@ -225,7 +226,10 @@ class CudaPlatformBase(Platform):
     def get_cuda_runtime_major(cls) -> int:
         """Major ``torch.version.cuda`` version, or ``0`` if undetermined."""
         major = (torch.version.cuda or "0").split(".", 1)[0]
-        return int(major) if major.isdigit() else 0
+        try:
+            return int(major)
+        except ValueError:
+            return 0
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -465,8 +469,12 @@ class CudaPlatformBase(Platform):
                         f"Using backend {vit_attn_backend} for vit attention",
                     )
                     return vit_attn_backend
-            except ImportError:
-                pass
+            except ImportError as error:
+                logger.debug(
+                    "Skipping unavailable ViT attention backend %s: %s",
+                    vit_attn_backend,
+                    error,
+                )
 
         return AttentionBackendEnum.TORCH_SDPA
 
@@ -641,7 +649,9 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @cache
     @with_nvml_context
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+    def get_device_capability(  # type: ignore[override]
+        cls, device_id: int = 0
+    ) -> DeviceCapability | None:
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
@@ -680,15 +690,19 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-        return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        total = pynvml.nvmlDeviceGetMemoryInfo(handle).total
+        try:
+            return int(total)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("NVML returned an invalid memory size") from error
 
     @classmethod
     @with_nvml_context
-    def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
+    def is_fully_connected(cls, device_ids: list[int]) -> bool:
         """
         query if the set of gpus are fully connected by nvlink (1 hop)
         """
-        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
@@ -733,8 +747,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
                 numa_node,
                 device_id,
             )
-        except Exception:
-            pass
+        except Exception as error:
+            logger.debug(
+                "NVML NUMA-node lookup failed for GPU %d: %s",
+                device_id,
+                error,
+            )
 
         try:
             cpu_ids = cls._get_device_cpu_affinity(handle)
@@ -813,10 +831,17 @@ class NvmlCudaPlatform(CudaPlatformBase):
             part = part.strip()
             if "-" in part:
                 start, end = part.split("-", 1)
-                if int(start) <= cpu_id <= int(end):
-                    return True
-            elif part.isdigit() and int(part) == cpu_id:
-                return True
+                try:
+                    if int(start) <= cpu_id <= int(end):
+                        return True
+                except ValueError:
+                    continue
+            elif part.isdigit():
+                try:
+                    if int(part) == cpu_id:
+                        return True
+                except ValueError:
+                    continue
         return False
 
     @classmethod
@@ -877,7 +902,9 @@ class NvmlCudaPlatform(CudaPlatformBase):
 class NonNvmlCudaPlatform(CudaPlatformBase):
     @classmethod
     @cache
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
+    def get_device_capability(  # type: ignore[override]
+        cls, device_id: int = 0
+    ) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)
         return DeviceCapability(major=major, minor=minor)
 
@@ -891,7 +918,8 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
         return device_props.total_memory
 
     @classmethod
-    def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
+    def is_fully_connected(cls, device_ids: list[int]) -> bool:
+        del device_ids
         logger.exception(
             "NVLink detection not possible, as context support was"
             " not found. Assuming no NVLink available."

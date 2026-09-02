@@ -126,12 +126,19 @@ def init_attn_backend(
                 num_metadata_builders=1,
             )
             builder = group.get_metadata_builder(0)
+            builder_any = cast(Any, builder)
             if attn_backend_workspace is None:
-                if hasattr(builder, "_get_workspace_buffer"):
-                    attn_backend_workspace = builder._get_workspace_buffer()
+                get_workspace_buffer = getattr(
+                    builder_any, "_get_workspace_buffer", None
+                )
+                if callable(get_workspace_buffer):
+                    attn_backend_workspace = get_workspace_buffer()
             else:
-                if hasattr(builder, "set_workspace_buffer"):
-                    builder.set_workspace_buffer(attn_backend_workspace)
+                set_workspace_buffer = getattr(
+                    builder_any, "set_workspace_buffer", None
+                )
+                if callable(set_workspace_buffer):
+                    set_workspace_buffer(attn_backend_workspace)
             # Check cudagraph support for the attention backend
             cg_support = builder.get_cudagraph_support(
                 vllm_config,
@@ -224,6 +231,20 @@ def _reshape_kv_cache(
                     for i in range(len(kv_cache_stride_order))
                 ]
 
+                if kv_cache_spec.kv_quant_mode.is_int8_block32:
+                    if (
+                        kernel_num_blocks != num_blocks
+                        or kernel_block_size != kv_cache_spec.block_size
+                    ):
+                        raise ValueError(
+                            "INT8 block cache requires the scheduler and kernel "
+                            "page sizes to match"
+                        )
+                    kv_caches[layer_name] = kv_raw_tensor.view(
+                        kernel_num_blocks, kv_cache_spec.page_size_bytes
+                    )
+                    continue
+
                 dtype = kv_cache_spec.dtype
                 kv_tensor = kv_raw_tensor.view(dtype)
                 if kv_cache_spec.page_size_padded is not None:
@@ -252,7 +273,9 @@ def _reshape_kv_cache(
                 has_mamba = True
                 state_tensors = []
                 storage_offset_bytes = 0
-                for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                for shape, dtype in zip(
+                    kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=False
+                ):
                     dtype_size = get_dtype_size(dtype)
                     num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
                     target_shape = (num_blocks, *shape)
@@ -351,7 +374,7 @@ def init_kv_cache(
     kv_cache_raw_tensors = _allocate_kv_cache(
         kv_cache_config, shared_kv_cache_layers, device
     )
-    flattened_attn_groups = list(group for groups in attn_groups for group in groups)
+    flattened_attn_groups = [group for groups in attn_groups for group in groups]
     kv_caches = _reshape_kv_cache(
         attn_groups=flattened_attn_groups,
         kv_cache_raw_tensors=kv_cache_raw_tensors,
@@ -368,7 +391,9 @@ def build_slot_mappings_by_layer(
 ) -> dict[str, torch.Tensor]:
     slot_mappings_by_layer: dict[str, torch.Tensor] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
-    for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
+    for slot_mapping, kv_cache_group in zip(
+        slot_mappings, kv_cache_groups, strict=False
+    ):
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
     return slot_mappings_by_layer
@@ -391,6 +416,13 @@ class CommonGDNSpecMetadata:
     spec_sequence_masks: torch.Tensor
     spec_token_indx: torch.Tensor
     non_spec_token_indx: torch.Tensor
+
+
+def _tensor_item_int(value: torch.Tensor) -> int:
+    try:
+        return int(value.item())
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("Failed to read a scalar attention metadata tensor") from error
 
 
 def compute_common_gdn_attn_metadata(
@@ -417,11 +449,11 @@ def compute_common_gdn_attn_metadata(
         raise ValueError("num_decode_draft_tokens_cpu must align with query_start_loc")
 
     spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-    num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+    num_spec_decodes = _tensor_item_int(spec_sequence_masks_cpu.sum())
     if num_spec_decodes == 0:
         return None
-    num_spec_draft_tokens = int(
-        num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
+    num_spec_draft_tokens = _tensor_item_int(
+        num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum()
     )
     if num_spec_draft_tokens == 0:
         return None
@@ -431,28 +463,28 @@ def compute_common_gdn_attn_metadata(
     )
     query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
     non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-    num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
+    num_zero_len = _tensor_item_int((non_spec_query_lens_cpu == 0).sum())
 
     if legacy_mixed_decode_routing:
-        num_decodes = int((non_spec_query_lens_cpu == 1).sum().item())
+        num_decodes = _tensor_item_int((non_spec_query_lens_cpu == 1).sum())
         num_prefills = non_spec_query_lens_cpu.numel() - num_decodes - num_zero_len
         num_decode_tokens = num_decodes
         num_prefill_tokens = (
-            int(non_spec_query_lens_cpu.sum().item()) - num_decode_tokens
+            _tensor_item_int(non_spec_query_lens_cpu.sum()) - num_decode_tokens
         )
     else:
         num_decodes = 0
         num_prefills = non_spec_query_lens_cpu.numel() - num_zero_len
         num_decode_tokens = 0
-        num_prefill_tokens = int(non_spec_query_lens_cpu.sum().item())
+        num_prefill_tokens = _tensor_item_int(non_spec_query_lens_cpu.sum())
 
     num_spec_decode_tokens = (
-        int(query_lens_cpu.sum().item()) - num_prefill_tokens - num_decode_tokens
+        _tensor_item_int(query_lens_cpu.sum()) - num_prefill_tokens - num_decode_tokens
     )
     if num_prefills == 0 and num_decodes == 0:
         spec_token_size = min(
             num_spec_decodes * (num_spec_state_tokens + 1),
-            int(query_start_loc_cpu[-1].item()),
+            _tensor_item_int(query_start_loc_cpu[-1]),
         )
         spec_token_indx = torch.arange(
             spec_token_size,
@@ -472,7 +504,7 @@ def compute_common_gdn_attn_metadata(
         spec_token_masks = torch.repeat_interleave(
             spec_sequence_masks,
             query_lens,
-            output_size=int(query_start_loc_cpu[-1].item()),
+            output_size=_tensor_item_int(query_start_loc_cpu[-1]),
         )
         index = torch.argsort(spec_token_masks, stable=True)
         num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
@@ -561,9 +593,11 @@ def build_attn_metadata(
         # Hybrid drafters can assign different causality to each KV group.
         # A Mapping must be resolved here; passing the dict itself into the
         # backend metadata makes it truthy and silently selects causal kernels.
-        group_causal = (
-            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
-        )
+        group_causal: bool | torch.Tensor
+        if isinstance(causal, Mapping):
+            group_causal = cast(Mapping[int, bool], causal).get(i, True)
+        else:
+            group_causal = cast(bool | torch.Tensor, causal)
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)

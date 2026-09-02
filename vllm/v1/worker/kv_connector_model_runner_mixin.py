@@ -145,6 +145,10 @@ class KVConnectorModelRunnerMixin:
             True if we should use a uniform KV cache layout.
         """
 
+        if cache_dtype == "int8_block32":
+            # The INT8 cache uses a backend-specific two-dimensional page
+            # tensor. The cross-layer layout assumes the standard KV shape.
+            return False
         if not has_kv_transfer_group():
             return False
         if not get_kv_transfer_group().prefer_cross_layer_blocks:
@@ -213,9 +217,9 @@ class KVConnectorModelRunnerMixin:
         kv_cache_spec = attn_group.kv_cache_spec
         assert isinstance(kv_cache_spec, AttentionSpec)
 
-        tensor_sizes = set(
+        tensor_sizes = {
             kv_cache_tensor.size for kv_cache_tensor in kv_cache_config.kv_cache_tensors
-        )
+        }
         assert len(tensor_sizes) == 1
         tensor_size = tensor_sizes.pop()
 

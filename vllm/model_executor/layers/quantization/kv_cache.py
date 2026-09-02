@@ -70,10 +70,12 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             del layer.prob_scale
             return
 
-        # Per-token-head quantized KV cache: scales are computed dynamically
-        # per (token, head) in the kernel at cache-write time.  Checkpoint
-        # scales are never used regardless of calculate_kv_scales.
-        if kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+        # Dynamic KV-cache modes compute scales in the cache-write kernel.
+        # Checkpoint scales are never used regardless of calculate_kv_scales.
+        if (
+            kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype)
+            or layer.kv_cache_dtype == "int8_block32"
+        ):
             layer._k_scale.copy_(1.0)
             layer._v_scale.copy_(1.0)
             layer._k_scale_float = 1.0
@@ -156,12 +158,11 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         else:
             prob_scale = 1.0
 
-        is_singleton_float = (
-            lambda x: isinstance(x, float)
-            or isinstance(x, torch.Tensor)
-            and x.numel() == 1
-            and x.is_floating_point()
-        )
+        def is_singleton_float(x: object) -> bool:
+            return isinstance(x, float) or (
+                isinstance(x, torch.Tensor) and x.numel() == 1 and x.is_floating_point()
+            )
+
         if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
             raise ValueError(
                 "Only support per-tensor scaling factorfor fp8-quantized Q/prob"

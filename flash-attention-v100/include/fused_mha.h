@@ -141,6 +141,24 @@ void flash_attention_fp8_e5m2_paged_kv_to_fp16(
     at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
     const float value_scale);
 
+void flash_attention_int8_block32_reshape_and_cache(
+    const at::Tensor& key, const at::Tensor& value, at::Tensor& key_cache,
+    at::Tensor& value_cache, at::Tensor& key_scales, at::Tensor& value_scales,
+    at::Tensor& page_owners, const at::Tensor& slot_mapping);
+
+void flash_attention_int8_block32_decode_paged(
+    const at::Tensor& query, const at::Tensor& key_cache,
+    const at::Tensor& value_cache, const at::Tensor& key_scales,
+    const at::Tensor& value_scales, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& output, const float softmax_scale);
+
+void flash_attention_int8_block32_prefill_paged(
+    const at::Tensor& query, const at::Tensor& key_cache,
+    const at::Tensor& value_cache, const at::Tensor& key_scales,
+    const at::Tensor& value_scales, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const at::Tensor& query_start_loc,
+    at::Tensor& output, const float softmax_scale);
+
 std::vector<at::Tensor> flash_attention_backward(
     const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k,
     const at::Tensor& v, const at::Tensor& out, const at::Tensor& softmax_lse,

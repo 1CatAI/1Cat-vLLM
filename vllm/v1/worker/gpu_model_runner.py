@@ -3623,7 +3623,7 @@ class GPUModelRunner(
         req_ids = tuple(f"dummy-{i}" for i in range(num_reqs))
         metadata = build_padded_parent_ids(
             req_ids,
-            {req_id: payload for req_id in req_ids},
+            dict.fromkeys(req_ids, payload),
             device="cpu",
             pad_to=width,
         )
@@ -6330,6 +6330,7 @@ class GPUModelRunner(
                         self.encoder_cudagraph_manager is not None
                         and self.encoder_cudagraph_manager.supports_modality(modality)
                     ):
+                        # pi-lens-ignore: python-sql-injection
                         cudagraph_output = self.encoder_cudagraph_manager.execute(
                             mm_kwargs_batch,
                         )
@@ -10572,7 +10573,7 @@ class GPUModelRunner(
     ) -> dict[str, int]:
         try:
             if logits is None:
-                return {req_id: 0 for req_id in self.input_batch.req_ids}
+                return dict.fromkeys(self.input_batch.req_ids, 0)
 
             num_nans_in_logits = {}
             num_nans_for_index = logits.isnan().sum(dim=-1).cpu().numpy()
@@ -12358,7 +12359,7 @@ class GPUModelRunner(
         kernel_block_sizes: list[int],
     ) -> dict[str, torch.Tensor]:
         """
-        Reshape the KV cache tensors to the desired shape and dtype.
+        Reshape each KV cache allocation to its backend storage layout.
 
         Args:
             kv_cache_raw_tensors: The KV cache buffer of each layer, with
@@ -12425,6 +12426,20 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+
+                    if kv_cache_spec.kv_quant_mode.is_int8_block32:
+                        if (
+                            kernel_num_blocks != num_blocks
+                            or kernel_block_size != kv_cache_spec.block_size
+                        ):
+                            raise ValueError(
+                                "INT8 block cache requires the scheduler and kernel "
+                                "page sizes to match"
+                            )
+                        kv_caches[layer_name] = kv_cache_raw_tensors[layer_name].view(
+                            kernel_num_blocks, kv_cache_spec.page_size_bytes
+                        )
+                        continue
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
                     if kv_cache_spec.page_size_padded is not None:

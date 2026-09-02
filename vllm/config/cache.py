@@ -30,6 +30,7 @@ CacheDType = Literal[
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
     "int8_per_token_head",
+    "int8_block32",
     "fp8_per_token_head",
     "nvfp4",
 ]
@@ -74,7 +75,9 @@ class CacheConfig:
     set the GPU memory utilization to 0.5 for each instance."""
     cache_dtype: CacheDType = "auto"
     """Data type for kv cache storage. If "auto", will use model data type.
-    CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ROCm (AMD GPU) supports
+    CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. ``int8_block32`` uses
+    signed INT8 values with separate FP16 page, head, and 32-channel scales.
+    ROCm (AMD GPU) supports
     fp8 (=fp8_e4m3). Intel Gaudi (HPU) supports fp8 (using fp8_inc).
     On SM70 with the 1Cat Flash-V100 backend enabled, the user-facing ``fp8``
     shorthand resolves to fp8_e5m2 for compatibility with its optimized KV
