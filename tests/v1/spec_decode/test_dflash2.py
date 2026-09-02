@@ -24,9 +24,11 @@ from vllm.config.speculative import (
 )
 from vllm.config.vllm import (
     _SM70_DFLASH2_VERIFIER_DEFAULTS,
+    _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS,
     _apply_sm70_dflash2_verifier_defaults,
     _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path,
     _configure_sm70_glm5_dflash_tp4_push_allreduce,
+    _configure_sm70_glm5_dflash_tp8_pp1_verifier_path,
     _is_sm70_dflash2_verifier_contract,
 )
 from vllm.model_executor.layers.attention import Attention
@@ -387,6 +389,107 @@ def test_glm5_dflash_tp4_push_allreduce_preserves_explicit_override(monkeypatch)
     )
 
     assert os.environ[name] == "1"
+
+
+def _glm5_dflash_tp8_verifier_config():
+    return (
+        SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm5_next_text"),
+            quantization="modelopt_fp4",
+            dtype=torch.float16,
+        ),
+        SimpleNamespace(
+            method="dflash",
+            draft_sample_method="probabilistic",
+            num_speculative_tokens=7,
+        ),
+        SimpleNamespace(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            enable_dbo=False,
+            ubatch_size=0,
+        ),
+    )
+
+
+def test_glm5_dflash_tp8_pp1_auto_selects_verifier_path(monkeypatch):
+    for name in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+
+    selected = _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+        *_glm5_dflash_tp8_verifier_config(), is_sm70=True
+    )
+
+    assert selected
+    assert {
+        name: os.environ.get(name) for name in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS
+    } == _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model_type", "qwen3"),
+        ("quantization", None),
+        ("dtype", torch.bfloat16),
+        ("method", "draft_model"),
+        ("draft_sample_method", "greedy"),
+        ("num_speculative_tokens", 6),
+        ("tensor_parallel_size", 4),
+        ("pipeline_parallel_size", 2),
+        ("enable_dbo", True),
+        ("ubatch_size", 2),
+        ("is_sm70", False),
+    ],
+)
+def test_glm5_dflash_tp8_verifier_policy_does_not_change_other_routes(
+    monkeypatch, field, value
+):
+    for name in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+
+    model_config, speculative_config, parallel_config = (
+        _glm5_dflash_tp8_verifier_config()
+    )
+    is_sm70 = True
+    if field == "model_type":
+        model_config.hf_text_config.model_type = value
+    elif field == "is_sm70":
+        is_sm70 = value
+    elif hasattr(model_config, field):
+        setattr(model_config, field, value)
+    elif hasattr(speculative_config, field):
+        setattr(speculative_config, field, value)
+    else:
+        setattr(parallel_config, field, value)
+
+    selected = _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+        model_config,
+        speculative_config,
+        parallel_config,
+        is_sm70=is_sm70,
+    )
+
+    assert not selected
+    assert not any(name in os.environ for name in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS)
+
+
+def test_glm5_dflash_tp8_verifier_policy_preserves_explicit_override(monkeypatch):
+    overridden_name = "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION"
+    monkeypatch.setenv(overridden_name, "1")
+    for name in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS:
+        if name != overridden_name:
+            monkeypatch.delenv(name, raising=False)
+
+    selected = _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+        *_glm5_dflash_tp8_verifier_config(), is_sm70=True
+    )
+
+    assert selected
+    assert os.environ[overridden_name] == "1"
+    for name, value in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS.items():
+        if name != overridden_name:
+            assert os.environ[name] == value
 
 
 def _glm5_dflash_acceptance_config():

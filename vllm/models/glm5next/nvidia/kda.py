@@ -186,6 +186,13 @@ def _sm70_exact_kda_gemv_enabled() -> bool:
     return os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "1") != "0"
 
 
+def _sm70_glm53_tp8_cublaslt_enabled() -> bool:
+    return (
+        os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0") != "0"
+        and torch.version.cuda == "12.8"
+    )
+
+
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
     """Merged projection with multiple replicated output shards.
 
@@ -357,6 +364,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and current_platform.get_device_capability() == (7, 0)
             and self.head_dim == 128
         )
+        self._use_sm70_glm53_tp8_cublaslt = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.tp_size == 8
+            and self.hidden_size == 4096
+            and self.local_projection_size == 1024
+            and _sm70_glm53_tp8_cublaslt_enabled()
+        )
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
@@ -443,6 +458,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        self.in_proj_qkvbfg_a._sm70_glm53_tp8_cublaslt = (
+            self._use_sm70_glm53_tp8_cublaslt
+        )
+        self.o_proj._sm70_glm53_tp8_cublaslt = self._use_sm70_glm53_tp8_cublaslt
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:

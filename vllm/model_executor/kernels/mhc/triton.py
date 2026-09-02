@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import vllm._sm70_ops as sm70_ops
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -394,13 +395,17 @@ def sm70_mhc_pre_norm_from_staging(
     if norm_weight.dtype != torch.float16:
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
-    if num_tokens == 1:
+    use_native_verify = num_tokens == 8 and envs.VLLM_SM70_GLM53_MHC_NATIVE_VERIFY
+    if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
                 "SM70 GLM mHC decode requires the native CUDA final-stage op. "
                 "Rebuild vLLM from source with CUDA arch 7.0."
             )
-        logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
+        if use_native_verify:
+            logger.info_once("SM70 GLM mHC native CUDA q8 final stage enabled.")
+        else:
+            logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
         sm70_ops.sm70_glm_mhc_pre_norm_out(
             gemm_out_mul,
             gemm_out_sqrsum,

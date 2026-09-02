@@ -102,6 +102,28 @@ _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
 }
 
+_SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
+    "VLLM_SM70_DFLASH2_BF16_EMULATION": "1",
+    # The sparse target sampler is not part of the retained GLM quality route.
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "0",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": "1",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": "1",
+    "VLLM_SM70_GLM53_TP8_CUBLASLT": "1",
+    "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": "1",
+    "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": "1",
+    "VLLM_SM70_GLM_MHC_PRE_THREADS": "1024",
+    "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": "0",
+    "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS": "1",
+    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": "1",
+    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": "1",
+    "VLLM_USE_AOT_COMPILE": "0",
+}
+
 
 def _is_sm70_dflash2_verifier_contract(
     model_config: Any,
@@ -220,6 +242,57 @@ def _configure_sm70_glm5_dflash_tp4_push_allreduce(
             env_name,
             os.environ[env_name],
         )
+
+
+def _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+    model_config: ModelConfig | None,
+    speculative_config: SpeculativeConfig | None,
+    parallel_config: ParallelConfig,
+    *,
+    is_sm70: bool,
+) -> bool:
+    """Select the quality-qualified GLM-5.3 DFlash2 TP8 verifier path."""
+    if (
+        not is_sm70
+        or model_config is None
+        or getattr(model_config.hf_text_config, "model_type", None)
+        not in ("glm5_next", "glm5_next_text")
+        or getattr(model_config, "quantization", None) != "modelopt_fp4"
+        or getattr(model_config, "dtype", None) != torch.float16
+        or speculative_config is None
+        or speculative_config.method != "dflash"
+        or speculative_config.draft_sample_method != "probabilistic"
+        or speculative_config.num_speculative_tokens != 7
+        or parallel_config.tensor_parallel_size != 8
+        or parallel_config.pipeline_parallel_size != 1
+        or getattr(parallel_config, "enable_dbo", False)
+        or int(getattr(parallel_config, "ubatch_size", 0) or 0) > 1
+    ):
+        return False
+
+    configured = []
+    overrides = []
+    for name, value in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            configured.append(f"{name}={value}")
+        elif os.environ[name] != value:
+            overrides.append(f"{name}={os.environ[name]}")
+
+    if configured:
+        logger.info_once(
+            "Auto-selecting the quality-qualified SM70 GLM-5.3 DFlash2 "
+            "TP8/PP1 verifier path: %s.",
+            ", ".join(configured),
+        )
+    if overrides:
+        logger.warning_once(
+            "Explicit SM70 GLM-5.3 DFlash2 overrides differ from the retained "
+            "TP8/PP1 verifier contract: %s. Re-run the exactness, acceptance, "
+            "output-quality, and verifier-latency gates before production use.",
+            ", ".join(overrides),
+        )
+    return True
 
 
 def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
@@ -1476,6 +1549,17 @@ class VllmConfig:
                 and current_platform.is_device_capability((7, 0))
             ),
         )
+        sm70_glm5_dflash_tp8_pp1_verifier = (
+            _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+                self.model_config,
+                self.speculative_config,
+                self.parallel_config,
+                is_sm70=(
+                    current_platform.is_cuda()
+                    and current_platform.is_device_capability((7, 0))
+                ),
+            )
+        )
         _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
             self.model_config,
             self.speculative_config,
@@ -1880,12 +1964,18 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity."
                     )
                 elif os.environ.get("VLLM_USE_AOT_COMPILE") == "0":
-                    logger.warning_once(
-                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
-                        "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
-                        "configuration: regular torch.compile reproduced "
-                        "deterministic greedy token drift."
-                    )
+                    if sm70_glm5_dflash_tp8_pp1_verifier:
+                        logger.info_once(
+                            "Using the quality-qualified regular torch.compile "
+                            "path for SM70 GLM-5.3 DFlash2 TP8/PP1."
+                        )
+                    else:
+                        logger.warning_once(
+                            "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
+                            "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
+                            "configuration: regular torch.compile reproduced "
+                            "deterministic greedy token drift."
+                        )
                 if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
                     logger.warning_once(
                         "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "

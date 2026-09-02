@@ -54,11 +54,46 @@ def _interleave_output_rows_for_gated_silu(weight: torch.Tensor) -> torch.Tensor
     return torch.stack((weight[:half], weight[half:]), dim=1).reshape(weight.shape)
 
 
+def _maybe_sm70_glm53_tp8_cublaslt(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if not getattr(layer, "_sm70_glm53_tp8_cublaslt", False):
+        return None
+    if bias is not None or x.dtype != torch.float16 or x.shape[-1] not in (1024, 4096):
+        return None
+    x_2d = x.reshape(-1, x.shape[-1])
+    if x_2d.shape[0] != 8 or not x_2d.is_contiguous():
+        return None
+    weight = layer.weight
+    if weight.dtype != torch.float16 or not weight.is_contiguous():
+        return None
+    shape = (tuple(weight.shape), tuple(x_2d.shape))
+    if shape not in (
+        ((3336, 4096), (8, 4096)),
+        ((4096, 1024), (8, 1024)),
+    ):
+        return None
+    if not hasattr(torch.ops._C, "sm70_glm53_tp8_cublaslt_out"):
+        raise RuntimeError(
+            "The SM70 GLM-5.3 TP8 cuBLASLt projection requires its native "
+            "op. Rebuild vLLM from source with CUDA 12.8 and arch 7.0."
+        )
+    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    sm70_ops.sm70_glm53_tp8_cublaslt_out(out, x_2d, weight)
+    logger.info_once("SM70 GLM-5.3 TP8 cuBLASLt M8 projection path enabled.")
+    return out.reshape(*x.shape[:-1], out.shape[-1])
+
+
 def _maybe_sm70_dense_forward(
     layer: torch.nn.Module,
     x: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
+    glm53_output = _maybe_sm70_glm53_tp8_cublaslt(layer, x, bias)
+    if glm53_output is not None:
+        return glm53_output
     if getattr(layer, "_sm70_f16_forbidden", False):
         return None
     if not getattr(layer, "_sm70_f16_prepared", False):
