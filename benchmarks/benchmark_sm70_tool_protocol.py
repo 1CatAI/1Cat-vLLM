@@ -894,6 +894,7 @@ def _run_json_schema_bench_sample(
     schema_dir: Path,
     limit: int,
     max_schema_bytes: int,
+    max_tokens: int,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     candidates = sorted(
@@ -933,7 +934,7 @@ def _run_json_schema_bench_sample(
             "return_token_ids": True,
             "temperature": 0.0,
             "seed": seed,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -1191,6 +1192,10 @@ def _run_structured(base_url: str, model: str, seed: int) -> dict[str, Any]:
             "temperature": 0.0,
             "seed": seed,
             "max_tokens": 512,
+            # This is a protocol/escaping gate, not a reasoning-budget gate.
+            # Thinking is covered separately with a sufficiently large output
+            # budget so it cannot consume this fixed 512-token contract.
+            "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -1227,6 +1232,7 @@ def main() -> None:
     parser.add_argument("--json-schema-dir", type=Path)
     parser.add_argument("--json-schema-limit", type=int, default=0)
     parser.add_argument("--json-schema-max-bytes", type=int, default=16384)
+    parser.add_argument("--json-schema-max-tokens", type=int, default=2048)
     parser.add_argument(
         "--only-datasets",
         action="store_true",
@@ -1267,6 +1273,7 @@ def main() -> None:
             args.json_schema_dir,
             args.json_schema_limit,
             args.json_schema_max_bytes,
+            args.json_schema_max_tokens,
         )
     result_keys = {
         "tool_chain",
