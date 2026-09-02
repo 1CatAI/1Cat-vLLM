@@ -6,8 +6,8 @@ serving path, substantially improves long-context decode and prefill, adds
 modern hybrid-model and NVFP4 support, and closes the wheel/API reliability
 gaps required for normal deployment.
 
-This release supersedes 1.3.0. The audited release range contains 125 merged
-pull requests and 396 commits after `v1.3.0`.
+This release supersedes 1.3.0. The audited release range contains 126 merged
+pull requests and 400 commits after `v1.3.0`.
 
 > The performance figures below are measured results under the recorded model,
 > GPU count, topology, context, sampling, KV dtype, and speculative-decoding
@@ -65,6 +65,14 @@ on q8. The q16 result is therefore a specialized opt-in capability rather than
 the expected speed of every request
 ([#355](https://github.com/1CatAI/1Cat-vLLM/pull/355),
 [#366](https://github.com/1CatAI/1Cat-vLLM/pull/366)).
+
+The recommended fully quantized target checkpoint for 1.5.0 is
+`QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`. Its fresh-wheel TP4 release gate reaches
+**17.645 ms per warmed complete round**, **4,038.5 tok/s at 32K prefill**, and
+**3,596.5 tok/s at 64K prefill**. This checkpoint has a distinct all-NVFP4
+layout, so these results are reported separately from the earlier mixed-NVFP4
+206 tok/s workload above
+([#445](https://github.com/1CatAI/1Cat-vLLM/pull/445)).
 
 ### Qwen3.8 target-only, MTP, and long-context performance
 
@@ -128,6 +136,13 @@ target-prefill results; they must not be relabeled as DFlash2 prefill results.
   TurboMind, Marlin, or explicit-emulation backends and fail closed otherwise.
   Scale provenance is preserved without magnitude heuristics
   ([#228](https://github.com/1CatAI/1Cat-vLLM/pull/228)).
+- **QUASAR Qwen3.8-27B full NVFP4.** Adds the fully quantized
+  `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` target to the DFlash2 production path.
+  The SM70 implementation separates the checkpoint's logical TP-local GDN
+  output width of 4,120 from its zero-padded physical execution width of 4,128,
+  enables quality-audited QPN2 execution for compatible projections and packed
+  prefill, and gives MRV2 its own K+1 draft buffers and slot mappings
+  ([#445](https://github.com/1CatAI/1Cat-vLLM/pull/445)).
 - **Qwen3.6-35B-A3B mixed FP8/NVFP4 MoE.** Adds graph-safe grouped NVFP4 MoE,
   compact active-expert paths, duplicate-slot correctness, and cold-start MTP
   warmup. The retained GSM8K result is 122/128 with zero invalid or repetitive
@@ -183,6 +198,15 @@ Absolute delta  : 0.0000506
 
 The quality audit and exact sampling contract are retained in
 [#346](https://github.com/1CatAI/1Cat-vLLM/pull/346).
+
+The recommended all-NVFP4 QUASAR checkpoint has an additional matched gate.
+At seed `20260925`, target-only and DFlash2 both score MBPP 32/32, EvalPlus
+Base 31/31, and Plus 28/31. Across two predeclared seeds there is only one
+paired discordance per score class, while the maximum matched WikiText PPL
+difference is 0.00851. Structured-output B1/B2/B4, a 96-request mixed B4
+stress, tool-chain, nested/escaped JSON, stream parity, and repeated-prefix
+state tests also pass
+([#445](https://github.com/1CatAI/1Cat-vLLM/pull/445)).
 
 ### Tool calling, structured output, and prefix state
 
@@ -285,34 +309,49 @@ Install the published wheel with:
 pip install ./1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl
 ```
 
-### Recommended Qwen3.8 DFlash2 serving example
+### Recommended QUASAR NVFP4 + DFlash2 serving example
+
+Download the recommended fully quantized target checkpoint from ModelScope:
 
 ```bash
-vllm serve /path/to/Qwen3.8-27B-NVFP4 \
+modelscope download \
+  --model QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --local_dir /data/models/Qwen3.8-27B-QUASAR-NVFP4
+```
+
+The following is the tested four-V100 production profile:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+vllm serve /data/models/Qwen3.8-27B-QUASAR-NVFP4 \
   --served-model-name qwen3.8-27b-dflash2 \
   --trust-remote-code \
+  --dtype half \
   --tensor-parallel-size 4 \
   --attention-backend FLASH_ATTN_V100 \
   --kv-cache-dtype fp8_e5m2 \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.80 \
+  --max-num-batched-tokens 4096 \
+  --max-num-seqs 4 \
   --enable-prefix-caching \
   --mamba-cache-mode align \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
-  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","kv_cache_dtype":"auto"}' \
+  --speculative-config '{"method":"dflash","model":"incoai/Qwen3.8-27B-DFlash2","revision":"dedf8df68adfb1afeaf7b7480c0a0243108177b4","kv_cache_dtype":"auto","draft_sample_method":"probabilistic"}' \
   --host 0.0.0.0 \
   --port 8000
 ```
 
 The official draft checkpoint declares block size 8 and selector top-K 16, so
 the runtime resolves seven speculative tokens automatically when the width is
-omitted. Target E5M2 KV is a validated example, not a global DFlash2
-requirement. TP degree, KV dtype, scheduler capacity, and prefill chunk size do
-not globally disable DFlash2; individual optimized operators still retain
-their own exact local admission contracts.
+omitted. TP4, E5M2 target KV, a 4,096-token scheduler budget, and four resident
+sequences are the release-validation profile, not global DFlash2 requirements.
+TP degree, KV dtype, scheduler capacity, and prefill chunk size do not globally
+disable DFlash2; individual optimized operators still retain their own exact
+local admission contracts.
 
 ## Upgrade notes and known limitations
 
@@ -354,8 +393,9 @@ their own exact local admission contracts.
 [#417](https://github.com/1CatAI/1Cat-vLLM/pull/417),
 [#420](https://github.com/1CatAI/1Cat-vLLM/pull/420),
 [#422](https://github.com/1CatAI/1Cat-vLLM/pull/422),
-[#426](https://github.com/1CatAI/1Cat-vLLM/pull/426), and
-[#436](https://github.com/1CatAI/1Cat-vLLM/pull/436).
+[#426](https://github.com/1CatAI/1Cat-vLLM/pull/426),
+[#436](https://github.com/1CatAI/1Cat-vLLM/pull/436), and
+[#445](https://github.com/1CatAI/1Cat-vLLM/pull/445).
 
 ### Attention, quantization, and model performance
 
