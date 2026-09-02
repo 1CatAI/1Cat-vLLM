@@ -10,6 +10,11 @@
 
 ### Modern LLM inference for NVIDIA Tesla V100 / SM70
 
+>recommend models:
+>QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
+>RadixArk/Qwen3.8-Flash-Next-NVFP4
+>incoai/Qwen3.8-27B-DFlash2
+
 <strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
 
 > Tesla V100 was released in 2017.
