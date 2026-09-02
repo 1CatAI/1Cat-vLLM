@@ -65,7 +65,7 @@ def test_sm70_qsa_grouped_page4_calibrated_kv(kv_cache_dtype: str) -> None:
 
     reference_key = reference_key.view(4, 256)
     reference_value = reference_value.view(4, 256)
-    scores = torch.einsum("thd,sd->ths", query.float(), reference_key) / math.sqrt(256)
+    scores = torch.matmul(query.float(), reference_key.transpose(0, 1)) / math.sqrt(256)
     probabilities = torch.softmax(scores, dim=-1)
-    reference = torch.einsum("ths,sd->thd", probabilities, reference_value)
+    reference = torch.matmul(probabilities, reference_value)
     torch.testing.assert_close(output.float(), reference, atol=3e-2, rtol=3e-2)
