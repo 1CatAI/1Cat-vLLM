@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,10 @@ import torch
 _LAYER_DUMP_RE = re.compile(
     r"pid(?P<pid>\d+)_step(?P<step>\d+)_layer(?P<layer>-?\d+)_"
     r"(?P<tail>.+?)_shape(?P<shape>[^/]+)\.pt$"
+)
+_DIRECT_LAYER_DUMP_RE = re.compile(
+    r"pid(?P<pid>\d+)_layer(?P<layer>-?\d+)_(?P<tail>.+?)_"
+    r"(?P<count>\d+)\.pt$"
 )
 _PID_RE = re.compile(r"pid(?P<pid>\d+)_")
 _SAMPLE_DUMP_RE = re.compile(r"sample_tensors_pid(?P<pid>\d+)_step(?P<step>\d+)\.pt$")
@@ -116,7 +121,7 @@ def _load_margin_records(path: Path | None) -> list[dict[str, Any]]:
     return records
 
 
-def _float_diff(left: float | int | None, right: float | int | None) -> float | None:
+def _float_diff(left: float | None, right: float | None) -> float | None:
     if left is None or right is None:
         return None
     return abs(float(left) - float(right))
@@ -225,6 +230,22 @@ def _tensor_stats(left: torch.Tensor, right: torch.Tensor) -> dict[str, Any]:
     right_f = right.float()
     diff = (left_f - right_f).abs()
     nonzero = diff > 0
+    left_square_sum = 0.0
+    right_square_sum = 0.0
+    diff_square_sum = 0.0
+    dot_sum = 0.0
+    chunk_elements = 1 << 20
+    left_flat = left_f.reshape(-1)
+    right_flat = right_f.reshape(-1)
+    for start in range(0, left_flat.numel(), chunk_elements):
+        left_chunk = left_flat[start : start + chunk_elements].double()
+        right_chunk = right_flat[start : start + chunk_elements].double()
+        delta = left_chunk - right_chunk
+        left_square_sum += float(torch.sum(left_chunk.square()).item())
+        right_square_sum += float(torch.sum(right_chunk.square()).item())
+        diff_square_sum += float(torch.sum(delta.square()).item())
+        dot_sum += float(torch.sum(left_chunk * right_chunk).item())
+    denominator = math.sqrt(left_square_sum * right_square_sum)
     return {
         "shape_equal": True,
         "shape": list(left.shape),
@@ -232,15 +253,69 @@ def _tensor_stats(left: torch.Tensor, right: torch.Tensor) -> dict[str, Any]:
         "dtype_right": str(right.dtype),
         "max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
         "mean_abs_diff": float(diff.mean().item()) if diff.numel() else 0.0,
+        "rmse": (math.sqrt(diff_square_sum / diff.numel()) if diff.numel() else 0.0),
+        "left_mean_abs": (float(left_f.abs().mean().item()) if left_f.numel() else 0.0),
+        "relative_l2": (
+            math.sqrt(diff_square_sum / left_square_sum) if left_square_sum else None
+        ),
+        "cosine_similarity": (dot_sum / denominator if denominator else None),
         "nonzero_count": int(nonzero.sum().item()) if diff.numel() else 0,
         "numel": int(diff.numel()),
+    }
+
+
+def _qsa_block_overlap_stats(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    compress_ratio: int,
+) -> dict[str, Any]:
+    """Compare expanded QSA selections as sets of compressed page IDs."""
+    if compress_ratio <= 0:
+        raise ValueError("QSA compress ratio must be positive")
+    if tuple(left.shape) != tuple(right.shape) or left.ndim != 2:
+        return {
+            "shape_equal": tuple(left.shape) == tuple(right.shape),
+            "left_shape": list(left.shape),
+            "right_shape": list(right.shape),
+        }
+
+    row_jaccards: list[float] = []
+    row_left_recalls: list[float] = []
+    exact_rows = 0
+    intersection_total = 0
+    union_total = 0
+    for left_row, right_row in zip(left.cpu().tolist(), right.cpu().tolist()):
+        left_blocks = {
+            int(index) // compress_ratio for index in left_row if int(index) >= 0
+        }
+        right_blocks = {
+            int(index) // compress_ratio for index in right_row if int(index) >= 0
+        }
+        intersection = len(left_blocks & right_blocks)
+        union = len(left_blocks | right_blocks)
+        if left_blocks == right_blocks:
+            exact_rows += 1
+        row_jaccards.append(intersection / union if union else 1.0)
+        row_left_recalls.append(intersection / len(left_blocks) if left_blocks else 1.0)
+        intersection_total += intersection
+        union_total += union
+
+    rows = left.shape[0]
+    return {
+        "compress_ratio": compress_ratio,
+        "rows": rows,
+        "exact_row_ratio": exact_rows / rows if rows else 1.0,
+        "mean_row_jaccard": sum(row_jaccards) / rows if rows else 1.0,
+        "min_row_jaccard": min(row_jaccards, default=1.0),
+        "mean_left_block_recall": sum(row_left_recalls) / rows if rows else 1.0,
+        "micro_jaccard": intersection_total / union_total if union_total else 1.0,
     }
 
 
 def _safe_load_tensor_payload(path: Path) -> dict[str, Any] | None:
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:  # pragma: no cover - diagnostic tool.
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover - diagnostic tool.
         return {"load_error": str(exc)}
 
 
@@ -263,23 +338,31 @@ def _index_layer_dumps(
     result: dict[tuple[int, int, int, str, str, str], Path] = {}
     for file in files:
         match = _LAYER_DUMP_RE.search(file.name)
-        if not match:
+        direct_match = _DIRECT_LAYER_DUMP_RE.search(file.name)
+        if match is None and direct_match is None:
             continue
+        parsed = match or direct_match
+        assert parsed is not None
         payload = _safe_load_tensor_payload(file)
         if not payload or "load_error" in payload:
             continue
-        pid = int(payload.get("pid", match.group("pid")))
+        pid = int(payload.get("pid", parsed.group("pid")))
         shape = payload.get("shape")
         if isinstance(shape, (tuple, list)):
             shape_key = "x".join(str(dim) for dim in shape)
         else:
-            shape_key = match.group("shape")
+            shape_key = match.group("shape") if match is not None else "unknown"
+        if match is not None:
+            fallback_step = int(match.group("step"))
+        else:
+            assert direct_match is not None
+            fallback_step = int(direct_match.group("count"))
         key = (
             pid_to_worker.get(pid, -1),
-            int(match.group("step")),
-            int(payload.get("layer_idx", match.group("layer"))),
-            str(payload.get("layer_type", match.group("tail"))),
-            str(payload.get("label", match.group("tail"))),
+            int(payload.get("step", payload.get("count", fallback_step))),
+            int(payload.get("layer_idx", parsed.group("layer"))),
+            str(payload.get("layer_type", parsed.group("tail"))),
+            str(payload.get("label", parsed.group("tail"))),
             shape_key,
         )
         result.setdefault(key, file)
@@ -290,6 +373,7 @@ def _compare_layer_dumps(
     left_dir: Path | None,
     right_dir: Path | None,
     max_rows: int,
+    qsa_compress_ratio: int,
 ) -> dict[str, Any] | None:
     left = _index_layer_dumps(left_dir)
     right = _index_layer_dumps(right_dir)
@@ -318,6 +402,16 @@ def _compare_layer_dumps(
         else:
             stats = _tensor_stats(left_payload["tensor"], right_payload["tensor"])
         worker, step, layer, layer_type, label, shape = key
+        if (
+            "load_error_left" not in stats
+            and "load_error_right" not in stats
+            and label == "qsa_selected_indices"
+        ):
+            stats["qsa_block_overlap"] = _qsa_block_overlap_stats(
+                left_payload["tensor"],
+                right_payload["tensor"],
+                qsa_compress_ratio,
+            )
         record = {
             "worker": worker,
             "step": step,
@@ -448,6 +542,7 @@ def _main() -> int:
     parser.add_argument("--left-sample-dir", type=Path)
     parser.add_argument("--right-sample-dir", type=Path)
     parser.add_argument("--max-rows", type=int, default=64)
+    parser.add_argument("--qsa-compress-ratio", type=int, default=4)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -472,6 +567,7 @@ def _main() -> int:
             args.left_layer_dir,
             args.right_layer_dir,
             args.max_rows,
+            args.qsa_compress_ratio,
         ),
     }
     text = json.dumps(result, indent=2, sort_keys=True)

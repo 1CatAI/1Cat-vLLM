@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -11,12 +13,15 @@ from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
     Qwen4ExpSparseMoeBlock,
+    _finalize_qsa_e4m3_scale_load,
     _remap_qsa_cache_scale_name,
+    _validate_qsa_e4m3_scale_load,
 )
 from vllm.models.qwen4_exp.nvidia.mtp import (
     Qwen4ExpMTP,
     _validate_mtp_expert_weights_loaded,
 )
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 
 
 def test_mtp_loader_prefers_compact_bf16_checkpoint_shards() -> None:
@@ -260,15 +265,15 @@ def test_mtp_expert_loading_fails_closed() -> None:
     [
         (
             "layers.0.self_attn.k_proj.k_scale",
-            "layers.0.self_attn._k_scale",
+            "layers.0.self_attn.k_scale",
         ),
         (
             "layers.0.self_attn.v_proj.output_scale",
-            "layers.0.self_attn._v_scale",
+            "layers.0.self_attn.v_scale",
         ),
         (
             "language_model.model.layers.0.self_attn.attn.k_scale",
-            "language_model.model.layers.0.self_attn._k_scale",
+            "language_model.model.layers.0.self_attn.k_scale",
         ),
         (
             "layers.0.self_attn.indexer.index_qk_proj.weight_scale",
@@ -285,3 +290,94 @@ def test_only_qsa_main_cache_scales_move_to_the_merged_owner(
     model_name: str,
 ) -> None:
     assert _remap_qsa_cache_scale_name(checkpoint_name, frozenset({0})) == model_name
+
+
+def test_qsa_e4m3_loader_requires_all_24_scales() -> None:
+    required = {
+        f"layers.{layer}.self_attn.{kind}_scale"
+        for layer in range(12)
+        for kind in ("k", "v")
+    }
+    _validate_qsa_e4m3_scale_load(required, required, "fp8_e4m3")
+    with pytest.raises(ValueError, match="Loaded 23/24"):
+        _validate_qsa_e4m3_scale_load(
+            required, required - {next(iter(required))}, "fp8"
+        )
+    _validate_qsa_e4m3_scale_load(required, set(), "float16")
+
+
+def test_qsa_e4m3_uses_sentinel_not_unit_value_as_load_signal() -> None:
+    layer = SimpleNamespace(
+        k_scale=torch.tensor(1.0),
+        v_scale=torch.tensor(0.02),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+        _qsa_kv_scales_finalized=False,
+        kv_cache_dtype="fp8_e4m3",
+        layer_name="model.layers.0.self_attn.attn",
+    )
+    Qwen4ExpQSAAttention.validate_loaded_kv_scales(layer)
+    assert layer._k_scale_float == 1.0
+    assert not hasattr(layer, "k_scale")
+
+    layer.k_scale = torch.tensor(0.01)
+    layer.v_scale = torch.tensor(float("nan"))
+    layer._qsa_kv_scales_finalized = False
+    with pytest.raises(ValueError, match="invalid: V"):
+        Qwen4ExpQSAAttention.validate_loaded_kv_scales(layer)
+
+
+def test_qsa_model_loader_defers_gate_until_all_weight_groups_are_consumed() -> None:
+    model = Qwen4ExpModel.__new__(Qwen4ExpModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=0)
+    model._qsa_layer_ids = frozenset({0})
+    model._kv_cache_dtype = "fp8_e4m3"
+    decoder = nn.Module()
+    attention = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    nn.Module.__init__(attention)
+    attention.kv_cache_dtype = "fp8_e4m3"
+    attention.layer_name = "model.layers.0.self_attn.attn"
+    attention._qsa_kv_scales_finalized = False
+    attention.register_buffer("_k_scale", torch.tensor(1.0))
+    attention.register_buffer("_v_scale", torch.tensor(1.0))
+    attention.k_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    attention.v_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    decoder.self_attn = attention
+    model.layers = nn.ModuleList([decoder])
+
+    loaded = model.load_weights(
+        [("layers.0.self_attn.k_scale", torch.tensor(0.02))]
+    ) | model.load_weights([("layers.0.self_attn.v_scale", torch.tensor(0.03))])
+
+    assert loaded == {
+        "layers.0.self_attn.k_scale",
+        "layers.0.self_attn.v_scale",
+    }
+    assert not attention._qsa_kv_scales_finalized
+    _finalize_qsa_e4m3_scale_load(model, loaded, "fp8_e4m3")
+    assert attention._qsa_kv_scales_finalized
+    assert attention._k_scale_float == pytest.approx(0.02)
+    assert attention._v_scale_float == pytest.approx(0.03)
+
+
+def test_qsa_e4m3_finalizes_and_deletes_invalid_loading_slots() -> None:
+    layer = SimpleNamespace(
+        k_scale=torch.tensor(0.01),
+        v_scale=torch.tensor(0.02),
+        _k_scale=torch.tensor(1.0),
+        _v_scale=torch.tensor(1.0),
+        _qsa_kv_scales_finalized=False,
+        kv_cache_dtype="fp8_e4m3",
+        layer_name="model.layers.0.self_attn.attn",
+    )
+
+    Qwen4ExpQSAAttention.validate_loaded_kv_scales(layer)
+
+    assert layer._qsa_kv_scales_finalized
+    assert not hasattr(layer, "k_scale")
+    assert not hasattr(layer, "v_scale")
+    assert layer._k_scale_float == pytest.approx(0.01)
+    assert layer._v_scale_float == pytest.approx(0.02)
+    assert layer._k_scale.item() == pytest.approx(0.01)
+    assert layer._v_scale.item() == pytest.approx(0.02)

@@ -4,10 +4,12 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import QSAKeyStateCache
 from vllm.models.qwen4_exp.nvidia.qsa import (
+    Qwen4ExpQSAAttention,
     Qwen4ExpQSAFlashAttentionBackend,
     Qwen4ExpQSAFlashAttentionImpl,
 )
@@ -75,6 +77,9 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
         *,
         query_positions,
         sequence_lengths,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
     ):
         captured["key_cache"] = key_cache_arg
         captured["value_cache"] = value_cache_arg
@@ -84,6 +89,9 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
         assert torch.equal(token_to_req_arg, token_to_req)
         captured["query_positions"] = query_positions
         captured["sequence_lengths"] = sequence_lengths
+        captured["kv_cache_dtype"] = kv_cache_dtype
+        captured["k_scale"] = k_scale
+        captured["v_scale"] = v_scale
         output_arg.fill_(1)
         return output_arg
 
@@ -93,9 +101,14 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
     impl.alibi_slopes = None
     impl.sinks = None
     impl.sliding_window = (-1, -1)
+    impl.kv_cache_dtype = "float16"
 
     result = impl.forward_qsa(
-        SimpleNamespace(topk_indices_buffer=logical_indices),
+        SimpleNamespace(
+            topk_indices_buffer=logical_indices,
+            _k_scale_float=1.0,
+            _v_scale_float=1.0,
+        ),
         query,
         query[:, :1],
         query[:, :1],
@@ -112,5 +125,26 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
     assert torch.equal(captured["value_cache"], expected_value)
     assert torch.equal(captured["query_positions"], query_positions)
     assert torch.equal(captured["sequence_lengths"], sequence_lengths)
+    assert captured["kv_cache_dtype"] == "float16"
+    assert captured["k_scale"] == 1.0
+    assert captured["v_scale"] == 1.0
     assert result is output
     assert torch.equal(output, torch.ones_like(output))
+
+
+def test_qsa_e4m3_forward_cannot_bypass_scale_finalization() -> None:
+    layer = SimpleNamespace(
+        _qsa_kv_scales_finalized=False,
+        layer_name="model.layers.3.self_attn.attn",
+    )
+    tensor = torch.empty(0)
+    with pytest.raises(RuntimeError, match="were not finalized"):
+        Qwen4ExpQSAAttention._run_qsa(
+            layer,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+        )

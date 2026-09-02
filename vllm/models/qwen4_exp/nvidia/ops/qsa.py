@@ -10,6 +10,9 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.common.ops.fp8_software import (
+    fp8_e4m3fn_bits_to_fp32,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
@@ -480,6 +483,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_rows,
     num_cache_blocks,
     num_requests,
+    k_scale,
+    v_scale,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -490,6 +495,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_E4M3: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -562,6 +568,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_E4M3:
+            keys = (fp8_e4m3fn_bits_to_fp32(keys) * k_scale).to(query.dtype)
+            values = (fp8_e4m3fn_bits_to_fp32(values) * v_scale).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -1299,7 +1308,8 @@ def _qsa_xqa_page4_shape_supported(
         query_positions is not None
         and sequence_lengths is not None
         and q.dtype == torch.float16
-        and k_cache.dtype == v_cache.dtype == torch.float16
+        and k_cache.dtype == v_cache.dtype
+        and k_cache.dtype in (torch.float16, torch.uint8)
         and q.device
         == k_cache.device
         == v_cache.device
@@ -1546,6 +1556,9 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     out: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
     flash_attn_v100_cuda,
 ) -> torch.Tensor:
     grouped_pages, token_masks, grouped_sequence_lengths, lse = (
@@ -1576,6 +1589,9 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         grouped_sequence_lengths,
         lse,
         q.shape[2] ** -0.5,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
     )
     logger.info_once(
         "Using SM70 grouped QSA Flash-V100 page4 prefill route (rows=%d, groups=%d).",
@@ -1595,6 +1611,9 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     out: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
 ) -> torch.Tensor | None:
     try:
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
@@ -1629,6 +1648,9 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
             query_positions,
             sequence_lengths,
             out,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
             flash_attn_v100_cuda,
         )
 
@@ -1642,7 +1664,12 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         k_cache.shape[1],
         k_cache.stride(0) // (4 * q.shape[2]),
     )
-    num_partitions = math.ceil(logical_indices.shape[1] / _SM70_QSA_XQA_PAGE4_PARTITION)
+    # Generic E4M3 G6 XQA supports P256 for virtual page4 caches. Its P1024
+    # specialization is restricted to the page1568 layout.
+    partition_size = (
+        256 if kv_cache_dtype == "fp8_e4m3" else _SM70_QSA_XQA_PAGE4_PARTITION
+    )
+    num_partitions = math.ceil(logical_indices.shape[1] / partition_size)
     temporary_output, max_logits, exp_sums, active_num_partitions = (
         _qsa_xqa_page4_workspace(q, num_partitions)
     )
@@ -1659,11 +1686,11 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         exp_sums,
         active_num_partitions,
         q.shape[2] ** -0.5,
-        _SM70_QSA_XQA_PAGE4_PARTITION,
+        partition_size,
         num_partitions,
-        "auto",
-        1.0,
-        1.0,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
         -1,
         -1,
         0,
@@ -1686,8 +1713,11 @@ def qsa_sparse_paged_attention(
     out: torch.Tensor | None = None,
     query_positions: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged FP16/BF16 K/V caches."""
+    """Run sparse GQA over paged FP16/BF16 or calibrated E4M3 K/V."""
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -1705,8 +1735,21 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
-    assert q.dtype in (torch.float16, torch.bfloat16)
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("QSA sparse attention requires FP16 or BF16 queries")
+    kv_e4m3 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    if kv_e4m3:
+        if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
+            raise ValueError("QSA E4M3 K/V caches must use uint8 storage")
+        if not math.isfinite(k_scale) or not math.isfinite(v_scale):
+            raise ValueError("QSA E4M3 K/V scales must be finite")
+        if k_scale <= 0.0 or v_scale <= 0.0:
+            raise ValueError("QSA E4M3 K/V scales must be positive")
+    else:
+        if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+            raise ValueError(f"Unsupported QSA K/V cache dtype: {kv_cache_dtype}")
+        if q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
+            raise ValueError("QSA unquantized K/V caches must match query dtype")
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -1745,6 +1788,9 @@ def qsa_sparse_paged_attention(
             query_positions,
             sequence_lengths,
             out,
+            "fp8_e4m3" if kv_e4m3 else "auto",
+            k_scale,
+            v_scale,
         )
         if xqa_output is not None:
             return xqa_output
@@ -1815,6 +1861,8 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
+        k_scale,
+        v_scale,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -1825,6 +1873,7 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_E4M3=kv_e4m3,
         num_warps=partial_warps,
         num_stages=2,
     )

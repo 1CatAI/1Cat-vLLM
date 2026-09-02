@@ -12,6 +12,7 @@ from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -97,6 +98,8 @@ except ModuleNotFoundError as exc:
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
+logger = init_logger(__name__)
+
 
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
@@ -116,22 +119,22 @@ def _remap_qsa_cache_scale_name(
 
     Regular attention keeps cache scales below its ``attn`` child. QSA owns
     that cache directly, so only QSA layers need the final path component
-    moved to the owner's persistent ``_k_scale``/``_v_scale`` buffers.
+    moved to the owner's invalid-until-loaded ``k_scale``/``v_scale`` slots.
     """
 
     scale_suffixes = {
-        "k_proj.k_scale": "_k_scale",
-        "k_proj.output_scale": "_k_scale",
-        "attn.k_scale": "_k_scale",
-        "attn._k_scale": "_k_scale",
-        "k_scale": "_k_scale",
-        "_k_scale": "_k_scale",
-        "v_proj.v_scale": "_v_scale",
-        "v_proj.output_scale": "_v_scale",
-        "attn.v_scale": "_v_scale",
-        "attn._v_scale": "_v_scale",
-        "v_scale": "_v_scale",
-        "_v_scale": "_v_scale",
+        "k_proj.k_scale": "k_scale",
+        "k_proj.output_scale": "k_scale",
+        "attn.k_scale": "k_scale",
+        "attn._k_scale": "k_scale",
+        "k_scale": "k_scale",
+        "_k_scale": "k_scale",
+        "v_proj.v_scale": "v_scale",
+        "v_proj.output_scale": "v_scale",
+        "attn.v_scale": "v_scale",
+        "attn._v_scale": "v_scale",
+        "v_scale": "v_scale",
+        "_v_scale": "v_scale",
     }
     for layer_id in qsa_layer_ids:
         marker = f"layers.{layer_id}.self_attn."
@@ -155,6 +158,45 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_weight_scale",
     "_input_scale",
 ]
+
+
+def _validate_qsa_e4m3_scale_load(
+    required_scales: set[str], loaded: set[str], cache_dtype: str
+) -> None:
+    if cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    missing_scales = sorted(required_scales - loaded)
+    if missing_scales:
+        raise ValueError(
+            "QSA E4M3 scale overlay is incomplete; refusing to start. "
+            f"Loaded {len(required_scales) - len(missing_scales)}/"
+            f"{len(required_scales)} local K/V scales. Missing: "
+            + ", ".join(missing_scales)
+        )
+
+
+def _finalize_qsa_e4m3_scale_load(
+    model: nn.Module, loaded: set[str], cache_dtype: str
+) -> None:
+    if cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    qsa_modules = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, Qwen4ExpQSAAttention)
+    }
+    required_scales = {
+        f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
+    }
+    _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
+    logger.info_once(
+        "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",
+        len(required_scales),
+        len(required_scales),
+    )
+    for module in qsa_modules.values():
+        module.validate_loaded_kv_scales()
+
 
 # The checkpoint keeps down and injection projections separate; runtime packs
 # them into adjacent logical shards of one MergedColumnParallelLinear.
@@ -458,6 +500,7 @@ class Qwen4ExpModel(nn.Module):
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
+        self._kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
@@ -674,6 +717,7 @@ class Qwen4ExpForCausalLM(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        self._qsa_scale_gate_at_this_level = prefix == ""
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -877,7 +921,10 @@ class Qwen4ExpForCausalLM(
             skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if self._qsa_scale_gate_at_this_level:
+            _finalize_qsa_e4m3_scale_load(self, loaded, self.model._kv_cache_dtype)
+        return loaded
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -1072,7 +1119,11 @@ class Qwen4ExpForConditionalGeneration(
             skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _finalize_qsa_e4m3_scale_load(
+            self, loaded, self.language_model.model._kv_cache_dtype
+        )
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(
