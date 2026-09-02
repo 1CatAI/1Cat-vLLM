@@ -220,6 +220,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         layer_type: str,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -274,6 +275,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     layer_id=self.layer_idx,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
+                    topk_indices_buffer=topk_indices_buffer,
                 )
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
@@ -468,6 +470,17 @@ class Qwen4ExpModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
+        topk_indices_buffer: torch.Tensor | None = None
+        if self._qsa_layer_ids:
+            topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                int(config.indexer_budget) + int(config.indexer_compress_ratio) - 1,
+                dtype=torch.int32,
+            )
+            # QSA layers execute serially and consume their selected indices
+            # before the next layer overwrites them, so one model-level
+            # workspace is sufficient for every QSA layer.
+            self.topk_indices_buffer = topk_indices_buffer
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
@@ -476,6 +489,7 @@ class Qwen4ExpModel(nn.Module):
                 vllm_config,
                 layer_type=config.layer_types[layer_idx],
                 prefix=prefix,
+                topk_indices_buffer=topk_indices_buffer,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
