@@ -45059,7 +45059,7 @@ Interpretation:
 
 - Draft PR #454 is stacked on GLM DFlash2 Draft PR #404. The owned branch is
   `codex/v100-glm53-dflash2-verifier30-20260901-165322`; the quality and
-  performance source is `167593e61052ac6c9399bea658aff46234a3a1d3` and the
+  performance source is `561b7007f12e78ed626041ae58fa1d51cc8486f9` and the
   loaded SM70 extension SHA256 is
   `e0e88d7629c81a808f4bebb17045757d4af5b99fd2c9db0f558ac7d6d7de4a15`.
 - The frozen contract is GLM-5.3-Flash-NVFP4, FP16 target execution, E4M3 FP8
@@ -45071,6 +45071,20 @@ Interpretation:
   metadata, and finally `29.91297 ms` with the native q8 mHC post+dot kernel.
   The source-default three-seed rerun records `29.88682 ms/round` across 74
   rounds and `172.2715 tok/s` weighted pure decode.
+- The final sampler step assigns eight warps only to the exact SM70 GLM5
+  target shape: batch 8, vocabulary 154,880, top-k disabled, and top-p
+  enabled. The existing default-on environment switch remains its immediate
+  rollback. A candidate/control/candidate sandwich records `29.847545`,
+  `30.210515`, and `30.049566 ms/round`; the two-candidate mean is
+  `29.948555 ms/round`, `0.261959 ms` or 0.87% below the four-warp control.
+  Individual runs can still land slightly above 30 ms, so this is a mean
+  steady-shape closure rather than an every-run upper bound.
+- A matched seed-zero graph-node trace has the same 128 output tokens, token
+  hash, and 23 verification steps on both schedules. `_topk_topp_kernel`
+  falls from `303.237 us` to `207.963 us` per rank/round, a `95.273 us`
+  (31.4%) reduction. One candidate trace step has 4.8 ms of rank-start skew;
+  traced interval means are therefore diagnostic composition evidence, not
+  the accepted endpoint latency.
 - The accepted mHC kernel uses CUDA `half`, round-to-nearest FP16 stores, and
   source-order `value += comb * residual` / `dot += weight * mapped`
   accumulation. Its six outputs are bitwise equal to the retained FP32 staged
@@ -45082,6 +45096,16 @@ Interpretation:
   128 natural stops. Mean completion tokens per verification step are
   `5.787283`, passing the `5.78` release gate; token-weighted acceptance is
   `5.573722`, passing the `4.85` implementation gate.
+- The post-sampler-change repeat again records `124/128`, zero invalid
+  answers, and 128 natural stops. Mean completion tokens per verification step
+  are `5.784293`; token-weighted acceptance is `5.561909`. Both gates pass,
+  and acceptance min/P50/P90/P99/max are unchanged from the earlier audit.
+  Weighted pure decode is `180.008 tok/s`; mean per-request steady decode is
+  `190.320 tok/s`, aggregate output throughput is `106.575 tok/s`, and mean
+  TPOT is `5.4041 ms`. Across all 38,236 completion tokens, total decode time
+  divided by all 6,873 verification steps is `30.8020 ms/round`; the longer
+  contexts and request transitions make this a different contract from the
+  short steady-shape 29.95 ms sandwich.
 - A paired fixed-seed 128-question audit records `122/128`, zero invalid
   answers, 128 natural stops, `5.753127` mean completion tokens per verifier
   step, and `5.602134` token-weighted acceptance. The more aggressive
@@ -45099,9 +45123,18 @@ Interpretation:
   rejection and the rejected MoE QPN W13 route disabled, and chooses regular
   `torch.compile`; AOT compile measured `30.98 ms/round` with an exact output
   prefix and is rejected for missing the 30 ms latency gate.
+- A historical upstream single-pass top-p kernel is also rejected: it is
+  faster but changes 703 mask elements on a random GLM-shaped exactness test.
+  Non-default top-p tile sizes likewise change the mask. An eight-warp
+  rejection block-stat candidate changed the accepted-token chain despite
+  matching isolated intermediate buffers and was removed. Compact target
+  rejection does not apply because the official target contract has top-k
+  disabled; forcing top-k 20 would change the target distribution.
 - Raw endpoint and quality artifacts are under
   `.artifacts/glm53_dflash2_verifier30/`, notably
-  `q8_tp8pp1_multiseed012_source_default_aot0_exact_candidate_20260902.json`,
-  `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_official_quality_20260902.json`,
+  `q8_tp8pp1_multiseed012_topponly8_source_default_prop09_candidate_20260902.json`,
+  `q8_tp8pp1_multiseed012_topponly4_rollback_prop09_control_20260902.json`,
+  `q8_tp8pp1_topponly8_final_round_nodes.json`,
+  `q8_tp8pp1_gsm8k128_topponly8_source_default_prop09_top095_official_quality_20260902.json`,
   and
   `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_seed20260902_quality_20260902.json`.

@@ -398,6 +398,16 @@ endpoint and `29.9130 ms` across 74 rounds and three seeds. With all flags
 selected by source defaults, the same 74-round workload measures
 `29.8868 ms/round` and `172.2715 tok/s` weighted pure decode.
 
+The target top-p pass now uses eight warps only for the exact SM70 GLM5 shape:
+batch 8, vocabulary 154,880, top-k disabled, and top-p enabled. A
+candidate/control/candidate sandwich measures `29.8475/30.2105/30.0496 ms`
+per round. The candidate mean is `29.9486 ms`, `0.2620 ms` (0.87%) below the
+four-warp rollback. A same-seed node trace preserves all 128 output tokens,
+the token hash, and all 23 verification steps while reducing
+`_topk_topp_kernel` from `303.237 us` to `207.963 us` per round. One candidate
+trace step contains 4.8 ms of rank-start skew, so graph-node timing remains
+diagnostic rather than the endpoint acceptance number.
+
 The accepted mHC arithmetic is intentionally strict. A first native kernel
 used explicit `fmaf` operations and differed from the staged TileLang path by
 one ULP in seven of 131,072 FP16 residual elements; that changed a generated
@@ -416,6 +426,16 @@ second fixed-seed 128-request audit records `122/128`, zero invalid answers,
 token-weighted acceptance. The `0.8/0.95` alternative is rejected because the
 same fixed seed produced one invalid length-capped response.
 
+The complete post-sampler-change audit again records `124/128`, zero invalid
+answers, and 128 natural stops. Mean completion tokens per verification step
+are `5.784293`, token-weighted acceptance is `5.561909`, and both release gates
+pass. Acceptance min/P50/P90/P99/max are unchanged. Mean per-request steady
+decode is `190.320 tok/s`, weighted pure decode is `180.008 tok/s`, aggregate
+output throughput is `106.575 tok/s`, and mean TPOT is `5.4041 ms`. Dividing
+the full audit's total decode time by its 6,873 verification steps gives
+`30.8020 ms/round`; that long-output workload is deliberately reported
+separately from the short steady-shape `29.9486 ms` result.
+
 The official run averages `187.4022 tok/s` steady decode with P50/P90/P99
 `189.8949/218.3878/233.8120 tok/s`; aggregate output throughput is
 `101.2123 tok/s`. Mean TPOT is `5.4907 ms`, mean prefill is `72.2387 tok/s`,
@@ -429,3 +449,10 @@ keeps sparse target rejection and MoE QPN W13 disabled, enables the exact
 hierarchical push collective, cuBLASLt KDA, grouped expert rows, fused GDN
 metadata, and fused q8 mHC, and uses regular `torch.compile`. The matched AOT
 compile path is rejected at `30.98 ms/round` despite an exact output prefix.
+
+Faster-looking alternatives remain excluded. The upstream historical
+single-pass top-p implementation changes 703 mask values on a random
+GLM-shaped oracle, non-default tile sizes change the mask, and an eight-warp
+rejection-statistics schedule changes the accepted-token chain. Compact target
+rejection is not valid for this workload because the official target uses
+`top_k=-1`; enabling top-k 20 would change the target distribution.
