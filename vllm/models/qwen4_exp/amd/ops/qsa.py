@@ -819,6 +819,20 @@ def qsa_select_paged_tokens(
     return out
 
 
+_SHARED_MEM_OPTIN: dict[int, int] = {}
+
+
+def _max_shared_mem(device: torch.device) -> int:
+    """Per-block shared memory the device can actually grant (opt-in limit)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _SHARED_MEM_OPTIN:
+        props = torch.cuda.get_device_properties(idx)
+        _SHARED_MEM_OPTIN[idx] = getattr(
+            props, "shared_memory_per_block_optin", props.shared_memory_per_block
+        )
+    return _SHARED_MEM_OPTIN[idx]
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -881,8 +895,39 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    # Pre-Ampere retune (measured on V100 sm70 and RTX 8000 sm75, see
+    # issue #441): the wide GB300 prefill tiles are 19.3x (V100,
+    # 527 -> 27.3 ms) and 4.2x (RTX 8000 after the shared-memory clamp,
+    # 199.7 -> 47.9 ms) slower than narrow 4-warp tiles on 2048-row
+    # chunks -- two warps cannot hide the emulated-bf16 latency on these
+    # parts. The decode/verify branches (base_programs < 32) already run
+    # the optimal narrow profiles and stay untouched.
+    if base_programs >= 32 and not current_platform.is_rocm():
+        if torch.cuda.get_device_capability(q.device)[0] < 8:
+            if base_programs <= 256:
+                block_n, target_splits, partial_warps = 16, 8, 4
+            elif base_programs <= 512:
+                block_n, target_splits, partial_warps = 16, 4, 4
+            else:
+                block_n, target_splits, partial_warps = 16, 1, 4
     # gfx942 and gfx950 have a 64 KiB LDS limit. One software-pipelining
     # stage keeps the wide TP4 tile within that shared-memory budget.
+    # On CUDA, the profiles above were tuned on GB300, whose 228 KiB of
+    # shared memory per block hides the cost of the widest tile. A tile
+    # holds K and V for the full head dimension plus the fp32 accumulator:
+    #     2 * BLOCK_N * HEAD_DIM * itemsize + BLOCK_M * HEAD_DIM * 4
+    # bytes -- 80 KiB at BLOCK_N 64 and HEAD_DIM 256. Turing grants only
+    # 64 KiB (Volta 96 KiB), so narrow the tile to the widest one the
+    # device can actually hold rather than asking the platform for its
+    # name. ROCm keeps its measured single-stage behaviour untouched.
+    if not current_platform.is_rocm():
+        shared_budget = _max_shared_mem(q.device)
+        accumulator_bytes = block_m * head_dim * 4
+        while block_n > 16 and (
+            2 * block_n * head_dim * q.element_size() + accumulator_bytes
+            > shared_budget
+        ):
+            block_n //= 2
     partial_stages = 1 if current_platform.is_rocm() else 2
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
