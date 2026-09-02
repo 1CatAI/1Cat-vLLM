@@ -937,8 +937,11 @@ class Qwen4ExpForConditionalGeneration(
             self._tower_model_names = []
         else:
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-            self._init_video_pruning(multimodal_config)
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+            self.video_pruning_rate = multimodal_config.video_pruning_rate
+            self.is_multimodal_pruning_enabled = (
+                multimodal_config.is_multimodal_pruning_enabled()
+            )
 
             with self._mark_tower_model(vllm_config, {"image", "video"}):
                 self.visual = Qwen3_VisionTransformer(
