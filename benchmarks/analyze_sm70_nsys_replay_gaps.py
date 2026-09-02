@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Measure GPU busy intervals and idle gaps inside Nsight replay ranges."""
 
 from __future__ import annotations

@@ -45054,3 +45054,54 @@ Interpretation:
   arithmetic path: it makes default capacity select the same previously
   quality-audited, checkpoint-code-preserving B1 operator path. Test services
   were stopped after collection and all four V100s returned to idle memory.
+
+## 2026-09-02 GLM-5.3 DFlash2 TP8 verifier under 30 ms
+
+- Draft PR #454 is stacked on GLM DFlash2 Draft PR #404. The owned branch is
+  `codex/v100-glm53-dflash2-verifier30-20260901-165322`; the quality and
+  performance source is `167593e61052ac6c9399bea658aff46234a3a1d3` and the
+  loaded SM70 extension SHA256 is
+  `e0e88d7629c81a808f4bebb17045757d4af5b99fd2c9db0f558ac7d6d7de4a15`.
+- The frozen contract is GLM-5.3-Flash-NVFP4, FP16 target execution, E4M3 FP8
+  target KV, DFlash2 q7 probabilistic sampling, TP8/PP1, eight V100-SXM2-32GB
+  GPUs, one live request, CUDA Graph, and no MTP. This is the PP-free verifier
+  lower bound; it does not replace the accepted TP4/PP2 service topology.
+- The matched verifier series moved from `33.2440 ms/round` to `32.7333 ms`
+  with exact cuBLASLt KDA projections, then `30.1857 ms` with fused GDN
+  metadata, and finally `29.91297 ms` with the native q8 mHC post+dot kernel.
+  The source-default three-seed rerun records `29.88682 ms/round` across 74
+  rounds and `172.2715 tok/s` weighted pure decode.
+- The accepted mHC kernel uses CUDA `half`, round-to-nearest FP16 stores, and
+  source-order `value += comb * residual` / `dot += weight * mapped`
+  accumulation. Its six outputs are bitwise equal to the retained FP32 staged
+  implementation. The earlier explicit-`fmaf` version was faster but changed
+  seven of 131,072 FP16 residual elements by one ULP and changed the token
+  hash, so it remains rejected.
+- The official no-request-seed 128-question GSM8K audit with proposal
+  calibration `0.9/0.95` records `124/128` accuracy, zero invalid answers, and
+  128 natural stops. Mean completion tokens per verification step are
+  `5.787283`, passing the `5.78` release gate; token-weighted acceptance is
+  `5.573722`, passing the `4.85` implementation gate.
+- A paired fixed-seed 128-question audit records `122/128`, zero invalid
+  answers, 128 natural stops, `5.753127` mean completion tokens per verifier
+  step, and `5.602134` token-weighted acceptance. The more aggressive
+  `0.8/0.95` candidate is rejected because it produced one length stop and one
+  invalid answer on the same fixed seed.
+- The official run averages `187.4022 tok/s` steady decode and `101.2123 tok/s`
+  aggregate output throughput. Mean/P50/P90/P99 TPOT is
+  `5.4907/5.2661/6.2850/9.3154 ms`. Each rank reports 1.7 GiB available for KV
+  and 34,071 logical KV tokens at 0.90 memory utilization. During steady
+  generation all eight GPUs report 100% GPU utilization and about 38-39%
+  memory-controller utilization.
+- The narrow runtime selector applies the qualified flags only to SM70,
+  ModelOpt NVFP4 GLM5, FP16, probabilistic q7 DFlash2, TP8/PP1, no-DBO
+  contracts. It preserves every explicit override, keeps sparse target
+  rejection and the rejected MoE QPN W13 route disabled, and chooses regular
+  `torch.compile`; AOT compile measured `30.98 ms/round` with an exact output
+  prefix and is rejected for missing the 30 ms latency gate.
+- Raw endpoint and quality artifacts are under
+  `.artifacts/glm53_dflash2_verifier30/`, notably
+  `q8_tp8pp1_multiseed012_source_default_aot0_exact_candidate_20260902.json`,
+  `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_official_quality_20260902.json`,
+  and
+  `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_seed20260902_quality_20260902.json`.

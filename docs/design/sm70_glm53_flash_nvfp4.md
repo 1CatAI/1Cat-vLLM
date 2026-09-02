@@ -381,3 +381,51 @@ runtime selects the retained `24,21` partition and proposal settings only when
 they are absent. Explicit overrides remain untouched and emit a warning. Other
 architectures, quantization formats, draft methods, q lengths, GPU
 capabilities, and TP/PP topologies do not receive these defaults.
+
+## TP8/PP1 Verifier Latency Qualification (2026-09-02)
+
+The PP-free TP8 route is retained as a verifier lower bound and a focused
+kernel-development lane. It uses all eight V100s, E4M3 FP8 target KV, q7
+probabilistic DFlash2, CUDA Graph, FP16 target arithmetic, and no MTP. The
+production TP4/PP2 quality route above remains a separate topology and must not
+be inferred by multiplying or dividing the TP8 result.
+
+The initial quality-qualified hierarchical-push endpoint took `33.2440 ms` per
+q8 verification round. Exact fixed-shape cuBLASLt KDA projections reduced it to
+`32.7333 ms`; fusing the four GDN metadata groups reduced it to `30.1857 ms`.
+The final native q8 mHC post+dot operator reaches `29.8732 ms` on the seed-zero
+endpoint and `29.9130 ms` across 74 rounds and three seeds. With all flags
+selected by source defaults, the same 74-round workload measures
+`29.8868 ms/round` and `172.2715 tok/s` weighted pure decode.
+
+The accepted mHC arithmetic is intentionally strict. A first native kernel
+used explicit `fmaf` operations and differed from the staged TileLang path by
+one ULP in seven of 131,072 FP16 residual elements; that changed a generated
+token hash and is rejected. Rewriting the source expressions in the same
+accumulation order as the staged kernel produces identical FFMA instructions
+while restoring bitwise equality for residual, mapped, residual output,
+squared sum, dot, and hidden output. The focused V100 test reports five passed
+cases, including CUDA Graph replay.
+
+The retained proposal calibration is temperature scale `0.9` with proposal
+top-p `0.95`. On the official 128-request contract it records `124/128`
+accuracy, zero invalid answers, 128 natural stops, `5.787283` mean completion
+tokens per verification step, and `5.573722` token-weighted acceptance. A
+second fixed-seed 128-request audit records `122/128`, zero invalid answers,
+128 natural stops, `5.753127` per-request acceptance, and `5.602134`
+token-weighted acceptance. The `0.8/0.95` alternative is rejected because the
+same fixed seed produced one invalid length-capped response.
+
+The official run averages `187.4022 tok/s` steady decode with P50/P90/P99
+`189.8949/218.3878/233.8120 tok/s`; aggregate output throughput is
+`101.2123 tok/s`. Mean TPOT is `5.4907 ms`, mean prefill is `72.2387 tok/s`,
+and the runtime exposes 34,071 logical KV tokens with 1.7 GiB available per
+rank. GPU sampling during steady generation reports 100% utilization on all
+eight V100s and approximately 38-39% memory-controller utilization.
+
+The runtime only auto-enables this set for SM70, GLM5 ModelOpt NVFP4, FP16,
+probabilistic q7 DFlash2, TP8/PP1, and no DBO. It preserves explicit overrides,
+keeps sparse target rejection and MoE QPN W13 disabled, enables the exact
+hierarchical push collective, cuBLASLt KDA, grouped expert rows, fused GDN
+metadata, and fused q8 mHC, and uses regular `torch.compile`. The matched AOT
+compile path is rejected at `30.98 ms/round` despite an exact output prefix.
