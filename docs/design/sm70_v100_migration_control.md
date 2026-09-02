@@ -45226,6 +45226,12 @@ Interpretation:
   trace is about 1.23 ms/round slower. TP4 shared+routed `all_reduce_sum2` was
   also left off: unmatched route smokes did not establish a benefit and were
   not promoted. The quality-rejected TP4 push collective remains off.
+- The latest SGLang PP work does not provide a mergeable latency escape hatch.
+  GLM-5 speculative decoding plus PP issue #23162 is a closed RFC with no
+  linked implementation and keeps target PP stages serial. Parallel-spec
+  roadmap #27462 lists DFlash's hidden-state data plane and the PP handshake
+  as future/unvalidated work. Cross-round enumeration is not quality-neutral
+  for this hidden-state-conditioned drafter without that data plane.
 - Strict TP4/PP2 does not meet the requested 32-ms full-round ceiling. It
   would require at least 10.5 ms, about 24.7%, below the stable 42.5-ms short
   round, while the sequential target forwards already exceed 32 ms before
