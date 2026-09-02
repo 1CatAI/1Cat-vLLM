@@ -79,8 +79,7 @@ __global__ void glm53_fp16_gemv_sm70_kernel(half* __restrict__ output,
   }
 }
 
-__device__ __forceinline__ half2 glm53_load_weight_half2(
-    const half2* address) {
+__device__ __forceinline__ half2 glm53_load_weight_half2(const half2* address) {
   unsigned packed;
   asm("ld.global.cg.u32 %0, [%1];" : "=r"(packed) : "l"(address));
   return *reinterpret_cast<half2*>(&packed);
@@ -105,21 +104,19 @@ __global__ void glm53_fp16_gemv_half2_sm70_kernel(
   float2 chunk_sum[kBatch] = {};
 #pragma unroll 1
   for (int tile = 0; tile < kChunkK / kLanesPerRow; ++tile) {
-    const int k =
-        chunk * kChunkK + tile * kLanesPerRow + lane_pair * 2;
-    const half2 w = glm53_load_weight_half2(
-        reinterpret_cast<const half2*>(
-            weight + static_cast<size_t>(row) * kGlm53K + k));
+    const int k = chunk * kChunkK + tile * kLanesPerRow + lane_pair * 2;
+    const half2 w = glm53_load_weight_half2(reinterpret_cast<const half2*>(
+        weight + static_cast<size_t>(row) * kGlm53K + k));
     const float2 weight_value = __half22float2(w);
 #pragma unroll
     for (int batch = 0; batch < kBatch; ++batch) {
       const half2 x = __ldg(reinterpret_cast<const half2*>(
           input + static_cast<size_t>(batch) * kGlm53K + k));
       const float2 input_value = __half22float2(x);
-      chunk_sum[batch].x = __fmaf_rn(
-          input_value.x, weight_value.x, chunk_sum[batch].x);
-      chunk_sum[batch].y = __fmaf_rn(
-          input_value.y, weight_value.y, chunk_sum[batch].y);
+      chunk_sum[batch].x =
+          __fmaf_rn(input_value.x, weight_value.x, chunk_sum[batch].x);
+      chunk_sum[batch].y =
+          __fmaf_rn(input_value.y, weight_value.y, chunk_sum[batch].y);
     }
   }
 
@@ -134,18 +131,17 @@ __global__ void glm53_fp16_gemv_half2_sm70_kernel(
 #pragma unroll
       for (int source_chunk = 1; source_chunk < kChunkCount / 2;
            ++source_chunk) {
-        head_sum[batch].x = __fadd_rn(
-            head_sum[batch].x,
-            __shfl_sync(0xffffffffu, chunk_sum[batch].x,
-                        source_chunk * kLanePairs + lane_pair));
-        head_sum[batch].y = __fadd_rn(
-            head_sum[batch].y,
-            __shfl_sync(0xffffffffu, chunk_sum[batch].y,
-                        source_chunk * kLanePairs + lane_pair));
+        head_sum[batch].x =
+            __fadd_rn(head_sum[batch].x,
+                      __shfl_sync(0xffffffffu, chunk_sum[batch].x,
+                                  source_chunk * kLanePairs + lane_pair));
+        head_sum[batch].y =
+            __fadd_rn(head_sum[batch].y,
+                      __shfl_sync(0xffffffffu, chunk_sum[batch].y,
+                                  source_chunk * kLanePairs + lane_pair));
       }
     } else {
-      const int tail =
-          (chunk - kChunkCount / 2) * kLanesPerRow + lane_pair * 2;
+      const int tail = (chunk - kChunkCount / 2) * kLanesPerRow + lane_pair * 2;
       tail_partials[row_in_block][batch][tail] = chunk_sum[batch].x;
       tail_partials[row_in_block][batch][tail + 1] = chunk_sum[batch].y;
     }
@@ -162,9 +158,8 @@ __global__ void glm53_fp16_gemv_half2_sm70_kernel(
            ++source_chunk) {
         const int tail_chunk = source_chunk - kChunkCount / 2;
         even_sum = __fadd_rn(
-            even_sum,
-            tail_partials[row_in_block][batch]
-                         [tail_chunk * kLanesPerRow + lane_pair * 2]);
+            even_sum, tail_partials[row_in_block][batch]
+                                   [tail_chunk * kLanesPerRow + lane_pair * 2]);
         odd_sum = __fadd_rn(
             odd_sum,
             tail_partials[row_in_block][batch]
@@ -183,8 +178,8 @@ __global__ void glm53_fp16_gemv_half2_sm70_kernel(
       float row_sum = lane_partials[row_in_block][batch][0];
 #pragma unroll
       for (int source_lane = 1; source_lane < kLanesPerRow; ++source_lane) {
-        row_sum = __fadd_rn(
-            row_sum, lane_partials[row_in_block][batch][source_lane]);
+        row_sum =
+            __fadd_rn(row_sum, lane_partials[row_in_block][batch][source_lane]);
       }
       output[static_cast<size_t>(batch) * kGlm53N + row] =
           __float2half_rn(row_sum);
@@ -212,11 +207,9 @@ __global__ void glm53_fp16_gemv_half2_broadcast_sm70_kernel(
   float2 chunk_sum[kBatch] = {};
 #pragma unroll 1
   for (int tile = 0; tile < kChunkK / kLanesPerRow; ++tile) {
-    const int k =
-        chunk * kChunkK + tile * kLanesPerRow + lane_pair * 2;
-    const half2 w = glm53_load_weight_half2(
-        reinterpret_cast<const half2*>(
-            weight + static_cast<size_t>(row) * kGlm53K + k));
+    const int k = chunk * kChunkK + tile * kLanesPerRow + lane_pair * 2;
+    const half2 w = glm53_load_weight_half2(reinterpret_cast<const half2*>(
+        weight + static_cast<size_t>(row) * kGlm53K + k));
     const float2 weight_value = __half22float2(w);
 #pragma unroll
     for (int batch = 0; batch < kBatch; ++batch) {
@@ -225,14 +218,13 @@ __global__ void glm53_fp16_gemv_half2_broadcast_sm70_kernel(
         input_packed = __ldg(reinterpret_cast<const unsigned*>(
             input + static_cast<size_t>(batch) * kGlm53K + k));
       }
-      input_packed =
-          __shfl_sync(0xffffffffu, input_packed, lane_pair);
+      input_packed = __shfl_sync(0xffffffffu, input_packed, lane_pair);
       const half2 x = *reinterpret_cast<half2*>(&input_packed);
       const float2 input_value = __half22float2(x);
-      chunk_sum[batch].x = __fmaf_rn(
-          input_value.x, weight_value.x, chunk_sum[batch].x);
-      chunk_sum[batch].y = __fmaf_rn(
-          input_value.y, weight_value.y, chunk_sum[batch].y);
+      chunk_sum[batch].x =
+          __fmaf_rn(input_value.x, weight_value.x, chunk_sum[batch].x);
+      chunk_sum[batch].y =
+          __fmaf_rn(input_value.y, weight_value.y, chunk_sum[batch].y);
     }
   }
 
@@ -250,21 +242,16 @@ __global__ void glm53_fp16_gemv_half2_broadcast_sm70_kernel(
   if (chunk == 0) {
 #pragma unroll
     for (int batch = 0; batch < kBatch; ++batch) {
-      float even_sum =
-          chunk_partials[row_in_block][batch][0][lane_pair * 2];
-      float odd_sum =
-          chunk_partials[row_in_block][batch][0][lane_pair * 2 + 1];
+      float even_sum = chunk_partials[row_in_block][batch][0][lane_pair * 2];
+      float odd_sum = chunk_partials[row_in_block][batch][0][lane_pair * 2 + 1];
 #pragma unroll
-      for (int source_chunk = 1; source_chunk < kChunkCount;
-           ++source_chunk) {
+      for (int source_chunk = 1; source_chunk < kChunkCount; ++source_chunk) {
         even_sum = __fadd_rn(
             even_sum,
-            chunk_partials[row_in_block][batch][source_chunk]
-                          [lane_pair * 2]);
-        odd_sum = __fadd_rn(
-            odd_sum,
-            chunk_partials[row_in_block][batch][source_chunk]
-                          [lane_pair * 2 + 1]);
+            chunk_partials[row_in_block][batch][source_chunk][lane_pair * 2]);
+        odd_sum =
+            __fadd_rn(odd_sum, chunk_partials[row_in_block][batch][source_chunk]
+                                             [lane_pair * 2 + 1]);
       }
 
       float row_sum = 0.0f;
@@ -275,9 +262,8 @@ __global__ void glm53_fp16_gemv_half2_broadcast_sm70_kernel(
         const float odd_value =
             __shfl_sync(0xffffffffu, odd_sum, source_pair, kLanePairs);
         if (lane_pair == 0) {
-          row_sum = source_pair == 0
-                        ? even_value
-                        : __fadd_rn(row_sum, even_value);
+          row_sum =
+              source_pair == 0 ? even_value : __fadd_rn(row_sum, even_value);
           row_sum = __fadd_rn(row_sum, odd_value);
         }
       }
@@ -290,8 +276,8 @@ __global__ void glm53_fp16_gemv_half2_broadcast_sm70_kernel(
 }
 
 template <int kRowsPerBlock, bool kSwizzled>
-__device__ __forceinline__ int glm53_staged_partial_index(
-    int row, int chunk, int lane) {
+__device__ __forceinline__ int glm53_staged_partial_index(int row, int chunk,
+                                                          int lane) {
   if constexpr (kSwizzled) {
     return ((chunk * kRowsPerBlock + row) * kLanesPerRow + lane);
   }
@@ -316,11 +302,9 @@ __global__ void glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel(
   float2 chunk_sum[kBatch] = {};
 #pragma unroll 1
   for (int tile = 0; tile < kChunkK / kLanesPerRow; ++tile) {
-    const int k =
-        chunk * kChunkK + tile * kLanesPerRow + lane_pair * 2;
-    const half2 w = glm53_load_weight_half2(
-        reinterpret_cast<const half2*>(
-            weight + static_cast<size_t>(row) * kGlm53K + k));
+    const int k = chunk * kChunkK + tile * kLanesPerRow + lane_pair * 2;
+    const half2 w = glm53_load_weight_half2(reinterpret_cast<const half2*>(
+        weight + static_cast<size_t>(row) * kGlm53K + k));
     const float2 weight_value = __half22float2(w);
 #pragma unroll
     for (int batch = 0; batch < kBatch; ++batch) {
@@ -329,27 +313,23 @@ __global__ void glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel(
         input_packed = __ldg(reinterpret_cast<const unsigned*>(
             input + static_cast<size_t>(batch) * kGlm53K + k));
       }
-      input_packed =
-          __shfl_sync(0xffffffffu, input_packed, lane_pair);
+      input_packed = __shfl_sync(0xffffffffu, input_packed, lane_pair);
       const half2 x = *reinterpret_cast<half2*>(&input_packed);
       const float2 input_value = __half22float2(x);
-      chunk_sum[batch].x = __fmaf_rn(
-          input_value.x, weight_value.x, chunk_sum[batch].x);
-      chunk_sum[batch].y = __fmaf_rn(
-          input_value.y, weight_value.y, chunk_sum[batch].y);
+      chunk_sum[batch].x =
+          __fmaf_rn(input_value.x, weight_value.x, chunk_sum[batch].x);
+      chunk_sum[batch].y =
+          __fmaf_rn(input_value.y, weight_value.y, chunk_sum[batch].y);
     }
   }
 
-  __shared__ float
-      chunk_partials[kRowsPerBlock * kChunkCount * kLanesPerRow];
+  __shared__ float chunk_partials[kRowsPerBlock * kChunkCount * kLanesPerRow];
 #pragma unroll
   for (int batch = 0; batch < kBatch; ++batch) {
     chunk_partials[glm53_staged_partial_index<kRowsPerBlock, kSwizzled>(
-        row_in_block, chunk, lane_pair * 2)] =
-        chunk_sum[batch].x;
+        row_in_block, chunk, lane_pair * 2)] = chunk_sum[batch].x;
     chunk_partials[glm53_staged_partial_index<kRowsPerBlock, kSwizzled>(
-        row_in_block, chunk, lane_pair * 2 + 1)] =
-        chunk_sum[batch].y;
+        row_in_block, chunk, lane_pair * 2 + 1)] = chunk_sum[batch].y;
     __syncthreads();
 
     if (chunk == 0) {
@@ -360,17 +340,14 @@ __global__ void glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel(
           chunk_partials[glm53_staged_partial_index<kRowsPerBlock, kSwizzled>(
               row_in_block, 0, lane_pair * 2 + 1)];
 #pragma unroll
-      for (int source_chunk = 1; source_chunk < kChunkCount;
-           ++source_chunk) {
+      for (int source_chunk = 1; source_chunk < kChunkCount; ++source_chunk) {
         even_sum = __fadd_rn(
             even_sum,
-            chunk_partials[glm53_staged_partial_index<kRowsPerBlock,
-                                                       kSwizzled>(
+            chunk_partials[glm53_staged_partial_index<kRowsPerBlock, kSwizzled>(
                 row_in_block, source_chunk, lane_pair * 2)]);
         odd_sum = __fadd_rn(
             odd_sum,
-            chunk_partials[glm53_staged_partial_index<kRowsPerBlock,
-                                                       kSwizzled>(
+            chunk_partials[glm53_staged_partial_index<kRowsPerBlock, kSwizzled>(
                 row_in_block, source_chunk, lane_pair * 2 + 1)]);
       }
 
@@ -382,9 +359,8 @@ __global__ void glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel(
         const float odd_value =
             __shfl_sync(0xffffffffu, odd_sum, source_pair, kLanePairs);
         if (lane_pair == 0) {
-          row_sum = source_pair == 0
-                        ? even_value
-                        : __fadd_rn(row_sum, even_value);
+          row_sum =
+              source_pair == 0 ? even_value : __fadd_rn(row_sum, even_value);
           row_sum = __fadd_rn(row_sum, odd_value);
         }
       }
@@ -437,8 +413,7 @@ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
               "sm70_glm53_fp16_gemv_out: requires SM70");
   const cudaStream_t stream =
       at::cuda::getCurrentCUDAStream(input.device().index());
-  const char* variant_raw =
-      std::getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS");
+  const char* variant_raw = std::getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS");
   const int variant = variant_raw == nullptr ? -3 : std::atoi(variant_raw);
   if (input.size(0) == 8 && variant != 0) {
     if (variant == -3) {
@@ -468,11 +443,11 @@ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
-#define VLLM_LAUNCH_GLM53_GEMV_HALF2(rows)                                \
-  glm53_fp16_gemv_half2_sm70_kernel<8, rows>                              \
-      <<<kGlm53N / rows, rows * 64, 0, stream>>>(                         \
-          reinterpret_cast<half*>(output.data_ptr<at::Half>()),           \
-          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),      \
+#define VLLM_LAUNCH_GLM53_GEMV_HALF2(rows)                           \
+  glm53_fp16_gemv_half2_sm70_kernel<8, rows>                         \
+      <<<kGlm53N / rows, rows * 64, 0, stream>>>(                    \
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()),      \
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>()), \
           reinterpret_cast<const half*>(weight.data_ptr<at::Half>()))
     switch (variant) {
       case 1:

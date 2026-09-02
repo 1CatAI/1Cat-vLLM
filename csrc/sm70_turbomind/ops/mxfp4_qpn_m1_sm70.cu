@@ -501,10 +501,11 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_glm53_moe_q8_qpn_sm70_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
-    torch::Tensor scales, torch::Tensor expert_ids,
-    torch::Tensor sorted_row_idx, bool w13) {
+void nvfp4_glm53_moe_q8_qpn_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor weights,
+                                     torch::Tensor scales,
+                                     torch::Tensor expert_ids,
+                                     torch::Tensor sorted_row_idx, bool w13) {
   TORCH_CHECK(out.is_cuda() && input.is_cuda() && weights.is_cuda() &&
                   scales.is_cuda() && expert_ids.is_cuda() &&
                   sorted_row_idx.is_cuda(),
@@ -542,26 +543,24 @@ void nvfp4_glm53_moe_q8_qpn_sm70_out(
                     weights.sizes() == torch::IntArrayRef({288, 4096, 64}) &&
                     scales.sizes() == torch::IntArrayRef({288, 256, 512}),
                 "nvfp4_glm53_moe_q8_qpn_sm70_out: W13 shape mismatch");
-    nvfp4_glm53_moe_q8_qpn_sm70_kernel<true>
-        <<<dim3(16, 64), 96, 0, stream>>>(
-            reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-            reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
-            reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
-            expert_ids.data_ptr<int32_t>(), sorted_row_idx.data_ptr<int32_t>(),
-            reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+    nvfp4_glm53_moe_q8_qpn_sm70_kernel<true><<<dim3(16, 64), 96, 0, stream>>>(
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        expert_ids.data_ptr<int32_t>(), sorted_row_idx.data_ptr<int32_t>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()));
   } else {
     TORCH_CHECK(input.sizes() == torch::IntArrayRef({64, 256}) &&
                     out.sizes() == torch::IntArrayRef({64, 4096}) &&
                     weights.sizes() == torch::IntArrayRef({288, 256, 512}) &&
                     scales.sizes() == torch::IntArrayRef({288, 16, 4096}),
                 "nvfp4_glm53_moe_q8_qpn_sm70_out: W2 shape mismatch");
-    nvfp4_glm53_moe_q8_qpn_sm70_kernel<false>
-        <<<dim3(128, 64), 32, 0, stream>>>(
-            reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-            reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
-            reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
-            expert_ids.data_ptr<int32_t>(), sorted_row_idx.data_ptr<int32_t>(),
-            reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+    nvfp4_glm53_moe_q8_qpn_sm70_kernel<false><<<dim3(128, 64), 32, 0, stream>>>(
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        expert_ids.data_ptr<int32_t>(), sorted_row_idx.data_ptr<int32_t>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()));
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

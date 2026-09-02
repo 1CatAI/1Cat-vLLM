@@ -50,8 +50,7 @@ inline hipPointer_attribute rangeStartAddrAttr =
 #endif
 
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
-constexpr size_t kSm70Tp8HierarchicalAllreduce8KiBBytes =
-    4096 * sizeof(half);
+constexpr size_t kSm70Tp8HierarchicalAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp8HierarchicalAllreduce64KiBBytes =
     8 * 4096 * sizeof(half);
 constexpr int kSm70Tp8HierarchicalPushWorldSize = 8;
@@ -69,8 +68,7 @@ constexpr size_t kSm70Tp8HierarchicalPushCrossBytes =
     kSm70Tp8HierarchicalPushEpochs * 2 *
     kSm70Tp8HierarchicalAllreduce64KiBBytes;
 constexpr size_t kSm70Tp8HierarchicalPushBufferBytes =
-    kSm70Tp8HierarchicalPushSignalBytes +
-    kSm70Tp8HierarchicalPushCliqueBytes +
+    kSm70Tp8HierarchicalPushSignalBytes + kSm70Tp8HierarchicalPushCliqueBytes +
     kSm70Tp8HierarchicalPushCrossBytes;
 constexpr size_t kSm70Tp4MtpVerifierBytesPerRequest = 5 * 2048 * sizeof(half);
 constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
@@ -179,8 +177,8 @@ inline int sm70_tp8_hierarchical_push_blocks(size_t bytes) {
   if (end == raw || *end != '\0' || parsed < 1 ||
       parsed > kSm70Tp8HierarchicalPushMaxBlocks) {
     throw std::runtime_error(
-        "Invalid VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS: " +
-        std::string(raw) + ". Expected an integer in [1, " +
+        "Invalid VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS: " + std::string(raw) +
+        ". Expected an integer in [1, " +
         std::to_string(kSm70Tp8HierarchicalPushMaxBlocks) + "].");
   }
   return static_cast<int>(parsed);
@@ -782,11 +780,10 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
   const int cross_epoch_offset = epoch * 2 * packed_stride;
   char* const local_clique =
       local_storage + kSm70Tp8HierarchicalPushSignalBytes;
-  char* const local_cross =
-      local_clique + kSm70Tp8HierarchicalPushCliqueBytes;
+  char* const local_cross = local_clique + kSm70Tp8HierarchicalPushCliqueBytes;
 
-  for (int offset = blockIdx.x * blockDim.x + threadIdx.x;
-       offset < packed_size; offset += gridDim.x * blockDim.x) {
+  for (int offset = blockIdx.x * blockDim.x + threadIdx.x; offset < packed_size;
+       offset += gridDim.x * blockDim.x) {
     P value = reinterpret_cast<const P*>(input_a)[offset];
     if constexpr (SumTwoInputs) {
       packed_assign_add(value, reinterpret_cast<const P*>(input_b)[offset]);
@@ -813,8 +810,8 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
     while (true) {
       bool has_empty_slot = false;
 #pragma unroll
-      for (int peer_slot = 0;
-           peer_slot < kSm70Tp8HierarchicalPushCliqueSize; ++peer_slot) {
+      for (int peer_slot = 0; peer_slot < kSm70Tp8HierarchicalPushCliqueSize;
+           ++peer_slot) {
         const void* source =
             local_clique +
             (clique_epoch_offset + peer_slot * packed_stride) * sizeof(P);
@@ -830,8 +827,8 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
 
     A partial = upcast(peer_values[0]);
 #pragma unroll
-    for (int peer_slot = 1;
-         peer_slot < kSm70Tp8HierarchicalPushCliqueSize; ++peer_slot) {
+    for (int peer_slot = 1; peer_slot < kSm70Tp8HierarchicalPushCliqueSize;
+         ++peer_slot) {
       packed_assign_add(partial, upcast(peer_values[peer_slot]));
     }
 #pragma unroll
@@ -862,8 +859,8 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
 #pragma unroll
         for (int element = 0; element < F::size; ++element) {
           has_empty_slot |=
-              *reinterpret_cast<const uint32_t*>(&pair_words[word].data[element]) ==
-              fp32_sentinel;
+              *reinterpret_cast<const uint32_t*>(
+                  &pair_words[word].data[element]) == fp32_sentinel;
         }
       }
       if (!has_empty_slot) break;
@@ -886,8 +883,8 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
           kSm70Tp4PushAllreduceSentinel;
     }
 #pragma unroll
-    for (int peer_slot = 0;
-         peer_slot < kSm70Tp8HierarchicalPushCliqueSize; ++peer_slot) {
+    for (int peer_slot = 0; peer_slot < kSm70Tp8HierarchicalPushCliqueSize;
+         ++peer_slot) {
       void* source =
           local_clique +
           (clique_epoch_offset + peer_slot * packed_stride) * sizeof(P);
@@ -907,8 +904,7 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
 
   __syncthreads();
   if (threadIdx.x == 0) {
-    local_epochs[blockIdx.x] =
-        (epoch + 1) % kSm70Tp8HierarchicalPushEpochs;
+    local_epochs[blockIdx.x] = (epoch + 1) % kSm70Tp8HierarchicalPushEpochs;
   }
 }
 
@@ -1366,8 +1362,7 @@ static __global__ void __launch_bounds__(512, 1)
     // Both cliques form the same (ranks 0..3) + (ranks 4..7) FP32 tree,
     // independent of which side writes the output.
     A total = rank < 4 ? self_partial[idx] : pair_partial[idx];
-    packed_assign_add(
-        total, rank < 4 ? pair_partial[idx] : self_partial[idx]);
+    packed_assign_add(total, rank < 4 ? pair_partial[idx] : self_partial[idx]);
     reinterpret_cast<P*>(result)[idx] = downcast<P>(total);
   }
   if (tid == 0) self_sg->_flag[0] = pair_flag;
@@ -1650,11 +1645,11 @@ class CustomAllreduce {
       }
       sm70_tp8_hierarchical_push_buffers_.ptrs[peer] = ptrs[peer];
     }
-    auto* local_data = static_cast<char*>(ptrs[rank_]) +
-                       kSm70Tp8HierarchicalPushSignalBytes;
+    auto* local_data =
+        static_cast<char*>(ptrs[rank_]) + kSm70Tp8HierarchicalPushSignalBytes;
     CUDACHECK(cudaMemset(local_data, kSm70Tp4PushAllreduceSentinelByte,
-                        kSm70Tp8HierarchicalPushBufferBytes -
-                            kSm70Tp8HierarchicalPushSignalBytes));
+                         kSm70Tp8HierarchicalPushBufferBytes -
+                             kSm70Tp8HierarchicalPushSignalBytes));
     sm70_tp8_hierarchical_push_buffers_registered_ = true;
   }
 

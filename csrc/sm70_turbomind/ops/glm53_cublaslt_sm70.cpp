@@ -38,22 +38,22 @@ struct MatmulResources {
 
 void create_row_major_layout(cublasLtMatrixLayout_t* layout, int64_t rows,
                              int64_t columns) {
-  check_cublaslt(cublasLtMatrixLayoutCreate(layout, CUDA_R_16F, rows, columns,
-                                             columns),
-                 "cublasLtMatrixLayoutCreate");
+  check_cublaslt(
+      cublasLtMatrixLayoutCreate(layout, CUDA_R_16F, rows, columns, columns),
+      "cublasLtMatrixLayoutCreate");
   cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-  check_cublaslt(cublasLtMatrixLayoutSetAttribute(
-                     *layout, CUBLASLT_MATRIX_LAYOUT_ORDER, &order,
-                     sizeof(order)),
-                 "set row-major matrix layout");
+  check_cublaslt(
+      cublasLtMatrixLayoutSetAttribute(*layout, CUBLASLT_MATRIX_LAYOUT_ORDER,
+                                       &order, sizeof(order)),
+      "set row-major matrix layout");
 }
 
 template <typename T>
 void set_algorithm_attribute(cublasLtMatmulAlgo_t* algorithm,
                              cublasLtMatmulAlgoConfigAttributes_t attribute,
                              T value) {
-  check_cublaslt(cublasLtMatmulAlgoConfigSetAttribute(
-                     algorithm, attribute, &value, sizeof(value)),
+  check_cublaslt(cublasLtMatmulAlgoConfigSetAttribute(algorithm, attribute,
+                                                      &value, sizeof(value)),
                  "cublasLtMatmulAlgoConfigSetAttribute");
 }
 
@@ -68,9 +68,9 @@ void sm70_glm53_tp8_cublaslt_out(torch::Tensor out, torch::Tensor input,
                   input.scalar_type() == torch::kFloat16 &&
                   weight.scalar_type() == torch::kFloat16,
               "sm70_glm53_tp8_cublaslt_out: tensors must be float16");
-  TORCH_CHECK(out.is_contiguous() && input.is_contiguous() &&
-                  weight.is_contiguous(),
-              "sm70_glm53_tp8_cublaslt_out: tensors must be contiguous");
+  TORCH_CHECK(
+      out.is_contiguous() && input.is_contiguous() && weight.is_contiguous(),
+      "sm70_glm53_tp8_cublaslt_out: tensors must be contiguous");
   TORCH_CHECK(out.dim() == 2 && input.dim() == 2 && weight.dim() == 2,
               "sm70_glm53_tp8_cublaslt_out: tensors must be rank two");
   TORCH_CHECK(input.get_device() == out.get_device() &&
@@ -80,9 +80,8 @@ void sm70_glm53_tp8_cublaslt_out(torch::Tensor out, torch::Tensor input,
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t n = weight.size(0);
-  const bool in_projection =
-      m == kTokens && k == 4096 && n == 3336 &&
-      weight.sizes() == torch::IntArrayRef({3336, 4096});
+  const bool in_projection = m == kTokens && k == 4096 && n == 3336 &&
+                             weight.sizes() == torch::IntArrayRef({3336, 4096});
   const bool out_projection =
       m == kTokens && k == 1024 && n == 4096 &&
       weight.sizes() == torch::IntArrayRef({4096, 1024});
@@ -99,7 +98,7 @@ void sm70_glm53_tp8_cublaslt_out(torch::Tensor out, torch::Tensor input,
 
   MatmulResources resources;
   check_cublaslt(cublasLtMatmulDescCreate(&resources.operation,
-                                           CUBLAS_COMPUTE_32F, CUDA_R_32F),
+                                          CUBLAS_COMPUTE_32F, CUDA_R_32F),
                  "cublasLtMatmulDescCreate");
   cublasOperation_t transpose_a = CUBLAS_OP_N;
   cublasOperation_t transpose_b = CUBLAS_OP_T;
@@ -116,9 +115,9 @@ void sm70_glm53_tp8_cublaslt_out(torch::Tensor out, torch::Tensor input,
   create_row_major_layout(&resources.output, m, n);
 
   cublasLtMatmulAlgo_t algorithm{};
-  check_cublaslt(cublasLtMatmulAlgoInit(
-                     handle, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16F,
-                     CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, 21, &algorithm),
+  check_cublaslt(cublasLtMatmulAlgoInit(handle, CUBLAS_COMPUTE_32F, CUDA_R_32F,
+                                        CUDA_R_16F, CUDA_R_16F, CUDA_R_16F,
+                                        CUDA_R_16F, 21, &algorithm),
                  "cublasLtMatmulAlgoInit");
   set_algorithm_attribute(&algorithm, CUBLASLT_ALGO_CONFIG_TILE_ID,
                           uint32_t{5});
@@ -136,18 +135,17 @@ void sm70_glm53_tp8_cublaslt_out(torch::Tensor out, torch::Tensor input,
                               resources.weight, resources.output,
                               resources.output, &checked.algo, &checked),
       "cublasLtMatmulAlgoCheck");
-  TORCH_CHECK(checked.state == CUBLAS_STATUS_SUCCESS &&
-                  checked.workspaceSize == 0,
-              "sm70_glm53_tp8_cublaslt_out: pinned algorithm is unavailable");
+  TORCH_CHECK(
+      checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize == 0,
+      "sm70_glm53_tp8_cublaslt_out: pinned algorithm is unavailable");
 
   constexpr float alpha = 1.0F;
   constexpr float beta = 0.0F;
   check_cublaslt(
-      cublasLtMatmul(
-          handle, resources.operation, &alpha, input.data_ptr(),
-          resources.input, weight.data_ptr(), resources.weight, &beta,
-          out.data_ptr(), resources.output, out.data_ptr(), resources.output,
-          &checked.algo, nullptr, 0,
-          c10::cuda::getCurrentCUDAStream(input.get_device())),
+      cublasLtMatmul(handle, resources.operation, &alpha, input.data_ptr(),
+                     resources.input, weight.data_ptr(), resources.weight,
+                     &beta, out.data_ptr(), resources.output, out.data_ptr(),
+                     resources.output, &checked.algo, nullptr, 0,
+                     c10::cuda::getCurrentCUDAStream(input.get_device())),
       "cublasLtMatmul");
 }
