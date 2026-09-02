@@ -630,7 +630,7 @@ def main() -> None:
                 [torch.nn.functional.linear(x8[i : i + 1], weight) for i in range(8)]
             )
             fp32_reference8 = torch.nn.functional.linear(x8.float(), weight.float())
-            for half2_rows in (-4, -3, -2, 4, 0, 1, 2, 8, 16):
+            for half2_rows in (-5, -4, -3, -2, 4, 0, 1, 2, 8, 16):
                 try:
                     result = _benchmark_cuda_chunk_parallel_kernel(
                         x8,

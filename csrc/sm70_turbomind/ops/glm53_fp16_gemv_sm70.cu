@@ -284,7 +284,8 @@ __device__ __forceinline__ int glm53_staged_partial_index(int row, int chunk,
   return ((row * kChunkCount + chunk) * kLanesPerRow + lane);
 }
 
-template <int kBatch, int kRowsPerBlock, bool kSwizzled>
+template <int kBatch, int kRowsPerBlock, bool kSwizzled,
+          bool kBroadcastInput = true>
 __global__ void glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel(
     half* __restrict__ output, const half* __restrict__ input,
     const half* __restrict__ weight) {
@@ -309,11 +310,16 @@ __global__ void glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel(
 #pragma unroll
     for (int batch = 0; batch < kBatch; ++batch) {
       unsigned input_packed = 0;
-      if (row_in_block == 0) {
+      if constexpr (!kBroadcastInput) {
+        input_packed = __ldg(reinterpret_cast<const unsigned*>(
+            input + static_cast<size_t>(batch) * kGlm53K + k));
+      } else if (row_in_block == 0) {
         input_packed = __ldg(reinterpret_cast<const unsigned*>(
             input + static_cast<size_t>(batch) * kGlm53K + k));
       }
-      input_packed = __shfl_sync(0xffffffffu, input_packed, lane_pair);
+      if constexpr (kBroadcastInput) {
+        input_packed = __shfl_sync(0xffffffffu, input_packed, lane_pair);
+      }
       const half2 x = *reinterpret_cast<half2*>(&input_packed);
       const float2 input_value = __half22float2(x);
       chunk_sum[batch].x =
@@ -414,8 +420,17 @@ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
   const cudaStream_t stream =
       at::cuda::getCurrentCUDAStream(input.device().index());
   const char* variant_raw = std::getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS");
-  const int variant = variant_raw == nullptr ? -3 : std::atoi(variant_raw);
+  const int variant = variant_raw == nullptr ? -5 : std::atoi(variant_raw);
   if (input.size(0) == 8 && variant != 0) {
+    if (variant == -5) {
+      glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel<8, 4, true, false>
+          <<<kGlm53N / 4, 256, 0, stream>>>(
+              reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+              reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+              reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
     if (variant == -3) {
       glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel<8, 4, true>
           <<<kGlm53N / 4, 256, 0, stream>>>(
@@ -468,7 +483,7 @@ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
       default:
         TORCH_CHECK(false,
                     "VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS must be one of "
-                    "-4, -3, -2, 0, 1, 2, 4, 8, or 16");
+                    "-5, -4, -3, -2, 0, 1, 2, 4, 8, or 16");
     }
 #undef VLLM_LAUNCH_GLM53_GEMV_HALF2
     C10_CUDA_KERNEL_LAUNCH_CHECK();
