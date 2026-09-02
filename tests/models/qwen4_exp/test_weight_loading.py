@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
+from vllm.models.qwen4_exp.nvidia import model as qwen4_exp_model
 from vllm.models.qwen4_exp.nvidia.model import (
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpModel,
@@ -381,3 +382,26 @@ def test_qsa_e4m3_finalizes_and_deletes_invalid_loading_slots() -> None:
     assert layer._v_scale_float == pytest.approx(0.02)
     assert layer._k_scale.item() == pytest.approx(0.01)
     assert layer._v_scale.item() == pytest.approx(0.02)
+
+
+def test_qsa_e4m3_skips_scale_gate_in_ple_offload_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = nn.Module()
+    attention = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    nn.Module.__init__(attention)
+    attention.kv_cache_dtype = "fp8_e4m3"
+    attention.layer_name = "model.layers.0.self_attn.attn"
+    attention._qsa_kv_scales_finalized = False
+    attention.register_buffer("_k_scale", torch.tensor(1.0))
+    attention.register_buffer("_v_scale", torch.tensor(1.0))
+    attention.k_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    attention.v_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    model.attention = attention
+    monkeypatch.setattr(qwen4_exp_model, "is_offload_process", lambda: True)
+
+    _finalize_qsa_e4m3_scale_load(model, set(), "fp8_e4m3")
+
+    assert not attention._qsa_kv_scales_finalized
+    assert attention.k_scale.item() == -1.0
+    assert attention.v_scale.item() == -1.0
