@@ -182,6 +182,81 @@ def test_qsa_xqa_page4_receives_calibrated_e4m3_scales(monkeypatch) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
+def test_qsa_e4m3_mixed_batch_split_matches_triton(monkeypatch) -> None:
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("QSA grouped/XQA page4 split is SM70-only")
+    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+    extension = interface.flash_attn_v100_cuda
+    if not (
+        hasattr(extension, "grouped_sparse_page4_plan_fwd")
+        and hasattr(extension, "grouped_sparse_page4_fwd")
+        and hasattr(extension, "decode_paged_xqa_fwd")
+    ):
+        pytest.skip("Flash-V100 extension lacks grouped/XQA page4 kernels")
+
+    torch.manual_seed(23)
+    rows, requests, heads, head_dim = 49, 4, 6, 256
+    page_size, topk = 2052, 2051
+    query = torch.randn(
+        (rows, heads, head_dim), dtype=torch.float16, device="cuda"
+    ).mul_(0.2)
+    key = torch.randn(
+        (requests, page_size, 1, head_dim),
+        dtype=torch.float16,
+        device="cuda",
+    ).mul_(0.35)
+    value = torch.randn_like(key).mul_(0.3)
+    k_scale = float(key.abs().max().item()) / 448.0
+    v_scale = float(value.abs().max().item()) / 448.0
+    key_cache = (key / k_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    value_cache = (value / v_scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    logical_indices = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
+        rows, 1
+    )
+    block_table = torch.arange(requests, dtype=torch.int32, device="cuda").view(
+        requests, 1
+    )
+    # Match the scheduler shape that exposed the bug: a 46-row catch-up chunk
+    # followed by one decode row from each of three other requests.
+    token_to_req = torch.tensor([0] * 46 + [1, 2, 3], dtype=torch.int32, device="cuda")
+    query_positions = torch.full((rows,), topk - 1, dtype=torch.int64, device="cuda")
+    sequence_lengths = torch.full((requests,), topk, dtype=torch.int32, device="cuda")
+    kwargs = {
+        "query_positions": query_positions,
+        "sequence_lengths": sequence_lengths,
+        "kv_cache_dtype": "fp8_e4m3",
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+    }
+
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    reference = qsa_sparse_paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        **kwargs,
+    )
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 4096)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    actual = qsa_sparse_paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        **kwargs,
+    )
+
+    torch.testing.assert_close(actual.float(), reference.float(), atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
 def test_qsa_xqa_page4_large_e4m3_key_accumulates_in_fp32(monkeypatch) -> None:
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("QSA XQA page4 is SM70-only")
