@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
+
 import pytest
 import torch
 
@@ -156,6 +160,148 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
     )
     monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
     assert not qsa_ops._use_sm70_qsa_xqa_page4(query, *args)
+
+
+def test_qsa_e4m3_page4_routes_large_mixed_batch_below_prefill_boundary(
+    monkeypatch,
+):
+    rows = 49
+    query = torch.empty(rows, 6, 256, dtype=torch.float16)
+    key_cache = torch.empty(2, 400, 1, 256, dtype=torch.uint8)
+    value_cache = torch.empty_like(key_cache)
+    indices = torch.empty(rows, 2051, dtype=torch.int32)
+    page_table = torch.empty(4, 2, dtype=torch.int32)
+    token_to_request = torch.zeros(rows, dtype=torch.int32)
+    query_positions = torch.arange(rows, dtype=torch.int64)
+    sequence_lengths = torch.full((4,), rows, dtype=torch.int32)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 4096)
+    monkeypatch.setattr(
+        qsa_ops.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+
+    assert qsa_ops._use_sm70_qsa_xqa_page4(
+        query,
+        key_cache,
+        value_cache,
+        indices,
+        page_table,
+        token_to_request,
+        query_positions,
+        sequence_lengths,
+    )
+
+
+def test_qsa_e4m3_xqa_page4_splits_non_grouped_large_batch(monkeypatch):
+    rows = 49
+    query = torch.empty(rows, 6, 256, dtype=torch.float16)
+    flash_cuda = SimpleNamespace(
+        decode_paged_xqa_fwd=object(),
+        grouped_sparse_page4_plan_fwd=object(),
+        grouped_sparse_page4_fwd=object(),
+    )
+    flash_interface = ModuleType("flash_attn_v100.flash_attn_interface")
+    cast(Any, flash_interface).flash_attn_v100_cuda = flash_cuda
+    flash_package = ModuleType("flash_attn_v100")
+    cast(Any, flash_package).flash_attn_interface = flash_interface
+    monkeypatch.setitem(sys.modules, "flash_attn_v100", flash_package)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100.flash_attn_interface",
+        flash_interface,
+    )
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+
+    calls = []
+
+    def fake_grouped(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        out,
+        *args,
+    ):
+        calls.append(
+            (
+                "grouped",
+                q.shape[0],
+                logical_indices.shape[0],
+                token_to_req.shape[0],
+                query_positions.shape[0],
+                out.shape[0],
+            )
+        )
+        return out
+
+    def fake_xqa_batch(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        out,
+        *args,
+    ):
+        calls.append(
+            (
+                "xqa",
+                q.shape[0],
+                logical_indices.shape[0],
+                token_to_req.shape[0],
+                query_positions.shape[0],
+                out.shape[0],
+            )
+        )
+        return out
+
+    monkeypatch.setattr(
+        qsa_ops,
+        "_qsa_sparse_paged_attention_sm70_grouped_page4",
+        fake_grouped,
+    )
+    monkeypatch.setattr(
+        qsa_ops,
+        "_qsa_sparse_paged_attention_sm70_xqa_page4_batch",
+        fake_xqa_batch,
+    )
+
+    cache = torch.empty(0)
+    logical_indices = torch.empty(rows, 2051, dtype=torch.int32)
+    block_table = torch.empty(4, 1, dtype=torch.int32)
+    token_to_req = torch.empty(rows, dtype=torch.int32)
+    query_positions = torch.empty(rows, dtype=torch.int64)
+    sequence_lengths = torch.empty(4, dtype=torch.int32)
+    out = torch.empty_like(query)
+    result = qsa_ops._qsa_sparse_paged_attention_sm70_xqa_page4(
+        query,
+        cache,
+        cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        out,
+        "fp8_e4m3",
+        0.05,
+        0.05,
+    )
+
+    assert result is out
+    assert calls == [
+        ("grouped", 48, 48, 48, 48, 48),
+        ("xqa", 1, 1, 1, 1, 1),
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

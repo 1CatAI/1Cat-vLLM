@@ -1362,7 +1362,10 @@ def _use_sm70_qsa_xqa_page4(
     return (
         _SM70_QSA_XQA_PAGE4
         and current_platform.is_device_capability(70)
-        and q.shape[0] >= _SM70_QSA_XQA_PAGE4_MIN_ROWS
+        and (
+            q.shape[0] >= _SM70_QSA_XQA_PAGE4_MIN_ROWS
+            or (k_cache.dtype == torch.uint8 and q.shape[0] > 16)
+        )
         and _qsa_xqa_page4_shape_supported(
             q,
             k_cache,
@@ -1601,7 +1604,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     return out
 
 
-def _qsa_sparse_paged_attention_sm70_xqa_page4(
+def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1614,46 +1617,8 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
-) -> torch.Tensor | None:
-    try:
-        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
-    except ImportError:
-        logger.warning_once(
-            "SM70 QSA page4 XQA route is unavailable because Flash-V100 "
-            "could not be imported; using Triton sparse attention."
-        )
-        return None
-    if not hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd"):
-        logger.warning_once(
-            "SM70 QSA page4 XQA route is unavailable in this Flash-V100 build; "
-            "using Triton sparse attention."
-        )
-        return None
-
-    grouped_bindings_available = hasattr(
-        flash_attn_v100_cuda, "grouped_sparse_page4_plan_fwd"
-    ) and hasattr(flash_attn_v100_cuda, "grouped_sparse_page4_fwd")
-    if (
-        _SM70_QSA_GROUPED_PAGE4
-        and q.shape[0] % _SM70_QSA_GROUPED_PAGE4_QUERIES == 0
-        and grouped_bindings_available
-    ):
-        return _qsa_sparse_paged_attention_sm70_grouped_page4(
-            q,
-            k_cache,
-            v_cache,
-            logical_indices,
-            block_table,
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            out,
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-            flash_attn_v100_cuda,
-        )
-
+    flash_attn_v100_cuda,
+) -> torch.Tensor:
     virtual_block_table, xqa_sequence_lengths = _qsa_xqa_page4_block_table(
         logical_indices,
         block_table,
@@ -1701,6 +1666,125 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         num_partitions,
     )
     return out
+
+
+def _qsa_sparse_paged_attention_sm70_xqa_page4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    out: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+) -> torch.Tensor | None:
+    try:
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+    except ImportError:
+        logger.warning_once(
+            "SM70 QSA page4 XQA route is unavailable because Flash-V100 "
+            "could not be imported; using Triton sparse attention."
+        )
+        return None
+    if not hasattr(flash_attn_v100_cuda, "decode_paged_xqa_fwd"):
+        logger.warning_once(
+            "SM70 QSA page4 XQA route is unavailable in this Flash-V100 build; "
+            "using Triton sparse attention."
+        )
+        return None
+
+    grouped_bindings_available = hasattr(
+        flash_attn_v100_cuda, "grouped_sparse_page4_plan_fwd"
+    ) and hasattr(flash_attn_v100_cuda, "grouped_sparse_page4_fwd")
+    grouped_enabled = _SM70_QSA_GROUPED_PAGE4 and grouped_bindings_available
+    if grouped_enabled and q.shape[0] % _SM70_QSA_GROUPED_PAGE4_QUERIES == 0:
+        return _qsa_sparse_paged_attention_sm70_grouped_page4(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            out,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            flash_attn_v100_cuda,
+        )
+
+    if kv_cache_dtype == "fp8_e4m3" and q.shape[0] > 16:
+        # The generic E4M3 XQA kernel accepts at most 16 query rows. Scheduler
+        # iterations can mix a large prefill (or catch-up chunk) with decode
+        # rows, so split the bulk across the grouped route and keep only the
+        # remainder on supported XQA batches. This avoids both an invalid
+        # B>16 XQA launch and the larger Triton split-K fallback workspace.
+        grouped_rows = 0
+        if grouped_enabled:
+            grouped_rows = (
+                q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES
+            ) * _SM70_QSA_GROUPED_PAGE4_QUERIES
+            if grouped_rows:
+                _qsa_sparse_paged_attention_sm70_grouped_page4(
+                    q[:grouped_rows],
+                    k_cache,
+                    v_cache,
+                    logical_indices[:grouped_rows],
+                    block_table,
+                    token_to_req[:grouped_rows],
+                    query_positions[:grouped_rows],
+                    sequence_lengths,
+                    out[:grouped_rows],
+                    kv_cache_dtype,
+                    k_scale,
+                    v_scale,
+                    flash_attn_v100_cuda,
+                )
+        logger.info_once(
+            "Splitting a non-grouped E4M3 page4 batch across supported "
+            "grouped/XQA routes (rows=%d, grouped_rows=%d).",
+            q.shape[0],
+            grouped_rows,
+        )
+        for row_start in range(grouped_rows, q.shape[0], 16):
+            row_end = min(row_start + 16, q.shape[0])
+            _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
+                q[row_start:row_end],
+                k_cache,
+                v_cache,
+                logical_indices[row_start:row_end],
+                block_table,
+                token_to_req[row_start:row_end],
+                query_positions[row_start:row_end],
+                sequence_lengths,
+                out[row_start:row_end],
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+                flash_attn_v100_cuda,
+            )
+        return out
+
+    return _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        query_positions,
+        sequence_lengths,
+        out,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        flash_attn_v100_cuda,
+    )
 
 
 def qsa_sparse_paged_attention(
