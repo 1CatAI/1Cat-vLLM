@@ -4245,22 +4245,19 @@ at::Tensor flash_attention_grouped_sparse_page4(
   TORCH_CHECK(block_table.is_cuda() && token_masks.is_cuda() &&
                   seq_lens.is_cuda() && lse.is_cuda(),
               "grouped sparse page4 metadata must be CUDA tensors");
-  const bool e4m3_kv = kv_cache_dtype == "fp8" ||
-                       kv_cache_dtype == "fp8_e4m3";
+  const bool e4m3_kv = kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3";
   TORCH_CHECK(q.dtype() == torch::kFloat16,
               "grouped sparse page4 requires fp16 queries");
+  TORCH_CHECK(e4m3_kv ? (k_cache.dtype() == torch::kUInt8 &&
+                         v_cache.dtype() == torch::kUInt8)
+                      : (k_cache.dtype() == torch::kFloat16 &&
+                         v_cache.dtype() == torch::kFloat16),
+              "grouped sparse page4 KV storage does not match kv_cache_dtype");
   TORCH_CHECK(
-      e4m3_kv ? (k_cache.dtype() == torch::kUInt8 &&
-                  v_cache.dtype() == torch::kUInt8)
-               : (k_cache.dtype() == torch::kFloat16 &&
-                  v_cache.dtype() == torch::kFloat16),
-      "grouped sparse page4 KV storage does not match kv_cache_dtype");
-  TORCH_CHECK(e4m3_kv || kv_cache_dtype == "auto" ||
-                  kv_cache_dtype == "float16",
-              "grouped sparse page4 supports fp16 and fp8_e4m3 KV only");
-  TORCH_CHECK(!e4m3_kv ||
-                  (std::isfinite(k_scale) && std::isfinite(v_scale) &&
-                   k_scale > 0.0f && v_scale > 0.0f),
+      e4m3_kv || kv_cache_dtype == "auto" || kv_cache_dtype == "float16",
+      "grouped sparse page4 supports fp16 and fp8_e4m3 KV only");
+  TORCH_CHECK(!e4m3_kv || (std::isfinite(k_scale) && std::isfinite(v_scale) &&
+                           k_scale > 0.0f && v_scale > 0.0f),
               "grouped sparse page4 E4M3 scales must be finite and positive");
   TORCH_CHECK(block_table.dtype() == torch::kInt32 &&
                   seq_lens.dtype() == torch::kInt32 &&
@@ -4312,30 +4309,28 @@ at::Tensor flash_attention_grouped_sparse_page4(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   const dim3 grid(1, 1, static_cast<unsigned>(num_groups));
   const size_t shared_mem = sizeof(GroupedVerifySmem);
-#define LAUNCH_GROUPED_SPARSE_PAGE4(KV_DTYPE_CODE)                           \
-  do {                                                                        \
-    auto kernel =                                                             \
-        (void*)flash_attention_grouped_verify_e5m2_partial_kernel<            \
-            kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE,   \
-            true>;                                                            \
-    const cudaError_t smem_status = cudaFuncSetAttribute(                     \
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);     \
-    TORCH_CHECK(smem_status == cudaSuccess,                                   \
-                "Failed to set grouped sparse page4 shared memory: ",        \
-                cudaGetErrorString(smem_status));                             \
-    flash_attention_grouped_verify_e5m2_partial_kernel<                       \
-        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true> \
+#define LAUNCH_GROUPED_SPARSE_PAGE4(KV_DTYPE_CODE)                             \
+  do {                                                                         \
+    auto kernel = (void*)flash_attention_grouped_verify_e5m2_partial_kernel<   \
+        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true>; \
+    const cudaError_t smem_status = cudaFuncSetAttribute(                      \
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);      \
+    TORCH_CHECK(smem_status == cudaSuccess,                                    \
+                "Failed to set grouped sparse page4 shared memory: ",          \
+                cudaGetErrorString(smem_status));                              \
+    flash_attention_grouped_verify_e5m2_partial_kernel<                        \
+        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true>  \
         <<<grid, kGroupedVerifyThreads, shared_mem, stream>>>(                 \
-            reinterpret_cast<const __half*>(q.data_ptr()),                    \
-            k_cache.data_ptr(), v_cache.data_ptr(),                           \
-            block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),            \
-            reinterpret_cast<__half*>(out.data_ptr()), lse.data_ptr<float>(), \
-            kQueriesPerGroup, static_cast<int>(block_table.size(1)), 4,       \
-            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),          \
-            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),          \
-            softmax_scale * (e4m3_kv ? k_scale : 1.0f),                       \
-            e4m3_kv ? v_scale : 1.0f, token_masks.data_ptr<uint32_t>(),       \
-            static_cast<int>(num_groups));                                    \
+            reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(), \
+            v_cache.data_ptr(), block_table.data_ptr<int>(),                   \
+            seq_lens.data_ptr<int>(),                                          \
+            reinterpret_cast<__half*>(out.data_ptr()), lse.data_ptr<float>(),  \
+            kQueriesPerGroup, static_cast<int>(block_table.size(1)), 4,        \
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
+            softmax_scale * (e4m3_kv ? k_scale : 1.0f),                        \
+            e4m3_kv ? v_scale : 1.0f, token_masks.data_ptr<uint32_t>(),        \
+            static_cast<int>(num_groups));                                     \
   } while (0)
   if (e4m3_kv) {
     LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
