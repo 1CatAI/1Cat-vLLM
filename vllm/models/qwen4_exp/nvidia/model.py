@@ -27,6 +27,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -179,6 +180,11 @@ def _finalize_qsa_e4m3_scale_load(
     model: nn.Module, loaded: set[str], cache_dtype: str
 ) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    # The dedicated PLE process builds the complete model structure on meta but
+    # intentionally streams only the PLE subtree from the checkpoint. It never
+    # executes QSA forward; the GPU workers own and validate the main KV cache.
+    if is_offload_process():
         return
     qsa_modules = {
         name: module
