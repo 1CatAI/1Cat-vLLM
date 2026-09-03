@@ -2597,16 +2597,15 @@ class VllmConfig:
         if (
             compile_range_end is not None
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
             and compilation_config.mode == CompilationMode.VLLM_COMPILE
             and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         ):
-            # FULL decode capture can enter the compiled piecewise wrapper with
+            # FULL capture can enter the compiled piecewise wrapper with
             # max_num_batched_tokens + one decode token. Keep scheduler capacity
             # unchanged, but allow the wrapper to select a compiled range.
             compile_range_end += 1
             logger.info_once(
-                "Extending SM70 Flash-V100 0.0.3 decode-only compile range "
+                "Extending SM70 Flash-V100 0.0.3 compile range "
                 "endpoint to %d for CUDA graph capture.",
                 compile_range_end,
             )

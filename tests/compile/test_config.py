@@ -468,6 +468,28 @@ def test_cudagraph_sizes_post_init(
         )
 
 
+def test_sm70_full_and_piecewise_compile_range_includes_decode_token(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE", "0")
+
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=512,
+            max_model_len=2048,
+            is_encoder_decoder=False,
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        ),
+    )
+    vllm_config._set_compile_ranges()
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+    assert vllm_config.compilation_config.compile_ranges_endpoints == [513]
+
+
 @pytest.mark.skipif(
     not current_platform.support_static_graph_mode(),
     reason="Skip if not cudagraph mode supported",
