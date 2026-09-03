@@ -253,10 +253,7 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
-            if (
-                envs.VLLM_SM70_QWEN38_HYBRID_PLE
-                and use_sm70_decode_graph_semantics()
-            ):
+            if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_sm70_decode_graph_semantics():
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
             torch.ops.vllm.ple_offload_wait(
                 self._sem.flag_tensor,

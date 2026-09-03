@@ -612,10 +612,7 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
-        if (
-            envs.VLLM_PLE_CPU_OFFLOAD
-            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
-        ):
+        if envs.VLLM_PLE_CPU_OFFLOAD and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.worker.spawn_ple_offload()
         elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.worker.prepare_ple_offload_spawn()

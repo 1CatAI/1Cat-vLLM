@@ -664,18 +664,24 @@ def test_delayed_ple_spawn_uses_pre_load_config_snapshot(
         _ple_offload_ipc_path="ipc:///tmp/test-ple-offload",
     )
 
+    def fake_make_process(*args: object) -> object:
+        calls.append(args)
+        return object()
+
     monkeypatch.setattr(
         ple_offload_worker.PleOffloadWorker,
         "make_process",
-        lambda *args: calls.append(args) or object(),
+        fake_make_process,
     )
 
     worker.prepare_ple_offload_spawn()
     worker.vllm_config.markers.append("model-load-mutation")
     worker.spawn_ple_offload()
 
-    assert calls[0][0].markers == []
-    assert calls[0][0] is not worker.vllm_config
+    spawn_config = calls[0][0]
+    assert isinstance(spawn_config, SimpleNamespace)
+    assert spawn_config.markers == []
+    assert spawn_config is not worker.vllm_config
     assert worker._ple_offload_spawn_config is None
 
 
