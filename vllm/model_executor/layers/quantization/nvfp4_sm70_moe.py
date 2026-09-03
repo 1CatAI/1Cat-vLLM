@@ -428,9 +428,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if (
             envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
-            or envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
-        ) and not sm70_ops.has_nvfp4_qpn_m1_dispatch():
+            and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
+        ):
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
+        if (
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+            and not sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+        ):
+            missing.append("nvfp4_moe_qpn_mtp5_sm70_out")
         indexed_prefill_ops = {
             "nvfp4_moe_indexed_dense_stage_sm70_out": hasattr(
                 torch.ops._C, "nvfp4_moe_indexed_dense_stage_sm70_out"
@@ -934,7 +939,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 w13_split_k,
             )
             route_ids = topk_ids.view(-1)
-            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+            direct_op = (
+                sm70_ops.nvfp4_moe_qpn_m1_sm70_out
+                if direct_qpn_m1
+                else sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out
+            )
+            direct_op(
                 buffers["gate_up"],
                 x,
                 layer.w13_tm_weight,
@@ -949,7 +959,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["gate_up"],
                 interleaved=interleaved_w13,
             )
-            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+            direct_op(
                 buffers["sorted_output"],
                 buffers["intermediate"],
                 layer.w2_tm_weight,

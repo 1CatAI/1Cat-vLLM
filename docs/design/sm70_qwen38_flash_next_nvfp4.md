@@ -592,6 +592,10 @@ than changing generic inference:
   performs the weighted reduction in the direct kernel. Across the complete
   path, maximum final-output error is `4.768e-7`; relative L2 is `7.773e-5`
   with ten overlapping experts and `1.051e-4` with 50 distinct experts.
+- The 50-route path has its own `nvfp4_moe_qpn_mtp5_sm70_out` capability
+  schema. Source overlays therefore fail closed with an older ten-route M=1
+  extension instead of sending an unsupported shape to it. The operator
+  benchmark resolves only the production `_C` or `_C_qwen38` namespace.
 - Warm-cache projection saves 2.259 ms and 1.695 ms per 48-layer verifier for
   those two routing patterns. The corresponding cold-weight projections save
   5.505 ms and 4.964 ms. The cold figures are the relevant planning range:

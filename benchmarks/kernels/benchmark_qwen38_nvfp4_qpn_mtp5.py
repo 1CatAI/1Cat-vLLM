@@ -140,14 +140,20 @@ def error(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float | boo
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--library", type=Path)
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    torch.ops.load_library(str(args.library))
-    op = torch.ops._C_qwen38_mtp5.nvfp4_moe_qpn_m1_sm70_out
+    if args.library is not None:
+        torch.ops.load_library(str(args.library))
+    if not sm70_ops.has_nvfp4_qpn_mtp5_dispatch():
+        raise RuntimeError(
+            "benchmark requires nvfp4_moe_qpn_mtp5_sm70_out in the "
+            "production _C or _C_qwen38 namespace"
+        )
+    op = sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out
     if torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("benchmark requires exact SM70")
 

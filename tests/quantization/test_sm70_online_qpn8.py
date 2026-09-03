@@ -65,6 +65,18 @@ def test_nvfp4_sidecar_loads_for_mtp5_when_m1_is_disabled(monkeypatch):
     assert calls == ["/tmp/qpn-mtp5.so"]
 
 
+def test_nvfp4_mtp5_capability_is_not_inferred_from_m1(monkeypatch):
+    legacy_sidecar = SimpleNamespace(nvfp4_moe_qpn_m1_sm70_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", legacy_sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert online_qpn8.sm70_ops.has_nvfp4_qpn_m1_dispatch()
+    assert not online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+
+    legacy_sidecar.nvfp4_moe_qpn_mtp5_sm70_out = object()
+    assert online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+
+
 @pytest.mark.parametrize(
     ("prefix", "k", "n", "expected"),
     [

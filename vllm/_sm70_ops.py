@@ -154,6 +154,13 @@ def has_nvfp4_qpn_m1_dispatch() -> bool:
     )
 
 
+def has_nvfp4_qpn_mtp5_dispatch() -> bool:
+    """Reject extensions that only implement the legacy ten-route kernel."""
+    return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
+        torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"
+    )
+
+
 def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
     _op("silu_and_mul_interleaved")(out, input)
 
@@ -1524,6 +1531,56 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out"):
 
     @register_fake("_C_qwen38::nvfp4_moe_qpn_m1_sm70_out")
     def _nvfp4_moe_qpn_m1_sm70_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_moe_qpn_mtp5_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+    split_k: int,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_mtp5_sm70_out")(
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        broadcast_input,
+        split_k,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_mtp5_sm70_out")
+    def _nvfp4_moe_qpn_mtp5_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_mtp5_sm70_out")
+    def _nvfp4_moe_qpn_mtp5_sm70_out_sidecar_fake(
         out: torch.Tensor,
         input: torch.Tensor,
         weights: torch.Tensor,

@@ -405,3 +405,13 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
                         broadcast_input, split_k);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+void nvfp4_moe_qpn_mtp5_sm70_out(torch::Tensor out, torch::Tensor input,
+                                 torch::Tensor weights, torch::Tensor scales,
+                                 torch::Tensor expert_ids, bool broadcast_input,
+                                 int64_t split_k) {
+  TORCH_CHECK(expert_ids.numel() == 50 && out.size(0) == 50,
+              "nvfp4_moe_qpn_mtp5_sm70_out: expected fifty routes");
+  nvfp4_moe_qpn_m1_sm70_out(out, input, weights, scales, expert_ids,
+                            broadcast_input, split_k);
+}
