@@ -84,6 +84,35 @@ def _sm70_channel_fp8_qpn8_config(
     return _SM70_CHANNEL_FP8_QPN8_CONFIGS.get((k_dim, n_dim))
 
 
+def _sm70_channel_fp8_shape_is_validated(layer: torch.nn.Module) -> bool:
+    """Whether an SM70 channel-FP8 GEMM has been validated for this shape.
+
+    ``_SM70_CHANNEL_FP8_QPN8_SHAPES`` is the only record of which dense shapes
+    have been exercised on SM70. ``fp8_gemm_sm70_out`` does not raise on the
+    others -- it spins without returning -- so the layout conversion below is
+    gated on this instead of on the QPN8 route being selected.
+    """
+    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
+    return tuple(layer.weight.shape) == _SM70_CHANNEL_FP8_QPN8_SHAPES.get(suffix)
+
+
+def _sm70_unpack_channel_fp8(layer: torch.nn.Module) -> None:
+    """Dequantize channel-FP8 weights to the model dtype, in place.
+
+    FP8 E4M3 to FP16 is exact, so this costs one extra byte per element on the
+    affected projections and nothing in accuracy.
+    """
+    scale = layer.weight_scale.data.to(torch.float32)
+    if scale.ndim == 1:
+        scale = scale.view(-1, 1)
+    dequantized = (layer.weight.data.to(torch.float32) * scale).to(layer.orig_dtype)
+    replace_parameter(layer, "weight", dequantized)
+    for stale in ("weight_scale", "weight_scale_inv", "input_scale"):
+        if stale in layer._parameters:
+            del layer._parameters[stale]
+    layer.sm70_fp8_fp16_dequant = True
+
+
 class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
     def __init__(
         self,
@@ -271,6 +300,20 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         "Insufficient memory for the SM70 channel-FP8 QPN8 "
                         "prefill workspace; retaining the TurboMind layout."
                     )
+            if not _sm70_channel_fp8_shape_is_validated(layer):
+                # No validated SM70 tile covers this shape. fp8_gemm_sm70_out
+                # neither falls back nor raises on such shapes: it spins,
+                # leaving the GPU at 100% utilization near idle power with no
+                # progress and no error. Unpack instead, which is exact.
+                logger.warning_once(
+                    "No validated SM70 channel-FP8 GEMM covers %s with shape "
+                    "%s; unpacking these weights to %s instead.",
+                    getattr(layer, "prefix", "<unknown>"),
+                    tuple(layer.weight.shape),
+                    layer.orig_dtype,
+                )
+                _sm70_unpack_channel_fp8(layer)
+                return
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 layer.weight, weight_scale, 128, False
             )
@@ -317,6 +360,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "sm70_fp8_fp16_dequant", False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
         if getattr(layer, "sm70_fp8_turbomind", False):
             if x.dtype != torch.float16:
                 raise RuntimeError(
