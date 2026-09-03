@@ -33,10 +33,11 @@ _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 
 def _resolve_persistent_max_tokens(
     max_num_seqs: int,
+    verifier_width: int = 1,
     override: int = 0,
 ) -> int:
-    """Size resident decode scratch without growing past the legacy ceiling."""
-    scheduler_cap = max(1, int(max_num_seqs))
+    """Size resident decode/verifier scratch up to the legacy ceiling."""
+    scheduler_cap = max(1, int(max_num_seqs)) * max(1, int(verifier_width))
     requested_cap = int(override)
     if requested_cap <= 0:
         return min(scheduler_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
@@ -51,8 +52,15 @@ def _persistent_max_tokens_for_runtime() -> int:
         if scheduler_config is None
         else scheduler_config.max_num_seqs
     )
+    speculative_config = None if vllm_config is None else vllm_config.speculative_config
+    verifier_width = (
+        speculative_config.num_speculative_state_tokens() + 1
+        if speculative_config is not None and speculative_config.method == "mtp"
+        else 1
+    )
     return _resolve_persistent_max_tokens(
         max_num_seqs,
+        verifier_width,
         envs.VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS,
     )
 

@@ -1631,9 +1631,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS", "0")
     ),
-    # Zero derives the resident MoE scratch cap from max_num_seqs, bounded by
-    # the historical 32-token ceiling. A positive value is an experimental
-    # cap for matched experiments and is still bounded by the legacy ceiling.
+    # Zero derives the resident MoE scratch cap from max_num_seqs and the MTP
+    # verifier width, bounded by the historical 32-token ceiling. A positive
+    # value is an experimental cap and is still bounded by that ceiling.
     "VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS", "0")
     ),
