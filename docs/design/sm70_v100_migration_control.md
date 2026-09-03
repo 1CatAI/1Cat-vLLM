@@ -44922,3 +44922,25 @@ Interpretation:
   parameters, focused config/route tests report `20 passed`, Ruff passes, and
   GPUs 4-7 remain at zero allocated MiB. Real-model quality/performance evidence
   is pending one combined candidate startup; no result is claimed yet.
+- The first routed real-model capture proved that the large backbone remains an
+  independent `(1, 8193)` graph (44.73 s compile), then stopped before any
+  request because the late-created decode wrapper was outside vLLM's model-load
+  config context. Commit `d6d72cd30b` scopes its construction with the derived
+  decode config; a focused lifecycle probe confirms that the wrapper observes
+  that config and limits its token range to `[1, 2]`. This failed capture is not
+  a performance or quality result and systemd was stopped before retry.
+- The corrected combined candidate produced two cache families on every rank:
+  `(1, 8193)` contains no Qwen3.8 M=1 GEMV/fused-HC/fused-GDN operators, while
+  `(1, 2)` contains the decode-only operators and captured successfully. Its
+  no-MTP steady decode is `85.80 tok/s`, but matched warm 8192-token prefill is
+  only `5525-5532 tok/s`, so this candidate is not the final 7k service.
+- AST call-count comparison against the accepted 7k graph leaves one material
+  runtime difference: the accepted graph calls CPU PLE gather plus FP8 byte
+  dequantization, whereas the combined candidate calls random UVA reads from
+  the pinned shard. Even the exact natural calibration hash regressed from
+  `6986` to `5522 tok/s`. The next candidate therefore preserves direct UVA for
+  decode, but deduplicates large-prefill row IDs on CPU, gathers from the same
+  pinned TP shard into a 20-MiB staging buffer, and performs one contiguous H2D
+  transfer before the existing byte-exact dequantization kernel. A 131072-row
+  CPU microbenchmark with 32703 unique local rows settles at `28.7-28.9 ms`;
+  the current random UVA path accounts for roughly 0.3 s at this shape.

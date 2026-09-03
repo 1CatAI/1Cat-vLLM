@@ -64,3 +64,18 @@ def test_qwen38_nomtp_dual_compile_contract() -> None:
     assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
         model_config, None, parallel_config
     )
+
+
+def test_qwen38_pinned_ple_cpu_gather_preserves_rows() -> None:
+    from vllm.models.qwen4_exp.nvidia.ple_layer import (
+        _gather_pinned_ple_rows_cpu,
+    )
+
+    weight = torch.arange(48, dtype=torch.uint8).reshape(8, 6)
+    input_ids = torch.tensor([5, 1, 5, 0, 7, 1], dtype=torch.int64)
+    output = torch.empty((input_ids.numel(), weight.shape[1]), dtype=torch.uint8)
+
+    unique_rows = _gather_pinned_ple_rows_cpu(weight, input_ids, output)
+
+    assert unique_rows == 4
+    torch.testing.assert_close(output, weight[input_ids])

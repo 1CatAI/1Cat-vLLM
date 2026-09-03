@@ -1673,6 +1673,21 @@ class VllmConfig:
                     "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
                     "large prefill and FULL decode graphs share one model."
                 )
+            if (
+                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                )
+                and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+                and "VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL"
+                not in os.environ
+            ):
+                os.environ["VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL"] = "1"
+                logger.info_once(
+                    "Auto-enabling staged pinned-PLE prefill for the SM70 "
+                    "Qwen3.8 dual-compile lane; decode keeps direct UVA gathers."
+                )
             if _is_sm70_dflash2_verifier_contract(
                 self.model_config,
                 self.speculative_config,
