@@ -1862,10 +1862,16 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
+      const char* qwen4_exp_m1 =
+          std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1");
+      const bool qwen4_exp_m1_enabled =
+          bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
+          (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
+          (bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes ||
+           qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
         if (push_blocks > 0) {

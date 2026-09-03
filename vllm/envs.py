@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -2119,6 +2120,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only. Keep opt-in until the TP4 dynamic-graph gate is recorded.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "0"))
+    ),
+    # Exact Qwen3.8 single-token MoE payload: FP16 [1, 2560]. Reuse the
+    # already-registered SM70 TP4 push buffers for all_reduce_sum2 while
+    # retaining the existing FP16 local sum and rank-ordered FP32 reduction.
+    # The TP4 CUDA Graph gate is bitwise across all ranks and cuts 48
+    # collectives from 0.459 ms to 0.136 ms; explicit 0 is the rollback.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1", "1"))
     ),
     # Optional task-built custom-AR fragment. Operators present in the sidecar
     # override the production namespace; every other operator falls back.
