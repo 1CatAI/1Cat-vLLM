@@ -390,3 +390,131 @@ the other six followed different but coherent trajectories, with 8/8 requests
 complete and no runtime corruption signal. This is a text-health pass, not a
 semantic-quality equivalence claim; normal benchmark quality gates remain
 required before either concurrency switch is promoted.
+
+### M16/M32 channel-FP8 concurrency optimization
+
+The explicit scaling targets use the steady B1 result above as the denominator:
+B2 must reach `300.43 token/s` (80%), B4 `525.76 token/s` (70%), and B8
+`901.30 token/s` (60%). The work below remains a mixed-checkpoint optimization
+screen; it does not close the unavailable fully-QUASAR quality gate.
+
+The old channel-FP8 path reconstructs a complete FP16 weight before every
+M>8 GEMM. A default-off QPN8 candidate now handles M=9--16 with two 8-row
+tiles, and a separate M=17--32 dense candidate executes the original logical
+split-K ranges in two ordered phases. The M32 design reduces static reduction
+storage from the naive 64 KiB to 28/36 KiB for split-12/16 and streams each
+packed weight tile once across all 32 rows. Admission is restricted to the
+five measured Qwen3.8 TP4 channel-FP8 shapes. The controls are
+`VLLM_SM70_FP8_QPN8_M16`, `VLLM_SM70_FP8_QPN8_M32_CHUNKED`, and
+`VLLM_SM70_FP8_QPN8_M32_NATIVE`; all default to off.
+
+Actual-checkpoint operator tests show that M16 reduces the weighted QPN8
+projection bucket from `20.276` to `6.959 ms` per target round. At M32, native
+dense graph timings are `82.68 us` for GDN input, `27.38 us` for output,
+`81.86 us` for full-attention QKV, and `73.71 us` for down projection. Across
+M=17/18/24/31/32, every production split is bitwise equal to concatenated M8
+calls with maximum difference zero; CUDA Graph replay is also stable. The
+retained operator artifacts are `.artifacts/runtime/qpn8-m32-native-dense-r2.json`
+and `.artifacts/runtime/qpn8-m32-native-dense-tails-r1.json`.
+
+Same-contract endpoint results are:
+
+| Candidate | B2 token/s | B2 efficiency | B4 token/s | B4 efficiency |
+|---|---:|---:|---:|---:|
+| steady baseline | 175.26 | 46.7% | 247.13 | 32.9% |
+| exact M16 + chunked M32 | 253.95 | 67.6% | 309.06 | 41.2% |
+| exact M16 + native dense M32 | - | - | 322.68 | 43.0% |
+
+The exact B2 candidate improves the old B2 row by 44.9%; native M32 improves
+the old B4 row by 30.6%. All reported rows completed 16/16 requests, generated
+the requested 512 tokens, and contained no empty output or replacement
+character. B2 acceptance was `47.62%` with mean accepted length `4.33`; B4
+native acceptance was `51.68%` with mean length `4.62`. These are output-health
+and distribution-correction checks, not a semantic benchmark. Raw endpoint
+artifacts are under `.artifacts/runtime/endpoint-qpn8-m16-m32-exact-b2-b4-v1`
+and `.artifacts/runtime/endpoint-qpn8-m32-native-b4-v1`.
+
+Three experiments were rejected:
+
+- Moving channel scale to the epilogue and changing split configurations made
+  M16 faster, but B4/B8 acceptance length fell by about 8%/10%; it is not the
+  retained quality-first implementation.
+- Draft proposal temperature scale `0.85` measured B2 `258.38 token/s` and B4
+  `313.46 token/s`; it did not improve native-M32 B4 and remains off.
+- A bitwise-exact native M64 kernel looked positive with warm operator caches,
+  but the endpoint fell to `283.94 token/s`, 21.7% below the steady B8 baseline.
+  It was removed. The retained negative artifact is
+  `.artifacts/runtime/endpoint-qpn8-m64-native-b8-v1`.
+
+The gates remain open. Native M32 leaves B4 at about 43% efficiency, and B8
+still needs a structural change rather than more row tiling. At observed
+accepted lengths, the remaining gap cannot be closed by selector or epilogue
+micro-tuning alone. The next measurement should split the unprofiled native
+candidate into target forward, target logits/rejection, draft, and host
+bookkeeping, then evaluate either multi-stream/request partitioning or a
+deployment topology that adds independent replicas. Two Nsight Systems runs
+were attempted, but CUPTI crashed during multiprocess shutdown before writing
+a report; do not repeat that capture path unchanged.
+
+The built-in CUDA-event profiler initially produced no output because the MRV2
+gate admitted `mtp` only, while this service resolves the same diagnostic path
+with `method=dflash`. The default-off profiler now admits `mtp`, `dflash`, and
+`dspark`, matching the legacy runner. A short B2/B4 diagnostic then completed.
+The profiler synchronizes every round, so its endpoint throughput is not a
+performance result; use only the per-phase CUDA-event split. Median stable
+full-batch intervals were:
+
+| Batch | Target forward | Target sample + state | Draft | Total GPU |
+|---:|---:|---:|---:|---:|
+| B2 / M16 | 37.64 ms | 1.29 ms | 7.50 ms | 46.65 ms |
+| B4 / M32 | 47.41 ms | 1.54 ms | 9.05 ms | 58.10 ms |
+
+Target forward is about 81% of the measured GPU interval in both rows and
+accounts for nearly all B2-to-B4 growth. Rejection/sampling is only about
+1.3--1.5 ms, which rules out more selector micro-tuning as the primary scaling
+project. The diagnostic artifact is
+`.artifacts/runtime/endpoint-qpn8-mrv2-profile-b2-b4-v1`.
+
+A q3 B8 screen tested whether shrinking the verifier from M64 to M32 could
+avoid the remaining large-batch fallback. It reached only `249.14 token/s`
+with `72.85%` draft acceptance and `3.19` emitted tokens per round, versus the
+q7 steady B8 result of `362.53 token/s` and mean accepted length `4.49`. The
+31.3% throughput loss rejects q3 despite its higher per-position acceptance;
+the shorter proposal cannot amortize the target round. The artifact is
+`.artifacts/runtime/endpoint-qpn8-q3-b8-screen-v2`.
+
+The historical B4 trace also attributed `5.31 ms` and about 133 launches per
+round to TP all-reduce. The accepted M8 push collective handled only the
+80-KiB `[8,5120]` payload. A default-off
+`VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY` candidate expands its IPC slot and
+uses a grid-stride loop for M16/M32 without changing rank-ordered FP32
+accumulation. Across 128 consecutive collectives per CUDA Graph replay and
+four input patterns, every rank is bitwise equal to the current custom-order
+reference. Per-collective medians are:
+
+| Payload | Current pull | Push candidate | Saving |
+|---:|---:|---:|---:|
+| M16 / 160 KiB | 18.45 us | 11.03 us | 40.2% |
+| M32 / 320 KiB | 26.78 us | 18.36 us | 31.5% |
+
+M64 measured `34.08 us` versus `30.79 us` current and was removed from the
+admission set. The retained operator artifacts are
+`.artifacts/runtime/tp4-push-concurrency-control-r1.json` and
+`.artifacts/runtime/tp4-push-concurrency-final-r1.json`.
+
+With exact QPN8 and the push candidate together, the endpoint measured B2
+`258.04 token/s` (68.7% efficiency) and B4 `317.11 token/s` (42.2%). B2 is
+1.6% above the prior exact-M16 row. B4 raw throughput is below the prior
+`322.68 token/s`, while mean emitted tokens per round also moved from `4.62`
+to `4.39`; throughput divided by that acceptance length improves by about
+3.4%, consistent with the operator saving but not enough to claim an absolute
+B4 endpoint win. Both rows completed 16/16 requests at 512 output tokens with
+no errors or invalid text. The switch remains default-off and the scaling
+gates remain open. Raw results are in
+`.artifacts/runtime/endpoint-qpn8-push-ar-b2-b4-v1`.
+
+A third Nsight Systems attempt changed capture termination from
+`stop-shutdown` to `stop`, completed the B4 workload, and still crashed in
+`cuptiActivityFlushAll` while exiting without generating a report. CUPTI is
+therefore unsuitable for this process topology until the external tool/runtime
+issue changes; do not spend another run on capture-end variations.

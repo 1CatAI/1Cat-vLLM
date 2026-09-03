@@ -3,8 +3,8 @@
 """Race experimental QPN8 against TurboMind on real TP-local FP8 weights.
 
 The benchmark is deliberately operator-only: it does not change model
-dispatch. It covers the exact Qwen3.8-27B-FP8 TP4 decode shapes at M=1, 2, 4,
-and 8, and measures eager launches separately from CUDA Graph replay.
+dispatch. It covers the exact Qwen3.8-27B-FP8 TP4 decode shapes through M=32
+and measures eager launches separately from CUDA Graph replay.
 
 The production gate/up GEMM has a fused SiLU epilogue. ``gate_up_raw`` is
 therefore opt-in and diagnostic only; its raw-GEMM timing is not an end-to-end
@@ -92,8 +92,16 @@ def _load_keys(model: Path, keys: list[str]) -> dict[str, torch.Tensor]:
     return result
 
 
-def _weight_keys(prefix: str) -> tuple[str, str]:
-    return f"{prefix}.weight", f"{prefix}.weight_scale_inv"
+def _weight_keys(model: Path, prefix: str) -> tuple[str, str]:
+    weight_key = f"{prefix}.weight"
+    weight_map = json.loads((model / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    for suffix in ("weight_scale_inv", "weight_scale"):
+        scale_key = f"{prefix}.{suffix}"
+        if scale_key in weight_map:
+            return weight_key, scale_key
+    raise KeyError(f"no FP8 scale tensor found for {prefix}")
 
 
 def _column_shard_raw(
@@ -107,9 +115,11 @@ def _column_shard_raw(
         raise ValueError(f"N={n} is not divisible by TP={tp_size}")
     begin = tp_rank * (n // tp_size)
     end = begin + n // tp_size
+    raw = weight.view(torch.uint8)[begin:end].contiguous()
+    if scales.shape == (n, 1):
+        return raw, scales[begin:end].contiguous()
     scale_begin = begin // 128
     scale_end = math.ceil(end / 128)
-    raw = weight.view(torch.uint8)[begin:end].contiguous()
     return raw, scales[scale_begin:scale_end].contiguous()
 
 
@@ -124,9 +134,11 @@ def _row_shard_raw(
         raise ValueError(f"K={k} is not divisible by TP={tp_size}")
     begin = tp_rank * (k // tp_size)
     end = begin + k // tp_size
+    raw = weight.view(torch.uint8)[:, begin:end].contiguous()
+    if scales.shape == (weight.shape[0], 1):
+        return raw, scales.contiguous()
     scale_begin = begin // 128
     scale_end = math.ceil(end / 128)
-    raw = weight.view(torch.uint8)[:, begin:end].contiguous()
     return raw, scales[:, scale_begin:scale_end].contiguous()
 
 
@@ -138,10 +150,14 @@ def _load_case(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, str]:
     root = "model.language_model.layers"
+    weight_map = json.loads((model / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    mlp_layer = 1 if f"{root}.1.mlp.down_proj.weight" in weight_map else 56
     if case == "down":
-        prefixes = [f"{root}.1.mlp.down_proj"]
+        prefixes = [f"{root}.{mlp_layer}.mlp.down_proj"]
         shard = "row"
-        note = "production down_proj TP row shard"
+        note = f"production layer-{mlp_layer} down_proj TP row shard"
     elif case == "gdn_in":
         prefixes = [
             f"{root}.1.linear_attn.in_proj_qkv",
@@ -163,8 +179,8 @@ def _load_case(
         note = "production full-attention q+k+v TP column shards concatenated"
     elif case in ("gate_up_raw", "gate_up_fused"):
         prefixes = [
-            f"{root}.1.mlp.gate_proj",
-            f"{root}.1.mlp.up_proj",
+            f"{root}.{mlp_layer}.mlp.gate_proj",
+            f"{root}.{mlp_layer}.mlp.up_proj",
         ]
         shard = "column"
         note = (
@@ -175,13 +191,13 @@ def _load_case(
     else:
         raise ValueError(f"unknown case: {case}")
 
-    keys = [key for prefix in prefixes for key in _weight_keys(prefix)]
+    keys = [key for prefix in prefixes for key in _weight_keys(model, prefix)]
     loaded = _load_keys(model, keys)
     raw_parts: list[torch.Tensor] = []
     scale_parts: list[torch.Tensor] = []
     fp8_dtype: torch.dtype | None = None
     for prefix in prefixes:
-        weight_key, scale_key = _weight_keys(prefix)
+        weight_key, scale_key = _weight_keys(model, prefix)
         weight = loaded[weight_key]
         scales = loaded[scale_key].float()
         if fp8_dtype is None:
@@ -232,6 +248,8 @@ def _qpn8_prepack(raw_weight: torch.Tensor) -> torch.Tensor:
 
 
 def _qpn8_group_scales(scales: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    if tuple(scales.shape) == (n, 1):
+        return scales.t().mul(256.0).half().contiguous()
     expected = (math.ceil(n / 128), math.ceil(k / 128))
     if tuple(scales.shape) != expected or n % 128 or k % 128:
         raise ValueError(
@@ -250,7 +268,11 @@ def _qpn8_group_scales(scales: torch.Tensor, n: int, k: int) -> torch.Tensor:
 
 def _dequantized_weight(qweight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     n, k = qweight.shape
-    expanded = scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    expanded = (
+        scales.expand(n, k)
+        if tuple(scales.shape) == (n, 1)
+        else scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    )
     return qweight.float().mul(expanded[:n, :k])
 
 
@@ -446,6 +468,7 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
         if (k // 16) % split_k == 0
         and not (prefetch == "on" and decoder != "fast")
         and not (gated_silu and split_k == 32)
+        and not (split_k == 12 and (nacc != 2 or decoder != "fast" or prefetch == "on"))
     ]
     for m in args.m:
         torch.manual_seed(args.seed + m)
@@ -520,7 +543,87 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
                     }
                 )
 
+        if m > 8:
+            dense_workspace = torch.empty((k, n), device=device, dtype=torch.float16)
+            prefill_out = torch.empty((m, output_n), device=device, dtype=torch.float16)
+
+            def launch_prefill(
+                prefill_out: torch.Tensor = prefill_out,
+                dense_workspace: torch.Tensor = dense_workspace,
+                inputs: torch.Tensor = inputs,
+                codes: torch.Tensor = codes,
+                group_scales: torch.Tensor = group_scales,
+                gated_silu: bool = gated_silu,
+            ) -> None:
+                sm70_ops.fp8_qpn8_prefill_sm70_out(
+                    prefill_out,
+                    dense_workspace.data_ptr(),
+                    inputs,
+                    codes,
+                    group_scales,
+                    gated_silu,
+                )
+
+            launch_prefill()
+            torch.accelerator.synchronize(device)
+            prefill_quality = _error_stats(prefill_out, reference)
+            prefill_bytes = 5 * n * k + 2 * m * (output_n + k)
+            for cache_state in args.cache_state:
+                scrub = cache_scrub if cache_state == "cold" else None
+                for mode, benchmark in (
+                    ("eager", _benchmark_eager),
+                    ("graph", _benchmark_graph),
+                ):
+                    measured = (
+                        benchmark(
+                            launch_prefill,
+                            args.warmup,
+                            args.iters,
+                            args.trials,
+                            scrub,
+                        )
+                        if mode == "eager"
+                        else benchmark(
+                            launch_prefill,
+                            prefill_out,
+                            args.warmup,
+                            args.iters,
+                            args.trials,
+                            scrub,
+                        )
+                    )
+                    case_result["rows"].append(
+                        {
+                            "backend": "qpn8_prefill_current",
+                            "mode": mode,
+                            "cache_state": cache_state,
+                            "m": m,
+                            "config": None,
+                            "quality": prefill_quality,
+                            "quality_pass": _quality_pass(
+                                prefill_quality,
+                                args.relative_l2_limit,
+                                args.cosine_limit,
+                            ),
+                            **measured,
+                            **_derived_metrics(
+                                measured["timing"], m, n, k, prefill_bytes
+                            ),
+                        }
+                    )
+            del dense_workspace, prefill_out
+
         for split_k, nacc, fast_decoder, prefetch_codes in valid_configs:
+            if m > 8 and (split_k > 16 or (gated_silu and split_k > 8)):
+                continue
+            if m > 16 and (
+                gated_silu
+                or split_k not in (12, 16)
+                or nacc != 2
+                or not fast_decoder
+                or prefetch_codes
+            ):
+                continue
             qpn_out = torch.empty((m, output_n), device=device, dtype=torch.float16)
 
             def launch_qpn(
@@ -560,6 +663,42 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
             launch_qpn()
             torch.accelerator.synchronize(device)
             quality = _error_stats(qpn_out, reference)
+            batch_invariance_equal: bool | None = None
+            batch_invariance_max_abs: float | None = None
+            if m > 8:
+                chunked_out = torch.empty_like(qpn_out)
+                for row_begin in range(0, m, 8):
+                    row_end = min(row_begin + 8, m)
+                    chunk_input = inputs[row_begin:row_end]
+                    chunk_output = chunked_out[row_begin:row_end]
+                    if gated_silu:
+                        sm70_ops.fp8_qpn8_gated_pair_sm70_out(
+                            chunk_output,
+                            chunk_input,
+                            codes,
+                            group_scales,
+                            split_k,
+                            nacc,
+                            fast_decoder,
+                            prefetch_codes,
+                        )
+                    else:
+                        sm70_ops.fp8_qpn8_gemm_sm70_out(
+                            chunk_output,
+                            chunk_input,
+                            codes,
+                            group_scales,
+                            split_k,
+                            nacc,
+                            fast_decoder,
+                            prefetch_codes,
+                        )
+                torch.accelerator.synchronize(device)
+                batch_invariance_equal = bool(torch.equal(qpn_out, chunked_out))
+                batch_invariance_max_abs = float(
+                    (qpn_out - chunked_out).abs().max().item()
+                )
+                del chunked_out
             quality_pass = _quality_pass(
                 quality, args.relative_l2_limit, args.cosine_limit
             )
@@ -605,6 +744,8 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
                             "config": config,
                             "quality": quality,
                             "quality_pass": quality_pass,
+                            "batch_invariance_equal": batch_invariance_equal,
+                            "batch_invariance_max_abs": batch_invariance_max_abs,
                             **measured,
                             **_derived_metrics(measured["timing"], m, n, k, qpn_bytes),
                         }
@@ -638,13 +779,16 @@ def _summarize(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for m in sorted({row["m"] for row in rows}):
             for cache_state in sorted({row["cache_state"] for row in rows}):
                 for mode in ("eager", "graph"):
+                    current_backend = (
+                        "qpn8_prefill_current" if m > 8 else "turbomind_current"
+                    )
                     current = next(
                         row
                         for row in rows
                         if row["m"] == m
                         and row["mode"] == mode
                         and row["cache_state"] == cache_state
-                        and row["backend"] == "turbomind_current"
+                        and row["backend"] == current_backend
                     )
                     candidates = [
                         row
@@ -654,6 +798,7 @@ def _summarize(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         and row["cache_state"] == cache_state
                         and row["backend"] == "qpn8_experimental"
                         and row["quality_pass"]
+                        and row.get("batch_invariance_equal") is not False
                         and (row["replay_max_abs"] in (None, 0.0))
                     ]
                     best = min(candidates, key=lambda row: row["timing"]["median_us"])
@@ -666,6 +811,7 @@ def _summarize(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                             "m": m,
                             "mode": mode,
                             "cache_state": cache_state,
+                            "current_backend": current_backend,
                             "current_us": current_us,
                             "best_qpn8_us": best_us,
                             "speedup": current_us / best_us,
@@ -691,8 +837,8 @@ def main() -> int:
         raise RuntimeError("Missing _C::fp8_qpn8_gemm_sm70_out; build this source tree")
     if args.tp_size <= 0 or not 0 <= args.tp_rank < args.tp_size:
         raise ValueError("invalid TP size/rank")
-    if any(m < 1 or m > 8 for m in args.m):
-        raise ValueError("QPN8 operator supports M=1..8")
+    if any(m < 1 or m > 32 for m in args.m):
+        raise ValueError("QPN8 operator supports M=1..32")
     if args.warmup < 1 or args.iters < 1 or args.trials < 1 or args.cache_scrub_mib < 1:
         raise ValueError("warmup, iters, trials, and cache scrub size must be positive")
 

@@ -298,7 +298,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _sm70_v2_mtp_profile_enabled(self) -> bool:
         return (
             self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
+            and self.speculative_config.method in ("mtp", "dflash", "dspark")
             and self.is_last_pp_rank
             and self.device.type == "cuda"
             and envs.VLLM_SM70_MTP_PROFILE

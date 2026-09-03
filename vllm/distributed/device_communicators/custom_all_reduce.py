@@ -340,10 +340,17 @@ class CustomAllreduce:
             mtp5_status = (
                 "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 else "disabled"
             )
+            concurrency_status = (
+                "enabled"
+                if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY
+                else "disabled"
+            )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
                 "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
-                "payloads; opt-in 25-KiB Qwen4Exp MTP4 payload is %s.",
+                "payloads; Qwen3.8 M16/M32 concurrency is %s and the "
+                "25-KiB Qwen4Exp MTP4 payload is %s.",
+                concurrency_status,
                 mtp5_status,
             )
 

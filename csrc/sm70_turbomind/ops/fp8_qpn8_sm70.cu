@@ -16,6 +16,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <mutex>
 
@@ -203,7 +205,8 @@ __global__ void fp8_qpn8_ba_split_copy_sm70_kernel(
 }
 
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
-          bool M1Only = false, bool FusedBA = false, bool SplitOutputs = false>
+          bool M1Only = false, bool FusedBA = false, bool SplitOutputs = false,
+          int RowTiles = 1>
 __global__ void fp8_qpn8_sm70_kernel(
     const uint8_t* __restrict__ codes, const half* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output,
@@ -211,7 +214,11 @@ __global__ void fp8_qpn8_sm70_kernel(
     half* __restrict__ ba_output, half* __restrict__ b_output,
     half* __restrict__ a_output, int ba_n, int qkv_n, int n, int k, int m,
     bool channel_scales) {
-  __shared__ float partials[SplitK][M1Only ? 32 : 256];
+  static_assert(RowTiles == 1 || RowTiles == 2,
+                "QPN8 supports one or two 8-row tiles");
+  static_assert(!M1Only || RowTiles == 1,
+                "QPN8 M=1 specialization uses one row tile");
+  __shared__ float partials[SplitK][M1Only ? 32 : RowTiles * 256];
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -275,12 +282,15 @@ __global__ void fp8_qpn8_sm70_kernel(
                           static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const half* scale_ptr = group_scales + tile;
 
-  float accum[NAcc][8];
+  float accum[RowTiles][NAcc][8];
 #pragma unroll
-  for (int chain = 0; chain < NAcc; ++chain) {
+  for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      accum[chain][i] = 0.0f;
+    for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        accum[row_tile][chain][i] = 0.0f;
+      }
     }
   }
   int loaded_scale_group = -1;
@@ -327,31 +337,38 @@ __global__ void fp8_qpn8_sm70_kernel(
       weights[i] = __hmul2(weights[i], scale2);
     }
 
-    uint4 input01 = make_uint4(0, 0, 0, 0);
-    uint4 input23 = make_uint4(0, 0, 0, 0);
-    if (row < m) {
-      const half* input_row = input + static_cast<size_t>(row) * k;
-      input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
-      input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
-    }
-
-    const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
-    const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
     const unsigned* b = reinterpret_cast<const unsigned*>(weights);
-    VLLM_SM70_MMA_8N8K4(accum[0], a0[0], a0[1], b[0], b[1]);
-    VLLM_SM70_MMA_8N8K4(accum[1 % NAcc], a0[2], a0[3], b[2], b[3]);
-    VLLM_SM70_MMA_8N8K4(accum[2 % NAcc], a1[0], a1[1], b[4], b[5]);
-    VLLM_SM70_MMA_8N8K4(accum[3 % NAcc], a1[2], a1[3], b[6], b[7]);
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+      uint4 input01 = make_uint4(0, 0, 0, 0);
+      uint4 input23 = make_uint4(0, 0, 0, 0);
+      const int input_row_idx = row_tile * 8 + row;
+      if (input_row_idx < m) {
+        const half* input_row = input + static_cast<size_t>(input_row_idx) * k;
+        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
+      }
+
+      const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+      const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][2 % NAcc], a1[0], a1[1], b[4], b[5]);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][3 % NAcc], a1[2], a1[3], b[6], b[7]);
+    }
     if constexpr (PrefetchCodes) {
       prefetched = next;
     }
   }
 
 #pragma unroll
-  for (int chain = 1; chain < NAcc; ++chain) {
+  for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      accum[0][i] += accum[chain][i];
+    for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        accum[row_tile][0][i] += accum[row_tile][chain][i];
+      }
     }
   }
 
@@ -364,22 +381,27 @@ __global__ void fp8_qpn8_sm70_kernel(
           const int i = pair * 4 + offset;
           const int output_col =
               offset | (((lane >> 1) & 1) << 1) | (pair << 2);
-          partials[warp][quadpair * 8 + output_col] = accum[0][i];
+          partials[warp][quadpair * 8 + output_col] = accum[0][0][i];
         }
       }
     }
   } else {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int output_row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-      const int output_col =
-          (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partials[warp][output_row * 32 + quadpair * 8 + output_col] = accum[0][i];
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int output_row =
+            row_tile * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const int output_col =
+            (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        partials[warp][output_row * 32 + quadpair * 8 + output_col] =
+            accum[row_tile][0][i];
+      }
     }
   }
   __syncthreads();
 
-  constexpr int kOutputElements = M1Only ? 32 : 256;
+  constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
   for (int element = threadIdx.x; element < kOutputElements;
        element += blockDim.x) {
     float value = 0.0f;
@@ -410,14 +432,144 @@ __global__ void fp8_qpn8_sm70_kernel(
 }
 
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
-          bool M1Only = false>
+          bool M1Only = false, int RowTiles = 1>
 void launch_fp8_qpn8_sm70(const uint8_t* codes, const half* group_scales,
                           const half* input, half* output, int n, int k, int m,
                           bool channel_scales, cudaStream_t stream) {
-  fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes, M1Only>
-      <<<(n / 32), (32 * SplitK), 0, stream>>>(
-          codes, group_scales, input, output, nullptr, nullptr, nullptr,
-          nullptr, nullptr, 0, n, n, k, m, channel_scales);
+  fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes, M1Only, false,
+                       false, RowTiles><<<(n / 32), (32 * SplitK), 0, stream>>>(
+      codes, group_scales, input, output, nullptr, nullptr, nullptr, nullptr,
+      nullptr, 0, n, n, k, m, channel_scales);
+}
+
+// M32 needs four independent 8-row accumulator tiles. Keeping all logical
+// split-K warps resident would require 64 KiB of static reduction storage for
+// split-16. Instead, half as many physical warps execute the original logical
+// warp ranges in two ordered phases. The compact first-half sum lets the final
+// reduction retain the exact p0 + ... + p(SplitK-1) order while using only
+// 28 KiB (split-12) or 36 KiB (split-16) of shared memory. Each output CTA
+// streams its packed weight tile once and reuses it across all 32 rows.
+template <int SplitK>
+__global__ void fp8_qpn8_m32_twophase_sm70_kernel(
+    const uint8_t* __restrict__ codes, const half* __restrict__ channel_scales,
+    const half* __restrict__ input, half* __restrict__ output, int n, int k,
+    int m) {
+  static_assert(SplitK == 12 || SplitK == 16,
+                "M32 two-phase QPN8 supports split-12 or split-16");
+  constexpr int kPhysicalWarps = SplitK / 2;
+  constexpr int kRowTiles = 4;
+  constexpr int kOutputElements = kRowTiles * 256;
+  __shared__ float reduction_storage[kPhysicalWarps + 1][kOutputElements];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int quadpair = (lane >> 2) & 3;
+  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int groups_k16 = k >> 4;
+  const int groups_per_warp = groups_k16 / SplitK;
+  const uint4* code_ptr = reinterpret_cast<const uint4*>(codes) +
+                          static_cast<size_t>(tile) * groups_k16 * 32 + lane;
+  const half scale =
+      __ldg(channel_scales + tile * 32 + qpn8_col_from_lane(lane));
+  const half2 scale2 = __halves2half2(scale, scale);
+
+#pragma unroll
+  for (int phase = 0; phase < 2; ++phase) {
+    float accum[kRowTiles][2][8];
+#pragma unroll
+    for (int row_tile = 0; row_tile < kRowTiles; ++row_tile) {
+#pragma unroll
+      for (int chain = 0; chain < 2; ++chain) {
+#pragma unroll
+        for (int index = 0; index < 8; ++index) {
+          accum[row_tile][chain][index] = 0.0f;
+        }
+      }
+    }
+
+    const int logical_warp = warp + phase * kPhysicalWarps;
+    const int group_begin = logical_warp * groups_per_warp;
+#pragma unroll 4
+    for (int group = group_begin; group < group_begin + groups_per_warp;
+         ++group) {
+      const uint4 packed = __ldcs(code_ptr + static_cast<size_t>(group) * 32);
+      half2 weights[8];
+      fp8x8_to_half2x4_fast(make_uint2(packed.x, packed.y), weights);
+      fp8x8_to_half2x4_fast(make_uint2(packed.z, packed.w), weights + 4);
+#pragma unroll
+      for (int index = 0; index < 8; ++index) {
+        weights[index] = __hmul2(weights[index], scale2);
+      }
+
+      const unsigned* b = reinterpret_cast<const unsigned*>(weights);
+#pragma unroll
+      for (int row_tile = 0; row_tile < kRowTiles; ++row_tile) {
+        uint4 input01 = make_uint4(0, 0, 0, 0);
+        uint4 input23 = make_uint4(0, 0, 0, 0);
+        const int input_row_idx = row_tile * 8 + row;
+        if (input_row_idx < m) {
+          const half* input_row =
+              input + static_cast<size_t>(input_row_idx) * k;
+          input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+          input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
+        }
+        const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+        const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+        VLLM_SM70_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+        VLLM_SM70_MMA_8N8K4(accum[row_tile][1], a0[2], a0[3], b[2], b[3]);
+        VLLM_SM70_MMA_8N8K4(accum[row_tile][0], a1[0], a1[1], b[4], b[5]);
+        VLLM_SM70_MMA_8N8K4(accum[row_tile][1], a1[2], a1[3], b[6], b[7]);
+      }
+    }
+
+#pragma unroll
+    for (int row_tile = 0; row_tile < kRowTiles; ++row_tile) {
+#pragma unroll
+      for (int index = 0; index < 8; ++index) {
+        accum[row_tile][0][index] += accum[row_tile][1][index];
+        const int output_row =
+            row_tile * 8 + (index & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const int output_col =
+            (index & 1) | (((lane >> 1) & 1) << 1) | ((index >> 2) << 2);
+        reduction_storage[warp][output_row * 32 + quadpair * 8 + output_col] =
+            accum[row_tile][0][index];
+      }
+    }
+    __syncthreads();
+
+    for (int element = threadIdx.x; element < kOutputElements;
+         element += blockDim.x) {
+      float value =
+          phase == 0 ? 0.0f : reduction_storage[kPhysicalWarps][element];
+#pragma unroll
+      for (int k_warp = 0; k_warp < kPhysicalWarps; ++k_warp) {
+        value += reduction_storage[k_warp][element];
+      }
+      if (phase == 0) {
+        reduction_storage[kPhysicalWarps][element] = value;
+      } else {
+        const int output_row = element >> 5;
+        const int output_col = element & 31;
+        if (output_row < m) {
+          output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
+              __float2half(value);
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <int SplitK>
+void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
+                                       const half* channel_scales,
+                                       const half* input, half* output, int n,
+                                       int k, int m, cudaStream_t stream) {
+  constexpr int kPhysicalWarps = SplitK / 2;
+  fp8_qpn8_m32_twophase_sm70_kernel<SplitK>
+      <<<(n / 32), (32 * kPhysicalWarps), 0, stream>>>(codes, channel_scales,
+                                                       input, output, n, k, m);
 }
 
 void launch_fp8_qpn8_ba_split_sm70(const uint8_t* codes,
@@ -434,12 +586,16 @@ void launch_fp8_qpn8_ba_split_sm70(const uint8_t* codes,
 }
 
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
-          bool M1Only = false>
+          bool M1Only = false, int RowTiles = 1>
 __global__ void fp8_qpn8_gated_pair_sm70_kernel(
     const uint8_t* __restrict__ codes, const half* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output, int hidden,
     int k, int m, bool channel_scales) {
-  __shared__ float partials[2][SplitK][M1Only ? 32 : 256];
+  static_assert(RowTiles == 1 || RowTiles == 2,
+                "QPN8 gated pair supports one or two 8-row tiles");
+  static_assert(!M1Only || RowTiles == 1,
+                "QPN8 gated M=1 specialization uses one row tile");
+  __shared__ float partials[2][SplitK][M1Only ? 32 : RowTiles * 256];
 
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
@@ -457,12 +613,15 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
                           static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const half* scale_ptr = group_scales + tile;
 
-  float accum[NAcc][8];
+  float accum[RowTiles][NAcc][8];
 #pragma unroll
-  for (int chain = 0; chain < NAcc; ++chain) {
+  for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      accum[chain][i] = 0.0f;
+    for (int chain = 0; chain < NAcc; ++chain) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        accum[row_tile][chain][i] = 0.0f;
+      }
     }
   }
   int loaded_scale_group = -1;
@@ -508,30 +667,37 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
       weights[i] = __hmul2(weights[i], scale2);
     }
 
-    uint4 input01 = make_uint4(0, 0, 0, 0);
-    uint4 input23 = make_uint4(0, 0, 0, 0);
-    if (row < m) {
-      const half* input_row = input + static_cast<size_t>(row) * k;
-      input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
-      input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
-    }
-    const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
-    const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
     const unsigned* b = reinterpret_cast<const unsigned*>(weights);
-    VLLM_SM70_MMA_8N8K4(accum[0], a0[0], a0[1], b[0], b[1]);
-    VLLM_SM70_MMA_8N8K4(accum[1 % NAcc], a0[2], a0[3], b[2], b[3]);
-    VLLM_SM70_MMA_8N8K4(accum[2 % NAcc], a1[0], a1[1], b[4], b[5]);
-    VLLM_SM70_MMA_8N8K4(accum[3 % NAcc], a1[2], a1[3], b[6], b[7]);
+#pragma unroll
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+      uint4 input01 = make_uint4(0, 0, 0, 0);
+      uint4 input23 = make_uint4(0, 0, 0, 0);
+      const int input_row_idx = row_tile * 8 + row;
+      if (input_row_idx < m) {
+        const half* input_row = input + static_cast<size_t>(input_row_idx) * k;
+        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
+      }
+      const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+      const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][2 % NAcc], a1[0], a1[1], b[4], b[5]);
+      VLLM_SM70_MMA_8N8K4(accum[row_tile][3 % NAcc], a1[2], a1[3], b[6], b[7]);
+    }
     if constexpr (PrefetchCodes) {
       prefetched = next;
     }
   }
 
 #pragma unroll
-  for (int chain = 1; chain < NAcc; ++chain) {
+  for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      accum[0][i] += accum[chain][i];
+    for (int chain = 1; chain < NAcc; ++chain) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        accum[row_tile][0][i] += accum[row_tile][chain][i];
+      }
     }
   }
   if constexpr (M1Only) {
@@ -543,23 +709,28 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
           const int i = pair * 4 + offset;
           const int output_col =
               offset | (((lane >> 1) & 1) << 1) | (pair << 2);
-          partials[projection][warp][quadpair * 8 + output_col] = accum[0][i];
+          partials[projection][warp][quadpair * 8 + output_col] =
+              accum[0][0][i];
         }
       }
     }
   } else {
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int output_row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-      const int output_col =
-          (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-      partials[projection][warp][output_row * 32 + quadpair * 8 + output_col] =
-          accum[0][i];
+    for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int output_row =
+            row_tile * 8 + (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const int output_col =
+            (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+        partials[projection][warp][output_row * 32 + quadpair * 8 +
+                                   output_col] = accum[row_tile][0][i];
+      }
     }
   }
   __syncthreads();
 
-  constexpr int kOutputElements = M1Only ? 32 : 256;
+  constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
   for (int element = threadIdx.x; element < kOutputElements;
        element += blockDim.x) {
     float gate = 0.0f;
@@ -585,14 +756,14 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
 }
 
 template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
-          bool M1Only = false>
+          bool M1Only = false, int RowTiles = 1>
 void launch_fp8_qpn8_gated_pair_sm70(const uint8_t* codes,
                                      const half* group_scales,
                                      const half* input, half* output,
                                      int hidden, int k, int m,
                                      bool channel_scales, cudaStream_t stream) {
   fp8_qpn8_gated_pair_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes,
-                                  M1Only>
+                                  M1Only, RowTiles>
       <<<(hidden / 32), (64 * SplitK), 0, stream>>>(
           codes, group_scales, input, output, hidden, k, m, channel_scales);
 }
@@ -1190,7 +1361,8 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t n = out.size(1);
-  TORCH_CHECK(m >= 1 && m <= 8, "fp8_qpn8_gemm_sm70_out: M must be in [1, 8]");
+  TORCH_CHECK(m >= 1 && m <= 32,
+              "fp8_qpn8_gemm_sm70_out: M must be in [1, 32]");
   TORCH_CHECK(out.size(0) == m, "fp8_qpn8_gemm_sm70_out: output M mismatch");
   TORCH_CHECK(n > 0 && n % 32 == 0,
               "fp8_qpn8_gemm_sm70_out: N must be a positive multiple of 32");
@@ -1205,11 +1377,15 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gemm_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gemm_sm70_out: scale shape mismatch");
+  TORCH_CHECK(m <= 8 || channel_scales,
+              "fp8_qpn8_gemm_sm70_out: M=9..32 requires channel scales");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 12 || split_k == 16 ||
                   split_k == 32,
               "fp8_qpn8_gemm_sm70_out: unsupported split_k");
   TORCH_CHECK((k / 16) % split_k == 0,
               "fp8_qpn8_gemm_sm70_out: K/16 must be divisible by split_k");
+  TORCH_CHECK(m <= 8 || split_k <= 16,
+              "fp8_qpn8_gemm_sm70_out: M=9..32 does not support split_k 32");
   TORCH_CHECK(accumulator_chains == 1 || accumulator_chains == 2,
               "fp8_qpn8_gemm_sm70_out: accumulator_chains must be 1 or 2");
   TORCH_CHECK(!prefetch_codes || fast_decoder,
@@ -1220,6 +1396,11 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                   (accumulator_chains == 2 && fast_decoder && !prefetch_codes),
               "fp8_qpn8_gemm_sm70_out: split_k 12 requires the "
               "fast decoder, two accumulator chains, and no prefetch");
+  TORCH_CHECK(
+      m <= 16 || ((split_k == 12 || split_k == 16) && accumulator_chains == 2 &&
+                  fast_decoder && !prefetch_codes),
+      "fp8_qpn8_gemm_sm70_out: M=17..32 requires split_k 12/16, "
+      "the fast decoder, two accumulator chains, and no prefetch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -1229,6 +1410,20 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
   const auto* input_ptr =
       reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+
+  if (m > 16) {
+    if (split_k == 12) {
+      launch_fp8_qpn8_m32_twophase_sm70<12>(
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
+          static_cast<int>(k), static_cast<int>(m), stream);
+    } else {
+      launch_fp8_qpn8_m32_twophase_sm70<16>(
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
+          static_cast<int>(k), static_cast<int>(m), stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
 
   // Keep the M=1 reduction order restricted to the two tuned output/down
   // projections. Extending it to the other split variants changed the frozen
@@ -1248,10 +1443,20 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
     return;
   }
 
-#define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                  \
-  launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false>(            \
-      code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n), \
-      static_cast<int>(k), static_cast<int>(m), channel_scales, stream)
+#define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                        \
+  do {                                                                       \
+    if (m <= 8) {                                                            \
+      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>(           \
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
+          static_cast<int>(k), static_cast<int>(m), channel_scales, stream); \
+    } else if constexpr (SPLIT <= 16) {                                      \
+      launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false, 2>(           \
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),   \
+          static_cast<int>(k), static_cast<int>(m), true, stream);           \
+    } else {                                                                 \
+      TORCH_CHECK(false, "QPN8 M=9..16 does not support split_k ", SPLIT);   \
+    }                                                                        \
+  } while (0)
 
   if (prefetch_codes) {
     if (split_k == 4 && accumulator_chains == 1) {
@@ -1509,8 +1714,8 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   const int64_t k = input.size(1);
   const int64_t hidden = out.size(1);
   const int64_t n = hidden * 2;
-  TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m,
-              "fp8_qpn8_gated_pair_sm70_out: M must be in [1, 8]");
+  TORCH_CHECK(m >= 1 && m <= 16 && out.size(0) == m,
+              "fp8_qpn8_gated_pair_sm70_out: M must be in [1, 16]");
   const bool channel_scales =
       group_scales.size(0) == 1 && group_scales.size(1) == n;
   const bool block_scales =
@@ -1524,10 +1729,14 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_qpn8_gated_pair_sm70_out: packed code size mismatch");
   TORCH_CHECK(channel_scales || block_scales,
               "fp8_qpn8_gated_pair_sm70_out: scale shape mismatch");
+  TORCH_CHECK(m <= 8 || channel_scales,
+              "fp8_qpn8_gated_pair_sm70_out: M=9..16 requires channel scales");
   TORCH_CHECK(split_k == 4 || split_k == 8 || split_k == 16,
               "fp8_qpn8_gated_pair_sm70_out: split_k must be 4, 8, or 16");
   TORCH_CHECK((k / 16) % split_k == 0,
               "fp8_qpn8_gated_pair_sm70_out: invalid split_k for K");
+  TORCH_CHECK(m <= 8 || split_k <= 8,
+              "fp8_qpn8_gated_pair_sm70_out: M=9..16 supports split_k 4 or 8");
   TORCH_CHECK(
       accumulator_chains == 1 || accumulator_chains == 2,
       "fp8_qpn8_gated_pair_sm70_out: accumulator_chains must be 1 or 2");
@@ -1554,10 +1763,23 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
     return;
   }
 
-#define VLLM_LAUNCH_QPN8_GATED_PAIR(SPLIT, NACC, FAST, PREFETCH)            \
-  launch_fp8_qpn8_gated_pair_sm70<SPLIT, NACC, FAST, PREFETCH, false>(      \
-      code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(hidden), \
-      static_cast<int>(k), static_cast<int>(m), channel_scales, stream)
+#define VLLM_LAUNCH_QPN8_GATED_PAIR(SPLIT, NACC, FAST, PREFETCH)              \
+  do {                                                                        \
+    if (m <= 8) {                                                             \
+      launch_fp8_qpn8_gated_pair_sm70<SPLIT, NACC, FAST, PREFETCH, false, 1>( \
+          code_ptr, scale_ptr, input_ptr, output_ptr,                         \
+          static_cast<int>(hidden), static_cast<int>(k), static_cast<int>(m), \
+          channel_scales, stream);                                            \
+    } else if constexpr (SPLIT <= 8) {                                        \
+      launch_fp8_qpn8_gated_pair_sm70<SPLIT, NACC, FAST, PREFETCH, false, 2>( \
+          code_ptr, scale_ptr, input_ptr, output_ptr,                         \
+          static_cast<int>(hidden), static_cast<int>(k), static_cast<int>(m), \
+          true, stream);                                                      \
+    } else {                                                                  \
+      TORCH_CHECK(false, "QPN8 gated M=9..16 does not support split_k ",      \
+                  SPLIT);                                                     \
+    }                                                                         \
+  } while (0)
 
   if (prefetch_codes) {
     if (split_k == 4 && accumulator_chains == 1) {
@@ -1619,6 +1841,73 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
     } else {
       fp8_qpn8_gemm_sm70_out(out, input, codes, group_scales, split_k,
                              accumulator_chains, true, prefetch_codes);
+    }
+    return;
+  }
+
+  // DFlash2 verifies eight speculative tokens per request, so B2 reaches
+  // M=16. The old path reconstructed the complete channel-FP8 weight before
+  // every GEMM. Keep the two-row-tile QPN8 candidate opt-in and restricted to
+  // the exact Qwen3.8 attention/GDN/last-eight-MLP shapes measured below.
+  const auto env_enabled = [](const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  };
+  const bool qpn8_m16_enabled = env_enabled("VLLM_SM70_FP8_QPN8_M16");
+  const bool qpn8_m32_chunked_enabled =
+      env_enabled("VLLM_SM70_FP8_QPN8_M32_CHUNKED");
+  const bool qpn8_m32_native_enabled =
+      env_enabled("VLLM_SM70_FP8_QPN8_M32_NATIVE");
+  const int64_t m = input.size(0);
+  const int64_t k = input.size(1);
+  const int64_t packed_n = codes.size(1);
+  const bool channel_scales = group_scales.dim() == 2 &&
+                              group_scales.size(0) == 1 &&
+                              group_scales.size(1) == packed_n;
+  const bool qwen38_dense_shape =
+      !gated_silu &&
+      ((k == 5120 && (packed_n == 4096 || packed_n == 3584)) ||
+       (k == 1536 && packed_n == 5120) || (k == 4352 && packed_n == 5120));
+  const bool qwen38_gated_shape = gated_silu && k == 5120 && packed_n == 8704;
+  const bool native_m32 =
+      qpn8_m32_native_enabled && m > 16 && m <= 32 && qwen38_dense_shape;
+  const bool admitted_m = (qpn8_m16_enabled && m <= 16) ||
+                          (qpn8_m32_chunked_enabled && m <= 32) || native_m32;
+  if (admitted_m && channel_scales &&
+      (qwen38_dense_shape || qwen38_gated_shape)) {
+    if (native_m32) {
+      static std::once_flag qpn8_m32_native_log_once;
+      std::call_once(qpn8_m32_native_log_once, []() {
+        std::fprintf(stderr,
+                     "INFO SM70 channel-FP8 QPN8 native M=17..32 "
+                     "two-phase dense candidate enabled.\n");
+      });
+      fp8_qpn8_gemm_sm70_out(out, input, codes, group_scales, split_k,
+                             accumulator_chains, true, prefetch_codes);
+      return;
+    }
+    static std::once_flag qpn8_m16_log_once;
+    std::call_once(qpn8_m16_log_once, []() {
+      std::fprintf(stderr,
+                   "INFO SM70 channel-FP8 QPN8 M=9..32 batch-invariant "
+                   "two-row-tile/chunked candidate enabled.\n");
+    });
+    // M32 reuses the accepted M16 body in contiguous row chunks. Each chunk
+    // still reads the packed weight directly, avoiding the old full matrix
+    // reconstruction while preserving the same reduction order.
+    for (int64_t row = 0; row < m; row += 16) {
+      const int64_t rows = std::min<int64_t>(16, m - row);
+      auto input_chunk = input.narrow(0, row, rows);
+      auto out_chunk = out.narrow(0, row, rows);
+      if (qwen38_gated_shape) {
+        fp8_qpn8_gated_pair_sm70_out(out_chunk, input_chunk, codes,
+                                     group_scales, split_k, accumulator_chains,
+                                     true, prefetch_codes);
+      } else {
+        fp8_qpn8_gemm_sm70_out(out_chunk, input_chunk, codes, group_scales,
+                               split_k, accumulator_chains, true,
+                               prefetch_codes);
+      }
     }
     return;
   }
