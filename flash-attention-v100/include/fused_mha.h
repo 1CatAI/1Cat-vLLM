@@ -59,6 +59,8 @@ at::Tensor flash_attention_grouped_verify_paged(
 
 int64_t flash_attention_grouped_verify_max_query_tokens();
 
+int64_t flash_attention_grouped_sparse_page4_abi_version();
+
 at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
