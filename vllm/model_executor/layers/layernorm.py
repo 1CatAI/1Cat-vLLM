@@ -9,6 +9,7 @@ import torch.nn.functional as F
 # Import kernels
 import vllm.kernels  # noqa: F401
 from vllm import envs, ir
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -395,6 +396,7 @@ class GemmaRMSNorm(CustomOp):
         return (
             envs.VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and use_sm70_decode_graph_semantics()
             and torch.compiler.is_compiling()
             and x.is_cuda
         )

@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
+    VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
@@ -3341,6 +3342,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )
         .strip()
         .lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Exact Qwen3.8 TP4 lane: trace the large dynamic prefill backbone and the
+    # small FULL decode backbone independently while sharing parameters/KV.
+    # Config auto-enables this only for the admitted no-MTP model contract.
+    "VLLM_SM70_QWEN38_DUAL_COMPILE": lambda: bool(
+        os.getenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile

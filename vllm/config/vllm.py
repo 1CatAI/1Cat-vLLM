@@ -152,6 +152,41 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+def _is_sm70_qwen38_nomtp_dual_compile_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit only the exact Qwen3.8 TP4 no-MTP dual-compile topology."""
+    if (
+        model_config is None
+        or parallel_config is None
+        or speculative_config is not None
+    ):
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        "Qwen4ExpForCausalLM" in architectures
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 2560
+        and getattr(hf_text_config, "num_hidden_layers", None) == 48
+        and getattr(hf_text_config, "num_experts", None) == 512
+        and getattr(hf_text_config, "num_experts_per_tok", None) == 10
+        and getattr(hf_text_config, "moe_intermediate_size", None) == 640
+        and getattr(hf_text_config, "hc_count", None) == 4
+        and getattr(hf_text_config, "hc_lowrank", None) == 320
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 2
+        and getattr(hf_text_config, "indexer_head_dim", None) == 128
+        and getattr(hf_text_config, "indexer_budget", None) == 2048
+        and getattr(hf_text_config, "indexer_compress_ratio", None) == 4
+        and getattr(parallel_config, "tensor_parallel_size", None) == 4
+        and getattr(parallel_config, "pipeline_parallel_size", None) == 1
+    )
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -1619,6 +1654,25 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
+            if (
+                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                )
+                and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                and (
+                    envs.VLLM_SM70_QWEN38_FP16_GEMV
+                    or envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16
+                    or envs.VLLM_SM70_QWEN38_FUSED_HC_FP16
+                )
+                and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in os.environ
+            ):
+                os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
+                logger.info_once(
+                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                    "large prefill and FULL decode graphs share one model."
+                )
             if _is_sm70_dflash2_verifier_contract(
                 self.model_config,
                 self.speculative_config,

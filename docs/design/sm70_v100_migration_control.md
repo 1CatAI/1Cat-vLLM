@@ -44895,3 +44895,30 @@ Interpretation:
   arithmetic path: it makes default capacity select the same previously
   quality-audited, checkpoint-code-preserving B1 operator path. Test services
   were stopped after collection and all four V100s returned to idle memory.
+
+## 2026-09-03 Qwen3.8 unified prefill/decode compilation
+
+- The matched TP4/no-MTP evidence separated the regression from PLE residency.
+  The current source with the prefill graph policy measured `7026 tok/s` on the
+  repeated 8192-token prompt, while the combined decode graph service measured
+  about `5480 tok/s` after PLE major faults fell to two and PLE CPU time was
+  about 70 ms. The remaining roughly 330 ms was therefore inside the GPU graph.
+- The combined service compiled one dynamic backbone range `(1, 8193)`. Its FX
+  graph contained the M=1 FP16 GEMV, fused HC, fused GDN input, sum2 all-reduce,
+  graph-safe GDN slicing, and native Gemma RMS paths even for M=8192. The 7k
+  graph instead retained ordinary prefill linear/HC/GDN/RMS operations. This is
+  a phase-specialization bug, not evidence that two services or two weight
+  copies are required.
+- The candidate keeps one engine, one parameter set, and one KV/state cache. It
+  traces the existing dynamic prefill backbone first, then creates a non-owning
+  shared-parameter compiler limited to the FULL decode capture range. A capture
+  context selects decode-only graph semantics only while tracing FULL graphs;
+  normal prefill and PIECEWISE capture retain the established prefill graph.
+- Admission is limited to the exact Qwen4Exp 48-layer, H2560, E512/K10, HC4,
+  QSA TP4, FP16, PP1, no-MTP contract with at least one Qwen3.8 decode operator
+  enabled. `VLLM_SM70_QWEN38_DUAL_COMPILE=0` is the explicit rollback.
+- CPU-only gates pass: the phase context produces independent Dynamo branches,
+  the shared-weight proxy compiles without registering or copying target
+  parameters, focused config/route tests report `20 passed`, Ruff passes, and
+  GPUs 4-7 remain at zero allocated MiB. Real-model quality/performance evidence
+  is pending one combined candidate startup; no result is claimed yet.
