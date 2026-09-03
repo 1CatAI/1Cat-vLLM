@@ -200,6 +200,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         nn.Module.__init__(self)
         cache_config = vllm_config.cache_config
@@ -338,20 +339,48 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             prefix=f"{prefix}.indexer",
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.register_buffer(
-            "topk_indices_buffer",
-            torch.empty(
-                max_tokens,
-                self.indexer.output_width,
-                dtype=torch.int32,
-            ),
-            persistent=False,
+        self._set_topk_indices_buffer(
+            max_tokens=max_tokens,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         static_context[self.layer_name] = self
+
+    def _set_topk_indices_buffer(
+        self,
+        *,
+        max_tokens: int,
+        topk_indices_buffer: torch.Tensor | None,
+    ) -> None:
+        if topk_indices_buffer is None:
+            self.register_buffer(
+                "topk_indices_buffer",
+                torch.empty(
+                    max_tokens,
+                    self.indexer.output_width,
+                    dtype=torch.int32,
+                ),
+                persistent=False,
+            )
+            return
+
+        expected_width = self.indexer.output_width
+        if (
+            topk_indices_buffer.dtype != torch.int32
+            or topk_indices_buffer.ndim != 2
+            or topk_indices_buffer.shape[0] < max_tokens
+            or topk_indices_buffer.shape[1] != expected_width
+        ):
+            raise ValueError(
+                "QSA shared top-k buffer must have dtype int32 and shape "
+                f"[{max_tokens} or more, {expected_width}], got "
+                f"dtype={topk_indices_buffer.dtype}, "
+                f"shape={tuple(topk_indices_buffer.shape)}"
+            )
+        self.topk_indices_buffer = topk_indices_buffer
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend

@@ -4,10 +4,12 @@
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import QSAKeyStateCache
 from vllm.models.qwen4_exp.nvidia.qsa import (
+    Qwen4ExpQSAAttention,
     Qwen4ExpQSAFlashAttentionBackend,
     Qwen4ExpQSAFlashAttentionImpl,
 )
@@ -16,6 +18,50 @@ from vllm.v1.worker.utils import bind_kv_cache
 
 def test_qsa_does_not_claim_batch_invariant_reductions() -> None:
     assert not Qwen4ExpQSAFlashAttentionBackend.supports_batch_invariance()
+
+
+def _bare_qsa_attention(output_width: int) -> Qwen4ExpQSAAttention:
+    attention = object.__new__(Qwen4ExpQSAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.indexer = SimpleNamespace(output_width=output_width)
+    return attention
+
+
+def test_qsa_attention_reuses_shared_topk_indices_buffer() -> None:
+    attention = _bare_qsa_attention(output_width=7)
+    shared = torch.empty(16, 7, dtype=torch.int32)
+
+    attention._set_topk_indices_buffer(
+        max_tokens=16,
+        topk_indices_buffer=shared,
+    )
+
+    assert attention.topk_indices_buffer is shared
+    assert "topk_indices_buffer" not in attention._buffers
+
+
+def test_qsa_attention_keeps_private_buffer_fallback() -> None:
+    attention = _bare_qsa_attention(output_width=7)
+
+    attention._set_topk_indices_buffer(
+        max_tokens=16,
+        topk_indices_buffer=None,
+    )
+
+    assert attention.topk_indices_buffer.shape == (16, 7)
+    assert attention.topk_indices_buffer.dtype == torch.int32
+    assert "topk_indices_buffer" in attention._buffers
+
+
+def test_qsa_attention_rejects_invalid_shared_topk_indices_buffer() -> None:
+    attention = _bare_qsa_attention(output_width=7)
+    invalid = torch.empty(16, 6, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="shared top-k buffer"):
+        attention._set_topk_indices_buffer(
+            max_tokens=16,
+            topk_indices_buffer=invalid,
+        )
 
 
 def test_bind_qsa_key_cache_builds_key_and_mrope_views() -> None:
