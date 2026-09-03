@@ -303,6 +303,8 @@ def _run_projection(
     warmup: int,
     iterations: int,
     trials: int,
+    split_k_override: int | None,
+    accumulator_chains_override: int | None,
 ) -> dict[str, object]:
     from vllm import _sm70_ops as sm70_ops
 
@@ -318,6 +320,10 @@ def _run_projection(
     )
     k, n = qweight.shape
     split_k, accumulator_chains = QPN2_CONFIGS[(k, n)]
+    if split_k_override is not None:
+        split_k = split_k_override
+    if accumulator_chains_override is not None:
+        accumulator_chains = accumulator_chains_override
     x = torch.randn((m, k), dtype=torch.float16, device=device) * 0.1
 
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
@@ -341,6 +347,7 @@ def _run_projection(
         return tm_final
 
     qpn_final = torch.empty((m, final_n), dtype=torch.float16, device=device)
+    run_qpn2_chunked = None
     if production:
         qpn_codes, qpn_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
             packed, projection.scales.to(device)
@@ -374,11 +381,13 @@ def _run_projection(
             packed, projection.scales.to(device)
         )
 
-        def run_qpn2() -> torch.Tensor:
+        def run_candidate(
+            candidate_out: torch.Tensor, candidate_input: torch.Tensor
+        ) -> torch.Tensor:
             if projection.gated_silu:
                 torch.ops._qpn2_candidate.gated(
-                    qpn_final,
-                    x,
+                    candidate_out,
+                    candidate_input,
                     qpn_codes,
                     qpn_scales,
                     projection.inverse_global_scale,
@@ -387,15 +396,30 @@ def _run_projection(
                 )
             else:
                 torch.ops._qpn2_candidate.gemm(
-                    qpn_final,
-                    x,
+                    candidate_out,
+                    candidate_input,
                     qpn_codes,
                     qpn_scales,
                     projection.inverse_global_scale,
                     split_k,
                     accumulator_chains,
                 )
-            return qpn_final
+            return candidate_out
+
+        def run_qpn2() -> torch.Tensor:
+            return run_candidate(qpn_final, x)
+
+        if m > 8:
+            qpn_chunked = torch.empty_like(qpn_final)
+
+            def run_qpn2_chunked() -> torch.Tensor:
+                for row in range(0, m, 8):
+                    rows = min(8, m - row)
+                    run_candidate(
+                        qpn_chunked.narrow(0, row, rows),
+                        x.narrow(0, row, rows),
+                    )
+                return qpn_chunked
 
     else:
         if extension is None:
@@ -422,11 +446,26 @@ def _run_projection(
     qpn_graph, qpn_output = _capture(run_qpn2)
     tm_timing = _time_graph(tm_graph, warmup, iterations, trials)
     qpn_timing = _time_graph(qpn_graph, warmup, iterations, trials)
+    chunked_timing = None
+    qpn_chunked_output = None
+    if run_qpn2_chunked is not None:
+        chunked_graph, qpn_chunked_output = _capture(run_qpn2_chunked)
+        chunked_timing = _time_graph(chunked_graph, warmup, iterations, trials)
     tm_graph.replay()
     qpn_graph.replay()
     torch.accelerator.synchronize()
     reference = _fp32_reference(projection, x, device)
+    batch_invariance = None
+    if qpn_chunked_output is not None:
+        run_qpn2_chunked()
+        torch.accelerator.synchronize()
+        batch_invariance = _quality(qpn_output, qpn_chunked_output)
     saved_us = float(tm_timing["median_us"]) - float(qpn_timing["median_us"])
+    native_saved_us = (
+        float(chunked_timing["median_us"]) - float(qpn_timing["median_us"])
+        if chunked_timing is not None
+        else None
+    )
     return {
         "name": projection.name,
         "m": m,
@@ -440,11 +479,23 @@ def _run_projection(
         },
         "turbomind": tm_timing,
         "qpn2": qpn_timing,
+        "qpn2_chunked_m8": chunked_timing,
         "speedup": float(tm_timing["median_us"]) / float(qpn_timing["median_us"]),
         "saved_ms_per_round": saved_us * projection.calls_per_round / 1000.0,
+        "native_vs_chunked_speedup": (
+            float(chunked_timing["median_us"]) / float(qpn_timing["median_us"])
+            if chunked_timing is not None
+            else None
+        ),
+        "native_saved_ms_per_round": (
+            native_saved_us * projection.calls_per_round / 1000.0
+            if native_saved_us is not None
+            else None
+        ),
         "quality_vs_turbomind": _quality(qpn_output, tm_output),
         "turbomind_quality_vs_fp32": _quality(tm_output, reference),
         "qpn2_quality_vs_fp32": _quality(qpn_output, reference),
+        "qpn2_batch_invariance": batch_invariance,
     }
 
 
@@ -461,6 +512,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--split-k-override", type=int, choices=(8, 16, 32))
+    parser.add_argument("--accumulator-chains-override", type=int, choices=(1, 2))
     parser.add_argument(
         "--synthetic-shapes",
         action="store_true",
@@ -560,6 +613,8 @@ def main() -> int:
             args.warmup,
             args.iterations,
             args.trials,
+            args.split_k_override,
+            args.accumulator_chains_override,
         )
         for projection in projections
     ]
@@ -596,6 +651,8 @@ def main() -> int:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "trials": args.trials,
+        "split_k_override": args.split_k_override,
+        "accumulator_chains_override": args.accumulator_chains_override,
         "rows": rows,
         "projected_total_saved_ms_per_round": sum(
             float(row["saved_ms_per_round"]) for row in rows

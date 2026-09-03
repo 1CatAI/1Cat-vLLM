@@ -130,6 +130,7 @@ def test_sm70_concurrency_tuning_envs(
         "VLLM_SM70_FP8_QPN8_M16",
         "VLLM_SM70_FP8_QPN8_M32_CHUNKED",
         "VLLM_SM70_FP8_QPN8_M32_NATIVE",
+        "VLLM_SM70_NVFP4_QPN2_M16_NATIVE",
         "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY",
     )
     for name in names:

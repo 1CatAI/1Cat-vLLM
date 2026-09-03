@@ -44954,9 +44954,9 @@ Interpretation:
   batch-invariance equality and supports real channel-scale checkpoint data.
 - The throughput gates are not closed. Further row tiling is stopped. The next
   high-yield branch must split draft versus target cost without CUPTI, then
-  test request/stream partitioning or replica topology; two Nsight attempts
-  crashed in `cuptiActivityFlushAll` during multiprocess shutdown and produced
-  no report.
+  test request/stream partitioning inside the same TP4 instance; two Nsight
+  attempts crashed in `cuptiActivityFlushAll` during multiprocess shutdown and
+  produced no report.
 - MRV2's default-off phase profiler incorrectly admitted only `method=mtp`, so
   the DFlash2 service emitted no phase records. Its gate now also admits
   `dflash` and `dspark`, matching the legacy runner. Targeted tests pass.
@@ -44985,3 +44985,31 @@ Interpretation:
 - A third Nsight run used stop-only capture termination, completed the B4
   workload, and still crashed in `cuptiActivityFlushAll` without a report.
   Do not retry this multiprocess CUPTI path until the external runtime changes.
+- The TP4/B8 synchronized MRV2 phase probe now has 43 stable full-batch q7/M64
+  rounds. Median target forward is `54.103 ms`, target sample plus state
+  `2.024 ms`, draft `12.041 ms`, and total GPU `68.290 ms`. Target forward is
+  79.2% of the interval, so selector work is not the primary B8 bottleneck.
+  The profiler-synchronized endpoint throughput is deliberately excluded.
+- A default-off `VLLM_SM70_NVFP4_QPN2_M16_NATIVE` route reuses each packed
+  NVFP4 weight tile across the two verifier row groups. On real layer-55 TP4
+  shards, gate/up improves `72.30 -> 66.76 us` and down projection
+  `38.06 -> 31.31 us`, saving a projected `0.786 ms` per target round versus
+  concatenated M8 calls. M9/M15/M16 gate/up and down outputs are bitwise equal
+  to that existing order with maximum difference zero.
+- Two same-contract single-instance TP4/B2 endpoint runs with retained QPN8,
+  push all-reduce, and native QPN2 M16 measured `271.46` and
+  `270.20 token/s`. The final source-matched result is `270.20 token/s`, or
+  72.0% scaling efficiency versus fixed B1 `187.77 token/s`. It completed
+  16/16 requests and 8,192/8,192 output tokens without errors, empty text, or
+  replacement characters; acceptance was `45.30%` with mean length `4.17`.
+- NVFP4 QPN2 M32 was removed because the exact candidate regressed down
+  projection to `140.94 us` versus approximately `71.59 us`. q5 B8 was also
+  rejected at `335.71 token/s`, 7.4% below q7, and a single-accumulator QPN8
+  candidate was removed because its acceptance-normalized B2 rate regressed
+  about 0.6% while changing reduction order.
+- The absolute gates remain open: B2 is about 10.1% below `300.43 token/s`,
+  while retained B4/B8 are `322.68/362.53 token/s` versus
+  `525.76/901.30`. Do not change tensor parallelism or use replica topology for
+  this acceptance task. Generic DBO targets DP+EP/DeepEP and is unsupported by
+  ModelRunnerV2, so the next branch is a TP4/DP1 MRV2-local verifier
+  microbatch/request-partitioning prototype.

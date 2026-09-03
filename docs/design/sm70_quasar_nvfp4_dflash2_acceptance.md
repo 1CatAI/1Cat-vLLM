@@ -451,10 +451,10 @@ still needs a structural change rather than more row tiling. At observed
 accepted lengths, the remaining gap cannot be closed by selector or epilogue
 micro-tuning alone. The next measurement should split the unprofiled native
 candidate into target forward, target logits/rejection, draft, and host
-bookkeeping, then evaluate either multi-stream/request partitioning or a
-deployment topology that adds independent replicas. Two Nsight Systems runs
-were attempted, but CUPTI crashed during multiprocess shutdown before writing
-a report; do not repeat that capture path unchanged.
+bookkeeping, then evaluate multi-stream or request partitioning inside the
+same TP4 instance. Two Nsight Systems runs were attempted, but CUPTI crashed
+during multiprocess shutdown before writing a report; do not repeat that
+capture path unchanged.
 
 The built-in CUDA-event profiler initially produced no output because the MRV2
 gate admitted `mtp` only, while this service resolves the same diagnostic path
@@ -518,3 +518,54 @@ A third Nsight Systems attempt changed capture termination from
 `cuptiActivityFlushAll` while exiting without generating a report. CUPTI is
 therefore unsuitable for this process topology until the external tool/runtime
 issue changes; do not spend another run on capture-end variations.
+
+The synchronized MRV2 profiler was then extended to the official q7 B8/M64
+shape. Across 43 stable full-batch rounds, median target forward was
+`54.103 ms`, target sampling `1.980 ms`, state update `0.044 ms`, draft
+`12.041 ms`, and total GPU interval `68.290 ms`. Target forward therefore
+accounts for 79.2% of the interval, draft 17.6%, and sampling plus state only
+3.0%. The profiler's synchronized `262.45 token/s` endpoint result is not a
+speed measurement. The retained phase records are in
+`.artifacts/runtime/endpoint-qpn8-mrv2-profile-b8-v1`; they confirm that target
+forward, rather than selector or host bookkeeping, remains the B8 bottleneck.
+
+For B2/M16, the NVFP4 QPN2 MLP path previously issued two independent M8
+kernels and loaded the same packed weights twice. A default-off
+`VLLM_SM70_NVFP4_QPN2_M16_NATIVE` candidate assigns both eight-row groups to
+one CTA, reuses each packed weight tile, and preserves the existing split-K
+and FP32 reduction order. On real layer-55 TP4-rank-0 weights, gate/up improves
+from `72.30` to `66.76 us` and down projection from `38.06` to `31.31 us`, a
+weighted `0.786 ms` saving per target round. M9, M15, and M16 outputs are
+bitwise equal to concatenated M8 calls for both projections with maximum
+difference zero. The operator artifacts are
+`.artifacts/runtime/qpn2-m16-native-real-final-r2.json` and
+`.artifacts/runtime/qpn2-m16-native-tails-m9-r1.json` /
+`.artifacts/runtime/qpn2-m16-native-tails-m15-r1.json`.
+
+With exact QPN8, TP4 push all-reduce, and native NVFP4 QPN2 M16 enabled, two
+same-contract TP4/B2 endpoint runs measured `271.46` and `270.20 token/s`.
+The final source-matched row is `270.20 token/s`, or 72.0% ideal scaling from
+the fixed `187.77 token/s` B1 denominator. It completed 16/16 requests and all
+8,192 requested output tokens, with no request errors, empty strings, or
+replacement characters. Draft acceptance was `45.30%` and mean accepted
+length `4.17`. The final artifact is
+`.artifacts/runtime/endpoint-qpn2-m16-native-b2-final-v1` and records extension
+SHA256 `10440281536d1364a2faa3b6c71129189aa1ccd6ee91aec598477a7d7d2b35f7`.
+
+Three additional branches were rejected. A bitwise-exact M32 NVFP4 two-row
+CTA was slower than the retained path, including down projection
+`140.94 us` versus approximately `71.59 us`, and was removed. A q5 TP4/B8
+endpoint screen reached only `335.71 token/s`, 7.4% below q7, because mean
+emission fell to `3.93` tokens per round despite `58.58%` acceptance. A
+single-accumulator channel-FP8 QPN8 M16 variant reached `274.28 token/s` in
+one B2 sample, but acceptance-normalized round rate was about 0.6% worse and
+the altered reduction order weakened its quality contract; that source was
+also removed.
+
+The B2/B4/B8 gates remain open at `300.43/525.76/901.30 token/s`. B2 is now
+about 10.1% below its gate, while the retained B4 and B8 rows remain
+`322.68/362.53 token/s`. Generic vLLM DBO is not directly applicable: it
+targets DP+EP/DeepEP, is unsupported by ModelRunnerV2, and the present service
+is dense TP4/DP1. The next structural branch must therefore stay within the
+single TP4 instance and prototype MRV2-local two-way verifier microbatching or
+request partitioning, with target arithmetic and output quality held fixed.
