@@ -31,6 +31,7 @@ from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
 
 import msgspec
+import psutil
 import torch
 import torch.distributed as dist
 import zmq
@@ -55,6 +56,7 @@ from vllm.model_executor.model_loader.utils import (
     process_weights_after_loading,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload.protocol import (
@@ -64,6 +66,56 @@ from vllm.v1.ple_offload.protocol import (
 )
 
 logger = init_logger(__name__)
+
+
+def _estimate_module_storage_bytes(modules: Iterable[torch.nn.Module]) -> int:
+    """Return unique materialized parameter and buffer storage bytes."""
+    seen: set[tuple[str, int, int]] = set()
+    total = 0
+    for module in modules:
+        tensors = (*module.parameters(), *module.buffers())
+        for tensor in tensors:
+            if tensor.device.type == "meta":
+                continue
+            storage = tensor.untyped_storage()
+            storage_bytes = storage.nbytes()
+            key = (str(tensor.device), storage.data_ptr(), storage_bytes)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += storage_bytes
+    return total
+
+
+def _log_ple_host_memory_capacity(layers: Iterable[PleOffloadLayer]) -> int:
+    """Report whether PLE weights can remain resident without swap pressure."""
+    required_bytes = _estimate_module_storage_bytes(layers)
+    memory = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    # Leave enough memory for the API process, model workers, page tables, and
+    # transient request buffers. This is a warning threshold, not an artificial
+    # model or checkpoint admission gate.
+    headroom_bytes = max(4 * GiB_bytes, memory.total // 10)
+    logger.info(
+        "PLE host-memory requirement: %.2f GiB weights/buffers, %.2f GiB "
+        "currently available of %.2f GiB total (%.2f GiB swap in use).",
+        required_bytes / GiB_bytes,
+        memory.available / GiB_bytes,
+        memory.total / GiB_bytes,
+        swap.used / GiB_bytes,
+    )
+    if required_bytes + headroom_bytes > memory.available:
+        logger.warning(
+            "PLE CPU offload may page its %.2f GiB table: only %.2f GiB host "
+            "RAM is currently available and %.2f GiB is reserved as runtime "
+            "headroom. Paging causes severe, input-dependent prefill and "
+            "decode latency. Free host memory, add RAM, or disable PLE CPU "
+            "offload when the table fits on the accelerators.",
+            required_bytes / GiB_bytes,
+            memory.available / GiB_bytes,
+            headroom_bytes / GiB_bytes,
+        )
+    return required_bytes
 
 
 @dataclass
@@ -387,6 +439,7 @@ class PleOffloadRunner:
             len(offload_layers),
             sorted(offload_layers),
         )
+        _log_ple_host_memory_capacity(offload_layers.values())
         offload_prefixes = tuple(f"{name}." for name in offload_layers)
 
         # Step 3: filter checkpoint tensors before model.load_weights(). The

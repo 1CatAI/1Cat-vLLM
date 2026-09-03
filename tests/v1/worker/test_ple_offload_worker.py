@@ -147,6 +147,46 @@ def test_ple_offload_rejects_missing_materialized_parameters(
         )
 
 
+def test_ple_storage_estimate_deduplicates_shared_storage() -> None:
+    module = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.zeros(16, dtype=torch.float32))
+    module.register_parameter("weight", weight)
+    module.register_buffer("weight_view", weight.detach().view(4, 4))
+
+    estimated = ple_offload_worker._estimate_module_storage_bytes([module])
+
+    assert estimated == weight.untyped_storage().nbytes()
+
+
+def test_ple_host_memory_pressure_warns_without_rejecting(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gib = ple_offload_worker.GiB_bytes
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "_estimate_module_storage_bytes",
+        lambda _: 6 * gib,
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=16 * gib, available=8 * gib),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "swap_memory",
+        lambda: SimpleNamespace(used=3 * gib),
+    )
+
+    with caplog.at_level("WARNING", logger=ple_offload_worker.__name__):
+        required = ple_offload_worker._log_ple_host_memory_capacity([])
+
+    assert required == 6 * gib
+    assert "may page its 6.00 GiB table" in caplog.text
+    assert "input-dependent prefill and decode latency" in caplog.text
+
+
 def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
     """A later batch must not retarget an earlier batch's D2H event."""
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
