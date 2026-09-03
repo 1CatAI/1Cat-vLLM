@@ -5,10 +5,14 @@ import pytest
 import torch
 
 import vllm.envs as envs
+from vllm.models.qwen4_exp.nvidia.ops.hc import hc_gate_mix
 from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import _plan_for
 from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import (
+    _qwen38_hc_down_local_shard_kernel,
+    _qwen38_hc_down_silu_inject_kernel,
     _qwen38_hc_up_gate_mix_kernel,
     _qwen38_hc_up_gate_mix_row4_kernel,
+    _qwen38_hc_up_local_gate_kernel,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
@@ -118,3 +122,77 @@ def test_qwen38_sm70_hc_up_row4_is_bitwise() -> None:
         )
         torch.accelerator.synchronize()
         assert torch.equal(actual, reference)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((7, 0)) or not HAS_TRITON,
+    reason="Qwen3.8 HC TP4 shards require CUDA SM70 and Triton",
+)
+def test_qwen38_sm70_hc_tp4_compute_shards_are_bitwise() -> None:
+    x = torch.empty(1, 10240, dtype=torch.float16, device="cuda")
+    down_weight = torch.randn(336, 10240, dtype=torch.float16, device="cuda")
+    up_weight = torch.randn(10240, 320, dtype=torch.float16, device="cuda")
+    reference_lora = torch.empty(1, 320, dtype=torch.float16, device="cuda")
+    reference_injection = torch.empty(1, 4, dtype=torch.float16, device="cuda")
+    reference_block = torch.empty(1, 2560, dtype=torch.float16, device="cuda")
+
+    for seed in range(4):
+        torch.manual_seed(seed)
+        x.normal_()
+        _qwen38_hc_down_silu_inject_kernel[(324,)](
+            x,
+            down_weight,
+            reference_lora,
+            reference_injection,
+            K=10240,
+            BLOCK_K=256,
+            RANK_VALUE=320,
+            HC_COUNT=4,
+            num_warps=4,
+        )
+        _qwen38_hc_up_gate_mix_row4_kernel[(640,)](
+            reference_lora,
+            up_weight,
+            x,
+            reference_block,
+            K=320,
+            HC_DIMENSION=2560,
+            HC_COUNT=4,
+            BLOCK_N=4,
+            BLOCK_K=512,
+            num_warps=8,
+        )
+
+        local_down = []
+        local_gates = []
+        for rank in range(4):
+            shard = torch.empty(1, 88, dtype=torch.float16, device="cuda")
+            _qwen38_hc_down_local_shard_kernel[(88,)](
+                x,
+                down_weight,
+                shard,
+                TP_RANK=rank,
+                num_warps=4,
+            )
+            local_down.append(shard)
+        gathered_lora = torch.cat([shard[..., :80] for shard in local_down], dim=-1)
+        gathered_injection = torch.cat(
+            [shard[..., 80:81] for shard in local_down], dim=-1
+        )
+        for rank in range(4):
+            gate = torch.empty(1, 2560, dtype=torch.float16, device="cuda")
+            _qwen38_hc_up_local_gate_kernel[(320,)](
+                gathered_lora,
+                up_weight,
+                gate,
+                TP_RANK=rank,
+                BLOCK_N=8,
+                num_warps=8,
+            )
+            local_gates.append(gate)
+        actual_block = hc_gate_mix(x, torch.cat(local_gates, dim=-1), 4)
+        torch.accelerator.synchronize()
+
+        assert torch.equal(gathered_lora, reference_lora)
+        assert torch.equal(gathered_injection, reference_injection)
+        assert torch.equal(actual_block, reference_block)

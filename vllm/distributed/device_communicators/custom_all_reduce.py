@@ -440,6 +440,31 @@ class CustomAllreduce:
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
 
+    def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
+        return bool(
+            not self.disabled
+            and self.world_size == 4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and branches.is_cuda
+            and branches.dtype == torch.float16
+            and branches.shape == (1, 10240)
+            and branches.is_contiguous()
+        )
+
+    def sm70_qwen38_hc_down_allgather(
+        self, local_down: torch.Tensor, gathered_down: torch.Tensor
+    ) -> None:
+        ops.sm70_qwen38_hc_down_allgather(self._ptr, local_down, gathered_down)
+
+    def sm70_qwen38_hc_gate_mix(
+        self,
+        local_gate: torch.Tensor,
+        branches: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        ops.sm70_qwen38_hc_gate_mix(self._ptr, local_gate, branches, output)
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,

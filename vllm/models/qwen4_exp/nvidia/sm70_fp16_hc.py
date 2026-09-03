@@ -64,6 +64,77 @@ def _qwen38_hc_down_silu_inject_kernel(
 
 
 @triton.jit
+def _qwen38_hc_down_local_shard_kernel(
+    x_ptr,
+    weight_ptr,
+    output_ptr,
+    TP_RANK: tl.constexpr,
+):
+    """Compute this TP rank's 80 low-rank rows and one injection row."""
+    row = tl.program_id(0)
+    active = row < 81
+    checkpoint_row = tl.where(row < 80, TP_RANK * 80 + row, 320 + TP_RANK)
+    offsets = tl.arange(0, 256)
+    acc = tl.zeros((256,), dtype=tl.float32)
+    for block_start in tl.static_range(0, 10240, 256):
+        indices = block_start + offsets
+        x = tl.load(
+            x_ptr + indices,
+            mask=active,
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        weight = tl.load(
+            weight_ptr + checkpoint_row * 10240 + indices,
+            mask=active,
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        acc += x.to(tl.float32) * weight.to(tl.float32)
+
+    # Match the replicated projection's FP16 materialization before SiLU.
+    value = tl.sum(acc, axis=0).to(tl.float16).to(tl.float32)
+    scaled = value / 4
+    value = tl.where(row < 80, scaled * tl.sigmoid(scaled), value)
+    tl.store(output_ptr + row, value, mask=active)
+    # Keep the 88-element communication packet aligned to 16 bytes. Padding
+    # is canonical zero and is discarded after the rank-ordered gather.
+    tl.store(output_ptr + row, 0.0, mask=~active)
+
+
+@triton.jit
+def _qwen38_hc_up_local_gate_kernel(
+    lora_ptr,
+    weight_ptr,
+    gate_ptr,
+    TP_RANK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Compute the 2560 gate rows owned by this TP rank."""
+    hidden = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets = tl.arange(0, 512)
+    hidden_mask = hidden < 2560
+    k_mask = offsets < 320
+    lora = tl.load(
+        lora_ptr + offsets,
+        mask=k_mask,
+        other=0.0,
+        eviction_policy="evict_last",
+    ).to(tl.float32)
+    checkpoint_row = TP_RANK * 2560 + hidden
+    weight = tl.load(
+        weight_ptr + checkpoint_row[:, None] * 320 + offsets[None, :],
+        mask=hidden_mask[:, None] & k_mask[None, :],
+        other=0.0,
+        eviction_policy="evict_first",
+    )
+    gate = tl.sum(lora[None, :] * weight.to(tl.float32), axis=1)
+    # The communication kernel applies the original FP16 gate boundary,
+    # sigmoid, rank-ordered FP32 FMA, and final FP16 materialization.
+    tl.store(gate_ptr + hidden, gate, mask=hidden_mask)
+
+
+@triton.jit
 def _qwen38_hc_up_gate_mix_kernel(
     lora_ptr,
     weight_ptr,
@@ -186,6 +257,42 @@ def _qwen38_sm70_fp16_fused_hc(
         gate = torch.nn.functional.linear(lora, up_weight)
         block = torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, _HC_COUNT)
         return block, injection
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        device_communicator = get_tp_group().device_communicator
+        custom_ar = getattr(device_communicator, "ca_comm", None)
+    except (AssertionError, AttributeError, RuntimeError, ValueError):
+        custom_ar = None
+
+    if custom_ar is not None and custom_ar.can_sm70_qwen38_hc_shard(x):
+        tp_rank = int(custom_ar.rank)
+        local_down = x.new_empty((1, 88))
+        gathered_down = x.new_empty((1, 336))
+        local_gate = x.new_empty((1, _HC_DIM))
+        block = x.new_empty((1, _HC_DIM))
+        _qwen38_hc_down_local_shard_kernel[(88,)](
+            x,
+            down_weight,
+            local_down,
+            TP_RANK=tp_rank,
+            num_warps=4,
+        )
+        custom_ar.sm70_qwen38_hc_down_allgather(local_down, gathered_down)
+        _qwen38_hc_up_local_gate_kernel[(triton.cdiv(_HC_DIM, 8),)](
+            gathered_down,
+            up_weight,
+            local_gate,
+            TP_RANK=tp_rank,
+            BLOCK_N=8,
+            num_warps=8,
+        )
+        custom_ar.sm70_qwen38_hc_gate_mix(local_gate, x, block)
+        logger.info_once(
+            "SM70 Qwen3.8 exact TP4-sharded checkpoint-FP16 HC route enabled."
+        )
+        return block, gathered_down[..., _HC_RANK : _HC_RANK + _HC_COUNT]
+
     lora = x.new_empty((1, _HC_RANK))
     injection = x.new_empty((1, _HC_COUNT))
     block = x.new_empty((1, _HC_DIM))
@@ -290,6 +397,8 @@ def enable_qwen38_sm70_fp16_fused_hc(
 
 
 __all__ = [
+    "_qwen38_hc_down_local_shard_kernel",
+    "_qwen38_hc_up_local_gate_kernel",
     "enable_qwen38_sm70_fp16_fused_hc",
     "maybe_apply_qwen38_sm70_fp16_fused_hc",
 ]

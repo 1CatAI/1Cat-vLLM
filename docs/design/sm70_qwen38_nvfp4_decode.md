@@ -930,3 +930,40 @@ with HC combine, followed by an exact norm-only kernel, is bitwise for both
 multi-stream and normalized outputs but is `0.013 ms/token` slower over 48
 calls. These paths should not be rescanned without a different kernel
 architecture.
+
+### Exact TP4 HyperConnection compute sharding
+
+The next retained HC candidate changes work placement, not model precision.
+For each M=1 HC down projection, rank `r` computes low-rank rows
+`[80r, 80(r+1))` and injection row `320+r` directly from the existing
+replicated checkpoint-FP16 weight. A rank-ordered push all-gather reconstructs
+the original 320 low-rank and four injection values. Each rank then computes
+the corresponding 2,560 rows of the FP16 HC-up projection, and a second push
+kernel applies the established FP16 gate boundary, FP32 sigmoid and
+rank-ordered FMA, and final FP16 materialization. The implementation keeps the
+full weights resident, so prefill and unsupported cases use the original
+replicated path without a weight-loader or memory-layout change.
+
+On four V100-SXM2-32GB GPUs, the real-shape 96-HC CUDA Graph cycle falls from
+`2.042378 ms` to `1.748982 ms`, saving `0.293396 ms/token` or 16.78%. All
+block and injection outputs are bitwise equal on all four ranks. A separate
+production-dispatch smoke covers 16 changing inputs through the registered
+custom op and CUDA Graph lifecycle; all four ranks report zero FP16 bit
+mismatches. The route requires the existing checkpoint-FP16 HC opt-in, exact
+Qwen3.8 topology, fully connected TP4 SM70 custom all-reduce, and registered
+push buffers. Otherwise it falls back before launching a sharded kernel.
+
+This candidate does not use FP8, INT8, QPN, altered activation types, or a
+reduced-precision accumulator. Together with the preceding isolated exact
+screens, projected operator savings are `0.884 ms/token`; this is still not an
+end-to-end throughput claim, and it does not by itself establish the 100
+tok/s target.
+
+Two additional no-lower-precision screens were rejected. A deterministic
+E512/K10 top-10 selector preserves all outputs bitwise across random inputs,
+dense ties, signed zero, NaN, and infinities, but loses `0.023 ms/token` with
+hot logits and `0.049 ms/token` after a 64-MiB L2 scrub. GDN input row tiling
+is bitwise but saves only `0.0046 ms/token`. Checkpoint-native NVFP4 W13
+split-16 retains FP32 MMA accumulation and FP16 output but changes FP32
+summation grouping; it differs from split-8 by one FP16 ULP in about 0.28% of
+sampled outputs, so it is not enabled without a full model quality gate.

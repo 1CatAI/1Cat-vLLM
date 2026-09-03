@@ -911,6 +911,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);
   custom_ar.def(
+      "sm70_qwen38_hc_down_allgather(int fa, Tensor inp, Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_down_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_down_allgather);
+  custom_ar.def(
+      "sm70_qwen38_hc_gate_mix(int fa, Tensor local_gate, Tensor branches, "
+      "Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_gate_mix", torch::kCUDA,
+                 &sm70_qwen38_hc_gate_mix);
+  custom_ar.def(
       "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("top1_argmax", torch::kCUDA, &top1_argmax);

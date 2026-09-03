@@ -87,6 +87,237 @@ bool _is_weak_contiguous(torch::Tensor& t) {
           t.numel() * t.element_size());
 }
 
+#if !defined(USE_ROCM)
+namespace vllm {
+
+constexpr int kQwen38HcDownLocalElements = 88;
+constexpr int kQwen38HcDownLiveElements = 84;
+constexpr int kQwen38HcDownLocalLoraElements = 80;
+constexpr int kQwen38HcDownLocalInjectionElements = 1;
+constexpr int kQwen38HcDownLocalPaddingElements = 3;
+constexpr int kQwen38HcDownGatheredElements =
+    kQwen38HcDownLiveElements * kSm70Tp4PushAllreduceWorldSize;
+constexpr int kQwen38HcGateLocalElements = 2560;
+constexpr int kQwen38HcGateGatheredElements =
+    kQwen38HcGateLocalElements * kSm70Tp4PushAllreduceWorldSize;
+
+template <int ngpus, int Rank>
+__global__ void __launch_bounds__(128, 1)
+    sm70_qwen38_hc_down_push_allgather(RankData push_buffers,
+                                       const half* __restrict__ input,
+                                       half* __restrict__ output) {
+  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
+  using P = typename packed_t<half>::P;
+  constexpr int kElementsPerPack = P::size;
+  constexpr int kPackedElements = kQwen38HcDownLocalElements / kElementsPerPack;
+  constexpr int kPackedStride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[Rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
+  const uint32_t epoch = local_epochs[0];
+  const int epoch_offset = epoch * ngpus * kPackedStride;
+  const int offset = threadIdx.x;
+
+  if (offset < kPackedElements) {
+    P value = reinterpret_cast<const P*>(input)[offset];
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value.data[element]);
+    }
+
+  #pragma unroll
+    for (int destination_rank = 0; destination_rank < ngpus;
+         ++destination_rank) {
+      if (destination_rank == Rank) continue;
+      auto* destination_base = const_cast<char*>(
+          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
+      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
+                          (epoch_offset + Rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[ngpus];
+    peer_values[Rank] = value;
+    while (true) {
+      bool has_empty_slot = false;
+  #pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        if (source_rank == Rank) continue;
+        const void* source =
+            local_storage + kSm70Tp4PushAllreduceSignalBytes +
+            (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+  #pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+  #pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+  #pragma unroll
+      for (int element = 0; element < P::size; ++element) {
+        const int local_element = offset * kElementsPerPack + element;
+        if (local_element < kQwen38HcDownLocalLoraElements) {
+          output[source_rank * kQwen38HcDownLocalLoraElements + local_element] =
+              peer_values[source_rank].data[element];
+        } else if (local_element == kQwen38HcDownLocalLoraElements) {
+          output[ngpus * kQwen38HcDownLocalLoraElements + source_rank] =
+              peer_values[source_rank].data[element];
+        } else if (local_element < kQwen38HcDownLiveElements) {
+          const int local_padding = local_element -
+                                    kQwen38HcDownLocalLoraElements -
+                                    kQwen38HcDownLocalInjectionElements;
+          output[ngpus * (kQwen38HcDownLocalLoraElements +
+                          kQwen38HcDownLocalInjectionElements) +
+                 source_rank * kQwen38HcDownLocalPaddingElements +
+                 local_padding] = peer_values[source_rank].data[element];
+        }
+      }
+    }
+
+    P empty;
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+  #pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      if (source_rank == Rank) continue;
+      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+                     (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty, source, offset);
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[0] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+  }
+}
+
+DINLINE float qwen38_hc_sigmoid_fp32(float value) {
+  constexpr uint32_t kLog2E = 0x3fb8aa3b;
+  const float log2e = __uint_as_float(kLog2E);
+  const float negated = __fsub_rn(0.0f, value);
+  const float exponent = __fmul_rn(negated, log2e);
+  float exp2;
+  asm volatile("ex2.approx.f32 %0, %1;" : "=f"(exp2) : "f"(exponent));
+  const float denominator = __fadd_rn(exp2, 1.0f);
+  float result;
+  asm volatile("div.full.f32 %0, %1, %2;"
+               : "=f"(result)
+               : "f"(1.0f), "f"(denominator));
+  return result;
+}
+
+DINLINE float qwen38_hc_divide_by_count(float value) {
+  float result;
+  asm volatile("div.full.f32 %0, %1, %2;"
+               : "=f"(result)
+               : "f"(value), "f"(4.0f));
+  return result;
+}
+
+template <int ngpus, int Rank>
+__global__ void __launch_bounds__(512, 1)
+    sm70_qwen38_hc_gate_push_mix(RankData push_buffers,
+                                 const half* __restrict__ local_gate,
+                                 const half* __restrict__ branches,
+                                 half* __restrict__ output,
+                                 int packed_elements) {
+  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
+  using P = typename packed_t<half>::P;
+  constexpr int kPackedStride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[Rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
+  const uint32_t epoch = local_epochs[blockIdx.x];
+  const int epoch_offset = epoch * ngpus * kPackedStride;
+  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (offset < packed_elements) {
+    P value = reinterpret_cast<const P*>(local_gate)[offset];
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value.data[element]);
+    }
+
+  #pragma unroll
+    for (int destination_rank = 0; destination_rank < ngpus;
+         ++destination_rank) {
+      if (destination_rank == Rank) continue;
+      auto* destination_base = const_cast<char*>(
+          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
+      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
+                          (epoch_offset + Rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[ngpus];
+    peer_values[Rank] = value;
+    while (true) {
+      bool has_empty_slot = false;
+  #pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        if (source_rank == Rank) continue;
+        const void* source =
+            local_storage + kSm70Tp4PushAllreduceSignalBytes +
+            (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+  #pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      const int hidden = offset * P::size + element;
+      float result = 0.0f;
+  #pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        const float gate = __half2float(peer_values[source_rank].data[element]);
+        const float branch = __half2float(
+            branches[source_rank * kQwen38HcGateLocalElements + hidden]);
+        result = __fmaf_rn(qwen38_hc_sigmoid_fp32(gate), branch, result);
+      }
+      output[hidden] = __float2half_rn(qwen38_hc_divide_by_count(result));
+    }
+
+    P empty;
+  #pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+  #pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      if (source_rank == Rank) continue;
+      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+                     (epoch_offset + source_rank * kPackedStride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty, source, offset);
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[blockIdx.x] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+  }
+}
+
+}  // namespace vllm
+#endif
+
 /**
  * Performs an out-of-place allreduce and stores result in out.
  *
@@ -411,6 +642,91 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
       throw std::runtime_error(
           "custom allreduce sum2 only supports float32, float16 and bfloat16");
   }
+}
+
+void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,
+                                   torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC all-gather is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  TORCH_CHECK_EQ(fa->world_size_, vllm::kSm70Tp4PushAllreduceWorldSize);
+  TORCH_CHECK(fa->fully_connected_ && fa->sm70_tp4_push_buffers_registered_);
+  TORCH_CHECK_EQ(input.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(output.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(input.numel(), vllm::kQwen38HcDownLocalElements);
+  TORCH_CHECK_EQ(output.numel(), vllm::kQwen38HcDownGatheredElements);
+  TORCH_CHECK(_is_weak_contiguous(input) && _is_weak_contiguous(output));
+  #define VLLM_LAUNCH_QWEN38_HC_DOWN(RANK)                                   \
+    vllm::sm70_qwen38_hc_down_push_allgather<4, RANK><<<1, 32, 0, stream>>>( \
+        fa->sm70_tp4_push_buffers_,                                          \
+        reinterpret_cast<const half*>(input.data_ptr()),                     \
+        reinterpret_cast<half*>(output.data_ptr()))
+  switch (fa->rank_) {
+    case 0:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(0);
+      break;
+    case 1:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(1);
+      break;
+    case 2:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(2);
+      break;
+    default:
+      VLLM_LAUNCH_QWEN38_HC_DOWN(3);
+      break;
+  }
+  #undef VLLM_LAUNCH_QWEN38_HC_DOWN
+#endif
+}
+
+void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
+                             torch::Tensor& branches, torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC gate-mix is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_gate));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  TORCH_CHECK_EQ(fa->world_size_, vllm::kSm70Tp4PushAllreduceWorldSize);
+  TORCH_CHECK(fa->fully_connected_ && fa->sm70_tp4_push_buffers_registered_);
+  TORCH_CHECK_EQ(local_gate.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(branches.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(output.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(local_gate.numel(), vllm::kQwen38HcGateLocalElements);
+  TORCH_CHECK_EQ(branches.numel(), vllm::kQwen38HcGateGatheredElements);
+  TORCH_CHECK_EQ(output.numel(), vllm::kQwen38HcGateLocalElements);
+  TORCH_CHECK(_is_weak_contiguous(local_gate) &&
+              _is_weak_contiguous(branches) && _is_weak_contiguous(output));
+  constexpr int kPackedElements =
+      vllm::kQwen38HcGateLocalElements / vllm::packed_t<half>::P::size;
+  constexpr int kThreads = 32;
+  constexpr int kBlocks = (kPackedElements + kThreads - 1) / kThreads;
+  #define VLLM_LAUNCH_QWEN38_HC_GATE(RANK)                        \
+    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK>                   \
+        <<<kBlocks, kThreads, 0, stream>>>(                       \
+            fa->sm70_tp4_push_buffers_,                           \
+            reinterpret_cast<const half*>(local_gate.data_ptr()), \
+            reinterpret_cast<const half*>(branches.data_ptr()),   \
+            reinterpret_cast<half*>(output.data_ptr()), kPackedElements)
+  switch (fa->rank_) {
+    case 0:
+      VLLM_LAUNCH_QWEN38_HC_GATE(0);
+      break;
+    case 1:
+      VLLM_LAUNCH_QWEN38_HC_GATE(1);
+      break;
+    case 2:
+      VLLM_LAUNCH_QWEN38_HC_GATE(2);
+      break;
+    default:
+      VLLM_LAUNCH_QWEN38_HC_GATE(3);
+      break;
+  }
+  #undef VLLM_LAUNCH_QWEN38_HC_GATE
+#endif
 }
 
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,

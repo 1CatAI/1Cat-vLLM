@@ -3085,6 +3085,23 @@ def all_reduce_sum2(
     _custom_ar_op("all_reduce_sum2")(fa, inp_a, inp_b, out)
 
 
+def sm70_qwen38_hc_down_allgather(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_op("sm70_qwen38_hc_down_allgather")(fa, inp, out)
+
+
+def sm70_qwen38_hc_gate_mix(
+    fa: int,
+    local_gate: torch.Tensor,
+    branches: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_op("sm70_qwen38_hc_gate_mix")(fa, local_gate, branches, out)
+
+
 def top1_argmax(
     fa: int,
     input_pair: torch.Tensor,
