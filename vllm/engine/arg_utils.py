@@ -97,6 +97,7 @@ from vllm.config.vllm import (
     OptimizationLevel,
     PerformanceMode,
     _sm70_mtp_cudagraph_capture_sizes,
+    _sm70_speculative_cudagraph_capture_sizes,
 )
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
@@ -1852,10 +1853,6 @@ class EngineArgs:
             self.speculative_config["use_local_argmax_reduction"] = True
             profile_updates.append("speculative_config.use_local_argmax_reduction=True")
 
-        if self.max_num_seqs is None:
-            self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1
-            profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
-
         if has_native_mtp and self.compilation_config.fast_moe_cold_start is None:
             # Native MTP layers are encoded explicitly by MoERunner and do not
             # consume the target-model forward-context MoE order.
@@ -1885,40 +1882,38 @@ class EngineArgs:
                     num_speculative_tokens, ddtree_budget
                 )
             decode_query_len = num_speculative_state_tokens + 1
-            max_num_seqs = max(int(self.max_num_seqs or 1), 1)
-            if envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
+            if self.max_num_seqs is None:
+                # Scheduler defaults are resolved later in VllmConfig. Leave
+                # graph sizing to that stage instead of turning a graph policy
+                # into a service-capacity limit.
+                profile_updates.append("mtp_cudagraph_shapes=deferred_to_scheduler")
+            elif envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
                 cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
-                    max_num_seqs,
+                    self.max_num_seqs,
                     decode_query_len,
                 )
                 profile_updates.append(
                     f"mtp_split_verifier_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
             else:
-                cudagraph_capture_sizes = (
-                    [1, 2, 4, 8, 9, 18]
-                    if self.tensor_parallel_size >= 4
-                    else [1, 2, 4, 8, 9]
-                )
-                cudagraph_capture_sizes = sorted(
-                    set(cudagraph_capture_sizes)
-                    | {
-                        decode_query_len * num_reqs
-                        for num_reqs in range(1, max_num_seqs + 1)
-                    }
+                cudagraph_capture_sizes = _sm70_speculative_cudagraph_capture_sizes(
+                    self.max_num_seqs,
+                    decode_query_len,
                 )
                 profile_updates.append(
-                    "mtp_verifier_cudagraph_shapes="
-                    f"{decode_query_len}x1..{max_num_seqs}"
+                    f"mtp_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
-            self.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
-            self.compilation_config.max_cudagraph_capture_size = max(
-                cudagraph_capture_sizes
-            )
-            profile_updates.append(
-                "cudagraph_capture_sizes="
-                f"{self.compilation_config.cudagraph_capture_sizes}"
-            )
+            if self.max_num_seqs is not None:
+                self.compilation_config.cudagraph_capture_sizes = (
+                    cudagraph_capture_sizes
+                )
+                self.compilation_config.max_cudagraph_capture_size = max(
+                    cudagraph_capture_sizes
+                )
+                profile_updates.append(
+                    "cudagraph_capture_sizes="
+                    f"{self.compilation_config.cudagraph_capture_sizes}"
+                )
 
         if profile_updates:
             logger.info_once(
