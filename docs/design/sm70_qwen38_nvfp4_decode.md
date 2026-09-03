@@ -919,3 +919,14 @@ Core/QPN layout is also `0.012-0.035 ms/token` slower, consumes about 0.6 GiB
 more packed weights per rank, and does not reproduce the established FP16
 materialization boundary. Both are rejected. The retained HC changes do not
 quantize FP16 tensors or relax any quality gate.
+
+Further exact HC screens close the inexpensive schedule space. Bypassing L1 for
+streaming weights is bitwise but `0.054 ms/token` slower. Changing Triton
+pipeline stages is bitwise and neutral within `0.002 ms/token`; 8/16-row HC-up
+tiles and paired-stream prefetch are bitwise but `0.043-0.097 ms/token` slower.
+Larger down reduction tiles save at most `0.022 ms/token` while changing FP16
+outputs by one ULP, so they are rejected. Fusing the attention output projection
+with HC combine, followed by an exact norm-only kernel, is bitwise for both
+multi-stream and normalized outputs but is `0.013 ms/token` slower over 48
+calls. These paths should not be rescanned without a different kernel
+architecture.
