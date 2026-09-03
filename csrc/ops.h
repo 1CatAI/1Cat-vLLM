@@ -523,10 +523,11 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor expert_ids, bool broadcast_input,
                                int64_t split_k);
 
-void nvfp4_qwen38_w2_direct_reduce_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
-    torch::Tensor scales, torch::Tensor expert_ids,
-    torch::Tensor topk_weights);
+void nvfp4_qwen38_w2_direct_reduce_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids,
+                                       torch::Tensor topk_weights);
 
 void nvfp4_moe_qpn_mtp5_sm70_out(torch::Tensor out, torch::Tensor input,
                                  torch::Tensor weights, torch::Tensor scales,

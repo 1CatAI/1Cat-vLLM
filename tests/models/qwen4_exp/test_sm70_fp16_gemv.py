@@ -116,5 +116,5 @@ def test_qwen38_sm70_hc_up_row4_is_bitwise() -> None:
             BLOCK_K=512,
             num_warps=8,
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert torch.equal(actual, reference)

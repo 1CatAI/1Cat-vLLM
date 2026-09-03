@@ -282,15 +282,14 @@ __global__ void nvfp4_qwen38_w2_direct_reduce_kernel(
 #pragma unroll
     for (int group = 0; group < kGroupsK16; ++group) {
       const size_t tile_group_base =
-          (static_cast<size_t>(tile) * kGroupsK8 + group * 2) * 32 +
-          packed_col;
+          (static_cast<size_t>(tile) * kGroupsK8 + group * 2) * 32 + packed_col;
       const unsigned packed0 = __ldcs(expert_weights + tile_group_base);
       const unsigned packed1 = __ldcs(expert_weights + tile_group_base + 32);
       const size_t scale_index =
           (static_cast<size_t>(group) * kTilesN32 + tile) * 32 + packed_col;
       const half scalar = __ldg(expert_scales + scale_index);
-      const half2 scale = __hmul2(__halves2half2(scalar, scalar),
-                                  __float2half2_rn(16384.0f));
+      const half2 scale =
+          __hmul2(__halves2half2(scalar, scalar), __float2half2_rn(16384.0f));
       half2 decoded[8];
       dequant_e2m1x8(packed0, scale, decoded);
       dequant_e2m1x8(packed1, scale, decoded + 4);
@@ -316,8 +315,7 @@ __global__ void nvfp4_qwen38_w2_direct_reduce_kernel(
 #pragma unroll
         for (int offset = 0; offset < 2; ++offset) {
           const int index = pair * 4 + offset;
-          const int local_col =
-              offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+          const int local_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
           route_outputs[route][quadpair * 8 + local_col] =
               __float2half(accum[index]);
         }
@@ -505,10 +503,11 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void nvfp4_qwen38_w2_direct_reduce_out(
-    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
-    torch::Tensor scales, torch::Tensor expert_ids,
-    torch::Tensor topk_weights) {
+void nvfp4_qwen38_w2_direct_reduce_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids,
+                                       torch::Tensor topk_weights) {
   TORCH_CHECK(out.is_cuda() && input.is_cuda() && weights.is_cuda() &&
                   scales.is_cuda() && expert_ids.is_cuda() &&
                   topk_weights.is_cuda(),
@@ -539,7 +538,7 @@ void nvfp4_qwen38_w2_direct_reduce_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   nvfp4_qwen38_w2_direct_reduce_kernel<<<80, 320, 0,
-                                          at::cuda::getCurrentCUDAStream()>>>(
+                                         at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
       reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
       reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
