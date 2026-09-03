@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import copy
 from collections.abc import Iterable
 from itertools import islice
 
@@ -10,7 +11,8 @@ from torch import nn
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -710,6 +712,70 @@ class Qwen4ExpModel(nn.Module):
         return loaded
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "query_start_loc": 0,
+        "ngram_context": 0,
+        "deepstack_input_embeds": 0,
+    }
+)
+class _Qwen4ExpDecodeGraphModel(nn.Module):
+    """Second compiled view of a Qwen4Exp backbone with shared parameters."""
+
+    def __init__(
+        self,
+        *,
+        target_model: Qwen4ExpModel,
+        vllm_config: VllmConfig,
+    ) -> None:
+        super().__init__()
+        # This is a non-owning view. Registering the target as a child would
+        # duplicate every checkpoint key and runtime-state traversal.
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            query_start_loc,
+            ngram_context,
+            deepstack_input_embeds,
+        )
+
+
+def _make_qwen38_decode_compile_config(vllm_config: VllmConfig) -> VllmConfig:
+    """Build a small-shape compiler config without copying model state."""
+    decode_config = copy.copy(vllm_config)
+    decode_config.scheduler_config = copy.copy(vllm_config.scheduler_config)
+    decode_config.compilation_config = copy.copy(vllm_config.compilation_config)
+
+    compilation_config = decode_config.compilation_config
+    capture_sizes = compilation_config.cudagraph_capture_sizes or [1]
+    max_decode_tokens = max(capture_sizes)
+    decode_config.scheduler_config.max_num_batched_tokens = max_decode_tokens
+    compilation_config.compile_ranges_endpoints = [max_decode_tokens]
+    compilation_config.compile_sizes = []
+    compilation_config.cache_dir = ""
+    compilation_config.local_cache_dir = ""
+    compilation_config.traced_files = set()
+    return decode_config
+
+
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
@@ -767,6 +833,26 @@ class Qwen4ExpForCausalLM(
         enable_qwen38_sm70_fp16_fused_hc(
             self, self.model_config.dtype, self.vllm_config
         )
+        object.__setattr__(self, "_sm70_decode_graph_model", None)
+
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        """Create the shared-weight decode compiler just before graph capture."""
+        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+            return False
+        if self._sm70_decode_graph_model is None:
+            decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
+            with set_current_vllm_config(decode_config):
+                decode_model = _Qwen4ExpDecodeGraphModel(
+                    target_model=self.model,
+                    vllm_config=decode_config,
+                )
+            object.__setattr__(self, "_sm70_decode_graph_model", decode_model)
+            logger.info_once(
+                "Prepared shared-weight SM70 Qwen3.8 decode compiler for token "
+                "range [1, %d]; large prefill keeps its independent graph.",
+                decode_config.scheduler_config.max_num_batched_tokens,
+            )
+        return True
 
     @staticmethod
     def get_model_state_cls():
@@ -784,7 +870,15 @@ class Qwen4ExpForCausalLM(
     ) -> torch.Tensor | IntermediateTensors:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
-        return self.model(
+        backbone = self.model
+        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+            decode_backbone = self._sm70_decode_graph_model
+            if decode_backbone is None:
+                raise RuntimeError(
+                    "SM70 Qwen3.8 decode graph compiler was not prepared"
+                )
+            backbone = decode_backbone
+        return backbone(
             input_ids,
             positions,
             intermediate_tensors,
@@ -1105,6 +1199,10 @@ class Qwen4ExpForConditionalGeneration(
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
 
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        """Forward decode compiler setup to the wrapped language model."""
+        return self.language_model.prepare_sm70_decode_graph_model()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1122,7 +1220,7 @@ class Qwen4ExpForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
-        hidden_states = self.language_model.model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,

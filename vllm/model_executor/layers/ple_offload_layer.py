@@ -28,6 +28,7 @@ from cuda.bindings.driver import CUstreamWaitValue_flags
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # Module-level flag set to True inside the offload subprocess.
@@ -198,7 +199,11 @@ class PleOffloadLayer(nn.Module, ABC):
         def guarded_init(
             self: "PleOffloadLayer", *args: object, **kwargs: object
         ) -> None:
-            if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            if (
+                envs.VLLM_PLE_CPU_OFFLOAD
+                and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                and not is_offload_process()
+            ):
                 nn.Module.__init__(self)
                 return
             original_init(self, *args, **kwargs)
@@ -208,7 +213,9 @@ class PleOffloadLayer(nn.Module, ABC):
     @classmethod
     def get_target_device(cls) -> torch.device:
         """Return CPU for the offload process and the active GPU otherwise."""
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if envs.VLLM_PLE_CPU_OFFLOAD and not (
+            envs.VLLM_SM70_QWEN38_HYBRID_PLE and not is_offload_process()
+        ):
             return torch.device("cpu")
         return torch.device("cuda", torch.accelerator.current_device_index())
 
@@ -246,6 +253,11 @@ class PleOffloadLayer(nn.Module, ABC):
     ) -> torch.Tensor:
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
+            if (
+                envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                and use_sm70_decode_graph_semantics()
+            ):
+                return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
             torch.ops.vllm.ple_offload_wait(
                 self._sem.flag_tensor,
                 self._gpu_output_buffer,

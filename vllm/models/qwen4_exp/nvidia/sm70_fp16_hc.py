@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -193,7 +194,7 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
     x: torch.Tensor,
     enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not enabled:
+    if not enabled or not use_sm70_decode_graph_semantics():
         return None
     down_weight = getattr(down_layer, "weight", None)
     up_weight = getattr(up_layer, "weight", None)

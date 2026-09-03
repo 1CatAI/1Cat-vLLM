@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
+    VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
@@ -560,6 +561,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
+    VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
     VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
@@ -3341,6 +3343,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )
         .strip()
         .lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Exact Qwen3.8 TP4 lane: trace the large dynamic prefill backbone and the
+    # small FULL decode backbone independently while sharing parameters/KV.
+    # Config auto-enables this only for the admitted no-MTP model contract.
+    "VLLM_SM70_QWEN38_DUAL_COMPILE": lambda: bool(
+        os.getenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
+    # uses the asynchronous CPU/disk-mmap offload result.
+    "VLLM_SM70_QWEN38_HYBRID_PLE": lambda: bool(
+        os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile

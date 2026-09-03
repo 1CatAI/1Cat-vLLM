@@ -44895,3 +44895,101 @@ Interpretation:
   arithmetic path: it makes default capacity select the same previously
   quality-audited, checkpoint-code-preserving B1 operator path. Test services
   were stopped after collection and all four V100s returned to idle memory.
+
+## 2026-09-03 Qwen3.8 unified prefill/decode compilation
+
+- The matched TP4/no-MTP evidence separated the regression from PLE residency.
+  The current source with the prefill graph policy measured `7026 tok/s` on the
+  repeated 8192-token prompt, while the combined decode graph service measured
+  about `5480 tok/s` after PLE major faults fell to two and PLE CPU time was
+  about 70 ms. The remaining roughly 330 ms was therefore inside the GPU graph.
+- The combined service compiled one dynamic backbone range `(1, 8193)`. Its FX
+  graph contained the M=1 FP16 GEMV, fused HC, fused GDN input, sum2 all-reduce,
+  graph-safe GDN slicing, and native Gemma RMS paths even for M=8192. The 7k
+  graph instead retained ordinary prefill linear/HC/GDN/RMS operations. This is
+  a phase-specialization bug, not evidence that two services or two weight
+  copies are required.
+- The candidate keeps one engine, one parameter set, and one KV/state cache. It
+  traces the existing dynamic prefill backbone first, then creates a non-owning
+  shared-parameter compiler limited to the FULL decode capture range. A capture
+  context selects decode-only graph semantics only while tracing FULL graphs;
+  normal prefill and PIECEWISE capture retain the established prefill graph.
+- Admission is limited to the exact Qwen4Exp 48-layer, H2560, E512/K10, HC4,
+  QSA TP4, FP16, PP1, no-MTP contract with at least one Qwen3.8 decode operator
+  enabled. `VLLM_SM70_QWEN38_DUAL_COMPILE=0` is the explicit rollback.
+- CPU-only gates pass: the phase context produces independent Dynamo branches,
+  the shared-weight proxy compiles without registering or copying target
+  parameters, focused config/route tests report `20 passed`, Ruff passes, and
+  GPUs 4-7 remain at zero allocated MiB. Real-model quality/performance evidence
+  is pending one combined candidate startup; no result is claimed yet.
+- The first routed real-model capture proved that the large backbone remains an
+  independent `(1, 8193)` graph (44.73 s compile), then stopped before any
+  request because the late-created decode wrapper was outside vLLM's model-load
+  config context. Commit `d6d72cd30b` scopes its construction with the derived
+  decode config; a focused lifecycle probe confirms that the wrapper observes
+  that config and limits its token range to `[1, 2]`. This failed capture is not
+  a performance or quality result and systemd was stopped before retry.
+- The corrected combined candidate produced two cache families on every rank:
+  `(1, 8193)` contains no Qwen3.8 M=1 GEMV/fused-HC/fused-GDN operators, while
+  `(1, 2)` contains the decode-only operators and captured successfully. Its
+  no-MTP steady decode is `85.80 tok/s`, but matched warm 8192-token prefill is
+  only `5525-5532 tok/s`, so this candidate is not the final 7k service.
+- AST call-count comparison against the accepted 7k graph leaves one material
+  runtime difference: the accepted graph calls CPU PLE gather plus FP8 byte
+  dequantization, whereas the combined candidate calls random UVA reads from
+  the pinned shard. Even the exact natural calibration hash regressed from
+  `6986` to `5522 tok/s`. The next candidate therefore preserves direct UVA for
+  decode, but deduplicates large-prefill row IDs on CPU, gathers from the same
+  pinned TP shard into a 20-MiB staging buffer, and performs one contiguous H2D
+  transfer before the existing byte-exact dequantization kernel. A 131072-row
+  CPU microbenchmark with 32703 unique local rows settles at `28.7-28.9 ms`;
+  the current random UVA path accounts for roughly 0.3 s at this shape.
+- The synchronous local staging candidate disproved the final sentence above:
+  matched warm prefill was only `5355-5399 tok/s`, while decode remained
+  `85.72 tok/s`. Its measured gather was `60-76 ms`; it could not reproduce
+  the accepted offload graph because GPU N-gram calculation and CPU gathering
+  still began at the PLE layer instead of being submitted before model forward.
+  That candidate was stopped and the local-staging code was removed.
+- The replacement hybrid uses the already validated offload connector for
+  prefill and the already validated rank-local pinned shard for decode. Both
+  storage views coexist in one model process topology: file-backed mmap pages
+  are loaded only by the asynchronous CPU worker, while each TP rank retains
+  its checkpoint-native pinned shard. The compile-phase context makes the large
+  graph wait for the async result and the small graph call local UVA; V2 FULL
+  replay suppresses unnecessary CPU requests. This route still needs one
+  combined real-model quality/performance gate before acceptance.
+- The first hybrid startup was killed by `systemd-oomd` after reaching
+  `108.7 GiB` unit memory: the existing executor spawned the mmap worker before
+  loading four local pinned shards, so both checkpoint scans overlapped. The
+  failure occurred before compile or requests and all GPUs were released. In
+  hybrid mode only, executor startup now loads the main model first and spawns
+  the file-backed worker afterward; non-hybrid offload ordering is unchanged.
+- Delaying process creation exposed that model loading attaches local weight
+  loader closures to the live configuration object graph, which `spawn` cannot
+  pickle. Hybrid startup now snapshots the small clean offload configuration
+  before model loading and consumes that snapshot after loading; the failed
+  attempt ended before mmap loading or compilation and produced no benchmark.
+- The corrected hybrid service started with zero systemd restarts. The large
+  graph contains `ple_offload_wait` and no Qwen3.8 M=1 operators; the small
+  graph contains the rank-local pinned PLE gather and decode-only FP16 GEMV,
+  fused HC, and fused GDN operators. No engine, weights, KV cache, or state
+  cache is duplicated.
+- An initial combined run measured only `5433` and `5495 tok/s` on the exact
+  8192-token hash `8aab945ad780...`, despite PLE mmap gather falling to
+  `31.3 ms`. The graph was structurally equivalent to the accepted disk graph;
+  the remaining regression was the launcher's explicit
+  `VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0`. Restoring the default original
+  FlashQLA-SM70 TileLang GDN prefill route recovered `6878` and `6984 tok/s`
+  warm, within `0.6%` of the historical `7026 tok/s` result.
+- The same final no-MTP TP4 service measured `513 / 5.9602 = 86.07 tok/s`
+  pure decode. A full-context request accepted `262143` prompt tokens plus one
+  generated token and reported `51.8063 s` prefill, or `5060 tok/s`; prefix
+  caching remained disabled. Deterministic quality probes returned `5017` for
+  `173 * 29`, `1517` for `41 * 37`, and an accurate Chinese two-sentence lunar
+  phase explanation. Thinking is enabled and exposed through
+  `message.reasoning` by the selected Qwen3 parser.
+- The final API advertises maximum model length `262144`, remains served by
+  1cattunnel, and its authenticated public `/v1/models` probe returned HTTP
+  200. The service retained the 47.684-GiB file-backed PLE mapping with about
+  1.3 GiB worker RSS; startup's cgroup peak includes reclaimable/shared file
+  mappings and did not trigger `systemd-oomd` after sequencing was repaired.

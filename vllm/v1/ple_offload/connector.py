@@ -15,6 +15,7 @@ import torch.nn as nn
 import zmq
 from cuda.bindings import driver as cuda_driver
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
@@ -432,10 +433,13 @@ class PleOffloadConnector:
         num_reqs: int,
         num_tokens: int,
         dummy_run: bool,
+        use_local_model: bool = False,
     ) -> None:
         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
+            return
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_local_model:
             return
         self._launch(num_reqs, num_tokens)
 

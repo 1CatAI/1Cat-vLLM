@@ -612,8 +612,13 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if (
+            envs.VLLM_PLE_CPU_OFFLOAD
+            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        ):
             self.worker.spawn_ple_offload()
+        elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+            self.worker.prepare_ple_offload_spawn()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -622,6 +627,11 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+            # Hybrid mode retains a large pinned shard in every TP worker.
+            # Load those shards before the file-backed PLE worker scans the
+            # checkpoint so startup does not create avoidable memory pressure.
+            self.worker.spawn_ple_offload()
         if envs.VLLM_PLE_CPU_OFFLOAD:
             self.worker.wait_ple_offload_ready()
 

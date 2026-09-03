@@ -889,6 +889,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
+        prepare_decode_graph_model = getattr(
+            self.model, "prepare_sm70_decode_graph_model", None
+        )
+        if prepare_decode_graph_model is not None:
+            prepare_decode_graph_model()
         with self.maybe_setup_dummy_loras(self.lora_config):
             captured_attn_states = self.cudagraph_manager.capture(
                 self.model,
@@ -1477,6 +1482,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run,
+                use_local_model=batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.

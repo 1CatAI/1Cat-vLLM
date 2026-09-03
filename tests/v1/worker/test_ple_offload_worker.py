@@ -610,6 +610,7 @@ def test_only_dp0_tp0_spawns_shared_ple_offload_worker(
     worker = Worker.__new__(Worker)
     worker._ple_offload_enabled = True
     worker._ple_offload_worker_handle = None
+    worker._ple_offload_spawn_config = None
     worker.rank = 0
     worker.local_rank = 0
     worker.vllm_config = SimpleNamespace()
@@ -643,6 +644,39 @@ def test_only_dp0_tp0_spawns_shared_ple_offload_worker(
             )
         ]
         assert worker._ple_offload_worker_handle is handle
+
+
+def test_delayed_ple_spawn_uses_pre_load_config_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    worker = Worker.__new__(Worker)
+    worker._ple_offload_enabled = True
+    worker._ple_offload_worker_handle = None
+    worker._ple_offload_spawn_config = None
+    worker.rank = 0
+    worker.local_rank = 0
+    worker.vllm_config = SimpleNamespace(markers=[])
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_rank=0,
+        data_parallel_size=1,
+        tensor_parallel_size=4,
+        _ple_offload_ipc_path="ipc:///tmp/test-ple-offload",
+    )
+
+    monkeypatch.setattr(
+        ple_offload_worker.PleOffloadWorker,
+        "make_process",
+        lambda *args: calls.append(args) or object(),
+    )
+
+    worker.prepare_ple_offload_spawn()
+    worker.vllm_config.markers.append("model-load-mutation")
+    worker.spawn_ple_offload()
+
+    assert calls[0][0].markers == []
+    assert calls[0][0] is not worker.vllm_config
+    assert worker._ple_offload_spawn_config is None
 
 
 def test_offload_distributed_sets_config_only_for_model_parallel(
