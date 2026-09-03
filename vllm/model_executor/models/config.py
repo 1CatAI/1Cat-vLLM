@@ -607,13 +607,7 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
 
         model_config = vllm_config.model_config
         multimodal_config = model_config.multimodal_config
-        if multimodal_config is not None:
-            if not multimodal_config.language_model_only:
-                raise NotImplementedError(
-                    "Qwen4Exp multimodal inference is not enabled in the initial "
-                    "SM70 route; pass --language-model-only while the vision "
-                    "tower remains outside the TP4 memory and quality gates"
-                )
+        if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(model_config)
 
         spec_config = vllm_config.speculative_config
