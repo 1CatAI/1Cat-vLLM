@@ -498,6 +498,7 @@ _flash_attn_decode_paged_xqa = None
 _flash_attn_decode_paged_wmma = None
 _flash_attn_grouped_verify_paged = None
 _flash_attn_grouped_verify_max_query_tokens = 8
+_flash_attn_grouped_verify_request_major_abi_version = 0
 _flash_attn_grouped_verify_checked = False
 _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
@@ -1264,6 +1265,7 @@ def _get_flash_grouped_verify_op():
     """Load the optional exact SM70 DFlash2 grouped verifier."""
     global _flash_attn_grouped_verify_paged
     global _flash_attn_grouped_verify_max_query_tokens
+    global _flash_attn_grouped_verify_request_major_abi_version
     global _flash_attn_grouped_verify_checked
     if _flash_attn_grouped_verify_checked:
         return _flash_attn_grouped_verify_paged
@@ -1283,6 +1285,16 @@ def _get_flash_grouped_verify_op():
             )
         except (ImportError, RuntimeError, TypeError, ValueError):
             _flash_attn_grouped_verify_max_query_tokens = 8
+        try:
+            from flash_attn_v100 import (
+                flash_attn_grouped_verify_request_major_abi_version,
+            )
+
+            _flash_attn_grouped_verify_request_major_abi_version = int(
+                flash_attn_grouped_verify_request_major_abi_version()
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            _flash_attn_grouped_verify_request_major_abi_version = 0
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return _flash_attn_grouped_verify_paged
@@ -4366,6 +4378,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.dflash2_grouped_verify_max_query_tokens = (
             _flash_attn_grouped_verify_max_query_tokens
         )
+        self.dflash2_grouped_verify_request_major_abi_version = (
+            _flash_attn_grouped_verify_request_major_abi_version
+        )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -4488,6 +4503,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_grouped_verify_paged is not None
             and envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY
             and current_platform.is_device_capability(70)
+        )
+        self.use_dflash2_batched_grouped_verify = (
+            self.use_dflash2_grouped_verify
+            and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY
         )
         self.dflash2_grouped_verify_min_model_len = (
             envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
@@ -5196,16 +5215,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_smallq_grouped_verify_gate
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
+        num_reqs = int(
+            getattr(
+                attn_metadata,
+                "num_reqs",
+                0 if block_table is None else block_table.shape[0],
+            )
+        )
+        max_query_len = int(
+            getattr(
+                attn_metadata,
+                "max_query_len",
+                num_query_tokens if num_reqs == 1 else 0,
+            )
+        )
+        single_request_shape = bool(
+            num_reqs == 1
+            and num_query_tokens in (8, 16)
+            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+        )
+        batched_request_shape = bool(
+            self.use_dflash2_batched_grouped_verify
+            and self.dflash2_grouped_verify_request_major_abi_version >= 1
+            and num_reqs in (2, 4, 8)
+            and max_query_len == 8
+            and num_query_tokens == num_reqs * 8
+        )
         allowed = bool(
             self.use_dflash2_grouped_verify
+            and (single_request_shape or batched_request_shape)
             and self.flash_attn_grouped_verify_paged is not None
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and num_query_tokens in (8, 16)
-            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
             and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
@@ -5226,13 +5270,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.kv_cache_dtype == "fp8_e5m2"
             and block_table is not None
             and block_table.ndim == 2
-            and block_table.shape[0] == 1
+            and block_table.shape[0] == num_reqs
             and block_table.device == query.device
             and block_table.dtype == torch.int32
             and block_table.is_contiguous()
             and seq_lens is not None
             and seq_lens.ndim == 1
-            and seq_lens.shape[0] == 1
+            and seq_lens.shape[0] == num_reqs
             and seq_lens.device == query.device
             and seq_lens.dtype == torch.int32
             and seq_lens.is_contiguous()
@@ -5245,7 +5289,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 grouped verifier gate rejected: "
                 "op=%s marker=%s max_model_len=%s min_model_len=%s "
-                "causal=%s window=%s actual=%d native_max_q=%d q=%s/%s "
+                "causal=%s window=%s reqs=%d max_q=%d actual=%d "
+                "native_max_q=%d q=%s/%s "
                 "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
                 "seq_lens=%s/%s.",
                 self.flash_attn_grouped_verify_paged is not None,
@@ -5254,6 +5299,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 self.dflash2_grouped_verify_min_model_len,
                 getattr(attn_metadata, "causal", True),
                 self._flash_v100_window_size(causal=True),
+                num_reqs,
+                max_query_len,
                 num_query_tokens,
                 self.dflash2_grouped_verify_max_query_tokens,
                 tuple(query.shape),
@@ -5282,19 +5329,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         out: torch.Tensor,
     ) -> None:
         global _logged_prefill_smallq_grouped_verify
+        num_reqs = int(attn_metadata.block_table.shape[0])
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
-                query.shape[0],
+                "(request-major B%d/q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                num_reqs,
+                query.shape[0] // num_reqs,
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(
             query,
             key_cache,
             value_cache,
-            attn_metadata.block_table[:1],
-            attn_metadata.seq_lens[:1],
+            attn_metadata.block_table[:num_reqs],
+            attn_metadata.seq_lens[:num_reqs],
             softmax_scale=self.scale,
             out=out,
             kv_cache_dtype=self.kv_cache_dtype,

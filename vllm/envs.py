@@ -415,6 +415,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
+    VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
@@ -2774,6 +2775,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))
+    ),
+    # Keep batched admission independent until the request-major kernel has
+    # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
+    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")
