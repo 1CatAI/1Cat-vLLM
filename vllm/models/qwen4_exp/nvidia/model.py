@@ -1198,6 +1198,10 @@ class Qwen4ExpForConditionalGeneration(
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
 
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        """Forward decode compiler setup to the wrapped language model."""
+        return self.language_model.prepare_sm70_decode_graph_model()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1215,7 +1219,7 @@ class Qwen4ExpForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
-        hidden_states = self.language_model.model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
