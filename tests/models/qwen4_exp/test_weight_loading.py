@@ -405,3 +405,41 @@ def test_qsa_e4m3_skips_scale_gate_in_ple_offload_process(
     assert not attention._qsa_kv_scales_finalized
     assert attention.k_scale.item() == -1.0
     assert attention.v_scale.item() == -1.0
+
+
+def test_loader_skips_final_mixer_on_non_last_pp_rank(monkeypatch) -> None:
+    """The final hyper-connection mixer exists only on the last PP rank;
+    other ranks must skip its checkpoint tensors instead of failing."""
+    captured: dict[str, list[str]] = {}
+
+    class _CaptureLoader:
+        def __init__(self, module, *, skip_substrs=None, ignore_unexpected_suffixes=None):
+            captured["skip"] = list(skip_substrs or [])
+
+        def load_weights(self, weights, mapper=None):
+            list(weights)
+            return set()
+
+    monkeypatch.setattr(qwen4_exp_model, "AutoWeightsLoader", _CaptureLoader)
+    self_stub = SimpleNamespace(
+        _qsa_layer_ids=frozenset(),
+        config=SimpleNamespace(num_experts=0),
+        hf_to_vllm_mapper=None,
+    )
+
+    monkeypatch.setattr(
+        qwen4_exp_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=False),
+    )
+    Qwen4ExpModel.load_weights(self_stub, iter([]))
+    assert "hyper_connection_mixer." in captured["skip"]
+
+    monkeypatch.setattr(
+        qwen4_exp_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    Qwen4ExpModel.load_weights(self_stub, iter([]))
+    assert "hyper_connection_mixer." not in captured["skip"]
+    assert "hyper_connection_mixer.block_inject_weight" in captured["skip"]
