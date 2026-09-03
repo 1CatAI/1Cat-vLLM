@@ -1900,7 +1900,7 @@ def qsa_sparse_paged_attention(
     block_n, target_splits, partial_warps = _qsa_sparse_launch_profile(
         base_programs,
         block_m,
-        current_platform.is_device_capability(70),
+        not current_platform.has_device_capability(80),
     )
 
     if (
@@ -2001,7 +2001,7 @@ def qsa_sparse_paged_attention(
 def _qsa_sparse_launch_profile(
     base_programs: int,
     block_m: int,
-    is_sm70: bool,
+    is_pre_ampere: bool,
 ) -> tuple[int, int, int]:
     """Return BLOCK_N, target splits, and warps for sparse QSA."""
     small_profile_limit = 8 if block_m <= 8 else 4
@@ -2018,14 +2018,16 @@ def _qsa_sparse_launch_profile(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
-    if is_sm70 and block_n == 64:
-        # Two warps serialize the D=256 tensor-core work on V100. Four warps
-        # restore warp-level parallelism for split and non-split prefill.
+    if is_pre_ampere and block_n == 64:
+        # Pre-Ampere: the 64-column tile at D=256 does not fit Turing's
+        # 64 KiB shared-memory limit (Triton OutOfResources -- the kernel
+        # cannot launch on SM75 at all), and two warps serialize the D=256
+        # tensor-core work on V100. A 16-column tile with four warps
+        # launches on both and measured 1.16-2.6x faster than the best
+        # previously runnable profile across the 64..2048-row prefill
+        # regimes (V100-PCIE-32GB and Quadro RTX 8000, see #441).
         partial_warps = 4
-        if base_programs >= 512:
-            # A 32-column tile improves the exact 512-row and 8192-row Qwen4Exp
-            # prefill shapes without changing small-batch or non-SM70 routes.
-            block_n = 32
+        block_n = 16
     return block_n, target_splits, partial_warps
 
 

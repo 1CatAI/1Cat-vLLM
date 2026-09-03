@@ -9,23 +9,24 @@ pytestmark = pytest.mark.skip_global_cleanup
 
 
 @pytest.mark.parametrize(
-    ("block_m", "base_programs", "is_sm70", "expected"),
+    ("block_m", "base_programs", "is_pre_ampere", "expected"),
     [
-        pytest.param(8, 8, True, (16, 64, 4), id="sm70_small_block_m8"),
-        pytest.param(16, 4, True, (16, 64, 4), id="sm70_small_block_m16"),
-        pytest.param(16, 5, True, (16, 32, 4), id="sm70_narrow"),
-        pytest.param(8, 256, True, (64, 8, 4), id="sm70_split8"),
-        pytest.param(8, 512, True, (32, 4, 4), id="sm70_split4"),
-        pytest.param(8, 513, False, (64, 1, 2), id="non_sm70_split1"),
-        pytest.param(8, 513, True, (32, 1, 4), id="sm70_split1"),
+        pytest.param(8, 8, True, (16, 64, 4), id="pre_ampere_small_block_m8"),
+        pytest.param(16, 4, True, (16, 64, 4), id="pre_ampere_small_block_m16"),
+        pytest.param(16, 5, True, (16, 32, 4), id="pre_ampere_narrow"),
+        pytest.param(8, 256, True, (16, 8, 4), id="pre_ampere_split8"),
+        pytest.param(8, 512, True, (16, 4, 4), id="pre_ampere_split4"),
+        pytest.param(8, 513, False, (64, 1, 2), id="ampere_split1"),
+        pytest.param(8, 513, True, (16, 1, 4), id="pre_ampere_split1"),
     ],
 )
 def test_qsa_sparse_launch_profile(
     block_m: int,
     base_programs: int,
-    is_sm70: bool,
+    is_pre_ampere: bool,
     expected: tuple[int, int, int],
 ) -> None:
     assert (
-        qsa_ops._qsa_sparse_launch_profile(base_programs, block_m, is_sm70) == expected
+        qsa_ops._qsa_sparse_launch_profile(base_programs, block_m, is_pre_ampere)
+        == expected
     )
