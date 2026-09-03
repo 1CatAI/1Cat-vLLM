@@ -585,6 +585,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_active_dense_stage_sm70_out);
 
   ops.def(
+      "awq_moe_chunked_w2_sm70_out("
+      "Tensor(a!) out, Tensor(b!) chunk_output, Tensor input, "
+      "Tensor expert_offsets, Tensor permuted_idx, Tensor topk_weights, "
+      "Tensor(c!) chunk_expert_offsets, Tensor(d!) chunk_range_begin, "
+      "Tensor(e!) chunk_range_end, Tensor(f!) chunk_a_indices, "
+      "Tensor(g!) chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_tokens, int top_k, int num_experts, int k, int n, "
+      "int hidden_logical_size, int group_size, int chunk_tokens) -> ()");
+  ops.impl("awq_moe_chunked_w2_sm70_out", torch::kCUDA,
+           &awq_moe_chunked_w2_sm70_out);
+
+  ops.def(
       "awq_moe_single_token_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "

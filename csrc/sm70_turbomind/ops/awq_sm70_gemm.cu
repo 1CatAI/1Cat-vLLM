@@ -7780,6 +7780,263 @@ void awq_moe_active_dense_stage_sm70_out(
   }
 }
 
+namespace {
+
+__device__ __forceinline__ int awq_moe_lower_bound_source_row(
+    const int* __restrict__ permuted_idx, int begin, int end, int target) {
+  while (begin < end) {
+    const int middle = begin + (end - begin) / 2;
+    if (permuted_idx[middle] < target) {
+      begin = middle + 1;
+    } else {
+      end = middle;
+    }
+  }
+  return begin;
+}
+
+__global__ void awq_moe_chunk_ranges_kernel(
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ permuted_idx,
+    int* __restrict__ chunk_expert_offsets, int* __restrict__ chunk_range_begin,
+    int* __restrict__ chunk_range_end, int num_experts, int source_begin,
+    int source_end) {
+  const int expert = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (expert >= num_experts) {
+    return;
+  }
+
+  const int expert_begin = expert_offsets[expert];
+  const int expert_end = expert_offsets[expert + 1];
+  const int range_begin = awq_moe_lower_bound_source_row(
+      permuted_idx, expert_begin, expert_end, source_begin);
+  const int range_end = awq_moe_lower_bound_source_row(
+      permuted_idx, range_begin, expert_end, source_end);
+  chunk_range_begin[expert] = range_begin;
+  chunk_range_end[expert] = range_end;
+  chunk_expert_offsets[expert + 1] = range_end - range_begin;
+}
+
+__global__ void awq_moe_prefix_chunk_offsets_kernel(
+    int* __restrict__ chunk_expert_offsets, int num_experts) {
+  int prefix = 0;
+  chunk_expert_offsets[0] = 0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    prefix += chunk_expert_offsets[expert + 1];
+    chunk_expert_offsets[expert + 1] = prefix;
+  }
+}
+
+__global__ void awq_moe_fill_chunk_indices_kernel(
+    const int* __restrict__ permuted_idx,
+    const int* __restrict__ chunk_expert_offsets,
+    const int* __restrict__ chunk_range_begin,
+    const int* __restrict__ chunk_range_end, int* __restrict__ chunk_a_indices,
+    int* __restrict__ chunk_inv_permuted_idx, int source_begin) {
+  const int expert = static_cast<int>(blockIdx.x);
+  const int range_begin = chunk_range_begin[expert];
+  const int range_end = chunk_range_end[expert];
+  const int chunk_begin = chunk_expert_offsets[expert];
+  for (int global_row = range_begin + threadIdx.x; global_row < range_end;
+       global_row += blockDim.x) {
+    const int chunk_row = chunk_begin + global_row - range_begin;
+    const int local_source_row = permuted_idx[global_row] - source_begin;
+    chunk_a_indices[chunk_row] = global_row;
+    chunk_inv_permuted_idx[local_source_row] = chunk_row;
+  }
+}
+
+__global__ void awq_moe_chunk_weighted_reduce_kernel(
+    __half* __restrict__ out, const __half* __restrict__ chunk_output,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ chunk_inv_permuted_idx, int output_token_begin,
+    int chunk_tokens, int top_k, int hidden_logical_size, int out_stride,
+    int chunk_output_stride) {
+  const int local_token = static_cast<int>(blockIdx.x);
+  if (local_token >= chunk_tokens) {
+    return;
+  }
+  const int output_token = output_token_begin + local_token;
+  for (int col = threadIdx.x; col < hidden_logical_size; col += blockDim.x) {
+    float reduced = 0.0f;
+    for (int route = 0; route < top_k; ++route) {
+      const int source_row = local_token * top_k + route;
+      const int chunk_row = chunk_inv_permuted_idx[source_row];
+      const float value = __half2float(
+          chunk_output[static_cast<int64_t>(chunk_row) * chunk_output_stride +
+                       col]);
+      const float weight = topk_weights[output_token * top_k + route];
+      reduced = fmaf(weight, value, reduced);
+    }
+    out[static_cast<int64_t>(output_token) * out_stride + col] =
+        __float2half_rn(reduced);
+  }
+}
+
+}  // namespace
+
+void awq_moe_chunked_w2_sm70_out(
+    torch::Tensor out, torch::Tensor chunk_output, torch::Tensor input,
+    torch::Tensor expert_offsets, torch::Tensor permuted_idx,
+    torch::Tensor topk_weights, torch::Tensor chunk_expert_offsets,
+    torch::Tensor chunk_range_begin, torch::Tensor chunk_range_end,
+    torch::Tensor chunk_a_indices, torch::Tensor chunk_inv_permuted_idx,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_tokens,
+    int64_t top_k, int64_t num_experts, int64_t k, int64_t n,
+    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens) {
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
+                  out.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: out must be contiguous CUDA "
+              "float16.");
+  TORCH_CHECK(chunk_output.is_cuda() &&
+                  chunk_output.scalar_type() == torch::kFloat16 &&
+                  chunk_output.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: chunk output must be "
+              "contiguous CUDA float16.");
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                  input.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: input must be contiguous "
+              "CUDA float16.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous() && permuted_idx.is_cuda() &&
+                  permuted_idx.scalar_type() == torch::kInt32 &&
+                  permuted_idx.is_contiguous() && topk_weights.is_cuda() &&
+                  topk_weights.scalar_type() == torch::kFloat32 &&
+                  topk_weights.is_contiguous(),
+              "awq_moe_chunked_w2_sm70_out: route metadata dtype/device "
+              "mismatch.");
+  TORCH_CHECK(
+      chunk_expert_offsets.is_cuda() &&
+          chunk_expert_offsets.scalar_type() == torch::kInt32 &&
+          chunk_expert_offsets.is_contiguous() && chunk_range_begin.is_cuda() &&
+          chunk_range_begin.scalar_type() == torch::kInt32 &&
+          chunk_range_begin.is_contiguous() && chunk_range_end.is_cuda() &&
+          chunk_range_end.scalar_type() == torch::kInt32 &&
+          chunk_range_end.is_contiguous() && chunk_a_indices.is_cuda() &&
+          chunk_a_indices.scalar_type() == torch::kInt32 &&
+          chunk_a_indices.is_contiguous() && chunk_inv_permuted_idx.is_cuda() &&
+          chunk_inv_permuted_idx.scalar_type() == torch::kInt32 &&
+          chunk_inv_permuted_idx.is_contiguous(),
+      "awq_moe_chunked_w2_sm70_out: chunk scratch must be "
+      "contiguous CUDA int32.");
+  TORCH_CHECK(ptrs_w.is_cuda() && ptrs_s.is_cuda(),
+              "awq_moe_chunked_w2_sm70_out: weight metadata must be CUDA.");
+  TORCH_CHECK(num_tokens >= 8192 && top_k > 0 && num_experts > 0 && k > 0 &&
+                  n > 0 && group_size > 0 &&
+                  (chunk_tokens == 4096 || chunk_tokens == 6144) &&
+                  chunk_tokens < num_tokens && hidden_logical_size > 0 &&
+                  hidden_logical_size <= n,
+              "awq_moe_chunked_w2_sm70_out: invalid dimensions.");
+  constexpr int64_t kIntMax = std::numeric_limits<int>::max();
+  TORCH_CHECK(num_tokens <= kIntMax / top_k && num_experts <= kIntMax &&
+                  k <= kIntMax && n <= kIntMax &&
+                  hidden_logical_size <= kIntMax && group_size <= kIntMax &&
+                  chunk_tokens <= kIntMax,
+              "awq_moe_chunked_w2_sm70_out: dimensions exceed int32.");
+  const int64_t total_slots = num_tokens * top_k;
+  const int64_t max_chunk_slots = std::min(num_tokens, chunk_tokens) * top_k;
+  constexpr int64_t kMinIndexedChunkTokens = 2048;
+  const int64_t tail_tokens = num_tokens % chunk_tokens;
+  TORCH_CHECK(
+      tail_tokens == 0 || tail_tokens >= kMinIndexedChunkTokens,
+      "awq_moe_chunked_w2_sm70_out: a non-empty tail chunk must contain at "
+      "least 2048 tokens.");
+  TORCH_CHECK(
+      out.dim() == 2 && out.size(0) == num_tokens &&
+          out.size(1) == hidden_logical_size && input.dim() == 2 &&
+          input.size(0) == total_slots && input.size(1) == k &&
+          expert_offsets.dim() == 1 &&
+          expert_offsets.numel() == num_experts + 1 &&
+          permuted_idx.dim() == 1 && permuted_idx.numel() == total_slots &&
+          topk_weights.dim() == 2 && topk_weights.size(0) == num_tokens &&
+          topk_weights.size(1) == top_k,
+      "awq_moe_chunked_w2_sm70_out: input/metadata shape "
+      "mismatch.");
+  TORCH_CHECK(
+      chunk_output.dim() == 2 && chunk_output.size(0) >= max_chunk_slots &&
+          chunk_output.size(1) == n && chunk_expert_offsets.dim() == 1 &&
+          chunk_expert_offsets.numel() >= num_experts + 1 &&
+          chunk_range_begin.dim() == 1 &&
+          chunk_range_begin.numel() >= num_experts &&
+          chunk_range_end.dim() == 1 &&
+          chunk_range_end.numel() >= num_experts &&
+          chunk_a_indices.dim() == 1 &&
+          chunk_a_indices.numel() >= max_chunk_slots &&
+          chunk_inv_permuted_idx.dim() == 1 &&
+          chunk_inv_permuted_idx.numel() >= max_chunk_slots,
+      "awq_moe_chunked_w2_sm70_out: scratch/output too small.");
+
+  const int device = input.get_device();
+  TORCH_CHECK(
+      out.get_device() == device && chunk_output.get_device() == device &&
+          expert_offsets.get_device() == device &&
+          permuted_idx.get_device() == device &&
+          topk_weights.get_device() == device &&
+          chunk_expert_offsets.get_device() == device &&
+          chunk_range_begin.get_device() == device &&
+          chunk_range_end.get_device() == device &&
+          chunk_a_indices.get_device() == device &&
+          chunk_inv_permuted_idx.get_device() == device &&
+          ptrs_w.get_device() == device && ptrs_s.get_device() == device,
+      "awq_moe_chunked_w2_sm70_out: tensors must share a device.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int kThreads = 256;
+  const int range_blocks =
+      static_cast<int>((num_experts + kThreads - 1) / kThreads);
+
+  // The production permutation is a stable expert-major sort, so source route
+  // indices remain ascending inside each expert segment. Intersecting every
+  // segment with a contiguous source-route interval therefore keeps the GEMM
+  // expert-major while allowing the final reduction to replay route 0..top_k-1
+  // in exactly the same FP32 order as moe_unpermute.
+  for (int64_t token_begin = 0; token_begin < num_tokens;
+       token_begin += chunk_tokens) {
+    const int64_t current_tokens =
+        std::min(chunk_tokens, num_tokens - token_begin);
+    const int64_t current_slots = current_tokens * top_k;
+    const int64_t source_begin = token_begin * top_k;
+    const int64_t source_end = source_begin + current_slots;
+
+    awq_moe_chunk_ranges_kernel<<<range_blocks, kThreads, 0, stream>>>(
+        expert_offsets.data_ptr<int>(), permuted_idx.data_ptr<int>(),
+        chunk_expert_offsets.data_ptr<int>(), chunk_range_begin.data_ptr<int>(),
+        chunk_range_end.data_ptr<int>(), static_cast<int>(num_experts),
+        static_cast<int>(source_begin), static_cast<int>(source_end));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    awq_moe_prefix_chunk_offsets_kernel<<<1, 1, 0, stream>>>(
+        chunk_expert_offsets.data_ptr<int>(), static_cast<int>(num_experts));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    awq_moe_fill_chunk_indices_kernel<<<num_experts, kThreads, 0, stream>>>(
+        permuted_idx.data_ptr<int>(), chunk_expert_offsets.data_ptr<int>(),
+        chunk_range_begin.data_ptr<int>(), chunk_range_end.data_ptr<int>(),
+        chunk_a_indices.data_ptr<int>(), chunk_inv_permuted_idx.data_ptr<int>(),
+        static_cast<int>(source_begin));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    awq_moe_gemm_sm70_out_impl(
+        chunk_output.narrow(0, 0, current_slots), input, chunk_expert_offsets,
+        ptrs_w, ptrs_s, num_experts, k, n, group_size, false, torch::Tensor(),
+        false, torch::Tensor(), torch::Tensor(), false, current_slots,
+        chunk_a_indices);
+
+    awq_moe_chunk_weighted_reduce_kernel<<<current_tokens, kThreads, 0,
+                                           stream>>>(
+        reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(chunk_output.data_ptr<at::Half>()),
+        topk_weights.data_ptr<float>(), chunk_inv_permuted_idx.data_ptr<int>(),
+        static_cast<int>(token_begin), static_cast<int>(current_tokens),
+        static_cast<int>(top_k), static_cast<int>(hidden_logical_size),
+        static_cast<int>(out.stride(0)),
+        static_cast<int>(chunk_output.stride(0)));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 void awq_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
     torch::Tensor sorted_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
