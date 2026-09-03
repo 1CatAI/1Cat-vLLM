@@ -21,6 +21,23 @@ logger = init_logger(__name__)
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+_SM70_QSA_TOPK_LIBRARY = os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY")
+if _SM70_QSA_TOPK_LIBRARY is not None:
+    torch.ops.load_library(_SM70_QSA_TOPK_LIBRARY)
+
+if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
+
+    @torch.library.register_fake("_C_qsa_sm70::qsa_lexicographic_topk")
+    def _qsa_lexicographic_topk_sidecar_fake(
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        output: torch.Tensor,
+        topk: int,
+    ) -> None:
+        del logits, lengths, output, topk
+        return None
+
+
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
@@ -1072,6 +1089,15 @@ def _use_sm70_qsa_lexicographic_topk(topk: int) -> bool:
     return topk == 512 and current_platform.is_device_capability(70)
 
 
+def _sm70_qsa_lexicographic_topk_op():
+    """Prefer an opt-in source-validation fragment over the wheel op."""
+
+    sidecar = torch.ops._C_qsa_sm70
+    if hasattr(sidecar, "qsa_lexicographic_topk"):
+        return sidecar.qsa_lexicographic_topk
+    return torch.ops._C.qsa_lexicographic_topk
+
+
 def _qsa_visible_blocks(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
@@ -1332,7 +1358,7 @@ def qsa_select_paged_tokens(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            torch.ops._C.qsa_lexicographic_topk(
+            _sm70_qsa_lexicographic_topk_op()(
                 logits,
                 visible_blocks,
                 blocks,

@@ -897,7 +897,9 @@ boundaries:
   `0.0931 ms/token` or 1.75x. Random scores, dense ties, signed zero, Inf/NaN,
   the 2,304-entry boundary, and the 2,305/4,096/16,384 device fallback are
   bitwise equal to the original selector. Multi-row prefill retains the
-  original kernel.
+  original kernel. Source-overlay validation may supply the same compiled
+  fragment through `VLLM_SM70_QSA_TOPK_LIBRARY`; release wheels link it into
+  `_C_stable_libtorch` normally.
 
 The isolated savings sum to `0.591 ms/token`; they are not an end-to-end TPOT
 claim because the shared-expert and main streams overlap. One full-model A/B is

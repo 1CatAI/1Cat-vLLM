@@ -13,6 +13,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
     _qsa_sparse_launch_profile,
     _qsa_xqa_page4_shape_supported,
+    _sm70_qsa_lexicographic_topk_op,
     _use_sm70_qsa_lexicographic_topk,
 )
 
@@ -473,3 +474,21 @@ def test_qsa_lexicographic_topk_is_limited_to_sm70_qsa_shape(monkeypatch):
         lambda capability: False,
     )
     assert not _use_sm70_qsa_lexicographic_topk(512)
+
+
+def test_qsa_lexicographic_topk_prefers_validation_sidecar(monkeypatch):
+    sidecar = object()
+    wheel = object()
+    monkeypatch.setattr(
+        qsa_ops.torch,
+        "ops",
+        SimpleNamespace(
+            _C_qsa_sm70=SimpleNamespace(qsa_lexicographic_topk=sidecar),
+            _C=SimpleNamespace(qsa_lexicographic_topk=wheel),
+        ),
+    )
+
+    assert _sm70_qsa_lexicographic_topk_op() is sidecar
+
+    qsa_ops.torch.ops._C_qsa_sm70 = SimpleNamespace()
+    assert _sm70_qsa_lexicographic_topk_op() is wheel
