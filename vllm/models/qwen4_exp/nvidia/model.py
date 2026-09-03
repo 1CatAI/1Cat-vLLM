@@ -12,7 +12,7 @@ from torch import nn
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -841,10 +841,11 @@ class Qwen4ExpForCausalLM(
             return False
         if self._sm70_decode_graph_model is None:
             decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
-            decode_model = _Qwen4ExpDecodeGraphModel(
-                target_model=self.model,
-                vllm_config=decode_config,
-            )
+            with set_current_vllm_config(decode_config):
+                decode_model = _Qwen4ExpDecodeGraphModel(
+                    target_model=self.model,
+                    vllm_config=decode_config,
+                )
             object.__setattr__(self, "_sm70_decode_graph_model", decode_model)
             logger.info_once(
                 "Prepared shared-weight SM70 Qwen3.8 decode compiler for token "
