@@ -102,9 +102,7 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches: list[tuple[int, int]] = []
     connector = SimpleNamespace(
-        _launch=lambda num_reqs, num_tokens: launches.append(
-            (num_reqs, num_tokens)
-        )
+        _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens))
     )
 
     PleOffloadConnector.prepare_forward(
