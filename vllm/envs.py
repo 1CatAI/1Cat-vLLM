@@ -729,6 +729,9 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_DISK_OFFLOAD: bool = False
+    VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
+    VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
     VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
     VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
@@ -4273,6 +4276,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implementation supports ModelRunner V1/V2 and node-local MP DP/TP.
     "VLLM_PLE_CPU_OFFLOAD": lambda: (
         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Retain Qwen4Exp PLE safetensor shards as file-backed mappings instead of
+    # copying the complete learned n-gram table into anonymous host memory.
+    "VLLM_PLE_DISK_OFFLOAD": lambda: (
+        os.getenv("VLLM_PLE_DISK_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Number of cross-shard mmap gather workers. Zero selects a bounded
+    # hardware-aware default.
+    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": lambda: int(
+        os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")
+    ),
+    "VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: (
+        os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "False").lower() in ("true", "1")
     ),
     # Keep the latency-critical PLE lookup process on the NUMA node local to
     # its first visible GPU. This changes CPU placement only; allocations use
