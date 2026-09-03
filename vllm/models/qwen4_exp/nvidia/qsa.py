@@ -208,6 +208,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
     supports_dcp = False
+    # The paged indexer and sparse attention switch launch profiles after 32
+    # query rows. Advertise the first row count in the wider profile so the
+    # generic MRV2 warmup can compile it before serving traffic.
+    kernel_warmup_prefill_token_counts = (33,)
 
     def __init__(
         self,
