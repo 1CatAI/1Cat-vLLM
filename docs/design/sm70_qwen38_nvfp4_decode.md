@@ -867,3 +867,40 @@ Raw reports remain outside Git under
 `.artifacts/qwen38_nomtp_token_trace/`, including the `.nsys-rep`, exported
 SQLite database, parsed per-token JSON/CSV/Markdown, route contract, and GPU
 samples.
+
+### Exact post-trace candidates
+
+Three lossless single-token changes have passed focused operator gates after
+the trace. They retain checkpoint FP16 activations and HC weights, native
+NVFP4 expert weights, FP32 accumulation, and the existing FP16 materialization
+boundaries:
+
+- The Qwen3.8 W2 kernel now forms each route's FP16 result before applying the
+  top-k weight and rank-ordered reduction in the same launch. Its real-weight
+  CUDA Graph gate is bitwise and projects `0.098 ms/token` savings over 48
+  layers.
+- HC up reuses the same 320-element low-rank vector across four independent
+  output rows. The selected row-four schedule is bitwise in all 128 changing
+  input cases and reduces the 96-call HC cycle from `2.139 ms` to `2.062 ms`,
+  saving `0.077 ms/token`.
+- Qwen3.8 M1 `all_reduce_sum2` now reuses the registered SM70 TP4 push buffers.
+  Both paths first form the local FP16 sum, accumulate ranks 0 through 3 in
+  FP32, and round once to FP16. The four-rank CUDA Graph gate is bitwise for
+  integer, model-distribution, and signed-zero patterns. Forty-eight
+  collectives fall from `0.459 ms` to `0.136 ms`, saving `0.323 ms/token`.
+  `VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=0` is the rollback.
+
+The isolated savings sum to `0.498 ms/token`; they are not an end-to-end TPOT
+claim because the shared-expert and main streams overlap. One full-model A/B is
+still required after another material exact candidate lands.
+
+Privileged NCU counters confirm why HC needs traffic/issue improvements rather
+than lower precision. The down projection reaches `488 GB/s` DRAM throughput
+with `24.23%` achieved occupancy and spends `86.11%` of scheduler cycles with
+no eligible warp. HC up reaches `481 GB/s`, `64.31%` occupancy, and `63.45%`
+no-eligible cycles. More warps, split-K down, down row tiling, and the SGLang
+persistent atomic-grid HC implementation are slower on V100. HC
+combine-plus-RMSNorm is already only about `0.305 ms` per 96-call graph cycle;
+an 8-warp variant saves just `0.014 ms` and changes the reduction result, so it
+is rejected. The retained HC changes do not quantize FP16 tensors or relax any
+quality gate.
