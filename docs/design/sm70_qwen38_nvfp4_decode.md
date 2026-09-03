@@ -816,3 +816,54 @@ Primary evidence is:
 - `.artifacts/qwen38_exact_decode80/gemv_router_ba_index_hc_bk256_qsa4_gdndual_gate_overlap_full/gemv_router_ba_index_hc_bk256_qsa4_gdndual_gate_overlap_full_i8192_o512_r5.json`
 - `.artifacts/qwen38_exact_decode80/gsm16_exact_decode80_official_xhigh/audit.json`
 - `.artifacts/qwen38_exact_decode80/gsm16_exact_decode80_official_xhigh/health.json`
+
+## 2026-09-04 current-main single-request decode trace
+
+The unified dual-compile/hybrid-PLE service was reprofiled at public-main SHA
+`05910abb97446128a259fbd5fbe2bf9ece70a492`. The locked route is TP4/V2,
+no MTP, FP16 activation/KV, checkpoint-native NVFP4 experts, full decode CUDA
+Graph, prefix caching off, and input 8,192/output 513. One model load ran a
+513-token low-overhead baseline outside the profiler capture and then captured
+only a 32-token graph-node diagnostic.
+
+The 8K baseline measured `83.3749 tok/s`, or `11.9940 ms/token`; the accepted
+short-prompt service point remains `86.07 tok/s`, so context length must stay
+in every decode comparison. The node trace measured a `12.783 ms` middle-token
+replay interval, `12.762 ms` GPU activity envelope, and only `0.050 ms` mean TP
+replay-start skew. It covered `97.09%` of graph-node kernels and contained about
+1,644 kernels/rank/token. Half of those kernels were shorter than 5 us. The
+unprofiled decode samples reported 100% GPU utilization but only 140-150 W per
+board, consistent with HBM traffic and small-kernel/graph-node issue cost rather
+than FP16 compute saturation.
+
+Rank-average service attribution, which is not additive wall time because the
+shared-expert stream overlaps the main stream, is:
+
+| Subsystem | Service ms/rank/token |
+| --- | ---: |
+| HyperConnection | 2.603 |
+| NVFP4 MoE expert/router/activation | 2.203 |
+| checkpoint-FP16 row GEMV | 1.441 |
+| QSA sparse attention | 1.263 |
+| remaining dense/cuBLAS, chiefly shared expert | 1.256 |
+| fused GDN input | 1.064 |
+| elementwise/metadata/copy | 1.022 |
+| TP communication | 0.854 |
+| GDN recurrent/core | 0.658 |
+| LM head/sample | 0.582 |
+
+The checkpoint-FP16 HC down/up, fused GDN input, and remaining row-GEMV kernels
+read at least 2.788 GB of weights per rank and token. Exact tensor sizes and
+trace duration imply 552-596 GB/s for HC, 529 GB/s for row GEMV, and 714 GB/s
+for fused GDN input. These are traffic lower bounds rather than NCU counters;
+the current host blocks performance counters with `ERR_NVGPUCTRPERM`. The GDN
+input is therefore not the first target. The ordered implementation candidates
+are exact router projection/top-k, NVFP4 W2 plus weighted-reduce fusion, QSA
+decode fusion, critical-path graph-node reduction around HC, and an exact or
+guarded greedy LM-head route. Full-model startup is deferred until standalone
+real-weight candidates project at least 0.4 ms/token combined savings.
+
+Raw reports remain outside Git under
+`.artifacts/qwen38_nomtp_token_trace/`, including the `.nsys-rep`, exported
+SQLite database, parsed per-token JSON/CSV/Markdown, route contract, and GPU
+samples.
