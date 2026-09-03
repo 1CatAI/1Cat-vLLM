@@ -207,6 +207,19 @@ def test_dflash2_grouped_verify_is_default_on_with_rollback(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_dflash2_batched_grouped_verify_is_default_off(monkeypatch):
+    name = "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert not getattr(envs, name)
+        monkeypatch.setenv(name, "1")
+        envs.disable_envs_cache()
+        assert getattr(envs, name)
+    finally:
+        envs.disable_envs_cache()
+
+
 def test_sm70_tp4_push_allreduce_is_default_on_with_rollback(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", raising=False)
     envs.disable_envs_cache()
@@ -574,21 +587,23 @@ def test_probabilistic_dense_fallback_is_allocated_after_initialization(monkeypa
     assert torch.isneginf(speculator.draft_logits).all()
 
 
-def _sparse_sampling_contract_fixture():
-    idx = np.array([0], dtype=np.int32)
+def _sparse_sampling_contract_fixture(num_reqs: int = 1):
+    idx = np.arange(num_reqs, dtype=np.int32)
     sampling_states = SimpleNamespace(
-        temperature=SimpleNamespace(np=np.array([1.0], dtype=np.float32)),
-        top_k=SimpleNamespace(np=np.array([20], dtype=np.int32)),
-        top_p=SimpleNamespace(np=np.array([0.95], dtype=np.float32)),
-        min_p=SimpleNamespace(np=np.array([0.0], dtype=np.float32)),
+        temperature=SimpleNamespace(np=np.ones(num_reqs, dtype=np.float32)),
+        top_k=SimpleNamespace(np=np.full(num_reqs, 20, dtype=np.int32)),
+        top_p=SimpleNamespace(np=np.full(num_reqs, 0.95, dtype=np.float32)),
+        min_p=SimpleNamespace(np=np.zeros(num_reqs, dtype=np.float32)),
         max_num_logprobs=Mock(return_value=-1),
     )
     sampler = SimpleNamespace(
         sampling_states=sampling_states,
-        penalties_state=SimpleNamespace(use_penalty=np.array([False])),
-        logit_bias_state=SimpleNamespace(use_logit_bias=np.array([False])),
+        penalties_state=SimpleNamespace(use_penalty=np.zeros(num_reqs, dtype=np.bool_)),
+        logit_bias_state=SimpleNamespace(
+            use_logit_bias=np.zeros(num_reqs, dtype=np.bool_)
+        ),
         bad_words_state=SimpleNamespace(
-            num_bad_words=SimpleNamespace(np=np.array([0], dtype=np.int32))
+            num_bad_words=SimpleNamespace(np=np.zeros(num_reqs, dtype=np.int32))
         ),
         logprob_token_ids_state=SimpleNamespace(max_num_token_ids=Mock(return_value=0)),
         compute_nans=False,
@@ -598,16 +613,24 @@ def _sparse_sampling_contract_fixture():
         sampler=sampler,
     )
     input_batch = SimpleNamespace(
-        num_reqs=1,
-        is_prefilling_np=np.array([False]),
+        num_reqs=num_reqs,
+        is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
         idx_mapping_np=idx,
     )
     return rejection_sampler, input_batch
 
 
-def test_sparse_target_rejection_accepts_official_sampling_contract():
-    rejection_sampler, input_batch = _sparse_sampling_contract_fixture()
+@pytest.mark.parametrize("num_reqs", [1, 2, 4, 8])
+def test_sparse_target_rejection_accepts_official_sampling_contract(num_reqs):
+    rejection_sampler, input_batch = _sparse_sampling_contract_fixture(num_reqs)
     assert _supports_sparse_sampling_contract(rejection_sampler, input_batch)
+
+
+def test_sparse_target_rejection_rejects_mixed_prefill_batch():
+    rejection_sampler, input_batch = _sparse_sampling_contract_fixture(4)
+    input_batch.is_prefilling_np[2] = True
+
+    assert not _supports_sparse_sampling_contract(rejection_sampler, input_batch)
 
 
 @pytest.mark.parametrize(

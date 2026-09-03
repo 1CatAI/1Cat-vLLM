@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark compact DFlash2 top-k/top-p rejection on one SM70 GPU.
+"""Benchmark batched compact DFlash2 top-k/top-p rejection on one SM70 GPU.
 
 This isolates target sampling after the TP merge. The separate TP4 compact
 logit benchmark measures local top-k and candidate transport.
@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--vocab-size", type=int, default=248320)
+    parser.add_argument("--num-reqs", type=int, default=1)
     parser.add_argument("--num-speculative-steps", type=int, default=7)
     parser.add_argument("--target-top-k", type=int, default=20)
     parser.add_argument("--draft-top-k", type=int, default=16)
@@ -78,6 +79,8 @@ def main() -> int:
         raise ValueError("--target-top-k must be in [1, 64]")
     if not 0 < args.draft_top_k <= 64:
         raise ValueError("--draft-top-k must be in [1, 64]")
+    if args.num_reqs < 1:
+        raise ValueError("--num-reqs must be positive")
 
     device = torch.device(args.device)
     torch.accelerator.set_device_index(device)
@@ -86,8 +89,10 @@ def main() -> int:
         raise RuntimeError(f"Expected SM70, got sm_{capability[0]}{capability[1]}.")
     torch.manual_seed(args.seed)
 
+    num_reqs = args.num_reqs
     num_steps = args.num_speculative_steps
-    num_logits = num_steps + 1
+    rows_per_req = num_steps + 1
+    num_logits = num_reqs * rows_per_req
     raw_target = torch.randn(
         num_logits,
         args.vocab_size,
@@ -111,37 +116,55 @@ def main() -> int:
     )
     processed_target = apply_top_k_top_p(raw_target.float(), target_k, target_p_rows)
 
-    draft_topk_ids = target_topk_ids[:num_steps, : args.draft_top_k].view(
-        1, num_steps, args.draft_top_k
+    target_topk_ids_by_req = target_topk_ids.view(
+        num_reqs, rows_per_req, args.target_top_k
     )
+    target_topk_logits_by_req = target_topk_logits.view(
+        num_reqs, rows_per_req, args.target_top_k
+    )
+    draft_topk_ids = target_topk_ids_by_req[
+        :, :num_steps, : args.draft_top_k
+    ].contiguous()
     draft_topk_logits = (
-        target_topk_logits[:num_steps, : args.draft_top_k]
+        target_topk_logits_by_req[:, :num_steps, : args.draft_top_k]
         + torch.randn(
+            num_reqs,
             num_steps,
             args.draft_top_k,
             dtype=torch.float32,
             device=device,
         )
         * 0.2
-    ).view(1, num_steps, args.draft_top_k)
+    ).contiguous()
     dense_draft = torch.full(
-        (1, num_steps, args.vocab_size),
+        (num_reqs, num_steps, args.vocab_size),
         -float("inf"),
         dtype=torch.float32,
         device=device,
     )
     dense_draft.scatter_(2, draft_topk_ids, draft_topk_logits)
 
-    draft_sampled = torch.zeros(num_logits, dtype=torch.int64, device=device)
-    draft_sampled[1:] = draft_topk_ids[0, :, 0]
-    cu_num_logits = torch.tensor([0, num_logits], dtype=torch.int32, device=device)
+    draft_sampled_2d = torch.zeros(
+        num_reqs, rows_per_req, dtype=torch.int64, device=device
+    )
+    draft_sampled_2d[:, 1:] = draft_topk_ids[:, :, 0]
+    draft_sampled = draft_sampled_2d.flatten()
+    cu_num_logits = (
+        torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * rows_per_req
+    )
     pos = torch.arange(num_logits, dtype=torch.int64, device=device) + 32768
-    idx_mapping = torch.zeros(1, dtype=torch.int32, device=device)
-    expanded_idx_mapping = torch.zeros(num_logits, dtype=torch.int32, device=device)
-    expanded_local_pos = torch.arange(num_logits, dtype=torch.int32, device=device)
-    temperature = torch.ones(1, dtype=torch.float32, device=device)
-    top_p_per_req = torch.full((1,), args.top_p, dtype=torch.float32, device=device)
-    seeds = torch.tensor([args.seed], dtype=torch.int64, device=device)
+    idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    expanded_idx_mapping = idx_mapping.repeat_interleave(rows_per_req)
+    expanded_local_pos = torch.arange(
+        rows_per_req, dtype=torch.int32, device=device
+    ).repeat(num_reqs)
+    temperature = torch.ones(num_reqs, dtype=torch.float32, device=device)
+    top_p_per_req = torch.full(
+        (num_reqs,), args.top_p, dtype=torch.float32, device=device
+    )
+    seeds = torch.arange(
+        args.seed, args.seed + num_reqs, dtype=torch.int64, device=device
+    )
 
     def dense_rejection() -> tuple[torch.Tensor, torch.Tensor]:
         return rejection_sample(
@@ -197,13 +220,16 @@ def main() -> int:
     sparse_out, sparse_count = sparse_rejection()
     torch.accelerator.synchronize(device)
     counts_equal = bool(torch.equal(dense_count, sparse_count))
-    valid = torch.arange(num_logits, device=device) < dense_count[0]
-    tokens_equal = bool(torch.equal(dense_out[0, valid], sparse_out[0, valid]))
+    valid = (
+        torch.arange(rows_per_req, device=device).unsqueeze(0) < dense_count[:, None]
+    )
+    tokens_equal = bool(torch.equal(dense_out[valid], sparse_out[valid]))
 
     result = {
         "device": torch.cuda.get_device_name(device),
         "device_capability": list(capability),
         "shape": {
+            "num_reqs": num_reqs,
             "num_logits": num_logits,
             "vocab_size": args.vocab_size,
             "target_top_k": args.target_top_k,
@@ -213,8 +239,8 @@ def main() -> int:
         "correctness": {
             "num_sampled_equal": counts_equal,
             "valid_tokens_equal": tokens_equal,
-            "dense_num_sampled": int(dense_count[0].item()),
-            "sparse_num_sampled": int(sparse_count[0].item()),
+            "dense_num_sampled": dense_count.tolist(),
+            "sparse_num_sampled": sparse_count.tolist(),
         },
         "timings": {
             "dense_topk_topp_only": _time_cuda(

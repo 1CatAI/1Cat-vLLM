@@ -155,10 +155,9 @@ def _supports_sparse_sampling_contract(
     """Whether compact logits preserve every requested sampling transform."""
     if rejection_sampler.rejection_sample_method != "standard":
         return False
-    # Start with the single-request path used by the latency target. The
-    # kernel supports batches, but mixed-request graph validation is a
-    # separate promotion gate.
-    if input_batch.num_reqs != 1 or np.any(input_batch.is_prefilling_np):
+    # Every request must be in the uniform decode verifier phase. The compact
+    # kernel is request-indexed and preserves each request's sampling state.
+    if input_batch.num_reqs < 1 or np.any(input_batch.is_prefilling_np):
         return False
 
     sampler = rejection_sampler.sampler

@@ -133,7 +133,9 @@ def _assert_distribution_match(
 @pytest.mark.parametrize("num_speculative_steps", [3, 7])
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
 @pytest.mark.parametrize("temperature", [0.6, 1.0])
+@pytest.mark.parametrize("num_reqs", [2, 4, 8])
 def test_dflash2_sparse_topk_matches_dense_rejection(
+    num_reqs: int,
     num_speculative_steps: int,
     top_p: float,
     temperature: float,
@@ -141,7 +143,6 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
     """Compact p/q support must preserve the dense DFlash2 decision path."""
     torch.manual_seed(20260823)
     device = torch.device("cuda")
-    num_reqs = 4
     target_top_k = 20
     draft_top_k = 16
     rows_per_req = num_speculative_steps + 1
