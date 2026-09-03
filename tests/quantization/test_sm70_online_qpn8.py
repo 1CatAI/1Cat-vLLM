@@ -77,6 +77,17 @@ def test_nvfp4_mtp5_capability_is_not_inferred_from_m1(monkeypatch):
     assert online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
 
 
+def test_nvfp4_w2_direct_reduce_capability_is_explicit(monkeypatch):
+    legacy_sidecar = SimpleNamespace(nvfp4_moe_qpn_m1_sm70_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", legacy_sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert not online_qpn8.sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+
+    legacy_sidecar.nvfp4_qwen38_w2_direct_reduce_out = object()
+    assert online_qpn8.sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+
+
 @pytest.mark.parametrize(
     ("prefix", "k", "n", "expected"),
     [

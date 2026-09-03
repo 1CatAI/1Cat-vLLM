@@ -101,6 +101,52 @@ def _qwen38_hc_up_gate_mix_kernel(
     tl.store(out_ptr + hidden, result / HC_COUNT)
 
 
+@triton.jit
+def _qwen38_hc_up_gate_mix_row4_kernel(
+    lora_ptr,
+    weight_ptr,
+    x_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    HC_DIMENSION: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Reuse the low-rank input across four bitwise-equivalent output rows."""
+    hidden = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets = tl.arange(0, BLOCK_K)
+    hidden_mask = hidden < HC_DIMENSION
+    k_mask = offsets < K
+    lora = tl.load(
+        lora_ptr + offsets,
+        mask=k_mask,
+        other=0.0,
+        eviction_policy="evict_last",
+    ).to(tl.float32)
+
+    result = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for stream in tl.static_range(HC_COUNT):
+        row = stream * HC_DIMENSION + hidden
+        weight = tl.load(
+            weight_ptr + row[:, None] * K + offsets[None, :],
+            mask=hidden_mask[:, None] & k_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_first",
+        )
+        # Keep the established FP32 reduction and FP16 gate boundary. Row
+        # tiling changes only work assignment and shares the lora read.
+        gate = tl.sum(lora[None, :] * weight.to(tl.float32), axis=1)
+        gate = gate.to(tl.float16).to(tl.float32)
+        branch = tl.load(
+            x_ptr + stream * HC_DIMENSION + hidden,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        result += tl.sigmoid(gate) * branch
+    tl.store(out_ptr + hidden, result / HC_COUNT, mask=hidden_mask)
+
+
 def _runtime_ok(
     x: torch.Tensor, down_weight: torch.Tensor, up_weight: torch.Tensor
 ) -> bool:
@@ -154,7 +200,7 @@ def _qwen38_sm70_fp16_fused_hc(
         HC_COUNT=_HC_COUNT,
         num_warps=4,
     )
-    _qwen38_hc_up_gate_mix_kernel[(_HC_DIM,)](
+    _qwen38_hc_up_gate_mix_row4_kernel[(triton.cdiv(_HC_DIM, 4),)](
         lora,
         up_weight,
         x,
@@ -162,8 +208,9 @@ def _qwen38_sm70_fp16_fused_hc(
         K=_HC_RANK,
         HC_DIMENSION=_HC_DIM,
         HC_COUNT=_HC_COUNT,
+        BLOCK_N=4,
         BLOCK_K=512,
-        num_warps=2,
+        num_warps=8,
     )
     logger.info_once("SM70 Qwen3.8 fused checkpoint-FP16 HC M=1 route enabled.")
     return block, injection

@@ -431,6 +431,25 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
         ):
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
+        w2_direct_reduce_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
+        )
+        w2_direct_reduce_available = sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+        w2_direct_reduce_explicit = (
+            "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE" in os.environ
+        )
+        if (
+            w2_direct_reduce_requested
+            and not w2_direct_reduce_available
+            and w2_direct_reduce_explicit
+        ):
+            missing.append("nvfp4_qwen38_w2_direct_reduce_out")
+        elif w2_direct_reduce_requested and not w2_direct_reduce_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 W2 direct-reduce op is absent from "
+                "the loaded extension; retaining separate W2 and weighted "
+                "reduce kernels. Explicit opt-in fails closed."
+            )
         if (
             envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
             and not sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
@@ -646,6 +665,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
+        layer.sm70_nvfp4_qwen38_w2_direct_reduce = bool(
+            w2_direct_reduce_requested and w2_direct_reduce_available
+        )
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         self._allocate_graph_safe_decode_buffers(layer)
@@ -959,6 +981,18 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["gate_up"],
                 interleaved=interleaved_w13,
             )
+            if direct_qpn_m1 and bool(
+                getattr(layer, "sm70_nvfp4_qwen38_w2_direct_reduce", False)
+            ):
+                sm70_ops.nvfp4_qwen38_w2_direct_reduce_out(
+                    output,
+                    buffers["intermediate"],
+                    layer.w2_tm_weight,
+                    layer.w2_tm_scales,
+                    route_ids,
+                    topk_weights,
+                )
+                return output
             direct_op(
                 buffers["sorted_output"],
                 buffers["intermediate"],

@@ -2,9 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
 import vllm.envs as envs
 from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import _plan_for
+from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import (
+    _qwen38_hc_up_gate_mix_kernel,
+    _qwen38_hc_up_gate_mix_row4_kernel,
+)
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON
 
 
 def test_qwen38_sm70_fp16_gemv_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,3 +76,45 @@ def test_qwen38_sm70_fp16_gemv_rejects_other_roles(
     prefix: str, shape: tuple[int, int]
 ) -> None:
     assert _plan_for(prefix, shape) is None
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((7, 0)) or not HAS_TRITON,
+    reason="Qwen3.8 HC row-tile kernel requires CUDA SM70 and Triton",
+)
+def test_qwen38_sm70_hc_up_row4_is_bitwise() -> None:
+    lora = torch.empty(1, 320, dtype=torch.float16, device="cuda")
+    weight = torch.randn(10240, 320, dtype=torch.float16, device="cuda")
+    branches = torch.empty(1, 10240, dtype=torch.float16, device="cuda")
+    reference = torch.empty(1, 2560, dtype=torch.float16, device="cuda")
+    actual = torch.empty_like(reference)
+
+    for seed in range(8):
+        torch.manual_seed(seed)
+        lora.normal_()
+        branches.normal_()
+        _qwen38_hc_up_gate_mix_kernel[(2560,)](
+            lora,
+            weight,
+            branches,
+            reference,
+            K=320,
+            HC_DIMENSION=2560,
+            HC_COUNT=4,
+            BLOCK_K=512,
+            num_warps=2,
+        )
+        _qwen38_hc_up_gate_mix_row4_kernel[(640,)](
+            lora,
+            weight,
+            branches,
+            actual,
+            K=320,
+            HC_DIMENSION=2560,
+            HC_COUNT=4,
+            BLOCK_N=4,
+            BLOCK_K=512,
+            num_warps=8,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(actual, reference)

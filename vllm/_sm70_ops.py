@@ -154,6 +154,12 @@ def has_nvfp4_qpn_m1_dispatch() -> bool:
     )
 
 
+def has_nvfp4_qwen38_w2_direct_reduce() -> bool:
+    return hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w2_direct_reduce_out") or hasattr(
+        torch.ops._C, "nvfp4_qwen38_w2_direct_reduce_out"
+    )
+
+
 def has_nvfp4_qpn_mtp5_dispatch() -> bool:
     """Reject extensions that only implement the legacy ten-route kernel."""
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
@@ -1538,6 +1544,47 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out"):
         expert_ids: torch.Tensor,
         broadcast_input: bool,
         split_k: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_qwen38_w2_direct_reduce_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_qwen38_w2_direct_reduce_out")(
+        out, input, weights, scales, expert_ids, topk_weights
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_w2_direct_reduce_out"):
+
+    @register_fake("_C::nvfp4_qwen38_w2_direct_reduce_out")
+    def _nvfp4_qwen38_w2_direct_reduce_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w2_direct_reduce_out"):
+
+    @register_fake("_C_qwen38::nvfp4_qwen38_w2_direct_reduce_out")
+    def _nvfp4_qwen38_w2_direct_reduce_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
     ) -> None:
         return None
 

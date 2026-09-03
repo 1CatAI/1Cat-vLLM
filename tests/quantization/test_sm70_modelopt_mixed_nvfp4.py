@@ -119,6 +119,19 @@ def test_qwen38_fast_prefill_defaults_on_and_can_be_disabled(monkeypatch):
     monkeypatch.setenv(name, "0")
     assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
 
+
+def test_qwen38_w2_direct_reduce_defaults_on_and_can_be_disabled(monkeypatch):
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
+    finally:
+        envs.disable_envs_cache()
+
     name = "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL"
     monkeypatch.delenv(name, raising=False)
     assert envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
