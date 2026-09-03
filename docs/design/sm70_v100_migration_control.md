@@ -44964,3 +44964,8 @@ Interpretation:
   failure occurred before compile or requests and all GPUs were released. In
   hybrid mode only, executor startup now loads the main model first and spawns
   the file-backed worker afterward; non-hybrid offload ordering is unchanged.
+- Delaying process creation exposed that model loading attaches local weight
+  loader closures to the live configuration object graph, which `spawn` cannot
+  pickle. Hybrid startup now snapshots the small clean offload configuration
+  before model loading and consumes that snapshot after loading; the failed
+  attempt ended before mmap loading or compilation and produced no benchmark.

@@ -56,6 +56,11 @@ def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
     monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
     monkeypatch.setattr(
         uniproc_executor_module.envs,
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+        False,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
         "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
         False,
     )
@@ -77,6 +82,47 @@ def test_uniproc_executor_starts_ple_worker_around_model_load(monkeypatch):
         "init_device",
         "spawn_ple_offload",
         "load_model",
+        "wait_ple_offload_ready",
+    ]
+
+
+def test_uniproc_executor_delays_hybrid_ple_spawn(monkeypatch):
+    driver_worker = MagicMock()
+    monkeypatch.setattr(
+        uniproc_executor_module,
+        "WorkerWrapperBase",
+        MagicMock(return_value=driver_worker),
+    )
+    monkeypatch.setattr(uniproc_executor_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+        True,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module.envs,
+        "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
+        False,
+    )
+    monkeypatch.setattr(
+        uniproc_executor_module,
+        "set_worker_net_device",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(uniproc_executor_module, "current_platform", MagicMock())
+
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    executor.vllm_config = object()
+    monkeypatch.setattr(executor, "_distributed_args", lambda: ("local://", 0, 0))
+
+    executor._init_executor()
+
+    assert [call[0] for call in driver_worker.method_calls] == [
+        "init_worker",
+        "init_device",
+        "prepare_ple_offload_spawn",
+        "load_model",
+        "spawn_ple_offload",
         "wait_ple_offload_ready",
     ]
 

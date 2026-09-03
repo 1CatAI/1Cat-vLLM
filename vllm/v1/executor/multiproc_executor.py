@@ -617,6 +617,8 @@ class WorkerProc:
             and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
         ):
             self.worker.spawn_ple_offload()
+        elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+            self.worker.prepare_ple_offload_spawn()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
