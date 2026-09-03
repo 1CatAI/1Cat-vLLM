@@ -44969,3 +44969,27 @@ Interpretation:
   pickle. Hybrid startup now snapshots the small clean offload configuration
   before model loading and consumes that snapshot after loading; the failed
   attempt ended before mmap loading or compilation and produced no benchmark.
+- The corrected hybrid service started with zero systemd restarts. The large
+  graph contains `ple_offload_wait` and no Qwen3.8 M=1 operators; the small
+  graph contains the rank-local pinned PLE gather and decode-only FP16 GEMV,
+  fused HC, and fused GDN operators. No engine, weights, KV cache, or state
+  cache is duplicated.
+- An initial combined run measured only `5433` and `5495 tok/s` on the exact
+  8192-token hash `8aab945ad780...`, despite PLE mmap gather falling to
+  `31.3 ms`. The graph was structurally equivalent to the accepted disk graph;
+  the remaining regression was the launcher's explicit
+  `VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=0`. Restoring the default original
+  FlashQLA-SM70 TileLang GDN prefill route recovered `6878` and `6984 tok/s`
+  warm, within `0.6%` of the historical `7026 tok/s` result.
+- The same final no-MTP TP4 service measured `513 / 5.9602 = 86.07 tok/s`
+  pure decode. A full-context request accepted `262143` prompt tokens plus one
+  generated token and reported `51.8063 s` prefill, or `5060 tok/s`; prefix
+  caching remained disabled. Deterministic quality probes returned `5017` for
+  `173 * 29`, `1517` for `41 * 37`, and an accurate Chinese two-sentence lunar
+  phase explanation. Thinking is enabled and exposed through
+  `message.reasoning` by the selected Qwen3 parser.
+- The final API advertises maximum model length `262144`, remains served by
+  1cattunnel, and its authenticated public `/v1/models` probe returned HTTP
+  200. The service retained the 47.684-GiB file-backed PLE mapping with about
+  1.3 GiB worker RSS; startup's cgroup peak includes reclaimable/shared file
+  mappings and did not trigger `systemd-oomd` after sequencing was repaired.
