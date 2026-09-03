@@ -335,3 +335,58 @@ the fully QUASAR checkpoint and report pure decode separately from prefill and
 TTFT. The required rows are B1/B2/B4/B8 at the same prompt/output lengths,
 sampling seed policy, q7 draft, FP8 target KV, FP16 draft KV, attention backend,
 and CUDA-graph state.
+
+### Mixed-checkpoint endpoint scaling probe
+
+A follow-up endpoint probe used the locally complete mixed-NVFP4 target because
+the fully QUASAR checkpoint is still absent. The contract was TP4 on four
+V100-SXM2-32GB GPUs, the official BF16 LM head, q7 probabilistic DFlash2, FP8
+E5M2 target KV, FP16 draft KV, Flash-V100 target and draft attention,
+FULL_AND_PIECEWISE CUDA Graphs, official temperature 1.0/top-p 0.95/top-k 20
+sampling, sixteen fixed low-entropy SPEED-Bench 1K prompts, and 512 output
+tokens per request. Batch-specific sampling shapes were warmed before the
+reported B2/B4/B8 rows. The B1 row came from the same source, model, sampling,
+and graph contract in the immediately preceding service boot.
+
+| Concurrency | Output token/s | Versus B1 | Ideal scaling efficiency | p50 TTFT | p50 TPOT | Mean accepted length |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 187.77 | 1.000x | 100.0% | 318.83 ms | 4.67 ms | 4.16 |
+| 2 | 175.26 | 0.933x | 46.7% | 393.04 ms | 10.33 ms | 4.33 |
+| 4 | 247.13 | 1.316x | 32.9% | 457.74 ms | 14.28 ms | 4.32 |
+| 8 | 362.53 | 1.931x | 24.1% | 1147.63 ms | 18.62 ms | 4.49 |
+
+B2 is a real negative scaling point: steady aggregate output throughput is
+6.7% below B1. B4 is 31.6% above B1 and 41.0% above B2. B8 is 93.1% above B1
+and 46.7% above B4, but still only 24.1% efficient relative to ideal linear
+scaling. The earlier 1K operator result already showed that grouped B2 is
+slower than independent XQA, but this endpoint matrix does not isolate that
+operator from all other batch-dependent work. A matched grouped-verifier-off
+arm is therefore required before changing the admission policy.
+
+The first formal B2 attempt measured only 139.26 output token/s because its
+first batch triggered a target-sampling Triton JIT and p99 TTFT reached
+11.46 seconds. It is retained as a cold-shape observation, not a steady
+baseline. The repeated row above measured 175.26 token/s with p99 TTFT
+0.73 seconds. Future concurrency harnesses must warm at least two output steps
+for every measured batch shape; a one-token prefix warmup does not compile the
+steady sampling path.
+
+The nominal prefix-warm pass queried the exact same input-length sequence, but
+Prometheus recorded zero prefix-cache hits in every speed row. These numbers
+are consequently 1K-input plus 512-output endpoint measurements, not pure
+decode measurements. The source overlay also lacked the optional
+`_vllm_fa2_C` exact D256 prefill operators and logged the slower prefill
+fallback. Neither caveat invalidates the decode concurrency route hit, but
+both prevent using this table as a final prefill or TTFT baseline.
+
+Runtime audit records show FULL target and DFlash CUDA Graph dispatch at
+B2/q8=16 tokens, B4/q8=32 tokens, and B8/q8=64 tokens on every TP rank. Worker
+logs also confirm QPN2 M<=32, FlashQLA GDN decode, FP8 E5M2 KV decode, compact
+target rejection, and the request-major B8 grouped verifier. All four official
+sampling rows completed 16/16 requests with zero errors, zero empty outputs,
+and the requested 512 tokens. Sampled text is not byte-identical across
+concurrency. A separate greedy B1/B8 smoke was byte-identical for 2/8 prompts;
+the other six followed different but coherent trajectories, with 8/8 requests
+complete and no runtime corruption signal. This is a text-health pass, not a
+semantic-quality equivalence claim; normal benchmark quality gates remain
+required before either concurrency switch is promoted.

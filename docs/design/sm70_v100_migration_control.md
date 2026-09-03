@@ -44895,3 +44895,35 @@ Interpretation:
   arithmetic path: it makes default capacity select the same previously
   quality-audited, checkpoint-code-preserving B1 operator path. Test services
   were stopped after collection and all four V100s returned to idle memory.
+
+## 2026-09-03 mixed-NVFP4 DFlash2 concurrency endpoint probe
+
+- Draft PR #476 at `51541062b8` was exercised with the local mixed-NVFP4 27B
+  target, BF16 LM head, q7 probabilistic DFlash2, TP4, Flash-V100, FlashQLA,
+  FP8 E5M2 target KV, FP16 draft KV, FULL_AND_PIECEWISE graphs, and sixteen
+  fixed SPEED-Bench 1K-by-512 requests per concurrency row.
+- After batch-specific sampling warmup, aggregate output throughput was
+  B1 `187.77`, B2 `175.26`, B4 `247.13`, and B8 `362.53` token/s. Relative to
+  B1 this is `0.933x/1.316x/1.931x`, or `46.7%/32.9%/24.1%` ideal scaling
+  efficiency at B2/B4/B8. B2 is a 6.7% regression and must not be promoted
+  without a matched grouped-verifier-off endpoint arm.
+- The cold B2 row was only `139.26` token/s because the first formal batch
+  JIT-compiled its sampling kernel and reached 11.46-second p99 TTFT. Retain it
+  as cold-shape evidence only. A one-output-token warmup is insufficient;
+  concurrency harnesses must warm the steady sampling path for each batch.
+- Prefix-cache queries matched the prewarmed prompt lengths but recorded zero
+  hits, and the source overlay lacked optional exact D256 prefill operators.
+  The table is therefore an endpoint scaling measurement, not a pure-decode,
+  prefill, or final TTFT baseline.
+- Target and DFlash graph audits hit FULL B2/q8, B4/q8, and B8/q8 descriptors
+  on all four ranks. QPN2 M<=32, FlashQLA decode, FP8 E5M2 KV, compact
+  rejection, and request-major grouped verification were present in worker
+  logs. Every official row completed 16/16 full-length outputs without an
+  error or empty response. Greedy B1/B8 was byte-identical on 2/8 prompts and
+  otherwise diverged into coherent text, so this closes text health but not
+  semantic-quality equivalence.
+- The fully QUASAR checkpoint remains unavailable. Do not use this mixed-target
+  probe to close the final QUASAR acceptance gate. Raw artifacts are retained
+  under the PR worktree's `.artifacts/runtime/endpoint-b1-b2-b4-b8-v2` and
+  `.artifacts/runtime/endpoint-b2-b4-b8-v3` directories. GPU 0-3 returned to
+  4 MiB per rank after graceful shutdown.
