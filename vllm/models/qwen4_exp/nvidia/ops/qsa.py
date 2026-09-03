@@ -58,7 +58,7 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
 ] = {}
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_requests"])
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -457,7 +457,7 @@ def _qsa_xqa_page4_table_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,

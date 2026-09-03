@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
+from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -19,6 +20,14 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle_speculator
+
+
+def test_qsa_request_count_is_not_a_triton_compile_key() -> None:
+    for kernel in (
+        qsa_ops._qsa_mqa_paged_kernel,
+        qsa_ops._qsa_sparse_paged_gqa_splitk_kernel,
+    ):
+        assert "num_requests" in kernel.do_not_specialize
 
 
 @pytest.mark.parametrize(

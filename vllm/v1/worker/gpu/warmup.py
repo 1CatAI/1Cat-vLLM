@@ -30,7 +30,7 @@ def _kernel_prefill_warmup_token_counts(
     model_runner: GPUModelRunner,
     default_prompt_len: int,
 ) -> tuple[int, ...]:
-    """Collect real-prefill sizes advertised by active kernel owners."""
+    """Collect per-request prefill sizes advertised by active kernel owners."""
     max_tokens = min(
         model_runner.scheduler_config.max_num_batched_tokens,
         model_runner.max_model_len,
