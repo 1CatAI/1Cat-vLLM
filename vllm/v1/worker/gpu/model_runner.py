@@ -1482,6 +1482,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run,
+                use_local_model=batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.

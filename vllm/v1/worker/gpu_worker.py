@@ -155,6 +155,15 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._ple_offload_worker_handle: Any | None = None
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and not (
+            envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+            and envs.VLLM_PLE_CPU_OFFLOAD
+            and envs.VLLM_PLE_DISK_OFFLOAD
+        ):
+            raise ValueError(
+                "VLLM_SM70_QWEN38_HYBRID_PLE requires dual compilation plus "
+                "PLE CPU and disk offload"
+            )
         if envs.VLLM_PLE_DISK_OFFLOAD and not envs.VLLM_PLE_CPU_OFFLOAD:
             raise ValueError("VLLM_PLE_DISK_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1")
         self._ple_offload_enabled = self._has_ple_layers()

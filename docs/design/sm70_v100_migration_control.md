@@ -44944,3 +44944,17 @@ Interpretation:
   transfer before the existing byte-exact dequantization kernel. A 131072-row
   CPU microbenchmark with 32703 unique local rows settles at `28.7-28.9 ms`;
   the current random UVA path accounts for roughly 0.3 s at this shape.
+- The synchronous local staging candidate disproved the final sentence above:
+  matched warm prefill was only `5355-5399 tok/s`, while decode remained
+  `85.72 tok/s`. Its measured gather was `60-76 ms`; it could not reproduce
+  the accepted offload graph because GPU N-gram calculation and CPU gathering
+  still began at the PLE layer instead of being submitted before model forward.
+  That candidate was stopped and the local-staging code was removed.
+- The replacement hybrid uses the already validated offload connector for
+  prefill and the already validated rank-local pinned shard for decode. Both
+  storage views coexist in one model process topology: file-backed mmap pages
+  are loaded only by the asynchronous CPU worker, while each TP rank retains
+  its checkpoint-native pinned shard. The compile-phase context makes the large
+  graph wait for the async result and the small graph call local UVA; V2 FULL
+  replay suppresses unnecessary CPU requests. This route still needs one
+  combined real-model quality/performance gate before acceptance.

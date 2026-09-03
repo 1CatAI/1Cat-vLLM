@@ -66,16 +66,52 @@ def test_qwen38_nomtp_dual_compile_contract() -> None:
     )
 
 
-def test_qwen38_pinned_ple_cpu_gather_preserves_rows() -> None:
-    from vllm.models.qwen4_exp.nvidia.ple_layer import (
-        _gather_pinned_ple_rows_cpu,
+def test_qwen38_hybrid_ple_decode_uses_local_module(monkeypatch) -> None:
+    from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
+
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
+
+    class ToyPle(PleOffloadLayer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.initialized_locally = True
+            self._is_cpu_offloaded = True
+
+        def forward_impl(
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            *args: object,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            return hidden_states + input_ids
+
+    layer = ToyPle()
+    with sm70_decode_graph_compilation():
+        output = layer(torch.tensor([2]), torch.tensor([3]))
+
+    assert layer.initialized_locally
+    torch.testing.assert_close(output, torch.tensor([5]))
+
+
+def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
+    from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    launches: list[tuple[int, int]] = []
+    connector = SimpleNamespace(
+        _launch=lambda num_reqs, num_tokens: launches.append(
+            (num_reqs, num_tokens)
+        )
     )
 
-    weight = torch.arange(48, dtype=torch.uint8).reshape(8, 6)
-    input_ids = torch.tensor([5, 1, 5, 0, 7, 1], dtype=torch.int64)
-    output = torch.empty((input_ids.numel(), weight.shape[1]), dtype=torch.uint8)
+    PleOffloadConnector.prepare_forward(
+        connector, 1, 1, dummy_run=False, use_local_model=True
+    )
+    PleOffloadConnector.prepare_forward(
+        connector, 1, 8192, dummy_run=False, use_local_model=False
+    )
 
-    unique_rows = _gather_pinned_ple_rows_cpu(weight, input_ids, output)
-
-    assert unique_rows == 4
-    torch.testing.assert_close(output, weight[input_ids])
+    assert launches == [(1, 8192)]

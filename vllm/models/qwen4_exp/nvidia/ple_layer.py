@@ -369,33 +369,6 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     return capability is not None and capability.to_int() == 70
 
 
-def _gather_pinned_ple_rows_cpu(
-    weight_bytes: torch.Tensor,
-    input_ids: torch.Tensor,
-    output_bytes: torch.Tensor,
-) -> int:
-    """Gather local PLE rows through a deduplicated CPU memory access."""
-    if weight_bytes.device.type != "cpu" or weight_bytes.dtype != torch.uint8:
-        raise TypeError("PLE staged weight must be a CPU uint8 tensor")
-    if input_ids.device.type != "cpu" or input_ids.dtype != torch.int64:
-        raise TypeError("PLE staged IDs must be a CPU int64 tensor")
-    if output_bytes.device.type != "cpu" or output_bytes.dtype != torch.uint8:
-        raise TypeError("PLE staged output must be a CPU uint8 tensor")
-
-    ids_numpy = input_ids.reshape(-1).numpy()
-    unique_ids, inverse = np.unique(ids_numpy, return_inverse=True)
-    if unique_ids.size and (
-        unique_ids[0] < 0 or unique_ids[-1] >= weight_bytes.shape[0]
-    ):
-        raise IndexError(
-            "PLE staged row id out of range: "
-            f"[{unique_ids[0]}, {unique_ids[-1]}] for {weight_bytes.shape[0]} rows"
-        )
-    selected = weight_bytes.numpy()[unique_ids]
-    np.take(selected, inverse, axis=0, out=output_bytes.numpy())
-    return int(unique_ids.size)
-
-
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table backed directly by pinned host memory.
 
@@ -412,8 +385,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         params_dtype: torch.dtype | None,
         padding_size: int,
         prefix: str,
-        layer_name: str,
-        max_lookup_rows: int,
         quant_method: QuantizeMethodBase,
     ) -> None:
         if not is_pin_memory_available():
@@ -459,26 +430,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         self._accelerator_weight_views: dict[int, torch.Tensor] = {}
         self._accelerator_weight_ptrs: dict[int, int] = {}
-        self._staged_device_bytes: dict[int, torch.Tensor] = {}
         self._output_dtype = self.weight_scale.dtype
-        self.layer_name = layer_name
-        self.max_lookup_rows = max_lookup_rows
-        self._staged_prefill_enabled = (
-            envs.VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL
-        )
-        if self._staged_prefill_enabled:
-            self._staged_host_ids = torch.empty(
-                max_lookup_rows,
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-            self._staged_host_bytes = torch.empty(
-                (max_lookup_rows, self.embedding_dim),
-                dtype=torch.uint8,
-                device="cpu",
-                pin_memory=True,
-            )
         logger.info(
             "Qwen4Exp PLE shard allocated in pinned host memory: %s",
             format_gib(self.weight.numel() * self.weight.element_size()),
@@ -504,15 +456,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 view = get_accelerator_view_from_cpu_tensor(self.weight)
             self._accelerator_weight_views[device_index] = view
             self._accelerator_weight_ptrs[device_index] = view.data_ptr()
-        if (
-            self._staged_prefill_enabled
-            and device_index not in self._staged_device_bytes
-        ):
-            self._staged_device_bytes[device_index] = torch.empty(
-                (self.max_lookup_rows, self.embedding_dim),
-                dtype=torch.uint8,
-                device=device,
-            )
         return view
 
     def prepare_accelerator_weight(self) -> None:
@@ -543,53 +486,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             self.weight_scale,
             weight_ptr,
             self.embedding_dim,
-            self.layer_name,
         )
         return output
-
-    def staged_prefill_lookup(
-        self,
-        input_: torch.Tensor,
-        output: torch.Tensor,
-        weight_scale: torch.Tensor,
-    ) -> None:
-        """Gather pinned FP8 rows on CPU, then issue one contiguous H2D copy."""
-        flat_ids = input_.reshape(-1)
-        num_rows = flat_ids.numel()
-        if num_rows > self.max_lookup_rows:
-            raise RuntimeError(
-                "Qwen3.8 staged PLE prefill exceeds its workspace: "
-                f"{num_rows} > {self.max_lookup_rows} rows"
-            )
-        device_index = (
-            torch.accelerator.current_device_index()
-            if input_.device.index is None
-            else input_.device.index
-        )
-        device_bytes = self._staged_device_bytes.get(device_index)
-        if device_bytes is None:
-            raise RuntimeError("Qwen3.8 staged PLE device buffer was not prepared")
-
-        started = time.perf_counter()
-        host_ids = self._staged_host_ids[:num_rows]
-        host_ids.copy_(flat_ids, non_blocking=True)
-        torch.cuda.current_stream(input_.device).synchronize()
-        host_bytes = self._staged_host_bytes[:num_rows]
-        unique_rows = _gather_pinned_ple_rows_cpu(
-            self.weight.view(torch.uint8),
-            host_ids,
-            host_bytes,
-        )
-        device_slice = device_bytes[:num_rows]
-        device_slice.copy_(host_bytes, non_blocking=True)
-        qwen4_exp_ple_fp8_bytes_dequant(device_slice, weight_scale, output)
-        logger.info_once(
-            "Qwen3.8 staged pinned-PLE prefill active: rows=%d unique=%d "
-            "D2H+CPU-gather=%.3f ms; decode retains direct UVA.",
-            num_rows,
-            unique_rows,
-            (time.perf_counter() - started) * 1000.0,
-        )
 
 
 class Qwen4ExpNGramEmbedding(PleOffloadLayer):
@@ -731,8 +629,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 params_dtype=params_dtype,
                 padding_size=divisor,
                 prefix=embedding_prefix,
-                layer_name=layer_name,
-                max_lookup_rows=max_total_tokens * self.ngram_heads,
                 quant_method=quant_method,
             )
         else:
@@ -1021,7 +917,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # GPU workers keep only the scale required to dequantize the FP8 rows
         # returned by the CPU process. The embedding weights live exclusively
         # in that process.
-        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+        if (
+            envs.VLLM_PLE_CPU_OFFLOAD
+            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and not is_offload_process()
+        ):
             retained: set[str] = set()
             for name, loaded_weight in weights:
                 if name != "ngram_embedding.weight_scale":
@@ -1901,21 +1801,8 @@ def qwen4_exp_ple_pinned_gather(
     weight_scale: torch.Tensor,
     weight_ptr: int,
     embedding_dim: int,
-    layer_name: str,
 ) -> None:
     if input_ids.numel() == 0:
-        return
-    if (
-        envs.VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL
-        and input_ids.numel() >= 1024
-    ):
-        layer = get_forward_context().no_compile_layers[layer_name]
-        embedding = layer.ple_embedding.ngram_embedding
-        if not isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
-            raise TypeError(
-                "Qwen3.8 staged PLE route requires Qwen4ExpPinnedHostEmbedding"
-            )
-        embedding.staged_prefill_lookup(input_ids, output, weight_scale)
         return
     block_d = triton.next_power_of_2(embedding_dim)
     _gather_ple_fp8_from_pinned_kernel[(input_ids.numel(),)](
@@ -1935,7 +1822,6 @@ def qwen4_exp_ple_pinned_gather_fake(
     weight_scale: torch.Tensor,
     weight_ptr: int,
     embedding_dim: int,
-    layer_name: str,
 ) -> None:
     return
 

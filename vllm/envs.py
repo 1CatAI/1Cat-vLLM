@@ -561,7 +561,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
-    VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL: bool = False
+    VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
     VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
@@ -3352,12 +3352,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ),
-    # Keep Qwen3.8 decode on low-latency UVA row reads, while large prefill
-    # gathers the same pinned-host shard into a contiguous transfer buffer.
-    "VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL": lambda: bool(
-        os.getenv("VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL", "0")
-        .strip()
-        .lower()
+    # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
+    # uses the asynchronous CPU/disk-mmap offload result.
+    "VLLM_SM70_QWEN38_HYBRID_PLE": lambda: bool(
+        os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile

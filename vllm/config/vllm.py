@@ -1680,13 +1680,22 @@ class VllmConfig:
                     self.parallel_config,
                 )
                 and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
-                and "VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL"
-                not in os.environ
+                and not any(
+                    name in os.environ
+                    for name in (
+                        "VLLM_SM70_QWEN38_HYBRID_PLE",
+                        "VLLM_PLE_CPU_OFFLOAD",
+                        "VLLM_PLE_DISK_OFFLOAD",
+                    )
+                )
             ):
-                os.environ["VLLM_SM70_QWEN38_PINNED_PLE_STAGED_PREFILL"] = "1"
+                os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
+                os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+                os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
                 logger.info_once(
-                    "Auto-enabling staged pinned-PLE prefill for the SM70 "
-                    "Qwen3.8 dual-compile lane; decode keeps direct UVA gathers."
+                    "Auto-enabling hybrid PLE for the SM70 Qwen3.8 "
+                    "dual-compile lane: async disk-mmap prefill plus local "
+                    "pinned-UVA decode."
                 )
             if _is_sm70_dflash2_verifier_contract(
                 self.model_config,
