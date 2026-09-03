@@ -158,6 +158,154 @@ def test_ple_storage_estimate_deduplicates_shared_storage() -> None:
     assert estimated == weight.untyped_storage().nbytes()
 
 
+def test_ple_auto_numa_uses_gpu_local_allowed_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    fake_libnuma = SimpleNamespace(
+        numa_available=lambda: 0,
+        numa_set_localalloc=lambda: calls.append("localalloc"),
+        get_mempolicy=lambda mode, *_: (
+            setattr(mode._obj, "value", 4) or 0  # MPOL_LOCAL
+        ),
+    )
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_AUTO_NUMA", True)
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "os",
+        SimpleNamespace(
+            sched_getaffinity=lambda _: {0, 1, 24, 25},
+            sched_setaffinity=lambda _, cpus: calls.append(set(cpus)),
+        ),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "Process",
+        lambda *_: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform.get_all_device_numa_nodes",
+        lambda: [1, 1, 1, 1],
+    )
+    monkeypatch.setattr(
+        "vllm.utils.cpu_resource_utils.get_allowed_cpu_list",
+        lambda: [
+            SimpleNamespace(id=0, numa_node=0),
+            SimpleNamespace(id=1, numa_node=0),
+            SimpleNamespace(id=24, numa_node=1),
+            SimpleNamespace(id=25, numa_node=1),
+        ],
+    )
+    monkeypatch.setattr("vllm.utils.numa_utils.get_libnuma", lambda: fake_libnuma)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(numa_bind_nodes=None),
+    )
+
+    node = ple_offload_worker._configure_ple_numa_locality(config)
+
+    assert node == 1
+    assert calls == ["localalloc", {24, 25}]
+
+
+def test_ple_auto_numa_keeps_cpu_affinity_when_mempolicy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fail_localalloc() -> None:
+        raise PermissionError("set_mempolicy denied")
+
+    fake_libnuma = SimpleNamespace(
+        numa_available=lambda: 0,
+        numa_set_localalloc=fail_localalloc,
+    )
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_AUTO_NUMA", True)
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "os",
+        SimpleNamespace(
+            sched_getaffinity=lambda _: {0, 1},
+            sched_setaffinity=lambda _, cpus: calls.append(set(cpus)),
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform.get_all_device_numa_nodes",
+        lambda: [0],
+    )
+    monkeypatch.setattr(
+        "vllm.utils.cpu_resource_utils.get_allowed_cpu_list",
+        lambda: [
+            SimpleNamespace(id=0, numa_node=0),
+            SimpleNamespace(id=1, numa_node=0),
+        ],
+    )
+    monkeypatch.setattr("vllm.utils.numa_utils.get_libnuma", lambda: fake_libnuma)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(numa_bind_nodes=None),
+    )
+
+    assert ple_offload_worker._configure_ple_numa_locality(config) == 0
+    assert calls == [{0, 1}]
+
+
+def test_ple_prefault_touches_unique_storage_when_capacity_allows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.arange(8192, dtype=torch.float32))
+    module.register_parameter("weight", weight)
+    module.register_buffer("weight_view", weight.detach().view(4096, 2))
+    required = weight.untyped_storage().nbytes()
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_PREFAULT", True)
+    monkeypatch.setattr(ple_offload_worker.os, "sysconf", lambda _: 4096)
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(
+            total=64 * ple_offload_worker.GiB_bytes,
+            available=32 * ple_offload_worker.GiB_bytes,
+        ),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "Process",
+        lambda _: SimpleNamespace(
+            memory_full_info=lambda: SimpleNamespace(rss=required, swap=0),
+        ),
+    )
+
+    assert ple_offload_worker._prefault_module_storage([module]) == required
+
+
+def test_ple_prefault_skips_when_host_capacity_is_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module = torch.nn.Linear(4, 4, bias=False)
+    required = module.weight.untyped_storage().nbytes()
+    gib = ple_offload_worker.GiB_bytes
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_PREFAULT", True)
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=16 * gib, available=1),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "Process",
+        lambda _: SimpleNamespace(
+            memory_full_info=lambda: SimpleNamespace(rss=0, swap=0)
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger=ple_offload_worker.__name__):
+        touched = ple_offload_worker._prefault_module_storage([module])
+
+    assert touched == 0
+    assert required > 0
+    assert "Skipping PLE RAM prefault" in caplog.text
+
+
 def test_ple_host_memory_pressure_warns_without_rejecting(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
