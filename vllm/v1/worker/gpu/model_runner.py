@@ -117,9 +117,20 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer
+from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 
 logger = init_logger(__name__)
+
+
+def _detach_model_runtime_state(model: nn.Module) -> None:
+    """Drop layer KV views and compilation hooks that can pin a model."""
+    clear_layer_kv_caches(model.modules())
+
+    from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+    for module in model.modules():
+        if isinstance(module, TorchCompileWithNoGuardsWrapper):
+            module.cleanup()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1815,9 +1826,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        # CUDA graph managers own graph pools, captured outputs, and persistent
+        # attention metadata. Drop both target and draft managers first.
+        self.cudagraph_manager = None
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
+
+        target_model = getattr(self, "model", None)
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None:
+            if hasattr(speculator, "query_cudagraph_manager"):
+                speculator.query_cudagraph_manager = None
+            draft_model = getattr(speculator, "model", None)
+            if isinstance(draft_model, nn.Module):
+                _detach_model_runtime_state(draft_model)
+        if isinstance(target_model, nn.Module):
+            _detach_model_runtime_state(target_model)
+
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):
@@ -1825,6 +1851,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
         free_before_shutdown(self.vllm_config)
+        if hasattr(self, "model_state"):
+            del self.model_state
+        if speculator is not None:
+            self.speculator = None
         if hasattr(self, "model"):
             del self.model
 

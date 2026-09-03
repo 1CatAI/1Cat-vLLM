@@ -50,7 +50,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -284,6 +284,22 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # A Mamba state is materialized only when a scheduler chunk ends on
+        # the Mamba group's own block grid. The global cache block size can be
+        # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
+        # with an 816-token recurrent-state block), so it is not a valid grid.
+        mamba_state_block_sizes = {
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
+        assert len(mamba_state_block_sizes) <= 1, (
+            "mamba align scheduling requires a single state block size, "
+            f"got {sorted(mamba_state_block_sizes)}"
+        )
+        self.mamba_state_block_size = (
+            next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
+        )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -400,45 +416,52 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        num_computed_tokens = (
+        start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        # Perform block-aligned splitting at prefill phase, including:
-        # * non-resumed requests: num_computed_tokens < num_prompt_tokens + 0
-        # * resumed requests: num_computed_tokens < (
-        #                       num_prompt_tokens + num_output_tokens
-        #                     )
-        # NOTE: Use `request.num_tokens - 1` to bypass normal decoding.
-        if num_computed_tokens < max(request.num_prompt_tokens, request.num_tokens - 1):
-            # To enable block-aligned caching of the Mamba state, `num_new_tokens`
-            # must be a multiple of `block_size`.
-            # As an exception, if `num_new_tokens` is less than `block_size`, the
-            # state is simply not cached, requiring no special handling.
-            # Additionally, when Eagle mode is enabled, FullAttn prunes the last
-            # matching block. To prevent this from causing a Mamba cache miss, the
-            # last chunk must be not smaller than `block_size`.
-            block_size = self.cache_config.block_size
-            last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
-            if self.use_eagle:
-                last_cache_position = max(last_cache_position - block_size, 0)
-            num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
-            if num_computed_tokens_after_sched < last_cache_position:
-                # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
-            elif (
-                num_computed_tokens
-                < last_cache_position
-                < num_computed_tokens_after_sched
-            ):
-                # force to cache the last chunk
-                num_new_tokens = last_cache_position - num_computed_tokens
-            else:
-                # prefill the last few tokens
-                pass
-        return num_new_tokens
+        # `request.num_tokens - 1` extends prefill handling to resumed requests
+        # replaying output tokens while leaving ordinary decode untouched.
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start >= prefill_end:
+            return num_new_tokens
+
+        block_size = (
+            self.mamba_state_block_size
+            if self.mamba_state_block_size is not None
+            else self.cache_config.block_size
+        )
+        # Prefix lookup is capped at n - 1. Flooring from n would register an
+        # unreachable state whenever the request length is block aligned.
+        last_token = request.num_tokens - 1
+        last_cache_position = last_token - last_token % block_size
+        if self.use_eagle:
+            last_cache_position = max(last_cache_position - block_size, 0)
+
+        end = start + num_new_tokens
+        if end < prefill_end:
+            max_prefill_tokens = self.max_num_scheduled_tokens
+            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
+            if long_prefill_threshold > 0:
+                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
+            aligned_end = end // block_size * block_size
+            if aligned_end > start or block_size <= max_prefill_tokens:
+                end = aligned_end
+
+        # The align allocator materializes one recurrent-state column per
+        # scheduler step. A step spanning multiple state blocks leaves the
+        # interior slots null, so every crossed boundary must end a chunk.
+        next_block_boundary = (start // block_size + 1) * block_size
+        end = min(
+            (
+                stop
+                for stop in (next_block_boundary, last_cache_position)
+                if start < stop < end
+            ),
+            default=end,
+        )
+        return max(end - start, 0)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:

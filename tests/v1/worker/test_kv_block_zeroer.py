@@ -318,9 +318,6 @@ def test_zeroer_supports_heterogeneous_page_sizes() -> None:
     small = torch.ones((3, 8), dtype=torch.int32, device=device)
     large = torch.ones((3, 20), dtype=torch.int32, device=device)
     zeroer = KVBlockZeroer(device, pin_memory=False)
-    zeroer._id_cap = 8
-    zeroer._ids_pinned = torch.empty(8, dtype=torch.int64)
-    zeroer._ids_gpu = torch.empty(8, dtype=torch.int64, device=device)
     zeroer._meta = (
         torch.tensor(
             [small.data_ptr(), large.data_ptr()], dtype=torch.uint64, device=device
@@ -341,3 +338,32 @@ def test_zeroer_supports_heterogeneous_page_sizes() -> None:
     torch.testing.assert_close(large[0], torch.ones_like(large[0]))
     torch.testing.assert_close(large[1], torch.zeros_like(large[1]))
     torch.testing.assert_close(large[2], torch.ones_like(large[2]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_block_ids_are_not_overwritten_while_copy_is_in_flight() -> None:
+    device = torch.device("cuda")
+    storage = torch.ones((4, 4), dtype=torch.int32, device=device)
+    zeroer = KVBlockZeroer(device, pin_memory=True)
+    zeroer._meta = (
+        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
+        torch.tensor([4], dtype=torch.int64, device=device),
+        torch.tensor([4], dtype=torch.int64, device=device),
+        1,
+        4,
+        1,
+    )
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        # Hold both copies behind pending GPU work. The second CPU submission
+        # must not mutate the pinned source used by the first copy.
+        torch.cuda._sleep(10_000_000)
+        zeroer.zero_block_ids([1])
+        zeroer.zero_block_ids([2])
+    stream.synchronize()
+
+    torch.testing.assert_close(storage[0], torch.ones_like(storage[0]))
+    torch.testing.assert_close(storage[1], torch.zeros_like(storage[1]))
+    torch.testing.assert_close(storage[2], torch.zeros_like(storage[2]))
+    torch.testing.assert_close(storage[3], torch.ones_like(storage[3]))

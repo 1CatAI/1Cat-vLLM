@@ -14,11 +14,15 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
+    MambaManager,
     PrefixAnchoredSWAManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
+    MambaSpec,
     PrefixAnchoredSWASpec,
     SlidingWindowSpec,
 )
@@ -586,3 +590,58 @@ def test_prefix_anchored_swa_manager_registered():
     )
     assert isinstance(manager, PrefixAnchoredSWAManager)
     assert manager.decode_sliding_window == 128
+
+
+def test_mamba_honors_eagle_cache_drop() -> None:
+    block_size = 16
+    num_blocks = 5
+    full_group_id, mamba_group_id = 0, 1
+    block_pool = BlockPool(
+        num_gpu_blocks=64,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    block_hashes = [BlockHash(f"block-{i}".encode()) for i in range(num_blocks)]
+
+    for group_id, block_offset in ((full_group_id, 10), (mamba_group_id, 20)):
+        for index, block_hash in enumerate(block_hashes):
+            block_pool.cached_block_hash_to_block.insert(
+                make_block_hash_with_group_id(block_hash, group_id),
+                block_pool.blocks[block_offset + index],
+            )
+
+    full_spec = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float16,
+    )
+    mamba_spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+
+    def hit_length(manager, group_id, spec, use_eagle: bool) -> int:
+        return len(
+            manager.find_longest_cache_hit(
+                block_hashes=block_hashes,
+                max_length=num_blocks * block_size,
+                kv_cache_group_ids=[group_id],
+                block_pool=block_pool,
+                kv_cache_spec=spec,
+                use_eagle=use_eagle,
+                alignment_tokens=block_size,
+            )[0]
+        )
+
+    assert (
+        hit_length(FullAttentionManager, full_group_id, full_spec, False) == num_blocks
+    )
+    assert hit_length(MambaManager, mamba_group_id, mamba_spec, False) == num_blocks
+
+    full_hit = hit_length(FullAttentionManager, full_group_id, full_spec, True)
+    mamba_hit = hit_length(MambaManager, mamba_group_id, mamba_spec, True)
+    assert full_hit == num_blocks - 1
+    assert mamba_hit == full_hit

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,7 +16,15 @@ import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm import envs
-from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative import (
+    SpeculativeConfig,
+    _get_dflash2_checkpoint_draft_tokens,
+)
+from vllm.config.vllm import (
+    _SM70_DFLASH2_VERIFIER_DEFAULTS,
+    _apply_sm70_dflash2_verifier_defaults,
+    _is_sm70_dflash2_verifier_contract,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _is_dflash2_spec_config,
@@ -60,6 +69,103 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     _requires_sm70_tail,
     _selector_walk_kernel,
 )
+
+
+def _sm70_dflash2_verifier_contract_args():
+    model_config = SimpleNamespace(
+        architectures=("Qwen3_5ForConditionalGeneration",),
+        quantization="compressed-tensors",
+        dtype=torch.float16,
+        model_arch_config=SimpleNamespace(
+            quantization_config={
+                "format": "mixed-precision",
+                "config_groups": {
+                    "nvfp4": {"format": "nvfp4-pack-quantized"},
+                    "fp8": {"format": "float-quantized"},
+                },
+            }
+        ),
+        hf_text_config=SimpleNamespace(
+            hidden_size=5120,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            head_dim=256,
+        ),
+    )
+    speculative_config = SimpleNamespace(
+        method="dflash",
+        num_speculative_tokens=7,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(dflash_config={"selector_top_k": 16})
+        ),
+    )
+    parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=4,
+        enable_dbo=False,
+        ubatch_size=0,
+    )
+    return model_config, speculative_config, parallel_config
+
+
+def test_dflash2_checkpoint_draft_tokens_follow_block_contract():
+    hf_config = SimpleNamespace(dflash_config={"block_size": 8, "selector_top_k": 16})
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) == 7
+
+    hf_config.dflash_config["selector_top_k"] = 0
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
+
+    hf_config.dflash_config = {"block_size": 1, "selector_top_k": 16}
+    assert _get_dflash2_checkpoint_draft_tokens(hf_config) is None
+
+
+def test_sm70_dflash2_verifier_contract_is_narrow():
+    args = _sm70_dflash2_verifier_contract_args()
+    assert _is_sm70_dflash2_verifier_contract(*args)
+
+    for config_index, attribute, incompatible_value in (
+        (0, "dtype", torch.bfloat16),
+        (1, "num_speculative_tokens", 5),
+        (2, "pipeline_parallel_size", 2),
+        (2, "enable_dbo", True),
+        (2, "ubatch_size", 2),
+    ):
+        incompatible_args = _sm70_dflash2_verifier_contract_args()
+        setattr(incompatible_args[config_index], attribute, incompatible_value)
+        assert not _is_sm70_dflash2_verifier_contract(*incompatible_args)
+
+    incompatible_args = _sm70_dflash2_verifier_contract_args()
+    incompatible_args[1].draft_model_config.hf_config.dflash_config[
+        "selector_top_k"
+    ] = 8
+    assert not _is_sm70_dflash2_verifier_contract(*incompatible_args)
+
+
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("quantization", [None, "fp8", "compressed-tensors"])
+def test_sm70_dflash2_verifier_contract_is_tp_and_quantization_independent(
+    tensor_parallel_size, quantization
+):
+    args = _sm70_dflash2_verifier_contract_args()
+    args[0].quantization = quantization
+    args[2].tensor_parallel_size = tensor_parallel_size
+    assert _is_sm70_dflash2_verifier_contract(*args)
+
+
+def test_sm70_dflash2_verifier_defaults_preserve_overrides(monkeypatch):
+    for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    overridden_name = "VLLM_SM70_DFLASH2_QPN8_RERANK"
+    monkeypatch.setenv(overridden_name, "0")
+
+    applied = _apply_sm70_dflash2_verifier_defaults()
+
+    assert overridden_name not in applied
+    assert os.environ[overridden_name] == "0"
+    for name, expected_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
+        if name != overridden_name:
+            assert name in applied
+            assert os.environ[name] == expected_value
 
 
 def test_dflash2_gdn_fastpaths_are_default_off(monkeypatch):
@@ -363,6 +469,7 @@ def test_selector_edges_match_sequential_reference():
 
 def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
     def init_base(self, _vllm_config, device):
+        self.device = device
         self.draft_model_config = SimpleNamespace(
             hf_config=SimpleNamespace(dflash_config={"selector_top_k": 16})
         )
@@ -373,6 +480,9 @@ def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):
         self.vocab_size = 31
         self.draft_tokens = torch.empty((2, 7), dtype=torch.int64, device=device)
         self.draft_logits = draft_logits
+        self._draft_logits_init = (
+            None if draft_logits is None else (torch.float32, -float("inf"))
+        )
 
     monkeypatch.setattr(DFlashSpeculator, "__init__", init_base)
 
@@ -384,7 +494,7 @@ def test_selector_leaves_greedy_without_proposal_logits(monkeypatch):
 
 
 def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch):
-    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", False)
     monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
@@ -396,7 +506,7 @@ def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch)
 
 
 def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
-    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
     speculator = DFlash2Speculator(None, torch.device("cpu"))
@@ -409,7 +519,7 @@ def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
 
 
 def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatch):
-    allocated = torch.zeros((2, 7, 31), dtype=torch.float32)
+    allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
     monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
     monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
@@ -448,6 +558,20 @@ def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
     assert speculator.selector_top_k == 16
     assert dtype is torch.float32
     assert fill == float("-inf")
+
+
+def test_probabilistic_dense_fallback_is_allocated_after_initialization(monkeypatch):
+    _stub_base(monkeypatch, None)
+    speculator = DFlash2Speculator(None, torch.device("cpu"))
+    speculator._draft_logits_init = (torch.float32, -float("inf"))
+
+    assert speculator.draft_logits is None
+    speculator._allocate_draft_logits()
+
+    assert speculator.draft_logits is not None
+    assert speculator.draft_logits.shape == (2, 7, 31)
+    assert speculator.draft_logits.dtype is torch.float32
+    assert torch.isneginf(speculator.draft_logits).all()
 
 
 def _sparse_sampling_contract_fixture():

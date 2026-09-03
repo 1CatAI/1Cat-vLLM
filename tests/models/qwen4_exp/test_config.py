@@ -53,7 +53,8 @@ def test_sm70_v2_route_accepts_prefix_caching(
     assert "mrope_interleaved" not in vllm_config.model_config.hf_config.rope_parameters
 
 
-def test_initial_sm70_route_rejects_multimodal_tower(
+@pytest.mark.skip_global_cleanup
+def test_sm70_route_accepts_multimodal_tower_and_preserves_mrope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -79,8 +80,9 @@ def test_initial_sm70_route_rejects_multimodal_tower(
         speculative_config=None,
     )
 
-    with pytest.raises(NotImplementedError, match="--language-model-only"):
-        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+    Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+    assert text_config.rope_parameters == {"mrope_section": [11, 11, 10]}
 
 
 @pytest.mark.parametrize(
@@ -100,6 +102,24 @@ def test_qwen4_exp_defaults_to_v2_even_when_quantized_moe(
     )
 
     assert VllmConfig._is_default_v2_model_runner_model(vllm_config)
+
+
+def test_qwen4_exp_rejects_explicit_v1_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.config.vllm.envs.VLLM_USE_V2_MODEL_RUNNER",
+        False,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=None,
+        model_config=SimpleNamespace(
+            architectures=["Qwen4ExpForCausalLM"],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires Model Runner V2"):
+        VllmConfig.use_v2_model_runner.fget(vllm_config)
 
 
 def test_initial_sm70_v2_route_accepts_native_mtp(

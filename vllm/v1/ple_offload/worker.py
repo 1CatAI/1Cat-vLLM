@@ -20,10 +20,13 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import ctypes
 import multiprocessing.process
+import os
 import signal
 import tempfile
 import threading
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -31,6 +34,7 @@ from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
 
 import msgspec
+import psutil
 import torch
 import torch.distributed as dist
 import zmq
@@ -55,6 +59,7 @@ from vllm.model_executor.model_loader.utils import (
     process_weights_after_loading,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload.protocol import (
@@ -64,6 +69,218 @@ from vllm.v1.ple_offload.protocol import (
 )
 
 logger = init_logger(__name__)
+
+
+def _configure_ple_numa_locality(vllm_config: VllmConfig) -> int | None:
+    """Use GPU-local CPUs without imposing a single-node memory hard limit.
+
+    PLE tables can occupy tens of GiB. Inheriting ``numactl --membind`` from
+    the spawning GPU worker can therefore swap a large part of the table even
+    when another local NUMA node has ample RAM. Use local-first allocation,
+    which retains NUMA locality but permits normal fallback under pressure,
+    and bind future CPU lookup threads to the first visible GPU's node.
+    """
+    if not envs.VLLM_PLE_OFFLOAD_AUTO_NUMA or not hasattr(os, "sched_setaffinity"):
+        return None
+
+    try:
+        from vllm.platforms import current_platform
+        from vllm.utils.cpu_resource_utils import get_allowed_cpu_list
+
+        parallel_config = vllm_config.parallel_config
+        numa_nodes = parallel_config.numa_bind_nodes
+        if numa_nodes is None:
+            numa_nodes = current_platform.get_all_device_numa_nodes()
+        if not numa_nodes:
+            logger.warning(
+                "PLE automatic NUMA placement skipped: GPU topology is unavailable."
+            )
+            return None
+
+        target_node = int(numa_nodes[0])
+        allowed_cpus = set(os.sched_getaffinity(0))
+        local_cpus = {
+            cpu.id
+            for cpu in get_allowed_cpu_list()
+            if cpu.numa_node == target_node and cpu.id in allowed_cpus
+        }
+        if not local_cpus:
+            logger.warning(
+                "PLE automatic NUMA placement skipped: no allowed CPU belongs "
+                "to GPU-local NUMA node %d.",
+                target_node,
+            )
+            return None
+
+    except Exception as error:
+        # Placement is an optimization. Keep the existing functional path on
+        # platforms or containers that cannot expose/change NUMA affinity.
+        logger.warning("PLE automatic NUMA placement failed: %s", error)
+        return None
+
+    # A PLE child spawned from a NUMA-bound GPU worker inherits its strict
+    # MPOL_BIND policy. Relax only this child to local-first allocation so a
+    # table larger than one node can spill into other host RAM, not swap. Keep
+    # this best-effort step independent from CPU affinity: containers often
+    # permit sched_setaffinity while denying set_mempolicy.
+    memory_policy = "inherited"
+    try:
+        from vllm.utils.numa_utils import get_libnuma
+
+        libnuma = get_libnuma()
+        if libnuma is not None and libnuma.numa_available() >= 0:
+            libnuma.numa_set_localalloc()
+            # numa_set_localalloc() has a void C signature and some libnuma
+            # builds only print when set_mempolicy is denied. Read the policy
+            # back before claiming that the strict inherited bind was relaxed.
+            policy_mode = ctypes.c_int(-1)
+            status = libnuma.get_mempolicy(
+                ctypes.byref(policy_mode),
+                None,
+                ctypes.c_ulong(0),
+                None,
+                ctypes.c_ulong(0),
+            )
+            if status != 0 or policy_mode.value != 4:  # MPOL_LOCAL
+                raise OSError(
+                    "numa_set_localalloc did not install MPOL_LOCAL "
+                    f"(status={status}, mode={policy_mode.value})"
+                )
+            memory_policy = "local-first with host-RAM fallback"
+    except Exception as error:
+        logger.warning(
+            "PLE could not relax its inherited NUMA memory policy: %s", error
+        )
+
+    try:
+        os.sched_setaffinity(0, local_cpus)
+    except Exception as error:
+        logger.warning("PLE automatic CPU affinity failed: %s", error)
+        return None
+
+    logger.info(
+        "PLE CPU lookup affinity: GPU-local NUMA node %d, CPUs %s; "
+        "memory policy is %s.",
+        target_node,
+        ",".join(str(cpu) for cpu in sorted(local_cpus)),
+        memory_policy,
+    )
+    return target_node
+
+
+def _iter_unique_module_storage_views(
+    modules: Iterable[torch.nn.Module],
+) -> Iterable[torch.Tensor]:
+    """Yield one byte view spanning each unique materialized CPU storage."""
+    seen: set[tuple[str, int, int]] = set()
+    for module in modules:
+        tensors = (*module.parameters(), *module.buffers())
+        for tensor in tensors:
+            if tensor.device.type == "meta":
+                continue
+            storage = tensor.untyped_storage()
+            storage_bytes = storage.nbytes()
+            key = (str(tensor.device), storage.data_ptr(), storage_bytes)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+                storage,
+                0,
+                (storage_bytes,),
+                (1,),
+            )
+
+
+def _estimate_module_storage_bytes(modules: Iterable[torch.nn.Module]) -> int:
+    """Return unique materialized parameter and buffer storage bytes."""
+    return sum(view.numel() for view in _iter_unique_module_storage_views(modules))
+
+
+def _prefault_module_storage(modules: Iterable[torch.nn.Module]) -> int:
+    """Bring offloaded table pages back to RAM when host capacity permits."""
+    if not envs.VLLM_PLE_OFFLOAD_PREFAULT:
+        return 0
+
+    storage_views = list(_iter_unique_module_storage_views(modules))
+    required_bytes = sum(view.numel() for view in storage_views)
+    if required_bytes == 0:
+        return 0
+
+    process = psutil.Process(os.getpid())
+    process_info = process.memory_full_info()
+    resident_bytes = process_info.rss
+    swap_bytes_before = int(getattr(process_info, "swap", 0))
+    memory = psutil.virtual_memory()
+    headroom_bytes = max(4 * GiB_bytes, memory.total // 10)
+    missing_bytes = min(
+        required_bytes,
+        max(required_bytes - resident_bytes, swap_bytes_before, 0),
+    )
+    if missing_bytes + headroom_bytes > memory.available:
+        logger.warning(
+            "Skipping PLE RAM prefault: %.2f GiB may be non-resident, but "
+            "only %.2f GiB host RAM is available with %.2f GiB reserved "
+            "as runtime headroom.",
+            missing_bytes / GiB_bytes,
+            memory.available / GiB_bytes,
+            headroom_bytes / GiB_bytes,
+        )
+        return 0
+
+    page_bytes = int(os.sysconf("SC_PAGE_SIZE"))
+    chunk_bytes = 256 * 1024 * 1024
+    checksum = 0
+    started = time.perf_counter()
+    for view in storage_views:
+        for start in range(0, view.numel(), chunk_bytes):
+            page_heads = view[start : start + chunk_bytes : page_bytes]
+            checksum ^= int(page_heads.sum(dtype=torch.int64).item())
+    elapsed = time.perf_counter() - started
+    full_info = process.memory_full_info()
+    swap_bytes = int(getattr(full_info, "swap", 0))
+    logger.info(
+        "PLE RAM prefault touched %.2f GiB in %.2f s "
+        "(process RSS %.2f GiB, swap %.2f -> %.2f GiB).",
+        required_bytes / GiB_bytes,
+        elapsed,
+        full_info.rss / GiB_bytes,
+        swap_bytes_before / GiB_bytes,
+        swap_bytes / GiB_bytes,
+    )
+    del checksum
+    return required_bytes
+
+
+def _log_ple_host_memory_capacity(layers: Iterable[PleOffloadLayer]) -> int:
+    """Report whether PLE weights can remain resident without swap pressure."""
+    required_bytes = _estimate_module_storage_bytes(layers)
+    memory = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    # Leave enough memory for the API process, model workers, page tables, and
+    # transient request buffers. This is a warning threshold, not an artificial
+    # model or checkpoint admission gate.
+    headroom_bytes = max(4 * GiB_bytes, memory.total // 10)
+    logger.info(
+        "PLE host-memory requirement: %.2f GiB weights/buffers, %.2f GiB "
+        "currently available of %.2f GiB total (%.2f GiB swap in use).",
+        required_bytes / GiB_bytes,
+        memory.available / GiB_bytes,
+        memory.total / GiB_bytes,
+        swap.used / GiB_bytes,
+    )
+    if required_bytes + headroom_bytes > memory.available:
+        logger.warning(
+            "PLE CPU offload may page its %.2f GiB table: only %.2f GiB host "
+            "RAM is currently available and %.2f GiB is reserved as runtime "
+            "headroom. Paging causes severe, input-dependent prefill and "
+            "decode latency. Free host memory, add RAM, or disable PLE CPU "
+            "offload when the table fits on the accelerators.",
+            required_bytes / GiB_bytes,
+            memory.available / GiB_bytes,
+            headroom_bytes / GiB_bytes,
+        )
+    return required_bytes
 
 
 @dataclass
@@ -245,6 +462,7 @@ class PleOffloadWorker:
     ) -> None:
         """Load PLE weights, accept registrations, and run the request loop."""
         decorate_logs("PleOffloadWorker")
+        _configure_ple_numa_locality(vllm_config)
         ready_reader, ready_writer = ready_pipe
         ready_reader.close()
         shutdown_event = threading.Event()
@@ -295,6 +513,7 @@ class PleOffloadWorker:
             # READY means that the process can immediately serve requests. Wait
             # for every DP/TP worker to register before notifying the parent.
             runner.accept_registrations(pull_socket, num_workers)
+            _prefault_module_storage(runner._layers.values())
             ready_writer.send(
                 {
                     "status": PleOffloadWorker.READY_STR,
@@ -387,6 +606,7 @@ class PleOffloadRunner:
             len(offload_layers),
             sorted(offload_layers),
         )
+        _log_ple_host_memory_capacity(offload_layers.values())
         offload_prefixes = tuple(f"{name}." for name in offload_layers)
 
         # Step 3: filter checkpoint tensors before model.load_weights(). The

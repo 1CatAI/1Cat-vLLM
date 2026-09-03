@@ -97,6 +97,7 @@ from vllm.config.vllm import (
     OptimizationLevel,
     PerformanceMode,
     _sm70_mtp_cudagraph_capture_sizes,
+    _sm70_speculative_cudagraph_capture_sizes,
 )
 from vllm.logger import init_logger, suppress_logging
 from vllm.platforms import CpuArchEnum, current_platform
@@ -1746,11 +1747,15 @@ class EngineArgs:
         usage_context: UsageContext | None,
         model_config: ModelConfig,
     ) -> None:
-        """Apply the 1Cat SM70 MTP baseline knobs that affect decode speed."""
-        if (
+        """Apply the 1Cat SM70 speculative serving defaults."""
+        mtp_defaults_disabled = (
             envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
             or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
-        ):
+        )
+        explicit_dflash = isinstance(self.speculative_config, dict) and (
+            self.speculative_config.get("method") == "dflash"
+        )
+        if mtp_defaults_disabled and not explicit_dflash:
             return
         if not current_platform.is_cuda_alike():
             return
@@ -1758,7 +1763,7 @@ class EngineArgs:
             cap = current_platform.get_device_capability()
         except Exception:
             return
-        if cap is None or cap.major != 7:
+        if cap is None or (cap.major, cap.minor) != (7, 0):
             return
 
         text_config = model_config.hf_text_config
@@ -1827,9 +1832,18 @@ class EngineArgs:
                 f"speculative_config.draft_sample_method={draft_sample_method}"
             )
 
-        if spec_method != "mtp":
+        if "attention_backend" not in self.speculative_config:
+            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
+            profile_updates.append(
+                "speculative_config.attention_backend=FLASH_ATTN_V100"
+            )
+
+        if spec_method == "dflash":
+            # MRV2 owns a separate K+1 draft query batch, so DFlash does not
+            # require B1 or a reduced prefill chunk. Preserve the server's
+            # normal capacity defaults and every explicit user override.
             if profile_updates:
-                logger.info(
+                logger.info_once(
                     "Applied SM70 speculative defaults: %s",
                     ", ".join(profile_updates),
                 )
@@ -1838,16 +1852,6 @@ class EngineArgs:
         if "use_local_argmax_reduction" not in self.speculative_config:
             self.speculative_config["use_local_argmax_reduction"] = True
             profile_updates.append("speculative_config.use_local_argmax_reduction=True")
-
-        if "attention_backend" not in self.speculative_config:
-            self.speculative_config["attention_backend"] = "FLASH_ATTN_V100"
-            profile_updates.append(
-                "speculative_config.attention_backend=FLASH_ATTN_V100"
-            )
-
-        if self.max_num_seqs is None:
-            self.max_num_seqs = 4 if self.tensor_parallel_size >= 4 else 1
-            profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
 
         if has_native_mtp and self.compilation_config.fast_moe_cold_start is None:
             # Native MTP layers are encoded explicitly by MoERunner and do not
@@ -1878,40 +1882,38 @@ class EngineArgs:
                     num_speculative_tokens, ddtree_budget
                 )
             decode_query_len = num_speculative_state_tokens + 1
-            max_num_seqs = max(int(self.max_num_seqs or 1), 1)
-            if envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
+            if self.max_num_seqs is None:
+                # Scheduler defaults are resolved later in VllmConfig. Leave
+                # graph sizing to that stage instead of turning a graph policy
+                # into a service-capacity limit.
+                profile_updates.append("mtp_cudagraph_shapes=deferred_to_scheduler")
+            elif envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
                 cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
-                    max_num_seqs,
+                    self.max_num_seqs,
                     decode_query_len,
                 )
                 profile_updates.append(
                     f"mtp_split_verifier_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
             else:
-                cudagraph_capture_sizes = (
-                    [1, 2, 4, 8, 9, 18]
-                    if self.tensor_parallel_size >= 4
-                    else [1, 2, 4, 8, 9]
-                )
-                cudagraph_capture_sizes = sorted(
-                    set(cudagraph_capture_sizes)
-                    | {
-                        decode_query_len * num_reqs
-                        for num_reqs in range(1, max_num_seqs + 1)
-                    }
+                cudagraph_capture_sizes = _sm70_speculative_cudagraph_capture_sizes(
+                    self.max_num_seqs,
+                    decode_query_len,
                 )
                 profile_updates.append(
-                    "mtp_verifier_cudagraph_shapes="
-                    f"{decode_query_len}x1..{max_num_seqs}"
+                    f"mtp_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
-            self.compilation_config.cudagraph_capture_sizes = cudagraph_capture_sizes
-            self.compilation_config.max_cudagraph_capture_size = max(
-                cudagraph_capture_sizes
-            )
-            profile_updates.append(
-                "cudagraph_capture_sizes="
-                f"{self.compilation_config.cudagraph_capture_sizes}"
-            )
+            if self.max_num_seqs is not None:
+                self.compilation_config.cudagraph_capture_sizes = (
+                    cudagraph_capture_sizes
+                )
+                self.compilation_config.max_cudagraph_capture_size = max(
+                    cudagraph_capture_sizes
+                )
+                profile_updates.append(
+                    "cudagraph_capture_sizes="
+                    f"{self.compilation_config.cudagraph_capture_sizes}"
+                )
 
         if profile_updates:
             logger.info_once(

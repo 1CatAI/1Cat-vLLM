@@ -8,7 +8,7 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import is_dataclass
 from datetime import datetime
@@ -81,7 +81,85 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
-_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
+_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
+_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
+
+_SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # This is the target projection's memory-neutral FP8 layout, not the
+    # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
+    # original layout whenever the exact operator contract is unavailable.
+    "VLLM_SM70_FP8_QPN8": "1",
+    "VLLM_SM70_DFLASH2_QPN8_RERANK": "1",
+    "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "1",
+    "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "0",
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
+}
+
+
+def _is_sm70_dflash2_verifier_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit the quality-audited Qwen3.8 DFlash2 verifier contract.
+
+    Target quantization, KV dtype, TP degree, and service capacity are
+    intentionally not part of this admission. Each fast operator capability-
+    checks its local weight, cache dtype, and live batch shape, then falls back
+    independently when it cannot handle that contract.
+    """
+    if any(
+        config is None
+        for config in (
+            model_config,
+            speculative_config,
+            parallel_config,
+        )
+    ):
+        return False
+
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    draft_hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(draft_hf_config, "dflash_config", None) or {}
+    selector_top_k = (
+        int(dflash_config.get("selector_top_k", 0) or 0)
+        if isinstance(dflash_config, Mapping)
+        else 0
+    )
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    return bool(
+        "Qwen3_5ForConditionalGeneration" in architectures
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 5120
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 4
+        and getattr(hf_text_config, "head_dim", None) == 256
+        and getattr(speculative_config, "method", None) == "dflash"
+        and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
+        and selector_top_k == 16
+        and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
+        and not getattr(parallel_config, "enable_dbo", False)
+        and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
+    )
+
+
+def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
+    """Set quality-audited defaults while preserving every explicit override."""
+    applied = []
+    for env_name, env_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
+        if env_name not in os.environ:
+            os.environ[env_name] = env_value
+            applied.append(env_name)
+    return tuple(applied)
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
@@ -104,6 +182,20 @@ def _sm70_mtp_cudagraph_capture_sizes(
     }
     request_sizes.add(max_graph_reqs)
     return [decode_query_len * size for size in sorted(request_sizes)]
+
+
+def _sm70_speculative_cudagraph_capture_sizes(
+    max_num_seqs: int,
+    decode_query_len: int,
+) -> list[int]:
+    """Return bounded auxiliary and verifier shapes without a TP contract."""
+    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
+        max_num_seqs,
+        decode_query_len,
+    )
+    return sorted(
+        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
+    )
 
 
 class OptimizationLevel(IntEnum):
@@ -492,7 +584,8 @@ class VllmConfig:
     performance_mode: PerformanceMode = "balanced"
     """Performance mode for runtime behavior, 'balanced' is the default.
     'interactivity' favors low end-to-end per-request latency at small batch
-    sizes (fine-grained CUDA graphs, latency-oriented kernels).
+    sizes (fine-grained CUDA graphs, latency-oriented kernels). For explicit
+    DFlash on SM70, it also selects the audited B1/q4096 capacity defaults.
     'throughput' favors aggregate tokens/sec at high concurrency (larger CUDA
     graphs, more aggressive batching, throughput-oriented kernels)."""
 
@@ -660,10 +753,23 @@ class VllmConfig:
     @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        architectures = (
+            getattr(self.model_config, "architectures", [])
+            if self.model_config is not None
+            else []
+        )
+        is_qwen4_exp = any(
+            architecture.startswith("Qwen4ExpFor") for architecture in architectures
+        )
         is_mrv2_dflash = (
             self.speculative_config is not None and self.speculative_config.use_dflash()
         )
         if use_v2_model_runner is not None:
+            if is_qwen4_exp and not use_v2_model_runner:
+                raise ValueError(
+                    "Qwen4Exp requires Model Runner V2 for its QSA ring cache "
+                    "and rollback-safe PLE n-gram context."
+                )
             if is_mrv2_dflash and not use_v2_model_runner:
                 raise ValueError(
                     "method='dflash' is implemented only by Model Runner V2. "
@@ -1513,6 +1619,19 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
+            if _is_sm70_dflash2_verifier_contract(
+                self.model_config,
+                self.speculative_config,
+                self.parallel_config,
+            ):
+                for env_name in _apply_sm70_dflash2_verifier_defaults():
+                    logger.info_once(
+                        "Auto-setting %s=%s for the quality-audited SM70 "
+                        "Qwen3.8 DFlash2 verification baseline. "
+                        "Set it explicitly to override.",
+                        env_name,
+                        os.environ[env_name],
+                    )
         sm70_flash_0dot3_compile_graph = envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
         sm70_flash_no_compile_graph = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE
@@ -1578,31 +1697,15 @@ class VllmConfig:
                             )
                         else:
                             cudagraph_capture_sizes = (
-                                [1, 2, 4, 8, 9, 18]
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else [1, 2, 4, 8, 9]
-                            )
-                            max_graph_reqs = (
-                                4
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else 1
-                            )
-                            max_graph_reqs = min(
-                                max(int(self.scheduler_config.max_num_seqs), 1),
-                                max_graph_reqs,
-                            )
-                            cudagraph_capture_sizes = sorted(
-                                set(cudagraph_capture_sizes)
-                                | {
-                                    decode_query_len * num_reqs
-                                    for num_reqs in range(1, max_graph_reqs + 1)
-                                }
+                                _sm70_speculative_cudagraph_capture_sizes(
+                                    self.scheduler_config.max_num_seqs,
+                                    decode_query_len,
+                                )
                             )
                             logger.info_once(
-                                "Using SM70 speculative verifier cudagraph shapes "
-                                "%sx1..%s for Flash-V100 compile graph.",
-                                decode_query_len,
-                                max_graph_reqs,
+                                "Using bounded SM70 speculative cudagraph token "
+                                "shapes %s for Flash-V100 compile graph.",
+                                tuple(cudagraph_capture_sizes),
                             )
                     elif cudagraph_capture_sizes != [1, 2]:
                         logger.info_once(
@@ -2251,7 +2354,7 @@ class VllmConfig:
         """
         if self.speculative_config is not None:
             scheduled_token_delta = (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             )
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -2269,7 +2372,10 @@ class VllmConfig:
                     " to accommodate the additional draft token slots, or decrease"
                     " num_speculative_tokens or max_num_seqs."
                 )
-            if self.scheduler_config.max_num_scheduled_tokens < 8192:
+            if (
+                scheduled_token_delta > 0
+                and self.scheduler_config.max_num_scheduled_tokens < 8192
+            ):
                 logger.warning_once(
                     "max_num_scheduled_tokens is set to"
                     f" {self.scheduler_config.max_num_scheduled_tokens} based on"
@@ -2281,7 +2387,7 @@ class VllmConfig:
 
             max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
             if max_num_batched_tokens < max_num_scheduled_tokens + (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             ):
                 raise ValueError(
@@ -2490,16 +2596,15 @@ class VllmConfig:
         if (
             compile_range_end is not None
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
             and compilation_config.mode == CompilationMode.VLLM_COMPILE
             and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         ):
-            # FULL decode capture can enter the compiled piecewise wrapper with
+            # FULL capture can enter the compiled piecewise wrapper with
             # max_num_batched_tokens + one decode token. Keep scheduler capacity
             # unchanged, but allow the wrapper to select a compiled range.
             compile_range_end += 1
             logger.info_once(
-                "Extending SM70 Flash-V100 0.0.3 decode-only compile range "
+                "Extending SM70 Flash-V100 0.0.3 compile range "
                 "endpoint to %d for CUDA graph capture.",
                 compile_range_end,
             )

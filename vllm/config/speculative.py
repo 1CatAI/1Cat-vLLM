@@ -82,6 +82,16 @@ RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
 
 
+def _get_dflash2_checkpoint_draft_tokens(hf_config: Any) -> int | None:
+    """Return the checkpoint-native DFlash2 draft width when declared."""
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
+    block_size = int(dflash_config.get("block_size", 0) or 0)
+    if selector_top_k <= 0 or block_size <= 1:
+        return None
+    return block_size - 1
+
+
 def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     """Return the block width produced by the DFlash checkpoint itself.
 
@@ -96,10 +106,8 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
 
     draft_model_config = getattr(speculative_config, "draft_model_config", None)
     hf_config = getattr(draft_model_config, "hf_config", None)
-    dflash_config = getattr(hf_config, "dflash_config", None) or {}
-    trained_tokens = int(dflash_config.get("block_size", 0) or 0) - 1
-    has_selector = int(dflash_config.get("selector_top_k", 0) or 0) > 0
-    if has_selector and 0 < trained_tokens < verify_tokens:
+    trained_tokens = _get_dflash2_checkpoint_draft_tokens(hf_config)
+    if trained_tokens is not None and trained_tokens < verify_tokens:
         return trained_tokens
     return verify_tokens
 
@@ -123,7 +131,8 @@ class SpeculativeConfig:
     # General speculative decoding control
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
-    number in the draft model config if present, otherwise, it is required."""
+    number in the draft model config if present; selector-based DFlash2 uses
+    checkpoint ``block_size - 1``. Otherwise, it is required."""
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""
@@ -955,6 +964,18 @@ class SpeculativeConfig:
                             f" must be divisible by {n_predict=}"
                         )
 
+                if self.num_speculative_tokens is None and self.use_dflash():
+                    native_draft_tokens = _get_dflash2_checkpoint_draft_tokens(
+                        self.draft_model_config.hf_config
+                    )
+                    if native_draft_tokens is not None:
+                        self.num_speculative_tokens = native_draft_tokens
+                        logger.info_once(
+                            "Defaulting DFlash2 num_speculative_tokens to %d "
+                            "from checkpoint block_size.",
+                            native_draft_tokens,
+                        )
+
                 if self.num_speculative_tokens is None:
                     raise ValueError(
                         "A speculative model was provided, but "
@@ -1343,6 +1364,19 @@ class SpeculativeConfig:
             # Since we do not slice the draft tokens
             slots_per_req += 1
         return slots_per_req
+
+    @property
+    def max_num_new_target_slots_for_drafting(self) -> int:
+        """Return extra slots inserted into the target runner's input batch.
+
+        MRV2 DFlash builds its K+1 query batch in a separate ``InputBuffers``
+        instance. Its K draft slots therefore consume draft-runner capacity,
+        not the target scheduler's prefill budget. Other proposers retain the
+        existing shared-batch accounting.
+        """
+        if self.use_dflash():
+            return 0
+        return self.max_num_new_slots_for_drafting
 
     def use_gemma4_mtp(self) -> bool:
         return (

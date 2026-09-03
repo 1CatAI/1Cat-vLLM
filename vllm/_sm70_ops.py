@@ -27,12 +27,50 @@ def _maybe_load_fp8_qpn8_library() -> None:
     online_override = os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8")
     generic_enabled = generic_override == "1"
     specific_enabled = generic_override != "0" and specific_override == "1"
-    online_enabled = online_override != "0"
+    online_enabled = online_override == "1"
     if generic_enabled or specific_enabled or online_enabled:
         torch.ops.load_library(library_path)
 
 
 _maybe_load_fp8_qpn8_library()
+
+
+def _nvfp4_qpn2_prefill_library_path() -> str | None:
+    library_path = os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY")
+    if library_path is not None:
+        return library_path
+    bundled = sorted(
+        Path(__file__).resolve().parent.glob("_sm70_nvfp4_qpn2_prefill_C*.so")
+    )
+    return str(bundled[-1]) if bundled else None
+
+
+def has_deferred_nvfp4_qpn2_prefill_library() -> bool:
+    """Return whether a separate large-M prefill fragment is configured."""
+    return _nvfp4_qpn2_prefill_library_path() is not None
+
+
+def load_deferred_nvfp4_qpn2_prefill_library() -> bool:
+    """Load an isolated large-M QPN2-packed prefill fragment.
+
+    Source-overlay deployments can retain a previously validated decode
+    extension while adding the newer, large-M-only QPN2-packed prefill op.
+    The op owns its temporary dense workspace, so registration before AOT
+    prefill compilation does not retain the large buffer during decode graph
+    capture.
+    Production wheels normally link the op into ``vllm._C``; a bundled
+    fragment is only used when the main extension does not provide it.
+    """
+    if hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out"):
+        return True
+
+    library_path = _nvfp4_qpn2_prefill_library_path()
+    if library_path is not None:
+        torch.ops.load_library(library_path)
+    return hasattr(torch.ops._C, "nvfp4_qpn4_prefill_sm70_out")
+
+
+load_deferred_nvfp4_qpn2_prefill_library()
 
 
 def _maybe_load_nvfp4_qpn_m1_library() -> None:
@@ -1239,6 +1277,63 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_dispatch_sm70_out"):
         tm_k_ld: int,
         tm_q_ld: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def nvfp4_qpn2_prefill_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    split_k: int,
+    accumulator_chains: int,
+    tm_weight: torch.Tensor,
+    tm_scales: torch.Tensor,
+    tm_group_size: int,
+    tm_k_ld: int,
+    tm_q_ld: int,
+    gated_silu: bool,
+    min_prefill_m: int,
+) -> None:
+    """Keep QPN2 decode and QPN2-packed prefill behind one opaque op."""
+    _op("nvfp4_qpn2_prefill_dispatch_sm70_out")(
+        out,
+        input,
+        codes,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+        tm_weight,
+        tm_scales,
+        tm_group_size,
+        tm_k_ld,
+        tm_q_ld,
+        gated_silu,
+        min_prefill_m,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_prefill_dispatch_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_prefill_dispatch_sm70_out")
+    def _nvfp4_qpn2_prefill_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+        split_k: int,
+        accumulator_chains: int,
+        tm_weight: torch.Tensor,
+        tm_scales: torch.Tensor,
+        tm_group_size: int,
+        tm_k_ld: int,
+        tm_q_ld: int,
+        gated_silu: bool,
+        min_prefill_m: int,
     ) -> None:
         return None
 

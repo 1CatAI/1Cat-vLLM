@@ -45,6 +45,7 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,15 @@ class GatedResidual(nn.Module):
 
     def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.use_combine:
+            fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
+                self.input_mix_weight_down_block_inject,
+                self.input_mix_weight_up,
+                xn,
+                getattr(self, "_sm70_qwen38_fp16_fused_hc", False),
+            )
+            if fused_fp16 is not None:
+                return fused_fp16
+
             fused = maybe_apply_fused_hc(
                 self.input_mix_weight_down_block_inject,
                 self.input_mix_weight_up,

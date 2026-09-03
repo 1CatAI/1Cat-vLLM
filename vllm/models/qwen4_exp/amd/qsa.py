@@ -86,6 +86,12 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         return True
 
     @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        # QSA chooses its split-K reduction depth from the runtime batch
+        # shape, so it cannot inherit FlashAttention's stronger guarantee.
+        return False
+
+    @classmethod
     def supports_kv_connector(cls) -> bool:
         return False
 

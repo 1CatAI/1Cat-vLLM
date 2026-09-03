@@ -352,7 +352,7 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         self._cached_candidate_scores = None
         if (
-            self.draft_logits is not None
+            self._draft_logits_init is not None
             and envs.VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION
         ):
             self._cached_candidate_scores = torch.full(
@@ -388,10 +388,6 @@ class DFlash2Speculator(DFlashSpeculator):
                 device=device,
             )
         self._use_sm70_tail = _requires_sm70_tail(device, self.draft_block)
-        if self.draft_logits is not None:
-            # The cache kernel writes only K columns; all other vocabulary
-            # columns must remain impossible.
-            self.draft_logits.fill_(-float("inf"))
 
         self._ngram_assist: DFlash2NgramAssist | None = None
         self._ngram_num_hits = 0

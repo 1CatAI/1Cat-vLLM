@@ -57,11 +57,16 @@ at::Tensor flash_attention_grouped_verify_paged(
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool one_pass);
 
+int64_t flash_attention_grouped_verify_max_query_tokens();
+
+int64_t flash_attention_grouped_sparse_page4_abi_version();
+
 at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
-    const float softmax_scale);
+    const float softmax_scale, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale);
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
     const at::Tensor& logical_indices, const at::Tensor& block_table,

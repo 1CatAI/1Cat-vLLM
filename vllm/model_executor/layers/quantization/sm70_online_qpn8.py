@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Narrow online QPN8 route for Qwen4Exp FP16 decode projections on SM70."""
+"""Opt-in online QPN8 route for Qwen4Exp FP16 decode projections on SM70.
+
+This route requantizes selected dense checkpoint weights at load time. It is a
+performance experiment rather than a precision-preserving checkpoint route and
+therefore requires an explicit environment opt-in.
+"""
 
 from __future__ import annotations
 
@@ -185,9 +190,10 @@ def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     layer.sm70_fp8_qpn8 = True
     layer.sm70_fp8_prefill_exact_dense_workspace_ptr = workspace.data_ptr()
     setattr(layer, _STATE_ATTR, True)
-    logger.info_once(
-        "SM70 Qwen4Exp online channel-QPN8 enabled for selected FP16 decode "
-        "projections."
+    logger.warning_once(
+        "Experimental SM70 Qwen4Exp online channel-QPN8 is requantizing "
+        "selected FP16 decode projections; model-level quality is not "
+        "guaranteed."
     )
     return True
 

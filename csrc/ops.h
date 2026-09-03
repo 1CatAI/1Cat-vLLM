@@ -255,6 +255,13 @@ void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
                                   int64_t tm_group_size, int64_t tm_k_ld,
                                   int64_t tm_q_ld, bool gated_silu);
 
+void nvfp4_qpn2_prefill_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m);
+
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,

@@ -4133,45 +4133,59 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             layer_name,
             hidden_states,
         )
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
-        mixed_qkvz = _sm70_dump_gdn_projection_tensor(
-            "in_proj_qkvz", layer_name, mixed_qkvz
+        use_qwen38_fused_input = bool(
+            getattr(self, "sm70_qwen38_fp16_fused_input", False)
+            and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
-
-        if self.gqa_interleaved_layout:
-            # Qwen3-Next: unpack the interleaved GQA layout
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                mixed_qkvz, ba
+        if use_qwen38_fused_input:
+            assert self.in_proj_ba is not None
+            mixed_qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
+                hidden_states,
+                self.in_proj_qkvz.weight,
+                self.in_proj_ba.weight,
             )
-            query, key, value = map(
-                lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
-            )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
-        else:
-            # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
-            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            z_size = self.value_dim // self.tp_size
-            mixed_qkv = mixed_qkvz[..., :qkv_size]
-            mixed_qkv = _sm70_dump_gdn_projection_tensor(
-                "split_mixed_qkv", layer_name, mixed_qkv
-            )
-            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
-                mixed_qkv = mixed_qkv.contiguous()
-            z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
-            z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
-            ba_size = ba.shape[-1] // 2
-            b = ba[..., :ba_size]
-            a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
-            if self.disable_tp_for_ba_proj and self.tp_size > 1:
-                ba_chunk = self.num_v_heads // self.tp_size
-                ba_start = self.tp_rank * ba_chunk
-                b = b[:, ba_start : ba_start + ba_chunk]
-                a = a[:, ba_start : ba_start + ba_chunk]
-            b = b.contiguous()
-            a = a.contiguous()
+        else:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = _sm70_dump_gdn_projection_tensor(
+                "in_proj_qkvz", layer_name, mixed_qkvz
+            )
+            ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
+
+            if self.gqa_interleaved_layout:
+                # Qwen3-Next: unpack the interleaved GQA layout
+                query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                    mixed_qkvz, ba
+                )
+                query, key, value = map(
+                    lambda x: rearrange(x, "l p d -> l (p d)"),
+                    (query, key, value),
+                )
+                mixed_qkv = torch.cat((query, key, value), dim=-1)
+            else:
+                # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
+                qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+                z_size = self.value_dim // self.tp_size
+                mixed_qkv = mixed_qkvz[..., :qkv_size]
+                mixed_qkv = _sm70_dump_gdn_projection_tensor(
+                    "split_mixed_qkv", layer_name, mixed_qkv
+                )
+                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                    mixed_qkv = mixed_qkv.contiguous()
+                z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+                z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
+                z = z.reshape(z.size(0), -1, self.head_v_dim)
+                ba_size = ba.shape[-1] // 2
+                b = ba[..., :ba_size]
+                a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+                if self.disable_tp_for_ba_proj and self.tp_size > 1:
+                    ba_chunk = self.num_v_heads // self.tp_size
+                    ba_start = self.tp_rank * ba_chunk
+                    b = b[:, ba_start : ba_start + ba_chunk]
+                    a = a[:, ba_start : ba_start + ba_chunk]
+                b = b.contiguous()
+                a = a.contiguous()
 
         if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
             70

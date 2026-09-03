@@ -405,6 +405,7 @@ ModalityStr = Literal[
     "prompt_embeds",
 ]
 _T = TypeVar("_T")
+_AsyncMultiModalItem: TypeAlias = Callable[[], Awaitable[tuple[object, str | None]]]
 
 
 # Backward compatibility for single item input
@@ -798,19 +799,24 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[tuple[object, str | None]]
         return MultiModalContentParser(self, mm_processor_kwargs=mm_processor_kwargs)
 
 
-class AsyncMultiModalItemTracker(
-    BaseMultiModalItemTracker[Awaitable[tuple[object, str | None]]]
-):
+class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[_AsyncMultiModalItem]):
     async def resolve_items(
         self,
     ) -> tuple[MultiModalDataDict | None, MultiModalUUIDDict | None]:
         if not self._items_by_modality:
             return None, None
 
-        resolved_items_by_modality = {
-            modality: await asyncio.gather(*coros)
-            for modality, coros in self._items_by_modality.items()
-        }
+        resolved_items_by_modality: dict[str, list[Any]] = {}
+        for modality, items in self._items_by_modality.items():
+            results = await asyncio.gather(
+                *(item() for item in items), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    # Drain every fetch in this modality before propagating an
+                    # error so no network/thread-pool work is left detached.
+                    raise result
+            resolved_items_by_modality[modality] = results
 
         mm_processor = (
             self.mm_processor if self._model_config.is_multimodal_model else None
@@ -1062,6 +1068,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
     def model_config(self) -> ModelConfig:
         return self._tracker.model_config
 
+    async def _item_with_uuid_async(self, item: object, uuid: str | None):
+        return item, uuid
+
     @override
     def parse_prompt_embeds(self, data: str) -> None:
         """Schedule async prompt embeds decode and store the coroutine in the tracker.
@@ -1073,8 +1082,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         if not self.model_config.enable_prompt_embeds:
             raise ValueError(_ENABLE_PROMPT_EMBEDS_ERROR)
 
-        coro = self._load_prompt_embeds_async(data.encode())
-        self._tracker.add("prompt_embeds", coro)
+        self._tracker.add(
+            "prompt_embeds", partial(self._load_prompt_embeds_async, data.encode())
+        )
         self._add_placeholder("prompt_embeds", PROMPT_EMBEDS_PLACEHOLDER_TOKEN)
 
     async def _load_prompt_embeds_async(
@@ -1092,9 +1102,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         return image, uuid
 
     def parse_image(self, image_url: str | None, uuid: str | None = None) -> None:
-        coro = self._image_with_uuid_async(image_url, uuid)
-
-        placeholder = self._tracker.add("image", coro)
+        placeholder = self._tracker.add(
+            "image", partial(self._image_with_uuid_async, image_url, uuid)
+        )
         self._add_placeholder("image", placeholder)
 
     def parse_image_embeds(
@@ -1108,25 +1118,19 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
                 "You must set `--enable-mm-embeds` to input `image_embeds`"
             )
 
-        future = asyncio.Future[
-            tuple[torch.Tensor | dict[str, torch.Tensor] | None, str | None]
-        ]()
-
         if isinstance(image_embeds, dict):
             embeds = {
                 k: self._connector.fetch_image_embedding(v)
                 for k, v in image_embeds.items()
             }
-            future.set_result((embeds, uuid))
+        elif isinstance(image_embeds, str):
+            embeds = self._connector.fetch_image_embedding(image_embeds)
+        else:
+            embeds = None
 
-        if isinstance(image_embeds, str):
-            embedding = self._connector.fetch_image_embedding(image_embeds)
-            future.set_result((embedding, uuid))
-
-        if image_embeds is None:
-            future.set_result((None, uuid))
-
-        placeholder = self._tracker.add("image_embeds", future)
+        placeholder = self._tracker.add(
+            "image_embeds", partial(self._item_with_uuid_async, embeds, uuid)
+        )
         self._add_placeholder("image", placeholder)
 
     def parse_audio_embeds(
@@ -1140,25 +1144,19 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
                 "You must set `--enable-mm-embeds` to input `audio_embeds`"
             )
 
-        future = asyncio.Future[
-            tuple[torch.Tensor | dict[str, torch.Tensor] | None, str | None]
-        ]()
-
         if isinstance(audio_embeds, dict):
             embeds = {
                 k: self._connector.fetch_audio_embedding(v)
                 for k, v in audio_embeds.items()
             }
-            future.set_result((embeds, uuid))
+        elif isinstance(audio_embeds, str):
+            embeds = self._connector.fetch_audio_embedding(audio_embeds)
+        else:
+            embeds = None
 
-        if isinstance(audio_embeds, str):
-            embedding = self._connector.fetch_audio_embedding(audio_embeds)
-            future.set_result((embedding, uuid))
-
-        if audio_embeds is None:
-            future.set_result((None, uuid))
-
-        placeholder = self._tracker.add("audio_embeds", future)
+        placeholder = self._tracker.add(
+            "audio_embeds", partial(self._item_with_uuid_async, embeds, uuid)
+        )
         self._add_placeholder("audio", placeholder)
 
     def parse_image_pil(
@@ -1166,13 +1164,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         image_pil: Image.Image | None,
         uuid: str | None = None,
     ) -> None:
-        future = asyncio.Future[tuple[Image.Image | None, str | None]]()
-        if image_pil:
-            future.set_result((image_pil, uuid))
-        else:
-            future.set_result((None, uuid))
-
-        placeholder = self._tracker.add("image", future)
+        placeholder = self._tracker.add(
+            "image", partial(self._item_with_uuid_async, image_pil, uuid)
+        )
         self._add_placeholder("image", placeholder)
 
     async def _audio_with_uuid_async(self, audio_url: str | None, uuid: str | None):
@@ -1182,9 +1176,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         return audio, uuid
 
     def parse_audio(self, audio_url: str | None, uuid: str | None = None) -> None:
-        coro = self._audio_with_uuid_async(audio_url, uuid)
-
-        placeholder = self._tracker.add("audio", coro)
+        placeholder = self._tracker.add(
+            "audio", partial(self._audio_with_uuid_async, audio_url, uuid)
+        )
         self._add_placeholder("audio", placeholder)
 
     def parse_input_audio(
@@ -1210,9 +1204,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
         return video, uuid
 
     def parse_video(self, video_url: str | None, uuid: str | None = None) -> None:
-        coro = self._video_with_uuid_async(video_url, uuid)
-
-        placeholder = self._tracker.add("video", coro)
+        placeholder = self._tracker.add(
+            "video", partial(self._video_with_uuid_async, video_url, uuid)
+        )
         self._add_placeholder("video", placeholder)
 
         # Extract audio from video if use_audio_in_video is True
@@ -1221,8 +1215,9 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
             and self._mm_processor_kwargs
             and self._mm_processor_kwargs.get("use_audio_in_video", False)
         ):
-            audio_coro = self._audio_with_uuid_async(video_url, uuid)
-            audio_placeholder = self._tracker.add("audio", audio_coro)
+            audio_placeholder = self._tracker.add(
+                "audio", partial(self._audio_with_uuid_async, video_url, uuid)
+            )
             self._add_placeholder("audio", audio_placeholder)
 
 
@@ -1834,10 +1829,39 @@ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
                         parameter="tool_calls",
                     )
 
-                # if arguments is None or empty string, set to {}
+                # Chat templates require tool arguments to be JSON objects.
                 if content := function.get("arguments"):
-                    if not isinstance(content, (dict, list)):
-                        function["arguments"] = json.loads(content)
+                    if isinstance(content, dict):
+                        parsed = content
+                    else:
+                        if isinstance(content, str):
+                            try:
+                                parsed = json.loads(content)
+                            except json.JSONDecodeError:
+                                # Historical malformed calls must not make all
+                                # subsequent conversation turns unrecoverable.
+                                logger.warning(
+                                    "Tool call %r has arguments that are not valid "
+                                    "JSON (%d chars); coercing to an empty object "
+                                    "so the conversation can continue.",
+                                    function.get("name"),
+                                    len(content),
+                                )
+                                parsed = None
+                        else:
+                            parsed = content
+
+                        if not isinstance(parsed, dict):
+                            if parsed is not None:
+                                logger.warning(
+                                    "Tool call %r arguments decoded to %s, not a "
+                                    "JSON object; coercing to an empty object.",
+                                    function.get("name"),
+                                    type(parsed).__name__,
+                                )
+                            parsed = {}
+
+                    function["arguments"] = parsed
                 else:
                     function["arguments"] = {}
 

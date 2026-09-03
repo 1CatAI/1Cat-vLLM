@@ -22,12 +22,22 @@ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _prepare_compact_slot_groups,
     _prepare_single_token_slots,
     _single_token_weighted_reduce,
+    _use_compact_grouped,
     _use_qwen38_indexed_prefill,
     _use_qwen38_qpn_m1_decode,
     _use_qwen38_qpn_mtp5_decode,
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
+
+
+@pytest.mark.parametrize(
+    ("top_k", "compact_tokens", "dense_tokens"),
+    [(8, 10, 11), (10, 8, 9)],
+)
+def test_nvfp4_compact_work_limit_is_routed_rows(top_k, compact_tokens, dense_tokens):
+    assert _use_compact_grouped(compact_tokens, top_k)
+    assert not _use_compact_grouped(dense_tokens, top_k)
 
 
 def _mixed_config() -> ModelOptMixedPrecisionConfig:
@@ -274,7 +284,7 @@ def test_nvfp4_sm70_moe_owns_routing_without_generic_modular_wrapper():
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an exact SM70 CUDA device",
 )
-@pytest.mark.parametrize("total_slots", (8, 72, 80, 100))
+@pytest.mark.parametrize("total_slots", (8, 72, 80))
 def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent(total_slots):
     sorted_expert_ids = (
         torch.arange(total_slots, dtype=torch.int32, device="cuda") // 3
@@ -289,6 +299,18 @@ def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent(total_slot
         torch.arange(total_slots + 1, dtype=torch.int32, device="cpu"),
     )
     assert torch.equal(active_expert_ids.cpu(), sorted_expert_ids.cpu())
+
+
+@pytest.mark.parametrize("total_slots", (81, 100))
+def test_nvfp4_compact_groups_reject_work_above_80_rows(total_slots):
+    sorted_expert_ids = torch.empty(total_slots, dtype=torch.int32)
+    compact_offsets = torch.empty(total_slots + 1, dtype=torch.int32)
+    active_expert_ids = torch.empty(total_slots, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="active-expert slots"):
+        _prepare_compact_slot_groups(
+            sorted_expert_ids, compact_offsets, active_expert_ids
+        )
 
 
 @pytest.mark.skipif(

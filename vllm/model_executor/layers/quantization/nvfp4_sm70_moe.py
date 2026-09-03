@@ -48,8 +48,7 @@ _SUPPORTED_CONTRACTS: Final = {
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
-_COMPACT_GROUPED_MAX_TOKENS: Final = 10
-_MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
+_COMPACT_GROUPED_MAX_SLOTS: Final = 80
 _QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
@@ -296,8 +295,7 @@ def _prepare_compact_slot_groups(
     active_expert_ids: torch.Tensor,
 ) -> None:
     total_slots = sorted_expert_ids.numel()
-    max_slots = _COMPACT_GROUPED_MAX_TOKENS * _MAX_SUPPORTED_TOP_K
-    if not (0 < total_slots <= max_slots):
+    if not (0 < total_slots <= _COMPACT_GROUPED_MAX_SLOTS):
         raise ValueError(f"Unsupported SM70 NVFP4 active-expert slots: {total_slots}")
     block = triton.next_power_of_2(total_slots + 1)
     # TurboMind's compact grouped dispatch forces one row per group. Keep each
@@ -312,6 +310,12 @@ def _prepare_compact_slot_groups(
         BLOCK=block,
         num_warps=1,
     )
+
+
+def _use_compact_grouped(num_tokens: int, top_k: int) -> bool:
+    """Bound compact dispatch by its routed-row workload, not batch size."""
+    total_slots = num_tokens * top_k
+    return 0 < total_slots <= _COMPACT_GROUPED_MAX_SLOTS
 
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
@@ -638,7 +642,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
-        layer.sm70_nvfp4_compact_grouped_max_tokens = _COMPACT_GROUPED_MAX_TOKENS
+        layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight
@@ -652,13 +656,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
             "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
-            "graph_safe_decode=B1-B%d, compact_grouped_decode=B1-B%d).",
+            "graph_safe_decode=B1-B%d, compact_grouped_decode<=%d routed rows).",
             hidden,
             intermediate,
             num_experts,
             layer.sm70_nvfp4_top_k,
             _GRAPH_SAFE_MAX_TOKENS,
-            _COMPACT_GROUPED_MAX_TOKENS,
+            _COMPACT_GROUPED_MAX_SLOTS,
         )
         if fused_swiglu_prefill:
             logger.info_once(
@@ -1016,7 +1020,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["expert_offsets64"], non_blocking=True
             )
 
-        if not direct_single_token and num_tokens <= _COMPACT_GROUPED_MAX_TOKENS:
+        if not direct_single_token and _use_compact_grouped(num_tokens, top_k):
             _prepare_compact_slot_groups(
                 buffers["permuted_experts_id"],
                 buffers["compact_offsets"],

@@ -227,6 +227,12 @@ class _FakeSM70Platform:
         return SimpleNamespace(major=7, minor=0)
 
 
+class _FakeSM75Platform(_FakeSM70Platform):
+    @staticmethod
+    def get_device_capability():
+        return SimpleNamespace(major=7, minor=5)
+
+
 def _fake_qwen_hybrid_model_config():
     return SimpleNamespace(
         hf_text_config=SimpleNamespace(
@@ -244,6 +250,8 @@ def _apply_sm70_defaults(
     speculative_config=None,
     enable_prefix_caching=None,
     max_num_seqs=None,
+    max_num_batched_tokens=None,
+    performance_mode="balanced",
 ):
     for key in (
         "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS",
@@ -265,6 +273,8 @@ def _apply_sm70_defaults(
         tensor_parallel_size=4,
         enable_prefix_caching=enable_prefix_caching,
         max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        performance_mode=performance_mode,
     )
     args.speculative_config = speculative_config
     args._maybe_apply_sm70_mtp_defaults(
@@ -298,19 +308,8 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
-    assert args.max_num_seqs == 4
-    assert args.compilation_config.cudagraph_capture_sizes == [
-        1,
-        2,
-        4,
-        5,
-        8,
-        9,
-        10,
-        15,
-        18,
-        20,
-    ]
+    assert args.max_num_seqs is None
+    assert args.compilation_config.cudagraph_capture_sizes is None
 
 
 def test_sm70_mtp_split_cudagraphs_are_opt_in(monkeypatch):
@@ -322,7 +321,7 @@ def test_sm70_mtp_split_cudagraphs_are_opt_in(monkeypatch):
         },
     )
 
-    assert args.compilation_config.cudagraph_capture_sizes == [5, 10, 20]
+    assert args.compilation_config.cudagraph_capture_sizes is None
 
 
 def test_sm70_mtp_split_cudagraphs_cover_production_batches(monkeypatch):
@@ -338,6 +337,7 @@ def test_sm70_mtp_split_cudagraphs_cover_production_batches(monkeypatch):
     assert args.compilation_config.cudagraph_capture_sizes == [
         5,
         10,
+        15,
         20,
         30,
         40,
@@ -385,7 +385,7 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
-    assert args.max_num_seqs == 4
+    assert args.max_num_seqs is None
 
 
 def test_sm70_explicit_dflash_preserves_probabilistic_default(monkeypatch):
@@ -398,9 +398,72 @@ def test_sm70_explicit_dflash_preserves_probabilistic_default(monkeypatch):
         "method": "dflash",
         "num_speculative_tokens": 7,
         "draft_sample_method": "probabilistic",
+        "attention_backend": "FLASH_ATTN_V100",
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
+    assert args.max_num_seqs is None
+    assert args.max_num_batched_tokens is None
+
+
+def test_sm70_dflash_interactivity_preserves_capacity_defaults(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+        performance_mode="interactivity",
+    )
+
+    assert args.speculative_config == {
+        "method": "dflash",
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "probabilistic",
+        "attention_backend": "FLASH_ATTN_V100",
+    }
+    assert args.max_num_seqs is None
+    assert args.max_num_batched_tokens is None
+
+
+def test_sm70_dflash_interactivity_preserves_capacity_overrides(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+        max_num_seqs=4,
+        max_num_batched_tokens=8192,
+        performance_mode="interactivity",
+    )
+
+    assert args.max_num_seqs == 4
+    assert args.max_num_batched_tokens == 8192
+
+
+def test_sm70_dflash_defaults_ignore_legacy_mtp_disable(monkeypatch):
+    args = _apply_sm70_defaults(
+        monkeypatch,
+        env={"VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS": "1"},
+        speculative_config={"method": "dflash", "num_speculative_tokens": 7},
+        performance_mode="interactivity",
+    )
+
+    assert args.speculative_config["attention_backend"] == "FLASH_ATTN_V100"
+    assert args.speculative_config["draft_sample_method"] == "probabilistic"
+    assert args.max_num_seqs is None
+    assert args.max_num_batched_tokens is None
+
+
+def test_sm70_speculative_defaults_do_not_apply_to_sm75(monkeypatch):
+    monkeypatch.setattr("vllm.engine.arg_utils.current_platform", _FakeSM75Platform())
+    args = EngineArgs(model="dummy", tensor_parallel_size=4)
+    args.speculative_config = {"method": "dflash", "num_speculative_tokens": 7}
+
+    args._maybe_apply_sm70_mtp_defaults(
+        UsageContext.OPENAI_API_SERVER,
+        _fake_qwen_hybrid_model_config(),
+    )
+
+    assert args.speculative_config == {
+        "method": "dflash",
+        "num_speculative_tokens": 7,
+    }
 
 
 def test_sm70_explicit_dflash_accepts_explicit_greedy(monkeypatch):

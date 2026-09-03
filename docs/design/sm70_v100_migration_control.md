@@ -44543,3 +44543,355 @@ Interpretation:
   long-context limiter. The next trace must be taken at 256K and separate the
   context-growing QSA indexer/attention work from the now-fixed MoE projection
   cost; 128K-only traces are no longer sufficient acceptance evidence.
+
+## 2026-08-29 DFlash2 18-ms source-default and prefill closure
+
+- The first NVFP4 QPN2-prefill integration exposed `M >= 1024` in Python.
+  AOT decode captured the wrong branch, grew the graph pool from 0.13 to
+  0.28 GiB, and regressed a complete DFlash2 round from about 17.4 to
+  41.98 ms. Sidecar-only and persistent-workspace variants are rejected.
+- One opaque C++ dispatcher now selects established QPN2/TurboMind for small M
+  and the QPN2-packed bounded prefill kernel for large M. The latter owns an
+  ephemeral FP16 workspace inside the operator. M8/M16 normal/gated and
+  explicit/ephemeral workspace comparisons are bitwise equal.
+- The exact quality-audited NVFP4 DFlash2 TP4/B1 q7/top16, E5M2-KV, q4096
+  contract now source-defaults the accepted verifier/GDN fast paths and QPN8
+  dense-order rerank. Explicit overrides remain authoritative. Candidate-order
+  stays off because its candidate-set tie cutoff is not quality-equivalent.
+- A four-V100 restart with the corresponding booleans absent from the launch
+  file logged automatic admission, opaque prefill, `dense_order=True`, and a
+  0.13-GiB graph pool. Three 512-token single-request runs measured
+  `17.4035/17.3569/17.3697 ms` per complete round (mean `17.3767 ms`). Cold
+  32K prefill was `4039.49 tok/s`; post-prefill decode remained
+  `17.3640 ms/round`.
+- Evidence:
+  `docs/design/sm70_dflash2_nvfp4_prefill_promotion.md` and
+  `/data/minimax-h3/task-cache/v100-dflash2-release-audit-20260829/remote-18ms-restart/source-default-validation.json`.
+
+## 2026-08-29 Qwen3.8 Flash-Next no-MTP checkpoint-native decode
+
+- Draft PR #415 carries the isolated source work. This contract is
+  `/data/models/RadixArk/Qwen3.8-Flash-Next-NVFP4`, TP4 on GPU0-3, V2,
+  ModelOpt FP4, FP16 activation/KV, Flash-V100, full CUDA Graph, aligned Mamba
+  prefix caching, max length 262,144, input 8,192, output 512, five cache-reset
+  greedy repetitions, and no MTP. Online QPN8 and top1-only LM-head lanes are
+  explicitly off. It is not the input-1,024/output-256 E4M3/QPN8 acceptance
+  recorded on 2026-08-24.
+- The matched control is 65.872/65.882/65.856/65.855/65.853 tok/s:
+  **65.864 tok/s** mean and **15.183 ms** mean TPOT. A four-rank graph-node
+  trace localizes 7.502 ms/rank/token and 812 launches/rank/token to dense
+  GEMV/GEMM and compressor work, led by two cuBLAS GEMV families at 3.656 and
+  2.254 ms/rank/token.
+- The retained default-off exact-topology route replaces audited
+  checkpoint-FP16 batch-one projections with SM70 row GEMV, fuses the exact
+  HyperConnection projection/mix, reduces QSA lexicographic top-k from eight
+  composite-key radix passes to four score-pivot passes plus exact
+  increasing-index tie compaction, and computes GDN QKVZ+b/a with direct
+  qkv/z/b/a outputs in one launch. It prepares 288 projections, 96 HC modules,
+  and 36 GDN inputs. Unsupported contracts retain the prior path.
+- The full matched candidate records
+  80.367/80.451/80.463/81.560/80.822 tok/s: **80.732 tok/s** mean,
+  **12.387 ms** mean TPOT, and 0.442 tok/s population standard deviation.
+  This is +22.57% throughput and -18.41% TPOT from control; all five token
+  arrays are identical. Warm 8K prefill median is 2,766.4 ms versus 2,777.6 ms
+  for control.
+- Frozen natural-output GSM8K indices 8-23 at xhigh,
+  temperature/top-p/top-k `1.0/0.95/20`, seed 20260828, and max output 4,096
+  score **15/16 raw and 15/16 strict**. All 16 stop naturally, all thinking
+  sections close, and there are no caps or structural failures. The historical
+  same-prompt MTP4 result is 15/16 raw and 14/16 strict; both miss item 12 with
+  prediction 12 versus answer 13. Repository repetition/character health
+  checks pass 16/16 with zero replacement characters and maximum same-token
+  run 3.
+- Focused static closure currently includes 25/25 QSA and new route policy tests,
+  Ruff check/format, shell syntax, and `git diff --check`. The exact QSA
+  sidecar previously passed its three GPU exactness, prefill-batch, and CUDA
+  Graph replay tests. Unused fused-W13 and shared-expert prototypes were
+  removed rather than stacked onto the accepted result.
+- Retained and rejected routes, full contracts, operator evidence, trace
+  tables, quality details, and artifact paths are recorded in
+  `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
+## 2026-08-29 DFlash2 grouped-verifier binary capability guard
+
+- A production NVFP4 DFlash2 TP4 service failed on a 51,088-token cached
+  request whose final chunk scheduled 16 target tokens. The Python source
+  admitted q16 grouped verification, but the deployed Flash-V100 extension
+  still enforced the legacy q8 limit. Its `TORCH_CHECK` killed EngineCore and
+  left the systemd unit falsely active with four orphaned TP workers.
+- Draft PR #422 makes the native extension report its maximum grouped-verifier
+  query length. Source overlays paired with an older binary conservatively
+  infer q8; rebuilt extensions report q16. Unsupported q16 work uses the exact
+  independent paged-decode fallback, while the normal seven-draft-plus-bonus
+  q8 verifier remains on the 18-ms grouped fast path.
+- Five focused policy tests pass, including q8/q16 admission with a simulated
+  current extension and q16 fallback with a legacy extension. The deployed
+  legacy binary reports max-q 8 through the compatibility interface.
+- The four-V100 deployment reproduced the incident boundary with exactly
+  49,084 prompt tokens: twelve 4,089-token chunks plus a final q16 chunk. It
+  completed in 13.288 seconds without an engine error. Repeating the same
+  prefix completed in 1.715 seconds, confirming prefix-cache health. A tool
+  smoke returned a valid `get_weather` call with `{"city":"北京"}`.
+- The historical single-request web-generation prompt produced 512 tokens at
+  206.06 token/s streaming decode. Metrics recorded 142 speculative rounds,
+  369 accepted draft tokens, 3.599 emitted tokens per round, and 17.463 ms per
+  engine round. The service remained healthy with no post-restart traceback or
+  grouped-verifier shape failure.
+
+## 2026-08-28 Qwen3.8 NVFP4 prefill output-quality audit
+
+- Public Draft PR #393 source `472e06f4461ff8cf9fe37063dc954eb0dfa1d301`
+  passed a matched TP4 V2 candidate/control audit on four V100-SXM2-32GB GPUs.
+  Model, source, weights, FP16 KV, no-MTP state, PLE CPU offload, chunk size,
+  prompts, seeds, sampling parameters, CUDA Graph state, MoE routes, and cuBLAS
+  QSA indexer were identical. The only environment differences were
+  `VLLM_SM70_QSA_GROUPED_PAGE4=1/0` and
+  `VLLM_SM70_QSA_XQA_PAGE4=1/0`. Candidate logs hit the grouped Flash-V100
+  page4 route at both 8,192-row chunks and the 8,128-row 256K tail; control
+  logs retained the selected-attention fallback and contain no page4 hit.
+- The quality set contains three official-sampling corruption/repetition
+  probes at temperature 1, top-p 0.95, top-k 20, and `ignore_eos=false`; an
+  exact 32,768-token four-needle prompt with facts crossing the 8,192,
+  16,384, and 24,576 chunk boundaries; and a 262,080-token prompt whose
+  generation budget reaches the exact 262,144-token model limit. The latter
+  places facts at token 4,096, across 131,072, across 253,952, and at 261,760.
+  Greedy 32K runs are repeated twice with top-5 logprobs, and the same 32K
+  prompt also runs with official sampling. Short official probes are text-
+  health smokes: all reach their 512-token cap inside coherent reasoning and
+  are not presented as natural-termination task scores.
+- Candidate and control both report `completed=true`, metrics available for
+  every request, zero corrupted requests, zero text-health failures, and
+  complete code recall. Across seven records and 1,704 generated tokens,
+  every prompt hash, output token ID, output hash, finish reason, and decoded
+  text is exactly equal between routes. Both 32K repeats, the 32K official-
+  sampling request, and the exact-limit request return
+  `ALPHA=R7K2-ZEPHYR; BETA=M4Q9-ORCHID; GAMMA=T8V3-LANTERN;`
+  `DELTA=C6P1-HARBOR` and terminate normally. The 32K repeat hashes are also
+  exact within each route.
+- The 126 greedy long-context generation steps have identical top-1 tokens in
+  candidate and control. Maximum chosen-token logprob difference is
+  `0.0024374` at 32K and `0.0010699` at 262,080 tokens; the minimum observed
+  top-1 margin is still `5.0156` nats for candidate and `4.8125` for control.
+  Mean top-5 token overlap is 4.64-4.76 of five. A low-probability common
+  top-5 tail value differs by as much as `2.2810` nats at 262,080 tokens, but
+  same-route 32K repeats already show tail drift up to `1.2031` for candidate
+  and `0.7422` for control, while control's same-route chosen-logprob drift
+  (`0.0031536`) exceeds the matched route difference. This tail variation did
+  not alter a top-1 token, sampled output, recall result, or corruption gate.
+- The end-to-end result is consistent with the page4 operator audit: maximum
+  FP16 difference `6.104e-5`, relative L2 `2.845e-4`, cosine `0.99999994`,
+  finite outputs, correct causal tails, and bitwise-stable CUDA Graph replay.
+  The attempted full-vocabulary dump produced no evidence file because the
+  active V2 runner uses the MRv2 sampler while the existing diagnostic hook
+  is in the legacy V1 sampler. Do not claim full-vocabulary logit equality
+  from this run; adding an MRv2-only diagnostic hook or a bounded
+  `logprobs=-1` one-token probe is the correct future test if that evidence is
+  required.
+- Matched warm 32K prefill improves from `4,744.62` to `6,493.38 token/s`
+  (`1.3686x`); the 32K official-sampling request improves from `4,762.95` to
+  `6,526.09 token/s` (`1.3702x`); and 262,080-token prefill improves from
+  `4,131.06` to `5,185.43 token/s` (`1.2552x`). The performance gain therefore
+  accompanies exact observed output parity rather than a changed prompt or
+  sampling contract. PR #393 passes this prefill quality gate; the two page4
+  environment variables remain its immediate rollback.
+
+## 2026-08-31 1.5.0 DFlash2 release usability audit
+
+- Integration base is public `onecat/main@187b932dbd11940f0bcf52fb3675dd47fd69f313`.
+  The audit does not change a CUDA kernel, sampler, rejection rule, or target
+  distribution. It closes configuration and documentation gaps around the
+  already accepted Qwen3.8 NVFP4 DFlash2 TP4/B1 profile.
+- Explicit SM70 DFlash now defaults its draft backend to `FLASH_ATTN_V100`.
+  `--performance-mode interactivity` selects the scored B1/q4096 capacity
+  values only when neither value was supplied. Balanced/concurrent services
+  and every explicit override retain their requested capacity.
+- Selector-based DFlash2 now derives seven draft tokens from the official
+  checkpoint's block size eight when the user omits the field. Config SHA256
+  `873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980`
+  at revision `dedf8df68adfb1afeaf7b7480c0a0243108177b4` resolves to block
+  size eight and selector top-K 16 in a source-only configuration load.
+- The practical-default admission now checks for an actual NVFP4 format,
+  including `nvfp4-pack-quantized` inside a mixed-precision compressed-tensors
+  config group. A same-shape non-NVFP4 compressed checkpoint no longer receives
+  the NVFP4-only default set. Legacy MTP-disable variables no longer suppress
+  explicit DFlash defaults, and SM75 no longer receives SM70 backends.
+- CPU gates pass: SM70 EngineArgs defaults `13 passed`, DFlash2 targeted suite
+  `84 passed, 12 CUDA-only skipped`, Qwen3 coder tool parser `104 passed`, and
+  changed-file pre-commit passes. Initial source-only pytest collection tried
+  to import the absent worktree `_C`; rerunning with host platform detection
+  disabled exercised the Python contracts without borrowing a stale binary.
+- No new throughput claim is made. The runtime values remain the accepted
+  `17.3767 ms` mean complete round and `4,039.49 token/s` cold 32K prefill from
+  the matched four-V100 source-default proof. A built 1.5.0 wheel still needs
+  install/import, grouped-verifier max-q, API tool/schema, and TP4 route smokes
+  before tagging.
+
+## 2026-08-31 1.5.0 wheel RPATH release gate
+
+- The first post-merge 1.5.0 RC wheel built successfully from
+  `onecat/main@87c615a02ffcba08cc00a0e48ad1363a23cb29d6`, but the build
+  environment did not contain `patchelf`. Packaging only warned and retained
+  the build host's absolute Conda RPATH in both bundled Flash-V100 extensions.
+  `readelf -d` reported
+  `/home/ymzx/miniconda3/envs/1cat-vllm-1.3.0/lib`; that artifact is rejected
+  even though it can import on the build host.
+- The build dependency contract now installs `patchelf`, and wheel assembly
+  fails closed if it is absent or cannot remove an RPATH. This converts a
+  silent portability hazard into a build-time error and applies to source and
+  precompiled-extension wheel assembly.
+- The first incremental rebuild also exposed a pre-existing FetchContent
+  failure: CMake reran the SM70 FA2 patch command against its already-patched
+  source checkout. The patch step now resets and cleans only the downloaded,
+  pinned dependency and its CUTLASS submodule before reapplying the four
+  repository patches. Explicit `VLLM_FLASH_ATTN_SRC_DIR` development trees
+  remain outside this reset path.
+- The rejected diagnostic wheel is
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`, SHA256
+  `e09fd22f4030560a54ad59a783d82ee054e52ea6da014c5c755ee5e8a51a8fb1`.
+  Do not publish it. A rebuilt wheel must show no absolute RPATH before its
+  clean-environment and four-V100 runtime gates count.
+- The first RPATH-clean replacement, SHA256
+  `112888af049c66fecdc96aa1cee12ca16ede54aee62819dd8018762069352995`,
+  has no `RPATH` or `RUNPATH` in any of its ten native libraries and installs
+  in an isolated Python 3.12 environment. It is nevertheless also rejected:
+  its dependency metadata selects FastAPI `0.141.1` together with
+  `prometheus-fastapi-instrumentator` `7.1.0`. A real Uvicorn request then
+  fails with HTTP 500 because the metrics middleware reads `.path` from
+  FastAPI's `_IncludedRouter`.
+- The metrics dependency now requires `prometheus-fastapi-instrumentator`
+  `>=8.1.0,<9.0.0`. Upstream fixed `_IncludedRouter` handling in `8.0.1`, and
+  `8.1.0` also repairs nested-route resolution. A final wheel must resolve the
+  new dependency contract, pass `pip check`, and repeat the live plain-chat,
+  tool-call, and JSON-schema API gates before publication.
+
+### Final wheel proof
+
+- The final wheel was built from exact head
+  `c660086aa1aa264058b1fe54c1cd9f0620bb978d` and is stored at
+  `/data/minimax-h3/task-cache/v100-release150-wheel-20260831/dist-final/`
+  `1cat_vllm-1.5.0-cp312-cp312-linux_x86_64.whl`. Its size is `147,963,867`
+  bytes and SHA256 is
+  `9dbb1118d670f081563b202127e77af41f9261d9ec7f7a829ec1357f53037d71`.
+  It is a validated release candidate, not a published/tagged artifact.
+- The wheel contains ten expected native libraries. All ten have zero
+  `RPATH`/`RUNPATH`, no `/home/ymzx` string, and no unresolved dependency when
+  checked with the normal Torch/CUDA runtime library set. Wheel metadata is
+  version `1.5.0` and requires
+  `prometheus-fastapi-instrumentator>=8.1.0,<9.0.0`.
+- A source-independent Python 3.12 environment force-installed the final wheel
+  and passed `pip check` with FastAPI `0.141.1`, Starlette `1.6.0`, and
+  instrumentator `8.1.0`. On a V100-SXM2 it imported the core and SM70
+  extensions, FlashQLA, grouped-verifier q16 capability, QPN2 prepare/decode/
+  prefill dispatch, SM70 LM-head top20, and the Qwen3 Coder tool parser.
+- The wheel then started a real TP4/B1 server on four V100s with the README
+  profile. Startup logs resolved q7/probabilistic DFlash2, target and draft
+  Flash-V100, FP8 E5M2 target KV, prefix cache plus Mamba align, q4096,
+  QPN2-packed prefill, exact grouped verification, and the quality-audited
+  DFlash2 defaults without explicit fast-path environment variables.
+- `/v1/models` and `/metrics` both returned HTTP 200. Plain chat returned
+  `42`; non-streaming `get_weather` and streaming `read_file` calls returned
+  the correct function names and JSON arguments; JSON-schema output returned
+  exactly `{"name":"小林","age":27}`. The schema case passed with thinking
+  enabled at a 512-token budget and with per-request thinking disabled at a
+  128-token budget. A 128-token thinking budget ended in reasoning before the
+  final JSON, confirming normal shared-budget semantics rather than DFlash2
+  token corruption; the public README now calls out this request contract.
+- Two identical 10,017-token prefix requests returned the same `收到` output.
+  Wall time fell from `2.642 s` cold to `0.164 s` cached, and the server
+  reported a `47.3%` aggregate prefix-cache hit rate while hitting the
+  Flash-V100 prefix/chunked prefill and FP8-KV routes. Shutdown released GPUs
+  4-7 back to `5 MiB` each.
+- A completely cold Triton cache still JIT-compiled three small kernels on the
+  first inference (`_sm70_qwen35_gdn_split_kernel`,
+  `_prepare_dflash_inputs_kernel`, and `layer_norm_fwd_kernel`). The request
+  remained correct and completed in `0.547 s`; this is a bounded cold-start
+  warmup follow-up, not a steady-state or publication correctness blocker.
+
+## 2026-08-31 API failure and in-process cleanup gate
+
+- Draft PR #432 is based on `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`;
+  tested head is `011adcf8ce`. It changes no DFlash2 proposal, selector,
+  rejection, sampling, verifier, or attention arithmetic.
+- Historical assistant tool calls now preserve object arguments, decode valid
+  JSON objects, and coerce malformed, null, or non-object arguments to an empty
+  object. This prevents one truncated tool call from making every later turn
+  in the conversation fail during template rendering.
+- Async multimodal items are stored as deferred factories, so per-prompt limit
+  validation happens before a coroutine exists. Resolution gathers with
+  `return_exceptions=True`, drains sibling fetches, then re-raises the first
+  failure. The two-image-over-limit API probe returned the expected HTTP 400
+  and produced no `coroutine ... was never awaited` warning, including after
+  server shutdown.
+- MRV2 shutdown now drops the target and draft CUDA Graph managers, detaches
+  target and draft layer KV/state views, removes Dynamo bytecode hooks, releases
+  `model_state` and `speculator`, and clears process-global Flash-V100, FP8, and
+  NVFP4 workspace owners. The multimodal language-model lookup cache is weak
+  keyed so it no longer pins models for the interpreter lifetime.
+- Focused Python gates pass `15 passed`; changed-file Ruff formatting/checks
+  and `git diff --check` pass. The broader pre-existing multimodal suite was
+  stopped while downloading its external model/assets and is not counted.
+- Remote TP4 proof used four V100-SXM2-32GB GPUs, Qwen3.8-27B NVFP4 target,
+  FP8 E5M2 target KV, FP16 draft KV, q7 probabilistic DFlash2, 256K maximum
+  context, q4096 chunked prefill, prefix cache plus Mamba align, Flash-V100,
+  and target/draft CUDA Graphs. Startup hit exact grouped verification and the
+  quality-audited fast-path defaults.
+- A malformed historical tool call returned HTTP 200 and continued with `OK`;
+  forced `get_weather` returned valid Guangzhou arguments; JSON Schema returned
+  exactly `{"name":"Alice","age":30}`. A no-thinking coding smoke naturally
+  stopped with valid typed binary-search code and three assertions. Its 176
+  completion tokens took `0.889 s` wall time (about 198 completion token/s),
+  which is a route smoke rather than a new performance baseline.
+- Graceful termination removed the API, engine, and all four worker processes;
+  GPU 0-3 memory fell from `26,259 MiB` to `9 MiB` each. No recent `/dev/shm`
+  file, port listener, or unawaited-coroutine warning remained. Python's
+  multiprocessing resource tracker still reported semaphore/shared-memory
+  cleanup warnings while removing them; this is retained as a logging cleanup
+  follow-up, not evidence of a surviving process, file, or GPU allocation.
+- Retained remote log and request/response artifacts are under
+  `/home/ymzx/1cat-vllm-deploy/logs/`
+  `nvfp4-dflash2-pr432-011adcf8ce-256k.log` and
+  `/home/ymzx/1cat-vllm-deploy/test-artifacts/pr432-011adcf8ce/`.
+
+## 2026-09-01 DFlash2 default-capacity 17 ms root cause
+
+- A matched four-V100 audit held the model, TP4, q8 verifier, E5M2 target KV,
+  256K maximum length, prefix cache, Mamba align, tool/reasoning parsers, and
+  graph policy fixed. Changing only `max_num_seqs` from the source default 256
+  to 1 moved the steady complete round from about `18.52 ms` to
+  `17.39 ms`. Changing graph capture sizes, available KV memory, and dense
+  draft-logit allocation order did not recover the gap.
+- The CUDA Graph descriptor and attention metadata are not capacity-expanded.
+  For the single live q8 request both configurations capture `num_reqs=1` and
+  `num_tokens=8`; Mamba/GDN state indices and Flash-V100 metadata are sliced to
+  that descriptor. Node traces placed the difference inside the target q8
+  graph, while the DFlash graph remained unchanged.
+- The causal branch was a model-load predicate in the NVFP4 scheme. The
+  DFlash2 QPN2 contract required `scheduler_config.max_num_seqs == 1`, so a
+  default-capacity server retained TurboMind for every compatible target MLP
+  even when the live verifier width was eight. The old default-capacity log
+  had no QPN2 route hit; the B1 log reported `QPN2 M<=8 route enabled`.
+- Scheduler capacity is not an operator capability. The opaque C++ dispatcher
+  already selects the byte-preserving QPN2 layout only for live `M<=8` and
+  falls back to the retained TurboMind layout for larger dynamic M. The model-
+  load contract now keeps TP4, q7/top16, PP1, no-DBO, dtype, tensor-shape, and
+  operator-availability checks, but no longer reads `max_num_seqs`. Explicit
+  `VLLM_SM70_NVFP4_QPN2=0` and prefill rollback controls remain authoritative.
+- With source-default capacity 256, the repaired launch now reports both QPN2
+  decode and QPN2-packed prefill routes. After one first-request warmup at
+  `18.972 ms`, two independent steady requests measure `17.391 ms` and
+  `17.394 ms`; the historical B1 controls were `17.396 ms` and `17.386 ms`.
+  This recovers about `1.13 ms` without constraining service concurrency.
+- The probabilistic dense draft-logit fallback is about `1.66 GiB` per rank at
+  capacity 256. It was previously allocated before the model-loading memory
+  profile, allowing KV sizing to overcommit that already-resident memory. Its
+  allocation is now deferred until draft weights load, while the compact
+  rejection cache and dense compatibility semantics are unchanged. This is a
+  startup/OOM accounting fix, not a speed claim: its isolated latency result
+  remained about `18.52 ms` before the QPN2 admission repair.
+- The focused NVFP4 QPN2 module reports `5 passed`. A live forced-tool request
+  returns `get_weather` with `{"city":"北京"}`, and a JSON-schema request
+  returns exactly `{"name":"小明","age":18}`. The change introduces no new
+  arithmetic path: it makes default capacity select the same previously
+  quality-audited, checkpoint-code-preserving B1 operator path. Test services
+  were stopped after collection and all four V100s returned to idle memory.

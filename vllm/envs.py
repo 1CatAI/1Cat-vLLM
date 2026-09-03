@@ -166,7 +166,10 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
-    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = True
+    VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
+    VLLM_SM70_QWEN38_FP16_GEMV: bool = False
+    VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
+    VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
     VLLM_SM70_FP8_QPN8_PP2_TP4_SHARED_GATE: bool = False
@@ -176,6 +179,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
+    VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
@@ -457,6 +461,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE: str | None = None
     VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS: int = 0
     VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS: str | None = None
+    VLLM_QSA_KV_CALIBRATION_DIR: str | None = None
+    VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD: str | None = None
     VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS: str | None = None
     VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE: str = "stream"
     VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS: str | None = None
@@ -725,6 +731,11 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_DISK_OFFLOAD: bool = False
+    VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
+    VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
+    VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
+    VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1706,12 +1717,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
     # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
-    # dense projections. Pure-FP8 checkpoints must opt in;
-    # a mixed NVFP4 checkpoint may select its separately validated default in
-    # the compressed-tensors scheme. Explicit 0 disables both routes.
+    # dense projections. Pure-FP8 checkpoints must opt in. The Qwen4Exp
+    # online route also stays opt-in because it requantizes checkpoint BF16
+    # attention, GDN, QSA, and mHC weights without calibration.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
-        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "1"))
+        int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
+    ),
+    # Precision-preserving checkpoint-FP16 row GEMV for the exact no-MTP,
+    # TP4 Qwen3.8 Flash Next single-token decode contract on SM70. This stays
+    # opt-in until operator, token, task-quality, and matched speed gates pass.
+    "VLLM_SM70_QWEN38_FP16_GEMV": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_FP16_GEMV", "0"))
+    ),
+    # Exact-topology Qwen3.8 decode candidate: compute checkpoint-FP16 GDN
+    # QKVZ and b/a projections and write their consumed splits in one launch.
+    "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
+    ),
+    # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
+    # stages while retaining FP16 checkpoint weights and inter-stage rounding.
+    # This remains opt-in pending the same model-level quality gates as GEMV.
+    "VLLM_SM70_QWEN38_FUSED_HC_FP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "0"))
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while
@@ -1751,6 +1779,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
     "VLLM_SM70_NVFP4_QPN2_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "0"))
+    ),
+    "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY": lambda: os.getenv(
+        "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY"
     ),
     "VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M": lambda: int(
         os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "1024")
@@ -2892,6 +2923,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS": lambda: os.getenv(
         "VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS"
+    ),
+    "VLLM_QSA_KV_CALIBRATION_DIR": lambda: os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"),
+    "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD": lambda: os.getenv(
+        "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD"
     ),
     "VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS": lambda: os.getenv(
         "VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS"
@@ -4256,6 +4291,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implementation supports ModelRunner V1/V2 and node-local MP DP/TP.
     "VLLM_PLE_CPU_OFFLOAD": lambda: (
         os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Retain Qwen4Exp PLE safetensor shards as file-backed mappings instead of
+    # copying the complete learned n-gram table into anonymous host memory.
+    "VLLM_PLE_DISK_OFFLOAD": lambda: (
+        os.getenv("VLLM_PLE_DISK_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Number of cross-shard mmap gather workers. Zero selects a bounded
+    # hardware-aware default.
+    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": lambda: int(
+        os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")
+    ),
+    "VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: (
+        os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "False").lower() in ("true", "1")
+    ),
+    # Keep the latency-critical PLE lookup process on the NUMA node local to
+    # its first visible GPU. This changes CPU placement only; allocations use
+    # a local-first policy with fallback so large tables are not forced into a
+    # single NUMA node and swapped out.
+    "VLLM_PLE_OFFLOAD_AUTO_NUMA": lambda: (
+        os.getenv("VLLM_PLE_OFFLOAD_AUTO_NUMA", "True").lower() in ("true", "1")
+    ),
+    # Fault PLE table pages back into RAM after GPU workers finish loading.
+    # Concurrent checkpoint loading can otherwise leave anonymous table pages
+    # in swap while reclaimable checkpoint page cache occupies host memory.
+    "VLLM_PLE_OFFLOAD_PREFAULT": lambda: (
+        os.getenv("VLLM_PLE_OFFLOAD_PREFAULT", "True").lower() in ("true", "1")
     ),
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(

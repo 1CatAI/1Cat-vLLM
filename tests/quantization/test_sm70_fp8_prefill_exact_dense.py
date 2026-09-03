@@ -470,23 +470,7 @@ def test_fp8_qpn8_shape_gate_uses_checkpoint_native_layout():
     assert not _is_sm70_fp8_qpn8_layer(layer)
 
 
-def test_fp8_qpn8_runtime_gate_uses_engine_contract_only(monkeypatch):
-    vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_seqs=8),
-        speculative_config=None,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8.get_current_vllm_config",
-        lambda: vllm_config,
-    )
-
-    assert _is_sm70_fp8_qpn8_runtime_contract()
-    vllm_config.scheduler_config.max_num_seqs = 16
-    assert not _is_sm70_fp8_qpn8_runtime_contract()
-    vllm_config.scheduler_config.max_num_seqs = 8
-    vllm_config.speculative_config = object()
-    assert not _is_sm70_fp8_qpn8_runtime_contract()
-    monkeypatch.setenv("VLLM_SM70_FP8_QPN8", "1")
+def test_fp8_qpn8_runtime_gate_is_capacity_and_speculation_independent():
     assert _is_sm70_fp8_qpn8_runtime_contract()
 
 

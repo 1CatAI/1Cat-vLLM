@@ -4,6 +4,10 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#ifdef VLLM_QPN4_STANDALONE
+  #include <ATen/core/dispatch/Dispatcher.h>
+  #include <ATen/core/stack.h>
+#endif
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
@@ -607,9 +611,9 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
                   out.scalar_type() == torch::kFloat16,
               "nvfp4_qpn4_prefill_sm70_out: input and output must be FP16");
-  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && dense_weight_ptr != 0 &&
-                  input.is_contiguous() && out.is_contiguous(),
-              "nvfp4_qpn4_prefill_sm70_out: invalid input or workspace");
+  TORCH_CHECK(input.dim() == 2 && out.dim() == 2 && input.is_contiguous() &&
+                  out.is_contiguous(),
+              "nvfp4_qpn4_prefill_sm70_out: invalid input or output");
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   TORCH_CHECK(codes.dim() == 2 && codes.size(0) == k,
@@ -618,8 +622,16 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   TORCH_CHECK(out.size(0) == m && out.size(1) == (gated_silu ? n / 2 : n),
               "nvfp4_qpn4_prefill_sm70_out: output shape mismatch");
 
-  auto dense_weight = torch::from_blob(
-      reinterpret_cast<void*>(dense_weight_ptr), {k, n}, input.options());
+  // A zero pointer requests an operator-local workspace. This keeps the
+  // 85 MiB dense FP16 buffer out of model load, AOT profile, and decode CUDA
+  // graph capture. The caching allocator reuses the allocation across layers
+  // during real prefill, while the worker's pre-capture empty_cache releases
+  // the profiling allocation before decode graphs are recorded.
+  auto dense_weight =
+      dense_weight_ptr == 0
+          ? torch::empty({k, n}, input.options())
+          : torch::from_blob(reinterpret_cast<void*>(dense_weight_ptr), {k, n},
+                             input.options());
   nvfp4_qpn4_dequantize_sm70_out(dense_weight, codes, scales, global_scale,
                                  use_scale_code);
   if (!gated_silu) {
@@ -635,6 +647,65 @@ void nvfp4_qpn4_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
       reinterpret_cast<const half*>(gate_up.data_ptr<at::Half>()),
       static_cast<int>(m), static_cast<int>(n / 2));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+#ifndef VLLM_QPN4_STANDALONE
+void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor codes, torch::Tensor scales,
+                                  double global_scale, int64_t split_k,
+                                  int64_t accumulator_chains,
+                                  torch::Tensor tm_weight,
+                                  torch::Tensor tm_scales,
+                                  int64_t tm_group_size, int64_t tm_k_ld,
+                                  int64_t tm_q_ld, bool gated_silu);
+#endif
+
+void nvfp4_qpn2_prefill_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_weight,
+    torch::Tensor tm_scales, int64_t tm_group_size, int64_t tm_k_ld,
+    int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m) {
+  TORCH_CHECK(min_prefill_m > 8,
+              "QPN2-packed prefill threshold must exceed M=8");
+  if (input.size(0) >= min_prefill_m) {
+    const int64_t k = input.size(1);
+    const int64_t n = gated_silu ? out.size(1) * 2 : out.size(1);
+    auto prefill_codes = codes.view({k, n / 2});
+    auto prefill_scales = scales.view({k / 16, n});
+    nvfp4_qpn4_prefill_sm70_out(out, 0, input, prefill_codes, prefill_scales,
+                                global_scale, true, gated_silu);
+    return;
+  }
+
+#ifndef VLLM_QPN4_STANDALONE
+  nvfp4_qpn2_dispatch_sm70_out(out, input, codes, scales, global_scale, split_k,
+                               accumulator_chains, tm_weight, tm_scales,
+                               tm_group_size, tm_k_ld, tm_q_ld, gated_silu);
+#else
+  // Source overlays retain the validated decode extension. Route small M
+  // through its existing opaque dispatch without exposing an M-dependent
+  // branch to Dynamo; only the large-M branch is supplied by this sidecar.
+  static const auto qpn2_dispatch =
+      c10::Dispatcher::singleton().findSchemaOrThrow(
+          "_C::nvfp4_qpn2_dispatch_sm70_out", "");
+  torch::jit::Stack stack;
+  stack.reserve(13);
+  stack.emplace_back(out);
+  stack.emplace_back(input);
+  stack.emplace_back(codes);
+  stack.emplace_back(scales);
+  stack.emplace_back(global_scale);
+  stack.emplace_back(split_k);
+  stack.emplace_back(accumulator_chains);
+  stack.emplace_back(tm_weight);
+  stack.emplace_back(tm_scales);
+  stack.emplace_back(tm_group_size);
+  stack.emplace_back(tm_k_ld);
+  stack.emplace_back(tm_q_ld);
+  stack.emplace_back(gated_silu);
+  qpn2_dispatch.callBoxed(&stack);
+#endif
 }
 
 void nvfp4_qpn4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
@@ -1019,6 +1090,14 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "use_scale_code, bool gated_silu) -> ()");
   ops.impl("nvfp4_qpn4_prefill_sm70_out", torch::kCUDA,
            &nvfp4_qpn4_prefill_sm70_out);
+  ops.def(
+      "nvfp4_qpn2_prefill_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains, Tensor tm_weight, Tensor tm_scales, "
+      "int tm_group_size, int tm_k_ld, int tm_q_ld, bool gated_silu, "
+      "int min_prefill_m) -> ()");
+  ops.impl("nvfp4_qpn2_prefill_dispatch_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_prefill_dispatch_sm70_out);
   ops.def(
       "nvfp4_qpn4_dispatch_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
       "Tensor input, Tensor codes, Tensor scales, float global_scale, bool "

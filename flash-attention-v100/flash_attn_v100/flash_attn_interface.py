@@ -1023,6 +1023,23 @@ def flash_attn_decode_paged_xqa_staged_available() -> bool:
     return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
 
 
+def flash_attn_grouped_verify_max_query_tokens() -> int:
+    """Return the native grouped-verifier query-length capability.
+
+    Extensions built before q16 support do not expose the capability entry.
+    Those binaries support q8, so keep source-overlay deployments safe by
+    falling back to the legacy limit instead of routing q16 into the old op.
+    """
+    get_max_query_tokens = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_max_query_tokens",
+        None,
+    )
+    if get_max_query_tokens is None:
+        return 8
+    return int(get_max_query_tokens())
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
