@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import math
 import os
-import re
 
+import regex as re
 import torch
 
 from vllm.logger import init_logger

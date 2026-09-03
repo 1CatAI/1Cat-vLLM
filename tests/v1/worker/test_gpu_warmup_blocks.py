@@ -3,6 +3,7 @@
 """MRV2 warmup must reserve the same speculative KV tail as the scheduler."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -74,8 +75,8 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
             set_disabled=lambda disabled: connector_states.append(disabled)
         ),
     )
-    executions = []
-    samples = []
+    executions: list[Any] = []
+    samples: list[Any] = []
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
     warmup_kernels(runner, executions.append, samples.append)

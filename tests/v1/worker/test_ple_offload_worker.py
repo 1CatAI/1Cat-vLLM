@@ -161,13 +161,16 @@ def test_ple_storage_estimate_deduplicates_shared_storage() -> None:
 def test_ple_auto_numa_uses_gpu_local_allowed_cpus(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = []
+    calls: list[str | set[int]] = []
+
+    def get_mempolicy(mode, *_):
+        mode._obj.value = 4  # MPOL_LOCAL
+        return 0
+
     fake_libnuma = SimpleNamespace(
         numa_available=lambda: 0,
         numa_set_localalloc=lambda: calls.append("localalloc"),
-        get_mempolicy=lambda mode, *_: (
-            setattr(mode._obj, "value", 4) or 0  # MPOL_LOCAL
-        ),
+        get_mempolicy=get_mempolicy,
     )
     monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_AUTO_NUMA", True)
     monkeypatch.setattr(
