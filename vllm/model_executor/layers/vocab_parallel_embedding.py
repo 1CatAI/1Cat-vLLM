@@ -65,6 +65,14 @@ def _sm70_dflash2_qpn8_rerank_requested() -> bool:
     )
 
 
+def _sm70_lm_head_packed_layout_requested() -> bool:
+    return (
+        _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
+        or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+        or _sm70_dflash2_qpn8_rerank_requested()
+    )
+
+
 def _sm70_dflash2_use_dense_order() -> bool:
     """Keep production on the scored full-vocabulary tie-order contract."""
     if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
@@ -105,9 +113,6 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         return False
     if not current_platform.is_cuda_alike():
         _trace_sm70_lm_head_skip("non_cuda_platform")
-        return False
-    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
-        _trace_sm70_lm_head_skip("missing_sm70_f16_prepare_op")
         return False
     if layer.weight.dtype != torch.float16:
         _trace_sm70_lm_head_skip(f"weight_dtype={layer.weight.dtype}")
@@ -353,10 +358,25 @@ def _sm70_dflash2_candidate_order_topk(
 
 
 def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
-    if getattr(layer, "_sm70_f16_prepared", False):
-        return True
     if not _is_sm70_lm_head_fastpath_eligible(layer):
         return False
+
+    raw_top1_requested = _sm70_env_bool(
+        "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
+    )
+    packed_layout_requested = _sm70_lm_head_packed_layout_requested()
+    if raw_top1_requested:
+        layer._sm70_f16_raw_top1_ready = True
+
+    if not packed_layout_requested:
+        logger.info_once("SM70 raw-weight LM head top1 path prepared.")
+        return True
+
+    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        _trace_sm70_lm_head_skip("missing_sm70_f16_prepare_op")
+        return raw_top1_requested
+    if getattr(layer, "_sm70_f16_prepared", False):
+        return True
     prepared = sm70_ops.sm70_f16_prepare(layer.weight)
     layer._sm70_f16_tm_weight = prepared[0]
     layer._sm70_f16_k_ld = int(prepared[1][0].item())
@@ -416,7 +436,9 @@ def _maybe_sm70_lm_head_top1(
         return None
     if bias is not None:
         return None
-    if not getattr(layer, "_sm70_f16_prepared", False):
+    raw_top1_ready = lm_head_top1 and getattr(layer, "_sm70_f16_raw_top1_ready", False)
+    packed_top1_ready = lm_head_top1_tc and getattr(layer, "_sm70_f16_prepared", False)
+    if not (raw_top1_ready or packed_top1_ready):
         _trace_sm70_lm_head_skip("top1_not_prepared")
         return None
     if not (
@@ -452,7 +474,7 @@ def _maybe_sm70_lm_head_top1(
 
     values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
     indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
-    if lm_head_top1_tc and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
+    if packed_top1_ready and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
         k_ld = getattr(layer, "_sm70_f16_k_ld", None)
         if tm_weight is not None and k_ld is not None:
@@ -473,7 +495,7 @@ def _maybe_sm70_lm_head_top1(
     if num_rows != 1:
         return None
 
-    if not lm_head_top1 or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
+    if not raw_top1_ready or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
         return None
 
     sm70_ops.sm70_f16_lm_head_top1_out(
