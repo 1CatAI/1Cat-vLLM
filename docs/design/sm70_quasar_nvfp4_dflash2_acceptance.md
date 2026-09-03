@@ -287,3 +287,51 @@ explicit-history Responses replay. Its aggregate flag remains false only for
 because the current store has no eviction policy. The first stored response is
 valid and the expected follow-up receives HTTP 404; ordinary Chat Completions
 tool calling and explicit-history Responses are unaffected.
+
+## 2026-09-03 concurrency operator campaign
+
+This campaign extends the q7 DFlash2 verifier contract to B2/B4/B8 without
+presenting operator projections as endpoint throughput. The fully QUASAR
+checkpoint is not available on this host, so the NVFP4 MLP race uses real
+layer-55 TP4 weights from the local mixed checkpoint; the three remaining
+QUASAR projection shapes use deterministic native-E2M1 tensors. All timings
+are CUDA-graph medians on one V100-SXM2-32GB with Torch 2.10/CUDA 12.8.
+
+The QPN2 kernel now tiles verifier rows in independent eight-row CTAs. The
+per-row reduction order is unchanged. Across all 64 MLP projections, 16 full
+attention projections, and 48 GDN projections, the weighted operator saving
+versus TurboMind is `3.115 ms` at M=16 and `2.430 ms` at M=32. M=64 is a
+`4.601 ms` regression, so opaque production dispatch admits only M<=32 and
+retains TurboMind for B8/M=64. Every measured output is finite; QPN2-versus-
+FP32 relative L2 is `3.3e-4--5.5e-4` with cosine approximately one.
+
+The Flash-V100 grouped verifier now accepts request-major q8 batches while
+preserving the existing single-request q8/q16 and sparse-page4 paths. B2/B4/B8
+interleaved and non-interleaved KV outputs are bitwise equal to concatenated
+single-request calls, and a captured B4 graph remains bitwise equal while each
+request's runtime sequence length changes. The graph timings are:
+
+| Context | Batch | Grouped | Independent XQA | Speedup |
+|---:|---:|---:|---:|---:|
+| 1,024 | 2 | 0.0739 ms | 0.0571 ms | 0.77x |
+| 1,024 | 4 | 0.0353 ms | 0.1058 ms | 3.00x |
+| 1,024 | 8 | 0.0680 ms | 0.2188 ms | 3.22x |
+| 16,384 | 2 | 0.1362 ms | 0.7056 ms | 5.18x |
+| 16,384 | 4 | 0.2530 ms | 1.3867 ms | 5.48x |
+| 16,384 | 8 | 0.4975 ms | 2.7351 ms | 5.50x |
+
+The B2/1K loss prevents unconditional promotion. Batched grouped verification
+therefore remains behind the default-off
+`VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY` switch until an endpoint run
+can establish an actual-length admission policy. The compact target-rejection
+path is also still opt-in, but its Python gate now accepts uniform decode-only
+B2/B4/B8 batches. Against dense top-k/top-p plus rejection, compact p50 time is
+`0.1290/0.0604/0.1300 ms` versus `0.5437/0.9810/1.2360 ms`, respectively. All
+24 B2/B4/B8 combinations of q3/q7, top-p 1.0/0.95, and temperature 0.6/1.0
+produce the exact same valid tokens and accepted lengths as dense rejection.
+
+Before either opt-in becomes a default, run a matched TP4 endpoint matrix with
+the fully QUASAR checkpoint and report pure decode separately from prefill and
+TTFT. The required rows are B1/B2/B4/B8 at the same prompt/output lengths,
+sampling seed policy, q7 draft, FP8 target KV, FP16 draft KV, attention backend,
+and CUDA-graph state.
