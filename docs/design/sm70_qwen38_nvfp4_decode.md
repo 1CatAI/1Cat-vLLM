@@ -889,10 +889,19 @@ boundaries:
   integer, model-distribution, and signed-zero patterns. Forty-eight
   collectives fall from `0.459 ms` to `0.136 ms`, saving `0.323 ms/token`.
   `VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=0` is the rollback.
+- Single-row QSA decode now performs one coarse score-radix pass, compacts only
+  that bucket, and refines the remaining radix bytes in shared memory. The
+  final increasing-index scan is unchanged, so lower-index score ties and the
+  downstream accumulation order remain exact. Twelve real-shape launches at
+  lengths 2,048-2,169 fall from `0.2169 ms` to `0.1238 ms`, saving
+  `0.0931 ms/token` or 1.75x. Random scores, dense ties, signed zero, Inf/NaN,
+  the 2,304-entry boundary, and the 2,305/4,096/16,384 device fallback are
+  bitwise equal to the original selector. Multi-row prefill retains the
+  original kernel.
 
-The isolated savings sum to `0.498 ms/token`; they are not an end-to-end TPOT
+The isolated savings sum to `0.591 ms/token`; they are not an end-to-end TPOT
 claim because the shared-expert and main streams overlap. One full-model A/B is
-still required after another material exact candidate lands.
+still required before treating the operator gains as service throughput.
 
 Privileged NCU counters confirm why HC needs traffic/issue improvements rather
 than lower precision. The down projection reaches `488 GB/s` DRAM throughput
@@ -902,5 +911,9 @@ no-eligible cycles. More warps, split-K down, down row tiling, and the SGLang
 persistent atomic-grid HC implementation are slower on V100. HC
 combine-plus-RMSNorm is already only about `0.305 ms` per 96-call graph cycle;
 an 8-warp variant saves just `0.014 ms` and changes the reduction result, so it
-is rejected. The retained HC changes do not quantize FP16 tensors or relax any
-quality gate.
+is rejected. A warp-per-dot HC-up kernel is `0.132 ms/token` slower and changes
+89 of 245,760 FP16 outputs by at most `0.000488`. A same-precision FP16 Tensor
+Core/QPN layout is also `0.012-0.035 ms/token` slower, consumes about 0.6 GiB
+more packed weights per rank, and does not reproduce the established FP16
+materialization boundary. Both are rejected. The retained HC changes do not
+quantize FP16 tensors or relax any quality gate.
