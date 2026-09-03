@@ -44958,3 +44958,9 @@ Interpretation:
   graph wait for the async result and the small graph call local UVA; V2 FULL
   replay suppresses unnecessary CPU requests. This route still needs one
   combined real-model quality/performance gate before acceptance.
+- The first hybrid startup was killed by `systemd-oomd` after reaching
+  `108.7 GiB` unit memory: the existing executor spawned the mmap worker before
+  loading four local pinned shards, so both checkpoint scans overlapped. The
+  failure occurred before compile or requests and all GPUs were released. In
+  hybrid mode only, executor startup now loads the main model first and spawns
+  the file-backed worker afterward; non-hybrid offload ordering is unchanged.
