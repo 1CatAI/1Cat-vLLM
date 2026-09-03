@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS: int = 0
+    VLLM_SM70_AWQ_MOE_COMPACT_METADATA: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST: str | None = None
     VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST: str | None = None
     VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR: str | None = None
@@ -1636,6 +1637,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS", "0")
+    ),
+    # Exact Qwen3.8 TP4 AWQ experiment: persist each per-group statistic as
+    # {FP16 scale, uint8 zero} and reconstruct the FP16 bias in the SM70
+    # iterator. Keep opt-in until model-level latency has been accepted.
+    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "0"))
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST": lambda: os.getenv(
         "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST", None

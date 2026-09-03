@@ -101,6 +101,10 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             int64_t group_size,
                                             bool interleave_gated_silu);
 
+std::vector<torch::Tensor> awq_sm70_prepare_compact(
+    torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros,
+    int64_t group_size, bool interleave_gated_silu);
+
 void awq_sm70_dequantize_out(torch::Tensor out, torch::Tensor _kernel,
                              torch::Tensor _scaling_factors,
                              int64_t group_size);

@@ -683,8 +683,13 @@ def _prepare_awq_moe_weights(
     interleave_gated_silu: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     tm_weights, tm_scales, metas = [], [], []
+    prepare_awq = (
+        sm70_ops.awq_sm70_prepare_compact
+        if os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA") == "1"
+        else sm70_ops.awq_sm70_prepare
+    )
     for expert_id in range(qweights.shape[0]):
-        tm_weight, tm_scale, meta = sm70_ops.awq_sm70_prepare(
+        tm_weight, tm_scale, meta = prepare_awq(
             qweights[expert_id],
             scales[expert_id],
             qzeros[expert_id],
@@ -2791,6 +2796,7 @@ def main() -> int:
         "awq_moe_top_k": args.awq_moe_top_k,
         "awq_moe_actual": awq_moe_actual,
         "awq_moe_dispatch_policy_env": os.getenv("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY"),
+        "awq_moe_compact_metadata_env": os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA"),
         "fp8_model": str(args.fp8_model) if args.fp8_model else None,
         "fp8_layer": args.fp8_layer,
         "fp8_moe_model": str(args.fp8_moe_model) if args.fp8_moe_model else None,

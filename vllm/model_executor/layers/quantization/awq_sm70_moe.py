@@ -29,6 +29,10 @@ logger = init_logger(__name__)
 
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 
+_QWEN38_TP4_NUM_EXPERTS = 512
+_QWEN38_TP4_W13_QWEIGHT_SHAPE = (2560, 40)
+_QWEN38_TP4_W2_QWEIGHT_SHAPE = (160, 320)
+
 
 def _log_runtime_route_once(message: str, *args) -> None:
     if torch.compiler.is_compiling():
@@ -80,6 +84,19 @@ def _legacy_single_token_compact_enabled() -> bool:
     if not envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT:
         return False
     return hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
+
+
+def _is_qwen38_tp4_compact_metadata_shape(
+    layer: RoutedExperts, group_size: int
+) -> bool:
+    """Return whether the loaded tensors match the validated compact lane."""
+    return (
+        group_size == 32
+        and tuple(layer.w13_qweight.shape)
+        == (_QWEN38_TP4_NUM_EXPERTS, *_QWEN38_TP4_W13_QWEIGHT_SHAPE)
+        and tuple(layer.w2_qweight.shape)
+        == (_QWEN38_TP4_NUM_EXPERTS, *_QWEN38_TP4_W2_QWEIGHT_SHAPE)
+    )
 
 
 def _silu_and_mul_w13(
@@ -556,6 +573,23 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
 
         num_experts = int(layer.w13_qweight.shape[0])
+        compact_metadata = envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA
+        if compact_metadata:
+            if not hasattr(torch.ops._C, "awq_sm70_prepare_compact"):
+                raise RuntimeError(
+                    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 requires an SM70 "
+                    "build with awq_sm70_prepare_compact."
+                )
+            if not _is_qwen38_tp4_compact_metadata_shape(layer, self.group_size):
+                raise RuntimeError(
+                    "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 currently requires "
+                    "the exact Qwen3.8 TP4 E512 native-g32 W13/W2 shapes."
+                )
+        prepare_awq = (
+            sm70_ops.awq_sm70_prepare_compact
+            if compact_metadata
+            else sm70_ops.awq_sm70_prepare
+        )
         w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
         w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
         build_legacy_w13 = (
@@ -568,7 +602,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         # carrying a second per-expert W13 TurboMind copy.
         w13_interleaved = build_legacy_w13
         for expert_id in range(num_experts):
-            r13 = sm70_ops.awq_sm70_prepare(
+            r13 = prepare_awq(
                 layer.w13_qweight[expert_id],
                 layer.w13_scales[expert_id],
                 layer.w13_qzeros[expert_id],
@@ -579,7 +613,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             w13_tm_scales.append(r13[1])
             w13_meta.append(r13[2])
 
-            r2 = sm70_ops.awq_sm70_prepare(
+            r2 = prepare_awq(
                 layer.w2_qweight[expert_id],
                 layer.w2_scales[expert_id],
                 layer.w2_qzeros[expert_id],
@@ -649,6 +683,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_awq_moe_layer_id = _get_layer_id(layer)
         layer.sm70_awq_moe_w13_interleaved = w13_interleaved
         layer.sm70_awq_moe_legacy_single_token_compact = build_legacy_w13
+        layer.sm70_awq_moe_compact_metadata = compact_metadata
 
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
@@ -667,6 +702,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             "batched" if batched_gemm else "per-expert dense",
             num_experts,
         )
+        if compact_metadata:
+            logger.info_once(
+                "SM70 Qwen3.8 TP4 AWQ compact scale/zero metadata enabled."
+            )
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
