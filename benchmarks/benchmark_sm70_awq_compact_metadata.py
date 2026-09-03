@@ -7,6 +7,7 @@ the reconstructed metadata and every GEMM output must be bitwise identical.
 """
 
 import argparse
+import hashlib
 import json
 import statistics
 from pathlib import Path
@@ -33,6 +34,8 @@ def _require_sm70() -> None:
         raise RuntimeError(f"Expected SM70, got sm_{capability[0]}{capability[1]}.")
     if not hasattr(torch.ops._C, "awq_sm70_prepare_compact"):
         raise RuntimeError("The build does not contain awq_sm70_prepare_compact.")
+    if not hasattr(torch.ops._C, "uint4_sm70_prepare"):
+        raise RuntimeError("The build does not contain uint4_sm70_prepare.")
 
 
 def _make_awq_inputs(
@@ -77,6 +80,11 @@ def _bitwise_equal(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
             lhs.contiguous().view(torch.uint8), rhs.contiguous().view(torch.uint8)
         )
     )
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    raw = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _prepare_pair(
@@ -234,6 +242,61 @@ def _check_dense_case(
         * 100.0,
         "cuda_graph_equal": True,
         "timings": timings,
+    }
+
+
+def _check_dense_uint4_case() -> dict[str, Any]:
+    """Exercise the untagged uint32 statistics iterator used by dense uint4."""
+    k, n, m = 2560, 320, 64
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(20260903)
+    qweight = torch.randint(
+        0,
+        16,
+        (k, n),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    scales = (
+        torch.rand(
+            (k // GROUP_SIZE, n),
+            dtype=torch.float16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.02
+        + 0.0001
+    )
+    zeros = torch.randint(
+        0,
+        16,
+        (k // GROUP_SIZE, n),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    ).to(torch.float16)
+    prepared = sm70_ops.uint4_sm70_prepare(qweight, scales, zeros, GROUP_SIZE, False)
+    if int(prepared[2][1].item()) <= 0:
+        raise AssertionError("dense uint4 must retain an untagged positive q_ld")
+
+    x = torch.randn((m, k), dtype=torch.float16, device="cuda", generator=generator)
+    first = torch.empty((m, n), dtype=torch.float16, device="cuda")
+    second = torch.empty_like(first)
+    _gemm_out(first, x, prepared)
+    _gemm_out(second, x, prepared)
+    torch.cuda.synchronize()
+    if not _bitwise_equal(first, second):
+        raise AssertionError("dense uint4 repeat output mismatch")
+
+    return {
+        "m": m,
+        "k": k,
+        "n": n,
+        "group_size": GROUP_SIZE,
+        "q_ld": int(prepared[2][1].item()),
+        "repeat_bitwise_equal": True,
+        "output_sha256": _tensor_sha256(first),
     }
 
 
@@ -457,6 +520,7 @@ def main() -> int:
         )
         for name, shape in SHAPES.items()
     ]
+    dense_uint4 = _check_dense_uint4_case()
     moe_pointer = _check_moe_pointer_path(args.experts, args.rows_per_expert)
     per_card_saving = sum(case["saving_bytes"] for case in cases)
     projected_saving = per_card_saving * QWEN38_NUM_EXPERTS * QWEN38_NUM_MOE_LAYERS
@@ -465,6 +529,7 @@ def main() -> int:
         "capability": list(torch.cuda.get_device_capability()),
         "strict_bitwise": True,
         "cases": cases,
+        "dense_uint4": dense_uint4,
         "moe_pointer_path": moe_pointer,
         "qwen38_tp4_projected_saving_bytes_per_card": projected_saving,
         "qwen38_tp4_projected_saving_gib_per_card": projected_saving / (1 << 30),

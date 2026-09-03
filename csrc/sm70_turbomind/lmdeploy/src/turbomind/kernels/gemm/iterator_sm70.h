@@ -101,14 +101,13 @@ struct GmemIteratorSm70 {
     const int lane_id = threadIdx.x % WARP_SIZE;
 
     const uintptr_t tagged_ptr = reinterpret_cast<uintptr_t>(mat.ptr.ptr);
-    const int raw_ld = mat.ptr.stride;
+    const int ld = mat.ptr.stride;
     if constexpr (std::is_same_v<T, uint32_t>) {
-      compact_awq_stats_ = (tagged_ptr & uintptr_t{1}) != 0 || raw_ld < 0;
+      compact_awq_stats_ = (tagged_ptr & uintptr_t{1}) != 0;
     }
     const uintptr_t data_ptr =
         compact_awq_stats_ ? tagged_ptr & ~uintptr_t{1} : tagged_ptr;
     const Pointer data{reinterpret_cast<T*>(data_ptr)};
-    const int ld = raw_ld < 0 ? -raw_ld : raw_ld;
     const int source_bits = compact_awq_stats_ ? 24 : bitsof<T>;
 
     const int2 offsets = Map::get_offset(warp_id, lane_id);
