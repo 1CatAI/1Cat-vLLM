@@ -6512,7 +6512,8 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
     torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce);
+    bool weighted_reduce, int64_t logical_total_tokens,
+    torch::Tensor a_indices);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -7331,7 +7332,8 @@ void awq_moe_gemm_sm70_out_impl(
     bool per_expert_dispatch = false,
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
-    bool weighted_reduce = false) {
+    bool weighted_reduce = false, int64_t logical_total_tokens = -1,
+    torch::Tensor a_indices = torch::Tensor()) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "awq_moe_gemm_sm70: input must be CUDA float16.");
@@ -7354,6 +7356,8 @@ void awq_moe_gemm_sm70_out_impl(
               "awq_moe_gemm_sm70: invalid dimensions.");
   TORCH_CHECK(k % group_size == 0,
               "awq_moe_gemm_sm70: input dim must be divisible by group size.");
+  TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
+              "awq_moe_gemm_sm70: input shape mismatch.");
   torch::Tensor b_group_indices_flat = b_group_indices;
   const bool use_b_group_indices =
       b_group_indices.defined() && b_group_indices.numel() > 0;
@@ -7370,7 +7374,25 @@ void awq_moe_gemm_sm70_out_impl(
   const int device = sorted_input.get_device();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  const int64_t total_tokens = sorted_input.size(0);
+  const int64_t input_tokens = sorted_input.size(0);
+  const int64_t total_tokens =
+      logical_total_tokens > 0 ? logical_total_tokens : input_tokens;
+  const bool use_a_indices = a_indices.defined() && a_indices.numel() > 0;
+  torch::Tensor a_indices_flat = a_indices;
+  if (use_a_indices) {
+    TORCH_CHECK(a_indices.is_cuda() &&
+                    a_indices.scalar_type() == torch::kInt32 &&
+                    a_indices.is_contiguous(),
+                "awq_moe_gemm_sm70: A row indices must be contiguous CUDA "
+                "int32.");
+    a_indices_flat = a_indices.view({-1});
+    TORCH_CHECK(a_indices_flat.numel() >= total_tokens,
+                "awq_moe_gemm_sm70: A row indices size mismatch.");
+  } else {
+    TORCH_CHECK(input_tokens == total_tokens,
+                "awq_moe_gemm_sm70: non-indexed input rows must match "
+                "logical rows.");
+  }
   TORCH_CHECK(out.size(0) == total_tokens,
               "awq_moe_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
@@ -7412,10 +7434,11 @@ void awq_moe_gemm_sm70_out_impl(
       turbomind::gemm::kRowMajor,
       static_cast<int>(total_tokens),
       static_cast<int>(k),
-      static_cast<int>(k),
+      static_cast<int>(sorted_input.stride(0)),
   };
   desc_A.num = static_cast<int>(num_experts);
   desc_A.offsets = expert_offsets.data_ptr<int>();
+  desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
 
   turbomind::gemm::MatrixLayout desc_U{};
 
@@ -7545,6 +7568,53 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
                              gated_silu, torch::Tensor(), true);
+}
+
+void awq_moe_indexed_dense_w13_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size) {
+  constexpr int kQwen38TopK = 10;
+  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
+                  input.scalar_type() == torch::kFloat16 && input.is_cuda() &&
+                  input.is_contiguous(),
+              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 CUDA FP16 "
+              "[tokens, 2560] input is required.");
+  TORCH_CHECK(num_experts == 512 && k == 2560 && n == 320 && group_size == 32,
+              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 TP4 W13 "
+              "g32 contract is required.");
+  TORCH_CHECK(input_row_indices.is_cuda() &&
+                  input_row_indices.scalar_type() == torch::kInt32 &&
+                  input_row_indices.is_contiguous() &&
+                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
+              "awq_moe_indexed_dense_w13_sm70_out: input row indices must "
+              "contain exactly tokens*10 contiguous CUDA int32 entries.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous() &&
+                  expert_offsets.numel() >= num_experts + 1,
+              "awq_moe_indexed_dense_w13_sm70_out: expert offsets must be "
+              "contiguous CUDA int32 with num_experts+1 entries.");
+  TORCH_CHECK(dense_expert_ids.is_cuda() &&
+                  dense_expert_ids.scalar_type() == torch::kInt32 &&
+                  dense_expert_ids.is_contiguous() &&
+                  dense_expert_ids.numel() >= num_experts,
+              "awq_moe_indexed_dense_w13_sm70_out: dense expert IDs must be "
+              "contiguous CUDA int32.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
+                  out.size(1) == n && out.stride(1) == 1,
+              "awq_moe_indexed_dense_w13_sm70_out: output shape mismatch.");
+
+  static std::atomic<unsigned> logged_awq_indexed_prefill{0u};
+  maybe_log_sm70_moe_route_once(
+      logged_awq_indexed_prefill,
+      "SM70 Qwen3.8 AWQ indexed-A W13 prefill path enabled C++ op reached",
+      input, input_row_indices.numel(), num_experts);
+  awq_moe_gemm_sm70_out_impl(
+      out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
+      false, dense_expert_ids, true, torch::Tensor(), torch::Tensor(), false,
+      input_row_indices.numel(), input_row_indices);
 }
 
 torch::Tensor awq_moe_gemm_sm70(torch::Tensor sorted_input,

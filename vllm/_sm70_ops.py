@@ -2670,6 +2670,53 @@ if hasattr(torch.ops._C, "awq_moe_dense_stage_sm70_out"):
         return None
 
 
+def awq_moe_indexed_dense_w13_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    input_row_indices: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    dense_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("awq_moe_indexed_dense_w13_sm70_out")(
+        out,
+        input,
+        input_row_indices,
+        expert_offsets,
+        dense_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_indexed_dense_w13_sm70_out"):
+
+    @register_fake("_C::awq_moe_indexed_dense_w13_sm70_out")
+    def _awq_moe_indexed_dense_w13_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        input_row_indices: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        dense_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
 def awq_moe_active_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
