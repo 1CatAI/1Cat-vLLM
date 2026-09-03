@@ -4,9 +4,9 @@
 
 This is a deliberately narrow verifier microbenchmark.  It loads the TP-local
 gate/up and down projection shards from one native NVFP4 layer, prepares both
-the current TurboMind layout and the QPN2 fragment layout, and measures an M=8
-CUDA-graph replay.  Weight loading and preparation are outside the timed
-region.
+the current TurboMind layout and the QPN2 fragment layout, and measures a
+CUDA-graph replay at verifier batch shapes through M=64. Weight loading and
+preparation are outside the timed region.
 
 QPN2 is compiled from an explicitly supplied source file so this benchmark can
 evaluate a pinned external implementation before it is admitted to the vLLM
@@ -44,6 +44,9 @@ class Projection:
 
 QPN2_CONFIGS = {
     # (K, N): (split K, independent accumulator chains)
+    (1536, 5120): (8, 2),
+    (5120, 3584): (16, 2),
+    (5120, 4128): (16, 2),
     (5120, 8704): (8, 2),
     (4352, 5120): (16, 2),
 }
@@ -64,6 +67,9 @@ def _load_projection_shards(
     tp_size: int,
 ) -> tuple[Projection, Projection]:
     path = model / "model.safetensors"
+    config = json.loads((model / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    num_hidden_layers = int(text_config["num_hidden_layers"])
     prefix = f"model.language_model.layers.{layer_index}.mlp"
     intermediate_size = 17408
     hidden_size = 5120
@@ -111,7 +117,7 @@ def _load_projection_shards(
             1.0 / torch.cat((gate_global, up_global)).max().float()
         ),
         gated_silu=True,
-        calls_per_round=56,
+        calls_per_round=num_hidden_layers,
     )
     down = Projection(
         name="down_proj",
@@ -119,9 +125,38 @@ def _load_projection_shards(
         scales=down_scales.contiguous(),
         inverse_global_scale=float(1.0 / down_global.max().float()),
         gated_silu=False,
-        calls_per_round=56,
+        calls_per_round=num_hidden_layers,
     )
     return gate_up, down
+
+
+def _synthetic_projections(model: Path) -> tuple[Projection, ...]:
+    """Build deterministic tensors for target shapes absent from local weights."""
+    config = json.loads((model / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    layer_types = text_config["layer_types"]
+    num_attention_layers = layer_types.count("full_attention")
+    num_linear_attention_layers = layer_types.count("linear_attention")
+    shapes = (
+        ("attention_out_proj", 1536, 5120, len(layer_types)),
+        ("attention_qkv_proj", 5120, 3584, num_attention_layers),
+        ("gdn_in_proj_qkvz", 5120, 4128, num_linear_attention_layers),
+    )
+    projections = []
+    for name, k, n, calls_per_round in shapes:
+        packed = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+        scales = (torch.rand((n, k // 16)) * 0.5 + 0.25).to(torch.float8_e4m3fn)
+        projections.append(
+            Projection(
+                name=name,
+                packed=packed,
+                scales=scales,
+                inverse_global_scale=0.01,
+                gated_silu=False,
+                calls_per_round=calls_per_round,
+            )
+        )
+    return tuple(projections)
 
 
 def _unpack_nibbles(weight_packed: torch.Tensor) -> torch.Tensor:
@@ -262,6 +297,7 @@ def _run_projection(
     projection: Projection,
     extension: Any | None,
     production: bool,
+    production_source_candidate: bool,
     m: int,
     device: torch.device,
     warmup: int,
@@ -271,7 +307,6 @@ def _run_projection(
     from vllm import _sm70_ops as sm70_ops
 
     packed = projection.packed.to(device)
-    scale_codes = projection.scales.view(torch.uint8).to(device)
     qweight = _unpack_nibbles(projection.packed).to(device)
     effective_scales = (
         projection.scales.t()
@@ -334,9 +369,38 @@ def _run_projection(
                 )
             return qpn_final
 
+    elif production_source_candidate:
+        qpn_codes, qpn_scales = torch.ops._qpn2_candidate.prepare(
+            packed, projection.scales.to(device)
+        )
+
+        def run_qpn2() -> torch.Tensor:
+            if projection.gated_silu:
+                torch.ops._qpn2_candidate.gated(
+                    qpn_final,
+                    x,
+                    qpn_codes,
+                    qpn_scales,
+                    projection.inverse_global_scale,
+                    split_k,
+                    accumulator_chains,
+                )
+            else:
+                torch.ops._qpn2_candidate.gemm(
+                    qpn_final,
+                    x,
+                    qpn_codes,
+                    qpn_scales,
+                    projection.inverse_global_scale,
+                    split_k,
+                    accumulator_chains,
+                )
+            return qpn_final
+
     else:
         if extension is None:
             raise AssertionError("external QPN2 extension was not loaded")
+        scale_codes = projection.scales.view(torch.uint8).to(device)
         qpn_codes, qpn_scales = _qpn2_prepack(packed, scale_codes)
 
         def run_qpn2() -> torch.Tensor:
@@ -397,7 +461,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=1000)
     parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument(
+        "--synthetic-shapes",
+        action="store_true",
+        help="Race deterministic tensors for non-MLP Qwen3.8 projection shapes.",
+    )
     parser.add_argument("--qpn2-source", type=Path)
+    parser.add_argument(
+        "--production-source-candidate",
+        type=Path,
+        help="Compile this repository's QPN2 source under a private namespace.",
+    )
     parser.add_argument(
         "--production-library",
         type=Path,
@@ -409,6 +483,9 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_production_library(path: Path) -> None:
+    stable_path = path.with_name("_C_stable_libtorch.abi3.so")
+    if stable_path.exists():
+        torch.ops.load_library(stable_path)
     spec = importlib.util.spec_from_file_location("vllm._C", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load production library: {path}")
@@ -425,15 +502,30 @@ def main() -> int:
         0,
     ):
         raise RuntimeError("benchmark requires an exact SM70 CUDA device")
-    if not 1 <= args.m <= 8:
-        raise ValueError("QPN2 benchmark supports M in [1, 8]")
-    production = args.production_library is not None
-    if production:
+    if not 1 <= args.m <= 64:
+        raise ValueError("QPN2 benchmark supports M in [1, 64]")
+    if args.production_library is not None:
         _load_production_library(args.production_library)
-        extension = None
-    else:
-        if args.qpn2_source is None:
-            raise ValueError("--qpn2-source is required without --production-library")
+    if args.qpn2_source is not None and args.production_source_candidate is not None:
+        raise ValueError("QPN2 source modes are mutually exclusive")
+    production_source_candidate = args.production_source_candidate is not None
+    extension = None
+    if production_source_candidate:
+        load(
+            name=args.extension_name,
+            sources=[str(args.production_source_candidate)],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-lineinfo",
+                "-gencode=arch=compute_70,code=sm_70",
+                "-DVLLM_NVFP4_QPN2_STANDALONE",
+                "-DVLLM_NVFP4_QPN2_BENCHMARK_CANDIDATE",
+            ],
+            verbose=False,
+            is_python_module=False,
+        )
+    elif args.qpn2_source is not None:
         extension = load(
             name=args.extension_name,
             sources=[str(args.qpn2_source)],
@@ -445,15 +537,24 @@ def main() -> int:
             ],
             verbose=False,
         )
+    elif args.production_library is None:
+        raise ValueError(
+            "one of --qpn2-source, --production-source-candidate, or "
+            "--production-library is required"
+        )
+    production = not production_source_candidate and args.qpn2_source is None
     torch.manual_seed(20260824)
-    projections = _load_projection_shards(
-        args.model, args.layer, args.tp_rank, args.tp_size
+    projections = (
+        _synthetic_projections(args.model)
+        if args.synthetic_shapes
+        else _load_projection_shards(args.model, args.layer, args.tp_rank, args.tp_size)
     )
     rows = [
         _run_projection(
             projection,
             extension,
             production,
+            production_source_candidate,
             args.m,
             device,
             args.warmup,
@@ -471,9 +572,20 @@ def main() -> int:
         "layer": args.layer,
         "tp_rank": args.tp_rank,
         "tp_size": args.tp_size,
+        "synthetic_shapes": args.synthetic_shapes,
         "qpn2_source": str(args.qpn2_source) if args.qpn2_source else None,
         "qpn2_source_sha256": (
             _sha256_file(args.qpn2_source) if args.qpn2_source else None
+        ),
+        "production_source_candidate": (
+            str(args.production_source_candidate)
+            if args.production_source_candidate
+            else None
+        ),
+        "production_source_candidate_sha256": (
+            _sha256_file(args.production_source_candidate)
+            if args.production_source_candidate
+            else None
         ),
         "production_library": (
             str(args.production_library) if args.production_library else None

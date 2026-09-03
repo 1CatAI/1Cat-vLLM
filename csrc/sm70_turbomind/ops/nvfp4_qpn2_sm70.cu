@@ -25,6 +25,9 @@ void nvfp4_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
 namespace {
 
 constexpr int kPrepareThreads = 256;
+constexpr int kQpn2RowsPerCta = 8;
+constexpr int kQpn2MaxRows = 64;
+constexpr int kQpn2DispatchMaxRows = 32;
 
 __device__ __forceinline__ int qpn2_col_from_lane(int lane) {
   return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -131,7 +134,8 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
   const int warp = threadIdx.x >> 5;
   const int tile = blockIdx.x;
   const int quadpair = (lane >> 2) & 3;
-  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int row = blockIdx.y * kQpn2RowsPerCta + local_row;
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
@@ -201,7 +205,7 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
     for (int k_warp = 0; k_warp < SplitK; ++k_warp) {
       value += partials[k_warp][element];
     }
-    const int output_row = element >> 5;
+    const int output_row = blockIdx.y * kQpn2RowsPerCta + (element >> 5);
     const int output_col = element & 31;
     if (output_row < m) {
       output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
@@ -224,7 +228,8 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
   const int hidden_tiles = hidden >> 5;
   const int tile = blockIdx.x + projection * hidden_tiles;
   const int quadpair = (lane >> 2) & 3;
-  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int row = blockIdx.y * kQpn2RowsPerCta + local_row;
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
@@ -296,7 +301,7 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
       gate += partials[0][k_warp][element];
       up += partials[1][k_warp][element];
     }
-    const int output_row = element >> 5;
+    const int output_row = blockIdx.y * kQpn2RowsPerCta + (element >> 5);
     const int output_col = element & 31;
     if (output_row < m) {
       // Match the existing SM70 silu_and_mul contract: round both GEMM
@@ -317,7 +322,8 @@ template <int SplitK, int NAcc>
 void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                  half* output, int n, int k, int m, float global_scale,
                  cudaStream_t stream) {
-  nvfp4_qpn2_sm70_kernel<SplitK, NAcc><<<(n / 32), (32 * SplitK), 0, stream>>>(
+  const dim3 grid(n / 32, (m + kQpn2RowsPerCta - 1) / kQpn2RowsPerCta);
+  nvfp4_qpn2_sm70_kernel<SplitK, NAcc><<<grid, (32 * SplitK), 0, stream>>>(
       codes, scales, input, output, n, k, m, global_scale);
 }
 
@@ -325,9 +331,10 @@ template <int SplitK, int NAcc>
 void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
                        const half* input, half* output, int hidden, int k,
                        int m, float global_scale, cudaStream_t stream) {
+  const dim3 grid(hidden / 32, (m + kQpn2RowsPerCta - 1) / kQpn2RowsPerCta);
   nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc>
-      <<<(hidden / 32), (64 * SplitK), 0, stream>>>(
-          codes, scales, input, output, hidden, k, m, global_scale);
+      <<<grid, (64 * SplitK), 0, stream>>>(codes, scales, input, output, hidden,
+                                           k, m, global_scale);
 }
 
 void check_qpn2_tensors(const torch::Tensor& out, const torch::Tensor& input,
@@ -353,8 +360,8 @@ void check_qpn2_tensors(const torch::Tensor& out, const torch::Tensor& input,
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t n = gated_silu ? out.size(1) * 2 : out.size(1);
-  TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m,
-              "NVFP4 QPN2 requires M in [1, 8]");
+  TORCH_CHECK(m >= 1 && m <= kQpn2MaxRows && out.size(0) == m,
+              "NVFP4 QPN2 requires M in [1, ", kQpn2MaxRows, "]");
   TORCH_CHECK(k > 0 && k % 64 == 0 && n > 0 && n % 32 == 0,
               "NVFP4 QPN2 shape alignment mismatch");
   TORCH_CHECK(codes.numel() == n * k / 2 && scales.numel() == n * k / 16,
@@ -498,7 +505,7 @@ void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor tm_scales,
                                   int64_t tm_group_size, int64_t tm_k_ld,
                                   int64_t tm_q_ld, bool gated_silu) {
-  if (input.size(0) <= 8) {
+  if (input.size(0) <= kQpn2DispatchMaxRows) {
     if (gated_silu) {
       nvfp4_qpn2_gated_sm70_out(out, input, codes, scales, global_scale,
                                 split_k, accumulator_chains);
@@ -522,7 +529,8 @@ void nvfp4_qpn2_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
 }
 #endif
 
-#ifdef VLLM_NVFP4_QPN2_STANDALONE
+#if defined(VLLM_NVFP4_QPN2_STANDALONE) && \
+    !defined(VLLM_NVFP4_QPN2_BENCHMARK_CANDIDATE)
 // Compile the exact production kernels as a task-local operator-race library
 // before paying for a complete vLLM rebuild. Production registers these
 // operators centrally in torch_bindings.cpp.
@@ -542,5 +550,22 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "int accumulator_chains) -> ()");
   ops.impl("nvfp4_qpn2_gated_sm70_out", torch::kCUDA,
            &nvfp4_qpn2_gated_sm70_out);
+}
+#endif
+
+#ifdef VLLM_NVFP4_QPN2_BENCHMARK_CANDIDATE
+// Register a private namespace so the extended-M candidate can race the
+// installed production operators without replacing vllm._C.
+TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
+  ops.def("prepare(Tensor weight_packed, Tensor weight_scale) -> Tensor[]");
+  ops.impl("prepare", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
+  ops.def(
+      "gemm(Tensor(a!) out, Tensor input, Tensor codes, Tensor scales, "
+      "float global_scale, int split_k, int accumulator_chains) -> ()");
+  ops.impl("gemm", torch::kCUDA, &nvfp4_qpn2_gemm_sm70_out);
+  ops.def(
+      "gated(Tensor(a!) out, Tensor input, Tensor codes, Tensor scales, "
+      "float global_scale, int split_k, int accumulator_chains) -> ()");
+  ops.impl("gated", torch::kCUDA, &nvfp4_qpn2_gated_sm70_out);
 }
 #endif

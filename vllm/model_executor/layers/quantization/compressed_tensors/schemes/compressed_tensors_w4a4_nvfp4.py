@@ -56,7 +56,7 @@ def _is_sm70_dflash2_nvfp4_qpn2_runtime_contract() -> bool:
     """Admit the quality-audited DFlash2 TP4 operator contract.
 
     Scheduler capacity is intentionally not part of this model-load decision.
-    The opaque dispatcher selects QPN2 only from the live ``M <= 8`` shape and
+    The opaque dispatcher selects QPN2 only from live ``M <= 32`` shapes and
     retains the existing TurboMind path for larger dynamic M.  A server that
     can hold many requests must therefore load the same small-M layout as a
     server configured with ``max_num_seqs=1``.
@@ -425,7 +425,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 layer.sm70_nvfp4_qpn2_gated_silu = suffix == "gate_up_proj"
                 layer.sm70_nvfp4_qpn2_prefill_enabled = qpn2_prefill_enabled
                 logger.info_once(
-                    "SM70 NVFP4 QPN2 M<=8 route enabled for a compatible "
+                    "SM70 NVFP4 QPN2 M<=32 route enabled for a compatible "
                     "TP4 projection contract."
                 )
                 if qpn2_prefill_enabled:
