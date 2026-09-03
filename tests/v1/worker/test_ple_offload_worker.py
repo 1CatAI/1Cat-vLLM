@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgspec
 import pytest
 import torch
 
 import vllm.envs as envs
+import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.ple_offload import worker as ple_offload_worker
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -141,6 +145,101 @@ def test_ple_offload_rejects_missing_materialized_parameters(
             monkeypatch,
             ["checkpoint.ple.weight"],
         )
+
+
+def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
+    """A later batch must not retarget an earlier batch's D2H event."""
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = 0
+    connector.dp_rank = 0
+    connector._uses_cuda_inputs = True
+    connector._request_queue = queue.Queue(maxsize=2)
+    connector._d2h_event_pool = queue.Queue(maxsize=2)
+    first_event = Mock()
+    second_event = Mock()
+    connector._d2h_event_pool.put_nowait(first_event)
+    connector._d2h_event_pool.put_nowait(second_event)
+    enqueue_cuda_inputs = Mock()
+    connector._enqueue_cuda_inputs = enqueue_cuda_inputs  # type: ignore[method-assign]
+
+    connector._launch(num_reqs=4, num_tokens=20)
+    connector._launch(num_reqs=1, num_tokens=5)
+
+    first_pending = connector._request_queue.get_nowait()
+    second_pending = connector._request_queue.get_nowait()
+    assert first_pending is not None
+    assert second_pending is not None
+    assert first_pending.d2h_done_event is first_event
+    assert second_pending.d2h_done_event is second_event
+    assert first_pending.request.num_reqs == 4
+    assert first_pending.request.num_tokens == 20
+    assert second_pending.request.num_reqs == 1
+    assert second_pending.request.num_tokens == 5
+    assert enqueue_cuda_inputs.call_args_list[0].args[1] is first_event
+    assert enqueue_cuda_inputs.call_args_list[1].args[1] is second_event
+    assert connector._d2h_event_pool.empty()
+
+    with pytest.raises(RuntimeError, match="configured concurrent batches"):
+        connector._launch(num_reqs=1, num_tokens=1)
+
+
+def test_ple_offload_request_waits_for_its_bound_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = SimpleNamespace(index=0)
+    connector._uses_cuda_inputs = True
+    connector._d2h_event_pool = queue.Queue(maxsize=1)
+    event = Mock()
+    socket = Mock()
+    request = ple_offload_worker.PleOffloadRequest(
+        dp_rank=0,
+        num_tokens=5,
+        num_reqs=1,
+    )
+    pending = ple_offload_connector_module._PendingPleOffloadRequest(request, event)
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.accelerator,
+        "device_index",
+        lambda *_: nullcontext(),
+    )
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.cuda.nvtx,
+        "range",
+        lambda *_: nullcontext(),
+    )
+
+    connector._process_request(pending, socket)
+
+    event.synchronize.assert_called_once_with()
+    socket.send.assert_called_once_with(msgspec.msgpack.encode(request))
+    assert connector._d2h_event_pool.get_nowait() is event
+
+
+def test_ple_offload_preserves_mrv1_cpu_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector._uses_cuda_inputs = False
+    connector._d2h_event_pool = None
+    connector._copy_cpu_inputs = Mock()  # type: ignore[method-assign]
+    socket = Mock()
+    request = ple_offload_worker.PleOffloadRequest(
+        dp_rank=0,
+        num_tokens=3,
+        num_reqs=1,
+    )
+    pending = ple_offload_connector_module._PendingPleOffloadRequest(request, None)
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.cuda.nvtx,
+        "range",
+        lambda *_: nullcontext(),
+    )
+
+    connector._process_request(pending, socket)
+
+    connector._copy_cpu_inputs.assert_called_once_with(request)
+    socket.send.assert_called_once_with(msgspec.msgpack.encode(request))
 
 
 def test_ple_offload_wait_only_waits_for_done(
