@@ -337,10 +337,14 @@ class CustomAllreduce:
             ops.register_sm70_tp4_push_allreduce_buffer(
                 self._ptr, self.sm70_tp4_push_buffer_ptrs
             )
+            mtp5_status = (
+                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 else "disabled"
+            )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
                 "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
-                "payloads."
+                "payloads; opt-in 25-KiB Qwen4Exp MTP4 payload is %s.",
+                mtp5_status,
             )
 
     @contextmanager

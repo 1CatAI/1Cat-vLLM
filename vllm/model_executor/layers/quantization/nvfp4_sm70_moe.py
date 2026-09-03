@@ -52,6 +52,7 @@ _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 _QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
+_QWEN38_QPN_MTP5_W13_SPLIT_K: Final = 4
 
 
 def _use_qwen38_qpn_m1_decode(
@@ -95,6 +96,30 @@ def _use_qwen38_indexed_prefill(
         and x.dtype == torch.float16
         and x.is_contiguous()
         and topk_ids.shape == (x.shape[0], 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_qwen38_qpn_mtp5_decode(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit only the exact Qwen3.8 TP4 MTP4 verifier route."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+        and x.shape == (5, 2560)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (5, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
         and int(layer.moe_config.tp_size) == 4
         and int(layer.sm70_nvfp4_num_experts) == 512
         and int(layer.sm70_nvfp4_hidden_size) == 2560
@@ -179,6 +204,54 @@ def _single_token_weighted_reduce(
         raise ValueError("SM70 NVFP4 direct weighted-reduce shape mismatch.")
     block = 256
     _single_token_weighted_reduce_kernel[(triton.cdiv(hidden, block),)](
+        expert_output,
+        topk_weights,
+        output,
+        HIDDEN=hidden,
+        TOP_K=top_k,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _mtp_weighted_reduce_kernel(
+    expert_output_ptr,
+    topk_weights_ptr,
+    output_ptr,
+    HIDDEN: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < HIDDEN
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for slot in tl.static_range(0, TOP_K):
+        route = token * TOP_K + slot
+        values = tl.load(
+            expert_output_ptr + route * HIDDEN + offsets,
+            mask=mask,
+            other=0.0,
+        )
+        weight = tl.load(topk_weights_ptr + route)
+        acc += values.to(tl.float32) * weight
+    tl.store(output_ptr + token * HIDDEN + offsets, acc, mask=mask)
+
+
+def _mtp_weighted_reduce(
+    expert_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    tokens, top_k = topk_weights.shape
+    hidden = expert_output.shape[1]
+    if tuple(expert_output.shape) != (tokens * top_k, hidden):
+        raise ValueError("SM70 NVFP4 MTP direct expert-output shape mismatch.")
+    if tuple(output.shape) != (tokens, hidden):
+        raise ValueError("SM70 NVFP4 MTP direct weighted-reduce shape mismatch.")
+    block = 256
+    _mtp_weighted_reduce_kernel[(tokens, triton.cdiv(hidden, block))](
         expert_output,
         topk_weights,
         output,
@@ -358,6 +431,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
         ):
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
+        if (
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+            and not sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+        ):
+            missing.append("nvfp4_moe_qpn_mtp5_sm70_out")
         indexed_prefill_ops = {
             "nvfp4_moe_indexed_dense_stage_sm70_out": hasattr(
                 torch.ops._C, "nvfp4_moe_indexed_dense_stage_sm70_out"
@@ -846,20 +924,34 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         output = buffers["output"]
         slots = num_tokens * top_k
         direct_single_token = num_tokens == 1
-        if _use_qwen38_qpn_m1_decode(layer, x, topk_ids):
+        direct_qpn_m1 = _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
+        direct_qpn_mtp5 = _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+        if direct_qpn_m1 or direct_qpn_mtp5:
+            w13_split_k = (
+                _QWEN38_QPN_M1_W13_SPLIT_K
+                if direct_qpn_m1
+                else _QWEN38_QPN_MTP5_W13_SPLIT_K
+            )
             logger.info_once(
-                "SM70 Qwen3.8 NVFP4 direct QPN-M1 expert path enabled "
-                "(TP4, E512/K10, W13 split8, W2 split1)."
+                "SM70 Qwen3.8 NVFP4 direct expert path enabled "
+                "(TP4, E512/K10, tokens=%d, W13 split%d, W2 split1).",
+                num_tokens,
+                w13_split_k,
             )
             route_ids = topk_ids.view(-1)
-            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+            direct_op = (
+                sm70_ops.nvfp4_moe_qpn_m1_sm70_out
+                if direct_qpn_m1
+                else sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out
+            )
+            direct_op(
                 buffers["gate_up"],
                 x,
                 layer.w13_tm_weight,
                 layer.w13_tm_scales,
                 route_ids,
                 True,
-                _QWEN38_QPN_M1_W13_SPLIT_K,
+                w13_split_k,
             )
             self._apply_swiglu(
                 layer,
@@ -867,7 +959,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["gate_up"],
                 interleaved=interleaved_w13,
             )
-            sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+            direct_op(
                 buffers["sorted_output"],
                 buffers["intermediate"],
                 layer.w2_tm_weight,
@@ -876,9 +968,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 False,
                 _QWEN38_QPN_M1_W2_SPLIT_K,
             )
-            _single_token_weighted_reduce(
-                buffers["sorted_output"], topk_weights, output
-            )
+            if direct_qpn_m1:
+                _single_token_weighted_reduce(
+                    buffers["sorted_output"], topk_weights, output
+                )
+            else:
+                _mtp_weighted_reduce(buffers["sorted_output"], topk_weights, output)
             return output
         if direct_single_token:
             _prepare_single_token_slots(

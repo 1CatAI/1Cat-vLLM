@@ -53,6 +53,30 @@ def test_qpn_sidecars_respect_safe_online_default(monkeypatch):
     assert calls == ["/tmp/qpn8.so"]
 
 
+def test_nvfp4_sidecar_loads_for_mtp5_when_m1_is_disabled(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY", "/tmp/qpn-mtp5.so")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "0")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1")
+    monkeypatch.setattr(torch.ops, "load_library", calls.append)
+
+    online_qpn8.sm70_ops._maybe_load_nvfp4_qpn_m1_library()
+
+    assert calls == ["/tmp/qpn-mtp5.so"]
+
+
+def test_nvfp4_mtp5_capability_is_not_inferred_from_m1(monkeypatch):
+    legacy_sidecar = SimpleNamespace(nvfp4_moe_qpn_m1_sm70_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", legacy_sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert online_qpn8.sm70_ops.has_nvfp4_qpn_m1_dispatch()
+    assert not online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+
+    legacy_sidecar.nvfp4_moe_qpn_mtp5_sm70_out = object()
+    assert online_qpn8.sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
+
+
 @pytest.mark.parametrize(
     ("prefix", "k", "n", "expected"),
     [

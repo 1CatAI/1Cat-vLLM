@@ -76,7 +76,9 @@ load_deferred_nvfp4_qpn2_prefill_library()
 def _maybe_load_nvfp4_qpn_m1_library() -> None:
     """Load the narrow Qwen3.8 NVFP4 experiment in spawned TP workers."""
     library_path = os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY")
-    route_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    m1_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    mtp5_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0") != "0"
+    route_enabled = m1_enabled or mtp5_enabled
     if library_path is not None and route_enabled:
         torch.ops.load_library(library_path)
 
@@ -149,6 +151,13 @@ def has_fp8_qpn8_hc_dispatch() -> bool:
 def has_nvfp4_qpn_m1_dispatch() -> bool:
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out") or hasattr(
         torch.ops._C, "nvfp4_moe_qpn_m1_sm70_out"
+    )
+
+
+def has_nvfp4_qpn_mtp5_dispatch() -> bool:
+    """Reject extensions that only implement the legacy ten-route kernel."""
+    return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
+        torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"
     )
 
 
@@ -1522,6 +1531,56 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out"):
 
     @register_fake("_C_qwen38::nvfp4_moe_qpn_m1_sm70_out")
     def _nvfp4_moe_qpn_m1_sm70_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_moe_qpn_mtp5_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+    split_k: int,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_mtp5_sm70_out")(
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        broadcast_input,
+        split_k,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_mtp5_sm70_out")
+    def _nvfp4_moe_qpn_mtp5_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_mtp5_sm70_out")
+    def _nvfp4_moe_qpn_mtp5_sm70_out_sidecar_fake(
         out: torch.Tensor,
         input: torch.Tensor,
         weights: torch.Tensor,

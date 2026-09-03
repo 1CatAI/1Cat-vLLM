@@ -697,6 +697,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
            &nvfp4_moe_qpn_m1_sm70_out);
 
+  // Keep the five-row verifier on a distinct schema so an old extension that
+  // only supports the ten-route M=1 contract cannot be selected accidentally.
+  ops.def(
+      "nvfp4_moe_qpn_mtp5_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_mtp5_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_mtp5_sm70_out);
+
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "

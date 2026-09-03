@@ -18,12 +18,14 @@ from vllm.model_executor.layers.quantization.modelopt import (
 )
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     ModelOptNvFp4SM70MoEMethod,
+    _mtp_weighted_reduce,
     _prepare_compact_slot_groups,
     _prepare_single_token_slots,
     _single_token_weighted_reduce,
     _use_compact_grouped,
     _use_qwen38_indexed_prefill,
     _use_qwen38_qpn_m1_decode,
+    _use_qwen38_qpn_mtp5_decode,
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
@@ -197,6 +199,29 @@ def test_qwen38_indexed_prefill_is_default_on_and_exact_shape_only(monkeypatch):
     assert not _use_qwen38_indexed_prefill(layer, x, topk_ids)
 
 
+def test_qwen38_qpn_mtp5_decode_is_opt_in_and_exact_shape_only(monkeypatch):
+    layer = SimpleNamespace(
+        moe_config=_qwen4_moe_contract(),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+    )
+    x = torch.empty(5, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(5, 10, dtype=torch.int32)
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", raising=False)
+    assert not _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1")
+    assert _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+    assert not _use_qwen38_qpn_mtp5_decode(layer, x[:4], topk_ids[:4])
+    assert not _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids.long())
+
+    layer.moe_config.tp_size = 2
+    assert not _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+
+
 def test_nvfp4_moe_contract_rejects_shape_consistent_unvalidated_tp8():
     with pytest.raises(NotImplementedError, match="tensor parallel"):
         validate_nvfp4_sm70_moe_contract(
@@ -335,6 +360,47 @@ def test_nvfp4_single_token_direct_routing_is_exact_and_graph_dynamic():
     torch.accelerator.synchronize()
     assert torch.equal(expanded, x.expand(top_k, -1))
     assert torch.equal(active_ids, topk_ids[0].int())
+    assert torch.equal(output, reference)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires an exact SM70 CUDA device",
+)
+def test_nvfp4_mtp5_direct_weighted_reduce_is_exact_and_graph_dynamic():
+    tokens = 5
+    top_k = 10
+    hidden = 2560
+    weights = torch.softmax(
+        torch.randn(tokens, top_k, device="cuda", dtype=torch.float32), dim=-1
+    )
+    expert_output = torch.randn(
+        tokens * top_k, hidden, dtype=torch.float16, device="cuda"
+    )
+    output = torch.empty(tokens, hidden, dtype=torch.float16, device="cuda")
+    reference = torch.empty_like(output)
+    identity = torch.arange(tokens * top_k, dtype=torch.int32, device="cuda").view(
+        tokens, top_k
+    )
+
+    _mtp_weighted_reduce(expert_output, weights, output)
+    torch.ops._moe_C.moe_unpermute(
+        expert_output, weights, identity, None, top_k, reference
+    )
+    torch.accelerator.synchronize()
+    assert torch.equal(output, reference)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _mtp_weighted_reduce(expert_output, weights, output)
+
+    weights.copy_(weights.roll(2, dims=1))
+    expert_output.mul_(0.5)
+    graph.replay()
+    torch.ops._moe_C.moe_unpermute(
+        expert_output, weights, identity, None, top_k, reference
+    )
+    torch.accelerator.synchronize()
     assert torch.equal(output, reference)
 
 
