@@ -21,10 +21,21 @@ def _require_grouped_page4():
     return extension
 
 
+def _grouped_page4_abi_version(extension) -> int:
+    capability = getattr(extension, "grouped_sparse_page4_abi_version", None)
+    if callable(capability):
+        return int(capability())
+    doc = getattr(extension.grouped_sparse_page4_fwd, "__doc__", "") or ""
+    return 2 if "arg11:" in doc else 1 if "arg8:" in doc else 0
+
+
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_e4m3"])
 @torch.inference_mode()
 def test_sm70_qsa_grouped_page4_calibrated_kv(kv_cache_dtype: str) -> None:
     extension = _require_grouped_page4()
+    abi_version = _grouped_page4_abi_version(extension)
+    if kv_cache_dtype == "fp8_e4m3" and abi_version < 2:
+        pytest.skip("installed grouped page4 ABI does not support quantized K/V")
     torch.manual_seed(7)
     query = torch.randn((8, 6, 256), dtype=torch.float16, device="cuda") * 0.2
     key = torch.randn((1, 4, 1, 256), dtype=torch.float16, device="cuda") * 0.35
@@ -48,7 +59,7 @@ def test_sm70_qsa_grouped_page4_calibrated_kv(kv_cache_dtype: str) -> None:
     seq_lens = torch.tensor([4], dtype=torch.int32, device="cuda")
     output = torch.empty_like(query)
     lse = torch.empty((8, 6), dtype=torch.float32, device="cuda")
-    extension.grouped_sparse_page4_fwd(
+    args = (
         query,
         key_cache,
         value_cache,
@@ -58,10 +69,16 @@ def test_sm70_qsa_grouped_page4_calibrated_kv(kv_cache_dtype: str) -> None:
         seq_lens,
         lse,
         256**-0.5,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
     )
+    if abi_version >= 2:
+        extension.grouped_sparse_page4_fwd(
+            *args,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+    else:
+        extension.grouped_sparse_page4_fwd(*args)
 
     reference_key = reference_key.view(4, 256)
     reference_value = reference_value.view(4, 256)

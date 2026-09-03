@@ -732,6 +732,8 @@ if TYPE_CHECKING:
     VLLM_PLE_DISK_OFFLOAD: bool = False
     VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
     VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
+    VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
+    VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -4287,6 +4289,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: (
         os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "False").lower() in ("true", "1")
+    ),
+    # Keep the latency-critical PLE lookup process on the NUMA node local to
+    # its first visible GPU. This changes CPU placement only; allocations use
+    # a local-first policy with fallback so large tables are not forced into a
+    # single NUMA node and swapped out.
+    "VLLM_PLE_OFFLOAD_AUTO_NUMA": lambda: (
+        os.getenv("VLLM_PLE_OFFLOAD_AUTO_NUMA", "True").lower() in ("true", "1")
+    ),
+    # Fault PLE table pages back into RAM after GPU workers finish loading.
+    # Concurrent checkpoint loading can otherwise leave anonymous table pages
+    # in swap while reclaimable checkpoint page cache occupies host memory.
+    "VLLM_PLE_OFFLOAD_PREFAULT": lambda: (
+        os.getenv("VLLM_PLE_OFFLOAD_PREFAULT", "True").lower() in ("true", "1")
     ),
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(

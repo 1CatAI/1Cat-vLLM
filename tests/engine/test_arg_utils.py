@@ -308,19 +308,8 @@ def test_sm70_mtp_defaults_require_env_opt_in(monkeypatch):
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
-    assert args.max_num_seqs == 4
-    assert args.compilation_config.cudagraph_capture_sizes == [
-        1,
-        2,
-        4,
-        5,
-        8,
-        9,
-        10,
-        15,
-        18,
-        20,
-    ]
+    assert args.max_num_seqs is None
+    assert args.compilation_config.cudagraph_capture_sizes is None
 
 
 def test_sm70_mtp_split_cudagraphs_are_opt_in(monkeypatch):
@@ -332,7 +321,7 @@ def test_sm70_mtp_split_cudagraphs_are_opt_in(monkeypatch):
         },
     )
 
-    assert args.compilation_config.cudagraph_capture_sizes == [5, 10, 20]
+    assert args.compilation_config.cudagraph_capture_sizes is None
 
 
 def test_sm70_mtp_split_cudagraphs_cover_production_batches(monkeypatch):
@@ -348,6 +337,7 @@ def test_sm70_mtp_split_cudagraphs_cover_production_batches(monkeypatch):
     assert args.compilation_config.cudagraph_capture_sizes == [
         5,
         10,
+        15,
         20,
         30,
         40,
@@ -395,7 +385,7 @@ def test_sm70_explicit_mtp_still_gets_safe_defaults(monkeypatch):
     }
     assert args.enable_prefix_caching is True
     assert args.mamba_cache_mode == "align"
-    assert args.max_num_seqs == 4
+    assert args.max_num_seqs is None
 
 
 def test_sm70_explicit_dflash_preserves_probabilistic_default(monkeypatch):

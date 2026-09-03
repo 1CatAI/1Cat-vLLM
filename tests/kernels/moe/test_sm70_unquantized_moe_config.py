@@ -8,6 +8,7 @@ import vllm.model_executor.layers.fused_moe.fused_moe as fused_moe_module
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _get_sm70_mtp_moe_decode_config,
     force_sm70_mtp_moe_legacy_config,
+    fused_moe_kernel,
 )
 
 
@@ -18,6 +19,10 @@ def _enable_tuned_mtp_config(monkeypatch):
 
 def test_mtp_sm70_decode_config_keeps_legacy_tile_at_m1():
     assert _get_sm70_mtp_moe_decode_config(1, 256, 128, 2048, 8) is None
+
+
+def test_fused_moe_does_not_specialize_on_routing_dependent_em_alignment():
+    assert "EM" in fused_moe_kernel.do_not_specialize_on_alignment
 
 
 @pytest.mark.parametrize("m", range(2, 17))

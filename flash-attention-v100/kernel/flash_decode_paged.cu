@@ -4034,6 +4034,12 @@ int64_t flash_attention_grouped_verify_max_query_tokens() {
   return kGroupedVerifyMaxSupportedQ;
 }
 
+int64_t flash_attention_grouped_sparse_page4_abi_version() {
+  // Version 1 accepted FP16 K/V through the nine-argument forward binding.
+  // Version 2 adds kv_cache_dtype and calibrated K/V scales.
+  return 2;
+}
+
 at::Tensor flash_attention_grouped_verify_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,

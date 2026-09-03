@@ -81,7 +81,8 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
-_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
+_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
+_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     # This is the target projection's memory-neutral FP8 layout, not the
@@ -181,6 +182,20 @@ def _sm70_mtp_cudagraph_capture_sizes(
     }
     request_sizes.add(max_graph_reqs)
     return [decode_query_len * size for size in sorted(request_sizes)]
+
+
+def _sm70_speculative_cudagraph_capture_sizes(
+    max_num_seqs: int,
+    decode_query_len: int,
+) -> list[int]:
+    """Return bounded auxiliary and verifier shapes without a TP contract."""
+    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
+        max_num_seqs,
+        decode_query_len,
+    )
+    return sorted(
+        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
+    )
 
 
 class OptimizationLevel(IntEnum):
@@ -1682,31 +1697,15 @@ class VllmConfig:
                             )
                         else:
                             cudagraph_capture_sizes = (
-                                [1, 2, 4, 8, 9, 18]
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else [1, 2, 4, 8, 9]
-                            )
-                            max_graph_reqs = (
-                                4
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else 1
-                            )
-                            max_graph_reqs = min(
-                                max(int(self.scheduler_config.max_num_seqs), 1),
-                                max_graph_reqs,
-                            )
-                            cudagraph_capture_sizes = sorted(
-                                set(cudagraph_capture_sizes)
-                                | {
-                                    decode_query_len * num_reqs
-                                    for num_reqs in range(1, max_graph_reqs + 1)
-                                }
+                                _sm70_speculative_cudagraph_capture_sizes(
+                                    self.scheduler_config.max_num_seqs,
+                                    decode_query_len,
+                                )
                             )
                             logger.info_once(
-                                "Using SM70 speculative verifier cudagraph shapes "
-                                "%sx1..%s for Flash-V100 compile graph.",
-                                decode_query_len,
-                                max_graph_reqs,
+                                "Using bounded SM70 speculative cudagraph token "
+                                "shapes %s for Flash-V100 compile graph.",
+                                tuple(cudagraph_capture_sizes),
                             )
                     elif cudagraph_capture_sizes != [1, 2]:
                         logger.info_once(
