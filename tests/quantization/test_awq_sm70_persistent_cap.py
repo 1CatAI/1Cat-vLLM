@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skip_global_cleanup
         (64, 8, 8),
         (64, 16, 16),
         (64, 32, 32),
-        (8, 16, 8),
+        (8, 16, 16),
         (0, 0, 1),
         (-1, 0, 1),
     ],
@@ -39,6 +39,7 @@ def test_resolve_persistent_max_tokens(
     ("config_max_num_seqs", "override", "expected"),
     [
         (8, 0, 8),
+        (8, 16, 16),
         (16, 8, 8),
         (64, 0, 32),
         (64, 16, 16),

@@ -39,8 +39,8 @@ def _resolve_persistent_max_tokens(
     scheduler_cap = max(1, int(max_num_seqs))
     requested_cap = int(override)
     if requested_cap <= 0:
-        requested_cap = scheduler_cap
-    return min(requested_cap, scheduler_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
+        return min(scheduler_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
+    return min(requested_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
 
 
 def _persistent_max_tokens_for_runtime() -> int:
