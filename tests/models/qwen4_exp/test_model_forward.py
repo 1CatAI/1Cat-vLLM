@@ -132,6 +132,7 @@ def test_qsa_model_shares_one_topk_indices_buffer(monkeypatch) -> None:
             eplb_config=SimpleNamespace(num_redundant_experts=0)
         ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        cache_config=SimpleNamespace(cache_dtype="float16"),
         compilation_config=SimpleNamespace(mode=0),
         speculative_config=None,
     )
