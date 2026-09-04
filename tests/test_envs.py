@@ -132,21 +132,12 @@ def test_sm70_concurrency_tuning_envs(
         "VLLM_SM70_FP8_QPN8_M32_NATIVE",
         "VLLM_SM70_NVFP4_QPN2_M16_NATIVE",
         "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY",
-        "VLLM_SM70_DFLASH2_BATCH_TRACE",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
         assert environment_variables[name]() is False
         monkeypatch.setenv(name, "1")
         assert environment_variables[name]() is True
-
-    name = "VLLM_SM70_DFLASH2_BATCH_TRACE_EVERY"
-    monkeypatch.delenv(name, raising=False)
-    assert environment_variables[name]() == 16
-    monkeypatch.setenv(name, "0")
-    assert environment_variables[name]() == 1
-    monkeypatch.setenv(name, "7")
-    assert environment_variables[name]() == 7
 
     name = "VLLM_SM70_MTP_MOE_TUNED_CONFIG"
     monkeypatch.delenv(name, raising=False)
