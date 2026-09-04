@@ -426,7 +426,6 @@ def _qsa_xqa_page4_table_kernel(
     OUTPUT_PAGES: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
     PHYSICAL_PAGE_STRIDE: tl.constexpr,
-    TAIL_MARKER: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     slots = tl.arange(0, BLOCK_PAGES)
@@ -491,13 +490,16 @@ def _qsa_xqa_page4_table_kernel(
     physical_microblock = (
         tl.maximum(physical_page, 0) * PHYSICAL_PAGE_STRIDE + page_offset // 4
     )
+    # Sort by logical token, not allocator-dependent physical page ID. Keep
+    # the partial causal page after all complete pages and invalid slots last.
+    logical_key = safe_token.to(tl.int64) << 31
     encoded = tl.where(
         valid & is_complete,
-        physical_microblock,
+        logical_key | physical_microblock.to(tl.int64),
         tl.where(
             valid & is_tail,
-            physical_microblock + TAIL_MARKER,
-            2147483647,
+            (1 << 62) | logical_key | physical_microblock.to(tl.int64),
+            9223372036854775807,
         ),
     )
     tl.store(
@@ -1464,7 +1466,7 @@ def _qsa_xqa_page4_block_table(
     rows = logical_indices.shape[0]
     encoded_pages = torch.empty(
         (rows, _SM70_QSA_XQA_PAGE4_PAGES),
-        dtype=torch.int32,
+        dtype=torch.int64,
         device=logical_indices.device,
     )
     xqa_sequence_lengths = torch.empty(
@@ -1490,14 +1492,13 @@ def _qsa_xqa_page4_block_table(
         OUTPUT_PAGES=_SM70_QSA_XQA_PAGE4_PAGES,
         BLOCK_PAGES=1024,
         PHYSICAL_PAGE_STRIDE=physical_page_stride,
-        TAIL_MARKER=_SM70_QSA_XQA_PAGE4_MARKER,
         num_warps=4,
     )
     sorted_pages = torch.sort(encoded_pages, dim=1).values
     physical_pages = torch.bitwise_and(
         sorted_pages,
         _SM70_QSA_XQA_PAGE4_MARKER - 1,
-    )
+    ).to(torch.int32)
     return physical_pages, xqa_sequence_lengths
 
 
