@@ -75,10 +75,34 @@ constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
     5 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
     ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70Tp4PushAllreduceGenericBufferBytes =
     kSm70Tp4PushAllreduceSignalBytes + kSm70Tp4PushAllreduceEpochs *
                                            kSm70Tp4PushAllreduceWorldSize *
                                            kSm70Tp4PushAllreduceBytes;
+// HC decode can overlap the ordinary MoE push collective on vLLM's auxiliary
+// stream. Keep both its epoch words and payloads disjoint so an HC poll cannot
+// observe or clear a concurrently running all-reduce packet. The ordinary
+// collective layout above remains unchanged.
+constexpr int kSm70Qwen38HcGatePushBlocks = 10;
+constexpr int kSm70Qwen38HcDownEpochIndex = 0;
+constexpr int kSm70Qwen38HcGateEpochIndexBase = 1;
+constexpr size_t kSm70Qwen38HcPushSignalOffset =
+    kSm70Tp4PushAllreduceGenericBufferBytes;
+constexpr size_t kSm70Qwen38HcPushSignalBytes = 128;
+constexpr size_t kSm70Qwen38HcDownPushBytes = 256;
+constexpr size_t kSm70Qwen38HcGatePushBytes = 2560 * sizeof(half);
+constexpr size_t kSm70Qwen38HcDownPushOffset =
+    kSm70Qwen38HcPushSignalOffset + kSm70Qwen38HcPushSignalBytes;
+constexpr size_t kSm70Qwen38HcGatePushOffset =
+    kSm70Qwen38HcDownPushOffset + kSm70Tp4PushAllreduceEpochs *
+                                      kSm70Tp4PushAllreduceWorldSize *
+                                      kSm70Qwen38HcDownPushBytes;
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcGatePushOffset + kSm70Tp4PushAllreduceEpochs *
+                                      kSm70Tp4PushAllreduceWorldSize *
+                                      kSm70Qwen38HcGatePushBytes;
+static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
+              kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
 inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
   if (bytes == kSm70Tp4PushAllreduceBytes) {
@@ -1505,11 +1529,19 @@ class CustomAllreduce {
       }
       sm70_tp4_push_buffers_.ptrs[peer] = ptrs[peer];
     }
-    auto* local_data =
+    auto* generic_data =
         static_cast<char*>(ptrs[rank_]) + kSm70Tp4PushAllreduceSignalBytes;
+    CUDACHECK(cudaMemset(generic_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceGenericBufferBytes -
+                             kSm70Tp4PushAllreduceSignalBytes));
+    auto* hc_signal =
+        static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcPushSignalOffset;
+    CUDACHECK(cudaMemset(hc_signal, 0, kSm70Qwen38HcPushSignalBytes));
+    auto* hc_data =
+        static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcDownPushOffset;
     CUDACHECK(cudaMemset(
-        local_data, kSm70Tp4PushAllreduceSentinelByte,
-        kSm70Tp4PushAllreduceBufferBytes - kSm70Tp4PushAllreduceSignalBytes));
+        hc_data, kSm70Tp4PushAllreduceSentinelByte,
+        kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcDownPushOffset));
     sm70_tp4_push_buffers_registered_ = true;
   }
 

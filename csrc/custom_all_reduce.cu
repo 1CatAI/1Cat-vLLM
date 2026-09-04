@@ -110,12 +110,14 @@ __global__ void __launch_bounds__(128, 1)
   using P = typename packed_t<half>::P;
   constexpr int kElementsPerPack = P::size;
   constexpr int kPackedElements = kQwen38HcDownLocalElements / kElementsPerPack;
-  constexpr int kPackedStride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+  constexpr int kPackedStride = kSm70Qwen38HcDownPushBytes / sizeof(P);
+  static_assert(kPackedElements <= kPackedStride);
 
   auto* local_storage =
       const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[Rank]));
-  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
-  const uint32_t epoch = local_epochs[0];
+  auto* local_epochs = reinterpret_cast<uint32_t*>(
+      local_storage + kSm70Qwen38HcPushSignalOffset);
+  const uint32_t epoch = local_epochs[kSm70Qwen38HcDownEpochIndex];
   const int epoch_offset = epoch * ngpus * kPackedStride;
   const int offset = threadIdx.x;
 
@@ -132,7 +134,7 @@ __global__ void __launch_bounds__(128, 1)
       if (destination_rank == Rank) continue;
       auto* destination_base = const_cast<char*>(
           reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
-      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
+      void* destination = destination_base + kSm70Qwen38HcDownPushOffset +
                           (epoch_offset + Rank * kPackedStride) * sizeof(P);
       sm70_push_store_volatile_16b(value, destination, offset);
     }
@@ -145,7 +147,7 @@ __global__ void __launch_bounds__(128, 1)
       for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
         if (source_rank == Rank) continue;
         const void* source =
-            local_storage + kSm70Tp4PushAllreduceSignalBytes +
+            local_storage + kSm70Qwen38HcDownPushOffset +
             (epoch_offset + source_rank * kPackedStride) * sizeof(P);
         sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
   #pragma unroll
@@ -189,7 +191,7 @@ __global__ void __launch_bounds__(128, 1)
   #pragma unroll
     for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
       if (source_rank == Rank) continue;
-      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+      void* source = local_storage + kSm70Qwen38HcDownPushOffset +
                      (epoch_offset + source_rank * kPackedStride) * sizeof(P);
       sm70_push_store_volatile_16b(empty, source, offset);
     }
@@ -197,7 +199,8 @@ __global__ void __launch_bounds__(128, 1)
 
   __syncthreads();
   if (threadIdx.x == 0) {
-    local_epochs[0] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+    local_epochs[kSm70Qwen38HcDownEpochIndex] =
+        (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
   }
 }
 
@@ -233,12 +236,14 @@ __global__ void __launch_bounds__(512, 1)
                                  int packed_elements) {
   static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
   using P = typename packed_t<half>::P;
-  constexpr int kPackedStride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+  constexpr int kPackedStride = kSm70Qwen38HcGatePushBytes / sizeof(P);
 
   auto* local_storage =
       const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[Rank]));
-  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
-  const uint32_t epoch = local_epochs[blockIdx.x];
+  auto* local_epochs = reinterpret_cast<uint32_t*>(
+      local_storage + kSm70Qwen38HcPushSignalOffset);
+  const int epoch_index = kSm70Qwen38HcGateEpochIndexBase + blockIdx.x;
+  const uint32_t epoch = local_epochs[epoch_index];
   const int epoch_offset = epoch * ngpus * kPackedStride;
   const int offset = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -255,7 +260,7 @@ __global__ void __launch_bounds__(512, 1)
       if (destination_rank == Rank) continue;
       auto* destination_base = const_cast<char*>(
           reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
-      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
+      void* destination = destination_base + kSm70Qwen38HcGatePushOffset +
                           (epoch_offset + Rank * kPackedStride) * sizeof(P);
       sm70_push_store_volatile_16b(value, destination, offset);
     }
@@ -268,7 +273,7 @@ __global__ void __launch_bounds__(512, 1)
       for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
         if (source_rank == Rank) continue;
         const void* source =
-            local_storage + kSm70Tp4PushAllreduceSignalBytes +
+            local_storage + kSm70Qwen38HcGatePushOffset +
             (epoch_offset + source_rank * kPackedStride) * sizeof(P);
         sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
   #pragma unroll
@@ -303,7 +308,7 @@ __global__ void __launch_bounds__(512, 1)
   #pragma unroll
     for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
       if (source_rank == Rank) continue;
-      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+      void* source = local_storage + kSm70Qwen38HcGatePushOffset +
                      (epoch_offset + source_rank * kPackedStride) * sizeof(P);
       sm70_push_store_volatile_16b(empty, source, offset);
     }
@@ -311,7 +316,7 @@ __global__ void __launch_bounds__(512, 1)
 
   __syncthreads();
   if (threadIdx.x == 0) {
-    local_epochs[blockIdx.x] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+    local_epochs[epoch_index] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
   }
 }
 
