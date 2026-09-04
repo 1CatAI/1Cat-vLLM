@@ -44993,3 +44993,42 @@ Interpretation:
   200. The service retained the 47.684-GiB file-backed PLE mapping with about
   1.3 GiB worker RSS; startup's cgroup peak includes reclaimable/shared file
   mappings and did not trigger `systemd-oomd` after sequencing was repaired.
+
+## 2026-09-04 Qwen3.8 exact no-MTP decode continuation
+
+- The current TP4/V2/no-MTP baseline uses Qwen3.8-Flash-Next-NVFP4 on four
+  V100-SXM2-32GB GPUs, FP16 activation/KV, Flash-V100, full CUDA Graphs,
+  hybrid mmap-prefill plus pinned-decode PLE, 8,192 input tokens, and 513
+  generated tokens. The accepted result is `85.136 token/s`, or
+  `11.746 ms/token`; its output token IDs exactly match the preceding control
+  (`7385dac...`). The active target remains `100 token/s` without changing
+  arithmetic precision or enabling MTP.
+- A graph-node trace at source `234d6bea91` measures `12.559 ms/token` with
+  tracing overhead. The leading additive categories are row GEMV
+  `1.439 ms`, GDN input `1.059 ms`, W13 `0.656 ms`, HC local down
+  `0.564 ms`, LM head `0.552 ms`, router `0.525 ms`, HC local up
+  `0.492 ms`, W2 `0.480 ms`, QSA split-K `0.440 ms`, and HC combine/norm
+  `0.402 ms`. Shared-expert auxiliary GEMVs overlap routed MoE and are not
+  added to the critical path a second time.
+- The production sidecar now includes the existing exact direct-W2 reduction
+  operator that the prior deployed binary lacked. Its production-shape graph
+  screen is bitwise equal and moves the W2 plus weighted-reduce chain from
+  `0.5062` to `0.4082 ms/token`, a projected `0.0980 ms/token` saving. This
+  projection is intentionally held for a combined model startup.
+- Two narrow SM70 PLE M=1 kernels remove generic tensor plumbing without
+  changing data types or rounding boundaries. The exact ngram-2/3 ID kernel
+  passes 256/256 random and EOS-boundary comparisons and moves
+  `0.08169` to `0.00435 ms/token`. The depthwise dilated-convolution/state
+  kernel is bitwise for normal, no-initial-state, and graph-padding cases and
+  moves `0.04084` to `0.00543 ms/token` while retaining native `F.silu`.
+- Fusing SiLU into Triton was rejected because the approximation changed two
+  FP16 values by up to `1.22e-4`; the admitted path keeps the original native
+  SiLU rounding. Cooperative HC combine/down, sum2/combine fusion, a
+  deterministic replacement router, SGLang's atomic persistent-HC design,
+  and fine-grained down-project/push pipelining were also rejected as slower,
+  nondeterministic, or deadlocking. They must not be retried without a new
+  schedule or arithmetic proof.
+- The direct-W2 and PLE screens project about `0.211 ms/token` combined. No
+  full-model speed result is claimed yet: these changes are deliberately
+  batched with further exact hot-path work so model loading is not repeated
+  for a sub-millisecond projection.
