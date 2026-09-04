@@ -27,7 +27,9 @@ def test_sm70_v2_mtp_profile_gate(monkeypatch):
     assert runner._sm70_v2_mtp_profile_enabled()
 
     runner.speculative_config = SimpleNamespace(method="dflash")
-    assert not runner._sm70_v2_mtp_profile_enabled()
+    assert runner._sm70_v2_mtp_profile_enabled()
+    runner.speculative_config = SimpleNamespace(method="dspark")
+    assert runner._sm70_v2_mtp_profile_enabled()
     runner.speculative_config = SimpleNamespace(method="mtp")
     runner.is_last_pp_rank = False
     assert not runner._sm70_v2_mtp_profile_enabled()

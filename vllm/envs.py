@@ -166,6 +166,9 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_QPN8_M16: bool = False
+    VLLM_SM70_FP8_QPN8_M32_CHUNKED: bool = False
+    VLLM_SM70_FP8_QPN8_M32_NATIVE: bool = False
     VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
@@ -179,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FA2_D256_LIBRARY: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
+    VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
@@ -231,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
@@ -416,6 +421,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER: bool = False
     VLLM_FLASH_V100_DECODE_USE_XQA: bool = True
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY: bool = True
+    VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY: bool = False
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
@@ -1723,6 +1729,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # online route also stays opt-in because it requantizes checkpoint BF16
     # attention, GDN, QSA, and mHC weights without calibration.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in
+    # QPN8 form for exact M=9..16 projection shapes instead of reconstructing
+    # a full FP16 matrix before every GEMM.
+    "VLLM_SM70_FP8_QPN8_M16": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_M16", "0"))
+    ),
+    # Follow-on B4 experiment: replay the accepted M16 body in contiguous row
+    # chunks through M=32 while retaining the same strict shape allowlist.
+    "VLLM_SM70_FP8_QPN8_M32_CHUNKED": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_M32_CHUNKED", "0"))
+    ),
+    # Native dense-only B4 verifier experiment. It keeps the logical split-K
+    # reduction order while one CTA reuses each packed weight tile for M<=32.
+    "VLLM_SM70_FP8_QPN8_M32_NATIVE": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QPN8_M32_NATIVE", "0"))
+    ),
     "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0"))
     ),
@@ -1776,6 +1798,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+    # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
+    # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
+    "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_M16_NATIVE", "0"))
+    ),
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
@@ -2107,6 +2134,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ordinary pull path; explicit 0 is the rollback.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1"))
+    ),
+    # Opt-in Qwen3.8 DFlash2 extension of the TP4 push collective from the
+    # accepted M8 payload to M16/M32 verifier payloads.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY", "0"))
     ),
     # Exact Qwen3.8 MTP4 verifier payload: FP16 [5, 2560] (25 KiB). The
     # existing push allocation is sized for 80 KiB, so this changes dispatch
@@ -2776,6 +2808,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY", "1"))
+    ),
+    # Keep batched admission independent until the request-major kernel has
+    # passed B2/B4/B8 operator, graph, endpoint, and quality gates.
+    "VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY", "0"))
     ),
     "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": lambda: int(
         os.getenv("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN", "32768")

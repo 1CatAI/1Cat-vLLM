@@ -56,6 +56,52 @@ def _make_case(
     return query, key_cache, value_cache, block_table, seq_lens
 
 
+def _make_batched_case(
+    *,
+    page_size: int,
+    batch_size: int,
+    query_len: int,
+    prefix_len: int,
+    interleaved: bool,
+) -> tuple[torch.Tensor, ...]:
+    seq_lens = torch.tensor(
+        [prefix_len + (req_idx % 3) * 17 + query_len for req_idx in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    max_logical_pages = math.ceil(int(seq_lens.max().item()) / page_size)
+    physical_pages = batch_size * max_logical_pages + 3
+    if interleaved:
+        source = torch.randn(
+            (physical_pages, 2, page_size, 1, 256),
+            dtype=torch.float16,
+            device="cuda",
+        ).mul_(0.25)
+        cache = source.to(torch.float8_e5m2).view(torch.uint8)
+        key_cache, value_cache = cache.unbind(1)
+    else:
+        source_shape = (physical_pages, page_size, 1, 256)
+        key_source = torch.randn(
+            source_shape,
+            dtype=torch.float16,
+            device="cuda",
+        ).mul_(0.25)
+        value_source = torch.randn_like(key_source).mul_(0.25)
+        key_cache = key_source.to(torch.float8_e5m2).view(torch.uint8)
+        value_cache = value_source.to(torch.float8_e5m2).view(torch.uint8)
+    block_table = torch.randperm(
+        physical_pages,
+        dtype=torch.int32,
+        device="cuda",
+    )[: batch_size * max_logical_pages].view(batch_size, max_logical_pages)
+    query = torch.randn(
+        (batch_size * query_len, 6, 256),
+        dtype=torch.float16,
+        device="cuda",
+    ).mul_(0.25)
+    return query, key_cache, value_cache, block_table, seq_lens
+
+
 def _make_interleaved_case(
     *,
     page_size: int,
@@ -114,6 +160,49 @@ def _reference(
         probabilities = torch.softmax(scores, dim=-1)
         rows.append(torch.einsum("hn,nd->hd", probabilities, value[:visible]))
     return torch.stack(rows).half()
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("batch_size", [2, 4, 8])
+@torch.inference_mode()
+def test_batched_grouped_verify_is_bitwise_per_request(
+    batch_size: int,
+    interleaved: bool,
+) -> None:
+    flash_attn_v100 = _require_grouped_verify()
+    torch.manual_seed(20260903 + batch_size)
+    query, key_cache, value_cache, block_table, seq_lens = _make_batched_case(
+        page_size=1648,
+        batch_size=batch_size,
+        query_len=8,
+        prefix_len=4097,
+        interleaved=interleaved,
+    )
+
+    batched = flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        one_pass=True,
+    ).clone()
+    per_request = torch.cat(
+        [
+            flash_attn_v100.flash_attn_grouped_verify_paged(
+                query[req_idx * 8 : (req_idx + 1) * 8],
+                key_cache,
+                value_cache,
+                block_table[req_idx : req_idx + 1],
+                seq_lens[req_idx : req_idx + 1],
+                one_pass=True,
+            ).clone()
+            for req_idx in range(batch_size)
+        ]
+    )
+    torch.accelerator.synchronize()
+
+    assert torch.equal(batched, per_request)
 
 
 @pytest.mark.parametrize(
@@ -276,6 +365,69 @@ def test_grouped_verify_cuda_graph_replay_tracks_runtime_seq_len(
         difference = output.float().sub(expected.float()).abs()
         assert difference.max().item() <= 6.2e-5
         assert difference.mean().item() <= 6.0e-6
+
+
+@torch.inference_mode()
+def test_batched_grouped_verify_cuda_graph_tracks_each_request_seq_len() -> None:
+    flash_attn_v100 = _require_grouped_verify()
+    torch.manual_seed(20260903)
+    batch_size = 4
+    query, key_cache, value_cache, block_table, seq_lens = _make_batched_case(
+        page_size=1648,
+        batch_size=batch_size,
+        query_len=8,
+        prefix_len=4097,
+        interleaved=True,
+    )
+    output = torch.empty_like(query)
+    flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        out=output,
+        one_pass=True,
+    )
+    torch.accelerator.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flash_attn_v100.flash_attn_grouped_verify_paged(
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            out=output,
+            one_pass=True,
+        )
+
+    for prefix_len in (127, 2049, 4097):
+        seq_lens.copy_(
+            torch.tensor(
+                [prefix_len + req_idx * 17 + 8 for req_idx in range(batch_size)],
+                dtype=torch.int32,
+                device="cuda",
+            )
+        )
+        graph.replay()
+        torch.accelerator.synchronize()
+        expected = torch.cat(
+            [
+                flash_attn_v100.flash_attn_grouped_verify_paged(
+                    query[req_idx * 8 : (req_idx + 1) * 8],
+                    key_cache,
+                    value_cache,
+                    block_table[req_idx : req_idx + 1],
+                    seq_lens[req_idx : req_idx + 1],
+                    one_pass=True,
+                ).clone()
+                for req_idx in range(batch_size)
+            ]
+        )
+        torch.accelerator.synchronize()
+        assert torch.equal(output, expected)
 
 
 @pytest.mark.parametrize("page_size", [1648, 3296])

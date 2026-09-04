@@ -67,8 +67,13 @@ constexpr int kSm70Tp4PushAllreduceThreads = 128;
 constexpr int kSm70Tp4PushAllreduceEpochs = 2;
 constexpr uint16_t kSm70Tp4PushAllreduceSentinel = 0x7f7f;
 constexpr int kSm70Tp4PushAllreduceSentinelByte = 0x7f;
-constexpr size_t kSm70Tp4PushAllreduceBytes =
+constexpr size_t kSm70Tp4PushAllreduceM8Bytes =
     8 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceM16Bytes =
+    16 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceM32Bytes =
+    32 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM32Bytes;
 constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
@@ -78,10 +83,17 @@ constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
     kSm70Tp4PushAllreduceSignalBytes + kSm70Tp4PushAllreduceEpochs *
                                            kSm70Tp4PushAllreduceWorldSize *
-                                           kSm70Tp4PushAllreduceBytes;
+                                           kSm70Tp4PushAllreduceMaxBytes;
 
 inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
-  if (bytes == kSm70Tp4PushAllreduceBytes) {
+  if (bytes == kSm70Tp4PushAllreduceM8Bytes) {
+    return kSm70Tp4PushAllreduceBlocks;
+  }
+  const char* concurrency =
+      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY");
+  if (concurrency != nullptr && std::strcmp(concurrency, "1") == 0 &&
+      (bytes == kSm70Tp4PushAllreduceM16Bytes ||
+       bytes == kSm70Tp4PushAllreduceM32Bytes)) {
     return kSm70Tp4PushAllreduceBlocks;
   }
   if (bytes == kSm70Tp4PushAllreduce8KiBBytes) {
@@ -655,11 +667,12 @@ __global__ void __launch_bounds__(1024, 1)
       const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
   auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
   const uint32_t epoch = local_epochs[blockIdx.x];
-  constexpr int packed_stride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+  constexpr int packed_stride = kSm70Tp4PushAllreduceMaxBytes / sizeof(P);
   const int epoch_offset = epoch * ngpus * packed_stride;
-  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+  const int first_offset = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (offset < packed_size) {
+  for (int offset = first_offset; offset < packed_size;
+       offset += gridDim.x * blockDim.x) {
     P value = reinterpret_cast<const P*>(input)[offset];
 #pragma unroll
     for (int element = 0; element < P::size; ++element) {
@@ -732,11 +745,12 @@ __global__ void __launch_bounds__(1024, 1)
       const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
   auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
   const uint32_t epoch = local_epochs[blockIdx.x];
-  constexpr int packed_stride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+  constexpr int packed_stride = kSm70Tp4PushAllreduceMaxBytes / sizeof(P);
   const int epoch_offset = epoch * ngpus * packed_stride;
-  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+  const int first_offset = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (offset < packed_size) {
+  for (int offset = first_offset; offset < packed_size;
+       offset += gridDim.x * blockDim.x) {
     P value_a = reinterpret_cast<const P*>(input_a)[offset];
     const P value_b = reinterpret_cast<const P*>(input_b)[offset];
     packed_assign_add(value_a, value_b);

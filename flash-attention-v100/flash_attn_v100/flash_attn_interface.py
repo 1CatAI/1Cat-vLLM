@@ -503,26 +503,44 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+def _get_grouped_verify_workspace(
+    q: torch.Tensor,
+    batch_size: int,
+) -> _GroupedVerifyWorkspace:
+    query_len = q.shape[0] // batch_size
+    max_query_tokens = 16 if query_len > 8 else 8
+    grouped_splits = 640 // max_query_tokens
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
         device_index,
         _workspace_stream_id(q.device),
+        batch_size,
+        max_query_tokens,
         q.dtype,
     )
     workspace = (
         _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
     )
     if workspace is None:
+        partial_out_shape = (
+            (grouped_splits, max_query_tokens, 6, 256)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6, 256)
+        )
+        partial_lse_shape = (
+            (grouped_splits, max_query_tokens, 6)
+            if batch_size == 1
+            else (batch_size, grouped_splits, max_query_tokens, 6)
+        )
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
-                (80, 8, 6, 256),
+                partial_out_shape,
                 dtype=torch.float16,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (80, 8, 6),
+                partial_lse_shape,
                 dtype=torch.float32,
                 device=q.device,
             ),
@@ -1040,6 +1058,16 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
     return int(get_max_query_tokens())
 
 
+def flash_attn_grouped_verify_request_major_abi_version() -> int:
+    """Return zero for binaries that only support single-request grouping."""
+    get_abi_version = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_request_major_abi_version",
+        None,
+    )
+    return 0 if get_abi_version is None else int(get_abi_version())
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1053,12 +1081,13 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
 ) -> torch.Tensor:
-    """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
+    """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
+    Each request has one block-table row and a uniform contiguous query span.
     The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across a packed GQA group. q8 uses one six-head group and q16
-    uses two three-head groups, retaining 48 rows per CTA and the same workspace
-    byte count. Workspaces are stream-local and CUDA-graph safe.
+    paged-KV scan across a packed GQA group. Single-request q16 uses two
+    three-head groups; batched requests use request-major q8 groups. Workspaces
+    are stream- and batch-local and CUDA-graph safe.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1066,13 +1095,7 @@ def flash_attn_grouped_verify_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
-    workspace = _get_grouped_verify_workspace(q)
-    if q.shape[0] > 8:
-        partial_out = workspace.partial_out.view(40, 16, 6, 256)
-        partial_lse = workspace.partial_lse.view(40, 16, 6)
-    else:
-        partial_out = workspace.partial_out
-        partial_lse = workspace.partial_lse
+    workspace = _get_grouped_verify_workspace(q, int(block_table.shape[0]))
     return flash_attn_v100_cuda.grouped_verify_paged_fwd(
         q,
         k_cache,
@@ -1080,8 +1103,8 @@ def flash_attn_grouped_verify_paged(
         out,
         block_table,
         seq_lens,
-        partial_out,
-        partial_lse,
+        workspace.partial_out,
+        workspace.partial_lse,
         float(softmax_scale),
         kv_cache_dtype,
         float(k_scale),

@@ -1980,14 +1980,22 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int head_group = blockIdx.x;
   const int split_id = blockIdx.y;
-  const int group_idx = SPARSE_PAGE4 ? blockIdx.z : 0;
+  const int group_idx = blockIdx.z;
   if (head_group >= Traits::kHeadGroups || split_id >= Traits::kSplits ||
       group_idx >= num_groups || query_len <= 0 ||
       query_len > MAX_QUERY_TOKENS) {
     return;
   }
 
-  const int total_kv = seq_lens[SPARSE_PAGE4 ? group_idx : 0];
+  if constexpr (!SPARSE_PAGE4) {
+    partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                   kGroupedVerifyHeadDim;
+    partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+  }
+
+  const int total_kv = seq_lens[group_idx];
   if (total_kv <= 0) {
     if constexpr (SPARSE_PAGE4) {
       constexpr int kGroupOutputElements =
@@ -2054,7 +2062,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     if (use_staged_page_ids) {
       for (int idx = tid; idx < split_page_count;
            idx += kGroupedVerifyThreads) {
-        smem.page_ids[idx] = __ldg(&block_table[split_start_page + idx]);
+        smem.page_ids[idx] = __ldg(&page_ids[split_start_page + idx]);
       }
     }
     if (use_staged_page_ids) {
@@ -2437,9 +2445,17 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int token_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
+  const int request_idx = blockIdx.z;
   if (token_idx >= query_len || head_idx >= kGroupedVerifyHeads) {
     return;
   }
+  partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
+  partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+  seq_lens += request_idx;
+  out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
+         kGroupedVerifyHeadDim;
   const int active_splits =
       grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(seq_lens[0]);
   __shared__ float split_lse[Traits::kSplits];
@@ -4034,6 +4050,8 @@ int64_t flash_attention_grouped_verify_max_query_tokens() {
   return kGroupedVerifyMaxSupportedQ;
 }
 
+int64_t flash_attention_grouped_verify_request_major_abi_version() { return 1; }
+
 int64_t flash_attention_grouped_sparse_page4_abi_version() {
   // Version 1 accepted FP16 K/V through the nine-argument forward binding.
   // Version 2 adds kv_cache_dtype and calibrated K/V scales.
@@ -4065,12 +4083,19 @@ at::Tensor flash_attention_grouped_verify_paged(
   TORCH_CHECK(partial_out.dtype() == torch::kFloat16 &&
                   partial_lse.dtype() == torch::kFloat32,
               "grouped verify workspaces must be fp16/fp32");
-  TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 &&
-                  q.size(0) <= kGroupedVerifyMaxSupportedQ &&
+  TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) > 0,
+              "grouped verify block_table must have shape [batch, blocks]");
+  const int64_t batch_size = block_table.size(0);
+  TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(0) % batch_size == 0 &&
                   q.size(1) == kGroupedVerifyHeads &&
                   q.size(2) == kGroupedVerifyHeadDim,
-              "grouped verify q must have shape [1..16, 6, 256]");
-  const bool wide_query = q.size(0) > kGroupedVerifyQ8MaxQ;
+              "grouped verify q must have shape [batch * query, 6, 256]");
+  const int64_t query_len = q.size(0) / batch_size;
+  TORCH_CHECK(
+      batch_size == 1 ? query_len <= kGroupedVerifyMaxSupportedQ
+                      : query_len == kGroupedVerifyQ8MaxQ,
+      "grouped verify requires q1..q16 for B1 or request-major q8 for batches");
+  const bool wide_query = query_len > kGroupedVerifyQ8MaxQ;
   const int max_query_tokens =
       wide_query ? kGroupedVerifyQ16MaxQ : kGroupedVerifyQ8MaxQ;
   const int grouped_splits = kGroupedVerifyWorkspaceRows / max_query_tokens;
@@ -4081,10 +4106,8 @@ at::Tensor flash_attention_grouped_verify_paged(
                   k_cache.size(2) == 1 &&
                   k_cache.size(3) == kGroupedVerifyHeadDim,
               "grouped verify KV must have shape [blocks, page, 1, 256]");
-  TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == 1,
-              "grouped verify block_table must have shape [1, blocks]");
-  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.size(0) >= 1,
-              "grouped verify seq_lens must cover one sequence");
+  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.size(0) == batch_size,
+              "grouped verify seq_lens must cover every request");
   TORCH_CHECK(q.is_contiguous(),
               "grouped verify q must be contiguous [M, H, D]");
   TORCH_CHECK(block_table.is_contiguous() && seq_lens.is_contiguous(),
@@ -4093,15 +4116,31 @@ at::Tensor flash_attention_grouped_verify_paged(
               "grouped verify KV head dimension must be contiguous");
   TORCH_CHECK(partial_out.is_contiguous() && partial_lse.is_contiguous(),
               "grouped verify workspaces must be contiguous");
-  TORCH_CHECK(partial_out.sizes() ==
-                  at::IntArrayRef({grouped_splits, max_query_tokens,
-                                   kGroupedVerifyHeads, kGroupedVerifyHeadDim}),
-              "partial_out must have shape [80, 8, 6, 256] or "
-              "[40, 16, 6, 256]");
-  TORCH_CHECK(
+  const bool single_out =
+      batch_size == 1 &&
+      partial_out.sizes() ==
+          at::IntArrayRef({grouped_splits, max_query_tokens,
+                           kGroupedVerifyHeads, kGroupedVerifyHeadDim});
+  const bool batched_out =
+      batch_size > 1 &&
+      partial_out.sizes() ==
+          at::IntArrayRef({batch_size, grouped_splits, max_query_tokens,
+                           kGroupedVerifyHeads, kGroupedVerifyHeadDim});
+  TORCH_CHECK(single_out || batched_out,
+              "partial_out must be [splits, query, 6, 256] for B1 or "
+              "[batch, splits, query, 6, 256]");
+  const bool single_lse =
+      batch_size == 1 &&
       partial_lse.sizes() == at::IntArrayRef({grouped_splits, max_query_tokens,
-                                              kGroupedVerifyHeads}),
-      "partial_lse must have shape [80, 8, 6] or [40, 16, 6]");
+                                              kGroupedVerifyHeads});
+  const bool batched_lse =
+      batch_size > 1 &&
+      partial_lse.sizes() ==
+          at::IntArrayRef({batch_size, grouped_splits, max_query_tokens,
+                           kGroupedVerifyHeads});
+  TORCH_CHECK(single_lse || batched_lse,
+              "partial_lse must be [splits, query, 6] for B1 or "
+              "[batch, splits, query, 6]");
   TORCH_CHECK(k_scale > 0.0f && v_scale > 0.0f,
               "grouped verify E5M2 K/V scales must be positive");
 
@@ -4124,7 +4163,8 @@ at::Tensor flash_attention_grouped_verify_paged(
               "grouped verify prototype supports SM70 only");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-  const dim3 partial_grid(head_groups, grouped_splits, 1);
+  const dim3 partial_grid(head_groups, grouped_splits,
+                          static_cast<unsigned>(batch_size));
   const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
 #define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
@@ -4153,12 +4193,12 @@ at::Tensor flash_attention_grouped_verify_paged(
             v_cache.data_ptr(), block_table.data_ptr<int>(),                   \
             seq_lens.data_ptr<int>(),                                          \
             reinterpret_cast<__half*>(partial_out.data_ptr()),                 \
-            partial_lse.data_ptr<float>(), static_cast<int>(q.size(0)),        \
+            partial_lse.data_ptr<float>(), static_cast<int>(query_len),        \
             static_cast<int>(block_table.size(1)),                             \
             static_cast<int>(k_cache.size(1)), k_cache.stride(0),              \
             k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),           \
             v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,     \
-            v_scale, nullptr, 1);                                              \
+            v_scale, nullptr, static_cast<int>(batch_size));                   \
   } while (0)
 
 #define DISPATCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS,           \
@@ -4201,7 +4241,7 @@ at::Tensor flash_attention_grouped_verify_paged(
     }                                                                         \
   } while (0)
 
-  const bool single_query = q.size(0) == 1;
+  const bool single_query = query_len == 1;
   if (wide_query && one_pass) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, false, false);
   } else if (wide_query) {
@@ -4217,8 +4257,8 @@ at::Tensor flash_attention_grouped_verify_paged(
   }
 #undef DISPATCH_GROUPED_VERIFY_PARTIAL
 #undef LAUNCH_GROUPED_VERIFY_PARTIAL
-  const dim3 combine_grid(static_cast<unsigned>(q.size(0)), kGroupedVerifyHeads,
-                          1);
+  const dim3 combine_grid(static_cast<unsigned>(query_len), kGroupedVerifyHeads,
+                          static_cast<unsigned>(batch_size));
 #define LAUNCH_GROUPED_VERIFY_COMBINE(MAX_QUERY_TOKENS, SINGLE_QUERY)  \
   flash_attention_grouped_verify_e5m2_combine_kernel<MAX_QUERY_TOKENS, \
                                                      SINGLE_QUERY>     \
@@ -4226,7 +4266,7 @@ at::Tensor flash_attention_grouped_verify_paged(
           reinterpret_cast<const __half*>(partial_out.data_ptr()),     \
           partial_lse.data_ptr<float>(), seq_lens.data_ptr<int>(),     \
           reinterpret_cast<__half*>(out.data_ptr()),                   \
-          static_cast<int>(q.size(0)))
+          static_cast<int>(query_len))
   if (wide_query) {
     LAUNCH_GROUPED_VERIFY_COMBINE(kGroupedVerifyQ16MaxQ, false);
   } else if (single_query) {
