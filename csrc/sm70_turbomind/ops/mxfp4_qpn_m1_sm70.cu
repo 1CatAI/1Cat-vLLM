@@ -138,7 +138,7 @@ __global__ void mxfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   }
 }
 
-template <int kSplitK>
+template <int kSplitK, bool kFusedSwiGLU = false>
 __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
                                          const uint32_t* __restrict__ weights,
                                          const half* __restrict__ scales,
@@ -153,7 +153,12 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   const int route = blockIdx.y;
   const int expert = __ldg(expert_ids + route);
   if (expert < 0 || expert >= 512) {
-    if (threadIdx.x < 32) {
+    if constexpr (kFusedSwiGLU) {
+      if (threadIdx.x < 16) {
+        output[static_cast<size_t>(route) * (n / 2) + tile * 16 + threadIdx.x] =
+            __float2half(0.0f);
+      }
+    } else if (threadIdx.x < 32) {
       output[static_cast<size_t>(route) * n + tile * 32 + threadIdx.x] =
           __float2half(0.0f);
     }
@@ -238,8 +243,23 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
     for (int k_warp = 0; k_warp < kSplitK; ++k_warp) {
       value += partials[k_warp][lane];
     }
-    output[static_cast<size_t>(route) * n + tile * 32 + lane] =
-        __float2half(value);
+    const half rounded = __float2half(value);
+    if constexpr (kFusedSwiGLU) {
+      const int source_lane = (lane & 15) * 2;
+      const unsigned rounded_bits = __half_as_ushort(rounded);
+      const half gate = __ushort_as_half(static_cast<unsigned short>(
+          __shfl_sync(0xffffffffu, rounded_bits, source_lane)));
+      const half up = __ushort_as_half(static_cast<unsigned short>(
+          __shfl_sync(0xffffffffu, rounded_bits, source_lane + 1)));
+      if (lane < 16) {
+        const float gate_f = __half2float(gate);
+        const half silu = __float2half(gate_f / (1.0f + expf(-gate_f)));
+        output[static_cast<size_t>(route) * (n / 2) + tile * 16 + lane] =
+            __hmul(silu, up);
+      }
+    } else {
+      output[static_cast<size_t>(route) * n + tile * 32 + lane] = rounded;
+    }
   }
 }
 
@@ -369,6 +389,25 @@ void launch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
       reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
       expert_ids.data_ptr<int32_t>(),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()), n, k, broadcast_input);
+}
+
+void launch_nvfp4_qwen38_w13_fused_swiglu(torch::Tensor out,
+                                          torch::Tensor input,
+                                          torch::Tensor weights,
+                                          torch::Tensor scales,
+                                          torch::Tensor expert_ids) {
+  constexpr int kN = 320;
+  constexpr int kK = 2560;
+  constexpr int kSplitK = 16;
+  const int routes = static_cast<int>(expert_ids.numel());
+  nvfp4_qpn_m1_sm70_kernel<kSplitK, true>
+      <<<dim3(kN / 32, routes), 32 * kSplitK, 0,
+         at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+          reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+          reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+          expert_ids.data_ptr<int32_t>(),
+          reinterpret_cast<half*>(out.data_ptr<at::Half>()), kN, kK, true);
 }
 
 void dispatch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
@@ -544,6 +583,40 @@ void nvfp4_qwen38_w2_direct_reduce_out(torch::Tensor out, torch::Tensor input,
       reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
       expert_ids.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
       reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_qwen38_w13_fused_swiglu_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && weights.is_cuda() &&
+                  scales.is_cuda() && expert_ids.is_cuda(),
+              "nvfp4_qwen38_w13_fused_swiglu_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weights.scalar_type() == torch::kInt32 &&
+                  scales.scalar_type() == torch::kFloat16 &&
+                  expert_ids.scalar_type() == torch::kInt32,
+              "nvfp4_qwen38_w13_fused_swiglu_out: dtype mismatch");
+  TORCH_CHECK(out.is_contiguous() && input.is_contiguous() &&
+                  weights.is_contiguous() && scales.is_contiguous() &&
+                  expert_ids.is_contiguous(),
+              "nvfp4_qwen38_w13_fused_swiglu_out: tensors must be contiguous");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({10, 160}) &&
+                  input.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  weights.sizes() == torch::IntArrayRef({512, 2560, 40}) &&
+                  scales.sizes() == torch::IntArrayRef({512, 160, 320}) &&
+                  expert_ids.numel() == 10,
+              "nvfp4_qwen38_w13_fused_swiglu_out: shape mismatch");
+  TORCH_CHECK(input.get_device() == out.get_device() &&
+                  input.get_device() == weights.get_device() &&
+                  input.get_device() == scales.get_device() &&
+                  input.get_device() == expert_ids.get_device(),
+              "nvfp4_qwen38_w13_fused_swiglu_out: device mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  launch_nvfp4_qwen38_w13_fused_swiglu(out, input, weights, scales, expert_ids);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

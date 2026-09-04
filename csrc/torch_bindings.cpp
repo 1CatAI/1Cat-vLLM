@@ -704,6 +704,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_qwen38_w2_direct_reduce_out", torch::kCUDA,
            &nvfp4_qwen38_w2_direct_reduce_out);
 
+  ops.def(
+      "nvfp4_qwen38_w13_fused_swiglu_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids) -> ()");
+  ops.impl("nvfp4_qwen38_w13_fused_swiglu_out", torch::kCUDA,
+           &nvfp4_qwen38_w13_fused_swiglu_out);
+
   // Keep the five-row verifier on a distinct schema so an old extension that
   // only supports the ten-route M=1 contract cannot be selected accidentally.
   ops.def(

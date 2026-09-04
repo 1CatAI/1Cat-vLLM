@@ -45032,3 +45032,20 @@ Interpretation:
   full-model speed result is claimed yet: these changes are deliberately
   batched with further exact hot-path work so model loading is not repeated
   for a sub-millisecond projection.
+- The official Qwen3.8 PLE gate and merged key/value projection were screened
+  separately on V100 before porting. The gate saved only `0.0022 ms` at the
+  production M=1 shape and changed thousands of FP16 elements. Merging the two
+  projections saved only `0.0031-0.0034 ms` and changed 11 of 12,800 FP16
+  outputs. Both are rejected for the no-precision-loss lane.
+- The checkpoint-native interleaved W13 layout places each gate/up pair in one
+  N32 CTA. The admitted decode epilogue retains the existing FP32 split-16
+  accumulation, rounds each projection to FP16 at the same boundary, then
+  evaluates the existing `expf` SiLU and FP16 multiply using warp shuffles.
+  Across 48 production-shaped layers, three CUDA Graph runs are bitwise equal
+  and save `0.0656-0.0720 ms/token` (`0.6045-0.6106` to
+  `0.5386-0.5388 ms/token`). Both variants use 60 registers/thread and 2 KiB
+  shared memory. Older extensions without the new op fall back to the prior
+  exact two-kernel route.
+- Direct-W2, exact PLE, and fused W13/SwiGLU now project about
+  `0.277-0.283 ms/token` combined. This remains a projection rather than an
+  end-to-end claim; retain it for the next material combined model startup.

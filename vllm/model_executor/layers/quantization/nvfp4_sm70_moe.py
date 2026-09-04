@@ -550,6 +550,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "activation route. Explicit opt-in fails closed."
             )
         fused_swiglu_prefill = bool(fused_swiglu_requested and fused_swiglu_available)
+        fused_swiglu_decode = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+            and fused_swiglu_prefill
+            and sm70_ops.has_nvfp4_qwen38_w13_fused_swiglu()
+        )
+        if (
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+            and fused_swiglu_prefill
+            and not fused_swiglu_decode
+        ):
+            logger.warning_once(
+                "The SM70 Qwen3.8 fused W13/SwiGLU decode op is absent; "
+                "retaining separate exact W13 and activation kernels."
+            )
         fast_prefill = bool(
             fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
         )
@@ -667,6 +681,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             indexed_prefill_requested and indexed_prefill_available
         )
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
+        layer.sm70_nvfp4_qwen38_fused_swiglu_decode = fused_swiglu_decode
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
         layer.sm70_nvfp4_qwen38_w2_direct_reduce = bool(
             w2_direct_reduce_requested and w2_direct_reduce_available
@@ -698,6 +713,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             logger.info_once(
                 "SM70 Qwen3.8 indexed-A fused-SwiGLU prefill candidate "
                 "enabled (interleaved W13, exact FP16 epilogue arithmetic)."
+            )
+        if fused_swiglu_decode:
+            logger.info_once(
+                "SM70 Qwen3.8 fused W13/SwiGLU decode route enabled "
+                "(split16, exact FP16 rounding and activation arithmetic)."
             )
         if fast_prefill:
             logger.info_once(
@@ -969,21 +989,39 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 if direct_qpn_m1
                 else sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out
             )
-            direct_op(
-                buffers["gate_up"],
-                x,
-                layer.w13_tm_weight,
-                layer.w13_tm_scales,
-                route_ids,
-                True,
-                w13_split_k,
+            fused_w13_decode = bool(
+                direct_qpn_m1
+                and interleaved_w13
+                and getattr(
+                    layer,
+                    "sm70_nvfp4_qwen38_fused_swiglu_decode",
+                    False,
+                )
             )
-            self._apply_swiglu(
-                layer,
-                buffers["intermediate"],
-                buffers["gate_up"],
-                interleaved=interleaved_w13,
-            )
+            if fused_w13_decode:
+                sm70_ops.nvfp4_qwen38_w13_fused_swiglu_out(
+                    buffers["intermediate"],
+                    x,
+                    layer.w13_tm_weight,
+                    layer.w13_tm_scales,
+                    route_ids,
+                )
+            else:
+                direct_op(
+                    buffers["gate_up"],
+                    x,
+                    layer.w13_tm_weight,
+                    layer.w13_tm_scales,
+                    route_ids,
+                    True,
+                    w13_split_k,
+                )
+                self._apply_swiglu(
+                    layer,
+                    buffers["intermediate"],
+                    buffers["gate_up"],
+                    interleaved=interleaved_w13,
+                )
             if direct_qpn_m1 and bool(
                 getattr(layer, "sm70_nvfp4_qwen38_w2_direct_reduce", False)
             ):
