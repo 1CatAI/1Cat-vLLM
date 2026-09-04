@@ -534,6 +534,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _gate_weight) -> ()");
   ops.impl("sm70_f16_gate_mul_out", torch::kCUDA, &sm70_f16_gate_mul_out);
 
+  ops.def(
+      "qwen38_shared_gate_exact_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight) -> ()");
+  ops.impl("qwen38_shared_gate_exact_out", torch::kCUDA,
+           &qwen38_shared_gate_exact_out);
+
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
 

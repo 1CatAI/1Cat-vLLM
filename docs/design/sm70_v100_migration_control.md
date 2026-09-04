@@ -45049,3 +45049,25 @@ Interpretation:
 - Direct-W2, exact PLE, and fused W13/SwiGLU now project about
   `0.277-0.283 ms/token` combined. This remains a projection rather than an
   end-to-end claim; retain it for the next material combined model startup.
+- A shared-expert gate screen localizes the old M=1 path to separate scalar
+  projection/reduction, sigmoid, and 2,560-element output-multiply kernels.
+  The prior `sm70_f16_gate_mul_out` candidate is rejected for this lane
+  because it rounds products to FP16 and omits the eager FP16 linear boundary;
+  on 48 real layer-0-shaped cases it changed 13,947 output elements by up to
+  `0.001953125` despite improving `0.4278 -> 0.1231 ms/token`.
+- The accepted shared-gate candidate retains FP32 FMA, explicitly rounds the
+  scalar linear output and sigmoid result to FP16 at the original boundaries,
+  and performs the final FP16 output multiplication in one CTA. Across all 48
+  real checkpoint gate weights and 512 changing inputs, the rounded gate and
+  all 2,560 output elements are bitwise equal (`0` mismatches). The production
+  sidecar/facade route measures `0.4261 -> 0.1253 ms/token`, saving
+  `0.3009 ms/token` for the isolated 48-layer chain without changing weight,
+  activation, accumulation, or output precision. Because shared experts can
+  overlap routed MoE, this is not counted one-for-one as endpoint TPOT until a
+  combined full-model run measures the reduced contention.
+- An exact HC-up projection/push experiment reproduced Triton's two-warp
+  K-split and XOR reduction tree, eliminating all 22 mismatches from the older
+  prototype on every TP4 rank. Expanding the fused collective from 32 to 80
+  CTAs nevertheless regressed the 96-HC chain from `1.7440` to
+  `2.3930 ms/token`; P2P polling and CTA overhead dominate the saved launch.
+  The 80-CTA fusion is rejected and must not replace the current split path.

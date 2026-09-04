@@ -11,6 +11,58 @@
 
 namespace {
 
+constexpr int kQwen38SharedGateHidden = 2560;
+constexpr int kQwen38SharedGateThreads = 256;
+
+__device__ __forceinline__ float qwen38_shared_gate_warp_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = __fadd_rn(value, __shfl_down_sync(0xffffffffU, value, offset));
+  }
+  return value;
+}
+
+__global__ void qwen38_shared_gate_exact_kernel(
+    half* __restrict__ output, const half* __restrict__ input,
+    const half* __restrict__ weight) {
+  constexpr int kValuesPerThread =
+      kQwen38SharedGateHidden / kQwen38SharedGateThreads;
+  const int tid = threadIdx.x;
+  float value = 0.0f;
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int index = tid + item * kQwen38SharedGateThreads;
+    value = __fmaf_rn(__half2float(input[index]), __half2float(weight[index]),
+                      value);
+  }
+  value = qwen38_shared_gate_warp_sum(value);
+
+  __shared__ float warp_partials[kQwen38SharedGateThreads / 32];
+  __shared__ half shared_gate;
+  if ((tid & 31) == 0) {
+    warp_partials[tid >> 5] = value;
+  }
+  __syncthreads();
+  if (tid < 32) {
+    value = tid < kQwen38SharedGateThreads / 32 ? warp_partials[tid] : 0.0f;
+    value = qwen38_shared_gate_warp_sum(value);
+    if (tid == 0) {
+      // Preserve the eager FP16 linear and sigmoid materialization points.
+      const half linear = __float2half_rn(value);
+      const float rounded_linear = __half2float(linear);
+      shared_gate = __float2half_rn(1.0f / (1.0f + __expf(-rounded_linear)));
+    }
+  }
+  __syncthreads();
+
+  const half2 gate = __half2half2(shared_gate);
+  auto* output2 = reinterpret_cast<half2*>(output);
+  for (int index = tid; index < kQwen38SharedGateHidden / 2;
+       index += blockDim.x) {
+    output2[index] = __hmul2(output2[index], gate);
+  }
+}
+
 __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
                                                half2 out[4]) {
   constexpr unsigned kSign = 0x80008000u;
@@ -617,6 +669,34 @@ void nvfp4_qwen38_w13_fused_swiglu_out(torch::Tensor out, torch::Tensor input,
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   launch_nvfp4_qwen38_w13_fused_swiglu(out, input, weights, scales, expert_ids);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor weight) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && weight.is_cuda(),
+              "qwen38_shared_gate_exact_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kFloat16,
+              "qwen38_shared_gate_exact_out: tensors must be float16");
+  TORCH_CHECK(
+      out.is_contiguous() && input.is_contiguous() && weight.is_contiguous(),
+      "qwen38_shared_gate_exact_out: tensors must be contiguous");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  input.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  weight.sizes() == torch::IntArrayRef({1, 2560}),
+              "qwen38_shared_gate_exact_out: expected M1/N1/K2560 tensors");
+  TORCH_CHECK(out.get_device() == input.get_device() &&
+                  out.get_device() == weight.get_device(),
+              "qwen38_shared_gate_exact_out: device mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  qwen38_shared_gate_exact_kernel<<<1, kQwen38SharedGateThreads, 0,
+                                    at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

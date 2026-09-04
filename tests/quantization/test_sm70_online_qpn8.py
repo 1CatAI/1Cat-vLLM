@@ -88,6 +88,17 @@ def test_nvfp4_w2_direct_reduce_capability_is_explicit(monkeypatch):
     assert online_qpn8.sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
 
 
+def test_qwen38_shared_gate_exact_capability_is_explicit(monkeypatch):
+    sidecar = SimpleNamespace(qwen38_shared_gate_exact_out=object())
+    monkeypatch.setattr(torch.ops, "_C_qwen38", sidecar)
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+
+    assert online_qpn8.sm70_ops.has_qwen38_shared_gate_exact()
+
+    del sidecar.qwen38_shared_gate_exact_out
+    assert not online_qpn8.sm70_ops.has_qwen38_shared_gate_exact()
+
+
 @pytest.mark.parametrize(
     ("prefix", "k", "n", "expected"),
     [

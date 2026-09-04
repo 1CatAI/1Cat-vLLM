@@ -391,6 +391,9 @@ void sm70_dynamic_draft_vocab_refresh_tail_weight_out(
 void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
                            torch::Tensor _gate_weight);
 
+void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor weight);
+
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
 

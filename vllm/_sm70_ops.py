@@ -166,6 +166,12 @@ def has_nvfp4_qwen38_w13_fused_swiglu() -> bool:
     )
 
 
+def has_qwen38_shared_gate_exact() -> bool:
+    return hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out") or hasattr(
+        torch.ops._C, "qwen38_shared_gate_exact_out"
+    )
+
+
 def has_nvfp4_qpn_mtp5_dispatch() -> bool:
     """Reject extensions that only implement the legacy ten-route kernel."""
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
@@ -1629,6 +1635,36 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w13_fused_swiglu_out"):
         weights: torch.Tensor,
         scales: torch.Tensor,
         expert_ids: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def qwen38_shared_gate_exact_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("qwen38_shared_gate_exact_out")(out, input, weight)
+
+
+if hasattr(torch.ops._C, "qwen38_shared_gate_exact_out"):
+
+    @register_fake("_C::qwen38_shared_gate_exact_out")
+    def _qwen38_shared_gate_exact_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out"):
+
+    @register_fake("_C_qwen38::qwen38_shared_gate_exact_out")
+    def _qwen38_shared_gate_exact_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
     ) -> None:
         return None
 
