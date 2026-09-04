@@ -203,6 +203,19 @@ def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     return tuple(applied)
 
 
+def _apply_sm70_qwen38_hybrid_ple_defaults(
+    parallel_config: ParallelConfig,
+) -> None:
+    """Enable hybrid PLE and complete its late-bound parallel config."""
+    os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
+    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
+    # ParallelConfig is validated before these model-aware defaults are
+    # applied, so initialize the endpoint that its validator would have
+    # created for an explicit PLE configuration.
+    parallel_config.ensure_ple_offload_ipc_path()
+
+
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
     capture_sizes = {
@@ -1695,9 +1708,7 @@ class VllmConfig:
                     )
                 )
             ):
-                os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
-                os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
-                os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
+                _apply_sm70_qwen38_hybrid_ple_defaults(self.parallel_config)
                 logger.info_once(
                     "Auto-enabling hybrid PLE for the SM70 Qwen3.8 "
                     "dual-compile lane: async disk-mmap prefill plus local "

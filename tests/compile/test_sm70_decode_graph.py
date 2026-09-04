@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import torch
@@ -10,7 +11,11 @@ from vllm.compilation.sm70_decode_graph import (
     sm70_decode_graph_compilation,
     use_sm70_decode_graph_semantics,
 )
-from vllm.config.vllm import _is_sm70_qwen38_nomtp_dual_compile_contract
+from vllm.config.parallel import ParallelConfig
+from vllm.config.vllm import (
+    _apply_sm70_qwen38_hybrid_ple_defaults,
+    _is_sm70_qwen38_nomtp_dual_compile_contract,
+)
 
 
 def _qwen38_model_config(
@@ -106,6 +111,29 @@ def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> Non
     assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
         model_config, None, parallel_config
     )
+
+
+def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
+    monkeypatch,
+) -> None:
+    for env_name in (
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+        "VLLM_PLE_CPU_OFFLOAD",
+        "VLLM_PLE_DISK_OFFLOAD",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    parallel_config = ParallelConfig()
+    assert parallel_config._ple_offload_ipc_path == ""
+
+    _apply_sm70_qwen38_hybrid_ple_defaults(parallel_config)
+    ipc_path = parallel_config._ple_offload_ipc_path
+
+    assert os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] == "1"
+    assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
+    assert os.environ["VLLM_PLE_DISK_OFFLOAD"] == "1"
+    assert ipc_path.startswith("ipc://")
+    parallel_config.ensure_ple_offload_ipc_path()
+    assert parallel_config._ple_offload_ipc_path == ipc_path
 
 
 def test_qwen38_hybrid_ple_decode_uses_local_module(monkeypatch) -> None:
