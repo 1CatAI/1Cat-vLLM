@@ -45071,3 +45071,18 @@ Interpretation:
   CTAs nevertheless regressed the 96-HC chain from `1.7440` to
   `2.3930 ms/token`; P2P polling and CTA overhead dominate the saved launch.
   The 80-CTA fusion is rejected and must not replace the current split path.
+- vLLM PR 55309's QSA output-gate fusion was adapted to this tree's split-K,
+  E4M3-scale, and SM70 XQA branches. The generic split-merge and direct-write
+  paths preserve the compiled model's FP16/BF16 attention-output boundary,
+  then evaluate sigmoid and multiplication in FP32 before the final store.
+  The TP4 decode/split-64 and large-batch/split-1 tests are bitwise equal to
+  the previous separate compiled gate. A 12-QSA-layer CUDA Graph screen at
+  8K context improves `0.35888 -> 0.34250 ms/token`, saving
+  `0.01639 ms/token` (`1.048x`) with zero differing elements.
+- The same upstream PR's PLE outer-residual patch is not directly portable as
+  an additional decode optimization here. This tree already compiles the two
+  PLE residual additions into one three-input FP32 pointwise kernel. Its exact
+  M=1 short-convolution deliberately retains native `F.silu`: the earlier
+  Triton SiLU fusion changed FP16 results. Moving the add across the custom-op
+  boundary without also replacing native SiLU would not remove a launch, so
+  no PLE residual source change is admitted from this PR.
