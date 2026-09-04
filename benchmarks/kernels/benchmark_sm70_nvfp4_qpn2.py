@@ -60,6 +60,11 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_tensor(tensor: torch.Tensor) -> str:
+    raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _load_projection_shards(
     model: Path,
     layer_index: int,
@@ -493,6 +498,8 @@ def _run_projection(
             else None
         ),
         "quality_vs_turbomind": _quality(qpn_output, tm_output),
+        "turbomind_output_sha256": _sha256_tensor(tm_output),
+        "qpn2_output_sha256": _sha256_tensor(qpn_output),
         "turbomind_quality_vs_fp32": _quality(tm_output, reference),
         "qpn2_quality_vs_fp32": _quality(qpn_output, reference),
         "qpn2_batch_invariance": batch_invariance,

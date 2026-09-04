@@ -250,6 +250,8 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
+    VLLM_SM70_DFLASH2_BATCH_TRACE: bool = False
+    VLLM_SM70_DFLASH2_BATCH_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
     VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING: bool = False
@@ -2185,6 +2187,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_ASYNC_CPU_TRACE_EVERY": lambda: max(
         1, int(os.getenv("VLLM_SM70_ASYNC_CPU_TRACE_EVERY", "16"))
+    ),
+    # Completed-iteration trace for DFlash2 concurrency diagnostics. This only
+    # reads scheduler/model outputs that are already CPU-visible and never adds
+    # a CUDA event or synchronization to the measured path.
+    "VLLM_SM70_DFLASH2_BATCH_TRACE": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_BATCH_TRACE", "0"))
+    ),
+    "VLLM_SM70_DFLASH2_BATCH_TRACE_EVERY": lambda: max(
+        1, int(os.getenv("VLLM_SM70_DFLASH2_BATCH_TRACE_EVERY", "16"))
     ),
     # Legacy 0.0.3 diagnostic gate. Logs one TP all-reduce backend decision per
     # group/backend/shape/dtype so route-hit data can distinguish custom AR,

@@ -45013,6 +45013,65 @@ Interpretation:
   this acceptance task. Generic DBO targets DP+EP/DeepEP and is unsupported by
   ModelRunnerV2, so the next branch is a TP4/DP1 MRV2-local verifier
   microbatch/request-partitioning prototype.
+
+## 2026-09-04 DFlash2 concurrency scheduling and graph-boundary audit
+
+- A default-off completed-iteration trace now records decode request occupancy,
+  target M, queue depth, accepted draft length, scheduled/emitted tokens, and
+  completions from values already visible on the CPU. It creates no CUDA event
+  or synchronization. This avoids interpreting profiler-synchronized endpoint
+  throughput as a production result.
+- Sixteen-request short traces show average request occupancy of about 91.6%,
+  84.4%, and 85.9% for B2/B4/B8. The fraction of completely full rounds is
+  lower (83.2%, 59.6%, and 50.7%), but the B4/B8 occupancy loss relative to B2
+  is only 6--8%. Acceptance length is also close across the three rows. Tail
+  batches and acceptance variation are real endpoint costs, but they are not
+  large enough to explain the missing scaling by themselves.
+- Raising the async batch queue depth from two to four changed the short B8
+  result by only +0.8% and made B2/B4 slower. An adaptive depth-four policy was
+  then measured on 16 requests by 512 outputs: B8 moved only
+  `366.47 -> 367.83 token/s` (+0.37%) while doing 5.1% more target work because
+  acceptance length fell `4.563 -> 4.384`. Both queue candidates were removed.
+- DFlash2 q7 is one parallel query layout and one draft-model call, not seven
+  serial draft forwards. Query attention, candidate generation, selector walk,
+  and sampling are captured in one DFlash2 FULL CUDA graph. The eager work
+  before replay is target-hidden staging, input/slot preparation, and context
+  K/V materialization.
+- A batched CUDA-event diagnostic sampled only pure-decode proposals and
+  synchronized once per 16-round window. Stable B2/B4/near-full-B8 windows
+  measured total DFlash proposal stages of `5.075/6.864/10.191 ms`. Their FULL
+  query graphs were `4.795/6.551/9.732 ms`; all graph-external work was only
+  `0.280/0.313/0.459 ms`. Thus 96.5% of the measured B2-to-B8 draft-stage
+  growth is inside the FULL graph, not metadata or host launch gaps.
+- The engine trace shows schedule, execute submission, sample submission, and
+  scheduler update together remain below 1 ms in sampled steady steps, while
+  waiting for the GPU future is about 43--58 ms. Combined with the synchronized
+  phase medians, B2-to-B8 round growth is approximately 76% target forward,
+  21% draft, and 3% target sampling/state. Scheduling/queue work is therefore
+  not the primary wall.
+- Two current B8 graph-node Nsight attempts completed inference but crashed in
+  `cuptiActivityFlushAll` during multiprocess shutdown and emitted no report.
+  They are retained only as profiler-failure evidence; do not repeat this
+  capture until the external CUPTI runtime changes.
+- A narrowly tuned M64 NVFP4 down projection improved the real layer-55
+  operator from `137.53` to `78.84 us`, projecting about 3.76 ms saved per
+  target round. It changed the reduction path, however: B8 acceptance length
+  fell `4.563 -> 4.00` and endpoint throughput regressed
+  `366.47 -> 341.90 token/s`. A bitwise-preserving kernel/split variant then
+  measured `124.365 us` versus `124.346 us` control after clock warmup. Both
+  variants were removed; the operator benchmark now records raw output SHA256
+  so future tactic races expose numerical changes directly.
+- Extending the accepted B1-only DFlash2 QPN8 LM-head rerank to B2 by executing
+  its 14 rows as 8+6 preserved healthy acceptance (`4.36`) but reached only
+  `174.46 token/s` versus the retained `270.20 token/s` B2 result. Re-reading
+  the 318-MiB QPN8 layout and reranking twice loses decisively to the batched
+  dense LM head, so the prototype was removed without B4/B8 testing.
+- The next viable work must reduce target FULL-graph time with a numerically
+  stable M64 path, or redesign draft candidate generation to process multiple
+  rows in one compressed-weight pass and rerank only row-local candidates.
+  Queue depth, tail-only policy, repeated 8-row rerank chunks, and unconstrained
+  TurboMind tactic tuning are closed directions for this contract.
+
 ## 2026-09-03 Qwen3.8 unified prefill/decode compilation
 
 - The matched TP4/no-MTP evidence separated the regression from PLE residency.

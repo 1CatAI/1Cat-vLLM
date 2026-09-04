@@ -201,6 +201,9 @@ class EngineCore:
                     self.batch_queue_size,
                 )
         self._sm70_async_cpu_trace_step = 0
+        self._sm70_dflash2_batch_trace_enabled = envs.VLLM_SM70_DFLASH2_BATCH_TRACE
+        self._sm70_dflash2_batch_trace_every = envs.VLLM_SM70_DFLASH2_BATCH_TRACE_EVERY
+        self._reset_sm70_dflash2_batch_trace()
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -448,6 +451,137 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _reset_sm70_dflash2_batch_trace(self) -> None:
+        self._sm70_dflash2_trace_steps = 0
+        self._sm70_dflash2_trace_started_at = 0.0
+        self._sm70_dflash2_trace_phase_hist: defaultdict[str, int] = defaultdict(int)
+        self._sm70_dflash2_trace_gen_req_hist: defaultdict[int, int] = defaultdict(int)
+        self._sm70_dflash2_trace_target_m_hist: defaultdict[int, int] = defaultdict(int)
+        self._sm70_dflash2_trace_accept_len_hist: defaultdict[int, int] = defaultdict(
+            int
+        )
+        self._sm70_dflash2_trace_queue_len_hist: defaultdict[int, int] = defaultdict(
+            int
+        )
+        self._sm70_dflash2_trace_unfinished_hist: defaultdict[int, int] = defaultdict(
+            int
+        )
+        self._sm70_dflash2_trace_scheduled_gen_tokens = 0
+        self._sm70_dflash2_trace_draft_tokens = 0
+        self._sm70_dflash2_trace_accepted_draft_tokens = 0
+        self._sm70_dflash2_trace_sampled_tokens = 0
+        self._sm70_dflash2_trace_emitted_tokens = 0
+        self._sm70_dflash2_trace_finished_reqs = 0
+
+    @staticmethod
+    def _format_sm70_dflash2_trace_hist(hist: dict[Any, int]) -> str:
+        return ",".join(f"{key}:{hist[key]}" for key in sorted(hist)) or "none"
+
+    def _record_sm70_dflash2_batch_trace(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_output: ModelRunnerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+        queue_len: int,
+    ) -> None:
+        """Aggregate completed scheduler iterations without synchronizing CUDA."""
+        if not self._sm70_dflash2_batch_trace_enabled:
+            return
+
+        now = time.perf_counter()
+        if self._sm70_dflash2_trace_steps == 0:
+            self._sm70_dflash2_trace_started_at = now
+
+        details = compute_iteration_details(scheduler_output)
+        if details.num_ctx_requests and details.num_generation_requests:
+            phase = "mixed"
+        elif details.num_ctx_requests:
+            phase = "prefill"
+        elif details.num_generation_requests:
+            phase = "decode"
+        else:
+            phase = "empty"
+
+        invalid_spec_tokens = scheduler_output.num_invalid_spec_tokens or {}
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        valid_draft_tokens = sum(
+            max(0, len(token_ids) - invalid_spec_tokens.get(req_id, 0))
+            for req_id, token_ids in scheduled_spec_tokens.items()
+        )
+        accepted_draft_tokens = 0
+        sampled_tokens = 0
+        for req_id, req_index in model_output.req_id_to_index.items():
+            generated_tokens = (
+                model_output.sampled_token_ids[req_index]
+                if model_output.sampled_token_ids
+                else []
+            )
+            sampled_tokens += len(generated_tokens)
+            if req_id in scheduled_spec_tokens:
+                accept_len = len(generated_tokens)
+                self._sm70_dflash2_trace_accept_len_hist[accept_len] += 1
+                accepted_draft_tokens += max(0, accept_len - 1)
+
+        emitted_tokens = 0
+        finished_reqs = 0
+        for client_output in engine_core_outputs.values():
+            for request_output in client_output.outputs:
+                emitted_tokens += len(request_output.new_token_ids)
+                finished_reqs += int(request_output.finished)
+
+        unfinished_reqs = self.scheduler.get_num_unfinished_requests()
+        self._sm70_dflash2_trace_steps += 1
+        self._sm70_dflash2_trace_phase_hist[phase] += 1
+        self._sm70_dflash2_trace_gen_req_hist[details.num_generation_requests] += 1
+        self._sm70_dflash2_trace_target_m_hist[details.num_generation_tokens] += 1
+        self._sm70_dflash2_trace_queue_len_hist[queue_len] += 1
+        self._sm70_dflash2_trace_unfinished_hist[unfinished_reqs] += 1
+        self._sm70_dflash2_trace_scheduled_gen_tokens += details.num_generation_tokens
+        self._sm70_dflash2_trace_draft_tokens += valid_draft_tokens
+        self._sm70_dflash2_trace_accepted_draft_tokens += accepted_draft_tokens
+        self._sm70_dflash2_trace_sampled_tokens += sampled_tokens
+        self._sm70_dflash2_trace_emitted_tokens += emitted_tokens
+        self._sm70_dflash2_trace_finished_reqs += finished_reqs
+
+        flush = (
+            self._sm70_dflash2_trace_steps >= self._sm70_dflash2_batch_trace_every
+            or (unfinished_reqs == 0 and queue_len == 0)
+        )
+        if not flush:
+            return
+
+        completion_span_ms = (now - self._sm70_dflash2_trace_started_at) * 1000.0
+        logger.info(
+            "SM70 DFlash2 batch trace steps=%d completion_span_ms=%.3f "
+            "phase_hist=%s gen_req_hist=%s target_m_hist=%s "
+            "accept_len_hist=%s queue_len_hist=%s unfinished_hist=%s "
+            "scheduled_gen_tokens=%d draft_tokens=%d accepted_draft_tokens=%d "
+            "sampled_tokens=%d emitted_tokens=%d finished_reqs=%d",
+            self._sm70_dflash2_trace_steps,
+            completion_span_ms,
+            self._format_sm70_dflash2_trace_hist(self._sm70_dflash2_trace_phase_hist),
+            self._format_sm70_dflash2_trace_hist(self._sm70_dflash2_trace_gen_req_hist),
+            self._format_sm70_dflash2_trace_hist(
+                self._sm70_dflash2_trace_target_m_hist
+            ),
+            self._format_sm70_dflash2_trace_hist(
+                self._sm70_dflash2_trace_accept_len_hist
+            ),
+            self._format_sm70_dflash2_trace_hist(
+                self._sm70_dflash2_trace_queue_len_hist
+            ),
+            self._format_sm70_dflash2_trace_hist(
+                self._sm70_dflash2_trace_unfinished_hist
+            ),
+            self._sm70_dflash2_trace_scheduled_gen_tokens,
+            self._sm70_dflash2_trace_draft_tokens,
+            self._sm70_dflash2_trace_accepted_draft_tokens,
+            self._sm70_dflash2_trace_sampled_tokens,
+            self._sm70_dflash2_trace_emitted_tokens,
+            self._sm70_dflash2_trace_finished_reqs,
+        )
+        self._reset_sm70_dflash2_batch_trace()
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -507,6 +641,9 @@ class EngineCore:
         profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        self._record_sm70_dflash2_batch_trace(
+            scheduler_output, model_output, engine_core_outputs, queue_len=0
         )
         if profile_ddtree_engine:
             profile_update_ms = (time.perf_counter() - profile_part_t0) * 1000.0
@@ -705,6 +842,12 @@ class EngineCore:
         trace_update_t0 = time.perf_counter() if trace_log else 0.0
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        self._record_sm70_dflash2_batch_trace(
+            scheduler_output,
+            model_output,
+            engine_core_outputs,
+            queue_len=len(batch_queue),
         )
         if trace_log:
             trace_update_ms = (time.perf_counter() - trace_update_t0) * 1000.0

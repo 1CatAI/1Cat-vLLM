@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import get_dflash_model_draft_tokens
@@ -133,6 +134,63 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_kv_cache_group_id: int = -1
         self._context_only_prefill_logged = False
         self._query_slot_mappings: torch.Tensor | None = None
+        self._stage_profile_records: list[
+            tuple[int, int, tuple[torch.cuda.Event, ...]]
+        ] = []
+
+    def _flush_stage_profile(
+        self,
+        num_reqs: int,
+        num_target_tokens: int,
+        events: tuple[torch.cuda.Event, ...] | None,
+    ) -> None:
+        """Report batched stream timing without synchronizing every decode step."""
+        if events is None:
+            return
+
+        self._stage_profile_records.append((num_reqs, num_target_tokens, events))
+        interval = envs.VLLM_DFLASH_PROFILE_LOG_INTERVAL
+        if len(self._stage_profile_records) < interval:
+            return
+
+        # One synchronization closes the whole window. Event-to-event elapsed
+        # time includes any exposed host launch gap on the current CUDA stream,
+        # which is exactly what this diagnostic is intended to find.
+        self._stage_profile_records[-1][2][-1].synchronize()
+        stage_names = ("hidden", "prepare", "context_kv", "metadata", "query_graph")
+        stage_values = {name: [] for name in stage_names}
+        total_values: list[float] = []
+        reqs = 0
+        target_tokens = 0
+        for record_reqs, record_tokens, record_events in self._stage_profile_records:
+            reqs += record_reqs
+            target_tokens += record_tokens
+            for name, start, end in zip(
+                stage_names, record_events[:-1], record_events[1:]
+            ):
+                stage_values[name].append(start.elapsed_time(end))
+            total_values.append(record_events[0].elapsed_time(record_events[-1]))
+
+        rounds = len(self._stage_profile_records)
+        means = {
+            name: sum(values) / len(values) for name, values in stage_values.items()
+        }
+        total_mean = sum(total_values) / len(total_values)
+        logger.info(
+            "DFLASH_STAGE_PROFILE rounds=%d avg_reqs=%.2f avg_target_tokens=%.2f "
+            "hidden_ms=%.3f prepare_ms=%.3f context_kv_ms=%.3f "
+            "metadata_ms=%.3f query_graph_ms=%.3f total_ms=%.3f",
+            rounds,
+            reqs / rounds,
+            target_tokens / rounds,
+            means["hidden"],
+            means["prepare"],
+            means["context_kv"],
+            means["metadata"],
+            means["query_graph"],
+            total_mean,
+        )
+        self._stage_profile_records.clear()
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -422,6 +480,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
         self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
+        profile_events = None
+        if (
+            envs.VLLM_DFLASH_PROFILE
+            and self.device.type == "cuda"
+            and not dummy_run
+            and not np.any(input_batch.is_prefilling_np[:num_reqs])
+        ):
+            profile_events = tuple(
+                torch.cuda.Event(enable_timing=True) for _ in range(6)
+            )
+            profile_events[0].record()
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
@@ -438,6 +507,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.hidden_states[:num_target_tokens].copy_(
                 hidden_states[:num_target_tokens]
             )
+        if profile_events is not None:
+            profile_events[1].record()
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -495,6 +566,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self.max_model_len,
                     self.sample_from_anchor,
                 )
+        if profile_events is not None:
+            profile_events[2].record()
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -515,6 +588,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.context_positions[:num_target_tokens],
                 context_slots,
             )
+        if profile_events is not None:
+            profile_events[3].record()
 
         if not dummy_run and _is_context_only_prefill(input_batch):
             # Intermediate chunked-prefill steps only need to materialize the
@@ -571,6 +646,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 query_slot_mappings[:, :num_tokens_padded],
                 self.kv_cache_config,
             )
+            if profile_events is not None:
+                profile_events[4].record()
 
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.query_cudagraph_manager is not None
@@ -584,8 +661,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+            if profile_events is not None:
+                profile_events[5].record()
 
         self._apply_ngram_assist(num_reqs)
+        self._flush_stage_profile(num_reqs, num_target_tokens, profile_events)
 
         return self.draft_tokens[:num_reqs]
 
