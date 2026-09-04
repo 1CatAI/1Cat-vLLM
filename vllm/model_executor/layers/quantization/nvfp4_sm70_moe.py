@@ -49,7 +49,10 @@ _SUPPORTED_CONTRACTS: Final = {
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
-_QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
+# V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
+# FP32 MMA accumulation, and the FP16 W13 output boundary; only the order in
+# which the FP32 K partitions are joined changes from the former split-8 plan.
+_QWEN38_QPN_M1_W13_SPLIT_K: Final = 16
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
 _QWEN38_QPN_MTP5_W13_SPLIT_K: Final = 4

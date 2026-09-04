@@ -17,6 +17,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
 )
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+    _QWEN38_QPN_M1_W13_SPLIT_K,
     ModelOptNvFp4SM70MoEMethod,
     _mtp_weighted_reduce,
     _prepare_compact_slot_groups,
@@ -29,6 +30,10 @@ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
+
+
+def test_qwen38_qpn_m1_w13_uses_same_precision_split16_plan():
+    assert _QWEN38_QPN_M1_W13_SPLIT_K == 16
 
 
 @pytest.mark.parametrize(
