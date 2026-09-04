@@ -167,8 +167,14 @@ def _is_sm70_qwen38_nomtp_dual_compile_contract(
 
     hf_text_config = getattr(model_config, "hf_text_config", None)
     architectures = set(getattr(model_config, "architectures", ()) or ())
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    supported_architecture = "Qwen4ExpForCausalLM" in architectures or (
+        "Qwen4ExpForConditionalGeneration" in architectures
+        and multimodal_config is not None
+        and getattr(multimodal_config, "language_model_only", False)
+    )
     return bool(
-        "Qwen4ExpForCausalLM" in architectures
+        supported_architecture
         and getattr(model_config, "dtype", None) == torch.float16
         and getattr(hf_text_config, "hidden_size", None) == 2560
         and getattr(hf_text_config, "num_hidden_layers", None) == 48
