@@ -6512,7 +6512,7 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
     torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce);
+    bool weighted_reduce, bool compact_grouped_rows);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -7331,7 +7331,7 @@ void awq_moe_gemm_sm70_out_impl(
     bool per_expert_dispatch = false,
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
-    bool weighted_reduce = false) {
+    bool weighted_reduce = false, bool compact_grouped_rows = false) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "awq_moe_gemm_sm70: input must be CUDA float16.");
@@ -7510,7 +7510,12 @@ void awq_moe_gemm_sm70_out_impl(
   op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
-  op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
+  op.dispatch_num_override =
+      (per_expert_dispatch || compact_grouped_rows) ? 1 : 0;
+  // Compact expert segments can own multiple rows and leave graph-dynamic
+  // empty groups in the tail. Keep the single-group dispatch choice while
+  // letting the offsets scheduler discover those bounds on device.
+  op.active_group_count = 0;
 
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
@@ -7613,6 +7618,61 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
   }
 }
 
+void awq_moe_compact_grouped_dense_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor compact_offsets,
+    torch::Tensor routed_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+    int64_t num_groups, int64_t k, int64_t n, int64_t group_size) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                  input.is_contiguous(),
+              "awq_moe_compact_grouped_dense_stage_sm70_out: input must be "
+              "contiguous CUDA float16.");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
+                  out.is_contiguous(),
+              "awq_moe_compact_grouped_dense_stage_sm70_out: out must be "
+              "contiguous CUDA float16.");
+  TORCH_CHECK(
+      num_groups >= 20 && num_groups <= 80 && num_groups % 10 == 0,
+      "awq_moe_compact_grouped_dense_stage_sm70_out: exact Qwen3.8 C2-C8 "
+      "decode requires 20-80 routed groups in multiples of 10.");
+  TORCH_CHECK(
+      group_size == 32 && ((k == 2560 && n == 320) || (k == 160 && n == 2560)),
+      "awq_moe_compact_grouped_dense_stage_sm70_out: exact Qwen3.8 "
+      "TP4 AWQ g32 W13/W2 shape is required.");
+  TORCH_CHECK(
+      input.dim() == 2 && input.size(0) == num_groups && input.size(1) == k,
+      "awq_moe_compact_grouped_dense_stage_sm70_out: input shape "
+      "mismatch.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == num_groups && out.size(1) == n,
+              "awq_moe_compact_grouped_dense_stage_sm70_out: out shape "
+              "mismatch.");
+  TORCH_CHECK(compact_offsets.is_cuda() &&
+                  compact_offsets.scalar_type() == torch::kInt32 &&
+                  compact_offsets.is_contiguous() &&
+                  compact_offsets.numel() >= num_groups + 1,
+              "awq_moe_compact_grouped_dense_stage_sm70_out: compact offsets "
+              "must be contiguous CUDA int32 with num_groups+1 entries.");
+  TORCH_CHECK(routed_expert_ids.is_cuda() &&
+                  routed_expert_ids.scalar_type() == torch::kInt32 &&
+                  routed_expert_ids.is_contiguous() &&
+                  routed_expert_ids.numel() >= num_groups,
+              "awq_moe_compact_grouped_dense_stage_sm70_out: routed expert "
+              "IDs must be contiguous CUDA int32.");
+  TORCH_CHECK(ptrs_w.is_cuda() && ptrs_s.is_cuda(),
+              "awq_moe_compact_grouped_dense_stage_sm70_out: ptr rows must be "
+              "CUDA.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  static std::atomic<unsigned> logged_awq_compact_grouped{0u};
+  maybe_log_sm70_moe_route_once(
+      logged_awq_compact_grouped,
+      "SM70 Qwen3.8 AWQ compact grouped decode path enabled C++ op reached",
+      input, input.size(0), num_groups);
+  awq_moe_gemm_sm70_out_impl(out, input, compact_offsets, ptrs_w, ptrs_s,
+                             num_groups, k, n, group_size, false,
+                             routed_expert_ids, false, torch::Tensor(),
+                             torch::Tensor(), false, true);
+}
+
 namespace {
 
 __global__ void awq_moe_build_active_expert_segments_kernel(
@@ -7648,6 +7708,41 @@ __global__ void awq_moe_build_active_expert_segments_kernel(
 }
 
 }  // namespace
+
+void awq_moe_prepare_compact_expert_groups_sm70_out(
+    torch::Tensor sorted_expert_ids, torch::Tensor compact_offsets,
+    torch::Tensor compact_expert_ids, int64_t total_slots) {
+  TORCH_CHECK(sorted_expert_ids.is_cuda() &&
+                  sorted_expert_ids.scalar_type() == torch::kInt32 &&
+                  sorted_expert_ids.is_contiguous(),
+              "awq_moe_prepare_compact_expert_groups_sm70_out: sorted expert "
+              "IDs must be contiguous CUDA int32.");
+  TORCH_CHECK(compact_offsets.is_cuda() &&
+                  compact_offsets.scalar_type() == torch::kInt32 &&
+                  compact_offsets.is_contiguous(),
+              "awq_moe_prepare_compact_expert_groups_sm70_out: offsets must "
+              "be contiguous CUDA int32.");
+  TORCH_CHECK(compact_expert_ids.is_cuda() &&
+                  compact_expert_ids.scalar_type() == torch::kInt32 &&
+                  compact_expert_ids.is_contiguous(),
+              "awq_moe_prepare_compact_expert_groups_sm70_out: compact expert "
+              "IDs must be contiguous CUDA int32.");
+  TORCH_CHECK(total_slots >= 20 && total_slots <= 80 && total_slots % 10 == 0,
+              "awq_moe_prepare_compact_expert_groups_sm70_out: exact Qwen3.8 "
+              "C2-C8 routed-slot count is required.");
+  TORCH_CHECK(sorted_expert_ids.numel() >= total_slots &&
+                  compact_offsets.numel() >= total_slots + 1 &&
+                  compact_expert_ids.numel() >= total_slots,
+              "awq_moe_prepare_compact_expert_groups_sm70_out: index buffer "
+              "too small.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(sorted_expert_ids));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  awq_moe_build_active_expert_segments_kernel<<<1, 1, 0, stream>>>(
+      sorted_expert_ids.data_ptr<int>(), compact_offsets.data_ptr<int>(),
+      compact_expert_ids.data_ptr<int>(), static_cast<int>(total_slots));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 void awq_moe_active_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor permuted_experts_id,

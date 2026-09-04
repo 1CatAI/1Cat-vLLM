@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
     VLLM_SM70_AWQ_MOE_DISABLE: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_GEMM: bool = True
+    VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE: bool = True
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2: bool = False
@@ -1626,6 +1627,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # diagnostics and fallback comparison.
     "VLLM_SM70_AWQ_MOE_BATCHED_GEMM": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_GEMM", "1"))
+    ),
+    # Match the compact grouped execution contract used by the SM70 NVFP4
+    # backend for Qwen3.8 TP4 decode. Contiguous rows routed to the same expert
+    # share one active group; unsupported shapes retain the existing
+    # 512-expert batched route.
+    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1"))
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13", "0"))

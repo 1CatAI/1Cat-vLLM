@@ -2729,6 +2729,76 @@ if hasattr(torch.ops._C, "awq_moe_dense_stage_sm70_out"):
         return None
 
 
+def awq_moe_compact_grouped_dense_stage_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    routed_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_groups: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("awq_moe_compact_grouped_dense_stage_sm70_out")(
+        out,
+        input,
+        compact_offsets,
+        routed_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_groups,
+        k,
+        n,
+        group_size,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_compact_grouped_dense_stage_sm70_out"):
+
+    @register_fake("_C::awq_moe_compact_grouped_dense_stage_sm70_out")
+    def _awq_moe_compact_grouped_dense_stage_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        compact_offsets: torch.Tensor,
+        routed_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_groups: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+def awq_moe_prepare_compact_expert_groups_sm70_out(
+    sorted_expert_ids: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    compact_expert_ids: torch.Tensor,
+    total_slots: int,
+) -> None:
+    _op("awq_moe_prepare_compact_expert_groups_sm70_out")(
+        sorted_expert_ids,
+        compact_offsets,
+        compact_expert_ids,
+        total_slots,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_prepare_compact_expert_groups_sm70_out"):
+
+    @register_fake("_C::awq_moe_prepare_compact_expert_groups_sm70_out")
+    def _awq_moe_prepare_compact_expert_groups_sm70_out_fake(
+        sorted_expert_ids: torch.Tensor,
+        compact_offsets: torch.Tensor,
+        compact_expert_ids: torch.Tensor,
+        total_slots: int,
+    ) -> None:
+        return None
+
+
 def awq_moe_active_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,

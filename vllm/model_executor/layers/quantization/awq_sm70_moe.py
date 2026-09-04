@@ -28,12 +28,44 @@ from vllm.model_executor.utils import set_weight_attrs
 logger = init_logger(__name__)
 
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
+_QWEN38_COMPACT_GROUPED_MAX_SLOTS = 80
 
 
 def _log_runtime_route_once(message: str, *args) -> None:
     if torch.compiler.is_compiling():
         return
     logger.info_once(message, *args)
+
+
+def _qwen38_compact_grouped_layer_contract(layer: RoutedExperts) -> bool:
+    return bool(
+        int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_num_experts) == 512
+        and int(layer.sm70_hidden_logical_size) == 2560
+        and int(layer.sm70_intermediate_size) == 160
+        and int(layer.sm70_w13_k_dim) == 2560
+        and int(layer.sm70_w13_n_dim) == 320
+        and int(layer.sm70_w2_k_dim) == 160
+        and int(layer.sm70_w2_n_dim) == 2560
+        and int(layer.sm70_awq_group_size) == 32
+    )
+
+
+def _use_qwen38_compact_grouped_decode(
+    layer: RoutedExperts,
+    num_tokens: int,
+    top_k: int,
+) -> bool:
+    """Admit only exact Qwen3.8 TP4 C2-C8 routed-slot groups."""
+    total_slots = num_tokens * top_k
+    return bool(
+        getattr(layer, "sm70_awq_qwen38_compact_grouped_decode", False)
+        and getattr(layer, "sm70_awq_moe_batched_gemm", False)
+        and num_tokens > 1
+        and top_k == 10
+        and total_slots <= _QWEN38_COMPACT_GROUPED_MAX_SLOTS
+        and _qwen38_compact_grouped_layer_contract(layer)
+    )
 
 
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
@@ -645,10 +677,56 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_w2_k_ld = w2_k_ld
         layer.sm70_w2_q_ld = w2_q_ld
         layer.sm70_intermediate_size = layer.sm70_w2_k_dim
+        layer.sm70_awq_group_size = self.group_size
         layer.sm70_awq_moe_batched_gemm = batched_gemm
         layer.sm70_awq_moe_layer_id = _get_layer_id(layer)
         layer.sm70_awq_moe_w13_interleaved = w13_interleaved
         layer.sm70_awq_moe_legacy_single_token_compact = build_legacy_w13
+        compact_grouped_requested = bool(
+            envs.VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE
+        )
+        compact_grouped_ops = {
+            "awq_moe_compact_grouped_dense_stage_sm70_out": hasattr(
+                torch.ops._C, "awq_moe_compact_grouped_dense_stage_sm70_out"
+            ),
+            "awq_moe_prepare_compact_expert_groups_sm70_out": hasattr(
+                torch.ops._C,
+                "awq_moe_prepare_compact_expert_groups_sm70_out",
+            ),
+        }
+        compact_grouped_available = all(compact_grouped_ops.values())
+        compact_grouped_explicit = (
+            "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE" in os.environ
+        )
+        compact_grouped_contract = _qwen38_compact_grouped_layer_contract(layer)
+        if (
+            compact_grouped_contract
+            and compact_grouped_requested
+            and not compact_grouped_available
+        ):
+            if compact_grouped_explicit:
+                raise RuntimeError(
+                    "The explicit SM70 Qwen3.8 AWQ compact grouped decode route "
+                    "requires "
+                    + ", ".join(
+                        name
+                        for name, available in compact_grouped_ops.items()
+                        if not available
+                    )
+                    + "."
+                )
+            logger.warning_once(
+                "The default SM70 Qwen3.8 AWQ compact grouped decode route is "
+                "not present in the loaded extension; falling back to the "
+                "512-expert batched route. Explicitly setting "
+                "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE=1 fails closed."
+            )
+        layer.sm70_awq_qwen38_compact_grouped_decode = bool(
+            compact_grouped_contract
+            and compact_grouped_requested
+            and compact_grouped_available
+        )
+        layer.sm70_awq_compact_grouped_max_slots = _QWEN38_COMPACT_GROUPED_MAX_SLOTS
 
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
@@ -1011,6 +1089,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         num_tokens = x.shape[0]
         top_k = topk_ids.shape[1]
         total_slots = num_tokens * top_k
+        compact_grouped_decode = _use_qwen38_compact_grouped_decode(
+            layer, num_tokens, top_k
+        )
         buffers = self._get_buffers(layer, total_slots, num_tokens)
         output = buffers["output"]
         output.zero_()
@@ -1267,7 +1348,6 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         use_batched_moe_gemm = route_plan.use_batched_moe_gemm
         use_batched_active_exact_w2 = route_plan.use_batched_active_exact_w2
         use_batched_exact_w2 = route_plan.use_batched_exact_w2
-        use_active_exact_small_batched_moe = False
         compare_dense_step = None
         compare_dense_w13_stats = None
         compare_dense_w2_stats = None
@@ -1280,18 +1360,24 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if num_tokens <= 8 and use_batched_moe_gemm:
             compare_dense_step = _compare_dense_decode_step(layer)
 
-        if use_active_exact_small_batched_moe:
+        if compact_grouped_decode:
+            sm70_ops.awq_moe_prepare_compact_expert_groups_sm70_out(
+                buffers["permuted_experts_id"],
+                buffers["active_expert_offsets"],
+                buffers["sorted_expert_ids"],
+                total_slots,
+            )
             _log_runtime_route_once(
-                "SM70 AWQ MoE batched path using active-route exact "
-                "dense-stage route (tokens=%d, routes=%d).",
+                "SM70 Qwen3.8 AWQ compact active-expert decode enabled "
+                "(tokens=%d, routed_slots=%d).",
                 num_tokens,
                 total_slots,
             )
-            sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+            sm70_ops.awq_moe_compact_grouped_dense_stage_sm70_out(
                 buffers["gate_up"],
                 buffers["permuted_input"],
                 buffers["active_expert_offsets"],
-                buffers["permuted_experts_id"],
+                buffers["sorted_expert_ids"],
                 layer.w13_strided_ptrs_w,
                 layer.w13_strided_ptrs_s,
                 total_slots,
@@ -1299,6 +1385,21 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
             )
+            if compare_dense_step is not None:
+                dense_gate_up = torch.empty_like(buffers["gate_up"])
+                sm70_ops.awq_moe_dense_stage_sm70_out(
+                    dense_gate_up,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer._awq_moe_buf_dense_expert_ids,
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                )
+                compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
         elif route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched W13 using per-expert dispatch "
@@ -1365,12 +1466,12 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         buffers["intermediate"] = _dump_awq_moe_buffer(
             layer, buffers["intermediate"], "silu_out"
         )
-        if use_active_exact_small_batched_moe:
-            sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+        if compact_grouped_decode:
+            sm70_ops.awq_moe_compact_grouped_dense_stage_sm70_out(
                 buffers["sorted_output"],
                 buffers["intermediate"],
                 buffers["active_expert_offsets"],
-                buffers["permuted_experts_id"],
+                buffers["sorted_expert_ids"],
                 layer.w2_strided_ptrs_w,
                 layer.w2_strided_ptrs_s,
                 total_slots,

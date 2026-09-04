@@ -569,6 +569,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_dense_stage_sm70_out);
 
   ops.def(
+      "awq_moe_compact_grouped_dense_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor compact_offsets, "
+      "Tensor routed_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_groups, int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_compact_grouped_dense_stage_sm70_out", torch::kCUDA,
+           &awq_moe_compact_grouped_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_prepare_compact_expert_groups_sm70_out("
+      "Tensor sorted_expert_ids, Tensor(a!) compact_offsets, "
+      "Tensor(b!) compact_expert_ids, int total_slots) -> ()");
+  ops.impl("awq_moe_prepare_compact_expert_groups_sm70_out", torch::kCUDA,
+           &awq_moe_prepare_compact_expert_groups_sm70_out);
+
+  ops.def(
       "awq_moe_active_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
       "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "

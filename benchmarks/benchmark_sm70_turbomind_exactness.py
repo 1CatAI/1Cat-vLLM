@@ -36,6 +36,7 @@ MoEActual = Literal[
     "batched_w2_per_expert_dispatch",
     "dense_out",
     "dense_graphsafe",
+    "compact_grouped",
     "single_token_dense",
     "single_token_indexed",
     "single_token_compact_w13",
@@ -948,6 +949,13 @@ def _check_awq_moe(
         _require_torch_op("awq_moe_gemm_sm70_per_expert_dispatch_out")
     if actual_impl in ("dense_graphsafe", "batched_w2_per_expert_dispatch"):
         _require_torch_op("awq_moe_dense_stage_sm70_out")
+    if actual_impl == "compact_grouped":
+        _require_torch_op("awq_moe_compact_grouped_dense_stage_sm70_out")
+        _require_torch_op("awq_moe_prepare_compact_expert_groups_sm70_out")
+        if not (2 <= m <= 8 and num_experts == 512 and top_k == 10):
+            raise ValueError(
+                "compact_grouped requires Qwen3.8 E512/K10 with --m in [2, 8]."
+            )
     if actual_impl == "active_dense_stage":
         _require_torch_op("awq_moe_dense_stage_sm70_out")
         _require_torch_op("awq_moe_active_dense_stage_sm70_out")
@@ -1011,6 +1019,15 @@ def _check_awq_moe(
     sorted_expert_ids, order = torch.sort(logical_expert_ids)
     expert_offsets, expert_offsets64 = _expert_offsets(sorted_expert_ids, num_experts)
     dense_expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
+    compact_offsets = torch.empty(total_slots + 1, dtype=torch.int32, device=device)
+    compact_expert_ids = torch.empty(total_slots, dtype=torch.int32, device=device)
+    if actual_impl == "compact_grouped":
+        sm70_ops.awq_moe_prepare_compact_expert_groups_sm70_out(
+            sorted_expert_ids.to(torch.int32).contiguous(),
+            compact_offsets,
+            compact_expert_ids,
+            total_slots,
+        )
 
     hidden_size = int(w13_qweight.shape[1])
     if actual_impl in AWQ_SINGLE_TOKEN_ACTUALS:
@@ -1047,6 +1064,19 @@ def _check_awq_moe(
             w13_ptrs_w,
             w13_ptrs_s,
             num_experts,
+            int(w13_tm_weight.shape[1]),
+            w13_n,
+            group_size,
+        )
+    elif actual_impl == "compact_grouped":
+        sm70_ops.awq_moe_compact_grouped_dense_stage_sm70_out(
+            gate_up_actual,
+            sorted_input,
+            compact_offsets,
+            compact_expert_ids,
+            w13_ptrs_w,
+            w13_ptrs_s,
+            total_slots,
             int(w13_tm_weight.shape[1]),
             w13_n,
             group_size,
@@ -1249,6 +1279,19 @@ def _check_awq_moe(
             hidden_out,
             group_size,
             False,
+        )
+    elif actual_impl == "compact_grouped":
+        sm70_ops.awq_moe_compact_grouped_dense_stage_sm70_out(
+            sorted_output_actual,
+            intermediate_actual,
+            compact_offsets,
+            compact_expert_ids,
+            w2_ptrs_w,
+            w2_ptrs_s,
+            total_slots,
+            int(w2_tm_weight.shape[1]),
+            hidden_out,
+            group_size,
         )
     elif actual_impl == "dense_graphsafe":
         sm70_ops.awq_moe_dense_stage_sm70_out(
@@ -2545,6 +2588,7 @@ def _parse_args() -> argparse.Namespace:
             "batched_w2_per_expert_dispatch",
             "dense_out",
             "dense_graphsafe",
+            "compact_grouped",
             "active_dense_stage",
             "single_token_dense",
             "single_token_indexed",

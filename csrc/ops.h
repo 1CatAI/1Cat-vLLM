@@ -423,6 +423,15 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                   int64_t num_experts, int64_t k, int64_t n,
                                   int64_t group_size);
 
+void awq_moe_compact_grouped_dense_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor compact_offsets,
+    torch::Tensor routed_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+    int64_t num_groups, int64_t k, int64_t n, int64_t group_size);
+
+void awq_moe_prepare_compact_expert_groups_sm70_out(
+    torch::Tensor sorted_expert_ids, torch::Tensor compact_offsets,
+    torch::Tensor compact_expert_ids, int64_t total_slots);
+
 void awq_moe_active_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor permuted_experts_id,
     torch::Tensor active_expert_offsets, torch::Tensor active_expert_ids,
