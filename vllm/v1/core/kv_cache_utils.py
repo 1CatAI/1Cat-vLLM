@@ -916,10 +916,13 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
     if (glm5 := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5
+        _, standalone_auxiliary = _glm5_next_auxiliary_tensor_plan(
+            kv_cache_groups, len(mla_names), mla_page
+        )
         return (
             len(mla_names) * mla_page
             + len(idx_names) * idx_page
-            + _glm5_next_auxiliary_page_bytes(kv_cache_groups)
+            + sum(page_size for _, page_size in standalone_auxiliary)
         )
     if layout := _get_csa_linear_tensor_layout(kv_cache_groups):
         return layout.bytes_per_block
@@ -1421,6 +1424,42 @@ def _get_kv_cache_groups_glm5_next(
     )
     assert uniform_spec is not None
 
+    # The target's Mamba state makes its MLA manager block much wider than the
+    # draft model needs. Keeping that block size on DFlash attention would add
+    # every draft layer's large page to every shared-pool block, even though a
+    # sliding-window draft owns only a few block ids. Reblock the draft to the
+    # largest 16-token-aligned divisor whose page fits in one MLA tensor slot.
+    # The padded page can then share that slot safely: block ids are globally
+    # unique across cache groups, so target, Mamba, and draft owners never alias
+    # the same physical page at the same time.
+    if auxiliary_attn_specs:
+        target_block_size = uniform_spec.block_size
+        fitted_auxiliary_specs: dict[str, KVCacheSpec] | None = None
+        for candidate in range(target_block_size, 15, -1):
+            if target_block_size % candidate != 0 or candidate % 16 != 0:
+                continue
+            candidate_specs = {
+                name: replace(spec, block_size=candidate, page_size_padded=None)
+                for name, spec in auxiliary_attn_specs.items()
+            }
+            if all(
+                cast(FullAttentionSpec, spec).real_page_size_bytes <= mla_page
+                for spec in candidate_specs.values()
+            ):
+                fitted_auxiliary_specs = {
+                    name: replace(spec, page_size_padded=mla_page)
+                    for name, spec in candidate_specs.items()
+                }
+                break
+        if fitted_auxiliary_specs is not None:
+            auxiliary_attn_specs = fitted_auxiliary_specs
+            logger.info_once(
+                "GLM-5.3 DFlash auxiliary attention uses block_size=%d and "
+                "shares padded %d-byte MLA tensor slots.",
+                next(iter(auxiliary_attn_specs.values())).block_size,
+                mla_page,
+            )
+
     # Keep all indexer tails in one group and pad their pages to the indexer
     # page size so each tail can share its sibling indexer's storage.
     tail_group = None
@@ -1479,13 +1518,22 @@ def _glm5_next_auxiliary_attention_groups(
     ]
 
 
-def _glm5_next_auxiliary_page_bytes(
+def _glm5_next_auxiliary_tensor_plan(
     kv_cache_groups: list[KVCacheGroupSpec],
-) -> int:
-    return sum(
-        len(group.layer_names) * group.kv_cache_spec.page_size_bytes
-        for group in _glm5_next_auxiliary_attention_groups(kv_cache_groups)
-    )
+    num_mla_slots: int,
+    mla_page: int,
+) -> tuple[list[list[str]], list[tuple[str, int]]]:
+    """Plan DFlash auxiliary tensors over globally exclusive pool block ids."""
+    shared_by_mla_slot: list[list[str]] = [[] for _ in range(num_mla_slots)]
+    standalone: list[tuple[str, int]] = []
+    for group in _glm5_next_auxiliary_attention_groups(kv_cache_groups):
+        page_size = group.kv_cache_spec.page_size_bytes
+        for index, layer_name in enumerate(group.layer_names):
+            if index < num_mla_slots and page_size == mla_page:
+                shared_by_mla_slot[index].append(layer_name)
+            else:
+                standalone.append((layer_name, page_size))
+    return shared_by_mla_slot, standalone
 
 
 def _glm5_next_tensor_layout(
@@ -1671,11 +1719,13 @@ def get_kv_cache_config_from_groups(
         ) = glm5n
         if tail_names:
             assert len(idx_names) == len(tail_names)
-        auxiliary_groups = _glm5_next_auxiliary_attention_groups(kv_cache_groups)
+        shared_auxiliary, standalone_auxiliary = _glm5_next_auxiliary_tensor_plan(
+            kv_cache_groups, len(mla_names), mla_page
+        )
         per_block = (
             len(mla_names) * mla_page
             + len(idx_names) * idx_page
-            + _glm5_next_auxiliary_page_bytes(kv_cache_groups)
+            + sum(page_size for _, page_size in standalone_auxiliary)
         )
         num_blocks = may_override_num_blocks(vllm_config, available_memory // per_block)
         kv_cache_tensors = [
@@ -1686,7 +1736,8 @@ def get_kv_cache_config_from_groups(
                     group.layer_names[i]
                     for group in mamba_groups
                     if i < len(group.layer_names)
-                ],
+                ]
+                + shared_auxiliary[i],
             )
             for i, mla_name in enumerate(mla_names)
         ] + [
@@ -1698,11 +1749,10 @@ def get_kv_cache_config_from_groups(
         ]
         kv_cache_tensors.extend(
             KVCacheTensor(
-                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                size=page_size * num_blocks,
                 shared_by=[layer_name],
             )
-            for group in auxiliary_groups
-            for layer_name in group.layer_names
+            for layer_name, page_size in standalone_auxiliary
         )
     elif csa_config := _get_kv_cache_config_csa_linear(
         vllm_config, kv_cache_groups, available_memory
@@ -2559,10 +2609,13 @@ def _max_memory_usage_bytes_from_groups(
             # Tail: 1 block/req (KpoolTailSpec.max_admission_blocks_per_request
             # == 1), drawn from the shared pool.
             blocks_needed += 1
+        _, standalone_auxiliary = _glm5_next_auxiliary_tensor_plan(
+            kv_cache_groups, len(mla_names), mla_page
+        )
         return blocks_needed * (
             len(mla_names) * mla_page
             + len(idx_names) * idx_page
-            + _glm5_next_auxiliary_page_bytes(kv_cache_groups)
+            + sum(page_size for _, page_size in standalone_auxiliary)
         )
 
     # General case: group_size pools, each shared by one layer per group
@@ -2810,9 +2863,32 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for worker_index, (groups, avail_mem) in enumerate(
+        zip(projected_groups_per_worker, available_memory)
+    ):
         if not groups:
             continue
+        if _glm5_next_tensor_layout(groups) is not None:
+            group_ledger = []
+            for group in groups:
+                spec = group.kv_cache_spec
+                pages = cdiv(
+                    spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+                )
+                group_ledger.append(
+                    f"{type(spec).__name__}(layers={len(group.layer_names)},"
+                    f"block={spec.block_size},page={spec.page_size_bytes},"
+                    f"pages={pages})"
+                )
+            logger.info(
+                "GLM-5.3 KV ledger worker=%d available=%s GiB required=%s GiB "
+                "pool_block_bytes=%d groups=[%s]",
+                worker_index,
+                format_gib(avail_mem),
+                format_gib(_max_memory_usage_bytes_from_groups(vllm_config, groups)),
+                _pool_bytes_per_block(groups),
+                ", ".join(group_ledger),
+            )
         _check_enough_kv_cache_memory(
             avail_mem,
             partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
