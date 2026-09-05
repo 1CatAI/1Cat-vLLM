@@ -45277,3 +45277,20 @@ Interpretation:
   other lease file. Do not enter the reserved suite's between-model gaps,
   interrupt it, or accept contended timing. The vector/parallel-gate kernel
   compiles without spills; its queued GPU screen remains pending.
+- The vector-load/parallel-gate screen subsequently completed under the
+  shared reservation. It produces the first material complete-chain win in
+  this follow-up: control `2.108826 ms`, 160-CTA local-only `2.068084 ms`,
+  160-CTA fused `1.999374 ms`. The full-chain saving is **`0.109452 ms`
+  (`5.19%`)**; fused samples are `1.999995/1.999374/1.998002 ms`. The 80-CTA
+  fused version is `2.082618 ms` and is not selected. There is no packed-weight
+  copy. All intermediate/final outputs pass bitwise on four ranks over 16
+  changing input cases and again after generation `146593` (two tag wraps).
+  Evidence: `up_gather_vector.json` and `up_gather_vector_final.log`; source
+  SHA256 `10d65cb0b979a51b3e6cf712dd3c535d93f66e4b418909adeec1616077c4def5`.
+- This is still an artifact prototype, not a registered production-path or
+  whole-model result. Next: port the selected 160-CTA kernel/private channel
+  with extension-capability fallback, then validate production dispatch and
+  actual auxiliary-stream sum2 coexistence. Batch the full-model trace and
+  output-quality gate with further material changes. Do not claim the old
+  full-model HC bucket moved `2.658 -> 1.999 ms`, or that the `1.5-ms` target
+  was achieved. All task-owned GPU tests/queues exited; other tasks continue.
