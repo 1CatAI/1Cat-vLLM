@@ -890,6 +890,7 @@ class SpeculativeConfig:
                     MTPModelTypes
                 ):
                     self.method = "mtp"
+                    self._inherit_target_rope_for_extended_native_mtp()
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
@@ -1091,6 +1092,81 @@ class SpeculativeConfig:
                 f"stage [{last_start}, {last_end}); got {layer_ids}. Adjust "
                 "VLLM_PP_LAYER_PARTITION or the DSpark layer contract."
             )
+
+    def _inherit_target_rope_for_extended_native_mtp(self) -> None:
+        """Validate and inherit target YaRN for an extended native drafter."""
+        if (
+            self.method != "mtp"
+            or self.max_model_len is None
+            or self.target_model_config is None
+            or self.draft_model_config is None
+            or self.model != self.target_model_config.model
+        ):
+            return
+
+        draft_text_config = get_hf_text_config(self.draft_model_config.hf_config)
+        draft_native_limit = getattr(draft_text_config, "max_position_embeddings", None)
+        if draft_native_limit is None or self.max_model_len <= draft_native_limit:
+            return
+
+        target_text_config = get_hf_text_config(self.target_model_config.hf_config)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        if (
+            not isinstance(rope_parameters, dict)
+            or rope_parameters.get("rope_type") != "yarn"
+        ):
+            raise ValueError(
+                "Extending native MTP beyond max_position_embeddings requires "
+                "explicit target YaRN rope_parameters; got "
+                f"{rope_parameters!r}."
+            )
+
+        original_limit = rope_parameters.get("original_max_position_embeddings")
+        factor = rope_parameters.get("factor")
+        try:
+            original_limit_value = float(original_limit)
+            factor_value = float(factor)
+            draft_native_limit_value = float(draft_native_limit)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Native MTP YaRN extension requires numeric "
+                "original_max_position_embeddings and factor."
+            ) from error
+
+        if (
+            not math.isfinite(original_limit_value)
+            or not math.isfinite(factor_value)
+            or original_limit_value <= 0
+            or factor_value <= 1
+            or original_limit_value != draft_native_limit_value
+        ):
+            raise ValueError(
+                "Native MTP YaRN extension requires the target's positive "
+                "original_max_position_embeddings to match the drafter's "
+                "native max_position_embeddings and factor to be greater "
+                f"than one; got original={original_limit!r}, "
+                f"native={draft_native_limit!r}, factor={factor!r}."
+            )
+
+        validated_yarn_limit = int(original_limit_value * factor_value)
+        validated_limit = min(
+            validated_yarn_limit,
+            self.target_model_config.max_model_len,
+        )
+        if self.max_model_len > validated_limit:
+            raise ValueError(
+                f"Native MTP max_model_len={self.max_model_len} exceeds the "
+                f"validated target YaRN limit={validated_limit}."
+            )
+
+        draft_text_config.rope_parameters = copy.deepcopy(rope_parameters)
+        logger.info(
+            "Extended native MTP context from %s to %s with validated target "
+            "YaRN parameters (factor=%s).",
+            draft_native_limit,
+            self.max_model_len,
+            factor,
+        )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():

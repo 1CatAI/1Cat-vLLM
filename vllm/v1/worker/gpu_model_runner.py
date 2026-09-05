@@ -9377,14 +9377,13 @@ class GPUModelRunner(
                 # make token id 0 look like a real speculative token to the
                 # scheduler and verifier.
                 logger.warning_once(
-                    "Skipping speculative drafts because the drafter context "
-                    "limit is reached: max_seq_len=%s, num_spec_tokens=%s, "
-                    "effective_drafter_max_model_len=%s.",
-                    spec_decode_common_attn_metadata.max_seq_len
-                    if spec_decode_common_attn_metadata is not None
-                    else None,
+                    "Skipping speculative drafts after reaching the drafter "
+                    "context limit: num_spec_tokens=%s, "
+                    "effective_drafter_max_model_len=%s. Future over-limit "
+                    "batches are suppressed.",
                     self.num_spec_tokens,
                     self.effective_drafter_max_model_len,
+                    scope="global",
                 )
                 self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
                 self._draft_probs = None
