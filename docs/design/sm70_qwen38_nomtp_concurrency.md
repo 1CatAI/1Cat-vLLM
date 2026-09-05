@@ -494,6 +494,186 @@ screen reusable batch epilogues before another full-model measurement.
   route remains unsorted. Evidence is in
   `.artifacts/qwen38_nomtp_concurrency/qsa_index_order_v1.json`.
 
+## Batch fusion implementation screen (2026-09-05)
+
+Control remains `d20a077bf4cc22da15850c03527ac323f30ff0cc`, prepared
+scales, raw-storage/dynamic-dispatch experiments off. The integration line is
+still `onecat/main`, original base
+`45a58ab6749096248dc15b1263bdf5faf51f5c70`, owned Draft PR #474.
+Protect the **measured 80.657 tok/s C1** within 1%; 70 tok/s is only the fixed
+denominator for the user's concurrency targets. Targets are 238/420/728 tok/s
+at C4/C8/C16, requiring complete steps <=16.807/19.048/21.978 ms. They are not
+met by the existing endpoint measurements.
+
+Source audit of the frozen control:
+
+| Component | M1 | M4/M8/M16 | Remaining batch limitation |
+| --- | --- | --- | --- |
+| FP16 dense projection | custom row GEMV | cuBLAS linear fallback | M1 kernel cannot be enabled merely by deleting its row guard |
+| HC input/up/gate mix | fused M1 operators | two GEMMs plus SiLU and gate mix | true multi-row projection/epilogue still pending |
+| GDN input qkvz + b/a | fused M1 projection | two GEMMs plus contiguous copies | prior overlap and concatenate experiments did not earn integration |
+| Routed W13 + SiLU | direct QPN | fused direct route, split5/4/1 | each route feeds only one logical HMMA row; repeated experts reload weights |
+| Routed W2 + ordered reduce | direct QPN | fused multi-route CTA | no cross-request weight reuse; preserve original top-k reduction order |
+| Router/shared gate/QSA | existing paths | batch candidates already on this branch | their gains must not be counted a second time |
+
+Trace correction: C16 dense matrix kernels account for **8.864 ms** of GPU
+service, plus **0.929 ms** split-K reduction = **9.792 ms**. The broad 5.736 ms
+cuBLAS signature is not exclusively LM-head work. These are service sums, not
+independent wall-clock savings or a valid subtraction from a differently
+configured C1 trace.
+
+### Implemented: grouped W13 plus intra-CTA Split-K prototype
+
+New portable benchmark and source:
+
+- `benchmarks/kernels/benchmark_sm70_moe_packed_w13.py`
+- `benchmarks/kernels/sm70_moe_packed_w13.cu`
+- `tests/kernels/quantization/test_sm70_moe_packed_w13.py`
+
+This is **benchmark-only**, with no production dispatch, CLI, model loader,
+prefill, or M1 change. It is materially different from the rejected packed
+W13+packed W2 path: gather up to eight original input rows per expert directly
+inside W13, divide K across CTA warps, retain the FP16 projection and SiLU
+materialization boundaries, scatter to original route slots, then use the
+unchanged fused W2/reduce. There is no duplicated top-k input tensor, floating
+atomic reduction, CPU routing readback, or persistent FP16 expert copy.
+The integer grouping plan and all writeback costs are inside the timed graph.
+An optional benchmark-only `--packed-w2` variant now reuses that metadata for
+W2 as described below; the default screen still uses the existing fused W2.
+
+Algorithm reference: [PyTorch's locality-aware vLLM MoE study](https://pytorch.org/blog/accelerating-moe-model/)
+supports investigating expert locality and Split-K, but its A100/H100 numbers
+and floating atomic implementation are not imported as V100 evidence. It also
+reports unresolved end-to-end expert mapping inconsistencies. This prototype
+therefore explicitly tests changing route groups and original-slot restoration.
+
+One idle V100 (physical GPU1), Torch 2.10/CUDA 12.8, SM70-only task-owned
+extension; all 512 experts from actual checkpoint **layer 0 / TP4 shard 0**,
+interleaved native NVFP4 weights/prepared FP16 scales, synthetic activations.
+Replay the 48 captured C16 routing patterns from the existing fixed baseline:
+
+| Screen | Control mean per-layer call | Candidate mean | Sum of paired savings across 48 route patterns |
+| --- | ---: | ---: | ---: |
+| grouped W13 split8 + unchanged W2 | 164.596 us | 124.579 us | 1.921 ms |
+| additionally mask inactive shared-memory rows | 164.408 us | 124.456 us | 1.918 ms |
+
+All 48 route patterns improved in the first screen (28.38--49.20 us).
+The second change is neutral and has been removed for simplicity. **This is
+not an actual 48-layer execution**: it reuses layer-0 weights with each layer's
+captured routing, and is only a phase-admission estimate. No endpoint speed
+or capacity improvement is claimed. This W13-only candidate is below the
+>=2 ms C16 screen gate; the subsequent grouped-W2 combination is assessed
+separately below.
+
+At the layer-0 captured routing, split8 saves only 3.63 us at M4. M8's
+same-split4 variant saves 3.28 us; forcing split1 on M4/M8 loses 36.12/25.80 us.
+Thus widening a guard is not a batch implementation or a universal speedup.
+
+Quality status: grouping with the **same split as the control** is exact in
+the exercised real-weight M4/M8/M16 cases, including interleaved W13. Split8
+at C16 changes FP32 association; the 48-pattern screen's maximum final-output
+absolute difference is `1.90735e-6`, maximum relative L2 `1.97128e-4`.
+These small operator errors are **not** a model-quality pass. Full HumanEval,
+MBPP, GSM8K, perplexity, tool-call and structured-output score gates remain
+pending; greedy hashes remain diagnostics rather than the score criterion.
+
+Graph checks poison scratch/output buffers and replay changed inputs with
+distinct, repeated, reversed and invalid routes. Dedicated tests also cover
+every width M1--M16, one expert filling multiple packs, and both physical W13
+layouts. Unsupported production widths still use the unchanged production
+fallback because this extension is not registered into the model dispatcher.
+W13-only focused GPU pytest: **22 passed** in 33.23 seconds (two unrelated Swig
+deprecation warnings). Run:
+`.venv/bin/python -m pytest -q tests/kernels/quantization/test_sm70_moe_packed_w13.py`.
+
+#### Follow-up: reuse the grouping in W2
+
+The new `--packed-w2` screen processes **both singleton and repeated groups in
+one kernel**, followed by one fixed original-slot weighted reduction. This
+removes the old repeated/singleton split and its redundant launches. It uses
+a bounded FP16 routed-output buffer (0.78125 MiB at M16), not a second grouping
+pass. The initial layer-0 / rank-0 real-weight C16 screen gives:
+
+| Route pattern | Direct production MoE | Grouped W13 split8 + grouped W2 | Saving |
+| --- | ---: | ---: | ---: |
+| all 160 experts different | 191.478 us | 178.256 us | 13.222 us |
+| all requests share 10 experts | 106.326 us | 33.245 us | 73.082 us |
+| captured layer-0 route, 99 experts | 170.886 us | 125.130 us | 45.757 us |
+
+Same-split1 W13 plus grouped W2 remains exact against the native control in
+all five changed-input/group-count checks. Split8 retains the previously
+described FP32 association difference. These are not endpoint or model-score
+results. The 48-route sweep and the expanded M1--M16 W2 pytest were initially
+deferred because another task occupied GPUs 0--3; the preflight correctly
+returned 75 before launching. No foreign processes were terminated. The
+W13-only 22-pass result above is not attributed to those expanded tests.
+
+After the other task exited, the expanded **22 GPU tests passed in 33.59 s**.
+Grouped W2 is bitwise equal to native W2 at every width M1--M16, including
+changing route counts and invalid slots after graph capture. The full
+48-route-pattern screen then measured **164.404 -> 112.939 us** per MoE call,
+**31.30% lower**, and **2.470 ms** summed paired saving. All 48 improved
+(30.22--68.55 us); final-output max-abs/relative-L2 error remained
+`1.90735e-6`/`1.97128e-4`. This crosses the >=2 ms *microbenchmark admission*
+gate, not an endpoint or quality-score gate. Layer-0 weights are still reused
+with all captured routes, so no actual full-model latency reduction is claimed.
+The combination is now eligible for production-wrapper integration followed
+by the planned paired endpoint/score tests; keep it out of default dispatch
+until those are completed.
+
+### Measurement hygiene and retained evidence
+
+Initial short-call timing used one operator sequence per graph and showed
+large C4/C8 fluctuations. The accepted screen captures 16 complete calls
+inside each graph, uses fixed pointers and alternating A/B order, and divides
+CUDA-event time by both unroll count and replay count. Initial v1 artifacts
+are retained but are not speed gates. A targeted recheck of the prior dense
+cuBLASLt sweep using 32 calls per graph still projects only 0.237 ms across
+all shapes, with several non-exact winners. It does not justify a new 64 MiB
+workspace or replacement of the production dense path.
+
+Artifacts relative to this owned worktree:
+
+- `.artifacts/raw-audit/packed-w13-real-layer0-unrolled-v2.json`
+- `.artifacts/raw-audit/packed-w13-real-48routes-v3.json`
+- `.artifacts/raw-audit/packed-w13-real-48routes-masked-v4.json`
+- `.artifacts/raw-audit/packed-w13-w2-real-v5.json`
+- `.artifacts/raw-audit/packed-w13-w2-real-48routes-v6.json`
+- `.artifacts/raw-audit/cublaslt-unrolled/cublaslt_fp16_algorithms_m16.json`
+
+Each portable report records CUDA/Torch, model layer/shard, source hash,
+route-file hashes (v3+), paired timing samples and numerical errors. Build
+with a task-owned `TORCH_EXTENSIONS_DIR`, CUDA 12.8 `CUDA_HOME`, and
+`TORCH_CUDA_ARCH_LIST=7.0`; use the task uv Python and frozen native `_C`.
+The tested native `_C` SHA256 is
+`6db72e5d72ed051423ce5dc62f5a935e716c02e85c3c423c92edc96fcce51fa3`;
+the W13-only unmasked prototype source SHA256 was
+`9bad8d300a3d8f96c697528a74cfd40e3a117c5a73c2c94cf4d494d94d4063e2`.
+The final W13+W2 source SHA256 is
+`b2ca971714153b83e81ff03cf7c51b8293e9723bfcaa5e8dd1427a424fdc125a`,
+and its tested extension SHA256 is
+`ebb7202f4462727db1345ad551f7d6f984363344024f84e440c9ba51a0768dc3`.
+All GPU runs used `.artifacts/raw-audit/.venv/bin/python`, a task-created uv
+environment, and the task native bootstrap. GPU1 was released after testing;
+no task-owned API or resident GPU worker was started. Other GPU workloads
+were not touched.
+
+Example benchmark arguments (model and route paths supplied locally):
+
+```bash
+.venv/bin/python benchmarks/kernels/benchmark_sm70_moe_packed_w13.py \
+  --model "$MODEL" --layer 0 --rank 0 --tokens 16 --splits 8 --interleaved --packed-w2 \
+  --route-glob "$ROUTE_GLOB" --samples 5 --repeats 10 --out "$RESULT_JSON"
+```
+
+Next: integrate the grouped W13/W2 candidate behind an experimental local
+capability/shape gate, then perform the planned control/candidate/control
+endpoint and score tests. Preserve C1 and prefill; no scheduler, KV-type or
+maximum-sequence-count binding. Dense multi-row fusion remains a separate
+unfinished optimization track.
+Keep Draft; neither default enablement nor a release claim is authorized by
+these microbenchmarks.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
