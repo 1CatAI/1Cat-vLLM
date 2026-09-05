@@ -134,6 +134,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
+        self.sm70_hc_batch_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -175,6 +176,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 ),
                 long_prefill_fusion_enabled=use_sm70_tp4_long_prefill_fused_norm,
             )
+
+            if (
+                envs.VLLM_SM70_QWEN38_BATCH_HC_FP16
+                and use_custom_allreduce
+                and current_platform.is_device_capability(70)
+                and self.ca_comm.supports_sm70_qwen38_hc_batch()
+            ):
+                # One isolated packet/epoch channel per TP group, prepared
+                # before model loading/capture. Ordinary/M1 collectives retain
+                # their existing communicator and auxiliary-stream ownership.
+                self.sm70_hc_batch_comm = CustomAllreduce(
+                    group=self.cpu_group, device=self.device, max_size=128 * 1024
+                )
 
             if current_platform.is_rocm():
                 # Initialize a custom quick all-reduce implementation for AMD.
@@ -617,6 +631,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        hc_comm = getattr(self, "sm70_hc_batch_comm", None)
+        if hc_comm is not None:
+            hc_comm.close()
+            self.sm70_hc_batch_comm = None
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None

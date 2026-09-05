@@ -1010,6 +1010,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);
   custom_ar.def(
+      "sm70_qwen38_hc_batch_down(int ptr, Tensor input, Tensor! injection, "
+      "Tensor! lora) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_batch_down", torch::kCUDA,
+                 &sm70_qwen38_hc_batch_down);
+  custom_ar.def(
+      "sm70_qwen38_hc_batch_mix(int ptr, Tensor gate, Tensor branches, "
+      "Tensor! output) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_batch_mix", torch::kCUDA,
+                 &sm70_qwen38_hc_batch_mix);
+  custom_ar.def(
       "sm70_qwen38_hc_down_allgather(int fa, Tensor inp, Tensor! out) -> ()");
   custom_ar.impl("sm70_qwen38_hc_down_allgather", torch::kCUDA,
                  &sm70_qwen38_hc_down_allgather);

@@ -1372,6 +1372,57 @@ frozen 81-tok/s C1 contract. After route-hit/quality checks, measure the actual
 engine and datasets. Current endpoint evidence remains C16 584.568 tok/s /
 27.371 ms, with overall throughput and model-quality gates **unmet**.
 
+### Opt-in HC runtime integration and component gate (2026-09-05)
+
+The successful down-view/packed-up variant now has an actual model dispatcher,
+behind `VLLM_SM70_QWEN38_BATCH_HC_FP16=0` (default off). The tested CUDA kernels
+are shared by production custom-AR bindings and the benchmark. A complete
+native-owner sidecar also preserves existing M1 bindings; the earlier
+benchmark-only sidecar that omitted them must not be used for model runs.
+
+One isolated communication channel is created per eligible TP group, not per
+layer or hot-loop invocation. The up-weight shards are nonpersistent buffers
+prepared after quantization post-load hooks, with pointer-preserving reload.
+The down shard aliases original FP16 storage. FP16 dimensions and native
+TP4 connectivity are local capabilities; no KV, scheduler chunk, max-seqs or
+checkpoint-ID gate is added. Unknown quantization/LoRA/offload layouts fall
+back. The opaque op makes the decode-width decision at runtime and preserves
+the previous M1 fused-HC delegate and prefill behavior.
+
+Validation from this worktree, CUDA 12.8 / Torch 2.10.0+cu128:
+
+- `tests/models/qwen4_exp/test_sm70_batch_hc.py` plus
+  `tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py`: **60 passed**,
+  `.artifacts/hc-production-cpu-v2.log`.
+- Staged pre-commit hooks all passed after correcting formatting and using
+  accelerator device/synchronization APIs. Artifact:
+  `.artifacts/hc-production-precommit-v3.log`.
+- Real `GatedResidual` and vLLM TP4 communicator on GPU 0--3:
+  M4/M8/M16 hit the candidate; M1, short prefill, M17 and prefill M32 correctly
+  fall back. Fallback output equals the original route. Eight changed-input,
+  poisoned-output graph replays match eager. Prefill-first dynamic compile,
+  re-preparation pointer stability and communicator destruction passed.
+- Actual layer-0 weights, random activations: candidate/reference block max
+  absolute difference 0.00048828125 and injection 0.001953125 for M4/M8/M16.
+  These are not dataset-quality guarantees. No additional quantization used.
+
+Runtime artifacts: `.artifacts/hc-production-runtime-v1.{json,log}` and
+`.artifacts/run_hc_production_runtime.sh`. Complete sidecar:
+`.artifacts/torch-extensions/vllm_sm70_hc_batch_production_v2/`
+`vllm_sm70_hc_batch_production_v2.so`, SHA256
+`3664deec1c713e3c4e0fe2bb5de22cc783a0eb99ebb7539a0376c39c270bdab2`.
+This is source plus a native sidecar, not a clean release wheel.
+
+Next full-model comparison retains the old fixed-width runner unchanged,
+with both arms on current task source, complete sidecar and the same pinned
+valid Flash-V100 package. Grouped MoE is fixed on; HC is the only arm switch.
+The corrected Flash-V100 import means this is a new controlled comparison,
+not a relabeling of the old exact baseline. First run the first 16 GSM8K test
+items with official sampling and natural EOS (16K maximum), then the original
+deterministic 8K/256 C1/4/8/16 speed probe. This small health screen is not
+final dataset/tool/schema/PPL admission. End-to-end and quality targets remain
+unmet pending results; no production default changed.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
