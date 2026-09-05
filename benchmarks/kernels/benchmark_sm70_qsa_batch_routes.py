@@ -86,9 +86,9 @@ def screen(rows, args):
             indices,
             table,
             req,
-            outputs[0],
-            pos,
-            lengths,
+            out=outputs[0],
+            query_positions=pos,
+            sequence_lengths=lengths,
         )
 
     def xqa_call():

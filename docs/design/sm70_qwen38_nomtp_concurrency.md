@@ -2127,6 +2127,149 @@ CPU-only build logs and finite task launchers. Both GPU jobs have exited.
 The last actual C4/C8/C16 throughput is still 216.496/364.129/589.860 tok/s,
 not new measurements from these failed micros. Goals remain unmet.
 
+### Validate the existing QSA page-order repair without replacing batch code
+
+At source `46f2b79022`, validate existing
+[PR #494](https://github.com/1CatAI/1Cat-vLLM/pull/494), SHA
+`5fa8a605dab12cc9ee15459d9ac6b88d95c7be3a`, as an isolated dependency.
+The unchanged Flash-V100 source matches that PR's parent; only its CUDA
+planner delta (77 additions / 25 deletions) and Python planner delta
+(8 additions / 7 deletions) are applied in
+`.artifacts/pr494-validation/`. No whole-file replacement, merge, production
+route change, or duplicate fix PR. Current batched two-warp, output-gate and
+selector-sidecar code remains intact.
+
+Build: the recorded Python 3.12/Torch 2.10 + CUDA 12.8 environment, SM70,
+`MAX_JOBS=4`, CPU-only `setup.py build_ext`, private build-lib/build-temp.
+New Flash-V100 SO SHA256:
+`b439320b4cd67c0c1c59d41277401a32472770c9995cc82f3b3eb604edb47434`.
+An exact-module import hook selects only the modified QSA file and pinned FA
+package; the model, other native operators and sidecar stay frozen.
+
+Run the PR's 26 regressions, current tree's 21 QSA tests, and two additional
+8K/page784 contiguous/interleaved checks. Old control: **25 failed, 24 passed**;
+fixed: **49 passed**. Failures include logical plans and physical-relocation
+attention equality, not CUDA import or device-initialization failures. This
+proves the allocation-order defect is present in our frozen components and
+the repair composes with current QSA changes. It does not prove the entire
+NVFP4 model's numerical or task-quality invariance.
+
+The two fixed-package API arms reuse the full unchanged 80-case manifest,
+official sampling, natural EOS and 16K output cap, followed by the same
+3654-token forced-reference diagnostic. Both finite servers finish with
+client/server status 0. An occupied foreign port 18191 is left untouched;
+the owned jobs use 18201/18202 instead. Actual worker logs confirm grouped
+prefill and grouped/XQA tails with production page784; no decode threshold
+is lowered.
+
+| Fixed-package natural subset | Original MoE/HC | Grouped MoE + batch HC |
+| --- | ---: | ---: |
+| Simple | 14/16 | 16/16 |
+| Parallel | 12/16 | 11/16 |
+| Multiple | 14/16 | 14/16 |
+| Irrelevance | 13/16 | 12/16 |
+| **BFCL** | **53/64** | **53/64** |
+| Schema | 16/16 | 16/16 |
+
+All 3654 reference tokens match in both arms, including four-worker trace
+agreement. Decode mean candidate-minus-control NLL is **-0.0014224**; the
+paired per-case bootstrap interval is **[-0.0033934, +0.0002685]**. The
+matched pure-C16 subset has 1641 tokens, mean **+0.00005284** and mean
+absolute delta **0.0059487**. However, `parallel_3` offset41 still changes
+from logprob -0.4567225 to -2.6368234 (**2.1801 nats**, same decode width).
+First-token maximum absolute delta is 1.9212 nats. Equal aggregate scores
+and small mean errors are not full quality admission. Compared with older
+runs, batch histories and prefill packing remain confounders; do not attribute
+all changes, or all remaining tails, to #494. No further full-model rerun is
+justified solely to seek a better same-seed score.
+
+Artifacts: `pr494-validation/{build-v1.log,pytest-control.xml,pytest-fixed.xml}`,
+`teacher-{control,candidate}/` and `batch-teacher-comparison-v1.json`.
+Forced response SHA256 control/candidate:
+`e3cc2431a13c2f40ae9efb068f71c5cab2acc65edc5feb939ec67aa45e437a95` /
+`cc3d13047fc9a3d26ce0d9a0350a5a43d24d0ef2bd7f2de17b693e78ee68a406`.
+This quality comparison does **not** enable the new GDN copy or the following
+attention experiments.
+
+### Sparse-QSA split-KV: localize planner overhead before a native redesign
+
+The previously unadmitted grouped small-batch screen now passes all six
+changed-input/physical-table/causal-tail-residue eager-versus-graph checks.
+Its benchmark had a stale positional call: current QSA inserts an optional
+output gate before position/length. Change that benchmark call to keywords.
+The first attempt fails before timing at output-gate shape validation; no
+bad result is counted. The corrected test uses current QSA plus the repaired
+FA binary, not the old worktree's Python module.
+
+Independent requests, 8K context, FP16 KV, page784, Hq/Hkv/D=6/1/256,
+16 calls per graph, 40 replays, five alternating samples:
+
+| Rows | Current Triton | Direct XQA | Grouped, no split |
+| --- | ---: | ---: | ---: |
+| 4 | 53.232 us | 301.546 us | 1770.187 us |
+| 8 | 99.627 us | 306.134 us | 3535.712 us |
+| 16 | 166.126 us | 308.522 us | 3690.357 us |
+
+Source confirms the alternative grouped route launches
+`grid=(1,1,num_groups)`: C16 has only **two forward CTAs**. This is a defect
+of promoting the prefill-oriented alternative to decode, **not** the route
+currently responsible for production C16's 27.125-ms complete step.
+
+Prototype 1 reuses the existing native arithmetic unchanged: partition the
+logical page plan into tile-aligned pieces, replicate Q, run approximately
+80 virtual groups, then merge FP16 partial output with FP32 natural-log LSE.
+Complete candidate M4/M8/M16 becomes **134.869/195.360/266.766 us**, versus
+paired Triton **53.614/99.368/166.803 us**. This recovers parallelism but
+still loses to production. No endpoint run or dispatcher change.
+
+A single C16 phase screen isolates graph service: planner **126.149 us**,
+Q/plan packing **7.451 us**, native forward **114.710 us**, merge **6.213 us**.
+These separately replayed phase costs are diagnostics, not an additive E2E
+closure. The first phase-only harness attempt left inference mode and failed
+on an in-place tensor update after the whole-call check; the corrected
+inference-mode attempt passes. It is not an operator arithmetic failure.
+
+Prototype 2 removes the cross-query hash union in this **benchmark only**.
+Reuse the existing XQA logical-token-to-physical-page kernel; retain each
+query's selection order, give it disjoint mask bits and tile-padded plan
+slots, then use the same split/forward/merge adapter. Physical pages shared
+by different queries need not be deduplicated to preserve their separate
+contributions, but this prototype is **not** accepted for production prefix
+sharing, malformed metadata, E4M3 or full-model quality.
+
+| Rows | Paired Triton | Per-query plan + split | Decision |
+| --- | ---: | ---: | --- |
+| 4 | 53.574 us | 94.070 us | Reject regression |
+| 8 | 99.203 us | 96.672 us | Small initial micro gain only |
+| 16 | 167.611 us | 145.221 us | 13.36% local micro gain only |
+
+All six changed-input/table/tail-residue graph checks pass against eager and
+FP32 attention. Maximum relative L2 is 0.000360; maximum absolute error
+0.0017114. These operator tolerances do not admit model quality. C16's
+22.390-us saving projects to only **0.269 ms across 12 QSA layers**, not a new
+complete-step result; C4 fails the <=1% regression gate. Do not hide it by
+shipping an exact-C16-only switch.
+
+The next structural question is a native independent-request GQA tile:
+the reused verifier reserves 48 query/head rows and 512 threads even where
+only a small subset is active. Inspect existing XQA/GQA helpers before a
+smaller native tile, preserve explicit logical plans and FP32 merge, then
+micro-screen the full batch family. Avoid further blind planner/split-count
+sweeps. Upstream
+[vLLM #54873](https://github.com/vllm-project/vllm/pull/54873) valid-count
+skipping is relevant to short-context padding, but cannot erase our full
+2048-entry 8K selection; do not import its newer-GPU speedup as our evidence.
+
+Artifacts under `.artifacts/pr494-validation/`:
+`sparse-micro-v2.json`, `sparse-split-v1.json`,
+`sparse-split-phases-v2.json`, `sparse-split-direct-v1.json`.
+Prototype snapshots are `sparse_split_v1.py`, `sparse_split.py` and
+`sparse_split_direct.py`; the last SHA256 is
+`1ee8e2f1552ede80444b22d606f4ae21416de74f284ff7c563784dee6827ae74`.
+The canonical-index CPU suite passes 24 cases after the benchmark call repair.
+All finite model/micro jobs exited and owned GPU allocations were released.
+The throughput goals are still unmet, and no experimental default is enabled.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
