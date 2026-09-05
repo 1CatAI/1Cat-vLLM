@@ -62,3 +62,37 @@ def test_chunks_stop_at_every_mamba_state_boundary() -> None:
         chunk_ends.append(position)
 
     assert chunk_ends == [816, 1632, 2448, prompt_len]
+
+
+@pytest.mark.parametrize("start", [0, 100, 816, 1000])
+def test_sub_block_encoder_budget_makes_progress(start: int) -> None:
+    request = SimpleNamespace(
+        num_computed_tokens=start,
+        num_prompt_tokens=3 * MAMBA_BLOCK_SIZE,
+        num_tokens=3 * MAMBA_BLOCK_SIZE,
+    )
+    # An encoder-cache boundary can limit this request even when the global
+    # token budget can accommodate a whole Mamba block.
+    assert _split(request, 79) == 79
+
+
+def test_repeated_sub_block_chunks_preserve_state_boundaries() -> None:
+    prompt_len = 2 * MAMBA_BLOCK_SIZE + 30
+    request = SimpleNamespace(
+        num_computed_tokens=0,
+        num_prompt_tokens=prompt_len,
+        num_tokens=prompt_len,
+    )
+    boundaries = []
+    while request.num_computed_tokens < prompt_len:
+        remaining = prompt_len - request.num_computed_tokens
+        chunk = _split(request, min(100, remaining))
+        assert 0 < chunk <= min(100, remaining)
+        previous = request.num_computed_tokens
+        request.num_computed_tokens += chunk
+        next_boundary = (previous // MAMBA_BLOCK_SIZE + 1) * MAMBA_BLOCK_SIZE
+        assert request.num_computed_tokens <= next_boundary
+        if request.num_computed_tokens == next_boundary:
+            boundaries.append(next_boundary)
+
+    assert boundaries == [816, 1632]
