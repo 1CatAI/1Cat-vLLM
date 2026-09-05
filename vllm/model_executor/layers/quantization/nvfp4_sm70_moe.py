@@ -18,6 +18,7 @@ from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -122,6 +123,16 @@ def _raw_scales_match_prepared(
 
 
 def _get_qwen38_raw_scale_workspace(device: torch.device) -> torch.Tensor:
+    # The persistent views below share one expansion buffer across layers.
+    # Concurrent microbatches could overwrite it before a GEMM consumes it.
+    # Reject at load time, without adding synchronization to decode.
+    config = get_current_vllm_config_or_none()
+    if config is not None and config.parallel_config.use_ubatching:
+        raise NotImplementedError(
+            "SM70 raw-scale storage uses a shared expansion workspace and "
+            "cannot be combined with DBO or microbatching. Disable "
+            "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE to use prepared scales."
+        )
     device_index = device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()

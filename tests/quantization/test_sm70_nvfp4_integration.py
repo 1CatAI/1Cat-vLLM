@@ -12,6 +12,19 @@ from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as moe
 from vllm.model_executor.models import qwen2_moe
 
 
+def test_raw_scale_shared_workspace_rejects_microbatching(monkeypatch):
+    monkeypatch.setattr(
+        moe,
+        "get_current_vllm_config_or_none",
+        lambda: NS(parallel_config=NS(use_ubatching=True)),
+    )
+    allocate = Mock(side_effect=AssertionError("must reject before allocating"))
+    monkeypatch.setattr(torch, "empty", allocate)
+    with pytest.raises(NotImplementedError, match="DBO or microbatching"):
+        moe._get_qwen38_raw_scale_workspace(torch.device("cuda", 0))
+    allocate.assert_not_called()
+
+
 @pytest.mark.parametrize("raw_scale", [False, True])
 @pytest.mark.parametrize("fused", [False, True])
 def test_m1_fusions_never_consume_raw_scale_workspace(monkeypatch, raw_scale, fused):

@@ -305,7 +305,8 @@ __global__ void __launch_bounds__(512, 1)
         float result = 0.0f;
   #pragma unroll
         for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-          const float gate = __half2float(peer_values[source_rank].data[element]);
+          const float gate =
+              __half2float(peer_values[source_rank].data[element]);
           const float branch = __half2float(
               branches[source_rank * kQwen38HcGateLocalElements + hidden]);
           result = __fmaf_rn(qwen38_hc_sigmoid_fp32(gate), branch, result);
@@ -750,9 +751,10 @@ void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
 }
 
 void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
-                                    torch::Tensor& output) {
+                                     torch::Tensor& output) {
 #if defined(USE_ROCM)
-  TORCH_CHECK(false, "SM70 Qwen3.8 HC output all-gather is unavailable on ROCm");
+  TORCH_CHECK(false,
+              "SM70 Qwen3.8 HC output all-gather is unavailable on ROCm");
 #else
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   TORCH_CHECK(local_block.is_cuda() && output.is_cuda());
@@ -770,13 +772,12 @@ void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
       vllm::kQwen38HcOutputLocalElements / vllm::packed_t<half>::P::size;
   constexpr int kThreads = 32;
   constexpr int kBlocks = (kPackedElements + kThreads - 1) / kThreads;
-  #define VLLM_LAUNCH_QWEN38_HC_OUTPUT(RANK)                              \
-    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK, true>                     \
-        <<<kBlocks, kThreads, 0, stream>>>(                             \
-            fa->sm70_tp4_push_buffers_,                                 \
-            reinterpret_cast<const half*>(local_block.data_ptr()),      \
-            nullptr, reinterpret_cast<half*>(output.data_ptr()),         \
-            kPackedElements)
+  #define VLLM_LAUNCH_QWEN38_HC_OUTPUT(RANK)                                \
+    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK, true>                       \
+        <<<kBlocks, kThreads, 0, stream>>>(                                 \
+            fa->sm70_tp4_push_buffers_,                                     \
+            reinterpret_cast<const half*>(local_block.data_ptr()), nullptr, \
+            reinterpret_cast<half*>(output.data_ptr()), kPackedElements)
   switch (fa->rank_) {
     case 0:
       VLLM_LAUNCH_QWEN38_HC_OUTPUT(0);

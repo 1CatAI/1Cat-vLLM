@@ -918,6 +918,89 @@ change. All microbenchmark workers/lock holders exit and GPU0--3 are released;
 unrelated services are untouched. Current accepted endpoint evidence remains
 the prior grouped candidate's 27.371 ms, still pending model-quality admission.
 
+### HC sharding trace and generic small-message admission (2026-09-05)
+
+The next diagnostic is a **single HC pair**, not another full-model launch.
+`benchmark_sm70_hc_batch_tp4.py --tokens 16 --profile` captures three paired
+graph replays on all four ranks, each containing 16 complete HC calls.
+Nsight Systems 2022.4.2 uses `--cuda-graph-trace=node` on this host; its
+standalone `QdstrmImporter` recovered the report without rerunning GPUs.
+Each NVTX range is joined to `cudaGraphLaunch` and then to kernels by
+`(globalPid, correlationId)`, not clipped to host launch duration. There are
+192 occurrences of each stage across all ranks and repeats.
+
+Mean **profiled kernel service per HC call**, not accepted absolute speed:
+
+| Stage | Replicated baseline | Sharded candidate |
+| --- | ---: | ---: |
+| Down GEMM | 16.363 us | 8.631 us |
+| Down split-K reduction | 4.370 us | 4.200 us |
+| Scatter down result | absent | 2.103 us |
+| Down-result all-reduce | absent | 16.365 us |
+| SiLU | 2.581 us | 2.374 us |
+| Up GEMM | 13.892 us | 6.830 us |
+| Gate mix / disjoint scatter | 4.563 us | 2.946 us |
+| Output all-reduce | absent | 8.775 us |
+
+This establishes that the local GEMMs are faster, while publication and
+collectives erase the saving. In particular, the `16 * 336 * 2 = 10752` byte
+down result misses the existing push size whitelist and selects ordinary
+`cross_device_reduce_1stage<half,4>` with grid `(2,1,1)`. The 80-KiB output
+already selects the push kernel. Do not subtract these profiled service
+numbers from the 27.371-ms full-model candidate result.
+
+The bounded next screen adds default-**off**
+`VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES`. It admits ordinary FP16
+all-reduces of positive, 16-byte-aligned messages up to the existing 80-KiB
+storage capacity. SM70, fully connected TP4, registered push storage and
+active graph capture are still required by the native caller. Established
+payload launch choices and the `sum2` admission remain unchanged. This is a
+message-size capability gate, not a model/max-sequence/chunk/KV condition.
+The explicit experiment can also admit the existing 25-KiB MTP payload;
+without it, the separate legacy MTP flag retains its old semantics.
+
+Source review also found a correctness bug in the old batch block-count
+override: an override below `ceil(bytes / 2048)` leaves a tail unwritten,
+because the push kernel processes one 16-byte pack per thread and has no
+grid-stride loop. Such overrides now fall back to the established safe
+launch count. Unset/default overrides are unaffected.
+
+`benchmark_sm70_tp4_small_message_push.py` exercises 13 sizes from 16 bytes
+through 80 KiB + 16 bytes (ordinary pull fallback), partial CTAs, 10.5-KiB HC
+payloads, forward/reverse mixed-size graphs and interleaved graph replay.
+Changed random inputs, signed zero, subnormals, finite extremes, infinities
+and NaNs (including the reserved sentinel payload) are checked against a
+rank-ordered FP32 sum with FP16 output. Outputs are poisoned before replay;
+prefix/suffix canaries and rank-skew delays cover stale buffers and tails.
+Finite values require bitwise equality; NaN payload identity is not required.
+An initial **8 cycles per pattern**, three graphs, all four ranks passes,
+including an intentionally undersized `QWEN38_BATCH_BLOCKS=1` override.
+This is a native numerical/graph gate, **not a model-quality score pass**.
+The existing CPU allocator/dispatch suite also passes: **21 tests**.
+
+Task-owned sidecar, same communicator lifecycle in one DSO, Torch 2.10.0
+cu128 / CUDA 12.8, native SM70 only. Candidate v2 binary SHA256:
+`68a14e492cc20e9fd5f8801051eabdd91a8d048537e4de32d4d564495a3491fd`.
+The earlier flag-off timing attempt was rejected before any accepted timing
+because an external GPU process appeared during the run. Do not count it or
+compare different CUDA-built binaries as if only the new flag changed.
+Use the same v2 sidecar with flag 0/1 for the pending matched HC screen.
+
+Artifacts relative to this worktree:
+
+- `.artifacts/raw-audit/hc-tp4-profile-v1.{qdstrm,nsys-rep,sqlite,log}`
+- `.artifacts/raw-audit/hc-tp4-smallmsg-off.log` (discarded timing)
+- `.artifacts/raw-audit/smallmsg-mixed-v2.{json,log}` (8-cycle native gate)
+- `.artifacts/raw-audit/hc-tp4-smallmsg-v2-off.{json,log}` (timing job)
+
+Primary upstream references rechecked for the next design decision:
+[vLLM fusion design](https://github.com/vllm-project/vllm/blob/main/docs/design/fusions.md)
+describes sequence parallel and compute/collective fusion, while
+[Triton-distributed's end-to-end guide](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/docs/getting-started/e2e/e2e_dense.md)
+explicitly reports that extra AG/RS work can erase overlap gains for small
+tensors. These motivate measuring the complete local chain; neither is V100
+performance evidence or justification for a blanket distributed rewrite.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its

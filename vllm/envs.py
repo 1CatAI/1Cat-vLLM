@@ -248,6 +248,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -2239,6 +2240,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # collectives from 0.459 ms to 0.136 ms; explicit 0 is the rollback.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1", "1"))
+    ),
+    # Experimental ordinary all-reduce admission by aligned message size.
+    # SM70, fully connected TP4 and captured FP16 only; default off until the
+    # mixed-size graph replay, numerical and full-model quality gates pass.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "0"))
     ),
     # Optional task-built custom-AR fragment. Operators present in the sidecar
     # override the production namespace; every other operator falls back.
