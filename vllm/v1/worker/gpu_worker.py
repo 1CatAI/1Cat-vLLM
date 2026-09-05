@@ -1044,6 +1044,11 @@ class Worker(WorkerBase):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
                     use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+                    force_uniform_decode=(
+                        self.model_runner._compute_force_uniform_decode(
+                            scheduler_output
+                        )
+                    ),
                 )
             )
             all_gather_tensors = {
