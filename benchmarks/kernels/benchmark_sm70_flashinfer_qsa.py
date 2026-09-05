@@ -194,6 +194,12 @@ def screen(rows, args):
     indices[:, 2048:] = -1
     timings = {name: [] for name in names}
     check_exclusive()
+    # Warm GPU clocks as well as JIT/graphs before paired sampling. Do not
+    # change clock policy or compare against timings from another process.
+    for _ in range(30):
+        for graph in graphs:
+            graph.replay()
+    torch.cuda.synchronize()
     for iteration in range(args.samples):
         order = list(range(len(names)))
         if iteration % 2:
@@ -201,6 +207,16 @@ def screen(rows, args):
         for index in order:
             timings[names[index]].append(elapsed_us(graphs[index], args.calls))
     check_exclusive()
+    hardware = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            os.environ["CUDA_VISIBLE_DEVICES"],
+            "--query-gpu=name,driver_version,clocks.current.sm,clocks.current.memory,temperature.gpu",
+            "--format=csv,noheader",
+        ],
+        text=True,
+    ).strip()
     return {
         "rows": rows,
         "length": args.length,
@@ -212,6 +228,7 @@ def screen(rows, args):
         "checks": checks,
         "microseconds_samples": timings,
         "median_us": {name: statistics.median(t) for name, t in timings.items()},
+        "hardware_after_sampling": hardware,
     }
 
 

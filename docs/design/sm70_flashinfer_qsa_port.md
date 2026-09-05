@@ -10,6 +10,8 @@ it does not select a new serving backend or change release defaults.
 - Integration: `1CatAI/1Cat-vLLM`, `onecat/main`.
 - Base: `755baae1d075ee04fa9096b23fc0225b23589a86`.
 - Branch: `codex/v100-flashinfer-qsa-sm70-20260905-164136`.
+- Draft PR: [#513](https://github.com/1CatAI/1Cat-vLLM/pull/513), initial
+  implementation commit `6b2f4ad8e9c1ddebf375bb1ea163dc2b5891ced4`.
 - FlashInfer source: [6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f](https://github.com/flashinfer-ai/flashinfer/tree/6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f).
 - Its CCCL submodule: `16bd510c9b712e82b0ab6cbb630d8e29ba1f7116`.
 - The previous WMMA primitive probe has its own older source pin; it is not
@@ -117,17 +119,76 @@ FlashInfer-only tests require neither vLLM's native extension nor Flash-V100.
 - `cuobjdump` confirms native `sm_70`; GQA6 decode uses 72 registers/thread
   and reports zero stack/local memory (not a measured occupancy or speed gain).
 - CPU tests: **5 passed, 9 GPU tests skipped** (not counted as GPU passes).
+- Subsequently acquired an idle, locked V100: **14 tests passed**, including
+  all 9 GPU cases. Runtime: 2.82 seconds; graph replay equals eager.
 - Python Ruff check/format and targeted C++/CUDA formatting: passed.
-- GPU correctness, graph, sanitizer and speed: pending GPU ownership; another
-  task currently holds the shared lock even when its model memory is released.
+- All applicable staged pre-commit hooks: passed, including mypy, shellcheck
+  and project-specific checks.
+- Compute Sanitizer 12.8.93 memcheck: 2 selected GQA6 cases passed, **0 errors**.
+  Racecheck of the same cases: **0 errors, 0 warnings**. Both include mutated
+  metadata, graph replay and empty rows. This is targeted, not whole-model
+  sanitizer coverage.
 - Serving dispatch/defaults/quality or model speed: unchanged, not validated
   by this prototype. Do not advertise a throughput increase yet.
 
 Build and test outputs are stored in this task's unversioned `.artifacts/` directory
 (`flashinfer-qsa-build-v4.log`, `flashinfer-qsa-cpu-tests-v1.log`,
-`flashinfer-qsa-resources-v1.txt`). The initial
+`flashinfer-qsa-resources-v1.txt`, `flashinfer-qsa-tests-v1.log`,
+`flashinfer-qsa-memcheck-v3.log`, `flashinfer-qsa-racecheck-v1.log`). The initial
 build failures from mixed CCCL headers and disabled half conversions were
 localized and fixed; do not rerun those variants as performance experiments.
+
+The system's 2022.4.1 sanitizer could not instrument this runtime (missing
+injection-library lookup, then application-exit failure). Neither failure is
+counted as a pass. The successful run uses NVIDIA's CUDA 12.8.1 redistribution,
+`cuda_sanitizer_api` 12.8.93, archive SHA256
+`ae3574f052c0e06c95305962668eb1fe6ab571dfbb58b305fdb14d523bb1b240`, unpacked
+only in task `.deps/`. It does not replace system tools. Command:
+
+```bash
+compute-sanitizer --tool memcheck --kernel-name kns=flashinfer \
+  --error-exitcode 99 .venv/bin/python -m pytest -q \
+  --confcutdir=flashinfer-sm70/tests flashinfer-sm70/tests/test_qsa_decode.py \
+  -k '16-2051 or 4-33'
+# Repeat with --tool racecheck, using the same pinned tool.
+```
+
+### First paired component screen
+
+After graph and GPU-clock warmup, 11 alternating-order paired samples of 100
+calls per graph, independent 8192-token requests, 2051 selection slots, page
+size 784, FP16 Q/K/V, local Hq=6/Hkv=1/D256. GPU: V100-SXM2-32GB; driver
+580.173.02; post-sampling SM/memory clocks 1530/877 MHz for each row count,
+automatic boost (not clock-locked); temperature 36..40 C. This is a component
+test on one TP4-shaped shard, not a TP4 model timing or a 1200 MHz comparison.
+
+| Query rows | Current two-warp Triton, us | Best FlashInfer, us | Splits | Latency change |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 27.228 | 30.556 | 32 | **+12.22% regression** |
+| 4 | 54.641 | 45.066 | 32 | -17.52% |
+| 8 | 100.055 | 60.611 | 32 | -39.42% |
+| 16 | 167.311 | 87.491 | 16 | -47.71% |
+
+Every FlashInfer timing includes preparation, actual upstream decode and merge.
+The split counts are selected from an explicitly exploratory 16/32/64 sweep,
+not a validated production policy. First-run cold-clock numbers are retained
+in `flashinfer-qsa-screen-v1.log`, but the warmed screen above is
+`flashinfer-qsa-screen-v2.log`. Do not compare unrelated historical absolute
+microseconds. The reference QSA source SHA256 is
+`01e9e97d49fe750e5e0d2ee61961e53349ba631a67be0df22e007a715c625543`.
+
+All four query-scale/tail/mapping cycles passed in every timed shape and split
+choice; maximum FlashInfer relative L2 error against FP32 was 0.00021144.
+This does not establish token equality or model-quality non-inferiority.
+
+Decision: the real FlashInfer SM70 path has a promising concurrent QSA
+component result, but do **not** enable it globally. B1 regresses, QSA indexer
+and projection costs are not included, and no E2E/quality gate is complete.
+Next: local B1/merge optimization, graph-safe serving workspace/metadata
+integration behind opt-in capability detection, then matched quality/latency
+validation. Global server settings must not become shortcut routing gates.
+The benchmark process exited and GPU 0 returned to desktop-only memory;
+no owned worker/API remains resident.
 
 ## Subsequent source-port targets
 
