@@ -807,6 +807,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
         del layer.w2_qweight, layer.w2_scales, layer.w2_qzeros
+        # Release unused conversion blocks between layers instead of retaining
+        # their high-water mark throughout model loading. Live prepared weights
+        # and inference buffers are unaffected; this is not an inference hook.
+        torch.accelerator.empty_cache()
         if (
             envs.VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST is not None
             or envs.VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST is not None
