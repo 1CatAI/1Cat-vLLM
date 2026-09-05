@@ -16,9 +16,15 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SHA = "6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f"
 
 
+def namespace(hidden, q_heads, v_heads):
+    return f"_C_flashinfer_gdn_sm70_h{hidden}_q{q_heads}_v{v_heads}"
+
+
 def build(hidden=2560, q_heads=4, v_heads=12):
     from torch.utils.cpp_extension import load
 
+    if min(hidden, q_heads, v_heads) <= 0 or v_heads % q_heads:
+        raise ValueError("Require positive geometry and integral GQA grouping")
     if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
         raise RuntimeError("Set TORCH_CUDA_ARCH_LIST=7.0")
     return load(
@@ -31,6 +37,7 @@ def build(hidden=2560, q_heads=4, v_heads=12):
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
+            f"-DFI_GDN_TORCH_NAMESPACE={namespace(hidden, q_heads, v_heads)}",
             f"-DFI_GDN_HIDDEN={hidden}",
             f"-DFI_GDN_N_BA={2 * v_heads}",
             f"-DFI_GDN_QKV_DIM={(2 * q_heads + v_heads) * 128}",
@@ -46,9 +53,14 @@ def build(hidden=2560, q_heads=4, v_heads=12):
 
 
 class FusedGDN:
-    def __init__(self, rows, q_heads=4, v_heads=12, device="cuda"):
-        if not 1 <= rows <= 64 or q_heads <= 0 or v_heads % q_heads:
-            raise ValueError("Require 1..64 rows and integral GQA grouping")
+    def __init__(self, rows, q_heads=4, v_heads=12, device="cuda", hidden=2560):
+        if (
+            not 1 <= rows <= 64
+            or min(hidden, q_heads, v_heads) <= 0
+            or v_heads % q_heads
+        ):
+            raise ValueError("Require 1..64 rows, positive geometry and integral GQA")
+        self.run = getattr(torch.ops, namespace(hidden, q_heads, v_heads)).run
         self.output = torch.empty(
             rows, v_heads, 128, device=device, dtype=torch.float16
         )
@@ -72,7 +84,7 @@ class FusedGDN:
         state,
         indices,
     ):
-        torch.ops._C_flashinfer_gdn_sm70.run(
+        self.run(
             hidden,
             weights,
             qkv,

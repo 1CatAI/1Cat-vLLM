@@ -33,7 +33,8 @@ namespace flashinfer::sm70::gdn {
 //
 // The layer geometry is a compile-time parameter of this translation unit,
 // supplied by benchmarks/kernels/flashinfer_sm70_gdn_conv.py (one JIT
-// module per geometry; a serving process runs one model, hence one module).
+// module and Torch operator namespace per geometry, so multiple TP geometries
+// may coexist in the same process).
 // Only the sizes change: the block shape, warp->row mapping and reduction
 // trees below are geometry-independent, and the static_asserts state exactly
 // which divisibility relations the code relies on.
@@ -136,9 +137,7 @@ __device__ __forceinline__ void grid_barrier() {
 // the compiler reorder a pool load across a pool store.  The remaining
 // pointers are genuinely disjoint buffers and keep the qualifier.  The read
 // path pays for this: loads from the pools can no longer be promoted to
-// ld.global.nc.  Only this impl is affected -- the registry prefers the
-// CuTe-DSL kernel for every shipped row -- and correctness is not a thing to
-// trade for a read-only-cache hint.
+// ld.global.nc. There is no production dispatch for this prototype yet.
 template <bool kB1>
 __global__ void gdn_fused_decode_kernel(
     const f16* __restrict__ hidden, const f16* __restrict__ w_ba,

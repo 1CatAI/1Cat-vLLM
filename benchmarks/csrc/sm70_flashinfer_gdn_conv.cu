@@ -96,7 +96,7 @@ void run(torch::Tensor hidden, torch::Tensor weights, torch::Tensor qkv,
 }
 }  // namespace
 
-TORCH_LIBRARY_FRAGMENT(_C_flashinfer_gdn_sm70, m) {
+TORCH_LIBRARY_FRAGMENT(FI_GDN_TORCH_NAMESPACE, m) {
   m.def(
       "run(Tensor hidden, Tensor weights, Tensor qkv, Tensor conv_w, "
       "Tensor conv_bias, Tensor(a!) conv, Tensor A_log, Tensor dt_bias, "
@@ -104,4 +104,4 @@ TORCH_LIBRARY_FRAGMENT(_C_flashinfer_gdn_sm70, m) {
       "conv_out, "
       "Tensor(e!) partial) -> ()");
 }
-TORCH_LIBRARY_IMPL(_C_flashinfer_gdn_sm70, CUDA, m) { m.impl("run", &run); }
+TORCH_LIBRARY_IMPL(FI_GDN_TORCH_NAMESPACE, CUDA, m) { m.impl("run", &run); }

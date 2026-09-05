@@ -8,6 +8,8 @@ from benchmarks.kernels.benchmark_sm70_flashinfer_gdn_conv import (
     check_exclusive,
 )
 from benchmarks.kernels.flashinfer_sm70_gdn_conv import FusedGDN, build
+from benchmarks.kernels.flashinfer_sm70_hc_norm import HCNorm
+from benchmarks.kernels.flashinfer_sm70_hc_norm import build as build_hc
 
 
 def test_conv_product_rounding_is_not_fp32_multiply():
@@ -21,6 +23,12 @@ def test_invalid_rows_fail_before_gpu_allocation(rows):
         FusedGDN(rows, device="cpu")
 
 
+@pytest.mark.parametrize("hq,hv", [(0, 12), (4, 0), (4, 7), (-1, 12)])
+def test_invalid_heads_fail_before_gpu_allocation(hq, hv):
+    with pytest.raises(ValueError):
+        FusedGDN(4, hq, hv, device="cpu")
+
+
 @pytest.fixture(scope="module")
 def cuda_build():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -28,6 +36,14 @@ def cuda_build():
     check_exclusive()
     torch.manual_seed(7)
     build()
+
+
+@pytest.fixture(scope="module")
+def cuda_hc_build():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    check_exclusive()
+    build_hc()
 
 
 def oracle(x, weights, qkv, cw, conv, A, dt, state, indices):
@@ -82,6 +98,7 @@ def test_gdn_graph_dynamic_slots_and_history(cuda_build, rows, sd_layout):
     candidate = FusedGDN(rows)
     call = lambda: candidate(x, weights, qkv, cw, bias, conv, A, dt, state, indices)
     graph = capture(call)
+    expected_c, expected_s = conv.clone(), state.clone()
     for cycle in range(8):
         x.normal_()
         qkv.normal_()
@@ -89,7 +106,8 @@ def test_gdn_graph_dynamic_slots_and_history(cuda_build, rows, sd_layout):
         if cycle % 3 == 2:
             indices[-1] = -1
         c0, s0 = conv.clone(), state.clone()
-        expected_c, expected_s = c0.clone(), s0.clone()
+        # The oracle retains its own history: copying candidate state into it
+        # each cycle would hide accumulated recurrent drift.
         expected_o = oracle(x, weights, qkv, cw, expected_c, A, dt, expected_s, indices)
         eager = call().clone()
         eager_state, eager_conv = state.clone(), conv.clone()
@@ -107,3 +125,51 @@ def test_gdn_graph_dynamic_slots_and_history(cuda_build, rows, sd_layout):
         torch.testing.assert_close(
             candidate.output.float(), expected_o, atol=1e-4, rtol=2e-3
         )
+
+
+@pytest.mark.parametrize(
+    "rows,groups,width,r_dtype,b_dtype,w_dtype,shared,warps",
+    [
+        (4, 4, 2560, torch.float16, torch.float16, torch.float16, False, 2),
+        (8, 4, 320, torch.float32, torch.float16, torch.float16, True, 1),
+        (16, 2, 520, torch.float16, torch.float32, torch.float32, False, 4),
+        (1, 3, 4096, torch.float32, torch.float32, torch.float32, True, 8),
+    ],
+)
+def test_hc_graph_rounding_and_shared_weights(
+    cuda_hc_build, rows, groups, width, r_dtype, b_dtype, w_dtype, shared, warps
+):
+    torch.manual_seed(19)
+    r = torch.randn(rows, groups * width, device="cuda", dtype=r_dtype)
+    b = torch.randn(rows, width, device="cuda", dtype=b_dtype)
+    inj = torch.randn(rows, groups, device="cuda", dtype=w_dtype)
+    w = torch.randn(width if shared else groups * width, device="cuda", dtype=w_dtype)
+    candidate = HCNorm(r, warps)
+    call = lambda: candidate(r, b, inj, w)
+    graph = capture(call)
+    for scale in (0.25, 1.0, 3.0):
+        r.normal_().mul_(scale)
+        b.normal_().mul_(scale)
+        inj.normal_()
+        # Independent wider-precision oracle, with the same explicit
+        # materialized residual boundary; never normalize the unrounded sum.
+        gate = 2 * (inj.double() / groups).sigmoid()
+        combined = (
+            r.double().reshape(rows, groups, width)
+            + b.double()[:, None, :] * gate[:, :, None]
+        ).to(r_dtype)
+        y = combined.double()
+        y *= (y.square().mean(-1, keepdim=True) + 1e-6).rsqrt()
+        y *= 1 + w.double().reshape(1, 1 if shared else groups, width)
+        eager = [t.clone() for t in call()]
+        candidate.combined.fill_(float("nan"))
+        candidate.normalized.fill_(float("nan"))
+        graph.replay()
+        torch.accelerator.synchronize()
+        for actual, ref in zip((candidate.combined, candidate.normalized), eager):
+            torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+        atol = 2e-3 if r_dtype == torch.float16 else 2e-5
+        for actual, ref in zip(eager, (combined, y.to(r_dtype))):
+            torch.testing.assert_close(
+                actual.reshape(rows, groups, width), ref, atol=atol, rtol=2e-3
+            )

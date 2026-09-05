@@ -95,13 +95,23 @@ private Torch/Triton caches. No service/model engine is launched at this stage.
    coding/tool/schema quality checks, reporting actual routes and pure decode
    separately from prefill/TTFT. Failed operators stay off.
 
-Current result: initial GDN and HC native SM70 builds passed. Updated
-cooperative GDN build, GPU correctness, speed and sanitizer results must be
-recorded before any performance claim. GPU 0--3 are reserved by another task;
+Current result: initial GDN and HC native SM70 builds passed. Cooperative
+GDN builds also passed, including Hq4/Hv12 and Hq8/Hv24 modules loaded in the
+same process; per-geometry Torch namespaces prevent duplicate registration.
+CPU tests: 8 passed, 8 GPU cases skipped (not GPU validation). The component
+benchmark now additionally retains independent reference/candidate state for
+256 steps with dynamic slots, padding and slot recycling; this screen is
+implemented but has not run on GPU yet.
+HC GPU tests include shared/per-branch weights, mixed FP16/FP32 inputs,
+non-power-of-two widths, an independent wider-precision oracle, poisoned
+outputs and graph replay. These are also pending GPU execution.
+GPU correctness, speed and sanitizer results must be recorded before any
+performance claim. GPU 0--3 are reserved by another task;
 honor the paper and 1Cat shared locks, even between its GPU launches.
 
 Local artifacts: `.artifacts/gdn-build-v1.log`, `gdn-build-v2.log`,
-`gdn-build-cooperative.log`, `hc-norm-build-v1.log`. GPU test logs may exist
+`gdn-build-cooperative.log`, `gdn-build-multi-geometry.log`,
+`hc-norm-build-v1.log`. GPU test logs may exist
 but be empty when lock acquisition timed out; file presence is not a result.
 No model speed or output-quality result is claimed yet. No owned service.
 

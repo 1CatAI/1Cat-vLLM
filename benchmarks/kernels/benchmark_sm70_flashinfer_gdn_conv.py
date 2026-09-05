@@ -46,6 +46,15 @@ def load_weights(model, layer=0, rank=0, tp=4):
         "weight_map"
     ]
     config = json.loads((model / "config.json").read_text())["text_config"]
+    if (
+        tp < 1
+        or not 0 <= rank < tp
+        or config["linear_num_key_heads"] % tp
+        or config["linear_num_value_heads"] % tp
+        or config["linear_key_head_dim"] != 128
+        or config["linear_value_head_dim"] != 128
+    ):
+        raise ValueError("Require D128 and a valid evenly sharded TP geometry")
     prefix = f"model.language_model.layers.{layer}.linear_attn."
 
     def get(name, dtype=torch.float16):
@@ -136,7 +145,7 @@ def screen(rows, weights, args):
         torch.empty(rows, hv, device="cuda", dtype=torch.float16),
     )
     out = torch.empty(rows, hv, 128, device="cuda", dtype=torch.float16)
-    candidate = FusedGDN(rows, hq, hv)
+    candidate = FusedGDN(rows, hq, hv, hidden=hidden)
 
     def baseline():
         base_in.copy_(raw)
@@ -218,12 +227,68 @@ def screen(rows, weights, args):
         and maxima["out"]["relative_l2"] < 5e-3
         and maxima["state"]["relative_l2"] < 5e-3
     )
+    # Unlike the local comparisons above, neither arm is reset from the other
+    # arm in this phase. This screens accumulation through independent FP32
+    # recurrent histories, including graph replays and recycled request slots.
+    cb.copy_(c0)
+    cc.copy_(c0)
+    sb.copy_(s0)
+    sc.copy_(s0)
+    history_maxima = {
+        part: {"max_abs": 0.0, "relative_l2": 0.0}
+        for part in ("out", "state", "conv_out")
+    }
+    history_gate, history_first_failure = True, None
+    for cycle in range(args.history_steps):
+        x.normal_().mul_((0.25, 1.0, 3.0)[cycle % 3])
+        raw.copy_(x @ wqkv.t())
+        indices.copy_(torch.randperm(pool, device="cuda")[:rows])
+        if cycle % 8 == 7:
+            indices[-1] = -1
+        if cycle % 31 == 30:
+            # A retired slot is cleared identically before being reused. Do
+            # not synchronize either arm's other, independently evolved slots.
+            slot = (cycle // 31) % pool
+            cb[slot].zero_()
+            cc[slot].zero_()
+            sb[slot].zero_()
+            sc[slot].zero_()
+        baseline()
+        candidate.output.fill_(float("nan"))
+        candidate.partial.fill_(float("nan"))
+        candidate_graph.replay()
+        live = indices >= 0
+        current = {
+            "out": error(candidate.output[live], out[live]),
+            "state": error(sc, sb),
+            "conv_out": error(candidate.conv_out[live], base_in[live]),
+        }
+        for part, metrics in history_maxima.items():
+            for metric in metrics:
+                metrics[metric] = max(metrics[metric], current[part][metric])
+        current_gate = (
+            all(check["finite"] for check in current.values())
+            and torch.equal(cc, cb)
+            and bool((candidate.output[~live] == 0).all())
+            and current["out"]["relative_l2"] < 5e-3
+            and current["state"]["relative_l2"] < 5e-3
+        )
+        if not current_gate and history_first_failure is None:
+            history_first_failure = {"cycle": cycle, "errors": current}
+        history_gate = history_gate and current_gate
+    gate = gate and history_gate
     record = {
         "rows": rows,
         "q_heads": hq,
         "v_heads": hv,
         "checks": checks,
         "maxima": maxima,
+        "independent_history": {
+            "steps": args.history_steps,
+            "maxima": history_maxima,
+            "gate": history_gate,
+            "first_failure": history_first_failure,
+        },
         "operator_gate": gate,
     }
     if gate:
@@ -256,14 +321,20 @@ def screen(rows, weights, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--steps", type=int, default=32)
+    parser.add_argument("--history-steps", type=int, default=256)
     parser.add_argument("--samples", type=int, default=9)
     parser.add_argument("--calls", type=int, default=30)
     args = parser.parse_args()
+    if min(args.steps, args.history_steps, args.samples, args.calls) <= 0:
+        parser.error("Step, sample and call counts must be positive")
     torch.manual_seed(20260906)
     check_exclusive()
-    weights = load_weights(args.model)
+    weights = load_weights(args.model, args.layer, args.rank, args.tp)
     build(*weights[:3])
     for rows in args.rows:
         print(json.dumps(screen(rows, weights, args)), flush=True)
