@@ -59,7 +59,12 @@ def main():
             torch.zeros(n // 2, device="cuda", dtype=torch.float16) for n in SIZES
         ]
         graphs, storage = [], []
-        for enabled, reverse in ((False, False), (True, False), (True, True)):
+        for enabled, reverse, sum2 in (
+            (False, False, False),
+            (True, False, False),
+            (True, True, False),
+            (True, False, True),
+        ):
             os.environ[FLAG] = str(int(enabled))
             envs.disable_envs_cache()
             buffers = [x.new_full((x.numel() + 16,), -37) for x in inputs]
@@ -75,6 +80,10 @@ def main():
                 # per-block epochs must stay valid across all these transitions.
                 for i in order:
                     ca.all_reduce(inputs[i], out=outputs[i], registered=True)
+                    if sum2:
+                        # Same push storage, but sum2 retains its old launch
+                        # policy. Exercise transitions between both protocols.
+                        ca.all_reduce_sum2(inputs[i], inputs[i], out=outputs[i])
             graphs.append(graph)
             storage.append(buffers)
 
@@ -116,7 +125,7 @@ def main():
                     for b in buffers:
                         b[8:-8].fill_(float("nan"))
                 dist.barrier()
-                for which in (0, 1, 2) if cycle % 2 else (2, 0, 1):
+                for which in (0, 1, 2, 3) if cycle % 2 else (3, 2, 0, 1):
                     if rank == cycle % 4:
                         torch.cuda._sleep(10000)
                     graphs[which].replay()
@@ -128,15 +137,20 @@ def main():
                     for peer in peers[1:]:
                         expected.add_(peer.float())
                     expected = expected.half()
-                    finite = torch.isfinite(expected)
-                    for buffers in storage:
+                    expected_sum2 = (peers[0] + peers[0]).float()
+                    for peer in peers[1:]:
+                        expected_sum2.add_((peer + peer).float())
+                    expected_sum2 = expected_sum2.half()
+                    for graph_id, buffers in enumerate(storage):
                         actual = buffers[i][8:-8]
+                        reference = expected_sum2 if graph_id == 3 else expected
+                        finite = torch.isfinite(reference)
                         torch.testing.assert_close(
-                            actual, expected, rtol=0, atol=0, equal_nan=True
+                            actual, reference, rtol=0, atol=0, equal_nan=True
                         )
                         assert torch.equal(
                             actual.view(torch.int16)[finite],
-                            expected.view(torch.int16)[finite],
+                            reference.view(torch.int16)[finite],
                         )
                         assert (buffers[i][:8] == -37).all()
                         assert (buffers[i][-8:] == -37).all()
@@ -144,7 +158,7 @@ def main():
                 dict(
                     pattern=pattern,
                     cycles=args.cycles,
-                    graph_orders=3,
+                    graph_orders=len(graphs),
                     sizes=len(SIZES),
                 )
             )
@@ -158,6 +172,7 @@ def main():
                 torch=torch.__version__,
                 library=library,
                 finite_bits_exact=True,
+                sum2_interleaved=True,
                 nan_payload_identity_required=False,
                 model_quality_test=False,
             )
