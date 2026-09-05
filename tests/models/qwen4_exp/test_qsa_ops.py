@@ -13,7 +13,9 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
     _qsa_sparse_launch_profile,
     _qsa_xqa_page4_shape_supported,
+    _sm70_qsa_lexicographic_topk_op,
     _use_sm70_qsa_lexicographic_topk,
+    _use_sm70_qsa_two_warp_partial,
 )
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -28,6 +30,36 @@ def test_pre_ampere_qsa_prefill_uses_narrow_tiles_and_four_warps():
 def test_ampere_qsa_prefill_keeps_gb300_profile():
     assert _qsa_sparse_launch_profile(512, 8, False) == (64, 4, 2)
     assert _qsa_sparse_launch_profile(8192, 8, False) == (64, 1, 2)
+
+
+@pytest.mark.parametrize("rows", (1, 2, 4, 8, 16))
+def test_sm70_qsa_two_warp_partial_accepts_small_decode_family(monkeypatch, rows):
+    monkeypatch.setattr(
+        qsa_ops.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+    assert _use_sm70_qsa_two_warp_partial(rows, 6, 256)
+    assert not _use_sm70_qsa_two_warp_partial(rows, 4, 256)
+    assert not _use_sm70_qsa_two_warp_partial(rows, 6, 128)
+
+
+def test_sm70_qsa_two_warp_partial_rejects_large_batch_and_other_arch(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        qsa_ops.current_platform,
+        "is_device_capability",
+        lambda capability: False,
+    )
+    assert not _use_sm70_qsa_two_warp_partial(8, 6, 256)
+    monkeypatch.setattr(
+        qsa_ops.current_platform,
+        "is_device_capability",
+        lambda capability: capability == 70,
+    )
+    assert not _use_sm70_qsa_two_warp_partial(0, 6, 256)
+    assert not _use_sm70_qsa_two_warp_partial(17, 6, 256)
 
 
 def test_qsa_indexer_cublas_accepts_only_exact_single_request_shape():
@@ -473,3 +505,21 @@ def test_qsa_lexicographic_topk_is_limited_to_sm70_qsa_shape(monkeypatch):
         lambda capability: False,
     )
     assert not _use_sm70_qsa_lexicographic_topk(512)
+
+
+def test_qsa_lexicographic_topk_prefers_validation_sidecar(monkeypatch):
+    sidecar = object()
+    wheel = object()
+    monkeypatch.setattr(
+        qsa_ops.torch,
+        "ops",
+        SimpleNamespace(
+            _C_qsa_sm70=SimpleNamespace(qsa_lexicographic_topk=sidecar),
+            _C=SimpleNamespace(qsa_lexicographic_topk=wheel),
+        ),
+    )
+
+    assert _sm70_qsa_lexicographic_topk_op() is sidecar
+
+    qsa_ops.torch.ops._C_qsa_sm70 = SimpleNamespace()
+    assert _sm70_qsa_lexicographic_topk_op() is wheel

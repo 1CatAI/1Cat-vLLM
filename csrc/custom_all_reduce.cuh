@@ -92,14 +92,60 @@ constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
     5 * 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen38M4Bytes = 4 * 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen38M8Bytes = 8 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
     ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70Tp4PushAllreduceGenericBufferBytes =
     kSm70Tp4PushAllreduceSignalBytes + kSm70Tp4PushAllreduceEpochs *
                                            kSm70Tp4PushAllreduceWorldSize *
                                            kSm70Tp4PushAllreduceBytes;
+// HC decode can overlap the ordinary MoE push collective on vLLM's auxiliary
+// stream. Keep both its epoch words and payloads disjoint so an HC poll cannot
+// observe or clear a concurrently running all-reduce packet. The ordinary
+// collective layout above remains unchanged.
+constexpr int kSm70Qwen38HcGatePushBlocks = 10;
+constexpr int kSm70Qwen38HcDownEpochIndex = 0;
+constexpr int kSm70Qwen38HcGateEpochIndexBase = 1;
+constexpr size_t kSm70Qwen38HcPushSignalOffset =
+    kSm70Tp4PushAllreduceGenericBufferBytes;
+constexpr size_t kSm70Qwen38HcPushSignalBytes = 128;
+constexpr size_t kSm70Qwen38HcDownPushBytes = 256;
+constexpr size_t kSm70Qwen38HcGatePushBytes = 2560 * sizeof(half);
+constexpr size_t kSm70Qwen38HcDownPushOffset =
+    kSm70Qwen38HcPushSignalOffset + kSm70Qwen38HcPushSignalBytes;
+constexpr size_t kSm70Qwen38HcGatePushOffset =
+    kSm70Qwen38HcDownPushOffset + kSm70Tp4PushAllreduceEpochs *
+                                      kSm70Tp4PushAllreduceWorldSize *
+                                      kSm70Qwen38HcDownPushBytes;
+constexpr size_t kSm70Qwen38HcUpFusedEpochOffset =
+    kSm70Qwen38HcGatePushOffset + kSm70Tp4PushAllreduceEpochs *
+                                      kSm70Tp4PushAllreduceWorldSize *
+                                      kSm70Qwen38HcGatePushBytes;
+// The fused up/mix/gather uses 160 independent generation counters and exact
+// half-plus-tag packets, separate from both legacy HC and auxiliary MoE data.
+constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
+constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
+    kSm70Qwen38HcUpFusedEpochOffset +
+    kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcUpFusedPacketOffset +
+    kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
+static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
+              kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
-inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
+inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
+                                          bool allow_generic = false) {
+  // Experimental message-size admission, independent of model or batch shape.
+  // Each thread handles one 16-byte pack. Use the smallest covering grid,
+  // bounded by the existing persistent buffer, including for known payloads.
+  const char* small =
+      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES");
+  if (allow_generic && small != nullptr && std::strcmp(small, "1") == 0 &&
+      bytes > 0 && bytes <= kSm70Tp4PushAllreduceBytes && bytes % 16 == 0) {
+    return static_cast<int>((bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                            (kSm70Tp4PushAllreduceThreads * 16));
+  }
   if (bytes == kSm70Tp4PushAllreduceBytes) {
     return kSm70Tp4PushAllreduceBlocks;
   }
@@ -108,6 +154,24 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
   }
   if (bytes == kSm70Tp4PushAllreduceQwen4ExpBytes) {
     return 3;
+  }
+  const char* batch = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
+  const bool batch_enabled = batch == nullptr || std::strcmp(batch, "1") == 0;
+  if (batch_enabled && (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
+                        bytes == kSm70Tp4PushAllreduceQwen38M8Bytes)) {
+    const char* blocks =
+        std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS");
+    if (blocks != nullptr) {
+      const int parsed = std::atoi(blocks);
+      const int min_blocks = (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                             (kSm70Tp4PushAllreduceThreads * 16);
+      // This push kernel handles one pack per thread, without a grid-stride
+      // loop. An undersized launch silently leaves the output tail unwritten.
+      if (parsed >= min_blocks && parsed <= kSm70Tp4PushAllreduceBlocks) {
+        return parsed;
+      }
+    }
+    return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&
@@ -1710,11 +1774,25 @@ class CustomAllreduce {
       }
       sm70_tp4_push_buffers_.ptrs[peer] = ptrs[peer];
     }
-    auto* local_data =
+    auto* generic_data =
         static_cast<char*>(ptrs[rank_]) + kSm70Tp4PushAllreduceSignalBytes;
+    CUDACHECK(cudaMemset(generic_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceGenericBufferBytes -
+                             kSm70Tp4PushAllreduceSignalBytes));
+    auto* hc_signal =
+        static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcPushSignalOffset;
+    CUDACHECK(cudaMemset(hc_signal, 0, kSm70Qwen38HcPushSignalBytes));
+    auto* hc_data =
+        static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcDownPushOffset;
     CUDACHECK(cudaMemset(
-        local_data, kSm70Tp4PushAllreduceSentinelByte,
-        kSm70Tp4PushAllreduceBufferBytes - kSm70Tp4PushAllreduceSignalBytes));
+        hc_data, kSm70Tp4PushAllreduceSentinelByte,
+        kSm70Qwen38HcUpFusedEpochOffset - kSm70Qwen38HcDownPushOffset));
+    // The first fused packet uses generation 1; zero is initially invalid.
+    auto* hc_up =
+        static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcUpFusedEpochOffset;
+    CUDACHECK(cudaMemset(
+        hc_up, 0,
+        kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcUpFusedEpochOffset));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -1854,7 +1932,7 @@ class CustomAllreduce {
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
+        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
         if (push_blocks > 0) {
           sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
@@ -2102,6 +2180,22 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
+      const char* batch =
+          std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH");
+      const bool qwen38_batch =
+          (batch == nullptr || std::strcmp(batch, "1") == 0) &&
+          (bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ||
+           bytes == kSm70Tp4PushAllreduceQwen38M8Bytes ||
+           bytes == kSm70Tp4PushAllreduceBytes);
+      const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
+      const bool qwen38_mtp5 = mtp5 != nullptr && std::strcmp(mtp5, "1") == 0 &&
+                               bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes;
+      const char* qwen4_exp_m1 =
+          std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1");
+      const bool qwen4_exp_m1_enabled =
+          bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
+          (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
+
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
@@ -2117,7 +2211,7 @@ class CustomAllreduce {
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
+          (qwen38_batch || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
         if (push_blocks > 0) {

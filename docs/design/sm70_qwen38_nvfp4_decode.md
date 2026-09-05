@@ -816,3 +816,273 @@ Primary evidence is:
 - `.artifacts/qwen38_exact_decode80/gemv_router_ba_index_hc_bk256_qsa4_gdndual_gate_overlap_full/gemv_router_ba_index_hc_bk256_qsa4_gdndual_gate_overlap_full_i8192_o512_r5.json`
 - `.artifacts/qwen38_exact_decode80/gsm16_exact_decode80_official_xhigh/audit.json`
 - `.artifacts/qwen38_exact_decode80/gsm16_exact_decode80_official_xhigh/health.json`
+
+## 2026-09-04 current-main single-request decode trace
+
+The unified dual-compile/hybrid-PLE service was reprofiled at public-main SHA
+`05910abb97446128a259fbd5fbe2bf9ece70a492`. The locked route is TP4/V2,
+no MTP, FP16 activation/KV, checkpoint-native NVFP4 experts, full decode CUDA
+Graph, prefix caching off, and input 8,192/output 513. One model load ran a
+513-token low-overhead baseline outside the profiler capture and then captured
+only a 32-token graph-node diagnostic.
+
+The 8K baseline measured `83.3749 tok/s`, or `11.9940 ms/token`; the accepted
+short-prompt service point remains `86.07 tok/s`, so context length must stay
+in every decode comparison. The node trace measured a `12.783 ms` middle-token
+replay interval, `12.762 ms` GPU activity envelope, and only `0.050 ms` mean TP
+replay-start skew. It covered `97.09%` of graph-node kernels and contained about
+1,644 kernels/rank/token. Half of those kernels were shorter than 5 us. The
+unprofiled decode samples reported 100% GPU utilization but only 140-150 W per
+board, consistent with HBM traffic and small-kernel/graph-node issue cost rather
+than FP16 compute saturation.
+
+Rank-average service attribution, which is not additive wall time because the
+shared-expert stream overlaps the main stream, is:
+
+| Subsystem | Service ms/rank/token |
+| --- | ---: |
+| HyperConnection | 2.603 |
+| NVFP4 MoE expert/router/activation | 2.203 |
+| checkpoint-FP16 row GEMV | 1.441 |
+| QSA sparse attention | 1.263 |
+| remaining dense/cuBLAS, chiefly shared expert | 1.256 |
+| fused GDN input | 1.064 |
+| elementwise/metadata/copy | 1.022 |
+| TP communication | 0.854 |
+| GDN recurrent/core | 0.658 |
+| LM head/sample | 0.582 |
+
+The checkpoint-FP16 HC down/up, fused GDN input, and remaining row-GEMV kernels
+read at least 2.788 GB of weights per rank and token. Exact tensor sizes and
+trace duration imply 552-596 GB/s for HC, 529 GB/s for row GEMV, and 714 GB/s
+for fused GDN input. These are traffic lower bounds rather than NCU counters;
+the current host blocks performance counters with `ERR_NVGPUCTRPERM`. The GDN
+input is therefore not the first target. The ordered implementation candidates
+are exact router projection/top-k, NVFP4 W2 plus weighted-reduce fusion, QSA
+decode fusion, critical-path graph-node reduction around HC, and an exact or
+guarded greedy LM-head route. Full-model startup is deferred until standalone
+real-weight candidates project at least 0.4 ms/token combined savings.
+
+Raw reports remain outside Git under
+`.artifacts/qwen38_nomtp_token_trace/`, including the `.nsys-rep`, exported
+SQLite database, parsed per-token JSON/CSV/Markdown, route contract, and GPU
+samples.
+
+### Exact post-trace candidates
+
+Three lossless single-token changes have passed focused operator gates after
+the trace. They retain checkpoint FP16 activations and HC weights, native
+NVFP4 expert weights, FP32 accumulation, and the existing FP16 materialization
+boundaries:
+
+- The Qwen3.8 W2 kernel now forms each route's FP16 result before applying the
+  top-k weight and rank-ordered reduction in the same launch. Its real-weight
+  CUDA Graph gate is bitwise and projects `0.098 ms/token` savings over 48
+  layers.
+- HC up reuses the same 320-element low-rank vector across four independent
+  output rows. The selected row-four schedule is bitwise in all 128 changing
+  input cases and reduces the 96-call HC cycle from `2.139 ms` to `2.062 ms`,
+  saving `0.077 ms/token`.
+- Qwen3.8 M1 `all_reduce_sum2` now reuses the registered SM70 TP4 push buffers.
+  Both paths first form the local FP16 sum, accumulate ranks 0 through 3 in
+  FP32, and round once to FP16. The four-rank CUDA Graph gate is bitwise for
+  integer, model-distribution, and signed-zero patterns. Forty-eight
+  collectives fall from `0.459 ms` to `0.136 ms`, saving `0.323 ms/token`.
+  `VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=0` is the rollback.
+- Single-row QSA decode now performs one coarse score-radix pass, compacts only
+  that bucket, and refines the remaining radix bytes in shared memory. The
+  final increasing-index scan is unchanged, so lower-index score ties and the
+  downstream accumulation order remain exact. Twelve real-shape launches at
+  lengths 2,048-2,169 fall from `0.2169 ms` to `0.1238 ms`, saving
+  `0.0931 ms/token` or 1.75x. Random scores, dense ties, signed zero, Inf/NaN,
+  the 2,304-entry boundary, and the 2,305/4,096/16,384 device fallback are
+  bitwise equal to the original selector. Multi-row prefill retains the
+  original kernel. Source-overlay validation may supply the same compiled
+  fragment through `VLLM_SM70_QSA_TOPK_LIBRARY`; release wheels link it into
+  `_C_stable_libtorch` normally.
+
+The isolated savings sum to `0.591 ms/token`; they are not an end-to-end TPOT
+claim because the shared-expert and main streams overlap. One full-model A/B is
+still required before treating the operator gains as service throughput.
+
+Privileged NCU counters confirm why HC needs traffic/issue improvements rather
+than lower precision. The down projection reaches `488 GB/s` DRAM throughput
+with `24.23%` achieved occupancy and spends `86.11%` of scheduler cycles with
+no eligible warp. HC up reaches `481 GB/s`, `64.31%` occupancy, and `63.45%`
+no-eligible cycles. More warps, split-K down, down row tiling, and the SGLang
+persistent atomic-grid HC implementation are slower on V100. HC
+combine-plus-RMSNorm is already only about `0.305 ms` per 96-call graph cycle;
+an 8-warp variant saves just `0.014 ms` and changes the reduction result, so it
+is rejected. A warp-per-dot HC-up kernel is `0.132 ms/token` slower and changes
+89 of 245,760 FP16 outputs by at most `0.000488`. A same-precision FP16 Tensor
+Core/QPN layout is also `0.012-0.035 ms/token` slower, consumes about 0.6 GiB
+more packed weights per rank, and does not reproduce the established FP16
+materialization boundary. Both are rejected. The retained HC changes do not
+quantize FP16 tensors or relax any quality gate.
+
+Further exact HC screens close the inexpensive schedule space. Bypassing L1 for
+streaming weights is bitwise but `0.054 ms/token` slower. Changing Triton
+pipeline stages is bitwise and neutral within `0.002 ms/token`; 8/16-row HC-up
+tiles and paired-stream prefetch are bitwise but `0.043-0.097 ms/token` slower.
+Larger down reduction tiles save at most `0.022 ms/token` while changing FP16
+outputs by one ULP, so they are rejected. Fusing the attention output projection
+with HC combine, followed by an exact norm-only kernel, is bitwise for both
+multi-stream and normalized outputs but is `0.013 ms/token` slower over 48
+calls. These paths should not be rescanned without a different kernel
+architecture.
+
+### Exact TP4 HyperConnection compute sharding
+
+The next retained HC candidate changes work placement, not model precision.
+For each M=1 HC down projection, rank `r` computes low-rank rows
+`[80r, 80(r+1))` and injection row `320+r` directly from the existing
+replicated checkpoint-FP16 weight. A rank-ordered push all-gather reconstructs
+the original 320 low-rank and four injection values. Each rank then computes
+the corresponding 2,560 rows of the FP16 HC-up projection, and a second push
+kernel applies the established FP16 gate boundary, FP32 sigmoid and
+rank-ordered FMA, and final FP16 materialization. The implementation keeps the
+full weights resident, so prefill and unsupported cases use the original
+replicated path without a weight-loader or memory-layout change.
+
+On four V100-SXM2-32GB GPUs, the real-shape 96-HC CUDA Graph cycle falls from
+`2.042378 ms` to `1.748982 ms`, saving `0.293396 ms/token` or 16.78%. All
+block and injection outputs are bitwise equal on all four ranks. A separate
+production-dispatch smoke covers 16 changing inputs through the registered
+custom op and CUDA Graph lifecycle; all four ranks report zero FP16 bit
+mismatches. The route requires the existing checkpoint-FP16 HC opt-in, exact
+Qwen3.8 topology, fully connected TP4 SM70 custom all-reduce, and registered
+push buffers. Otherwise it falls back before launching a sharded kernel.
+
+This candidate does not use FP8, INT8, QPN, altered activation types, or a
+reduced-precision accumulator. Together with the preceding isolated exact
+screens, projected operator savings are `0.884 ms/token`; this is still not an
+end-to-end throughput claim, and it does not by itself establish the 100
+tok/s target.
+
+Two additional no-lower-precision screens were rejected. A deterministic
+E512/K10 top-10 selector preserves all outputs bitwise across random inputs,
+dense ties, signed zero, NaN, and infinities, but loses `0.023 ms/token` with
+hot logits and `0.049 ms/token` after a 64-MiB L2 scrub. GDN input row tiling
+is bitwise but saves only `0.0046 ms/token`. Checkpoint-native NVFP4 W13
+split-16 retains FP32 MMA accumulation and FP16 output but changes FP32
+summation grouping; it differs from split-8 by one FP16 ULP in about 0.28% of
+sampled outputs, so it is not enabled without a full model quality gate.
+
+### Hidden-coordinate HC sharding, 2026-09-05
+
+The next exact M=1 candidate assigns each TP rank 640 hidden coordinates and
+computes all four branch gates for those coordinates. It preserves the
+checkpoint FP16 weight layout, the two-K-warp FP32 reduction, the FP16 gate
+boundary, FP32 sigmoid and branch-ordered FMA, and the final FP16 output.
+The following collective gathers final hidden slices instead of branch gates:
+each rank sends 1,280 rather than 5,120 bytes to each peer. No extra weight
+copy or precision change is introduced, and prefill is unchanged.
+
+It uses the existing `VLLM_SM70_QWEN38_FUSED_HC_FP16` opt-in and exact TP4
+admission checks. A source-matched custom-AR extension enables the new
+`sm70_qwen38_hc_output_allgather` op; an older extension retains the existing
+gate-sharded path. Capability discovery and dispatch use the DSO that owns the
+opaque communicator, never a different extension's fallback symbol. The new
+gather reuses the isolated HC channel, not the concurrent MoE channel.
+
+The initial screen loads all 96 real HC weight pairs, not a repeated layer-0
+weight. Four V100-SXM2-32GB ranks each report zero FP16 bit mismatches for
+block and injection outputs over 16 changing inputs. After 1,000 warmup graph
+replays, three alternating paired timing groups give the following medians:
+
+| Variant | 96 Mix calls (ms) | Change from control (ms) |
+| --- | ---: | ---: |
+| Current gate-sharded control | 1.743988 | — |
+| Hidden shard, two hidden rows / eight warps | 1.703158 | -0.040830 |
+| Producer-only down publication, coalesced revision | 2.037357 | +0.293369 |
+| Exact down partials + fused tail/gather, one part | 1.842709 | +0.098720 |
+| Same, two parts | 1.850873 | +0.106885 |
+| Same, four parts | 1.864315 | +0.120327 |
+
+Only hidden sharding is retained. The first producer-only version was still
+slower at 2.229951 ms. Coalescing its peer writes reduced that overhead but
+did not beat the control. Fixed-order down splitting also remained slower
+after half2 loads and a one-warp gather tail. None of those losing prototypes
+is part of the production dispatch. Alternative hidden tiles / warp counts
+were bitwise but slower than the selected two-row/eight-warp schedule.
+
+These are Mix-only graph measurements: they exclude HC combine/RMSNorm and
+must not be subtracted directly from the 2.658-ms full-HC trace service sum.
+The initial prototype improvement is about 2.3%, not the initial 20% screening
+target and not an end-to-end tokens/s claim.
+
+The committed production implementation (`aaf63696b6`) subsequently passes
+the registered-op gate: 96 real weight pairs x 16 changing inputs x four
+ranks, including 512 graph replays overlapping the actual sum2 route on an
+auxiliary stream. All HC block, injection, and sum2 outputs have zero FP16 bit
+mismatches. The independent hidden-shard GPU unit test passes, as do all 13
+CPU dispatch tests. With Torch `2.10.0+cu128`, runtime CUDA `12.8`, and the
+SM70 extension compiled by NVCC `12.0.140`, three paired timings are:
+
+| Production dispatch | Paired samples (ms) | Median (ms) |
+| --- | --- | ---: |
+| Existing gate shard | 1.738315 / 1.739291 / 1.738595 | 1.738595 |
+| New hidden shard | 1.689020 / 1.690590 / 1.690003 | 1.690003 |
+
+The final Mix-only saving is **0.048592 ms (2.79%)**; each variant's sample
+range is below 0.1%. No full-model startup is justified by this small increment
+alone. Combine it with other admitted exact candidates for the next matched
+endpoint gate; natural-output quality and the required 256K boundary remain
+part of endpoint promotion. The 100-tok/s target remains unproven by this
+change.
+
+Reproduce the production-dispatch gate without loading the entire model:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 VLLM_SM70_TP4_PUSH_ALLREDUCE=1 \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_tp4.py \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --out /path/to/hc-result.json
+```
+
+Use a source-matched wheel or set `VLLM_SM70_CUSTOM_AR_LIBRARY` to an extension
+that contains both the new op and the complete communicator lifecycle. The
+benchmark compares old and new registered-op dispatch, checks all 96 real
+weight pairs, overlaps HC with the actual sum2 CUDA Graph route on an auxiliary
+stream, and reports three paired Mix-only timings separately from correctness.
+
+### Exact fused HC up/mix/gather candidate (2026-09-05)
+
+The source now includes the selected 160-CTA FP16 up/mix/gather kernel. It
+uses 128-bit weight/input reads, parallel branch sigmoids, and the same
+eight-term FP32 FMA chains, XOR reduction tree, FP16 gate boundary, and
+branch-ordered FP32 mixing. Each CTA publishes exact FP16 outputs together
+with a generation tag; its two packet slots and generation counter are
+isolated from both legacy HC collectives and the auxiliary MoE channel.
+The existing communicator allocation grows by 21,120 bytes per rank; there
+is no weight copy, additional communicator, or new user tuning switch.
+
+The existing `VLLM_SM70_QWEN38_FUSED_HC_FP16` opt-in and TP4/SM70/M=1 gates
+still apply. A source-matched extension selects fused up/mix/gather; an older
+extension retains hidden-sharded split up/gather, or the legacy gate-sharded
+route if needed. Optional-op capability and dispatch must come from the DSO
+that owns the communicator, including the extended allocation layout.
+
+The preceding **prototype** complete-HC screen measures `2.108826 ->
+1.999374 ms` (5.19%) with bitwise intermediate/final outputs. Production
+dispatch and auxiliary-stream gates remain pending at this source update.
+The `1.5-ms` whole-HC target and endpoint speed are not established by this
+microbenchmark. The old `2.658-ms` whole-model trace uses a different scope
+and must not be compared directly to it.
+
+Run the complete registered-op gate, without loading attention/MoE weights:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  VLLM_SM70_TP4_PUSH_ALLREDUCE=1 VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=1 \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_full_chain.py --fused-up \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --out /path/to/hc-full-result.json
+```
+
+This compares forced split-hidden and fused registered dispatch, includes all
+HC norms and final projections, checks 16 changing inputs and 512 auxiliary
+sum2 graph replays, then rechecks outputs after timing crosses packet-tag
+wrap. Timings exclude the auxiliary stress workload. Both this benchmark and
+the older Mix-only gate explicitly freeze their control routes so a newer
+extension cannot silently replace both sides of the comparison.

@@ -366,6 +366,32 @@ def test_sm70_tp4_push_allreduce_mtp5_is_opt_in(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_sm70_tp4_push_allreduce_qwen38_batch_defaults_on(monkeypatch):
+    name = "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_sm70_tp4_push_allreduce_sum2_m1_is_default_on_with_rollback(monkeypatch):
+    name = "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
+    finally:
+        envs.disable_envs_cache()
+
+
 @pytest.mark.parametrize(
     ("model_type", "method", "tp_size", "is_sm70"),
     [

@@ -346,10 +346,21 @@ class CustomAllreduce:
             mtp5_status = (
                 "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 else "disabled"
             )
+            qwen38_batch_status = (
+                "enabled"
+                if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH
+                else "disabled"
+            )
+            sum2_m1_status = (
+                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1 else "disabled"
+            )
             logger.info(
                 "SM70 TP4 SGLang-style push all-reduce enabled for the "
                 "FP16 80-KiB verifier, 8-KiB decode, and 5-KiB Qwen4Exp "
-                "payloads; opt-in 25-KiB Qwen4Exp MTP4 payload is %s.",
+                "payloads; batch payloads are %s, 5-KiB sum2 is %s, "
+                "and opt-in 25-KiB MTP4 is %s.",
+                qwen38_batch_status,
+                sum2_m1_status,
                 mtp5_status,
             )
         if tp8_hierarchical and envs.VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR:
@@ -455,6 +466,52 @@ class CustomAllreduce:
             out = torch.empty_like(inp_a)
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
+
+    def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
+        return bool(
+            not self.disabled
+            and self.world_size == 4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and branches.is_cuda
+            and branches.dtype == torch.float16
+            and branches.shape == (1, 10240)
+            and branches.is_contiguous()
+            and ops.supports_sm70_qwen38_hc_shard()
+        )
+
+    def sm70_qwen38_hc_down_allgather(
+        self, local_down: torch.Tensor, gathered_down: torch.Tensor
+    ) -> None:
+        ops.sm70_qwen38_hc_down_allgather(self._ptr, local_down, gathered_down)
+
+    def sm70_qwen38_hc_gate_mix(
+        self,
+        local_gate: torch.Tensor,
+        branches: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        ops.sm70_qwen38_hc_gate_mix(self._ptr, local_gate, branches, output)
+
+    def supports_sm70_qwen38_hc_output_allgather(self) -> bool:
+        return ops.supports_sm70_qwen38_hc_output_allgather()
+
+    def sm70_qwen38_hc_output_allgather(
+        self, local_block: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        ops.sm70_qwen38_hc_output_allgather(self._ptr, local_block, output)
+
+    def supports_sm70_qwen38_hc_up_mix_allgather(self) -> bool:
+        return ops.supports_sm70_qwen38_hc_up_mix_allgather()
+
+    def sm70_qwen38_hc_up_mix_allgather(
+        self,
+        lora: torch.Tensor,
+        weight: torch.Tensor,
+        branches: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        ops.sm70_qwen38_hc_up_mix_allgather(self._ptr, lora, weight, branches, output)
 
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,

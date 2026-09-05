@@ -77,8 +77,9 @@ def _maybe_load_nvfp4_qpn_m1_library() -> None:
     """Load the narrow Qwen3.8 NVFP4 experiment in spawned TP workers."""
     library_path = os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY")
     m1_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    batch_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "1") != "0"
     mtp5_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0") != "0"
-    route_enabled = m1_enabled or mtp5_enabled
+    route_enabled = m1_enabled or batch_enabled or mtp5_enabled
     if library_path is not None and route_enabled:
         torch.ops.load_library(library_path)
 
@@ -154,11 +155,111 @@ def has_nvfp4_qpn_m1_dispatch() -> bool:
     )
 
 
+def has_nvfp4_qpn_raw_scale_dispatch() -> bool:
+    names = (
+        "nvfp4_expand_raw_scales_sm70_out",
+        "nvfp4_moe_qpn_raw_scale_sm70_out",
+        "nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out",
+        "nvfp4_moe_qpn_raw_w2_reduce_sm70_out",
+    )
+    return all(
+        hasattr(torch.ops._C_qwen38, name) or hasattr(torch.ops._C, name)
+        for name in names
+    )
+
+
+def has_nvfp4_qwen38_w2_direct_reduce() -> bool:
+    return hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w2_direct_reduce_out") or hasattr(
+        torch.ops._C, "nvfp4_qwen38_w2_direct_reduce_out"
+    )
+
+
+def has_nvfp4_qwen38_w13_fused_swiglu() -> bool:
+    return hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w13_fused_swiglu_out") or hasattr(
+        torch.ops._C, "nvfp4_qwen38_w13_fused_swiglu_out"
+    )
+
+
+def has_qwen38_shared_gate_exact() -> bool:
+    return hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out") or hasattr(
+        torch.ops._C, "qwen38_shared_gate_exact_out"
+    )
+
+
 def has_nvfp4_qpn_mtp5_dispatch() -> bool:
     """Reject extensions that only implement the legacy ten-route kernel."""
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
         torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"
     )
+
+
+def has_nvfp4_qpn_w13_swiglu_batch_dispatch() -> bool:
+    return hasattr(
+        torch.ops._C_qwen38,
+        "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out",
+    ) or hasattr(torch.ops._C, "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out")
+
+
+def has_nvfp4_grouped_decode_dispatch() -> bool:
+    return all(
+        hasattr(torch.ops._C, name)
+        for name in ("nvfp4_grouped_w13_sm70_out", "nvfp4_grouped_w2_sm70_out")
+    )
+
+
+def nvfp4_grouped_w13_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    split: int,
+    interleaved: bool,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w13_sm70_out(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    )
+
+
+def nvfp4_grouped_w2_sm70_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_sm70_out(
+        out, routed, x, w, s, topk, rows, experts, sizes, total
+    )
+
+
+if has_nvfp4_grouped_decode_dispatch():
+
+    @register_fake("_C::nvfp4_grouped_w13_sm70_out")
+    def _grouped_w13_fake(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    ):
+        return None
+
+    @register_fake("_C::nvfp4_grouped_w2_sm70_out")
+    def _grouped_w2_fake(out, routed, x, w, s, topk, rows, experts, sizes, total):
+        return None
+
+
+def has_nvfp4_qpn_w2_reduce_dispatch() -> bool:
+    return hasattr(
+        torch.ops._C_qwen38,
+        "nvfp4_moe_qpn_w2_reduce_sm70_out",
+    ) or hasattr(torch.ops._C, "nvfp4_moe_qpn_w2_reduce_sm70_out")
 
 
 def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
@@ -1566,6 +1667,178 @@ def nvfp4_moe_qpn_m1_sm70_out(
     )
 
 
+def nvfp4_moe_qpn_raw_scale_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+    interleaved_w13: bool,
+    split_k: int,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_raw_scale_sm70_out")(
+        out,
+        input,
+        weights,
+        scale_codes,
+        global_scales,
+        expert_ids,
+        broadcast_input,
+        interleaved_w13,
+        split_k,
+    )
+
+
+def nvfp4_expand_raw_scales_sm70_out(
+    out: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    interleaved_w13: bool,
+    fast_decode_rounding: bool = False,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_expand_raw_scales_sm70_out")(
+        out,
+        scale_codes,
+        global_scales,
+        interleaved_w13,
+        fast_decode_rounding,
+    )
+
+
+def nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    interleaved: bool,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out")(
+        out,
+        input,
+        weights,
+        scale_codes,
+        global_scales,
+        expert_ids,
+        interleaved,
+    )
+
+
+def nvfp4_moe_qpn_raw_w2_reduce_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_raw_w2_reduce_sm70_out")(
+        out,
+        input,
+        weights,
+        scale_codes,
+        global_scales,
+        expert_ids,
+        topk_weights,
+    )
+
+
+def nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    interleaved: bool,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_w13_swiglu_batch_sm70_out")(
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        interleaved,
+    )
+
+
+def nvfp4_moe_qpn_w2_reduce_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_w2_reduce_sm70_out")(
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        topk_weights,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_w2_reduce_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_w2_reduce_sm70_out")
+    def _nvfp4_moe_qpn_w2_reduce_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_w2_reduce_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_w2_reduce_sm70_out")
+    def _nvfp4_moe_qpn_w2_reduce_sm70_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_w13_swiglu_batch_sm70_out")
+    def _nvfp4_moe_qpn_w13_swiglu_batch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        interleaved: bool,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_w13_swiglu_batch_sm70_out")
+    def _nvfp4_moe_qpn_w13_swiglu_batch_sm70_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        interleaved: bool,
+    ) -> None:
+        return None
+
+
 if hasattr(torch.ops._C, "nvfp4_moe_qpn_m1_sm70_out"):
 
     @register_fake("_C::nvfp4_moe_qpn_m1_sm70_out")
@@ -1592,6 +1865,183 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out"):
         expert_ids: torch.Tensor,
         broadcast_input: bool,
         split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_raw_scale_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_raw_scale_sm70_out")
+    def _nvfp4_moe_qpn_raw_scale_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scale_codes: torch.Tensor,
+        global_scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        interleaved_w13: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_qwen38_w2_direct_reduce_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_qwen38_w2_direct_reduce_out")(
+        out, input, weights, scales, expert_ids, topk_weights
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_w2_direct_reduce_out"):
+
+    @register_fake("_C::nvfp4_qwen38_w2_direct_reduce_out")
+    def _nvfp4_qwen38_w2_direct_reduce_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_raw_scale_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_raw_scale_sm70_out")
+    def _nvfp4_moe_qpn_raw_scale_sm70_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scale_codes: torch.Tensor,
+        global_scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        interleaved_w13: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w2_direct_reduce_out"):
+
+    @register_fake("_C_qwen38::nvfp4_qwen38_w2_direct_reduce_out")
+    def _nvfp4_qwen38_w2_direct_reduce_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        return None
+
+
+for _raw_namespace, _raw_prefix in (
+    (torch.ops._C, "_C"),
+    (torch.ops._C_qwen38, "_C_qwen38"),
+):
+    if hasattr(_raw_namespace, "nvfp4_expand_raw_scales_sm70_out"):
+        register_fake(f"{_raw_prefix}::nvfp4_expand_raw_scales_sm70_out")(
+            lambda out,
+            scale_codes,
+            global_scales,
+            interleaved_w13,
+            fast_decode_rounding: None
+        )
+    if hasattr(_raw_namespace, "nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out"):
+        register_fake(f"{_raw_prefix}::nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out")(
+            lambda out,
+            input,
+            weights,
+            scale_codes,
+            global_scales,
+            expert_ids,
+            interleaved: None
+        )
+    if hasattr(_raw_namespace, "nvfp4_moe_qpn_raw_w2_reduce_sm70_out"):
+        register_fake(f"{_raw_prefix}::nvfp4_moe_qpn_raw_w2_reduce_sm70_out")(
+            lambda out,
+            input,
+            weights,
+            scale_codes,
+            global_scales,
+            expert_ids,
+            topk_weights: None
+        )
+
+
+def nvfp4_qwen38_w13_fused_swiglu_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_qwen38_w13_fused_swiglu_out")(
+        out, input, weights, scales, expert_ids
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_w13_fused_swiglu_out"):
+
+    @register_fake("_C::nvfp4_qwen38_w13_fused_swiglu_out")
+    def _nvfp4_qwen38_w13_fused_swiglu_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w13_fused_swiglu_out"):
+
+    @register_fake("_C_qwen38::nvfp4_qwen38_w13_fused_swiglu_out")
+    def _nvfp4_qwen38_w13_fused_swiglu_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def qwen38_shared_gate_exact_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("qwen38_shared_gate_exact_out")(out, input, weight)
+
+
+if hasattr(torch.ops._C, "qwen38_shared_gate_exact_out"):
+
+    @register_fake("_C::qwen38_shared_gate_exact_out")
+    def _qwen38_shared_gate_exact_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out"):
+
+    @register_fake("_C_qwen38::qwen38_shared_gate_exact_out")
+    def _qwen38_shared_gate_exact_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
     ) -> None:
         return None
 

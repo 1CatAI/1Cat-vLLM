@@ -188,6 +188,140 @@ def _dequantize_ple_fp8_bytes_kernel(
     tl.store(output_ptr + offsets, values, mask=mask)
 
 
+@triton.jit
+def _qwen38_ple_m1_ngram_ids_kernel(
+    input_ids_ptr,
+    ngram_context_ptr,
+    multipliers_ptr,
+    sizes_ptr,
+    offsets_ptr,
+    output_ptr,
+    EOS_TOKEN_ID: tl.constexpr,
+):
+    """Compute the exact Qwen3.8 M=1 ngram-2/3 IDs in one launch."""
+
+    head = tl.arange(0, 16)
+    current = tl.load(input_ids_ptr).to(tl.int64)
+    older = tl.load(ngram_context_ptr).to(tl.int64)
+    previous = tl.load(ngram_context_ptr + 1).to(tl.int64)
+
+    # ``compute_ngram_ids`` resets history at EOS. The immediately previous
+    # token remains the ngram-2 source (and is itself EOS), while ngram-3 must
+    # not reach across that boundary.
+    older = tl.where(previous == EOS_TOKEN_ID, EOS_TOKEN_ID, older)
+    multiplier0 = tl.load(multipliers_ptr).to(tl.int64)
+    multiplier1 = tl.load(multipliers_ptr + 1).to(tl.int64)
+    multiplier2 = tl.load(multipliers_ptr + 2).to(tl.int64)
+    mixed2 = (current * multiplier0) ^ (previous * multiplier1)
+    mixed3 = mixed2 ^ (older * multiplier2)
+    mixed = tl.where(head < 8, mixed2, mixed3)
+
+    size = tl.load(sizes_ptr + head).to(tl.int64)
+    offset = tl.load(offsets_ptr + head).to(tl.int64)
+    remainder = mixed % size
+    # PTX signed remainder follows the dividend, whereas torch.remainder is
+    # always non-negative for these positive vocabulary sizes.
+    remainder = tl.where(remainder < 0, remainder + size, remainder)
+    tl.store(output_ptr + head, remainder + offset)
+
+
+@triton.jit
+def _qwen38_ple_m1_short_conv_kernel(
+    x_ptr,
+    state_ptr,
+    weight_ptr,
+    output_ptr,
+    state_index_ptr,
+    has_initial_ptr,
+    STATE_STRIDE_0: tl.constexpr,
+    STATE_STRIDE_1: tl.constexpr,
+    STATE_STRIDE_2: tl.constexpr,
+    HAS_INITIAL: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fuse exact Qwen3.8 M=1 dilated conv and state-cache update."""
+
+    hidden = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    hidden_mask = hidden < HIDDEN_SIZE
+    state_index = tl.load(state_index_ptr).to(tl.int64)
+    valid = state_index != NULL_STATE_ID
+    safe_state_index = tl.where(valid, state_index, 0)
+    use_initial = valid
+    if HAS_INITIAL:
+        use_initial &= tl.load(has_initial_ptr).to(tl.int1)
+    state_base = safe_state_index * STATE_STRIDE_0 + hidden * STATE_STRIDE_1
+    state_mask = hidden_mask & use_initial
+
+    s0 = tl.load(state_ptr + state_base, mask=state_mask, other=0.0).to(tl.float32)
+    s1 = tl.load(
+        state_ptr + state_base + STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s2 = tl.load(
+        state_ptr + state_base + 2 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s3 = tl.load(
+        state_ptr + state_base + 3 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s4 = tl.load(
+        state_ptr + state_base + 4 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s5 = tl.load(
+        state_ptr + state_base + 5 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s6 = tl.load(
+        state_ptr + state_base + 6 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s7 = tl.load(
+        state_ptr + state_base + 7 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    s8 = tl.load(
+        state_ptr + state_base + 8 * STATE_STRIDE_2,
+        mask=state_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x = tl.load(x_ptr + hidden, mask=hidden_mask, other=0.0).to(tl.float32)
+    w0 = tl.load(weight_ptr + hidden * 4).to(tl.float32)
+    w1 = tl.load(weight_ptr + hidden * 4 + 1).to(tl.float32)
+    w2 = tl.load(weight_ptr + hidden * 4 + 2).to(tl.float32)
+    w3 = tl.load(weight_ptr + hidden * 4 + 3).to(tl.float32)
+    conv = s0 * w0
+    conv += s3 * w1
+    conv += s6 * w2
+    conv += x * w3
+    # Preserve the depthwise-conv FP16 output boundary. The caller deliberately
+    # retains native F.silu because its SM70 rounding differs slightly from
+    # Triton's sigmoid approximation.
+    conv = conv.to(tl.float16)
+    tl.store(output_ptr + hidden, tl.where(valid, conv, 0.0), mask=hidden_mask)
+
+    update_mask = hidden_mask & valid
+    tl.store(state_ptr + state_base, s1, mask=update_mask)
+    tl.store(state_ptr + state_base + STATE_STRIDE_2, s2, mask=update_mask)
+    tl.store(state_ptr + state_base + 2 * STATE_STRIDE_2, s3, mask=update_mask)
+    tl.store(state_ptr + state_base + 3 * STATE_STRIDE_2, s4, mask=update_mask)
+    tl.store(state_ptr + state_base + 4 * STATE_STRIDE_2, s5, mask=update_mask)
+    tl.store(state_ptr + state_base + 5 * STATE_STRIDE_2, s6, mask=update_mask)
+    tl.store(state_ptr + state_base + 6 * STATE_STRIDE_2, s7, mask=update_mask)
+    tl.store(state_ptr + state_base + 7 * STATE_STRIDE_2, s8, mask=update_mask)
+    tl.store(state_ptr + state_base + 8 * STATE_STRIDE_2, x, mask=update_mask)
+
+
 def _splitmix64(value: int) -> int:
     value = (value + _SPLITMIX_GAMMA) & _MASK64
     value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
@@ -697,8 +831,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
         """Compute PLE indices for the current, unpadded request layout."""
-        input_ids = input_ids.reshape(-1).long()
-        query_start_loc = query_start_loc.long()
+        input_ids = input_ids.reshape(-1)
         num_reqs = query_start_loc.numel() - 1
         num_tokens = input_ids.shape[0]
 
@@ -714,6 +847,47 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         if num_reqs <= 0:
             raise ValueError("PLE requires at least one request")
+
+        if (
+            not is_offload_process()
+            and input_ids.is_cuda
+            and current_platform.is_device_capability((7, 0))
+            and num_tokens == 1
+            and num_reqs == 1
+            and input_ids.dtype in (torch.int32, torch.int64)
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+            and self.ngram_heads == 16
+            and ngram_context.ndim == 2
+            and ngram_context.shape[0] >= 1
+            and ngram_context.shape[1] == 2
+            and ngram_context.is_cuda
+            and ngram_context.is_contiguous()
+            and self.layer_multipliers.is_cuda
+            and self.ngram_heads_vocab_sizes.is_cuda
+            and self.ngram_heads_offsets.is_cuda
+            and input_ids.device
+            == ngram_context.device
+            == self.layer_multipliers.device
+            == self.ngram_heads_vocab_sizes.device
+            == self.ngram_heads_offsets.device
+        ):
+            output = torch.empty((1, 16), dtype=torch.long, device=input_ids.device)
+            _qwen38_ple_m1_ngram_ids_kernel[(1,)](
+                input_ids,
+                ngram_context,
+                self.layer_multipliers,
+                self.ngram_heads_vocab_sizes,
+                self.ngram_heads_offsets,
+                output,
+                EOS_TOKEN_ID=self.eos_token_id,
+                num_warps=1,
+            )
+            logger.info_once("SM70 Qwen3.8 fused M=1 PLE ngram-ID path enabled.")
+            return output
+
+        input_ids = input_ids.long()
+        query_start_loc = query_start_loc.long()
 
         if is_offload_process():
             max_seq_len = max(
@@ -1222,6 +1396,67 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         state_indices_tensor_d: torch.Tensor,
         has_initial_states_d: torch.Tensor | None,
     ) -> torch.Tensor:
+        has_initial_ok = has_initial_states_d is None or (
+            has_initial_states_d.numel() >= 1
+            and has_initial_states_d.is_cuda
+            and has_initial_states_d.is_contiguous()
+        )
+        if (
+            current_platform.is_device_capability((7, 0))
+            and x_d.shape == (1, 10240)
+            and x_d.dtype == torch.float16
+            and x_d.is_cuda
+            and x_d.is_contiguous()
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == 10240
+            and conv_state.shape[2] == 9
+            and conv_state.dtype == torch.float16
+            and conv_state.is_cuda
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_cuda
+            and conv_weights.is_contiguous()
+            and state_indices_tensor_d.numel() == 1
+            and state_indices_tensor_d.dtype in (torch.int32, torch.int64)
+            and state_indices_tensor_d.is_cuda
+            and state_indices_tensor_d.is_contiguous()
+            and has_initial_ok
+            and x_d.device
+            == conv_state.device
+            == conv_weights.device
+            == state_indices_tensor_d.device
+            and (
+                has_initial_states_d is None
+                or has_initial_states_d.device == x_d.device
+            )
+        ):
+            conv_output = torch.empty_like(x_d)
+            has_initial_ptr = (
+                state_indices_tensor_d
+                if has_initial_states_d is None
+                else has_initial_states_d
+            )
+            _qwen38_ple_m1_short_conv_kernel[(triton.cdiv(10240, 256),)](
+                x_d,
+                conv_state,
+                conv_weights,
+                conv_output,
+                state_indices_tensor_d,
+                has_initial_ptr,
+                STATE_STRIDE_0=conv_state.stride(0),
+                STATE_STRIDE_1=conv_state.stride(1),
+                STATE_STRIDE_2=conv_state.stride(2),
+                HAS_INITIAL=has_initial_states_d is not None,
+                NULL_STATE_ID=NULL_BLOCK_ID,
+                HIDDEN_SIZE=10240,
+                BLOCK=256,
+                num_warps=4,
+            )
+            logger.info_once(
+                "SM70 Qwen3.8 fused M=1 PLE short-conv state path enabled."
+            )
+            return F.silu(conv_output)
+
         state_indices = state_indices_tensor_d.to(
             device=conv_state.device, dtype=torch.int64
         )

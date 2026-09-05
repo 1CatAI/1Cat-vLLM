@@ -413,6 +413,9 @@ void sm70_dynamic_draft_vocab_refresh_tail_weight_out(
 void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
                            torch::Tensor _gate_weight);
 
+void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor weight);
+
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
 
@@ -551,6 +554,51 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor expert_ids, bool broadcast_input,
                                int64_t split_k);
 
+void nvfp4_expand_raw_scales_sm70_out(torch::Tensor out,
+                                      torch::Tensor scale_codes,
+                                      torch::Tensor global_scales,
+                                      bool interleaved_w13,
+                                      bool fast_decode_rounding);
+
+void nvfp4_moe_qpn_raw_scale_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weights,
+                                      torch::Tensor scale_codes,
+                                      torch::Tensor global_scales,
+                                      torch::Tensor expert_ids,
+                                      bool broadcast_input,
+                                      bool interleaved_w13, int64_t split_k);
+
+void nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scales, torch::Tensor expert_ids, bool interleaved);
+
+void nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scale_codes, torch::Tensor global_scales,
+    torch::Tensor expert_ids, bool interleaved);
+
+void nvfp4_moe_qpn_w2_reduce_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weights,
+                                      torch::Tensor scales,
+                                      torch::Tensor expert_ids,
+                                      torch::Tensor topk_weights);
+
+void nvfp4_moe_qpn_raw_w2_reduce_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scale_codes, torch::Tensor global_scales,
+    torch::Tensor expert_ids, torch::Tensor topk_weights);
+
+void nvfp4_qwen38_w2_direct_reduce_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids,
+                                       torch::Tensor topk_weights);
+
+void nvfp4_qwen38_w13_fused_swiglu_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids);
+
 void nvfp4_glm53_moe_q8_qpn_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor weights,
                                      torch::Tensor scales,
@@ -678,6 +726,17 @@ void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
     fptr_t reg_output_buffer, int64_t reg_buffer_sz_bytes, double epsilon);
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
+void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,
+                                   torch::Tensor& output);
+void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
+                             torch::Tensor& branches, torch::Tensor& output);
+void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
+                                     torch::Tensor& output);
+
+void sm70_qwen38_hc_up_mix_allgather(fptr_t _fa, torch::Tensor& lora,
+                                     torch::Tensor& weight,
+                                     torch::Tensor& branches,
+                                     torch::Tensor& output);
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                  fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,

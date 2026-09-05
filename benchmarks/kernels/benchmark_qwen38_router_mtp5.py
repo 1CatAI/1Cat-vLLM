@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark the exact SM70 Qwen3.8 E512/K10 router at verifier M=5."""
+"""Benchmark the exact SM70 Qwen3.8 E512/K10 small-batch router."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
     _sm70_qwen38_router_topk,
 )
 
-TOKENS = 5
 EXPERTS = 512
 TOP_K = 10
 LAYERS = 48
@@ -56,14 +55,16 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--tokens", type=int, choices=range(1, 17), default=5)
     args = parser.parse_args()
     if torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("benchmark requires exact SM70")
 
     torch.manual_seed(args.seed)
-    logits = torch.randn(TOKENS, EXPERTS, device="cuda", dtype=torch.float16)
-    baseline_weights = torch.empty(TOKENS, TOP_K, device="cuda", dtype=torch.float32)
-    baseline_ids = torch.empty(TOKENS, TOP_K, device="cuda", dtype=torch.int32)
+    tokens = args.tokens
+    logits = torch.randn(tokens, EXPERTS, device="cuda", dtype=torch.float16)
+    baseline_weights = torch.empty(tokens, TOP_K, device="cuda", dtype=torch.float32)
+    baseline_ids = torch.empty(tokens, TOP_K, device="cuda", dtype=torch.int32)
     baseline_rows = torch.empty_like(baseline_ids)
     candidate_weights = torch.empty_like(baseline_weights)
     candidate_ids = torch.empty_like(baseline_ids)
@@ -119,7 +120,7 @@ def main() -> None:
     )
     result = {
         "device": torch.cuda.get_device_name(),
-        "shape": [TOKENS, EXPERTS],
+        "shape": [tokens, EXPERTS],
         "top_k": TOP_K,
         "layers_per_round": LAYERS,
         "dynamic_graph_comparison": comparison,

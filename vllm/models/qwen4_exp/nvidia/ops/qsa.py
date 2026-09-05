@@ -21,6 +21,23 @@ logger = init_logger(__name__)
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+_SM70_QSA_TOPK_LIBRARY = os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY")
+if _SM70_QSA_TOPK_LIBRARY is not None:
+    torch.ops.load_library(_SM70_QSA_TOPK_LIBRARY)
+
+if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
+
+    @torch.library.register_fake("_C_qsa_sm70::qsa_lexicographic_topk")
+    def _qsa_lexicographic_topk_sidecar_fake(
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        output: torch.Tensor,
+        topk: int,
+    ) -> None:
+        del logits, lengths, output, topk
+        return None
+
+
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
@@ -523,6 +540,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    output_gate_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -535,6 +553,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_table_req,
     stride_output_row,
     stride_output_head,
+    stride_output_gate_row,
+    stride_output_gate_head,
     num_rows,
     num_cache_blocks,
     num_requests,
@@ -660,6 +680,21 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             # V dequantization is linear, so apply its scalar after the
             # normalized FP32 accumulation instead of to every loaded value.
             normalized_output *= v_scale
+        if output_gate_ptr is not None:
+            # Preserve the compiled path's rounded attention output before
+            # evaluating the sigmoid gate and final product in FP32.
+            normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
+            output_gate = tl.load(
+                output_gate_ptr
+                + row * stride_output_gate_row
+                + (first_head + head_offsets[:, None]) * stride_output_gate_head
+                + dim_offsets[None, :],
+                mask=output_mask,
+                other=0.0,
+            ).to(tl.float32)
+            normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(
+                output_gate
+            )
         tl.store(
             output_ptr
             + row * stride_output_row
@@ -701,8 +736,11 @@ def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    output_gate_ptr,
     stride_output_row,
     stride_output_head,
+    stride_output_gate_row,
+    stride_output_gate_head,
     num_rows,
     v_scale,
     HEAD_DIM: tl.constexpr,
@@ -740,9 +778,59 @@ def _qsa_merge_splitk_kernel(
         # Apply the V scale once after combining all independently normalized
         # splits. Scaling partials earlier would repeat this work per split.
         merged *= v_scale
+    if output_gate_ptr is not None:
+        merged = merged.to(output_ptr.dtype.element_ty)
+        output_gate = tl.load(
+            output_gate_ptr
+            + row * stride_output_gate_row
+            + head * stride_output_gate_head
+            + dim_offsets
+        ).to(tl.float32)
+        merged = merged.to(tl.float32) * tl.sigmoid(output_gate)
     tl.store(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
         merged,
+    )
+
+
+@triton.jit
+def _qsa_output_gate_kernel(
+    output_ptr,
+    output_gate_ptr,
+    stride_output_row,
+    stride_output_head,
+    stride_output_gate_row,
+    stride_output_gate_head,
+    HEAD_DIM: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    output = tl.load(
+        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets
+    ).to(tl.float32)
+    gate = tl.load(
+        output_gate_ptr
+        + row * stride_output_gate_row
+        + head * stride_output_gate_head
+        + dim_offsets
+    ).to(tl.float32)
+    tl.store(
+        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
+        output * tl.sigmoid(gate),
+    )
+
+
+def _qsa_output_gate(output: torch.Tensor, output_gate: torch.Tensor) -> None:
+    _qsa_output_gate_kernel[(output.shape[0], output.shape[1])](
+        output,
+        output_gate,
+        output.stride(0),
+        output.stride(1),
+        output_gate.stride(0),
+        output_gate.stride(1),
+        HEAD_DIM=output.shape[2],
+        num_warps=4,
     )
 
 
@@ -1072,6 +1160,15 @@ def _use_sm70_qsa_lexicographic_topk(topk: int) -> bool:
     return topk == 512 and current_platform.is_device_capability(70)
 
 
+def _sm70_qsa_lexicographic_topk_op():
+    """Prefer an opt-in source-validation fragment over the wheel op."""
+
+    sidecar = torch.ops._C_qsa_sm70
+    if hasattr(sidecar, "qsa_lexicographic_topk"):
+        return sidecar.qsa_lexicographic_topk
+    return torch.ops._C.qsa_lexicographic_topk
+
+
 def _qsa_visible_blocks(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
@@ -1332,7 +1429,7 @@ def qsa_select_paged_tokens(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            torch.ops._C.qsa_lexicographic_topk(
+            _sm70_qsa_lexicographic_topk_op()(
                 logits,
                 visible_blocks,
                 blocks,
@@ -1917,6 +2014,7 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
     query_positions: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
@@ -1970,6 +2068,12 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse output must match its query")
     assert out.dtype == q.dtype and out.device == q.device
     assert out.stride(2) == 1
+    output_gate_view = output_gate.view_as(q) if output_gate is not None else None
+    if output_gate_view is not None:
+        if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
+            raise ValueError("QSA output gate must match the query dtype and device")
+        if output_gate_view.stride(2) != 1:
+            raise ValueError("QSA output gate must be contiguous in head dimension")
     if not q.shape[0]:
         return out
 
@@ -1999,6 +2103,8 @@ def qsa_sparse_paged_attention(
             v_scale,
         )
         if xqa_output is not None:
+            if output_gate_view is not None:
+                _qsa_output_gate(xqa_output, output_gate_view)
             return xqa_output
 
     group_size = q.shape[1] // k_cache.shape[2]
@@ -2010,13 +2116,8 @@ def qsa_sparse_paged_attention(
         not current_platform.has_device_capability(80),
     )
 
-    if (
-        q.shape[0] == 1
-        and group_size == 6
-        and head_dim == 256
-        and current_platform.is_device_capability(70)
-    ):
-        # Exact Qwen4Exp TP4 decode shape. Two warps preserve the existing
+    if _use_sm70_qsa_two_warp_partial(q.shape[0], group_size, head_dim):
+        # Exact Qwen4Exp TP4 decode family. Two warps preserve the existing
         # split/merge arithmetic and cut the partial-kernel time on V100.
         partial_warps = 2
 
@@ -2052,6 +2153,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        output_gate_view,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -2064,6 +2166,8 @@ def qsa_sparse_paged_attention(
         block_table.stride(0),
         out.stride(0),
         out.stride(1),
+        output_gate_view.stride(0) if output_gate_view is not None else 0,
+        output_gate_view.stride(1) if output_gate_view is not None else 0,
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
@@ -2090,8 +2194,11 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        output_gate_view,
         out.stride(0),
         out.stride(1),
+        output_gate_view.stride(0) if output_gate_view is not None else 0,
+        output_gate_view.stride(1) if output_gate_view is not None else 0,
         q.shape[0],
         v_scale,
         HEAD_DIM=q.shape[2],
@@ -2136,6 +2243,20 @@ def _qsa_sparse_launch_profile(
         partial_warps = 4
         block_n = 16
     return block_n, target_splits, partial_warps
+
+
+def _use_sm70_qsa_two_warp_partial(
+    num_query_tokens: int,
+    group_size: int,
+    head_dim: int,
+) -> bool:
+    """Gate the bitwise small-batch SM70 sparse-QSA launch policy."""
+    return bool(
+        0 < num_query_tokens <= 16
+        and group_size == 6
+        and head_dim == 256
+        and current_platform.is_device_capability(70)
+    )
 
 
 def qsa_store_cache_rows(

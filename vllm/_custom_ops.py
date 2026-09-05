@@ -3092,6 +3092,59 @@ def all_reduce_sum2(
     _custom_ar_op("all_reduce_sum2")(fa, inp_a, inp_b, out)
 
 
+def sm70_qwen38_hc_down_allgather(
+    fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_down_allgather(fa, inp, out)
+
+
+def sm70_qwen38_hc_gate_mix(
+    fa: int,
+    local_gate: torch.Tensor,
+    branches: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_gate_mix(fa, local_gate, branches, out)
+
+
+def supports_sm70_qwen38_hc_output_allgather() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_output_allgather")
+
+
+def supports_sm70_qwen38_hc_shard() -> bool:
+    owner = _custom_ar_owner_namespace()
+    return all(
+        hasattr(owner, name)
+        for name in ("sm70_qwen38_hc_down_allgather", "sm70_qwen38_hc_gate_mix")
+    )
+
+
+def sm70_qwen38_hc_output_allgather(
+    fa: int,
+    local_block: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_output_allgather(fa, local_block, out)
+
+
+def supports_sm70_qwen38_hc_up_mix_allgather() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_up_mix_allgather")
+
+
+def sm70_qwen38_hc_up_mix_allgather(
+    fa: int,
+    lora: torch.Tensor,
+    weight: torch.Tensor,
+    branches: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_up_mix_allgather(
+        fa, lora, weight, branches, out
+    )
+
+
 def top1_argmax(
     fa: int,
     input_pair: torch.Tensor,

@@ -640,6 +640,7 @@ def test_qsa_block_expansion_matches_test_reference() -> None:
     [
         # Kernel-visible pages with --block-size 256 and hybrid-cache alignment.
         pytest.param(1, 24, 2, 1792, id="tp1_split64"),
+        pytest.param(1, 6, 1, 1024, id="tp4_decode_split64"),
         pytest.param(16, 12, 1, 1792, id="tp2_split32"),
         pytest.param(32, 6, 1, 1024, id="tp4_split8"),
         pytest.param(257, 6, 1, 1024, id="tp4_split4"),
@@ -665,6 +666,7 @@ def test_qsa_sparse_paged_attention_matches_test_reference(
     q = torch.randn(
         num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
     )
+    output_gate = torch.randn_like(q)
     kv_cache = torch.randn(
         num_cache_blocks,
         page_size,
@@ -718,7 +720,7 @@ def test_qsa_sparse_paged_attention_matches_test_reference(
     assert logical_indices.shape == (num_rows, selection_width)
     scale = q.shape[-1] ** -0.5
 
-    actual = qsa_ops.qsa_sparse_paged_attention(
+    ungated = qsa_ops.qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
@@ -726,6 +728,21 @@ def test_qsa_sparse_paged_attention_matches_test_reference(
         block_table,
         token_to_req,
     )
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        output_gate=output_gate,
+    )
+    # Match the compiled model path: load the rounded attention and gate in
+    # FP32, then evaluate sigmoid and multiply before the final BF16 store.
+    expected_fused = ungated.clone()
+    qsa_ops._qsa_output_gate(expected_fused, output_gate)
+    torch.testing.assert_close(actual, expected_fused, rtol=0, atol=0)
+
     expected = _qsa_sparse_paged_attention_reference(
         q,
         k_cache,
@@ -735,6 +752,7 @@ def test_qsa_sparse_paged_attention_matches_test_reference(
         token_to_req,
         scale,
     )
+    expected = expected * torch.sigmoid(output_gate)
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
