@@ -59,10 +59,19 @@ def main():
     p.add_argument("--pair", choices=("attn", "mlp"), default="attn")
     p.add_argument("--mode", choices=("full", "down"), default="full")
     p.add_argument(
+        "--weight-copies",
+        type=int,
+        default=1,
+        help="Distinct allocations of the same real weights: cache-footprint screen",
+    )
+    p.add_argument(
         "--profile", action="store_true", help="Capture graph nodes, skip timing sweep"
     )
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
+    if args.weight_copies <= 0:
+        p.error("--weight-copies must be positive")
+    calls_per_graph = max(16, args.weight_copies)
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl")
@@ -125,6 +134,9 @@ def main():
         .reshape(2560, 320)
         .contiguous()
     )
+    weights = [(down, up, local_down_w, local_up_w)]
+    for _ in range(args.weight_copies - 1):
+        weights.append(tuple(w.clone() for w in weights[0]))
     results = []
     try:
         for m in map(int, args.tokens.split(",")):
@@ -135,23 +147,25 @@ def main():
             sparse_output = x.new_empty(m, 2560)
             output = torch.empty_like(sparse_output)
 
-            def baseline():
-                d = torch.nn.functional.linear(x, down)
+            def baseline(index=0):
+                wd, wu, _, _ = weights[index]
+                d = torch.nn.functional.linear(x, wd)
                 lora = hc_silu(d[:, :320], 4)
-                return hc_gate_mix(x, torch.nn.functional.linear(lora, up), 4), d[
+                return hc_gate_mix(x, torch.nn.functional.linear(lora, wu), 4), d[
                     :, 320:324
                 ]
 
-            def candidate(registered):
-                d = torch.nn.functional.linear(x, local_down_w)
+            def candidate(registered, index=0):
+                _, wu, local_wd, local_wu = weights[index]
+                d = torch.nn.functional.linear(x, local_wd)
                 scatter_down[(m,)](d, sparse_down, RANK=rank)
                 ca.all_reduce(sparse_down, out=full_down, registered=registered)
                 lora = hc_silu(full_down[:, :320], 4)
                 if args.mode == "down":
                     return hc_gate_mix(
-                        x, torch.nn.functional.linear(lora, up), 4
+                        x, torch.nn.functional.linear(lora, wu), 4
                     ), full_down[:, 320:324]
-                gate = torch.nn.functional.linear(lora, local_up_w)
+                gate = torch.nn.functional.linear(lora, local_wu)
                 mix_scatter[(m, 10)](gate, x, sparse_output, RANK=rank)
                 ca.all_reduce(sparse_output, out=output, registered=registered)
                 return output, full_down[:, 320:324]
@@ -165,8 +179,9 @@ def main():
             for which in (0, 1):
                 graph = torch.cuda.CUDAGraph()
                 with ca.capture(), torch.cuda.graph(graph):
-                    for _ in range(16):
-                        values = candidate(True) if which else baseline()
+                    for call in range(calls_per_graph):
+                        index = call % args.weight_copies
+                        values = candidate(True, index) if which else baseline(index)
                 graphs.append(graph)
                 outputs.append(values)
             checks = []
@@ -236,7 +251,7 @@ def main():
                         graphs[which].replay()
                     end.record()
                     end.synchronize()
-                    us = begin.elapsed_time(end) * 1000 / (40 * 16)
+                    us = begin.elapsed_time(end) * 1000 / (40 * calls_per_graph)
                     all_us = [None] * 4
                     dist.all_gather_object(all_us, us, group=group)
                     check_exclusive()
@@ -261,6 +276,13 @@ def main():
                 "custom_ar_library": library,
                 "small_message_push": os.environ.get(
                     "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "0"
+                ),
+                "calls_per_graph": calls_per_graph,
+                "replicated_weight_bytes": sum(
+                    w.numel() * w.element_size() for ws in weights for w in ws[:2]
+                ),
+                "sharded_weight_bytes": sum(
+                    w.numel() * w.element_size() for ws in weights for w in ws[2:]
                 ),
             }
             if library:

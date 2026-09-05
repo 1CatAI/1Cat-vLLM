@@ -984,7 +984,13 @@ cu128 / CUDA 12.8, native SM70 only. Candidate v2 binary SHA256:
 The earlier flag-off timing attempt was rejected before any accepted timing
 because an external GPU process appeared during the run. Do not count it or
 compare different CUDA-built binaries as if only the new flag changed.
-Use the same v2 sidecar with flag 0/1 for the pending matched HC screen.
+The same v2 sidecar was subsequently used for flag 0/1 screening. At M16,
+flag-off baseline/candidate were 31.872/37.363 us; a later flag-on process
+measured 33.790/33.552 us. The replicated baseline itself moved between
+processes, so do not attribute the raw 37.363-to-33.552 difference entirely
+to the flag. Within-process flag-on paired savings were 3.536/2.338/0.238 us
+at M4/M8/M16. The first flag-on attempt also detected foreign workers and
+was discarded; only the `on-retry` artifact supplies those results.
 
 Artifacts relative to this worktree:
 
@@ -992,6 +998,7 @@ Artifacts relative to this worktree:
 - `.artifacts/raw-audit/hc-tp4-smallmsg-off.log` (discarded timing)
 - `.artifacts/raw-audit/smallmsg-mixed-v2.{json,log}` (8-cycle native gate)
 - `.artifacts/raw-audit/hc-tp4-smallmsg-v2-off.{json,log}` (timing job)
+- `.artifacts/raw-audit/hc-tp4-smallmsg-v2-on-retry.{json,log}`
 
 Primary upstream references rechecked for the next design decision:
 [vLLM fusion design](https://github.com/vllm-project/vllm/blob/main/docs/design/fusions.md)
@@ -1000,6 +1007,74 @@ describes sequence parallel and compute/collective fusion, while
 explicitly reports that extra AG/RS work can erase overlap gains for small
 tensors. These motivate measuring the complete local chain; neither is V100
 performance evidence or justification for a blanket distributed rewrite.
+
+### Follow-up: remove empty push CTAs and reject the HC cache-footprint bias
+
+The 80-KiB legacy push launch uses 80 CTAs, but only 40 CTAs have active
+16-byte packs. The current experimental admission therefore uses
+`ceil(bytes / 2048)` for **all ordinary** covered messages, including known
+sizes. This happens only when `SMALL_MESSAGES=1`; ordinary flag-off launches
+remain unchanged. The helper's explicit `allow_generic` argument keeps
+`sum2` admission and launch geometry unchanged even while the experiment is
+active. No new scratch space or communicator ABI is introduced.
+
+Candidate **v4** sidecar SHA256:
+`348b782113785d374d397362b37cc93dc06f445d595b7cd4a0d5e5f3fdaf3888`.
+The intermediate v3 DSO is not used for accepted GPU evidence: source review
+separated `sum2` from generic grid selection before launching v4.
+The expanded native gate passes **64 cycles per pattern / 13 sizes / four
+graph sequences / four ranks**. The fourth graph interleaves ordinary and
+`sum2` calls sharing the same push storage. Rank-skew, poisoned output,
+canaries, finite-bit equality and NaN classification all pass, still with
+the intentionally undersized legacy block override. This does not establish
+model scores. Artifact: `.artifacts/raw-audit/smallmsg-mixed-v4.{json,log}`.
+
+The HC screen now offers `--weight-copies`: rotate distinct allocations of
+the **same checkpoint HC pair**, not an actual multi-layer model. This
+separates hot single-pair behavior from a working set too large for cache.
+With one copy, the candidate uses 3,440,640 bytes of local weights versus
+13,434,880 bytes in the replicated path. With 16 copies those working sets
+are 55,050,240 and 214,958,080 bytes. Both paths still execute the same
+16-call graph and include GEMMs, SiLU, scatter, mix and both communications.
+This allocation test is not a claim about production model memory savings.
+
+Five alternating unprofiled samples, per-sample maximum rank duration:
+
+| M | One-copy baseline | One-copy candidate | 16-copy baseline | 16-copy candidate |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 31.235 us | 27.187 us | 31.370 us | 31.198 us |
+| 8 | 31.872 us | 28.843 us | 32.018 us | 33.462 us |
+| 16 | 33.781 us | 32.486 us | 33.947 us | 36.520 us |
+
+One M4 candidate timing outlier is retained in each report rather than
+trimmed; the table uses medians. M8/M16 rotating-weight regressions occur in
+all five samples. Foreign-process checks pass in these completed runs.
+Changed-input/poisoned graph results equal candidate eager outputs, but the
+earlier small non-exact differences versus the replicated model remain.
+
+**Decision: reject this HC sharding implementation for production.** The
+single-pair cache benefit is not robust to a layer-like working set; removing
+the 10.5-KiB pull fallback and inactive CTAs does not overcome the complete
+chain's communication/data-movement cost. Do not integrate it, launch a full
+model for it, or count its hot-cache micro gain toward 238/420/728 tok/s.
+The generic push experiment stays off by default in the WIP branch.
+The next bounded implementation would need to fuse local pointwise work and
+disjoint publication/gather, eliminating zero-filled scatter and redundant
+traffic/launches, rather than merely split more GEMMs. Screen it with the
+rotating-weight case first. Reuse existing push storage/protocol, keep all
+communicator lifecycle calls within one DSO, and retain the native/model
+quality gates. No such fused operator has been implemented or measured yet.
+
+Artifacts: `.artifacts/raw-audit/hc-tp4-smallmsg-v4-copies{1,16}.{json,log}`.
+The first old-binary undercoverage reproducer never reached the GPU because
+an edit to its waiting shell launcher invalidated the shell's read position;
+that log is a tooling failure, not a kernel result. The retry is a separate
+job/artifact. Do not modify launch scripts while their waiting processes
+are live. The launcher now also honors the paper campaign's full-job GPU
+reservation, in addition to per-GPU locks and actual process checks.
+All completed GPU workers exit. Current endpoint evidence remains the
+grouped-MoE candidate's 27.371-ms C16 result, pending model-quality admission;
+the overall concurrency and C1/quality goals remain **unmet**.
 
 ## Acceptance gates
 

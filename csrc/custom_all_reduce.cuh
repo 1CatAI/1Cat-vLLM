@@ -125,7 +125,18 @@ constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
-inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
+inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
+                                          bool allow_generic = false) {
+  // Experimental message-size admission, independent of model or batch shape.
+  // Each thread handles one 16-byte pack. Use the smallest covering grid,
+  // bounded by the existing persistent buffer, including for known payloads.
+  const char* small =
+      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES");
+  if (allow_generic && small != nullptr && std::strcmp(small, "1") == 0 &&
+      bytes > 0 && bytes <= kSm70Tp4PushAllreduceBytes && bytes % 16 == 0) {
+    return static_cast<int>((bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                            (kSm70Tp4PushAllreduceThreads * 16));
+  }
   if (bytes == kSm70Tp4PushAllreduceBytes) {
     return kSm70Tp4PushAllreduceBlocks;
   }
@@ -152,16 +163,6 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
       }
     }
     return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
-  }
-  // Experimental message-size admission, independent of model or batch shape.
-  // Preserve the established launch choices above. Each thread handles one
-  // 16-byte pack, and the persistent buffer remains bounded by its old size.
-  const char* small =
-      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES");
-  if (small != nullptr && std::strcmp(small, "1") == 0 && bytes > 0 &&
-      bytes <= kSm70Tp4PushAllreduceBytes && bytes % 16 == 0) {
-    return static_cast<int>((bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
-                            (kSm70Tp4PushAllreduceThreads * 16));
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&
@@ -1916,7 +1917,7 @@ class CustomAllreduce {
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
+        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
         if (push_blocks > 0) {
           sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
