@@ -45324,3 +45324,24 @@ Interpretation:
   Public integration was fetched at `2b89b77e3882423d1c93e01faf8c1db43f6650f4`;
   keep the candidate's existing integration base `fbcef6e2f9` frozen for this
   paired screen rather than mixing unrelated model-route updates into it.
+- Registered gate completed at `0303b82d1ec8fd9549d75018995939bbee63846e`:
+  full semantic HC split `2.109529 ms` -> fused **`1.994807 ms`**, saving
+  **`0.114722 ms` (`5.44%`)**. Split samples are
+  `2.109556/2.109529/2.109242`; fused `1.994807/1.993735/1.996370 ms`.
+  All four ranks have zero HC/intermediate/final and sum2 bit mismatches over
+  16 changing input cases, 512 auxiliary sum2 replays, and post-timing checks
+  after generation wrap. `result.json` SHA256:
+  `b9524acfe04ea92ca3836a404ae590284dc6ea0b8ee4ddfd3a3488e9653a9996`.
+  Production binary SHA256:
+  `5b1ee678bebf6a8fcdb008d5832cfd8ca3d6978558291ec9fe54ec2b9f6cf1bf`.
+  All test processes exited; no full-model startup. This is a production-op
+  microbenchmark, not a whole-model trace or endpoint acceptance.
+- Next bounded screen is an exact down/gather packet fusion, under
+  `.artifacts/hc_down_packet/`. It is materially different from the old
+  rejected 80-CTA/16-byte-sentinel fusion: 81 resident cooperative CTAs (no
+  serialized injection row), 4-byte half-plus-generation packets, no sentinel
+  clearing, half2 projection loads, and a private channel. The original
+  40-term FMA chains and cross-warp reduction remain unchanged. Both split and
+  fused variants compile with 31 registers/16 bytes shared/zero stack or
+  spills. Compare complete HC with the newly registered up fusion held fixed,
+  including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
