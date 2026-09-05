@@ -1479,6 +1479,87 @@ Primary-source review:
 - PR #506 was inspected: its remaining norm-prefetch work targets single-token
   HC. Keep this comparison frozen; do not mix it into a batch-fusion A/B.
 
+### Completed HC full-model A/B (2026-09-05)
+
+Both finite runs completed at source
+`b64dae6e5b7d14eb4f0e0861d31600fc866c4e48`. All task model workers exited.
+The control/candidate use the same complete HC native-owner sidecar and pinned
+Flash-V100 library described above. Native NVFP4 target, FP16 KV/activations,
+FP32 GDN state, TP4 V100-SXM2-32GB GPU 0--3, Torch 2.10.0+cu128, CUDA 12.8,
+driver 580.173.02, MRV2/no MTP, Prefix Cache + Mamba align, max context 262144,
+chunk 2048, max-seqs 16, memory utilization 0.90, full decode graphs. Grouped
+MoE stays on in both arms. The only candidate switch is batch HC.
+
+Original deterministic speed workload: independent 8192-token inputs, forced
+256 output tokens, temperature 0/top-p 1/top-k -1, same prompts/seeds and
+fixed-live-width engine-timestamp interval selection (head/tail 8 excluded).
+The client receive-blocking wait is not used as complete TPOT.
+
+| C | HC off ms | HC on ms | Off tok/s | On tok/s | On gain |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 11.357011 | 11.356076 | 88.051 | 88.059 | 0.008% |
+| 4 | 18.753086 | 18.476128 | 213.298 | 216.496 | 1.499% |
+| 8 | 22.144332 | 21.970248 | 361.266 | 364.129 | 0.792% |
+| 16 | 27.400743 | 27.125071 | 583.926 | 589.860 | 1.016% |
+
+This is one A/B, not a repeated confidence-interval admission. Real per-step
+savings are only 0.277/0.174/0.276 ms at C4/C8/C16, below the component
+projection and far short of the 238/420/728 goals. Worker logs confirm all
+96 prepared HC up shards and native decode capture at M2/4/8/16, with original
+M1 fused up/mix/gather preserved. Candidate loading uses approximately 150 MiB
+extra per rank; reported KV pool 541053 -> 529622 tokens (not a 256K quality
+test). No default changed.
+
+The separate natural-EOS first-16 GSM8K health screen has identical prompt IDs
+and official sampling (temperature 1/top-p .95/top-k 20, seeds 20260905+i,
+thinking enabled, max 16384). Both score **15/16**, both miss item 12 (12 years
+versus the reference's 13 years), and neither truncates. Responses have
+different lengths/text; this small score tie does not establish non-inferiority
+on the required coding/tool/schema/PPL gates. Its duration is not throughput:
+61.24 vs 30.42 seconds includes different generated lengths. The legacy
+speed JSON `load_seconds` field wraps startup **and this health check** in the
+adapter; it is not a model-loading-only or prefill measurement.
+
+Even the M1 forced-speed completion differs at token 12 despite identical M1
+dispatch; this synthetic continuation runs past natural EOS. Keep this as a
+diagnostic, not an automatic model-quality failure or attribution to HC.
+PR #494 documents a separate allocation-sensitive QSA planner order issue;
+it was inspected, not imported or proved to explain this run. Do not change
+the frozen A/B or impose cross-batch bitwise equality instead of score gates.
+
+Runtime limitation: both arms' frozen base `_C` library lacks the newer
+single-token `nvfp4_qwen38_w13_fused_swiglu_out` and
+`nvfp4_qwen38_w2_direct_reduce_out`. Source audit places those gates only in
+the direct M1 MoE branch; current M4 direct-batch fusion and M8/M16 grouped
+routes do not depend on them. Both arms emit the same fallback warnings.
+Thus the HC A/B is controlled, but is **not** a clean latest-main wheel or
+complete native-optimization baseline. C1's improvement over the old 81-tok/s
+run must not be attributed to the new batch HC switch.
+
+Artifacts in this worktree:
+
+- `.artifacts/hc-model-runtime/{control,candidate}-v1.json` and matching `.env`;
+  JSON SHA256 respectively
+  `c8e13ba1d6de30fa5c362b171e58fcf6370074f5254aad0a706c785538c8bd3f`,
+  `6cad83b2948a011e526763762afa4ecde7f29eb374fa4bad4e81151fcf7593bc`.
+- `.artifacts/hc-model-runtime/{control,candidate}-quality-v1.json`;
+  SHA256 respectively
+  `a639cfbe6fbeb9f24f4b577799211bc3b8bdbb1b37643ef9922d392403d9c41e`,
+  `b7b8e44a685922555bfe4fe27d79f0d7153a720316550b3db6886f57e2f5c7c1`.
+- `.artifacts/hc-model-control-v1-requeue.log`,
+  `.artifacts/hc-model-candidate-v1.log`,
+  `.artifacts/run_hc_full_model.{sh,py}`.
+
+Next bounded job: one local candidate API at port 18184, concurrent 64 BFCL +
+16 JSONSchemaBench cases, then an explicitly deterministic, prefix-warmed
+C16/8K short CUDA graph-node trace. CUDA profiler delay 8/max 16 steps avoids
+profiling startup; the profiled request is not accepted throughput. Nsight
+2022.4.2 uses `--cuda-graph-trace=node`, not unsupported `node:host-only`.
+Task launcher `.artifacts/run_hc_api_quality_trace.sh` waits for verified idle
+GPUs/locks, refuses port/artifact overwrite and shuts down its own API by PID
+plus process-start generation. It is a finite quality/profile job, not a
+resident API. No API quality or new trace result exists at this update.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
