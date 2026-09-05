@@ -1076,6 +1076,101 @@ All completed GPU workers exit. Current endpoint evidence remains the
 grouped-MoE candidate's 27.371-ms C16 result, pending model-quality admission;
 the overall concurrency and C1/quality goals remain **unmet**.
 
+### Fused HC pointwise + disjoint push gather screen (2026-09-05)
+
+The rejected plain sharding path is **not** promoted. The next prototype
+implements the previously identified missing fusion, without production
+dispatch or CMake changes:
+
+- `benchmarks/kernels/sm70_hc_push_gather.cuh`
+- `benchmarks/kernels/sm70_hc_push_sidecar.cu`
+- `benchmark_sm70_hc_batch_tp4.py --mode fused`
+
+The down producer applies HC SiLU to each rank's 80 local low-rank values,
+publishes only 88 values/row (including injection padding), and gathers the
+four disjoint pieces into the 320-wide lora plus rank3 injection output.
+The up producer fuses four-branch sigmoid/FMA/mean with publication of each
+rank's 640 hidden coordinates, then gathers the final 2560-wide result.
+There is no zero-filled full tensor or redundant summation of disjoint data.
+Local FP16 GEMMs and their materialization boundaries remain unchanged.
+The complete candidate has five kernels instead of the plain sharding's
+eight: down GEMM/reduction, down SiLU/gather, up GEMM, mix/gather.
+
+Both native kernels reuse existing SM70 two-epoch push storage and volatile
+16-byte publication/poll/clear helpers. Packing-to-CTA mapping stays at one
+pack per thread and 128 threads per CTA, preserving epoch indexing when
+interleaved with the existing collectives. No new buffer or communicator
+layout is introduced. All lifecycle/method bindings and these benchmark
+functions must be compiled in the **same DSO**, never passed a communicator
+created by another loaded sidecar. A complete benchmark-only sidecar source
+is included for reproducibility; it is not an inference-backend replacement.
+
+PTX from the retained Triton HC kernels was inspected before implementing
+sigmoid: explicit `mul`, `ex2.approx`, `add` and `div.full` preserve the
+existing operation sequence, followed by the same ordered FP32 FMA and FP16
+rounding. Signed zero is canonicalized only at the boundaries where the
+unfused disjoint all-reduce adds positive zero. NaN sentinels are escaped
+using the existing helper. This is not activation or weight quantization.
+CUDA 12.8 ptxas reports 40/44 registers for down/up producers, zero spills
+and 64-byte stack frames; these are compiler properties, not occupancy or
+HBM utilization measurements.
+
+V100 TP4, actual checkpoint layer-0 attention-HC weights, **16 distinct
+weight allocations**, same 16-call graphs and five alternating samples;
+all completed timing groups pass foreign-GPU-process checks:
+
+| M | Replicated HC baseline | Fused sharding candidate | Per-call reduction |
+| ---: | ---: | ---: | ---: |
+| 4 | 29.320 us | 23.411 us | 20.15% |
+| 8 | 30.029 us | 24.270 us | 19.18% |
+| 16 | 33.222 us | 26.854 us | 19.17% |
+
+Every candidate timing sample is below its paired baseline at each width;
+raw clock/timing variation is retained, not discarded. Scaling these local
+deltas to 96 HC calls gives **0.55--0.61 ms as a screening estimate only**:
+these are copies of layer-0 weights and synthetic activations, not an actual
+96-HC execution, endpoint saving or a revised 238/420/728-tok/s result.
+The prior accepted C16 grouped-MoE candidate remains 27.371 ms pending
+model-quality admission. Its gap to 21.978 ms is not closed by this screen.
+
+At all four ranks and activation scales 0.25/1/3, the fused candidate equals
+the **unfused sharded** reference with zero tolerance, and poisoned-output
+changed-input graph replay equals candidate eager. Against the original
+replicated GEMM baseline, the existing association differences remain:
+block/injection relative-L2 up to `2.981e-4`/`4.385e-4`, max-abs
+`0.00390625`/`0.0078125`. No full-model quality pass is claimed. This fusion
+adds no observed difference beyond the already recorded GEMM sharding, but
+that is not sufficient for default enablement.
+
+The queued `--check-only --tokens 1,2,...,17,24` run extends graph/shape
+coverage without collecting irrelevant timing; its result must be checked
+before production-wrapper integration. Preparation must happen after real
+weight loading and before capture, not in a constructor that only allocates
+weights or inside fake-tensor tracing. Preserve the existing M1 path and
+prefill/unsupported fallbacks. New native calls must resolve to the same
+communicator owner rather than falling back across DSO boundaries.
+
+Artifact: `.artifacts/raw-audit/hc-fused-push-v1-copies16.{json,log}`.
+Test DSO SHA256:
+`62d77f78b48837565cd1f132f55766d81ad9747ff65121383eb9782862a9e69d`.
+It was built from the task sidecar with the new header; the included portable
+sidecar has the same bindings and includes the same native source/header.
+For a portable rebuild, in a task uv environment with matching Torch/CUDA,
+set `CUDA_HOME`, `TORCH_CUDA_ARCH_LIST=7.0` and a private
+`TORCH_EXTENSIONS_DIR`, then call `torch.utils.cpp_extension.load` with
+`sources=["benchmarks/kernels/sm70_hc_push_sidecar.cu"]`,
+`extra_cuda_cflags=["-O3", "-lineinfo"]`, `extra_ldflags=["-lcuda"]`,
+`extra_include_paths=["csrc"]`, and `is_python_module=False`.
+Set `VLLM_SM70_CUSTOM_AR_LIBRARY` to that returned library before launching
+torchrun; never load a second `_C_custom_ar_flashnext` owner in that process.
+
+The old undercoverage reproducer also completed. With the old binary and
+`QWEN38_BATCH_BLOCKS=1`, all four ranks report **9216/10240 elements (90%)**
+unwritten at the 20-KiB case, starting at element 1024. The prior fixed-v4
+64-cycle test with the same override passes. This closes the reproducer/fix
+loop; it is not evidence of a bug in the unset/default launch geometry.
+Artifact: `.artifacts/raw-audit/smallmsg-undercoverage-old-retry.log`.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
