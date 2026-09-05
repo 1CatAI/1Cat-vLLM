@@ -97,10 +97,19 @@ constexpr size_t kSm70Qwen38HcGatePushOffset =
     kSm70Qwen38HcDownPushOffset + kSm70Tp4PushAllreduceEpochs *
                                       kSm70Tp4PushAllreduceWorldSize *
                                       kSm70Qwen38HcDownPushBytes;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70Qwen38HcUpFusedEpochOffset =
     kSm70Qwen38HcGatePushOffset + kSm70Tp4PushAllreduceEpochs *
                                       kSm70Tp4PushAllreduceWorldSize *
                                       kSm70Qwen38HcGatePushBytes;
+// The fused up/mix/gather uses 160 independent generation counters and exact
+// half-plus-tag packets, separate from both legacy HC and auxiliary MoE data.
+constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
+constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
+    kSm70Qwen38HcUpFusedEpochOffset +
+    kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcUpFusedPacketOffset +
+    kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
@@ -1541,7 +1550,13 @@ class CustomAllreduce {
         static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcDownPushOffset;
     CUDACHECK(cudaMemset(
         hc_data, kSm70Tp4PushAllreduceSentinelByte,
-        kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcDownPushOffset));
+        kSm70Qwen38HcUpFusedEpochOffset - kSm70Qwen38HcDownPushOffset));
+    // The first fused packet uses generation 1; zero is initially invalid.
+    auto* hc_up =
+        static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcUpFusedEpochOffset;
+    CUDACHECK(cudaMemset(
+        hc_up, 0,
+        kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcUpFusedEpochOffset));
     sm70_tp4_push_buffers_registered_ = true;
   }
 

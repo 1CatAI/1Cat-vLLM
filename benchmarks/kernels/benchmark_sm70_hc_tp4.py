@@ -127,11 +127,17 @@ def main() -> None:
             dist.barrier()
             return graph, outputs, sums
 
-        graphs = {
-            "control": capture(False),
-            "hidden": capture(True),
-            "hidden_aux": capture(True, overlap=True),
-        }
+        # Keep this legacy gate-vs-hidden benchmark on its named routes even
+        # when the loaded extension also provides the newer fused up path.
+        fused_override = patch.object(
+            comm, "supports_sm70_qwen38_hc_up_mix_allgather", return_value=False
+        )
+        with fused_override:
+            graphs = {
+                "control": capture(False),
+                "hidden": capture(True),
+                "hidden_aux": capture(True, overlap=True),
+            }
         mismatches = {"hidden": 0, "hidden_aux": 0, "sum2_aux": 0}
         for case in range(args.quality_inputs):
             xs.normal_(generator=generator)

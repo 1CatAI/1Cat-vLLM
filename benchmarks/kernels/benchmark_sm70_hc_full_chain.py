@@ -27,6 +27,7 @@ import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
+import vllm.envs as envs
 from benchmarks.kernels.benchmark_sm70_hc_tp4 import load_weights
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 from vllm.models.qwen4_exp.nvidia.ops.hc import (
@@ -45,7 +46,22 @@ def main() -> None:
     parser.add_argument("--quality-inputs", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=1000)
     parser.add_argument("--replays", type=int, default=150)
+    parser.add_argument(
+        "--fused-up",
+        action="store_true",
+        help="Compare hidden split against fused up/mix/gather",
+    )
+    parser.add_argument(
+        "--aux-stress-replays",
+        type=int,
+        default=32,
+        help="Auxiliary sum2 replays per changing input with --fused-up",
+    )
     args = parser.parse_args()
+    if args.fused_up and not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1:
+        raise RuntimeError(
+            "Set VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=1 for the aux gate"
+        )
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if len(visible.split(",")) != 4 or int(os.environ["WORLD_SIZE"]) != 4:
         raise RuntimeError("Set CUDA_VISIBLE_DEVICES and launch exactly four ranks")
@@ -85,6 +101,8 @@ def main() -> None:
         ensure_exclusive()
         if not comm.supports_sm70_qwen38_hc_output_allgather():
             raise RuntimeError("Load a source-matched custom-AR extension")
+        if args.fused_up and not comm.supports_sm70_qwen38_hc_up_mix_allgather():
+            raise RuntimeError("Load an extension with fused HC up/mix/gather")
         weights = load_weights(args.model)
         mapping = json.loads((args.model / "model.safetensors.index.json").read_text())[
             "weight_map"
@@ -115,6 +133,20 @@ def main() -> None:
         if not comm.can_sm70_qwen38_hc_shard(initial):
             raise RuntimeError("The exact TP4 HC route is unavailable")
         tp = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=comm))
+        if args.fused_up:
+            sum_gen = torch.Generator(device="cuda").manual_seed(20260905 + rank)
+            sum_a = torch.randn(
+                96, 2560, device="cuda", dtype=torch.float16, generator=sum_gen
+            )
+            sum_b = torch.randn(
+                96, 2560, device="cuda", dtype=torch.float16, generator=sum_gen
+            )
+            peer_sums = [torch.empty_like(sum_a) for _ in range(4)]
+            dist.all_gather(peer_sums, sum_a + sum_b)
+            expected_sum = torch.zeros_like(sum_a, dtype=torch.float32)
+            for peer in peer_sums:
+                expected_sum.add_(peer.float())
+            expected_sum = expected_sum.half()
 
         def finish(state: torch.Tensor, injection: torch.Tensor):
             combined, xn = hc_combine_norm(
@@ -128,21 +160,31 @@ def main() -> None:
         finish(initial, torch.zeros((1, 4), device="cuda", dtype=torch.float16))
         torch.cuda.synchronize()
 
-        def capture(hidden: bool):
+        def capture(mode: str, overlap: bool = False):
             torch.cuda.synchronize()
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
             outputs = []
+            sums = []
+            aux = torch.cuda.Stream() if overlap else None
             with (
                 patch("vllm.distributed.parallel_state.get_tp_group", return_value=tp),
                 patch.object(
                     comm,
                     "supports_sm70_qwen38_hc_output_allgather",
-                    return_value=hidden,
+                    return_value=mode != "gate",
+                ),
+                patch.object(
+                    comm,
+                    "supports_sm70_qwen38_hc_up_mix_allgather",
+                    return_value=mode == "fused",
                 ),
                 comm.capture(),
                 torch.cuda.graph(graph),
             ):
+                main_stream = torch.cuda.current_stream()
+                if aux is not None:
+                    aux.wait_stream(main_stream)
                 state, injection = initial, None
                 for i, (down, up) in enumerate(weights):
                     # PLE at decoder layer 2 requires a materialized state.
@@ -159,13 +201,51 @@ def main() -> None:
                         xn, down, up
                     )
                     outputs.extend((state, xn, block, injection))
+                    if aux is not None:
+                        with torch.cuda.stream(aux):
+                            sums.append(comm.all_reduce_sum2(sum_a[i], sum_b[i]))
                 outputs.extend(finish(state, injection))
+                if aux is not None:
+                    main_stream.wait_stream(aux)
             torch.cuda.synchronize()
             dist.barrier()
-            return graph, outputs
+            return graph, outputs, sums
 
-        graphs = {"gate": capture(False), "hidden": capture(True)}
-        mismatches = 0
+        timed_modes = ("hidden", "fused") if args.fused_up else ("gate", "hidden")
+        graphs = {mode: capture(mode) for mode in timed_modes}
+        if args.fused_up:
+            graphs["fused_aux"] = capture("fused", overlap=True)
+        mismatches = {mode: 0 for mode in list(graphs)[1:]}
+        sum_mismatches = 0
+
+        def replay_and_check(stress: bool):
+            for mode, (graph, _, _) in graphs.items():
+                repeats = (
+                    args.aux_stress_replays if stress and mode == "fused_aux" else 1
+                )
+                for _ in range(repeats):
+                    graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+            expected = torch.cat(
+                [x.flatten().view(torch.int16) for x in graphs[timed_modes[0]][1]]
+            )
+            diffs = {}
+            for mode in list(graphs)[1:]:
+                actual = torch.cat(
+                    [x.flatten().view(torch.int16) for x in graphs[mode][1]]
+                )
+                diffs[mode] = int(torch.count_nonzero(expected != actual))
+            sum_diff = 0
+            if args.fused_up:
+                actual_sum = torch.stack(graphs["fused_aux"][2])
+                sum_diff = int(
+                    torch.count_nonzero(
+                        actual_sum.view(torch.int16) != expected_sum.view(torch.int16)
+                    )
+                )
+            return diffs, sum_diff
+
         for case in range(args.quality_inputs):
             initial.normal_(generator=gen)
             cores.normal_(generator=gen)
@@ -175,34 +255,35 @@ def main() -> None:
             elif case == 1:
                 initial.mul_(0.01)
                 cores.mul_(0.01)
-            for graph, _ in graphs.values():
-                graph.replay()
-                torch.cuda.synchronize()
-                dist.barrier()
-            expected = torch.cat(
-                [x.flatten().view(torch.int16) for x in graphs["gate"][1]]
-            )
-            actual = torch.cat(
-                [x.flatten().view(torch.int16) for x in graphs["hidden"][1]]
-            )
-            mismatches += int(torch.count_nonzero(expected != actual))
+            diffs, sum_diff = replay_and_check(stress=True)
+            for mode, diff in diffs.items():
+                mismatches[mode] += diff
+            sum_mismatches += sum_diff
         quality = [None] * 4
         dist.all_gather_object(
-            quality, {"rank": rank, "mismatches": mismatches}, group=group
+            quality,
+            {
+                "rank": rank,
+                "mismatches": sum(mismatches.values()) + sum_mismatches,
+                "hc_mismatches": mismatches,
+                "sum2_mismatches": sum_mismatches,
+            },
+            group=group,
         )
         if rank == 0:
             print({"quality": quality}, flush=True)
         if any(q["mismatches"] for q in quality):
             raise RuntimeError("Full HC outputs are not bitwise")
         ensure_exclusive()
-        for graph, _ in graphs.values():
+        for mode in timed_modes:
+            graph = graphs[mode][0]
             for _ in range(args.warmup):
                 graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-        samples = {mode: [] for mode in graphs}
+        samples = {mode: [] for mode in timed_modes}
         for repeat in range(3):
-            modes = list(graphs) if repeat % 2 == 0 else list(graphs)[::-1]
+            modes = timed_modes if repeat % 2 == 0 else timed_modes[::-1]
             for mode in modes:
                 ensure_exclusive()
                 graph = graphs[mode][0]
@@ -225,6 +306,18 @@ def main() -> None:
                 )
                 samples[mode].append(max(times))
                 ensure_exclusive()
+        diffs, sum_diff = replay_and_check(stress=False)
+        post_quality = [None] * 4
+        dist.all_gather_object(
+            post_quality,
+            {"rank": rank, "hc_mismatches": diffs, "sum2_mismatches": sum_diff},
+            group=group,
+        )
+        if any(
+            any(q["hc_mismatches"].values()) or q["sum2_mismatches"]
+            for q in post_quality
+        ):
+            raise RuntimeError("Post-timing HC/sum2 output differs after epoch wrap")
         if rank == 0:
             result = {
                 "source_sha": subprocess.check_output(
@@ -248,6 +341,10 @@ def main() -> None:
                 "visible_devices": visible,
                 "quality": quality,
                 "quality_inputs": args.quality_inputs,
+                "post_timing_quality": post_quality,
+                "aux_stress_replays": args.quality_inputs * args.aux_stress_replays
+                if args.fused_up
+                else 0,
                 "samples_ms": samples,
                 "median_ms": {mode: median(values) for mode, values in samples.items()},
             }

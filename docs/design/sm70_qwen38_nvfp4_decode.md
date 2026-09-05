@@ -1045,3 +1045,44 @@ that contains both the new op and the complete communicator lifecycle. The
 benchmark compares old and new registered-op dispatch, checks all 96 real
 weight pairs, overlaps HC with the actual sum2 CUDA Graph route on an auxiliary
 stream, and reports three paired Mix-only timings separately from correctness.
+
+### Exact fused HC up/mix/gather candidate (2026-09-05)
+
+The source now includes the selected 160-CTA FP16 up/mix/gather kernel. It
+uses 128-bit weight/input reads, parallel branch sigmoids, and the same
+eight-term FP32 FMA chains, XOR reduction tree, FP16 gate boundary, and
+branch-ordered FP32 mixing. Each CTA publishes exact FP16 outputs together
+with a generation tag; its two packet slots and generation counter are
+isolated from both legacy HC collectives and the auxiliary MoE channel.
+The existing communicator allocation grows by 21,120 bytes per rank; there
+is no weight copy, additional communicator, or new user tuning switch.
+
+The existing `VLLM_SM70_QWEN38_FUSED_HC_FP16` opt-in and TP4/SM70/M=1 gates
+still apply. A source-matched extension selects fused up/mix/gather; an older
+extension retains hidden-sharded split up/gather, or the legacy gate-sharded
+route if needed. Optional-op capability and dispatch must come from the DSO
+that owns the communicator, including the extended allocation layout.
+
+The preceding **prototype** complete-HC screen measures `2.108826 ->
+1.999374 ms` (5.19%) with bitwise intermediate/final outputs. Production
+dispatch and auxiliary-stream gates remain pending at this source update.
+The `1.5-ms` whole-HC target and endpoint speed are not established by this
+microbenchmark. The old `2.658-ms` whole-model trace uses a different scope
+and must not be compared directly to it.
+
+Run the complete registered-op gate, without loading attention/MoE weights:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  VLLM_SM70_TP4_PUSH_ALLREDUCE=1 VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=1 \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_full_chain.py --fused-up \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --out /path/to/hc-full-result.json
+```
+
+This compares forced split-hidden and fused registered dispatch, includes all
+HC norms and final projections, checks 16 changing inputs and 512 auxiliary
+sum2 graph replays, then rechecks outputs after timing crosses packet-tag
+wrap. Timings exclude the auxiliary stress workload. Both this benchmark and
+the older Mix-only gate explicitly freeze their control routes so a newer
+extension cannot silently replace both sides of the comparison.

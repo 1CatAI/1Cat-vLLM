@@ -312,6 +312,14 @@ def _qwen38_sm70_fp16_fused_hc(
             num_warps=4,
         )
         custom_ar.sm70_qwen38_hc_down_allgather(local_down, gathered_down)
+        if custom_ar.supports_sm70_qwen38_hc_up_mix_allgather():
+            custom_ar.sm70_qwen38_hc_up_mix_allgather(
+                gathered_down, up_weight, x, block
+            )
+            logger.info_once(
+                "SM70 Qwen3.8 exact TP4 fused FP16 HC up/mix/gather enabled."
+            )
+            return block, gathered_down[..., _HC_RANK : _HC_RANK + _HC_COUNT]
         if custom_ar.supports_sm70_qwen38_hc_output_allgather():
             local_block = x.new_empty((1, _HC_DIM // _HC_COUNT))
             _qwen38_hc_up_hidden_shard_kernel[(320,)](

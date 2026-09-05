@@ -938,6 +938,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.impl("sm70_qwen38_hc_output_allgather", torch::kCUDA,
                  &sm70_qwen38_hc_output_allgather);
   custom_ar.def(
+      "sm70_qwen38_hc_up_mix_allgather(int fa, Tensor lora, Tensor weight, "
+      "Tensor branches, Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_up_mix_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_up_mix_allgather);
+  custom_ar.def(
       "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("top1_argmax", torch::kCUDA, &top1_argmax);
