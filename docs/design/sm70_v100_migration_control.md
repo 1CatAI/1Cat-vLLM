@@ -45345,3 +45345,36 @@ Interpretation:
   fused variants compile with 31 registers/16 bytes shared/zero stack or
   spills. Compare complete HC with the newly registered up fusion held fixed,
   including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
+- The exact down packet screen completed and is rejected. Same-source
+  complete-HC control `1.989379 ms`, CUDA down plus separate gather
+  `2.072549 ms`, fused down/gather `2.218926 ms`. All intermediate/final
+  outputs and auxiliary sum2 are bitwise, including generation `195841`, but
+  both projection scheduling and distributed polling regress latency. Do
+  not repeat this 81-CTA packet variant unchanged. Evidence:
+  `.artifacts/hc_down_packet/result.json`; no production down route changed.
+
+## Decode-only HC norm weight prefetch, 2026-09-05
+
+- Previous goal turn made progress by registering and validating the up
+  fusion. Its final bounded down queue expired with exit75 before obtaining
+  GPUs, not after a failed GPU test. The same waiting job was resumed only
+  after its terminal status was verified; the down screen then completed.
+- The existing norm source documents that early weight reads help decode but
+  regress larger batches. A decode-only screen keeps the exact two-axis sum,
+  FP16 combine boundary, FP32 RMS/affine operations and their order; only the
+  weight load moves before combine/reduction. Offline SM70 compilation has
+  40 registers for late load and 66 for early, zero stack/local spills, and
+  64 bytes dynamic shared memory. This is not a repeat of failed norm/down
+  fusion or its down-weight-prefetch variants.
+- Complete-HC prototype control `1.982710 ms` -> early norm load
+  `1.942050 ms`, saving `0.040660 ms` (2.05%). Early samples
+  `1.942009/1.942050/1.942132 ms`. Four ranks x16 changing inputs and all
+  post-timing intermediate/final FP16 bits match. The already registered up
+  fusion is fixed on both sides; no new communication path is introduced.
+  Evidence: `.artifacts/hc_norm_prefetch/result.json` and `run.log`.
+- Port the load scheduling only for SM70, FP16, N=1, HC=4, H=2560. Other
+  shapes/dtypes/architectures and prefill retain deferred loads. Targeted CPU
+  dispatch tests **5 passed**, Ruff passed. The registered-kernel A/B with
+  explicit late/early control is pending; no whole-model claim from this
+  microbenchmark. Next also refresh the whole-model trace after the admitted
+  HC changes, with natural-output checks before profiling and one model load.
