@@ -2458,6 +2458,26 @@ def is_global_first_rank() -> bool:
         return True
 
 
+def is_last_pp_first_tp_rank() -> bool:
+    """
+    Check if the current process is the first tensor-parallel rank of the
+    last pipeline-parallel stage.
+
+    Sampling and speculative decoding only run on the last PP stage, so
+    per-step reports about them have to be emitted from that stage; the
+    global first rank (see `is_global_first_rank`) is never on it when
+    PP > 1.
+
+    Returns:
+        bool: True on the first TP rank of the last PP stage. Returns True
+              if the model-parallel groups are not initialized
+              (single process).
+    """
+    if _PP is None or _TP is None:
+        return True
+    return _PP.is_last_rank and _TP.rank_in_group == 0
+
+
 def is_local_first_rank() -> bool:
     """
     Check if the current process is the first local rank (rank 0 on its node).
