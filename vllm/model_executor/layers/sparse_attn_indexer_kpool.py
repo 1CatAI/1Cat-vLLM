@@ -38,6 +38,8 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
+_DFLASH_KPOOL_COORD_TRACE_SEEN = False
+
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 elif current_platform.is_xpu():
@@ -273,6 +275,7 @@ def sparse_attn_indexer_kpool(
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
 ) -> torch.Tensor:
+    global _DFLASH_KPOOL_COORD_TRACE_SEEN
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -844,6 +847,24 @@ def sparse_attn_indexer_kpool(
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
             out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+            if (
+                os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE", "0") == "1"
+                and not _DFLASH_KPOOL_COORD_TRACE_SEEN
+                and 1 < out.shape[0] <= 8
+                and positions is not None
+                and int(positions[0].item())
+                >= int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8"))
+            ):
+                logger.warning(
+                    "DFLASH_KPOOL_COORD_TRACE positions=%s dec_seq=%s "
+                    "decode_seq_lens=%s pool_topk_prefix=%s out_prefix=%s",
+                    positions[:num_decode_tokens].detach().cpu().tolist(),
+                    dec_seq.detach().cpu().tolist(),
+                    decode_metadata.seq_lens.detach().cpu().tolist(),
+                    pool_topk[:, :8].detach().cpu().tolist(),
+                    out[:, :24].detach().cpu().tolist(),
+                )
+                _DFLASH_KPOOL_COORD_TRACE_SEEN = True
         else:
             out = topk_dst
 

@@ -44491,6 +44491,107 @@ Interpretation:
   JSON artifacts. The fixed prompt set has SHA256
   `cb8f877ca930299393816d06fb1584c2227f2c3971206fd622955a032c451d0d`.
 
+## 2026-08-28 GLM-5.3 DFlash2 TP4/PP2 bring-up
+
+- Development is isolated in worktree
+  `v100-glm53-dflash2-20260828-125830`, branch
+  `codex/v100-glm53-dflash2-20260828-125830`, from public-main base
+  `62ad1e02693f4c857f3b7547cef1860ee54e8053`; Draft PR #404 is the owned
+  review boundary. The target contract is
+  `LibertAIDAI/GLM-5.3-Flash-NVFP4`, official
+  `incoai/GLM-5.3-Flash-DFlash2`, TP4/PP2 on eight V100s, seven draft tokens,
+  greedy lossless validation, target E4M3 KV, draft FP16 KV, and CUDA Graphs.
+- The GLM target now exposes completed mHC-contracted auxiliary hidden states
+  at boundaries `6,15,25,34,43`, transports PP0 captures to PP1, and shares a
+  replicated target embedding with the final-stage-local DFlash draft. The
+  capture mapping matches the SGLang GLM DFlash adapter and its follow-up mHC
+  residual correction. The draft uses an independent SWA KV group and its own
+  final-stage parallel config rather than inheriting target MLA/PP metadata.
+- The first TP4/PP2 route attempt reached proposal generation but hung after
+  verification. NCCL diagnostics reduced this to a PP token broadcast count
+  mismatch: the last stage sent the first prefill result as `[B,1]` while the
+  receiving stage always posted `[B,8]`. PP broadcast now pads the sender to
+  the fixed `num_speculative_steps + 1` width; focused PP tests cover both
+  single-token and multi-token sends. Do not classify this wait as target
+  compute or TP/PP service time in a latency table.
+- After the PP fix, DFlash candidates and selector outputs were finite and in
+  range, but target verification returned vocabulary sentinel `154880` with
+  zero acceptance. Layer probes found the first real-request corruption in
+  layer 41 KDA: projection, gate, and short-conv outputs were finite; only
+  `fused_recurrent_kda` produced two nonfinite FP16 elements on TP0. The
+  following FP16 `o_proj` and TP all-reduce spread that one-token corruption
+  to every rank. Packed E4M3 sparse MLA, DFlash capture, selector, and PP
+  transport are therefore ruled out as the first source.
+- A production-shape V100 microbenchmark (`T8/H16/K128/V128`) proves the
+  caller-provided output buffer is bitwise identical to kernel allocation, so
+  aliasing is also ruled out. Scaling the FP32 recurrent state to `5e5`
+  makes the old FP16 staging produce three nonfinite values with the largest
+  finite value at `63680`; FP32 staging remains finite at `78023.71`, and the
+  existing fused RMSNorm+sigmoid gate writes a fully finite FP16 result.
+- The retained SM70 GLM route therefore keeps recurrent output in FP32 only
+  through the immediately following fused gate-norm, which writes FP16 for
+  `o_proj`. It adds no kernel launch and no clamp or per-token fallback. The
+  paired microbenchmark moves recurrent+norm from `120.279` to `121.188 us`
+  at T1 and `115.090` to `119.721 us` at T8. The T8 cost is about
+  `0.157 ms` across all 34 KDA layers per verifier round. The mixed-dtype norm
+  suite passes 25 tests; the SM70 KDA suite passes 10, including forced FP16
+  overflow and bitwise-stable CUDA Graph replay.
+- Subsequent correctness work removed two independent acceptance blockers.
+  The draft now keeps its trained NeoX RoPE instead of inheriting the NoPE
+  target/indexer layout, and the compressed MRV2 indexer cache is exposed as
+  real 64-token virtual pages rather than indexing 64-token metadata into
+  576-token physical blocks. A post-fix request accepts all seven proposed
+  tokens without an out-of-bounds cache access.
+- A target-only versus DFlash layer trace then found the first material quality
+  drift at sparse-attention layer 3. B1 decode used packed-E4M3 dequantization
+  plus FP16 Tensor Core GEMMs; M2-M8 verification used a numerically different
+  online-softmax kernel. Commit `494770be21` adds a small-batch hybrid route:
+  gather, QK, and softmax remain batched, while each PV uses the exact B1
+  Tensor Core GEMM reduction. The 2048-index-width V100 gate is bitwise equal
+  to eight B1 calls in eager and CUDA Graph replay. Strided-batched PV is
+  rejected because it changes the reduction order.
+- The retained exact-contract eager audit is
+  `.artifacts/glm53_dflash2_route_smoke/`
+  `gsm8k60_hybrid_fp8_gemm_release_eager_tp4pp2_20260901.json`. Across 60
+  sequential GSM8K questions it records `59/60` accuracy, zero invalid answers,
+  token-weighted acceptance length `5.5305228`, and no regression from the
+  independent target-only wrong-question set. The previous DFlash audit was
+  `58/60`; dataset index 16 improves to answer 230, while index 12 remains the
+  same target-only error. Per-position acceptance is
+  `0.9123/0.8148/0.7275/0.6320/0.5548/0.4766/0.4125`.
+- Eager steady decode averages `35.144 tok/s` (P50 `35.328`, P90 `39.655`),
+  versus `36.426 tok/s` before the exact PV correction and `14.597 tok/s`
+  target-only. The 3.5% quality cost retains a 2.41x target-only speedup.
+  Logical KV capacity is 10,406 tokens, 110 fewer than the prior DFlash audit.
+  The focused closure is 26 SM70 sparse/KDA GPU tests plus 170 CPU-side
+  DFlash, PP, and benchmark tests, with 21 environment-dependent skips; ruff,
+  format, compileall, and diff checks pass.
+- The final production graph audit is
+  `.artifacts/glm53_dflash2_route_smoke/`
+  `gsm8k60_hybrid_graph_fast_nopush_tp4pp2_20260901.json`. CUDA Graph and all
+  DFlash compute/metadata fast paths are enabled; only TP4 push all-reduce is
+  disabled. It records `59/60` accuracy, zero invalid answers, `60/60` natural
+  stops, and no target-only-correct regression. Token-weighted acceptance is
+  `5.6119455`; request mean/P50/P90 are `5.69076/5.78544/6.40038`.
+- The accepted graph averages `112.406 tok/s` steady decode (P50 `114.162`, P90
+  `126.322`, P99 `133.706`) and `77.496 tok/s` aggregate output throughput.
+  This closes the no-MTP TP4/PP2 75-token/s production goal. The separate
+  1024-input/256-output three-repeat checkpoint averages `154.57 tok/s`, with
+  identical outputs and full eight-token acceptance on its repeated
+  low-entropy prompt.
+- The matched all-fast graph with `VLLM_SM70_TP4_PUSH_ALLREDUCE=1` is rejected:
+  accuracy falls to `58/60`, case 20 becomes a new low-margin divergence and
+  reaches the 1024-token cap. Case 20 passes three repeated graph runs both with
+  all DFlash fast paths plus ordinary custom all-reduce (`108.934 tok/s`) and
+  with the conservative graph route (`103.530 tok/s`). The material quality
+  difference is therefore isolated to push all-reduce, not CUDA Graph or the
+  DFlash compute path.
+- For SM70 GLM5 DFlash2 TP4, config now auto-sets the push variable to `0` when
+  absent. Explicit `1` is preserved only for diagnostics and emits a warning;
+  Qwen and non-DFlash routes retain their existing global default. The
+  deterministic quality and graph speed gates are complete. The release-card
+  128-request stochastic `5.78` gate remains open and is reported separately.
+
 ## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
 
 - Public Draft PR #390 is stacked on grouped-QSA PR #387. The retained clean
@@ -44880,6 +44981,64 @@ Interpretation:
   `_prepare_dflash_inputs_kernel`, and `layer_norm_fwd_kernel`). The request
   remained correct and completed in `0.547 s`; this is a bounded cold-start
   warmup follow-up, not a steady-state or publication correctness blocker.
+
+## 2026-09-01 GLM-5.3 Flash DFlash2 official closure
+
+- Draft PR #404 closes the GLM-5.3-Flash-NVFP4 DFlash2 release-card gate on
+  eight V100-SXM2-32GB GPUs with TP4/PP2, no MTP, E4M3 target KV, q7
+  probabilistic draft sampling, and CUDA Graph. Integration base is
+  `onecat/main@9e860996550c692d42b6f7ca57ced1bffbd8dfe5`; the owned branch is
+  `codex/v100-glm53-dflash2-20260828-125830`.
+- The remaining quality failure was cross-request PP state contamination, not
+  target or draft arithmetic. Immediate PP sampled-token receives could arrive
+  after a request slot was freed and then update the next request assigned to
+  that slot. Dataset item 16 reproduced the failure only after 16 preceding
+  requests: the isolated answer was 230, while the contaminated sequence
+  produced 170 and reached the output limit.
+- The fix adapts upstream vLLM #42187 to DFlash2: scheduler PP cadence, a
+  PP-depth deferred receive ring, a sibling NCCL communicator and side stream,
+  per-slot generation counters, optimistic position updates, and deferred
+  sampled/rejected updates. Sampled q8 and next-step draft q7 tokens share one
+  15-int64 packet. Triton scatters valid draft/state rows, skips negative
+  sentinels, and handles native int32 request indices without an indexing
+  fallback.
+- The retained deterministic artifact is
+  `gsm8k60_deterministic_graph_pp24_21_slotring_dtypefix_tp4pp2_20260901.json`.
+  It records `59/60` accuracy, zero invalid answers, 60 natural stops, and exact
+  extracted-answer parity with the target-only deterministic audit. Item 16 is
+  again 230. Token-weighted acceptance length is `5.615924`, aggregate output
+  throughput is `75.9518 tok/s`, and mean steady decode is `109.1768 tok/s`.
+- The official retained artifact is
+  `gsm8k128_official_graph_slotring_auto_tp4pp2_20260901.json`. The benchmark
+  clears manual acceptance-path overrides; the runtime then logs the production
+  defaults `PP=24,21`, proposal temperature scale `0.8`, and proposal top-p
+  `0.95`. The `zlab-shuffle42`, temperature-1.0/top-p-0.95, Max-reasoning run
+  records `122/128` accuracy, zero invalid answers, and 128 natural stops.
+- Mean completion tokens per verification step are `5.810047` (release gate
+  `5.78`) and token-weighted acceptance length is `5.585307` (implementation
+  gate `4.85`). Aggregate output throughput is `77.8477 tok/s`; mean steady
+  decode is `112.1869 tok/s` with P50/P90/P99
+  `111.3379/127.3029/138.8517`. Mean TPOT is `9.0196 ms`, mean prefill is
+  `89.4121 tok/s`, and FP8 KV capacity is 18,064 logical tokens.
+- The `25,20` alternative is not retained: its deterministic run has a length
+  stop and its official accuracy is `120/128`, below the accepted route.
+  Explicit mHC boundary materialization remains rejected at `58/60`; item 16
+  changes to 170. Both remain diagnostic-only.
+- The selector retains the exact calibrated/nucleus-truncated q logits used for
+  each draft draw, so standard p/q rejection corrects against the actual
+  proposal. After merging current `onecat/main`, the complete DFlash2 suite,
+  including the multi-position statistical test, passes `143` tests; PP
+  scheduler/model-runner regression files pass another `25` tests. Ruff
+  check/format, Python compilation, and `git diff --check` pass on the
+  pre-publication worktree.
+- The post-merge source is `3129de7dcd5ccc3463158dca652a5dc4657bd5d5`.
+  Its retained 17-request sequential integration artifact is
+  `gsm8k17_deterministic_graph_pp24_21_slotring_postmerge_3129de7_tp4pp2_20260901.json`:
+  `16/17`, only the target-baseline item 12 miss, 17 natural stops, and item 16
+  at 230 with the same accepted token hash. Token-weighted acceptance length is
+  `5.481799`. Its `73.8594 tok/s` aggregate includes first-request JIT over a
+  small 17-request set and is a merge smoke, not a replacement for the formal
+  128-request `77.8477 tok/s` performance result.
 
 ## 2026-08-31 API failure and in-process cleanup gate
 

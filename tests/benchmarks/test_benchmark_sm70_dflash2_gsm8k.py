@@ -24,6 +24,22 @@ def answer_parser(monkeypatch):
     return module._answer_value, module.INVALID_ANSWER
 
 
+@pytest.fixture
+def acceptance_gate(monkeypatch):
+    benchmark_dir = Path(__file__).resolve().parents[2] / "benchmarks"
+    monkeypatch.syspath_prepend(str(benchmark_dir))
+    module = importlib.import_module("benchmark_sm70_dflash2_gsm8k")
+    return module._acceptance_gate
+
+
+@pytest.fixture
+def tracked_env(monkeypatch):
+    benchmark_dir = Path(__file__).resolve().parents[2] / "benchmarks"
+    monkeypatch.syspath_prepend(str(benchmark_dir))
+    module = importlib.import_module("benchmark_sm70_dflash2_gsm8k")
+    return module._tracked_env
+
+
 @pytest.mark.parametrize(
     ("request_seed", "request_seeds", "expected"),
     [
@@ -79,3 +95,39 @@ def test_answer_value_rejects_missing_or_non_integral_answer(answer_parser, text
     parse, invalid = answer_parser
 
     assert parse(text) == invalid
+
+
+@pytest.mark.parametrize(
+    ("observed", "minimum", "passed"),
+    [
+        (5.78, 5.78, True),
+        (5.7629, 5.78, False),
+        (None, 5.78, None),
+    ],
+)
+def test_acceptance_gate_uses_its_named_metric(
+    acceptance_gate, observed, minimum, passed
+):
+    gate = acceptance_gate(observed, minimum, "per_request_completion")
+
+    assert gate == {
+        "metric": "per_request_completion",
+        "minimum": minimum,
+        "observed": observed,
+        "passed": passed,
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("VLLM_GLM53_PP_MHC_MATERIALIZE", "1"),
+        ("VLLM_PP_LAYER_PARTITION", "25,20"),
+    ],
+)
+def test_runtime_contract_tracks_dflash_environment(
+    tracked_env, monkeypatch, name, value
+):
+    monkeypatch.setenv(name, value)
+
+    assert tracked_env()[name] == value

@@ -141,6 +141,10 @@ class Request:
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
+        # V2 PP async decode must wait for the sampled-token broadcast slot
+        # from the prior pipeline pass before scheduling this request again.
+        self.next_decode_eligible_step = 0
+
         # Tokens of steps whose output is not yet processed (async scheduling
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
         # optimistically.
