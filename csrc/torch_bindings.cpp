@@ -215,6 +215,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
 
   ops.def(
+      "sm70_glm53_tp8_cublaslt_out("
+      "Tensor(a!) out, Tensor input, Tensor weight) -> ()");
+  ops.impl("sm70_glm53_tp8_cublaslt_out", torch::kCUDA,
+           &sm70_glm53_tp8_cublaslt_out);
+
+  ops.def(
       "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
   ops.impl("awq_gemm_sm70", torch::kCUDA, &awq_gemm_sm70);
@@ -446,6 +452,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &sm70_glm_mhc_pre_norm_out);
 
   ops.def(
+      "sm70_glm_mhc_post_dot_q8_out("
+      "Tensor(a!) residual_out, Tensor(b!) gemm_mul, "
+      "Tensor(c!) gemm_sqrsum, Tensor comb_mix, Tensor residual, "
+      "Tensor post_mix, Tensor x, Tensor weight, int tile_n) -> ()");
+  ops.impl("sm70_glm_mhc_post_dot_q8_out", torch::kCUDA,
+           &sm70_glm_mhc_post_dot_q8_out);
+
+  ops.def(
       "sm70_glm_kda_fg_b_out(Tensor(a!) f_out, Tensor(b!) g_out, "
       "Tensor f_input, Tensor g_input, Tensor f_weight, Tensor g_weight) -> "
       "()");
@@ -455,6 +469,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "sm70_glm53_fp16_gemv_out(Tensor(a!) output, Tensor input, Tensor "
       "weight) -> ()");
   ops.impl("sm70_glm53_fp16_gemv_out", torch::kCUDA, &sm70_glm53_fp16_gemv_out);
+
+  ops.def(
+      "sm70_glm53_moe_permute_q8_out("
+      "Tensor input, Tensor topk_ids, Tensor(a!) permuted_input, "
+      "Tensor(b!) sorted_row_idx, Tensor(c!) inv_permuted_idx, "
+      "Tensor(d!) compact_offsets, Tensor(e!) active_expert_ids) -> ()");
+  ops.impl("sm70_glm53_moe_permute_q8_out", torch::kCUDA,
+           &sm70_glm53_moe_permute_q8_out);
 
   ops.def(
       "sm70_f16_indexed_rerank_out(Tensor(a!) out, Tensor _in_feats, "
@@ -721,6 +743,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &nvfp4_moe_qpn_mtp5_sm70_out);
 
   ops.def(
+      "nvfp4_glm53_moe_q8_qpn_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor sorted_row_idx, bool w13) -> ()");
+  ops.impl("nvfp4_glm53_moe_q8_qpn_sm70_out", torch::kCUDA,
+           &nvfp4_glm53_moe_q8_qpn_sm70_out);
+
+  ops.def(
       "nvfp4_moe_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
@@ -943,10 +972,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("meta_size", &meta_size);
   custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
                 &sm70_tp4_push_allreduce_buffer_size);
+  custom_ar.def("sm70_tp8_hierarchical_push_allreduce_buffer_size",
+                &sm70_tp8_hierarchical_push_allreduce_buffer_size);
 
   custom_ar.def("register_buffer", &register_buffer);
   custom_ar.def("register_sm70_tp4_push_allreduce_buffer",
                 &register_sm70_tp4_push_allreduce_buffer);
+  custom_ar.def("register_sm70_tp8_hierarchical_push_allreduce_buffer",
+                &register_sm70_tp8_hierarchical_push_allreduce_buffer);
   custom_ar.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   custom_ar.def("register_graph_buffers", &register_graph_buffers);
 

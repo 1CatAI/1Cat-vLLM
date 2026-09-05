@@ -29,7 +29,8 @@ except Exception:
 
 logger = init_logger(__name__)
 
-_SM70_TP8_HIERARCHICAL_ELEMENTS = 4096
+_SM70_TP8_HIERARCHICAL_ELEMENTS = frozenset((4096, 8 * 4096))
+_SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -129,6 +130,7 @@ class CustomAllreduce:
         self.disabled = True
         self.long_prefill_output_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
+        self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -274,8 +276,12 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
+        meta_scratch_size = max(
+            max_size,
+            _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES if tp8_hierarchical else 0,
+        )
         self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size,
+            ops.meta_size() + meta_scratch_size,
             group=group,
             uncached=True,
             peer_ranks=set(hierarchical_peer_ranks)
@@ -346,6 +352,21 @@ class CustomAllreduce:
                 "payloads; opt-in 25-KiB Qwen4Exp MTP4 payload is %s.",
                 mtp5_status,
             )
+        if tp8_hierarchical and envs.VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR:
+            assert hierarchical_peer_ranks is not None
+            push_buffer_size = ops.sm70_tp8_hierarchical_push_allreduce_buffer_size()
+            self.sm70_tp8_hierarchical_push_buffer_ptrs = self.create_shared_buffer(
+                push_buffer_size,
+                group=group,
+                peer_ranks=set(hierarchical_peer_ranks),
+            )
+            ops.register_sm70_tp8_hierarchical_push_allreduce_buffer(
+                self._ptr, self.sm70_tp8_hierarchical_push_buffer_ptrs
+            )
+            logger.info(
+                "SM70 TP8 hierarchical push all-reduce enabled for exact "
+                "FP16 8-KiB and 64-KiB CUDA-Graph payloads."
+            )
 
     @contextmanager
     def capture(self):
@@ -396,7 +417,7 @@ class CustomAllreduce:
         if self.tp8_hierarchical:
             return (
                 inp.dtype == torch.float16
-                and inp.numel() == _SM70_TP8_HIERARCHICAL_ELEMENTS
+                and inp.numel() in _SM70_TP8_HIERARCHICAL_ELEMENTS
             )
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
@@ -883,6 +904,12 @@ class CustomAllreduce:
             if self.sm70_tp4_push_buffer_ptrs is not None:
                 self.free_shared_buffer(self.sm70_tp4_push_buffer_ptrs, rank=self.rank)
                 self.sm70_tp4_push_buffer_ptrs = None
+            if self.sm70_tp8_hierarchical_push_buffer_ptrs is not None:
+                self.free_shared_buffer(
+                    self.sm70_tp8_hierarchical_push_buffer_ptrs,
+                    rank=self.rank,
+                )
+                self.sm70_tp8_hierarchical_push_buffer_ptrs = None
 
     def __del__(self):
         self.close()

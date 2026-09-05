@@ -443,6 +443,25 @@ if hasattr(torch.ops._C, "sm70_f16_prepare"):
         return [torch.empty_like(weight), meta]
 
 
+def sm70_glm53_tp8_cublaslt_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _op("sm70_glm53_tp8_cublaslt_out")(out, input, weight)
+
+
+if hasattr(torch.ops._C, "sm70_glm53_tp8_cublaslt_out"):
+
+    @register_fake("_C::sm70_glm53_tp8_cublaslt_out")
+    def _sm70_glm53_tp8_cublaslt_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
 def awq_gemm_sm70(
     input: torch.Tensor,
     qweight: torch.Tensor,
@@ -1577,6 +1596,35 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_m1_sm70_out"):
         return None
 
 
+def nvfp4_glm53_moe_q8_qpn_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_row_idx: torch.Tensor,
+    w13: bool,
+) -> None:
+    _op("nvfp4_glm53_moe_q8_qpn_sm70_out")(
+        out, input, weights, scales, expert_ids, sorted_row_idx, w13
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_glm53_moe_q8_qpn_sm70_out"):
+
+    @register_fake("_C::nvfp4_glm53_moe_q8_qpn_sm70_out")
+    def _nvfp4_glm53_moe_q8_qpn_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        sorted_row_idx: torch.Tensor,
+        w13: bool,
+    ) -> None:
+        return None
+
+
 def nvfp4_moe_qpn_mtp5_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -2050,6 +2098,47 @@ if hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
         return None
 
 
+def sm70_glm_mhc_post_dot_q8_out(
+    residual_out: torch.Tensor,
+    gemm_mul: torch.Tensor,
+    gemm_sqrsum: torch.Tensor,
+    comb_mix: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    tile_n: int,
+) -> None:
+    _op("sm70_glm_mhc_post_dot_q8_out")(
+        residual_out,
+        gemm_mul,
+        gemm_sqrsum,
+        comb_mix,
+        residual,
+        post_mix,
+        x,
+        weight,
+        tile_n,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_glm_mhc_post_dot_q8_out"):
+
+    @register_fake("_C::sm70_glm_mhc_post_dot_q8_out")
+    def _sm70_glm_mhc_post_dot_q8_out_fake(
+        residual_out: torch.Tensor,
+        gemm_mul: torch.Tensor,
+        gemm_sqrsum: torch.Tensor,
+        comb_mix: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        tile_n: int,
+    ) -> None:
+        return None
+
+
 def sm70_f16_indexed_rerank_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -2137,6 +2226,41 @@ if hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out"):
         output: torch.Tensor,
         input: torch.Tensor,
         weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def sm70_glm53_moe_permute_q8_out(
+    input: torch.Tensor,
+    topk_ids: torch.Tensor,
+    permuted_input: torch.Tensor,
+    sorted_row_idx: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+) -> None:
+    _op("sm70_glm53_moe_permute_q8_out")(
+        input,
+        topk_ids,
+        permuted_input,
+        sorted_row_idx,
+        inv_permuted_idx,
+        compact_offsets,
+        active_expert_ids,
+    )
+
+
+if hasattr(torch.ops._C, "sm70_glm53_moe_permute_q8_out"):
+
+    @register_fake("_C::sm70_glm53_moe_permute_q8_out")
+    def _sm70_glm53_moe_permute_q8_out_fake(
+        input: torch.Tensor,
+        topk_ids: torch.Tensor,
+        permuted_input: torch.Tensor,
+        sorted_row_idx: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        compact_offsets: torch.Tensor,
+        active_expert_ids: torch.Tensor,
     ) -> None:
         return None
 

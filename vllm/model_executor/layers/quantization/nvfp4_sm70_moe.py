@@ -89,6 +89,31 @@ def _use_qwen38_qpn_m1_decode(
     )
 
 
+def _use_glm53_qpn_w13_q8(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    fused_permute: bool,
+) -> bool:
+    """Admit the exact GLM-5.3 TP8 eight-token W13 route."""
+    return bool(
+        fused_permute
+        and getattr(layer, "sm70_glm53_qpn_w13_q8", False)
+        and x.shape == (8, 4096)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (8, 8)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 8
+        and int(layer.sm70_nvfp4_num_experts) == 288
+        and int(layer.sm70_nvfp4_hidden_size) == 4096
+        and int(layer.sm70_nvfp4_intermediate_size) == 256
+        and int(layer.sm70_nvfp4_top_k) == 8
+    )
+
+
 def _use_qwen38_indexed_prefill(
     layer: RoutedExperts,
     x: torch.Tensor,
@@ -324,6 +349,104 @@ def _prepare_compact_slot_groups(
     )
 
 
+@triton.jit
+def _prepare_compact_expert_groups_kernel(
+    sorted_expert_ids_ptr,
+    compact_offsets_ptr,
+    active_expert_ids_ptr,
+    TOTAL_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    valid = offsets < TOTAL_SLOTS
+    expert_ids = tl.load(
+        sorted_expert_ids_ptr + offsets,
+        mask=valid,
+        other=-1,
+    )
+    previous_ids = tl.load(
+        sorted_expert_ids_ptr + offsets - 1,
+        mask=valid & (offsets > 0),
+        other=-2,
+    )
+    is_boundary = valid & ((offsets == 0) | (expert_ids != previous_ids))
+    active_indices = tl.cumsum(is_boundary.to(tl.int32), axis=0) - 1
+
+    tl.store(
+        compact_offsets_ptr + offsets,
+        TOTAL_SLOTS,
+        mask=offsets <= TOTAL_SLOTS,
+    )
+    tl.store(
+        active_expert_ids_ptr + offsets,
+        0,
+        mask=valid,
+    )
+    tl.store(
+        compact_offsets_ptr + active_indices,
+        offsets,
+        mask=is_boundary,
+    )
+    tl.store(
+        active_expert_ids_ptr + active_indices,
+        expert_ids,
+        mask=is_boundary,
+    )
+
+
+def _prepare_compact_expert_groups(
+    sorted_expert_ids: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+) -> None:
+    total_slots = sorted_expert_ids.numel()
+    max_slots = _COMPACT_GROUPED_MAX_SLOTS
+    if not (0 < total_slots <= max_slots):
+        raise ValueError(f"Unsupported SM70 NVFP4 active-expert slots: {total_slots}")
+    block = triton.next_power_of_2(total_slots + 1)
+    _prepare_compact_expert_groups_kernel[(1,)](
+        sorted_expert_ids,
+        compact_offsets,
+        active_expert_ids,
+        TOTAL_SLOTS=total_slots,
+        BLOCK=block,
+        num_warps=1,
+    )
+
+
+def _use_glm53_grouped_expert_rows(
+    layer: RoutedExperts,
+    num_tokens: int,
+) -> bool:
+    return bool(
+        envs.VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS
+        and num_tokens > 1
+        and _use_compact_grouped(num_tokens, int(layer.sm70_nvfp4_top_k))
+        and int(layer.moe_config.tp_size) in (4, 8)
+        and int(layer.sm70_nvfp4_num_experts) == 288
+        and int(layer.sm70_nvfp4_hidden_size) == 4096
+        and int(layer.sm70_nvfp4_intermediate_size) in (256, 512)
+        and int(layer.sm70_nvfp4_top_k) == 8
+    )
+
+
+def _use_glm53_fused_permute_q8(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    return bool(
+        getattr(layer, "sm70_glm53_fused_permute_q8", False)
+        and _use_glm53_grouped_expert_rows(layer, x.shape[0])
+        and tuple(x.shape) == (8, 4096)
+        and x.is_contiguous()
+        and tuple(topk_ids.shape) == (8, 8)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_ids.device == x.device
+    )
+
+
 def _use_compact_grouped(num_tokens: int, top_k: int) -> bool:
     """Bound compact dispatch by its routed-row workload, not batch size."""
     total_slots = num_tokens * top_k
@@ -332,17 +455,7 @@ def _use_compact_grouped(num_tokens: int, top_k: int) -> bool:
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
     """Reject every topology outside the validated SM70 NVFP4 contract."""
-    if moe.tp_size not in _SUPPORTED_TP_SIZES:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
-            f"sizes {_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
-        )
     local_intermediate = moe.intermediate_size_per_partition
-    if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
-            f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
-        )
     global_intermediate = local_intermediate * max(moe.tp_size, 1)
     contract = (
         moe.hidden_dim,
@@ -350,6 +463,17 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
         moe.num_experts,
         moe.experts_per_token,
     )
+    glm53_tp8 = moe.tp_size == 8 and contract == (4096, 2048, 288, 8)
+    if moe.tp_size not in _SUPPORTED_TP_SIZES and not glm53_tp8:
+        raise NotImplementedError(
+            "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
+            f"sizes {_SUPPORTED_TP_SIZES}, plus GLM-5.3 TP8; got {moe.tp_size}."
+        )
+    if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
+        raise NotImplementedError(
+            "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
+            f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
+        )
     if contract not in _SUPPORTED_CONTRACTS:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE shape is not validated: "
@@ -543,6 +667,67 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         fast_prefill = bool(
             fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
         )
+        glm53_fused_permute_requested = bool(
+            envs.VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8
+            and int(layer.moe_config.tp_size) in (4, 8)
+            and num_experts == 288
+            and hidden == 4096
+            and intermediate in (256, 512)
+            and int(layer.moe_config.experts_per_token) == 8
+        )
+        glm53_fused_permute_available = hasattr(
+            torch.ops._C, "sm70_glm53_moe_permute_q8_out"
+        )
+        glm53_fused_permute_explicit = (
+            "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8" in os.environ
+        )
+        if (
+            glm53_fused_permute_requested
+            and not glm53_fused_permute_available
+            and glm53_fused_permute_explicit
+        ):
+            raise RuntimeError(
+                "SM70 GLM-5.3 fused q8 MoE permute requires the TurboMind "
+                "extension with sm70_glm53_moe_permute_q8_out."
+            )
+        if glm53_fused_permute_requested and not glm53_fused_permute_available:
+            logger.warning_once(
+                "The default SM70 GLM-5.3 fused q8 MoE permute op is absent "
+                "from the loaded extension; retaining the generic graph-safe "
+                "permute route. Explicit opt-in fails closed."
+            )
+        glm53_fused_permute_q8 = bool(
+            glm53_fused_permute_requested and glm53_fused_permute_available
+        )
+        glm53_qpn_w13_requested = bool(
+            envs.VLLM_SM70_GLM53_MOE_QPN_W13_Q8
+            and glm53_fused_permute_q8
+            and int(layer.moe_config.tp_size) == 8
+            and num_experts == 288
+            and hidden == 4096
+            and intermediate == 256
+            and int(layer.moe_config.experts_per_token) == 8
+        )
+        glm53_qpn_w13_available = hasattr(
+            torch.ops._C, "nvfp4_glm53_moe_q8_qpn_sm70_out"
+        )
+        glm53_qpn_w13_explicit = "VLLM_SM70_GLM53_MOE_QPN_W13_Q8" in os.environ
+        if (
+            glm53_qpn_w13_requested
+            and not glm53_qpn_w13_available
+            and glm53_qpn_w13_explicit
+        ):
+            raise RuntimeError(
+                "SM70 GLM-5.3 TP8 q8 W13 QPN requires the TurboMind extension "
+                "with nvfp4_glm53_moe_q8_qpn_sm70_out."
+            )
+        if glm53_qpn_w13_requested and not glm53_qpn_w13_available:
+            logger.warning_once(
+                "The default SM70 GLM-5.3 TP8 q8 W13 QPN op is absent; "
+                "retaining the exact TurboMind split-3 path. Explicit opt-in "
+                "fails closed."
+            )
+        glm53_qpn_w13_q8 = bool(glm53_qpn_w13_requested and glm53_qpn_w13_available)
 
         w13_tm_weights: list[torch.Tensor] = []
         w13_tm_scales: list[torch.Tensor] = []
@@ -658,6 +843,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
+        layer.sm70_glm53_fused_permute_q8 = glm53_fused_permute_q8
+        layer.sm70_glm53_qpn_w13_q8 = glm53_qpn_w13_q8
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         self._allocate_graph_safe_decode_buffers(layer)
@@ -690,6 +877,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 fast grouped prefill enabled "
                 "(zero-copy W13 N256+N64, cached-B W2)."
+            )
+        if glm53_fused_permute_q8:
+            logger.info_once(
+                "SM70 GLM-5.3 exact fused q8 MoE permute enabled "
+                "(M8/K8/E288 stable sort and materialized expert rows)."
             )
 
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
@@ -932,6 +1124,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         split_fused_indexed_w13 = fused_indexed_w13 and bool(
             getattr(layer, "sm70_nvfp4_qwen38_fast_prefill", False)
         )
+        glm53_fused_permute_q8 = _use_glm53_fused_permute_q8(layer, x, topk_ids)
+        glm53_qpn_w13_q8 = _use_glm53_qpn_w13_q8(
+            layer,
+            x,
+            topk_ids,
+            fused_permute=glm53_fused_permute_q8,
+        )
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
@@ -997,6 +1196,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = top_k
+        elif glm53_fused_permute_q8:
+            sm70_ops.sm70_glm53_moe_permute_q8_out(
+                x,
+                topk_ids,
+                buffers["permuted_input"],
+                buffers["sorted_row_idx"],
+                buffers["inv_permuted_idx"],
+                buffers["compact_offsets"],
+                buffers["active_expert_ids"],
+            )
+            stage_offsets = buffers["compact_offsets"]
+            stage_expert_ids = buffers["active_expert_ids"]
+            stage_experts = slots
         else:
             output.zero_()
             topk_ids_i32 = buffers["topk_ids"]
@@ -1042,8 +1254,17 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["expert_offsets64"], non_blocking=True
             )
 
-        if not direct_single_token and _use_compact_grouped(num_tokens, top_k):
-            _prepare_compact_slot_groups(
+        if (
+            not direct_single_token
+            and not glm53_fused_permute_q8
+            and _use_compact_grouped(num_tokens, top_k)
+        ):
+            prepare_groups = (
+                _prepare_compact_expert_groups
+                if _use_glm53_grouped_expert_rows(layer, num_tokens)
+                else _prepare_compact_slot_groups
+            )
+            prepare_groups(
                 buffers["permuted_experts_id"],
                 buffers["compact_offsets"],
                 buffers["active_expert_ids"],
@@ -1051,7 +1272,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
-        elif not direct_single_token:
+        elif not direct_single_token and not glm53_fused_permute_q8:
             stage_offsets = buffers["expert_offsets"]
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
@@ -1124,6 +1345,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer.sm70_nvfp4_w13_n_dim,
                 layer.sm70_nvfp4_group_size,
             )
+        elif glm53_qpn_w13_q8:
+            logger.info_once(
+                "SM70 GLM-5.3 TP8 q8 exact W13 QPN path enabled "
+                "(CTA-K32 split-3 accumulation tree)."
+            )
+            sm70_ops.nvfp4_glm53_moe_q8_qpn_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                topk_ids.view(-1),
+                buffers["sorted_row_idx"],
+                True,
+            )
         else:
             sm70_ops.nvfp4_moe_dense_stage_sm70_out(
                 buffers["gate_up"],
@@ -1165,7 +1400,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["sorted_output"],
                 topk_weights,
                 buffers["inv_permuted_idx"],
-                buffers["expert_offsets64"],
+                None if glm53_fused_permute_q8 else buffers["expert_offsets64"],
                 top_k,
                 output,
             )

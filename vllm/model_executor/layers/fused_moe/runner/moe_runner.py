@@ -598,7 +598,7 @@ class MoERunner(MoERunnerInterface):
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
     ) -> bool:
-        if shared_output is None or not envs.VLLM_SM70_MOE_ADD_ALLREDUCE:
+        if shared_output is None:
             return False
         if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and not use_sm70_decode_graph_semantics():
             return False
@@ -619,6 +619,14 @@ class MoERunner(MoERunnerInterface):
             return False
 
         tp_size = self.moe_config.tp_size
+        glm53_q8 = bool(
+            envs.VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8
+            and tp_size == 8
+            and shared_output.dtype == torch.float16
+            and tuple(shared_output.shape) == (8, 4096)
+        )
+        if not envs.VLLM_SM70_MOE_ADD_ALLREDUCE and not glm53_q8:
+            return False
         return tp_size in (2, 4, 6, 8)
 
     def _maybe_sm70_moe_sum2_allreduce(

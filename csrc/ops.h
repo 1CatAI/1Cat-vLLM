@@ -136,6 +136,9 @@ std::vector<torch::Tensor> nvfp4_sm70_prepare(torch::Tensor _kernel,
 
 std::vector<torch::Tensor> sm70_f16_prepare(torch::Tensor _kernel);
 
+void sm70_glm53_tp8_cublaslt_out(torch::Tensor out, torch::Tensor input,
+                                 torch::Tensor weight);
+
 torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats, torch::Tensor _kernel,
                             torch::Tensor _scaling_factors, int64_t group_size,
                             int64_t k_ld, int64_t q_ld);
@@ -340,12 +343,27 @@ void sm70_glm_mhc_pre_norm_out(
     double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
     double norm_eps);
 
+void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
+                                  torch::Tensor gemm_mul,
+                                  torch::Tensor gemm_sqrsum,
+                                  torch::Tensor comb_mix,
+                                  torch::Tensor residual,
+                                  torch::Tensor post_mix, torch::Tensor x,
+                                  torch::Tensor weight, int64_t tile_n);
+
 void sm70_glm_kda_fg_b_out(torch::Tensor f_out, torch::Tensor g_out,
                            torch::Tensor f_input, torch::Tensor g_input,
                            torch::Tensor f_weight, torch::Tensor g_weight);
 
 void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
                               torch::Tensor weight);
+
+void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
+                                   torch::Tensor permuted_input,
+                                   torch::Tensor sorted_row_idx,
+                                   torch::Tensor inv_permuted_idx,
+                                   torch::Tensor compact_offsets,
+                                   torch::Tensor active_expert_ids);
 
 void sm70_f16_lm_head_top1_out(torch::Tensor values_out,
                                torch::Tensor indices_out,
@@ -533,6 +551,12 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor expert_ids, bool broadcast_input,
                                int64_t split_k);
 
+void nvfp4_glm53_moe_q8_qpn_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor weights,
+                                     torch::Tensor scales,
+                                     torch::Tensor expert_ids,
+                                     torch::Tensor sorted_row_idx, bool w13);
+
 void nvfp4_moe_qpn_mtp5_sm70_out(torch::Tensor out, torch::Tensor input,
                                  torch::Tensor weights, torch::Tensor scales,
                                  torch::Tensor expert_ids, bool broadcast_input,
@@ -672,8 +696,11 @@ void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
 void dispose(fptr_t _fa);
 int64_t meta_size();
 int64_t sm70_tp4_push_allreduce_buffer_size();
+int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 void register_sm70_tp4_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
+void register_sm70_tp8_hierarchical_push_allreduce_buffer(
     fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>>
 get_graph_buffer_ipc_meta(fptr_t _fa);

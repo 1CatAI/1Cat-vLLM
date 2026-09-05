@@ -233,6 +233,16 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
+    VLLM_SM70_GLM53_MHC_NATIVE_VERIFY: bool = False
+    VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8: bool = False
+    VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8: bool = True
+    VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8: bool = True
+    VLLM_SM70_GLM53_MOE_QPN_W13_Q8: bool = False
+    VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8: bool = True
+    VLLM_SM70_GLM_MHC_PRE_THREADS: int = 256
+    VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS: int = -3
+    VLLM_SM70_GLM53_TP8_CUBLASLT: bool = False
+    VLLM_SM70_GLM53_TP8_FUSED_FG_B: bool = False
     VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE: float = 1.0
     VLLM_SM70_DFLASH2_PROPOSAL_TOP_P: float = 1.0
     VLLM_GLM53_PP_MHC_MATERIALIZE: bool = False
@@ -271,6 +281,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
+    VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS: bool = False
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_QPN4: bool = True
     VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE: bool = False
@@ -300,6 +311,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH: bool = True
     VLLM_SM70_MOE_ADD_ALLREDUCE: bool = False
     VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR: bool = False
+    VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH: bool = False
     VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH: bool = True
@@ -2120,11 +2132,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))
     ),
     # Compute the compatible 25600->5120 target-hidden projection as four output
-    # shards, then all-gather only the 80-KiB block-eight result. This
-    # remains opt-in until the acceptance/quality gate follows the positive
-    # production-weight TP4 microbenchmark.
+    # shards, then all-gather only the 80-KiB block-eight result. The global
+    # default remains off; audited DFlash2 contracts enable it explicitly.
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    ),
+    # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
+    # topology contracts enable it while the global default remains off.
+    "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))
+    ),
+    # Fixed-shape SM70 q8 mHC post+dot kernel. The global default remains off;
+    # audited GLM-5.3 verifier contracts enable the bitwise-qualified path.
+    "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8", "0"))
+    ),
+    # Exact fixed-shape GLM-5.3 verifier route. It fuses the stable E288 sort,
+    # inverse map, compact active-expert groups, and M8/K8 input expansion.
+    "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8", "1"))
+    ),
+    "VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_MOE_SHUFFLE_SORT_Q8", "1"))
+    ),
+    # Exact TP8/q8 W13 path matching TurboMind's CTA-K32 split-3 tree.
+    "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_MOE_QPN_W13_Q8", "0"))
+    ),
+    # Fuse the local shared+routed FP16 add into the exact TP8 q8 push tree.
+    "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8", "1"))
+    ),
+    "VLLM_SM70_GLM_MHC_PRE_THREADS": lambda: int(
+        os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")
+    ),
+    # Exact GLM-5.3 q8 KDA projection. The -3 variant uses a four-row CTA with
+    # swizzled shared partials; zero keeps the scalar reference for audits.
+    "VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS": lambda: int(
+        os.getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-3")
+    ),
+    "VLLM_SM70_GLM53_TP8_CUBLASLT": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0"))
+    ),
+    # Fixed-shape TP8 KDA f_b/g_b fusion. The global default remains off;
+    # the quality-audited GLM-5.3 DFlash2 TP8/PP1 contract enables it.
+    "VLLM_SM70_GLM53_TP8_FUSED_FG_B": lambda: bool(
+        int(os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0"))
     ),
     # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
     # transformed q logits are cached for rejection sampling, so non-default
@@ -2282,6 +2335,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1"))
     ),
+    # Experimental GLM-5.3 verifier route. Consecutive sorted slots that hit
+    # the same expert share one TurboMind group so its packed weights are read
+    # once for all rows. The candidate stays opt-in until its exactness and
+    # model-quality gates pass.
+    "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS", "0"))
+    ),
     "VLLM_SM70_NVFP4_DENSE_GATED_SILU": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_DENSE_GATED_SILU", "1"))
     ),
@@ -2430,6 +2490,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": lambda: bool(
         int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR", "0"))
+    ),
+    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR", "0"))
     ),
     # Legacy 0.0.3 SM70 MoE permute/unpermute micro fast paths. They bypass
     # CUB sort and the generic k-way reduction for the n_token==1 decode case.

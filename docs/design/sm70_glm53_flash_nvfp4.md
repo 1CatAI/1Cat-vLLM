@@ -381,3 +381,118 @@ runtime selects the retained `24,21` partition and proposal settings only when
 they are absent. Explicit overrides remain untouched and emit a warning. Other
 architectures, quantization formats, draft methods, q lengths, GPU
 capabilities, and TP/PP topologies do not receive these defaults.
+
+## TP8/PP1 Verifier Latency Qualification (2026-09-02)
+
+The PP-free TP8 route is retained as a verifier lower bound and a focused
+kernel-development lane. It uses all eight V100s, E4M3 FP8 target KV, q7
+probabilistic DFlash2, CUDA Graph, FP16 target arithmetic, and no MTP. The
+production TP4/PP2 quality route above remains a separate topology and must not
+be inferred by multiplying or dividing the TP8 result.
+
+The initial quality-qualified hierarchical-push endpoint took `33.2440 ms` per
+q8 verification round. Exact fixed-shape cuBLASLt KDA projections reduced it to
+`32.7333 ms`; fusing the four GDN metadata groups reduced it to `30.1857 ms`.
+The final native q8 mHC post+dot operator reaches `29.8732 ms` on the seed-zero
+endpoint and `29.9130 ms` across 74 rounds and three seeds. With all flags
+selected by source defaults, the same 74-round workload measures
+`29.8868 ms/round` and `172.2715 tok/s` weighted pure decode.
+
+The target top-p pass now uses eight warps only for the exact SM70 GLM5 shape:
+batch 8, vocabulary 154,880, top-k disabled, and top-p enabled. A
+candidate/control/candidate sandwich measures `29.8475/30.2105/30.0496 ms`
+per round. The candidate mean is `29.9486 ms`, `0.2620 ms` (0.87%) below the
+four-warp rollback. A same-seed node trace preserves all 128 output tokens,
+the token hash, and all 23 verification steps while reducing
+`_topk_topp_kernel` from `303.237 us` to `207.963 us` per round. One candidate
+trace step contains 4.8 ms of rank-start skew, so graph-node timing remains
+diagnostic rather than the endpoint acceptance number.
+
+The accepted mHC arithmetic is intentionally strict. A first native kernel
+used explicit `fmaf` operations and differed from the staged TileLang path by
+one ULP in seven of 131,072 FP16 residual elements; that changed a generated
+token hash and is rejected. Rewriting the source expressions in the same
+accumulation order as the staged kernel produces identical FFMA instructions
+while restoring bitwise equality for residual, mapped, residual output,
+squared sum, dot, and hidden output. The focused V100 test reports five passed
+cases, including CUDA Graph replay.
+
+The retained proposal calibration is temperature scale `0.9` with proposal
+top-p `0.95`. On the official 128-request contract it records `124/128`
+accuracy, zero invalid answers, 128 natural stops, `5.787283` mean completion
+tokens per verification step, and `5.573722` token-weighted acceptance. A
+second fixed-seed 128-request audit records `122/128`, zero invalid answers,
+128 natural stops, `5.753127` per-request acceptance, and `5.602134`
+token-weighted acceptance. The `0.8/0.95` alternative is rejected because the
+same fixed seed produced one invalid length-capped response.
+
+The complete post-sampler-change audit again records `124/128`, zero invalid
+answers, and 128 natural stops. Mean completion tokens per verification step
+are `5.784293`, token-weighted acceptance is `5.561909`, and both release gates
+pass. Acceptance min/P50/P90/P99/max are unchanged. Mean per-request steady
+decode is `190.320 tok/s`, weighted pure decode is `180.008 tok/s`, aggregate
+output throughput is `106.575 tok/s`, and mean TPOT is `5.4041 ms`. Dividing
+the full audit's total decode time by its 6,873 verification steps gives
+`30.8020 ms/round`; that long-output workload is deliberately reported
+separately from the short steady-shape `29.9486 ms` result.
+
+The official run averages `187.4022 tok/s` steady decode with P50/P90/P99
+`189.8949/218.3878/233.8120 tok/s`; aggregate output throughput is
+`101.2123 tok/s`. Mean TPOT is `5.4907 ms`, mean prefill is `72.2387 tok/s`,
+and the runtime exposes 34,071 logical KV tokens with 1.7 GiB available per
+rank. GPU sampling during steady generation reports 100% utilization on all
+eight V100s and approximately 38-39% memory-controller utilization.
+
+The runtime only auto-enables this set for SM70, GLM5 ModelOpt NVFP4, FP16,
+probabilistic q7 DFlash2, TP8/PP1, and no DBO. It preserves explicit overrides,
+keeps sparse target rejection and MoE QPN W13 disabled, enables the exact
+hierarchical push collective, cuBLASLt KDA, grouped expert rows, fused GDN
+metadata, and fused q8 mHC, and uses regular `torch.compile`. The matched AOT
+compile path is rejected at `30.98 ms/round` despite an exact output prefix.
+
+Faster-looking alternatives remain excluded. The upstream historical
+single-pass top-p implementation changes 703 mask values on a random
+GLM-shaped oracle, non-default tile sizes change the mask, and an eight-warp
+rejection-statistics schedule changes the accepted-token chain. Compact target
+rejection is not valid for this workload because the official target uses
+`top_k=-1`; enabling top-k 20 would change the target distribution.
+
+### TP8 fused KDA f_b/g_b closure (2026-09-02)
+
+The fixed-shape native KDA projection now also supports the TP8 output width:
+`B=1..8`, `N=1024`, and `K=128`. The existing TP4 `N=2048` specialization is
+unchanged. On the TP8 q8 operator benchmark, replacing the two FP16 linear
+launches with one native kernel reduces CUDA Graph service from `6.218 us` to
+`4.264 us` per layer (`1.458x`). The native output is CUDA Graph stable; versus
+the retained FP16 linear path, f/g differ in 8/10 of 8,192 elements with
+maximum absolute errors `1.526e-5` and `7.63e-6` respectively.
+
+After a full 128-token warmup, a matched ten-seed candidate/control pair
+measures `29.6850/29.9173 ms` per verification round. The fusion saves
+`0.2323 ms` (`0.78%`); dropping the first three requests still gives
+`29.7347/29.9182 ms`, a `0.1834 ms` gain. Short 32-token warmups are not valid
+for this comparison because lazy kernel loading produced one-time 31-56 ms
+request outliers.
+
+The matched seed-zero node traces preserve the output hash and all 23
+verification steps. Across 24 captured replay groups and eight ranks, the
+fusion removes 13,056 launches of the CUTLASS FP16 `32x32x64 TN` family and
+adds 6,528 native launches: exactly 68 removed and 34 added per rank/round.
+The removed launches cost `78.562 ms` TP GPU-sum and the native launches cost
+`33.705 ms`, a net `0.2336 ms` per-rank round reduction. This matches the
+low-overhead endpoint A/B; the previously suspected `16x16x128` family is not
+the f_b/g_b projection.
+
+The full no-request-seed 128-question audit passes the release gates with
+`123/128` accuracy (`96.09375%`), zero invalid answers, and 128 natural stops.
+Mean completion tokens per verification step are `5.827398`, and
+token-weighted acceptance is `5.585305`. Mean per-request steady decode is
+`196.012 tok/s`, weighted pure decode is `187.716 tok/s`, aggregate output
+throughput is `99.039 tok/s`, and mean TPOT is `5.1581 ms`. Total decode time
+divided by all 6,805 verification steps is `29.6639 ms/round`; stochastic
+output-length and context differences mean this long audit is quality evidence,
+not the matched `0.2323 ms` kernel speed claim.
+
+`VLLM_SM70_GLM53_TP8_FUSED_FG_B` remains globally off. The runtime enables it
+only inside the audited SM70, GLM-5.3 ModelOpt NVFP4, FP16, probabilistic q7
+DFlash2, TP8/PP1, no-DBO contract and preserves explicit rollback value `0`.

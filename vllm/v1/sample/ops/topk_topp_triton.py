@@ -32,15 +32,32 @@ def _use_sm70_topk_topp_8_warps(
         device.type != "cuda"
         or not current_platform.is_cuda()
         or not current_platform.is_device_capability((7, 0))
-        or vocab_size != 248_320
-        or not topk_enabled
-        or not topp_enabled
     ):
         return False
 
-    if batch_size in (8, 16) and envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS:
+    if (
+        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        and vocab_size == 154_880
+        and batch_size == 8
+        and not topk_enabled
+        and topp_enabled
+    ):
         return True
-    return envs.VLLM_SM70_TOPK_TOPP_8_WARPS and batch_size in (5, 10, 20, 40, 60, 80)
+    if (
+        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        and vocab_size == 248_320
+        and batch_size in (8, 16)
+        and topk_enabled
+        and topp_enabled
+    ):
+        return True
+    return (
+        vocab_size == 248_320
+        and topk_enabled
+        and topp_enabled
+        and envs.VLLM_SM70_TOPK_TOPP_8_WARPS
+        and batch_size in (5, 10, 20, 40, 60, 80)
+    )
 
 
 # fmt: off

@@ -10,7 +10,11 @@ from vllm.model_executor.layers.fla.ops.kda import (
     fused_recurrent_kda,
     layer_norm_gated_fwd,
 )
-from vllm.models.glm5next.nvidia.kda import _sm70_exact_kda_gemv_enabled
+from vllm.models.glm5next.nvidia.kda import (
+    _sm70_exact_kda_gemv_enabled,
+    _sm70_glm53_tp8_cublaslt_enabled,
+    _sm70_glm53_tp8_fused_fg_b_enabled,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 
@@ -31,6 +35,75 @@ def test_sm70_exact_kda_gemv_gate(
     assert _sm70_exact_kda_gemv_enabled() is expected
 
 
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [(None, False), ("1", True), ("0", False)],
+)
+def test_sm70_glm53_tp8_cublaslt_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    enabled: bool,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("VLLM_SM70_GLM53_TP8_CUBLASLT", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_GLM53_TP8_CUBLASLT", value)
+    expected = enabled and torch.version.cuda == "12.8"
+    assert _sm70_glm53_tp8_cublaslt_enabled() is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [(None, False), ("1", True), ("0", False)],
+)
+def test_sm70_glm53_tp8_fused_fg_b_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    enabled: bool,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", value)
+    assert _sm70_glm53_tp8_fused_fg_b_enabled() is enabled
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and current_platform.get_device_capability() == DeviceCapability(7, 0)
+        and hasattr(torch.ops._C, "sm70_glm53_tp8_cublaslt_out")
+    ),
+    reason="native NVIDIA V100/SM70 GLM-5.3 cuBLASLt op required",
+)
+@pytest.mark.parametrize("seed", range(2))
+@pytest.mark.parametrize("n, k", [(3336, 4096), (4096, 1024)])
+def test_sm70_glm53_tp8_cublaslt_matches_torch_and_graph(
+    seed: int,
+    n: int,
+    k: int,
+) -> None:
+    torch.manual_seed(seed)
+    device = current_platform.device_type
+    input = torch.randn((8, k), device=device, dtype=torch.float16)
+    weight = torch.randn((n, k), device=device, dtype=torch.float16)
+    output = torch.empty((8, n), device=device, dtype=torch.float16)
+    expected = F.linear(input, weight)
+
+    sm70_ops.sm70_glm53_tp8_cublaslt_out(output, input, weight)
+    torch.accelerator.synchronize()
+    assert torch.equal(output, expected)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sm70_ops.sm70_glm53_tp8_cublaslt_out(output, input, weight)
+    input.copy_(torch.randn_like(input))
+    expected = F.linear(input, weight)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(output, expected)
+
+
 @pytest.mark.skipif(
     not (
         current_platform.is_cuda()
@@ -39,22 +112,29 @@ def test_sm70_exact_kda_gemv_gate(
     ),
     reason="native NVIDIA V100/SM70 GLM KDA CUDA op required",
 )
+@pytest.mark.parametrize("output_rows", [1024, 2048])
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
 def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph(
     num_tokens: int,
+    output_rows: int,
 ) -> None:
     torch.manual_seed(20260827)
     device = current_platform.device_type
+    projected_rows = 3336 if output_rows == 1024 else 6416
     projected = torch.randn(
-        (num_tokens, 6416), device=device, dtype=torch.float16
+        (num_tokens, projected_rows), device=device, dtype=torch.float16
     ).mul_(0.1)
     f_input = projected[:, -256:-128]
     g_input = projected[:, -128:]
-    assert f_input.stride() == (6416, 1)
-    assert g_input.stride() == (6416, 1)
-    f_weight = torch.randn((2048, 128), device=device, dtype=torch.float16).mul_(0.01)
-    g_weight = torch.randn((2048, 128), device=device, dtype=torch.float16).mul_(0.01)
-    f_out = torch.empty((num_tokens, 2048), device=device, dtype=torch.float16)
+    assert f_input.stride() == (projected_rows, 1)
+    assert g_input.stride() == (projected_rows, 1)
+    f_weight = torch.randn((output_rows, 128), device=device, dtype=torch.float16).mul_(
+        0.01
+    )
+    g_weight = torch.randn((output_rows, 128), device=device, dtype=torch.float16).mul_(
+        0.01
+    )
+    f_out = torch.empty((num_tokens, output_rows), device=device, dtype=torch.float16)
     g_out = torch.empty_like(f_out)
 
     def run() -> None:
@@ -68,7 +148,7 @@ def test_sm70_glm_kda_fused_fg_b_matches_fp16_and_graph(
     rowwise_f = []
     rowwise_g = []
     for token_idx in range(num_tokens):
-        f_row = torch.empty((1, 2048), device=device, dtype=torch.float16)
+        f_row = torch.empty((1, output_rows), device=device, dtype=torch.float16)
         g_row = torch.empty_like(f_row)
         sm70_ops.sm70_glm_kda_fg_b_out(
             f_row,
@@ -144,6 +224,43 @@ def test_sm70_glm53_fp16_gemv_matches_cublas_and_graph(
     graph.replay()
     torch.accelerator.synchronize()
     assert torch.equal(output, expected)
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda()
+        and current_platform.get_device_capability() == DeviceCapability(7, 0)
+        and hasattr(torch.ops._C, "sm70_glm53_fp16_gemv_out")
+    ),
+    reason="native NVIDIA V100/SM70 GLM-5.3 exact FP16 GEMV op required",
+)
+def test_sm70_glm53_fp16_gemv_swizzle_matches_baseline_and_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(20260902)
+    device = current_platform.device_type
+    input = torch.randn((8, 4096), device=device, dtype=torch.float16)
+    weight = torch.randn((6416, 4096), device=device, dtype=torch.float16)
+    half2_output = torch.empty((8, 6416), device=device, dtype=torch.float16)
+    swizzled_output = torch.empty_like(half2_output)
+
+    monkeypatch.setenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-2")
+    sm70_ops.sm70_glm53_fp16_gemv_out(half2_output, input, weight)
+    monkeypatch.setenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-3")
+    sm70_ops.sm70_glm53_fp16_gemv_out(swizzled_output, input, weight)
+    torch.accelerator.synchronize()
+    assert torch.equal(swizzled_output, half2_output)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sm70_ops.sm70_glm53_fp16_gemv_out(swizzled_output, input, weight)
+    input.copy_(torch.randn_like(input))
+    monkeypatch.setenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-2")
+    sm70_ops.sm70_glm53_fp16_gemv_out(half2_output, input, weight)
+    monkeypatch.setenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS", "-3")
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(swizzled_output, half2_output)
 
 
 @pytest.mark.skipif(

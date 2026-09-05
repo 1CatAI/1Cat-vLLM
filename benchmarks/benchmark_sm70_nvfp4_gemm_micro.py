@@ -217,6 +217,9 @@ def _run_case(
     tensor_out: Path | None,
     data_pattern: str,
     generator: torch.Generator,
+    expert_row_counts: list[int] | None,
+    prime_slot_groups: bool,
+    prime_active_groups: int,
 ) -> dict[str, Any]:
     if case.k % group_size != 0:
         raise ValueError(f"{case.label}: K={case.k} not divisible by {group_size}.")
@@ -313,7 +316,27 @@ def _run_case(
             q_ld,
             num_experts,
         )
-        expert_offsets = torch.arange(num_experts + 1, dtype=torch.int32, device=device)
+        if expert_row_counts is None:
+            expert_offsets = torch.arange(
+                num_experts + 1, dtype=torch.int32, device=device
+            )
+        else:
+            if any(count <= 0 for count in expert_row_counts):
+                raise ValueError("Expert row counts must all be positive.")
+            if sum(expert_row_counts) != case.m:
+                raise ValueError(
+                    "Expert row counts must sum to grouped-moe M: "
+                    f"sum={sum(expert_row_counts)}, M={case.m}."
+                )
+            if len(expert_row_counts) > num_experts:
+                raise ValueError(
+                    "Expert row count entries cannot exceed --num-experts."
+                )
+            offsets = [0]
+            for count in expert_row_counts:
+                offsets.append(offsets[-1] + count)
+            offsets.extend([case.m] * (num_experts - len(expert_row_counts)))
+            expert_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
         expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
         run = partial(
             ops.nvfp4_moe_dense_stage_sm70_out,
@@ -328,6 +351,50 @@ def _run_case(
             case.n,
             group_size,
         )
+        if prime_slot_groups and expert_row_counts is not None:
+            slot_offsets = torch.arange(
+                num_experts + 1, dtype=torch.int32, device=device
+            )
+            ops.nvfp4_moe_dense_stage_sm70_out(
+                out,
+                x,
+                slot_offsets,
+                expert_ids,
+                ptrs_w,
+                ptrs_s,
+                num_experts,
+                case.k,
+                case.n,
+                group_size,
+            )
+            torch.cuda.synchronize(device)
+        elif prime_active_groups > 0 and expert_row_counts is not None:
+            if prime_active_groups > num_experts or case.m < prime_active_groups:
+                raise ValueError(
+                    "--prime-active-groups must not exceed grouped M or experts."
+                )
+            base, remainder = divmod(case.m, prime_active_groups)
+            prime_counts = [
+                base + (group < remainder) for group in range(prime_active_groups)
+            ]
+            offsets = [0]
+            for count in prime_counts:
+                offsets.append(offsets[-1] + count)
+            offsets.extend([case.m] * (num_experts - prime_active_groups))
+            prime_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+            ops.nvfp4_moe_dense_stage_sm70_out(
+                out,
+                x,
+                prime_offsets,
+                expert_ids,
+                ptrs_w,
+                ptrs_s,
+                num_experts,
+                case.k,
+                case.n,
+                group_size,
+            )
+            torch.cuda.synchronize(device)
     elif mode in ("raw-gemv", "raw-gemv-warp", "raw-gemv-h2"):
         if case.m != 1:
             raise ValueError(f"{mode} mode only supports M=1.")
@@ -399,6 +466,16 @@ def _run_case(
         "group_size": group_size,
         "gated_silu": gated_silu,
         "num_experts": num_experts if mode == "grouped-moe" else 1,
+        "active_expert_groups": (
+            len(expert_row_counts)
+            if mode == "grouped-moe" and expert_row_counts is not None
+            else num_experts
+            if mode == "grouped-moe"
+            else 1
+        ),
+        "expert_row_counts": expert_row_counts if mode == "grouped-moe" else None,
+        "prime_slot_groups": bool(prime_slot_groups and mode == "grouped-moe"),
+        "prime_active_groups": (prime_active_groups if mode == "grouped-moe" else 0),
         "gemv_split_k": gemv_split_k if mode in ("raw-gemv", "raw-gemv-h2") else 0,
         "k_ld": k_ld,
         "q_ld": q_ld,
@@ -464,6 +541,10 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "group_size",
         "gated_silu",
         "num_experts",
+        "active_expert_groups",
+        "expert_row_counts",
+        "prime_slot_groups",
+        "prime_active_groups",
         "gemv_split_k",
         "k_ld",
         "q_ld",
@@ -523,6 +604,30 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument(
+        "--expert-row-counts",
+        help=(
+            "Comma-separated positive row counts for grouped-moe. Counts must "
+            "sum to M; unused expert-offset entries become graph-safe empty tails."
+        ),
+    )
+    parser.add_argument(
+        "--prime-slot-groups",
+        action="store_true",
+        help=(
+            "Before timing grouped expert rows, tune the same shape with one row "
+            "per expert to reproduce the production warmup cache choice."
+        ),
+    )
+    parser.add_argument(
+        "--prime-active-groups",
+        type=int,
+        default=0,
+        help=(
+            "Tune grouped-MoE on a balanced number of active groups before "
+            "timing --expert-row-counts."
+        ),
+    )
+    parser.add_argument(
         "--gemv-split-k",
         type=int,
         default=8,
@@ -546,6 +651,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if args.prime_active_groups < 0:
+        raise ValueError("--prime-active-groups must be non-negative.")
+    if args.prime_slot_groups and args.prime_active_groups:
+        raise ValueError(
+            "--prime-slot-groups and --prime-active-groups are mutually exclusive."
+        )
     device = torch.device(args.device)
     _require_sm70(device)
     ops = _import_sm70_ops()
@@ -586,6 +697,11 @@ def main() -> int:
     if args.tensor_out is not None and len(cases) != 1:
         raise ValueError("--tensor-out requires exactly one benchmark case.")
     generator = torch.Generator(device=device).manual_seed(args.seed)
+    expert_row_counts = (
+        [int(value) for value in args.expert_row_counts.split(",")]
+        if args.expert_row_counts
+        else None
+    )
     rows = [
         _run_case(
             ops=ops,
@@ -602,6 +718,9 @@ def main() -> int:
             tensor_out=args.tensor_out,
             data_pattern=args.data_pattern,
             generator=generator,
+            expert_row_counts=expert_row_counts,
+            prime_slot_groups=args.prime_slot_groups,
+            prime_active_groups=args.prime_active_groups,
         )
         for case in cases
     ]
@@ -616,6 +735,9 @@ def main() -> int:
         "cuda_version": torch.version.cuda,
         "group_size": args.group_size,
         "num_experts": args.num_experts if args.mode == "grouped-moe" else 1,
+        "expert_row_counts": expert_row_counts,
+        "prime_slot_groups": args.prime_slot_groups,
+        "prime_active_groups": args.prime_active_groups,
         "mode": args.mode,
         "gated_silu": args.gated_silu,
         "gemv_split_k": (
