@@ -236,6 +236,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE: float = 1.0
     VLLM_SM70_DFLASH2_PROPOSAL_TOP_P: float = 1.0
     VLLM_GLM53_PP_MHC_MATERIALIZE: bool = False
+    VLLM_SM70_DFLASH2_QUANT_LM_HEAD: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
@@ -2136,6 +2137,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GLM53_PP_MHC_MATERIALIZE": lambda: bool(
         int(os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0"))
+    ),
+    # Allow DFlash2 candidate TopK when the shared target LM head is
+    # quantized (e.g. compressed-tensors NVFP4 checkpoints, whose
+    # unquantized-head guard predates this deployment). The dense-logit
+    # fallback (quant_method.apply over the full vocabulary) produces the
+    # candidates instead of the QPN8 fast path. Opt-in because draft
+    # acceptance may differ from the unquantized baseline; quality gates
+    # must follow before broad rollout.
+    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_QUANT_LM_HEAD", "0"))
     ),
     # Default-on SGLang-style push collective for the validated FP16 80-KiB
     # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA
