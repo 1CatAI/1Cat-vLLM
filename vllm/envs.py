@@ -240,6 +240,9 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
+    VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE: float = 1.0
+    VLLM_SM70_DFLASH2_PROPOSAL_TOP_P: float = 1.0
+    VLLM_GLM53_PP_MHC_MATERIALIZE: bool = False
     VLLM_SM70_DFLASH2_QUANT_LM_HEAD: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
@@ -2187,6 +2190,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # production-weight TP4 microbenchmark.
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC", "0"))
+    ),
+    # Proposal-only calibration for DFlash2 probabilistic drafting. The exact
+    # transformed q logits are cached for rejection sampling, so non-default
+    # values preserve the target distribution while changing acceptance.
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": lambda: float(
+        os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE", "1.0")
+    ),
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": lambda: float(
+        os.getenv("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P", "1.0")
+    ),
+    "VLLM_GLM53_PP_MHC_MATERIALIZE": lambda: bool(
+        int(os.getenv("VLLM_GLM53_PP_MHC_MATERIALIZE", "0"))
     ),
     # Allow DFlash2 candidate TopK when the shared target LM head is
     # quantized (e.g. compressed-tensors NVFP4 checkpoints, whose

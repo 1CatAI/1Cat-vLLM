@@ -41,6 +41,18 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+_DEBUG_DFLASH_NVFP4_TRACE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
+)
+_DFLASH_NVFP4_TRACE_ARMED = False
+
+
+def arm_dflash_nvfp4_trace() -> None:
+    global _DFLASH_NVFP4_TRACE_ARMED
+    if _DEBUG_DFLASH_NVFP4_TRACE:
+        _DFLASH_NVFP4_TRACE_ARMED = True
+
+
 _SUPPORTED_CONTRACTS: Final = {
     # (hidden size, global expert intermediate size, experts, top-k)
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
@@ -1703,6 +1715,35 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 top_k,
                 output,
             )
+        global _DFLASH_NVFP4_TRACE_ARMED
+        if _DFLASH_NVFP4_TRACE_ARMED and num_tokens > 1:
+            _DFLASH_NVFP4_TRACE_ARMED = False
+            actual = output.clone()
+            reference_rows = []
+            for token_idx in range(num_tokens):
+                reference_rows.append(
+                    self.apply(
+                        layer,
+                        x[token_idx : token_idx + 1],
+                        topk_weights[token_idx : token_idx + 1],
+                        topk_ids[token_idx : token_idx + 1],
+                        None,
+                        None,
+                    ).clone()
+                )
+            reference = torch.cat(reference_rows, dim=0)
+            delta = (actual - reference).float().reshape(num_tokens, -1)
+            logger.warning(
+                "DFLASH_TARGET_NVFP4_SEQUENCE_DELTA tokens=%d "
+                "max_by_token=%s mean_by_token=%s sqsum_by_token=%s "
+                "routes=%s",
+                num_tokens,
+                delta.abs().amax(dim=1).cpu().tolist(),
+                delta.abs().mean(dim=1).cpu().tolist(),
+                (delta * delta).sum(dim=1).cpu().tolist(),
+                topk_ids.detach().cpu().tolist(),
+            )
+            output.copy_(actual)
         return output
 
     def apply_monolithic(

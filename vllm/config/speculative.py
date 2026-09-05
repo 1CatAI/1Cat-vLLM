@@ -1048,11 +1048,11 @@ class SpeculativeConfig:
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
-                        # The runner constructs the complete DSpark drafter on
-                        # the target model's final PP rank. It is local to that
+                        # MRV2 constructs complete DFlash/DSpark drafters on the
+                        # target model's final PP rank. They are local to that
                         # stage rather than partitioned across target PP ranks.
                         speculative_draft_pipeline_parallel_size=(
-                            1 if self.use_dspark() else None
+                            1 if self.use_dspark() or self.use_dflash() else None
                         ),
                     )
                 )

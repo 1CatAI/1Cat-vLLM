@@ -33,6 +33,22 @@ def _requires_sm70_tail(device: torch.device, num_steps: int) -> bool:
 
 
 @triton.jit
+def _proposal_nucleus_logits(
+    scores,
+    mask,
+    top_p: tl.constexpr,
+):
+    sorted_scores = tl.sort(tl.where(mask, scores, float("-inf")), descending=True)
+    row_max = tl.max(sorted_scores, axis=0)
+    unnormalized = tl.exp(sorted_scores - row_max)
+    probs = unnormalized / tl.sum(unnormalized, axis=0)
+    cumulative_before = tl.cumsum(probs, axis=0) - probs
+    keep_sorted = cumulative_before < top_p
+    cutoff = tl.min(tl.where(keep_sorted, sorted_scores, float("inf")), axis=0)
+    return tl.where(mask & (scores >= cutoff), scores, float("-inf"))
+
+
+@triton.jit
 def _selector_walk_kernel(
     scores_ptr,
     candidate_ptr,
@@ -49,6 +65,8 @@ def _selector_walk_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
+    PROPOSAL_TOP_P: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_K)
@@ -65,12 +83,15 @@ def _selector_walk_kernel(
             scores_ptr + score_base + offsets,
             mask=mask & valid,
             other=float("-inf"),
-        ).to(tl.float64 if USE_FP64 else tl.float32)
+        ).to(tl.float32)
         if SAMPLE_PROBABILISTIC and temperature != 0.0:
             # Cache the exact temperature-applied proposal scores expected by
             # the shared rejection sampler. This keeps Eagle/MTP's established
             # contract unchanged while matching the DFlash2 selector draw.
-            scores = scores / temperature
+            scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+            if PROPOSAL_TOP_P < 1.0:
+                scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+        scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
         candidate_base = flat * top_k
         candidates = tl.load(
             candidate_ptr + candidate_base + offsets,
@@ -78,7 +99,7 @@ def _selector_walk_kernel(
             other=0,
         )
 
-        # Candidate token IDs key the noise, matching the target sampler.
+        # Candidate token IDs key an independent draft-noise stream.
         position = tl.load(sample_pos_ptr + flat) - 1
         _, index = gumbel_noised_argmax(
             scores,
@@ -87,6 +108,7 @@ def _selector_walk_kernel(
             seed,
             position,
             temperature if SAMPLE_PROBABILISTIC else 0.0,
+            IS_DRAFTING=True,
             USE_FP64=USE_FP64,
             APPLY_TEMPERATURE=False,
         )
@@ -120,6 +142,8 @@ def _selector_walk_tail_kernel(
     BLOCK_K: tl.constexpr,
     SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
+    PROPOSAL_TEMPERATURE_SCALE: tl.constexpr,
+    PROPOSAL_TOP_P: tl.constexpr,
 ):
     """Write the final dependent slot separately on SM70.
 
@@ -142,15 +166,19 @@ def _selector_walk_tail_kernel(
         scores_ptr + score_base + offsets,
         mask=mask & valid,
         other=float("-inf"),
-    ).to(tl.float64 if USE_FP64 else tl.float32)
+    ).to(tl.float32)
     if SAMPLE_PROBABILISTIC and temperature != 0.0:
-        scores = scores / temperature
+        scores = scores / (temperature * PROPOSAL_TEMPERATURE_SCALE)
+        if PROPOSAL_TOP_P < 1.0:
+            scores = _proposal_nucleus_logits(scores, mask, PROPOSAL_TOP_P)
+    scores = scores.to(tl.float64 if USE_FP64 else tl.float32)
     candidate_base = flat * top_k
     candidates = tl.load(
         candidate_ptr + candidate_base + offsets,
         mask=mask & valid,
         other=0,
     )
+    # Candidate token IDs key an independent draft-noise stream.
     position = tl.load(sample_pos_ptr + flat) - 1
     _, index = gumbel_noised_argmax(
         scores,
@@ -159,6 +187,7 @@ def _selector_walk_tail_kernel(
         seed,
         position,
         temperature if SAMPLE_PROBABILISTIC else 0.0,
+        IS_DRAFTING=True,
         USE_FP64=USE_FP64,
         APPLY_TEMPERATURE=False,
     )
@@ -324,8 +353,26 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
+        self.proposal_temperature_scale = (
+            envs.VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE
+        )
+        self.proposal_top_p = envs.VLLM_SM70_DFLASH2_PROPOSAL_TOP_P
+        if self.proposal_temperature_scale <= 0.0:
+            raise ValueError(
+                "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE must be positive"
+            )
+        if not 0.0 < self.proposal_top_p <= 1.0:
+            raise ValueError("VLLM_SM70_DFLASH2_PROPOSAL_TOP_P must be in (0, 1]")
+        if self.proposal_temperature_scale != 1.0 or self.proposal_top_p != 1.0:
+            logger.info_once(
+                "Using DFlash2 proposal calibration: temperature_scale=%.3f, "
+                "top_p=%.3f. Cached q logits preserve exact rejection sampling.",
+                self.proposal_temperature_scale,
+                self.proposal_top_p,
+            )
         self._anchor_indices = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
@@ -364,6 +411,34 @@ class DFlash2Speculator(DFlashSpeculator):
         self._selector_path_state = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self._debug_backbone_hidden_states: torch.Tensor | None = None
+        self._debug_candidate_ids: torch.Tensor | None = None
+        self._debug_unary_logits: torch.Tensor | None = None
+        self._debug_lattice_scores: torch.Tensor | None = None
+        if getattr(self, "_debug_tensor_dump_dir", ""):
+            packed_shape = (
+                self.max_num_reqs,
+                self.draft_block,
+                self.selector_top_k,
+            )
+            self._debug_backbone_hidden_states = torch.empty(
+                self.max_num_reqs,
+                self.draft_block,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+            self._debug_candidate_ids = torch.empty(
+                packed_shape, dtype=torch.int64, device=device
+            )
+            self._debug_unary_logits = torch.empty(
+                packed_shape, dtype=torch.float32, device=device
+            )
+            self._debug_lattice_scores = torch.empty(
+                (*packed_shape, self.selector_top_k),
+                dtype=torch.float32,
+                device=device,
+            )
         self._alignment_candidate_ids: torch.Tensor | None = None
         self._alignment_unary_logits: torch.Tensor | None = None
         self._alignment_lattice_scores: torch.Tensor | None = None
@@ -701,6 +776,8 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             SAMPLE_PROBABILISTIC=self.draft_logits is not None,
             USE_FP64=self.use_fp64_gumbel,
+            PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
+            PROPOSAL_TOP_P=self.proposal_top_p,
             num_warps=1,
         )
         if self._use_sm70_tail:
@@ -719,6 +796,8 @@ class DFlash2Speculator(DFlashSpeculator):
                 BLOCK_K=block_k,
                 SAMPLE_PROBABILISTIC=self.draft_logits is not None,
                 USE_FP64=self.use_fp64_gumbel,
+                PROPOSAL_TEMPERATURE_SCALE=self.proposal_temperature_scale,
+                PROPOSAL_TOP_P=self.proposal_top_p,
                 num_warps=1,
             )
 
@@ -965,6 +1044,14 @@ class DFlash2Speculator(DFlashSpeculator):
             hidden_states,
             anchor_token_ids,
         )
+        if self._debug_candidate_ids is not None:
+            assert self._debug_backbone_hidden_states is not None
+            assert self._debug_unary_logits is not None
+            assert self._debug_lattice_scores is not None
+            self._debug_backbone_hidden_states[:num_reqs].copy_(hidden_states)
+            self._debug_candidate_ids[:num_reqs].copy_(candidate_ids)
+            self._debug_unary_logits[:num_reqs].copy_(unary_logits)
+            self._debug_lattice_scores[:num_reqs].copy_(scores)
         if self._alignment_candidate_ids is not None:
             assert self._alignment_unary_logits is not None
             assert self._alignment_lattice_scores is not None
@@ -975,6 +1062,44 @@ class DFlash2Speculator(DFlashSpeculator):
         self.draft_tokens[:num_reqs, : self.draft_block].copy_(
             self._selector_tokens[:num_reqs]
         )
+        if (
+            getattr(self, "_debug_proposal_stages", False)
+            and getattr(self, "_debug_real_proposal", False)
+            and self._debug_token_dump_count < 2
+        ):
+            first_scores = scores[0, 0, 0]
+            first_unary = unary_logits[0, 0]
+            first_bilinear = first_scores - first_unary
+            greedy_path = []
+            predecessor = 0
+            for step in range(self.draft_block):
+                score_row = scores[0, step, predecessor]
+                successor = int(score_row.argmax().item())
+                greedy_path.append(
+                    (
+                        successor,
+                        int(candidate_ids[0, step, successor].item()),
+                        float(score_row[successor].item()),
+                    )
+                )
+                predecessor = successor
+            logger.info(
+                "DFlash2 token diagnostic: finite_hidden=%s max_abs_hidden=%s "
+                "query_input_ids=%s anchor_token_id=%s candidate_ids=%s "
+                "unary_logits=%s first_bilinear=%s first_total=%s "
+                "greedy_path=%s draft_tokens=%s",
+                bool(torch.isfinite(hidden_states).all().item()),
+                float(hidden_states.abs().max().item()),
+                self.input_buffers.input_ids[: self.num_query_per_req].tolist(),
+                int(anchor_token_ids[0].item()),
+                candidate_ids[0].tolist(),
+                unary_logits[0].tolist(),
+                first_bilinear.tolist(),
+                first_scores.tolist(),
+                greedy_path,
+                self.draft_tokens[0, : self.draft_block].tolist(),
+            )
+            self._debug_token_dump_count += 1
         if self.draft_block < self.num_speculative_steps:
             self.draft_tokens[:num_reqs, self.draft_block :].zero_()
         if self.draft_logits is not None:

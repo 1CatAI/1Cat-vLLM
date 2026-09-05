@@ -101,3 +101,36 @@ def test_compiled_vs_eager_multidim(
     native_out = compiled_native(x.clone(), g.clone())
 
     torch.testing.assert_close(native_out, cuda_out, atol=1e-3, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_fp32_input_fp16_output(default_vllm_config) -> None:
+    """The fused kernel can normalize fp32 staging directly into fp16."""
+    device = torch.device("cuda:0")
+    module = FusedRMSNormGated(
+        128,
+        eps=1e-5,
+        activation="sigmoid",
+        device=device,
+        dtype=torch.float16,
+    )
+    x = torch.randn(1, 8, 16, 128, dtype=torch.float32, device=device) * 1e6
+    g = torch.randn(1, 8, 16, 128, dtype=torch.float16, device=device)
+
+    cuda_out = module.forward_cuda(x, g, out_dtype=torch.float16)
+    native_out = module.forward_native(x, g, out_dtype=torch.float16)
+    compiled_native = torch.compile(module.forward_native, fullgraph=True)
+    compiled_out = compiled_native(x, g, out_dtype=torch.float16)
+
+    assert cuda_out.dtype == torch.float16
+    assert torch.isfinite(cuda_out).all()
+    torch.testing.assert_close(native_out, cuda_out, atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(compiled_out, cuda_out, atol=2e-3, rtol=1e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = module.forward_cuda(x, g, out_dtype=torch.float16)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    assert torch.equal(graph_out, cuda_out)

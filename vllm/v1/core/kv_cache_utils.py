@@ -916,7 +916,11 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
     if (glm5 := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
         _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5
-        return len(mla_names) * mla_page + len(idx_names) * idx_page
+        return (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + _glm5_next_auxiliary_page_bytes(kv_cache_groups)
+        )
     if layout := _get_csa_linear_tensor_layout(kv_cache_groups):
         return layout.bytes_per_block
     if all(
@@ -1377,16 +1381,31 @@ def _get_kv_cache_groups_glm5_next(
     tail_specs = {
         k: v for k, v in kv_cache_spec.items() if isinstance(v, KpoolTailSpec)
     }
-    attn_specs = {
+    mla_specs_untyped = {
+        k: v for k, v in kv_cache_spec.items() if type(v) is MLAAttentionSpec
+    }
+    auxiliary_attn_specs = {
         k: v
         for k, v in kv_cache_spec.items()
-        if not isinstance(v, (MambaSpec, KpoolTailSpec))
+        if type(v) in (FullAttentionSpec, SlidingWindowSpec)
     }
-    if not mamba_specs or not all(
-        type(s) is MLAAttentionSpec for s in attn_specs.values()
-    ):
+    known_names = (
+        set(mamba_specs)
+        | set(tail_specs)
+        | set(mla_specs_untyped)
+        | set(auxiliary_attn_specs)
+    )
+    if not mamba_specs or not mla_specs_untyped or known_names != set(kv_cache_spec):
         return None
-    mla_specs = cast(dict[str, MLAAttentionSpec], attn_specs)
+    if auxiliary_attn_specs:
+        spec_config = vllm_config.speculative_config
+        if (
+            spec_config is None
+            or not spec_config.use_dflash()
+            or not is_kv_cache_spec_uniform(auxiliary_attn_specs)
+        ):
+            return None
+    mla_specs = cast(dict[str, MLAAttentionSpec], mla_specs_untyped)
     idx_pages = {s.page_size_bytes for s in mla_specs.values() if s.compress_ratio > 1}
     if not idx_pages:
         return None
@@ -1397,7 +1416,9 @@ def _get_kv_cache_groups_glm5_next(
     mla_pages = {mla_specs[n].page_size_bytes for n in mla_names}
     assert len(mla_pages) == 1
     mla_page = mla_pages.pop()
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs(
+        cast(dict[str, KVCacheSpec], mla_specs_untyped)
+    )
     assert uniform_spec is not None
 
     # Keep all indexer tails in one group and pad their pages to the indexer
@@ -1435,10 +1456,35 @@ def _get_kv_cache_groups_glm5_next(
     mamba_grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
     for k, name in enumerate(mamba_specs):
         mamba_grouped_names[k % num_groups].append(name)
+    auxiliary_groups = (
+        _get_kv_cache_groups_uniform_spec(auxiliary_attn_specs)
+        if auxiliary_attn_specs
+        else []
+    )
     return (
-        [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+        [KVCacheGroupSpec(list(mla_specs_untyped), uniform_spec)]
         + ([tail_group] if tail_group is not None else [])
         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+        + auxiliary_groups
+    )
+
+
+def _glm5_next_auxiliary_attention_groups(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[KVCacheGroupSpec]:
+    return [
+        group
+        for group in kv_cache_groups
+        if type(group.kv_cache_spec) in (FullAttentionSpec, SlidingWindowSpec)
+    ]
+
+
+def _glm5_next_auxiliary_page_bytes(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> int:
+    return sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+        for group in _glm5_next_auxiliary_attention_groups(kv_cache_groups)
     )
 
 
@@ -1486,7 +1532,10 @@ def _glm5_next_tensor_layout(
             tail_group = g
     if attn_group is None or not mamba_groups:
         return None
-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+    auxiliary_groups = _glm5_next_auxiliary_attention_groups(kv_cache_groups)
+    if len(uniform_groups) + len(mamba_groups) + len(auxiliary_groups) != len(
+        kv_cache_groups
+    ):
         return None
     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
     if not all(
@@ -1622,7 +1671,12 @@ def get_kv_cache_config_from_groups(
         ) = glm5n
         if tail_names:
             assert len(idx_names) == len(tail_names)
-        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
+        auxiliary_groups = _glm5_next_auxiliary_attention_groups(kv_cache_groups)
+        per_block = (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + _glm5_next_auxiliary_page_bytes(kv_cache_groups)
+        )
         num_blocks = may_override_num_blocks(vllm_config, available_memory // per_block)
         kv_cache_tensors = [
             KVCacheTensor(
@@ -1642,6 +1696,14 @@ def get_kv_cache_config_from_groups(
             )
             for i, idx_name in enumerate(idx_names)
         ]
+        kv_cache_tensors.extend(
+            KVCacheTensor(
+                size=group.kv_cache_spec.page_size_bytes * num_blocks,
+                shared_by=[layer_name],
+            )
+            for group in auxiliary_groups
+            for layer_name in group.layer_names
+        )
     elif csa_config := _get_kv_cache_config_csa_linear(
         vllm_config, kv_cache_groups, available_memory
     ):
@@ -2487,11 +2549,21 @@ def _max_memory_usage_bytes_from_groups(
             blocks_needed += cdiv(
                 spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
             )
+        for group in _glm5_next_auxiliary_attention_groups(kv_cache_groups):
+            if group.layer_names:
+                spec = group.kv_cache_spec
+                blocks_needed += cdiv(
+                    spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+                )
         if tail_names:
             # Tail: 1 block/req (KpoolTailSpec.max_admission_blocks_per_request
             # == 1), drawn from the shared pool.
             blocks_needed += 1
-        return blocks_needed * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+        return blocks_needed * (
+            len(mla_names) * mla_page
+            + len(idx_names) * idx_page
+            + _glm5_next_auxiliary_page_bytes(kv_cache_groups)
+        )
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
