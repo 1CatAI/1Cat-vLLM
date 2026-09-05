@@ -35,7 +35,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
-    is_global_first_rank,
+    is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -376,7 +376,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         interval = envs.VLLM_SM70_MTP_PROFILE_INTERVAL
         if calls != 1 and calls % interval != 0:
             return
-        if not is_global_first_rank():
+        # Profiling is enabled on the last PP stage only (see
+        # _sm70_v2_mtp_profile_enabled); report from that stage as well.
+        if not is_last_pp_first_tp_rank():
             return
 
         preferred = (

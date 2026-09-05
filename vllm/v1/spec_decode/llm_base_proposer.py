@@ -19,7 +19,7 @@ from vllm.config import (
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
-    is_global_first_rank,
+    is_last_pp_first_tp_rank,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -848,11 +848,9 @@ class SpecDecodeBaseProposer:
 
         if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
             return
-        try:
-            should_log = is_global_first_rank()
-        except RuntimeError:
-            should_log = True
-        if not should_log:
+        # The drafter lives on the last PP stage; the global first rank
+        # never runs it when PP > 1.
+        if not is_last_pp_first_tp_rank():
             return
 
         preferred = [

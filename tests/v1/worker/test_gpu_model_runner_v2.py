@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.distributed.parallel_state as parallel_state
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -47,7 +48,8 @@ def test_sm70_v2_mtp_profile_composes_target_verifier(monkeypatch):
 
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     monkeypatch.setenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "1")
-    monkeypatch.setattr(mrv2, "is_global_first_rank", lambda: True)
+    monkeypatch.setattr(parallel_state, "_PP", None)
+    monkeypatch.setattr(parallel_state, "_TP", None)
     ctx = {
         "events": [
             ("target_forward", FakeEvent(10.0), FakeEvent()),
@@ -68,6 +70,53 @@ def test_sm70_v2_mtp_profile_composes_target_verifier(monkeypatch):
     assert runner._sm70_v2_mtp_profile_totals["target_verifier_wall_cpu"] == 14.0
     assert runner._sm70_v2_mtp_profile_totals["draft_total"] == 5.0
     assert runner._sm70_v2_mtp_profile_totals["total_gpu"] == 20.0
+
+
+@pytest.mark.parametrize(
+    ("global_first", "pp_last", "tp_rank", "expected"),
+    [
+        pytest.param(False, True, 0, True, id="pp2-last-stage-leader"),
+        pytest.param(False, True, 1, False, id="pp2-last-stage-tp1"),
+        pytest.param(True, False, 0, False, id="pp2-first-stage"),
+    ],
+)
+def test_sm70_v2_mtp_profile_reports_from_last_pp_stage(
+    monkeypatch, global_first, pp_last, tp_rank, expected
+):
+    """Regression for #414: profiling is enabled on the last PP stage only,
+    so the report must not be gated on the global first rank."""
+
+    class FakeEvent:
+        def elapsed_time(self, end: "FakeEvent") -> float:
+            del end
+            return 1.0
+
+        def synchronize(self) -> None:
+            pass
+
+    runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    monkeypatch.setenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "1")
+    monkeypatch.setattr(
+        parallel_state, "_WORLD", SimpleNamespace(is_first_rank=global_first)
+    )
+    monkeypatch.setattr(parallel_state, "_PP", SimpleNamespace(is_last_rank=pp_last))
+    monkeypatch.setattr(parallel_state, "_TP", SimpleNamespace(rank_in_group=tp_rank))
+    messages: list[str] = []
+    monkeypatch.setattr(
+        mrv2.logger, "info", lambda msg, *args, **kwargs: messages.append(msg)
+    )
+    ctx = {
+        "events": [("target_forward", FakeEvent(), FakeEvent())],
+        "num_tokens": 1,
+        "num_draft_tokens": 0,
+        "target_verifier_wall_cpu": 1.0,
+        "total_wall_start": time.perf_counter(),
+    }
+
+    runner._sm70_v2_mtp_profile_report(ctx)
+
+    assert runner._sm70_v2_mtp_profile_totals["target_forward"] == 1.0
+    assert bool(messages) is expected
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
