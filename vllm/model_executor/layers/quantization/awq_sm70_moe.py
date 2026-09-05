@@ -11,6 +11,7 @@ from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -32,6 +33,40 @@ _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
 
 
+def _resolve_persistent_max_tokens(
+    max_num_seqs: int,
+    verifier_width: int = 1,
+    override: int = 0,
+) -> int:
+    """Size resident decode/verifier scratch up to the legacy ceiling."""
+    scheduler_cap = max(1, int(max_num_seqs)) * max(1, int(verifier_width))
+    requested_cap = int(override)
+    if requested_cap <= 0:
+        return min(scheduler_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
+    return min(requested_cap, _DEFAULT_PERSISTENT_MAX_TOKENS)
+
+
+def _persistent_max_tokens_for_runtime() -> int:
+    vllm_config = get_current_vllm_config_or_none()
+    scheduler_config = None if vllm_config is None else vllm_config.scheduler_config
+    max_num_seqs = (
+        _DEFAULT_PERSISTENT_MAX_TOKENS
+        if scheduler_config is None
+        else scheduler_config.max_num_seqs
+    )
+    speculative_config = None if vllm_config is None else vllm_config.speculative_config
+    verifier_width = (
+        speculative_config.num_speculative_state_tokens() + 1
+        if speculative_config is not None and speculative_config.method == "mtp"
+        else 1
+    )
+    return _resolve_persistent_max_tokens(
+        max_num_seqs,
+        verifier_width,
+        envs.VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS,
+    )
+
+
 def _log_runtime_route_once(message: str, *args) -> None:
     if torch.compiler.is_compiling():
         return
@@ -39,9 +74,9 @@ def _log_runtime_route_once(message: str, *args) -> None:
 
 
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
-    # CUDA graph replay is address-fixed. Use the per-layer persistent buffers
-    # during capture too, so the captured indexed MoE scratch/output lifetimes
-    # do not depend on graph-pool temporary allocation analysis.
+    # Dummy/profile and CUDA graph capture allocate temporary tensors. Captured
+    # addresses subsequently remain fixed in the graph pool; normal eager
+    # decode can reuse the smaller per-layer resident buffers below.
     return is_forward_context_available() and get_forward_context().is_dummy_run
 
 
@@ -754,11 +789,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = self.moe.experts_per_token
-        persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
+        persistent_tokens = _persistent_max_tokens_for_runtime()
         max_slots = persistent_tokens * top_k
         layer._awq_moe_buf_max_tokens = persistent_tokens
         layer._awq_moe_buf_max_slots = max_slots
         layer._awq_moe_buf_top_k = top_k
+        logger.info_once(
+            "SM70 AWQ MoE persistent scratch cap=%d tokens (legacy ceiling=%d).",
+            persistent_tokens,
+            _DEFAULT_PERSISTENT_MAX_TOKENS,
+        )
         layer._awq_moe_buf_output = torch.empty(
             persistent_tokens,
             layer.sm70_hidden_logical_size,
