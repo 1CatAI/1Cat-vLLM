@@ -700,6 +700,11 @@ class Qwen4ExpModel(nn.Module):
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
         ]
+        if not get_pp_group().is_last_rank:
+            # The final hyper-connection mixer only exists on the last
+            # pipeline rank (see __init__); other ranks must skip its
+            # checkpoint tensors instead of failing the load.
+            skip_substrs.append("hyper_connection_mixer.")
         loader = AutoWeightsLoader(
             self,
             skip_substrs=skip_substrs,
