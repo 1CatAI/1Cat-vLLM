@@ -917,7 +917,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # GPU workers keep only the scale required to dequantize the FP8 rows
         # returned by the CPU process. The embedding weights live exclusively
         # in that process.
-        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+        if (
+            envs.VLLM_PLE_CPU_OFFLOAD
+            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and not is_offload_process()
+        ):
             retained: set[str] = set()
             for name, loaded_weight in weights:
                 if name != "ngram_embedding.weight_scale":

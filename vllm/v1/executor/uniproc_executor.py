@@ -63,13 +63,17 @@ class UniProcExecutor(Executor):
         self.driver_worker.init_worker(all_kwargs=[kwargs])
         self.driver_worker.init_device()
 
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if envs.VLLM_PLE_CPU_OFFLOAD and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
             self.driver_worker.spawn_ple_offload()
+        elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+            self.driver_worker.prepare_ple_offload_spawn()
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.driver_worker.elastic_ep_execute("load_model")
         else:
             self.driver_worker.load_model()
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+            self.driver_worker.spawn_ple_offload()
         if envs.VLLM_PLE_CPU_OFFLOAD:
             self.driver_worker.wait_ple_offload_ready()
         current_platform.update_block_size_for_backend(self.vllm_config)

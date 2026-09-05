@@ -19,6 +19,11 @@ import torch
 
 import vllm._custom_ops as ops
 from vllm import _sm70_ops as sm70_ops
+from vllm import envs
+from vllm.model_executor.layers.quantization.awq_sm70_moe import (
+    _align_awq_input_dim,
+    _align_awq_output_dim,
+)
 
 Mode = Literal[
     "all",
@@ -30,6 +35,7 @@ Mode = Literal[
     "awq_moe_compile",
 ]
 MoEActual = Literal[
+    "indexed_prefill",
     "batched",
     "batched_per_expert_dispatch",
     "batched_w13_per_expert_dispatch",
@@ -137,7 +143,11 @@ def _load_awq_layer(
     with safe_open(model_path / filename, framework="pt", device="cpu") as f:
         qweight = f.get_tensor(f"{layer_prefix}.qweight").to(device).contiguous()
         qzeros = f.get_tensor(f"{layer_prefix}.qzeros").to(device).contiguous()
-        scales = f.get_tensor(f"{layer_prefix}.scales").to(device).contiguous()
+        scales = (
+            f.get_tensor(f"{layer_prefix}.scales")
+            .to(device=device, dtype=torch.float16)
+            .contiguous()
+        )
     return qweight, scales, qzeros
 
 
@@ -214,11 +224,113 @@ def _load_awq_moe_layer(
 
     return (
         torch.stack(w13_qweights),
-        torch.stack(w13_scales),
+        torch.stack(w13_scales).half(),
         torch.stack(w13_qzeros),
         torch.stack(w2_qweights),
-        torch.stack(w2_scales),
+        torch.stack(w2_scales).half(),
         torch.stack(w2_qzeros),
+    )
+
+
+def _prepare_awq_moe_checkpoint_for_tp(
+    tensors: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    tp_size: int,
+    tp_rank: int,
+    checkpoint_group_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+]:
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError("Invalid AWQ MoE TP size or rank.")
+    w13_qweight, w13_scales, w13_qzeros, w2_qweight, w2_scales, w2_qzeros = tensors
+    hidden_size = int(w13_qweight.shape[-2])
+    intermediate_size = int(w13_scales.shape[-1]) // 2
+    if intermediate_size % tp_size:
+        raise ValueError("AWQ intermediate size cannot be evenly sharded for TP.")
+    intermediate_size_per_partition = intermediate_size // tp_size
+    group_size = checkpoint_group_size
+    if hidden_size % group_size or intermediate_size_per_partition % group_size:
+        raise ValueError("AWQ dimensions must be divisible by the checkpoint group.")
+
+    w13_q_half = w13_qweight.shape[-1] // 2
+    w13_n_half = w13_scales.shape[-1] // 2
+    if w13_q_half % tp_size or w13_n_half % tp_size:
+        raise ValueError("AWQ W13 output cannot be evenly sharded for TP.")
+    q_start = tp_rank * (w13_q_half // tp_size)
+    q_end = (tp_rank + 1) * (w13_q_half // tp_size)
+    n_start = tp_rank * (w13_n_half // tp_size)
+    n_end = (tp_rank + 1) * (w13_n_half // tp_size)
+    w13_qweight = torch.cat(
+        (
+            w13_qweight[..., q_start:q_end],
+            w13_qweight[..., w13_q_half + q_start : w13_q_half + q_end],
+        ),
+        dim=-1,
+    ).contiguous()
+    w13_qzeros = torch.cat(
+        (
+            w13_qzeros[..., q_start:q_end],
+            w13_qzeros[..., w13_q_half + q_start : w13_q_half + q_end],
+        ),
+        dim=-1,
+    ).contiguous()
+    w13_scales = torch.cat(
+        (
+            w13_scales[..., n_start:n_end],
+            w13_scales[..., w13_n_half + n_start : w13_n_half + n_end],
+        ),
+        dim=-1,
+    ).contiguous()
+
+    w2_k = w2_qweight.shape[-2]
+    if w2_k % tp_size or (w2_k // tp_size) % group_size:
+        raise ValueError("AWQ W2 input cannot be evenly sharded by groups for TP.")
+    k_start = tp_rank * (w2_k // tp_size)
+    k_end = (tp_rank + 1) * (w2_k // tp_size)
+    group_start = k_start // group_size
+    group_end = k_end // group_size
+    w13_qweight, w13_scales, w13_qzeros, _ = _align_awq_output_dim(
+        w13_qweight,
+        w13_scales,
+        w13_qzeros,
+        8,
+        group_size * 2,
+    )
+    w2_qweight, w2_scales, w2_qzeros, _ = _align_awq_input_dim(
+        w2_qweight[..., k_start:k_end, :].contiguous(),
+        w2_scales[..., group_start:group_end, :].contiguous(),
+        w2_qzeros[..., group_start:group_end, :].contiguous(),
+        group_size,
+        group_size,
+    )
+    w2_qweight, w2_scales, w2_qzeros, _ = _align_awq_output_dim(
+        w2_qweight,
+        w2_scales,
+        w2_qzeros,
+        8,
+        group_size,
+    )
+    return (
+        w13_qweight,
+        w13_scales,
+        w13_qzeros,
+        w2_qweight,
+        w2_scales,
+        w2_qzeros,
+        group_size,
     )
 
 
@@ -683,8 +795,13 @@ def _prepare_awq_moe_weights(
     interleave_gated_silu: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     tm_weights, tm_scales, metas = [], [], []
+    prepare_awq = (
+        sm70_ops.awq_sm70_prepare_compact
+        if os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA") == "1"
+        else sm70_ops.awq_sm70_prepare
+    )
     for expert_id in range(qweights.shape[0]):
-        tm_weight, tm_scale, meta = sm70_ops.awq_sm70_prepare(
+        tm_weight, tm_scale, meta = prepare_awq(
             qweights[expert_id],
             scales[expert_id],
             qzeros[expert_id],
@@ -753,6 +870,118 @@ def _expert_offsets(
     offsets64[0] = 0
     torch.cumsum(counts, dim=0, out=offsets64[1:])
     return offsets64.to(torch.int32), offsets64
+
+
+def _service_moe_permute_inputs(
+    input: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run both production MoE permute forms and prove their row mapping agrees."""
+    for op_name in (
+        "moe_permute_with_scratch",
+        "moe_permute_metadata_with_scratch",
+        "moe_permute_sort_workspace_size",
+    ):
+        if not hasattr(torch.ops._moe_C, op_name):
+            raise RuntimeError(f"Required torch op _moe_C.{op_name} is unavailable.")
+
+    num_tokens, hidden_size = input.shape
+    topk_ids_i32 = topk_ids.to(torch.int32).contiguous()
+    top_k = int(topk_ids_i32.shape[1])
+    total_slots = num_tokens * top_k
+    token_expert_indices = torch.arange(
+        total_slots, dtype=torch.int32, device=input.device
+    ).view(num_tokens, top_k)
+    workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
+        total_slots, num_experts
+    )
+
+    def _scratch() -> dict[str, torch.Tensor]:
+        return {
+            "expert_offsets64": torch.empty(
+                num_experts + 1, dtype=torch.int64, device=input.device
+            ),
+            "inv_permuted_idx": torch.empty(
+                num_tokens, top_k, dtype=torch.int32, device=input.device
+            ),
+            "permuted_idx": torch.empty(
+                total_slots, dtype=torch.int32, device=input.device
+            ),
+            "sort_workspace": torch.empty(
+                workspace_size, dtype=torch.int8, device=input.device
+            ),
+            "permuted_experts_id": torch.empty(
+                total_slots, dtype=torch.int32, device=input.device
+            ),
+            "sorted_row_idx": torch.empty(
+                total_slots, dtype=torch.int32, device=input.device
+            ),
+            "topk_ids_for_sort": torch.empty(
+                total_slots, dtype=torch.int32, device=input.device
+            ),
+        }
+
+    materialized = torch.empty(
+        total_slots, hidden_size, dtype=input.dtype, device=input.device
+    )
+    materialized_scratch = _scratch()
+    torch.ops._moe_C.moe_permute_with_scratch(
+        input,
+        topk_ids_i32,
+        token_expert_indices,
+        None,
+        num_experts,
+        num_experts,
+        top_k,
+        materialized,
+        materialized_scratch["expert_offsets64"],
+        materialized_scratch["inv_permuted_idx"],
+        materialized_scratch["permuted_idx"],
+        materialized_scratch["sort_workspace"],
+        materialized_scratch["permuted_experts_id"],
+        materialized_scratch["sorted_row_idx"],
+        materialized_scratch["topk_ids_for_sort"],
+    )
+
+    metadata_scratch = _scratch()
+    input_row_indices = torch.empty(total_slots, dtype=torch.int32, device=input.device)
+    torch.ops._moe_C.moe_permute_metadata_with_scratch(
+        input,
+        topk_ids_i32,
+        token_expert_indices,
+        None,
+        num_experts,
+        num_experts,
+        top_k,
+        metadata_scratch["expert_offsets64"],
+        metadata_scratch["inv_permuted_idx"],
+        metadata_scratch["permuted_idx"],
+        input_row_indices,
+        metadata_scratch["sort_workspace"],
+        metadata_scratch["permuted_experts_id"],
+        metadata_scratch["sorted_row_idx"],
+        metadata_scratch["topk_ids_for_sort"],
+    )
+
+    if not torch.equal(
+        materialized_scratch["expert_offsets64"],
+        metadata_scratch["expert_offsets64"],
+    ):
+        raise AssertionError("Materialized and metadata MoE expert offsets differ.")
+    gathered = input[input_row_indices.to(torch.int64)]
+    if not torch.equal(materialized, gathered):
+        raise AssertionError(
+            "Metadata-only MoE row indices do not reproduce production permute."
+        )
+
+    expert_offsets64 = metadata_scratch["expert_offsets64"]
+    return (
+        materialized,
+        input_row_indices,
+        expert_offsets64.to(torch.int32),
+        expert_offsets64,
+    )
 
 
 def _make_logical_expert_ids(
@@ -934,11 +1163,15 @@ def _check_awq_moe(
     top_k: int,
     actual_impl: MoEActual,
     expert_pattern: str,
+    tp_size: int,
+    tp_rank: int,
 ) -> list[dict[str, Any]]:
     _require_torch_op("awq_sm70_prepare")
     _require_torch_op("awq_gemm_sm70")
     _require_torch_op("awq_moe_build_strided_ptrs")
     _require_torch_op("awq_moe_gemm_sm70_out")
+    if actual_impl == "indexed_prefill":
+        _require_torch_op("awq_moe_indexed_dense_w13_sm70_out")
     if actual_impl in (
         "batched",
         "batched_per_expert_dispatch",
@@ -965,6 +1198,8 @@ def _check_awq_moe(
         if m != 1:
             raise ValueError(f"{actual_impl} AWQ MoE check requires --m 1.")
 
+    checkpoint_group_size = group_size
+    loaded = _load_awq_moe_layer(awq_moe_model, awq_moe_layer, num_experts, device)
     (
         w13_qweight,
         w13_scales,
@@ -972,33 +1207,38 @@ def _check_awq_moe(
         w2_qweight,
         w2_scales,
         w2_qzeros,
-    ) = _load_awq_moe_layer(awq_moe_model, awq_moe_layer, num_experts, device)
+        group_size,
+    ) = _prepare_awq_moe_checkpoint_for_tp(
+        loaded,
+        tp_size,
+        tp_rank,
+        checkpoint_group_size,
+    )
+
+    w13_interleaved = bool(
+        actual_impl == "legacy_single_token_compact"
+        or (
+            envs.VLLM_SM70_AWQ_MOE_BATCHED_GEMM
+            and envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT
+            and hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
+        )
+    )
 
     w13_tm_weight, w13_tm_scales, w13_ptrs_w, w13_ptrs_s, w13_k_ld, w13_q_ld = (
-        _prepare_awq_moe_weights(w13_qweight, w13_scales, w13_qzeros, group_size)
-    )
-    w2_tm_weight, w2_tm_scales, w2_ptrs_w, w2_ptrs_s, w2_k_ld, w2_q_ld = (
-        _prepare_awq_moe_weights(w2_qweight, w2_scales, w2_qzeros, group_size)
-    )
-    if actual_impl == "legacy_single_token_compact":
-        (
-            _w13_legacy_tm_weight,
-            _w13_legacy_tm_scales,
-            w13_legacy_ptrs_w,
-            w13_legacy_ptrs_s,
-            _w13_legacy_k_ld,
-            _w13_legacy_q_ld,
-        ) = _prepare_awq_moe_weights(
+        _prepare_awq_moe_weights(
             w13_qweight,
             w13_scales,
             w13_qzeros,
             group_size,
-            interleave_gated_silu=True,
+            interleave_gated_silu=w13_interleaved,
         )
-    else:
-        _w13_legacy_tm_weight = w13_tm_weight
-        w13_legacy_ptrs_w = w13_ptrs_w
-        w13_legacy_ptrs_s = w13_ptrs_s
+    )
+    w2_tm_weight, w2_tm_scales, w2_ptrs_w, w2_ptrs_s, w2_k_ld, w2_q_ld = (
+        _prepare_awq_moe_weights(w2_qweight, w2_scales, w2_qzeros, group_size)
+    )
+    _w13_legacy_tm_weight = w13_tm_weight
+    w13_legacy_ptrs_w = w13_ptrs_w
+    w13_legacy_ptrs_s = w13_ptrs_s
 
     total_slots = m * top_k
     logical_expert_ids = _make_logical_expert_ids(
@@ -1013,7 +1253,29 @@ def _check_awq_moe(
     dense_expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
 
     hidden_size = int(w13_qweight.shape[1])
-    if actual_impl in AWQ_SINGLE_TOKEN_ACTUALS:
+    input_row_indices = None
+    if actual_impl == "indexed_prefill":
+        if (
+            num_experts != 512
+            or top_k != 10
+            or checkpoint_group_size != 32
+            or group_size != 32
+        ):
+            raise ValueError(
+                "indexed_prefill requires the Qwen3.8 E512/K10 AWQ g32 contract."
+            )
+        indexed_input = _make_input(m, hidden_size, device)
+        (
+            sorted_input,
+            input_row_indices,
+            expert_offsets,
+            expert_offsets64,
+        ) = _service_moe_permute_inputs(
+            indexed_input,
+            topk_ids,
+            num_experts,
+        )
+    elif actual_impl in AWQ_SINGLE_TOKEN_ACTUALS:
         single_token_input = _make_input(1, hidden_size, device)
         sorted_input = single_token_input.expand(total_slots, hidden_size).contiguous()
         sorted_input = sorted_input[order]
@@ -1035,7 +1297,22 @@ def _check_awq_moe(
     single_token_offsets64 = None
     single_token_inv_permuted_idx = None
     single_token_sorted_expert_ids = None
-    if actual_impl in (
+    if actual_impl == "indexed_prefill":
+        assert input_row_indices is not None
+        sm70_ops.awq_moe_indexed_dense_w13_sm70_out(
+            gate_up_actual,
+            indexed_input,
+            input_row_indices,
+            expert_offsets,
+            dense_expert_ids,
+            w13_ptrs_w,
+            w13_ptrs_s,
+            num_experts,
+            int(w13_tm_weight.shape[1]),
+            w13_n,
+            group_size,
+        )
+    elif actual_impl in (
         "batched",
         "batched_per_expert_dispatch",
         "batched_w13_per_expert_dispatch",
@@ -1197,25 +1474,45 @@ def _check_awq_moe(
             w13_q_ld,
             w13_n,
         )
-    gate_up_expected = _dense_awq_moe_stage(
-        sorted_input,
-        expert_offsets64,
-        w13_tm_weight,
-        w13_tm_scales,
-        group_size,
-        w13_k_ld,
-        w13_q_ld,
-        w13_n,
-    )
+    if actual_impl == "indexed_prefill":
+        gate_up_expected = torch.empty_like(gate_up_actual)
+        sm70_ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
+            gate_up_expected,
+            sorted_input,
+            expert_offsets,
+            w13_ptrs_w,
+            w13_ptrs_s,
+            num_experts,
+            int(w13_tm_weight.shape[1]),
+            w13_n,
+            group_size,
+            False,
+        )
+    else:
+        gate_up_expected = _dense_awq_moe_stage(
+            sorted_input,
+            expert_offsets64,
+            w13_tm_weight,
+            w13_tm_scales,
+            group_size,
+            w13_k_ld,
+            w13_q_ld,
+            w13_n,
+        )
 
     if intermediate_actual is None:
         intermediate_actual = torch.empty(
             (total_slots, intermediate_size), dtype=torch.float16, device=device
         )
     intermediate_expected = torch.empty_like(intermediate_actual)
+    silu_and_mul = (
+        sm70_ops.silu_and_mul_interleaved
+        if w13_interleaved
+        else torch.ops._C.silu_and_mul
+    )
     if actual_impl != "legacy_single_token_compact":
-        torch.ops._C.silu_and_mul(intermediate_actual, gate_up_actual)
-    torch.ops._C.silu_and_mul(intermediate_expected, gate_up_expected)
+        silu_and_mul(intermediate_actual, gate_up_actual)
+    silu_and_mul(intermediate_expected, gate_up_expected)
 
     if sorted_output_actual is None:
         sorted_output_actual = torch.empty(
@@ -1235,6 +1532,7 @@ def _check_awq_moe(
             False,
         )
     elif actual_impl in (
+        "indexed_prefill",
         "batched_per_expert_dispatch",
         "batched_w2_per_expert_dispatch",
     ):
@@ -1323,16 +1621,31 @@ def _check_awq_moe(
             w2_q_ld,
             hidden_out,
         )
-    sorted_output_expected = _dense_awq_moe_stage(
-        intermediate_expected,
-        expert_offsets64,
-        w2_tm_weight,
-        w2_tm_scales,
-        group_size,
-        w2_k_ld,
-        w2_q_ld,
-        hidden_out,
-    )
+    if actual_impl == "indexed_prefill":
+        sorted_output_expected = torch.empty_like(sorted_output_actual)
+        sm70_ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
+            sorted_output_expected,
+            intermediate_expected,
+            expert_offsets,
+            w2_ptrs_w,
+            w2_ptrs_s,
+            num_experts,
+            int(w2_tm_weight.shape[1]),
+            hidden_out,
+            group_size,
+            False,
+        )
+    else:
+        sorted_output_expected = _dense_awq_moe_stage(
+            intermediate_expected,
+            expert_offsets64,
+            w2_tm_weight,
+            w2_tm_scales,
+            group_size,
+            w2_k_ld,
+            w2_q_ld,
+            hidden_out,
+        )
     if actual_impl == "legacy_single_token_compact":
         assert final_output_actual is not None
         assert single_token_inv_permuted_idx is not None
@@ -1418,6 +1731,22 @@ def _check_awq_moe(
                 stage="final_weighted_output",
                 layer=awq_moe_layer,
             )
+        )
+    for result in results:
+        result.update(
+            {
+                "checkpoint_group_size": checkpoint_group_size,
+                "effective_group_size": group_size,
+                "tp_size": tp_size,
+                "tp_rank": tp_rank,
+                "w13_interleaved": w13_interleaved,
+                "weight_scale_dtype": str(w13_scales.dtype),
+                "reference_impl": (
+                    "materialized_per_expert_dispatch"
+                    if actual_impl == "indexed_prefill"
+                    else "per_expert_dense"
+                ),
+            }
         )
     return results
 
@@ -2536,9 +2865,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--awq-moe-num-experts", type=int, default=256)
     parser.add_argument("--awq-moe-top-k", type=int, default=8)
+    parser.add_argument("--awq-moe-tp-size", type=int, default=1)
+    parser.add_argument("--awq-moe-tp-rank", type=int, default=0)
     parser.add_argument(
         "--awq-moe-actual",
         choices=[
+            "indexed_prefill",
             "batched",
             "batched_per_expert_dispatch",
             "batched_w13_per_expert_dispatch",
@@ -2723,6 +3055,8 @@ def main() -> int:
                             args.awq_moe_top_k,
                             awq_moe_actual,
                             moe_expert_pattern,
+                            args.awq_moe_tp_size,
+                            args.awq_moe_tp_rank,
                         )
                     )
         if mode == "awq_moe_graph_replay":
@@ -2789,8 +3123,11 @@ def main() -> int:
         "awq_moe_layers": awq_moe_layers,
         "awq_moe_num_experts": args.awq_moe_num_experts,
         "awq_moe_top_k": args.awq_moe_top_k,
+        "awq_moe_tp_size": args.awq_moe_tp_size,
+        "awq_moe_tp_rank": args.awq_moe_tp_rank,
         "awq_moe_actual": awq_moe_actual,
         "awq_moe_dispatch_policy_env": os.getenv("VLLM_SM70_AWQ_MOE_DISPATCH_POLICY"),
+        "awq_moe_compact_metadata_env": os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA"),
         "fp8_model": str(args.fp8_model) if args.fp8_model else None,
         "fp8_layer": args.fp8_layer,
         "fp8_moe_model": str(args.fp8_moe_model) if args.fp8_moe_model else None,

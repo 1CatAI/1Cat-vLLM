@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
+//
+// The MXFP4 M=1 quadpair-N m8n8k4 layout is derived from dnv2003/v100-skinny
+// (MIT). See LICENSE.v100-skinny in this directory for the retained MIT notice.
 
 #include <torch/all.h>
 

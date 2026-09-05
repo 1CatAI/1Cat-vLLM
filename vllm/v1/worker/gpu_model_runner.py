@@ -8133,6 +8133,44 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _compute_force_uniform_decode(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool | None:
+        """Reject uniform-decode dispatch for hybrid-model prefills.
+
+        A prefill can have the same shape as a uniform decode batch, notably
+        when its scheduled token count equals ``1 + num_speculative_tokens``.
+        Hybrid backends keep recurrent state and must run that row through the
+        prefill path. Derive the phase from this iteration's scheduler output
+        rather than ``input_batch`` so the early PP+SP caller observes the
+        current step as well.
+
+        ``None`` preserves the normal shape heuristic. ``False`` is only
+        returned when a hybrid batch contains an unfinished prompt.
+        """
+        if not self.model_config.is_hybrid:
+            return None
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                new_req.prompt_token_ids,
+                new_req.prompt_embeds,
+            )
+            if new_req.num_computed_tokens < num_prompt_tokens:
+                return False
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for req_id, num_computed_tokens in zip(
+            cached_reqs.req_ids,
+            cached_reqs.num_computed_tokens,
+            strict=True,
+        ):
+            if num_computed_tokens < self.requests[req_id].num_prompt_tokens:
+                return False
+
+        return None
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -8575,6 +8613,9 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_uniform_decode=self._compute_force_uniform_decode(
+                    scheduler_output
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
             if trace_log:

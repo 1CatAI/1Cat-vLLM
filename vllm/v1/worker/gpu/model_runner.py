@@ -44,6 +44,11 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.offloader import (
+    create_offloader,
+    get_offloader,
+    set_offloader,
+)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -295,6 +300,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
 
+        set_offloader(create_offloader(self.vllm_config.offload_config))
+
     def _sm70_v2_mtp_profile_enabled(self) -> bool:
         return (
             self.speculative_config is not None
@@ -499,6 +506,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=self.model_config.dtype,
                 device=self.device,
             )
+
+        get_offloader().post_init()
 
     def get_model(self) -> nn.Module:
         return self.model
@@ -889,6 +898,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
+        prepare_decode_graph_model = getattr(
+            self.model, "prepare_sm70_decode_graph_model", None
+        )
+        if prepare_decode_graph_model is not None:
+            prepare_decode_graph_model()
         with self.maybe_setup_dummy_loras(self.lora_config):
             captured_attn_states = self.cudagraph_manager.capture(
                 self.model,
@@ -1477,6 +1491,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run,
+                use_local_model=batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.

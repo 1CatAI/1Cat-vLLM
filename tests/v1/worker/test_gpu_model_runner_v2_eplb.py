@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from vllm.config.offload import OffloadConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.gpu import eplb_utils as eplb
 from vllm.v1.worker.gpu import model_runner as mrv2
@@ -65,6 +66,7 @@ def _make_runner(**overrides: Any) -> Any:
     runner.vllm_config = SimpleNamespace(
         load_config=runner.load_config,
         model_config=runner.model_config,
+        offload_config=OffloadConfig(),
     )
     runner.lora_config = None
     runner.use_aux_hidden_state_outputs = False
@@ -84,9 +86,45 @@ def _make_runner(**overrides: Any) -> Any:
     runner.eplb = eplb.EPLBController(runner.parallel_config, runner.device)
     runner.pooling_runner = None
     runner.execute_model_state = None
+    runner._sm70_v2_mtp_profile_pending = None
     for key, value in overrides.items():
         setattr(runner, key, value)
     return runner
+
+
+def test_v2_load_model_finalizes_offloader_after_model_construction(monkeypatch):
+    FakeEplbState.instances.clear()
+    events: list[str] = []
+    model = SimpleNamespace(is_moe=False)
+
+    def load_model(**kwargs):
+        events.append("load_model")
+        return model
+
+    def init_model_state(*args):
+        events.append("init_model_state")
+        return "model-state"
+
+    offloader = SimpleNamespace(post_init=lambda: events.append("post_init"))
+
+    monkeypatch.setattr(mrv2, "DeviceMemoryProfiler", FakeMemoryProfiler)
+    monkeypatch.setattr(eplb, "EplbState", FakeEplbState)
+    monkeypatch.setattr(
+        mrv2,
+        "get_model_loader",
+        lambda load_config: SimpleNamespace(load_model=load_model),
+    )
+    monkeypatch.setattr(mrv2, "get_offloader", lambda: offloader)
+    monkeypatch.setattr(mrv2, "prepare_communication_buffer_for_model", lambda *_: None)
+    monkeypatch.setattr(mrv2, "init_model_state", init_model_state)
+    monkeypatch.setattr(eplb, "is_mixture_of_experts", lambda *_: False)
+
+    runner = _make_runner()
+    mrv2.GPUModelRunner.load_model(runner)
+
+    assert runner.model is model
+    assert runner.model_state == "model-state"
+    assert events == ["load_model", "init_model_state", "post_init"]
 
 
 def test_v2_load_model_registers_moe_with_eplb(monkeypatch):

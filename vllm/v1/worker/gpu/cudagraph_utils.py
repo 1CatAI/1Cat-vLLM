@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import (
@@ -465,14 +466,17 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens, has_lora=has_lora
                     )
-                with set_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens,
-                    cudagraph_runtime_mode=cg_mode,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    slot_mapping=slot_mappings,
-                    batch_descriptor=batch_descriptor,
+                with (
+                    sm70_decode_graph_compilation(desc.cg_mode == CUDAGraphMode.FULL),
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens,
+                        cudagraph_runtime_mode=cg_mode,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        slot_mapping=slot_mappings,
+                        batch_descriptor=batch_descriptor,
+                    ),
                 ):
                     model_output = model(**model_inputs)
 
