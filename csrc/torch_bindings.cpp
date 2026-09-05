@@ -540,6 +540,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _gate_weight) -> ()");
   ops.impl("sm70_f16_gate_mul_out", torch::kCUDA, &sm70_f16_gate_mul_out);
 
+  ops.def(
+      "qwen38_shared_gate_exact_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight) -> ()");
+  ops.impl("qwen38_shared_gate_exact_out", torch::kCUDA,
+           &qwen38_shared_gate_exact_out);
+
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
 
@@ -754,6 +760,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_moe_qpn_raw_w2_reduce_sm70_out", torch::kCUDA,
            &nvfp4_moe_qpn_raw_w2_reduce_sm70_out);
 
+  ops.def(
+      "nvfp4_qwen38_w2_direct_reduce_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor topk_weights) -> ()");
+  ops.impl("nvfp4_qwen38_w2_direct_reduce_out", torch::kCUDA,
+           &nvfp4_qwen38_w2_direct_reduce_out);
+
+  ops.def(
+      "nvfp4_qwen38_w13_fused_swiglu_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids) -> ()");
+  ops.impl("nvfp4_qwen38_w13_fused_swiglu_out", torch::kCUDA,
+           &nvfp4_qwen38_w13_fused_swiglu_out);
+
   // Keep the five-row verifier on a distinct schema so an old extension that
   // only supports the ten-route M=1 contract cannot be selected accidentally.
   ops.def(
@@ -960,6 +980,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def(
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);
+  custom_ar.def(
+      "sm70_qwen38_hc_down_allgather(int fa, Tensor inp, Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_down_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_down_allgather);
+  custom_ar.def(
+      "sm70_qwen38_hc_gate_mix(int fa, Tensor local_gate, Tensor branches, "
+      "Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_gate_mix", torch::kCUDA,
+                 &sm70_qwen38_hc_gate_mix);
+  custom_ar.def(
+      "sm70_qwen38_hc_output_allgather(int fa, Tensor local_block, "
+      "Tensor! out) -> ()");
+  custom_ar.impl("sm70_qwen38_hc_output_allgather", torch::kCUDA,
+                 &sm70_qwen38_hc_output_allgather);
   custom_ar.def(
       "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");

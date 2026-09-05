@@ -145,6 +145,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
         sequence_lengths: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
@@ -188,6 +189,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             qsa_metadata["query_positions"] = query_positions[:num_tokens]
         if sequence_lengths is not None:
             qsa_metadata["sequence_lengths"] = sequence_lengths
+        if output_gate is not None:
+            qsa_metadata["output_gate"] = output_gate[:num_tokens]
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -514,6 +517,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         key: torch.Tensor,
         value: torch.Tensor,
         output: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
     ) -> None:
         if not self._qsa_kv_scales_finalized:
             raise RuntimeError(
@@ -577,6 +581,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            output_gate=output_gate,
             query_positions=side_metadata.logical_positions,
             sequence_lengths=side_metadata.seq_lens,
         )
@@ -609,6 +614,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key,
                 value,
                 attn_output,
+                gate,
                 encoded_layer_name,
             )
         else:
@@ -619,11 +625,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key,
                 value,
                 attn_output,
+                gate,
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        if gate is not None:
-            flat_output = flat_output * torch.sigmoid(gate)
         projected_output, _ = self.o_proj(flat_output)
         if output is not None:
             output.copy_(projected_output)
@@ -637,6 +642,7 @@ def qwen4_exp_qsa_with_output(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
     """Run the complete QSA state/update/attend transaction."""
@@ -652,6 +658,7 @@ def qwen4_exp_qsa_with_output(
         key,
         value,
         output,
+        output_gate,
     )
 
 
@@ -662,9 +669,10 @@ def qwen4_exp_qsa_with_output_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
+    output_gate: torch.Tensor | None,
     layer_name: LayerNameType,
 ) -> None:
-    del hidden_states, positions, query, key, value, output, layer_name
+    del hidden_states, positions, query, key, value, output, output_gate, layer_name
 
 
 direct_register_custom_op(

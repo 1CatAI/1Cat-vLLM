@@ -168,6 +168,24 @@ def has_nvfp4_qpn_raw_scale_dispatch() -> bool:
     )
 
 
+def has_nvfp4_qwen38_w2_direct_reduce() -> bool:
+    return hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w2_direct_reduce_out") or hasattr(
+        torch.ops._C, "nvfp4_qwen38_w2_direct_reduce_out"
+    )
+
+
+def has_nvfp4_qwen38_w13_fused_swiglu() -> bool:
+    return hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w13_fused_swiglu_out") or hasattr(
+        torch.ops._C, "nvfp4_qwen38_w13_fused_swiglu_out"
+    )
+
+
+def has_qwen38_shared_gate_exact() -> bool:
+    return hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out") or hasattr(
+        torch.ops._C, "qwen38_shared_gate_exact_out"
+    )
+
+
 def has_nvfp4_qpn_mtp5_dispatch() -> bool:
     """Reject extensions that only implement the legacy ten-route kernel."""
     return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
@@ -1849,6 +1867,33 @@ if hasattr(torch.ops._C, "nvfp4_moe_qpn_raw_scale_sm70_out"):
         return None
 
 
+def nvfp4_qwen38_w2_direct_reduce_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_qwen38_w2_direct_reduce_out")(
+        out, input, weights, scales, expert_ids, topk_weights
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_w2_direct_reduce_out"):
+
+    @register_fake("_C::nvfp4_qwen38_w2_direct_reduce_out")
+    def _nvfp4_qwen38_w2_direct_reduce_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        return None
+
+
 if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_raw_scale_sm70_out"):
 
     @register_fake("_C_qwen38::nvfp4_moe_qpn_raw_scale_sm70_out")
@@ -1862,6 +1907,20 @@ if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_raw_scale_sm70_out"):
         broadcast_input: bool,
         interleaved_w13: bool,
         split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w2_direct_reduce_out"):
+
+    @register_fake("_C_qwen38::nvfp4_qwen38_w2_direct_reduce_out")
+    def _nvfp4_qwen38_w2_direct_reduce_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
     ) -> None:
         return None
 
@@ -1898,6 +1957,74 @@ for _raw_namespace, _raw_prefix in (
             expert_ids,
             topk_weights: None
         )
+
+
+def nvfp4_qwen38_w13_fused_swiglu_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_qwen38_w13_fused_swiglu_out")(
+        out, input, weights, scales, expert_ids
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_w13_fused_swiglu_out"):
+
+    @register_fake("_C::nvfp4_qwen38_w13_fused_swiglu_out")
+    def _nvfp4_qwen38_w13_fused_swiglu_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_qwen38_w13_fused_swiglu_out"):
+
+    @register_fake("_C_qwen38::nvfp4_qwen38_w13_fused_swiglu_out")
+    def _nvfp4_qwen38_w13_fused_swiglu_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def qwen38_shared_gate_exact_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _qwen38_qpn8_op("qwen38_shared_gate_exact_out")(out, input, weight)
+
+
+if hasattr(torch.ops._C, "qwen38_shared_gate_exact_out"):
+
+    @register_fake("_C::qwen38_shared_gate_exact_out")
+    def _qwen38_shared_gate_exact_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "qwen38_shared_gate_exact_out"):
+
+    @register_fake("_C_qwen38::qwen38_shared_gate_exact_out")
+    def _qwen38_shared_gate_exact_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> None:
+        return None
 
 
 def nvfp4_moe_qpn_mtp5_sm70_out(

@@ -14,6 +14,58 @@
 
 namespace {
 
+constexpr int kQwen38SharedGateHidden = 2560;
+constexpr int kQwen38SharedGateThreads = 256;
+
+__device__ __forceinline__ float qwen38_shared_gate_warp_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = __fadd_rn(value, __shfl_down_sync(0xffffffffU, value, offset));
+  }
+  return value;
+}
+
+__global__ void qwen38_shared_gate_exact_kernel(
+    half* __restrict__ output, const half* __restrict__ input,
+    const half* __restrict__ weight) {
+  constexpr int kValuesPerThread =
+      kQwen38SharedGateHidden / kQwen38SharedGateThreads;
+  const int tid = threadIdx.x;
+  float value = 0.0f;
+#pragma unroll
+  for (int item = 0; item < kValuesPerThread; ++item) {
+    const int index = tid + item * kQwen38SharedGateThreads;
+    value = __fmaf_rn(__half2float(input[index]), __half2float(weight[index]),
+                      value);
+  }
+  value = qwen38_shared_gate_warp_sum(value);
+
+  __shared__ float warp_partials[kQwen38SharedGateThreads / 32];
+  __shared__ half shared_gate;
+  if ((tid & 31) == 0) {
+    warp_partials[tid >> 5] = value;
+  }
+  __syncthreads();
+  if (tid < 32) {
+    value = tid < kQwen38SharedGateThreads / 32 ? warp_partials[tid] : 0.0f;
+    value = qwen38_shared_gate_warp_sum(value);
+    if (tid == 0) {
+      // Preserve the eager FP16 linear and sigmoid materialization points.
+      const half linear = __float2half_rn(value);
+      const float rounded_linear = __half2float(linear);
+      shared_gate = __float2half_rn(1.0f / (1.0f + __expf(-rounded_linear)));
+    }
+  }
+  __syncthreads();
+
+  const half2 gate = __half2half2(shared_gate);
+  auto* output2 = reinterpret_cast<half2*>(output);
+  for (int index = tid; index < kQwen38SharedGateHidden / 2;
+       index += blockDim.x) {
+    output2[index] = __hmul2(output2[index], gate);
+  }
+}
+
 __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
                                                half2 out[4]) {
   constexpr unsigned kSign = 0x80008000u;
@@ -141,7 +193,7 @@ __global__ void mxfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   }
 }
 
-template <int kSplitK>
+template <int kSplitK, bool kFusedSwiGLU = false>
 __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
                                          const uint32_t* __restrict__ weights,
                                          const half* __restrict__ scales,
@@ -156,7 +208,12 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   const int route = blockIdx.y;
   const int expert = __ldg(expert_ids + route);
   if (expert < 0 || expert >= 512) {
-    if (threadIdx.x < 32) {
+    if constexpr (kFusedSwiGLU) {
+      if (threadIdx.x < 16) {
+        output[static_cast<size_t>(route) * (n / 2) + tile * 16 + threadIdx.x] =
+            __float2half(0.0f);
+      }
+    } else if (threadIdx.x < 32) {
       output[static_cast<size_t>(route) * n + tile * 32 + threadIdx.x] =
           __float2half(0.0f);
     }
@@ -241,8 +298,120 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
     for (int k_warp = 0; k_warp < kSplitK; ++k_warp) {
       value += partials[k_warp][lane];
     }
-    output[static_cast<size_t>(route) * n + tile * 32 + lane] =
-        __float2half(value);
+    const half rounded = __float2half(value);
+    if constexpr (kFusedSwiGLU) {
+      const int source_lane = (lane & 15) * 2;
+      const unsigned rounded_bits = __half_as_ushort(rounded);
+      const half gate = __ushort_as_half(static_cast<unsigned short>(
+          __shfl_sync(0xffffffffu, rounded_bits, source_lane)));
+      const half up = __ushort_as_half(static_cast<unsigned short>(
+          __shfl_sync(0xffffffffu, rounded_bits, source_lane + 1)));
+      if (lane < 16) {
+        const float gate_f = __half2float(gate);
+        const half silu = __float2half(gate_f / (1.0f + expf(-gate_f)));
+        output[static_cast<size_t>(route) * (n / 2) + tile * 16 + lane] =
+            __hmul(silu, up);
+      }
+    } else {
+      output[static_cast<size_t>(route) * n + tile * 32 + lane] = rounded;
+    }
+  }
+}
+
+// Qwen3.8 TP4 has ten K160 -> N2560 W2 routes. Keeping one route per warp
+// retains split-K=1 accumulation, while grouping all routes for one N32 tile
+// lets the CTA reduce them directly. Each route is rounded through FP16 before
+// weighting, matching the former W2-output plus Triton-reduce path bit for bit.
+__global__ void nvfp4_qwen38_w2_direct_reduce_kernel(
+    const half* __restrict__ input, const uint32_t* __restrict__ weights,
+    const half* __restrict__ scales, const int32_t* __restrict__ expert_ids,
+    const float* __restrict__ topk_weights, half* __restrict__ output) {
+  constexpr int kRoutes = 10;
+  constexpr int kK = 160;
+  constexpr int kN = 2560;
+  constexpr int kExperts = 512;
+  __shared__ half route_outputs[kRoutes][32];
+
+  const int lane = threadIdx.x & 31;
+  const int route = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int expert = __ldg(expert_ids + route);
+  float accum[8] = {};
+
+  if (expert >= 0 && expert < kExperts) {
+    const int quadpair = (lane >> 2) & 3;
+    const int a_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+    const int packed_col =
+        ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+    constexpr int kGroupsK16 = kK >> 4;
+    constexpr int kGroupsK8 = kK >> 3;
+    constexpr int kTilesN32 = kN >> 5;
+    constexpr size_t kWordsPerExpert = static_cast<size_t>(kK) * kN / 8;
+    constexpr size_t kScalesPerExpert = static_cast<size_t>(kK >> 4) * kN;
+    const uint32_t* expert_weights =
+        weights + static_cast<size_t>(expert) * kWordsPerExpert;
+    const half* expert_scales =
+        scales + static_cast<size_t>(expert) * kScalesPerExpert;
+    const half* input_row = input + static_cast<size_t>(route) * kK;
+
+#pragma unroll
+    for (int group = 0; group < kGroupsK16; ++group) {
+      const size_t tile_group_base =
+          (static_cast<size_t>(tile) * kGroupsK8 + group * 2) * 32 + packed_col;
+      const unsigned packed0 = __ldcs(expert_weights + tile_group_base);
+      const unsigned packed1 = __ldcs(expert_weights + tile_group_base + 32);
+      const size_t scale_index =
+          (static_cast<size_t>(group) * kTilesN32 + tile) * 32 + packed_col;
+      const half scalar = __ldg(expert_scales + scale_index);
+      const half2 scale =
+          __hmul2(__halves2half2(scalar, scalar), __float2half2_rn(16384.0f));
+      half2 decoded[8];
+      dequant_e2m1x8(packed0, scale, decoded);
+      dequant_e2m1x8(packed1, scale, decoded + 4);
+      const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
+
+      uint4 input01 = make_uint4(0, 0, 0, 0);
+      uint4 input23 = make_uint4(0, 0, 0, 0);
+      if (a_row == 0) {
+        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
+      }
+      const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+      const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+      VLLM_SM70_MMA_8N8K4(accum, a0[0], a0[1], b[0], b[1]);
+      VLLM_SM70_MMA_8N8K4(accum, a0[2], a0[3], b[2], b[3]);
+      VLLM_SM70_MMA_8N8K4(accum, a1[0], a1[1], b[4], b[5]);
+      VLLM_SM70_MMA_8N8K4(accum, a1[2], a1[3], b[6], b[7]);
+    }
+
+    if ((lane & 17) == 0) {
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+        for (int offset = 0; offset < 2; ++offset) {
+          const int index = pair * 4 + offset;
+          const int local_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+          route_outputs[route][quadpair * 8 + local_col] =
+              __float2half(accum[index]);
+        }
+      }
+    }
+  } else if (lane < 4) {
+#pragma unroll
+    for (int offset = 0; offset < 8; ++offset) {
+      route_outputs[route][lane * 8 + offset] = __float2half(0.0f);
+    }
+  }
+  __syncthreads();
+
+  if (route == 0) {
+    float weighted = 0.0f;
+#pragma unroll
+    for (int selected = 0; selected < kRoutes; ++selected) {
+      weighted = fmaf(__ldg(topk_weights + selected),
+                      __half2float(route_outputs[selected][lane]), weighted);
+    }
+    output[tile * 32 + lane] = __float2half(weighted);
   }
 }
 
@@ -706,6 +875,25 @@ void launch_nvfp4_qpn_raw_scale(torch::Tensor out, torch::Tensor input,
           broadcast_input, interleaved_w13);
 }
 
+void launch_nvfp4_qwen38_w13_fused_swiglu(torch::Tensor out,
+                                          torch::Tensor input,
+                                          torch::Tensor weights,
+                                          torch::Tensor scales,
+                                          torch::Tensor expert_ids) {
+  constexpr int kN = 320;
+  constexpr int kK = 2560;
+  constexpr int kSplitK = 16;
+  const int routes = static_cast<int>(expert_ids.numel());
+  nvfp4_qpn_m1_sm70_kernel<kSplitK, true>
+      <<<dim3(kN / 32, routes), 32 * kSplitK, 0,
+         at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+          reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+          reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+          expert_ids.data_ptr<int32_t>(),
+          reinterpret_cast<half*>(out.data_ptr<at::Half>()), kN, kK, true);
+}
+
 void dispatch_nvfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
                            torch::Tensor weights, torch::Tensor scales,
                            torch::Tensor expert_ids, bool broadcast_input,
@@ -973,6 +1161,112 @@ void nvfp4_moe_qpn_raw_scale_sm70_out(torch::Tensor out, torch::Tensor input,
   dispatch_nvfp4_qpn_raw_scale(out, input, weights, scale_codes, global_scales,
                                expert_ids, broadcast_input, interleaved_w13,
                                split_k);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_qwen38_w2_direct_reduce_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids,
+                                       torch::Tensor topk_weights) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && weights.is_cuda() &&
+                  scales.is_cuda() && expert_ids.is_cuda() &&
+                  topk_weights.is_cuda(),
+              "nvfp4_qwen38_w2_direct_reduce_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weights.scalar_type() == torch::kInt32 &&
+                  scales.scalar_type() == torch::kFloat16 &&
+                  expert_ids.scalar_type() == torch::kInt32 &&
+                  topk_weights.scalar_type() == torch::kFloat32,
+              "nvfp4_qwen38_w2_direct_reduce_out: dtype mismatch");
+  TORCH_CHECK(out.is_contiguous() && input.is_contiguous() &&
+                  weights.is_contiguous() && scales.is_contiguous() &&
+                  expert_ids.is_contiguous() && topk_weights.is_contiguous(),
+              "nvfp4_qwen38_w2_direct_reduce_out: tensors must be contiguous");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  input.sizes() == torch::IntArrayRef({10, 160}) &&
+                  weights.sizes() == torch::IntArrayRef({512, 160, 320}) &&
+                  scales.sizes() == torch::IntArrayRef({512, 10, 2560}) &&
+                  expert_ids.numel() == 10 && topk_weights.numel() == 10,
+              "nvfp4_qwen38_w2_direct_reduce_out: shape mismatch");
+  TORCH_CHECK(input.get_device() == out.get_device() &&
+                  input.get_device() == weights.get_device() &&
+                  input.get_device() == scales.get_device() &&
+                  input.get_device() == expert_ids.get_device() &&
+                  input.get_device() == topk_weights.get_device(),
+              "nvfp4_qwen38_w2_direct_reduce_out: device mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  nvfp4_qwen38_w2_direct_reduce_kernel<<<80, 320, 0,
+                                         at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+      reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+      expert_ids.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_qwen38_w13_fused_swiglu_out(torch::Tensor out, torch::Tensor input,
+                                       torch::Tensor weights,
+                                       torch::Tensor scales,
+                                       torch::Tensor expert_ids) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && weights.is_cuda() &&
+                  scales.is_cuda() && expert_ids.is_cuda(),
+              "nvfp4_qwen38_w13_fused_swiglu_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weights.scalar_type() == torch::kInt32 &&
+                  scales.scalar_type() == torch::kFloat16 &&
+                  expert_ids.scalar_type() == torch::kInt32,
+              "nvfp4_qwen38_w13_fused_swiglu_out: dtype mismatch");
+  TORCH_CHECK(out.is_contiguous() && input.is_contiguous() &&
+                  weights.is_contiguous() && scales.is_contiguous() &&
+                  expert_ids.is_contiguous(),
+              "nvfp4_qwen38_w13_fused_swiglu_out: tensors must be contiguous");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({10, 160}) &&
+                  input.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  weights.sizes() == torch::IntArrayRef({512, 2560, 40}) &&
+                  scales.sizes() == torch::IntArrayRef({512, 160, 320}) &&
+                  expert_ids.numel() == 10,
+              "nvfp4_qwen38_w13_fused_swiglu_out: shape mismatch");
+  TORCH_CHECK(input.get_device() == out.get_device() &&
+                  input.get_device() == weights.get_device() &&
+                  input.get_device() == scales.get_device() &&
+                  input.get_device() == expert_ids.get_device(),
+              "nvfp4_qwen38_w13_fused_swiglu_out: device mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  launch_nvfp4_qwen38_w13_fused_swiglu(out, input, weights, scales, expert_ids);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
+                                  torch::Tensor weight) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && weight.is_cuda(),
+              "qwen38_shared_gate_exact_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weight.scalar_type() == torch::kFloat16,
+              "qwen38_shared_gate_exact_out: tensors must be float16");
+  TORCH_CHECK(
+      out.is_contiguous() && input.is_contiguous() && weight.is_contiguous(),
+      "qwen38_shared_gate_exact_out: tensors must be contiguous");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  input.sizes() == torch::IntArrayRef({1, 2560}) &&
+                  weight.sizes() == torch::IntArrayRef({1, 2560}),
+              "qwen38_shared_gate_exact_out: expected M1/N1/K2560 tensors");
+  TORCH_CHECK(out.get_device() == input.get_device() &&
+                  out.get_device() == weight.get_device(),
+              "qwen38_shared_gate_exact_out: device mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  qwen38_shared_gate_exact_kernel<<<1, kQwen38SharedGateThreads, 0,
+                                    at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

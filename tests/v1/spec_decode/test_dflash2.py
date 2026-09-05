@@ -244,6 +244,19 @@ def test_sm70_tp4_push_allreduce_qwen38_batch_defaults_on(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_sm70_tp4_push_allreduce_sum2_m1_is_default_on_with_rollback(monkeypatch):
+    name = "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert getattr(envs, name)
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not getattr(envs, name)
+    finally:
+        envs.disable_envs_cache()
+
+
 def _bare_dflash2_model() -> DFlash2Qwen3Model:
     model = DFlash2Qwen3Model.__new__(DFlash2Qwen3Model)
     torch.nn.Module.__init__(model)

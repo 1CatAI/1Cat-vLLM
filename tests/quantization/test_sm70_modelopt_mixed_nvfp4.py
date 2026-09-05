@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K,
     _QWEN38_QPN_BATCH_W13_SPLIT_K,
+    _QWEN38_QPN_M1_W13_SPLIT_K,
     ModelOptNvFp4SM70MoEMethod,
     _mtp_weighted_reduce,
     _prepare_compact_slot_groups,
@@ -46,6 +47,10 @@ def test_qwen38_qpn_batch_covers_dynamic_graph_widths():
     assert set(_QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K) == set(range(2, 17))
     for tokens, split_k in _QWEN38_QPN_BATCH_W13_SPLIT_K.items():
         assert _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K[tokens] == split_k
+
+
+def test_qwen38_qpn_m1_w13_uses_same_precision_split16_plan():
+    assert _QWEN38_QPN_M1_W13_SPLIT_K == 16
 
 
 @pytest.mark.parametrize(
@@ -135,6 +140,19 @@ def test_qwen38_fast_prefill_defaults_on_and_can_be_disabled(monkeypatch):
 
     monkeypatch.setenv(name, "0")
     assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
+
+
+def test_qwen38_w2_direct_reduce_defaults_on_and_can_be_disabled(monkeypatch):
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE"
+    monkeypatch.delenv(name, raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
+        monkeypatch.setenv(name, "0")
+        envs.disable_envs_cache()
+        assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
+    finally:
+        envs.disable_envs_cache()
 
     name = "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL"
     monkeypatch.delenv(name, raising=False)

@@ -50,7 +50,10 @@ _SUPPORTED_CONTRACTS: Final = {
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
-_QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
+# V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
+# FP32 MMA accumulation, and the FP16 W13 output boundary; only the order in
+# which the FP32 K partitions are joined changes from the former split-8 plan.
+_QWEN38_QPN_M1_W13_SPLIT_K: Final = 16
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
 _QWEN38_QPN_MTP5_W13_SPLIT_K: Final = 4
@@ -615,6 +618,25 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             or envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE
         ) and not sm70_ops.has_nvfp4_qpn_m1_dispatch():
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
+        w2_direct_reduce_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
+        )
+        w2_direct_reduce_available = sm70_ops.has_nvfp4_qwen38_w2_direct_reduce()
+        w2_direct_reduce_explicit = (
+            "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE" in os.environ
+        )
+        if (
+            w2_direct_reduce_requested
+            and not w2_direct_reduce_available
+            and w2_direct_reduce_explicit
+        ):
+            missing.append("nvfp4_qwen38_w2_direct_reduce_out")
+        elif w2_direct_reduce_requested and not w2_direct_reduce_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 W2 direct-reduce op is absent from "
+                "the loaded extension; retaining separate W2 and weighted "
+                "reduce kernels. Explicit opt-in fails closed."
+            )
         if (
             envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
             and not sm70_ops.has_nvfp4_qpn_mtp5_dispatch()
@@ -712,6 +734,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "activation route. Explicit opt-in fails closed."
             )
         fused_swiglu_prefill = bool(fused_swiglu_requested and fused_swiglu_available)
+        fused_swiglu_decode = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+            and fused_swiglu_prefill
+            and sm70_ops.has_nvfp4_qwen38_w13_fused_swiglu()
+        )
+        if (
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
+            and fused_swiglu_prefill
+            and not fused_swiglu_decode
+        ):
+            logger.warning_once(
+                "The SM70 Qwen3.8 fused W13/SwiGLU decode op is absent; "
+                "retaining separate exact W13 and activation kernels."
+            )
         fast_prefill = bool(
             fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
         )
@@ -924,8 +960,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             indexed_prefill_requested and indexed_prefill_available
         )
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
+        layer.sm70_nvfp4_qwen38_fused_swiglu_decode = fused_swiglu_decode
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
         layer.sm70_nvfp4_qwen38_raw_scale = raw_scale
+        layer.sm70_nvfp4_qwen38_w2_direct_reduce = bool(
+            w2_direct_reduce_requested and w2_direct_reduce_available
+        )
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         grouped_requested = bool(
@@ -986,6 +1026,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             logger.info_once(
                 "SM70 Qwen3.8 indexed-A fused-SwiGLU prefill candidate "
                 "enabled (interleaved W13, exact FP16 epilogue arithmetic)."
+            )
+        if fused_swiglu_decode:
+            logger.info_once(
+                "SM70 Qwen3.8 fused W13/SwiGLU decode route enabled "
+                "(split16, exact FP16 rounding and activation arithmetic)."
             )
         if fast_prefill:
             logger.info_once(
@@ -1325,7 +1370,21 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 else sm70_ops.nvfp4_moe_qpn_m1_sm70_out
             )
             fused_batch_w13 = _use_qwen38_qpn_batch_fused_w13(layer, x, topk_ids)
-            if fused_batch_w13:
+            fused_w13_decode = bool(
+                direct_qpn_m1
+                and not raw_scale
+                and interleaved_w13
+                and getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_decode", False)
+            )
+            if fused_w13_decode:
+                sm70_ops.nvfp4_qwen38_w13_fused_swiglu_out(
+                    buffers["intermediate"],
+                    x,
+                    layer.w13_tm_weight,
+                    layer.w13_tm_scales,
+                    route_ids,
+                )
+            elif fused_batch_w13:
                 logger.info_once(
                     "SM70 Qwen3.8 NVFP4 direct W13+SwiGLU fusion enabled (tokens=%d).",
                     num_tokens,
@@ -1378,6 +1437,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     buffers["gate_up"],
                     interleaved=interleaved_w13,
                 )
+            if (
+                direct_qpn_m1
+                and not raw_scale
+                and getattr(layer, "sm70_nvfp4_qwen38_w2_direct_reduce", False)
+            ):
+                sm70_ops.nvfp4_qwen38_w2_direct_reduce_out(
+                    output,
+                    buffers["intermediate"],
+                    layer.w2_tm_weight,
+                    layer.w2_tm_scales,
+                    route_ids,
+                    topk_weights,
+                )
+                return output
             if _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids):
                 logger.info_once(
                     "SM70 Qwen3.8 NVFP4 direct W2+weighted-reduce fusion "
