@@ -51,6 +51,36 @@ def mix_scatter(gate, x, out, RANK: tl.constexpr):
     tl.store(out + row * 2560 + col, acc / 4)
 
 
+def shard_weights(down, up, rank, layout):
+    """Screen zero-copy output shards; do not change production weight loading."""
+    up_view = up.view(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+    if layout == "views":
+        # Extra eight down rows are unused except rank3's four injections.
+        # The kernel already discards other ranks' col80..87 outputs.
+        return down.narrow(0, rank * 80, 88), up_view
+    if layout == "down-view":
+        local_down = down.narrow(0, rank * 80, 88)
+    else:
+        local_down = down.new_zeros(88, 10240)
+        local_down[:80].copy_(down[rank * 80 : (rank + 1) * 80])
+        if rank == 3:
+            local_down[80:84].copy_(down[320:324])
+    return local_down, up_view.reshape(2560, 320).contiguous()
+
+
+def up_projection(lora, weight, output):
+    if weight.ndim == 2:
+        return torch.nn.functional.linear(lora, weight)
+    # Each branch writes disjoint columns of each output row. The batch
+    # dimension shares the lora input (stride zero), never the output cells.
+    torch.bmm(
+        lora.unsqueeze(0).expand(4, -1, -1),
+        weight.transpose(1, 2),
+        out=output.view(lora.shape[0], 4, 640).transpose(0, 1),
+    )
+    return output
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True)
@@ -58,6 +88,9 @@ def main():
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pair", choices=("attn", "mlp"), default="attn")
     p.add_argument("--mode", choices=("full", "down", "fused"), default="full")
+    p.add_argument(
+        "--weight-layout", choices=("packed", "down-view", "views"), default="packed"
+    )
     p.add_argument(
         "--weight-copies",
         type=int,
@@ -144,18 +177,10 @@ def main():
     injection = weight(".block_inject_weight.weight")
     down = torch.cat((down, injection, down.new_zeros(12, 10240)))
     up = weight(".input_mix_weight_up.weight")
-    local_down_w = down.new_zeros(88, 10240)
-    local_down_w[:80].copy_(down[rank * 80 : (rank + 1) * 80])
-    if rank == 3:
-        local_down_w[80:84].copy_(down[320:324])
-    local_up_w = (
-        up.view(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
-        .reshape(2560, 320)
-        .contiguous()
-    )
-    weights = [(down, up, local_down_w, local_up_w)]
+    weights = [(down, up, *shard_weights(down, up, rank, args.weight_layout))]
     for _ in range(args.weight_copies - 1):
-        weights.append(tuple(w.clone() for w in weights[0]))
+        wd, wu = down.clone(), up.clone()
+        weights.append((wd, wu, *shard_weights(wd, wu, rank, args.weight_layout)))
     results = []
     try:
         for m in map(int, args.tokens.split(",")):
@@ -167,6 +192,7 @@ def main():
             output = torch.empty_like(sparse_output)
             fused_lora = x.new_empty(m, 320)
             fused_injection = x.new_empty(m, 4)
+            local_gate = x.new_empty(m, 2560)
 
             def baseline(index=0):
                 wd, wu, _, _ = weights[index]
@@ -183,7 +209,7 @@ def main():
                     torch.ops._C_custom_ar_flashnext.hc_down_gather(
                         hc_ca._ptr, d, fused_injection, fused_lora
                     )
-                    gate = torch.nn.functional.linear(fused_lora, local_wu)
+                    gate = up_projection(fused_lora, local_wu, local_gate)
                     torch.ops._C_custom_ar_flashnext.hc_mix_gather(
                         hc_ca._ptr, gate, x, output
                     )
@@ -195,7 +221,7 @@ def main():
                     return hc_gate_mix(
                         x, torch.nn.functional.linear(lora, wu), 4
                     ), full_down[:, 320:324]
-                gate = torch.nn.functional.linear(lora, local_wu)
+                gate = up_projection(lora, local_wu, local_gate)
                 mix_scatter[(m, 10)](gate, x, sparse_output, RANK=rank)
                 ca.all_reduce(sparse_output, out=output, registered=registered)
                 return output, full_down[:, 320:324]
@@ -372,6 +398,13 @@ def main():
                 ),
                 "sharded_weight_bytes": sum(
                     w.numel() * w.element_size() for ws in weights for w in ws[2:]
+                ),
+                "additional_sharded_storage_bytes": sum(
+                    shard.numel() * shard.element_size()
+                    for ws in weights
+                    for original, shard in zip(ws[:2], ws[2:])
+                    if original.untyped_storage().data_ptr()
+                    != shard.untyped_storage().data_ptr()
                 ),
             }
             if library:

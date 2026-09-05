@@ -1288,6 +1288,90 @@ New-worktree CPU test logs: `.artifacts/qsa-cpu-tests.log` and
 not file presence, before citing results). Latest endpoint and model-score
 status are unchanged; do not convert this metadata repair to throughput.
 
+### Canonical QSA outcome and HC weight-view screen (2026-09-05)
+
+The canonical QSA job completed (exit 1 because grouped replay admission
+failed), with exclusive single-GPU timing. No full-model service was launched.
+FP16 KV, independent 8K requests, GQA6/D256, 512 selected compressed blocks,
+five alternating timing groups, 16 calls per graph, 40 replays per group:
+
+| M | Frozen Triton | Direct XQA | Padded grouped Page4 |
+| ---: | ---: | ---: | ---: |
+| 1 | 26.610 us | 221.773 us | 381.122 us |
+| 4 | 53.162 us | 283.080 us | 1738.734 us |
+| 8 | 98.955 us | 287.075 us | Not admitted |
+| 16 | 166.763 us | 289.534 us | Not admitted |
+
+All three routes pass the unchanged FP32-oracle tolerance at every shape and
+all six changed-input/slot-map cycles. Direct XQA and Triton graph outputs
+equal their eager outputs. Grouped M8/M16 graph outputs are not bitwise
+equal to eager, although their FP32 relative-L2 remains below `3e-4`.
+Do not call this model-quality corruption or infer its cause from the small
+operator differences. Grouped's ordering/reduction behavior is not localized;
+it has no admitted timing at these widths. The slow M1/M4 result is already
+sufficient to reject this native small-batch route as the next optimization.
+No change to the rows>=64 production admission threshold follows. The source
+is the frozen old QSA implementation and the pinned Flash-V100 binary, not a
+claim about every Flash-V100 build or its existing large-prefill path.
+Artifact: `.artifacts/qsa-native-frozen-v3-canonical.{json,log}`.
+
+HC fusion now also passed a GPU screen against the **new main-base sidecar**
+(`872f4e3a37...`), rather than merely importing/compiling it. Same real layer-0
+weights, 16 distinct weight allocations, five alternating paired measurements,
+16 complete HC calls/graph, all four TP ranks. The benchmark includes 64
+changed-input auxiliary-stream sum2 cycles per width, then restores the
+original timing input. All fused-versus-unfused sharded and graph-versus-eager
+checks pass with zero tolerance. The original replicated-GEMM association
+differences remain; there is still no model-score admission.
+
+| M | Packed: baseline / fused | All views: baseline / fused | Down view: baseline / fused |
+| ---: | ---: | ---: | ---: |
+| 4 | 31.406 / 26.898 us | 31.389 / 30.707 us | 31.294 / 26.989 us |
+| 8 | 32.214 / 26.626 us | 31.274 / 29.830 us | 32.059 / 27.309 us |
+| 16 | 33.819 / 27.885 us | 31.723 / 29.723 us | 32.410 / 27.000 us |
+
+The three layouts are separate processes, each with its own paired baseline;
+do not attribute every absolute-time difference to layout. Packed retains
+14--18% local savings. Fully strided `torch.bmm` retains only 2--6% local
+savings, so it is not the performance choice despite eliminating the extra
+weight storage. Down-view retains about 14--17% versus its original HC
+baseline, but these data do not prove <=1% regression against the packed
+candidate at every shape (in particular M8). Keep that distinction rather
+than claiming a free speed improvement. Its 96-call projection is only
+0.41--0.52 ms, not a new endpoint result.
+
+The view design uses ordinary checkpoint FP16 values: down is a contiguous
+88-row slice (only rank3 uses the four injection values in its extra rows),
+up can be a four-branch strided batched GEMM with shared lora input and
+disjoint output columns. This applies the tensor-contraction layouts described
+in [NVIDIA's strided batched GEMM reference](https://developer.nvidia.com/blog/cublas-strided-batched-matrix-multiply/);
+it introduces no weight or activation quantization. The new CPU layout suite
+passes **16 cases** (four ranks x four widths), checks no output-cell overlap,
+storage aliasing, and visibility of original-weight updates. It is not a GPU
+arithmetic oracle or a model-quality score.
+
+Measured additional shard storage for 16 HC weight copies is 52.5 MiB
+(packed), zero (all views), and 25 MiB (down view). For 96 HC pairs these
+amount to 315/0/150 MiB respectively: down-view avoids **165 MiB/worker** of
+the prototype's additional weight copies. Original full weights, private
+communicator and graph workspaces remain allocated; this is not total model
+memory usage. The benchmark reports aliased-view bytes separately from
+additional allocated shard storage. Artifacts:
+
+- `.artifacts/hc-main-{packed,views,down-view}-v1.json`
+- `.artifacts/hc-main-layouts-v1.log`
+- `.artifacts/hc-main-down-view-v1.log`
+- `.artifacts/hc-weight-views-cpu.log`
+
+All completed task GPU workers exited; the API was not started. The next
+production work must preserve #481's M1 native capabilities, use an isolated
+HC channel owned by the same DSO, prepare any remaining up-weight copy only
+after real loading and before capture, and retain dynamic prefill/unsupported
+fallbacks. Do not globally bind max-seqs/chunk/KV or silently replace the
+frozen 81-tok/s C1 contract. After route-hit/quality checks, measure the actual
+engine and datasets. Current endpoint evidence remains C16 584.568 tok/s /
+27.371 ms, with overall throughput and model-quality gates **unmet**.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
