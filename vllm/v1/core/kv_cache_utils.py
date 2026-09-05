@@ -1439,11 +1439,15 @@ def _get_kv_cache_groups_glm5_next(
             if target_block_size % candidate != 0 or candidate % 16 != 0:
                 continue
             candidate_specs = {
-                name: replace(spec, block_size=candidate, page_size_padded=None)
+                name: replace(
+                    cast(FullAttentionSpec, spec),
+                    block_size=candidate,
+                    page_size_padded=None,
+                )
                 for name, spec in auxiliary_attn_specs.items()
             }
             if all(
-                cast(FullAttentionSpec, spec).real_page_size_bytes <= mla_page
+                spec.real_page_size_bytes <= mla_page
                 for spec in candidate_specs.values()
             ):
                 fitted_auxiliary_specs = {
