@@ -191,6 +191,57 @@ def qsa_screen():
     }
 
 
+def qsa_dynamic_screen(base=None):
+    """Change device lengths across fast/fallback boundaries in one graph."""
+    if base is None:
+        base = torch.ops._C_qsa_verify.baseline
+    fast = torch.ops._C_qsa_sm70.qsa_lexicographic_topk
+    rows, width, replays = 12, 65536, 128
+    # Padded row storage also tests that an M1 view need not have stride=width.
+    storage = torch.empty(rows, width + 32, device="cuda")
+    x = storage[:, :width]
+    n = torch.zeros(rows, 1, dtype=torch.int32, device="cuda")
+    a = torch.empty(rows, 1, 512, dtype=torch.int32, device="cuda")
+    b = torch.empty_like(a)
+    lengths = torch.tensor(
+        [-1, 0, 511, 512, 513, 2048, 2169, 2304, 2305, 4096, 65536, 65537],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    def run(op, out):
+        for i in range(rows):
+            op(x[i : i + 1], n[i], out[i], 512)
+
+    ga, gb = capture(lambda: run(base, a)), capture(lambda: run(fast, b))
+    for replay in range(replays):
+        n[:, 0].copy_(lengths.roll(replay % rows))
+        x.normal_()
+        pattern = replay % 4
+        if pattern == 0:
+            x.relu_()  # Dense zero ties, as in ReLU-based indexer scores.
+        elif pattern == 1:
+            x.mul_(1e-6).add_(1)  # Shared exponent and many close scores.
+        elif pattern == 2:
+            x.round_()
+        else:
+            x[:, ::19] = float("nan")
+            x[:, ::23] = -float("inf")
+            x[:, ::29] = float("inf")
+        a.fill_(-111)
+        b.fill_(-777)
+        ga.replay()
+        gb.replay()
+        assert torch.equal(a, b), ("dynamic lengths", replay, pattern)
+    return {
+        "changing_length_graph_replays": replays,
+        "row_comparisons": replays * rows,
+        "lengths": lengths.cpu().tolist(),
+        "patterns": ["relu", "near_ties", "integer_ties", "nonfinite"],
+        "padded_row_stride": storage.stride(0),
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qsa-library", required=True)
@@ -204,6 +255,7 @@ if __name__ == "__main__":
     result["router"] = router_screen()
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     result["qsa"] = qsa_screen()
+    result["qsa_dynamic"] = qsa_dynamic_screen()
     result.update(
         torch=torch.__version__,
         cuda=torch.version.cuda,

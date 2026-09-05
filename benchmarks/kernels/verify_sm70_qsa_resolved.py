@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Screen address resolution plus unchanged sparse attention/merge, M1 TP4."""
 
+import argparse
 import json
-import sys
 from functools import partial
 from pathlib import Path
 from statistics import median
@@ -43,6 +43,11 @@ def paired(ga, gb):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--interleaved-kv", action="store_true")
+    parser.add_argument("--skip-timing", action="store_true")
+    args = parser.parse_args()
     torch.cuda.set_device(0)
     torch.manual_seed(20260905)
     qsa._SM70_QSA_XQA_PAGE4 = False
@@ -50,10 +55,18 @@ def main():
     for context in (8192, 32768, 262144):
         page, layers, width = 400, 12, 2051
         blocks = (context + page - 1) // page
-        k = torch.randn(
-            layers, blocks, page, 1, 256, device="cuda", dtype=torch.float16
-        )
-        v = torch.randn_like(k)
+        if args.interleaved_kv:
+            # Match the worker ABI: [blocks, 2, page, KV heads, head dim].
+            kv = torch.randn(
+                layers, blocks, 2, page, 1, 256, device="cuda", dtype=torch.float16
+            )
+            k, v = kv.unbind(2)
+        else:
+            kv = None
+            k = torch.randn(
+                layers, blocks, page, 1, 256, device="cuda", dtype=torch.float16
+            )
+            v = torch.randn_like(k)
         queries = torch.randn(layers, 1, 6, 256, device="cuda", dtype=torch.float16)
         gates = torch.randn_like(queries)
         indices = torch.randint(
@@ -137,13 +150,15 @@ def main():
             "context": context,
             "layers": layers,
             "page_size": page,
+            "cache_layout": "interleaved_kv" if args.interleaved_kv else "separate_kv",
+            "key_strides": list(k[0].stride()),
             "bitwise_graph_scenarios": 8,
-            **paired(ga, gb),
+            **({} if args.skip_timing else paired(ga, gb)),
         }
         results.append(result)
-        Path(sys.argv[1]).write_text(json.dumps(results, indent=2) + "\n")
+        args.out.write_text(json.dumps(results, indent=2) + "\n")
         print(json.dumps(result), flush=True)
-        del ga, gb, run, k, v, queries, gates, indices, tables, requests, a, b
+        del ga, gb, run, kv, k, v, queries, gates, indices, tables, requests, a, b
         torch.cuda.empty_cache()
 
 
