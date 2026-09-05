@@ -1660,6 +1660,94 @@ ownership locks, refuses artifact overwrite, and the finite runner explicitly
 shuts down its engine. The new trace still requires NVTX/graph-node validation
 before attribution; its profiled throughput is never accepted endpoint speed.
 
+### Valid C16 graph attribution and QSA grid screen (2026-09-05)
+
+The decode-triggered job completed successfully and its engine, workers and
+launcher all exited. NVTX now contains exactly 16
+`execute_context_0(0)_generation_16(16)` ranges per TP rank. All 64 complete
+graphs contain 2211 nodes. The source/runtime is the frozen `0ed451fbda`
+candidate; subsequent scorer/docs commits do not change `vllm/` or `csrc/`.
+This is the same pinned native stack, not a new clean-wheel speed claim.
+
+Use `.artifacts/attribute_hc_c16_complete_graphs.py` to group by the actual
+`(globalPid, correlationId)`, check uniform node counts and drop each rank's
+first/last graph. Do not hardcode the old pre-grouped graph's 1976 nodes.
+The bundled generic per-token parser is also retained, but its host replay
+intervals cut across some GPU graphs and it labels the shared cuBLAS signature
+as LM-head. Neither artifact should be presented as an additive wall table.
+
+For the 56 middle complete graphs, average per-rank graph envelope is
+**26.789 ms**, activity union **24.895 ms**, summed kernel service **27.053 ms**,
+internal gaps **1.894 ms**, overlap **2.158 ms**. Per-step max-rank envelope
+averages 26.799 ms. These are profiled graph diagnostics, not new endpoint
+measurements; the accepted unprofiled C16 candidate remains **27.125 ms /
+589.860 tok/s**, with the 21.978-ms target still unmet.
+
+| Source-attributed family | Mean service ms / rank / graph |
+| --- | ---: |
+| Routed MoE W13 | 4.301 |
+| Routed MoE W2 | 2.284 |
+| MoE grouping and weighted reduction | 0.268 |
+| QSA scoring, top-k and sparse attention (excluding projections) | 3.824 |
+| GDN qkvz projection | 1.653 |
+| GDN b/a projection plus reduction | 0.583 |
+| GDN recurrence / convolution | 1.520 |
+| HC down/up projection plus down reduction | 1.947 |
+| HC fused pointwise / TP gather | 1.437 |
+| HC remaining postops | 0.536 |
+| Other TP reductions | 1.195 |
+
+Other projections, shared expert work and 1.702 ms of unattributed small
+kernels remain explicitly in the complete JSON. Role inference uses shapes
+and same-stream neighbours, not invented module NVTX labels. The graph
+excludes the subsequent LM-head/sampler; do not subtract its envelope from a
+different run's endpoint time to manufacture a host-cost closure.
+
+Within QSA, the scorer costs about 103 us/layer and sparse GQA about
+169 us/layer. The scorer grid is `(16, 1026)`, driven by the fixed 256K
+capacity (65660 compressed columns) rather than visible length. At this
+8K/256 workload, only approximately 512--528 of 16416 CTAs can have live
+tiles: over 96% immediately return. This is a source/shape deduction, **not**
+an NCU occupancy or measured bandwidth percentage. The native small-batch
+Page4 alternative was already rejected; do not retest that dead end.
+
+New benchmark-only `benchmark_sm70_qsa_scorer_grid.py` tests the existing
+scorer at rows 1/4/8/16, lengths 8K/128K/256K and fixed maximum capacity,
+with randomized physical pages. The indexer has **four replicated heads**,
+not four heads divided by TP4. All 12 cases pass four changed-input,
+shrinking/growing/mixed-length poisoned CUDA Graph replays with exact live
+scores against the production kernel. This is operator evidence, not model
+quality admission. The graph grouping screen uses five alternating-order
+timing samples and 20 replays per sample.
+
+Contiguous grouping is not a safe default: at C16/8K, group 4 improves
+65.331 -> 48.179 us, but at C16/256K it regresses 1094.042 -> 1113.856 us
+(1.81%). Larger grouping also reduces useful short-context CTA parallelism.
+Reject an unconditional `tiles_per_program` change. These hot-cache single-
+GPU times must not replace the TP4 full-model trace's absolute scorer cost.
+
+The next benchmark-only variant, `sm70_qsa_strided_scorer.py`, bounds the
+grid while visiting **all** live tiles by a grid-stride loop. It retains each
+tile's dot/head reduction and existing validity masks. This follows the
+portable scheduling concept in the [Triton persistent-kernel tutorial](https://triton-lang.org/main/getting-started/tutorials/gluon/persistence.html),
+not its Hopper-only TMA machinery. PR #507 targets single-row QSA/router;
+its body/source were checked and do not cover this batched scorer grid.
+Production dispatch is unchanged. The initial queued launcher was cancelled
+before acquiring GPUs after a syntax preflight caught a missing closing
+parenthesis in the copied benchmark kernel; no GPU result was produced by
+that attempt. A syntax-checked replacement waits behind verified foreign
+paper-campaign GPU processes and their ownership reservation.
+
+Artifacts under `.artifacts/hc-fixed-decode-trace/`: raw qdstrm SHA256
+`b2223fcf637e9706f80d959f7184e0a8c2bed5b3a514165bd32f2b8f10d2f7f7`,
+SQLite `1815931586378c3fc23d460107e1d7e0dcacdf1aecccbd5ac6483535518ef83f`,
+`whole-graph-attribution.json`
+`ca5c0b8144a7c587c3d32339435277a7dcc0502c6c14138dfc42833080e2053a`.
+Scorer screen: `.artifacts/qsa-scorer-grid/grouping-v1.{json,log}`;
+the replacement strided-grid job has its own `strided-v1` outputs and
+`.artifacts/qsa-scorer-strided-launch-v2.log`. All benchmark processes are
+finite; no API is left resident.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
