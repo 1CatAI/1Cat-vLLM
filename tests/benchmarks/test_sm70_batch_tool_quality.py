@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from benchmarks.benchmark_sm70_batch_tool_quality import run_cases, score_case
+from benchmarks.benchmark_sm70_tool_protocol import _bfcl_argument_matches
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -103,3 +104,35 @@ def test_bfcl_uses_tool_name_and_arguments_not_just_valid_json():
     response["finish_reason"] = "tool_calls"
     function["name"] = '{"name": "sum"}'
     assert score_case(case, response)
+
+
+@pytest.mark.parametrize(
+    "value,expected,valid",
+    [
+        ({"min": 3, "max": 4}, [{"min": [3], "max": [4]}], True),
+        ({"min": 3}, [{"min": [2, 3], "max": [4, ""]}], True),
+        ({"name": "New-York"}, [{"name": ["new york"]}], True),
+        ({"values": [1, 2]}, [{"values": [[1, 2]]}], True),
+        ({"values": [2, 1]}, [{"values": [[1, 2]]}], False),
+        ({"min": [3]}, [{"min": [3]}], False),
+        ({"min": 5}, [{"min": [3, 4]}], False),
+        ({"min": 3}, [{"min": [3], "max": [4]}], False),
+        ({"min": 3, "extra": 4}, [{"min": [3]}], False),
+        ({"min": 3}, ["", {"min": [3]}], True),
+        ({"min": 3}, [""], False),
+    ],
+)
+def test_bfcl_dictionary_alternatives_not_literal_values(value, expected, valid):
+    assert _bfcl_argument_matches(value, expected, {"type": "dict"}) == valid
+
+
+def test_bfcl_list_of_dicts_preserves_order_count_and_literal_array_semantics():
+    schema = {"type": "array", "items": {"type": "dict"}}
+    allowed = [[{"a": [1]}, {"a": [2]}]]
+    assert _bfcl_argument_matches([{"a": 1}, {"a": 2}], allowed, schema)
+    assert not _bfcl_argument_matches([{"a": 2}, {"a": 1}], allowed, schema)
+    assert not _bfcl_argument_matches([{"a": 1}], allowed, schema)
+    assert not _bfcl_argument_matches([{"a": 1}, 2], allowed, schema)
+    ordinary = {"type": "array", "items": {"type": "integer"}}
+    assert _bfcl_argument_matches([1, 2], [[1, 2]], ordinary)
+    assert not _bfcl_argument_matches([1, 2], [1, 2], ordinary)

@@ -1591,6 +1591,75 @@ API actually emits that defect. Do not substitute a prefill-only PPL run for
 decode-path quality: the new HC/grouped-MoE candidates explicitly fall back
 on prefill and such a run would not exercise their changed arithmetic.
 
+### Concurrent API results and measurement repairs (2026-09-05)
+
+The V2 API job completed with client/nsys status 0. All 80 requests returned
+HTTP 200 and ended naturally (53 `tool_calls`, 27 `stop`); client peak inflight
+was 16. This proves neither fixed GPU batch width nor model-quality parity.
+The same 64 BFCL / 16 JSONSchemaBench cases used temperature 1, top-k 20,
+top-p 0.95, per-case seeds starting 20260905, thinking off and max output
+16384. Do not compare to a thinking-on control or use request wall duration
+as pure-decode throughput.
+
+| Suite | Correct / total |
+| --- | ---: |
+| BFCL simple Python | 14 / 16 |
+| BFCL parallel | 12 / 16 |
+| BFCL multiple | 14 / 16 |
+| BFCL irrelevance | 11 / 16 |
+| JSONSchemaBench WashingtonPost | 16 / 16 |
+
+The original BFCL score was 49/64. Offline audit corrected **two scorer false
+negatives**, not model outputs: `multiple_8` budget and `multiple_9` gradeDict.
+BFCL dictionary ground truth encodes per-key acceptable alternatives (e.g.
+`{"min": [300000]}` permits the scalar `300000`). The old helper compared
+the scalar to the literal list. Match dictionary and ordered list-of-dicts
+values using the rules of the pinned official BFCL `dict_checker` /
+`list_dict_checker`, including missing optional keys and literal array
+alternatives. Other scoring rules remain unchanged; this is still a subset
+scorer, not the full official leaderboard evaluator.
+
+The pinned reference is BFCL `f7cf7359b7ac615a0b294831c5ba2bc95ee4a000`,
+`berkeley-function-call-leaderboard/bfcl_eval/eval_checker/ast_eval/ast_checker.py`.
+Eight real-parameter/negative-mutation vectors agree with its actual
+standalone `dict_checker`; the expanded CPU client/scorer suite passes
+**24 tests**. A plain pytest launch initially imported the source tree's
+unbuilt `_C` via root conftest; the CPU-only command uses
+`python -m pytest --confcutdir=tests/benchmarks
+tests/benchmarks/test_sm70_batch_tool_quality.py -q`. It does not initialize
+GPU fixtures or claim GPU validation.
+
+The corrected BFCL score is **51/64**, with all generated responses, seeds,
+payloads and dataset hashes unchanged. The remaining 13 misses are retained
+for a matched original-production control, including omitted/wrong arguments,
+wrong call counts, name/choice errors and irrelevant tool use. Candidate-only
+scores do not establish non-regression. No optimization is newly defaulted.
+
+Artifacts: `.artifacts/hc-api-trace-v2/candidate-tools-v1.json` (immutable raw),
+`candidate-tools-rescored-v2.json`, `.artifacts/rescore_hc_api_tools.py`,
+`.artifacts/bfcl-rescore-oracle-v2.log`, `.artifacts/bfcl-dict-scorer-tests.log`.
+The rescorer refuses changed dataset hashes, case ordering or request payloads.
+
+The accompanying trace is **rejected as decode evidence**. Its NVTX labels
+all contain prefill (2044--2048 context tokens); the SQLite has 198412 kernels
+and zero graph-node kernels. Repeating the 16 prompts did not yield prefix
+cache hits, and the fixed 8-step delay captured mixed prefill, not C16 decode.
+Retain the qdstrm, manually imported nsys-rep and SQLite in the V2 directory;
+do not feed these into a C16 GPU-cost table or repeat that priming strategy.
+The API and all four owned model workers have exited.
+
+Replacement task `.artifacts/run_hc_fixed_decode_trace.{sh,py}` preserves the
+frozen independent 8K/256 deterministic speed workload and runtime flags.
+It arms profiling only after eight consecutive engine outputs report all
+16 running, zero waiting, one emitted token per request, no prefill and no
+finished request. Then it captures 16 worker steps after a two-step delay.
+CPU tests reject each mixed-width/prefill/finished trigger and verify spawn
+import has no launch side effect. Output is isolated in
+`.artifacts/hc-fixed-decode-trace/`; the launcher checks actual idle GPUs and
+ownership locks, refuses artifact overwrite, and the finite runner explicitly
+shuts down its engine. The new trace still requires NVTX/graph-node validation
+before attribution; its profiled throughput is never accepted endpoint speed.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its

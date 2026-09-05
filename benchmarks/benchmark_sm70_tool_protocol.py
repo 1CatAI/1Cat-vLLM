@@ -732,6 +732,50 @@ def _bfcl_normalized_value(value: Any) -> Any:
     return value
 
 
+def _bfcl_dict_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+    # BFCL's dict_checker encodes each dictionary value as a list of acceptable
+    # alternatives, NOT as the literal value. Empty string permits an omitted
+    # key. Preserve literal lists within an alternative (do not flatten them).
+    return all(
+        key in expected
+        and any(
+            _bfcl_normalized_value(value) == _bfcl_normalized_value(candidate)
+            for candidate in expected[key]
+        )
+        for key, value in actual.items()
+    ) and all(key in actual or "" in allowed for key, allowed in expected.items())
+
+
+def _bfcl_argument_matches(value: Any, allowed: list[Any], schema: dict) -> bool:
+    # Mirror BFCL's dict/list-of-dicts value rules; other arguments retain the
+    # existing comparison. This helper is not the full official AST evaluator.
+    if schema.get("type") in ("dict", "object") and isinstance(value, dict):
+        return any(
+            isinstance(candidate, dict) and _bfcl_dict_matches(value, candidate)
+            for candidate in allowed
+        )
+    if (
+        schema.get("type") == "array"
+        and schema.get("items", {}).get("type") in ("dict", "object")
+        and isinstance(value, list)
+    ):
+        return any(
+            isinstance(candidate, list)
+            and len(value) == len(candidate)
+            and all(
+                isinstance(item, dict)
+                and isinstance(answer, dict)
+                and _bfcl_dict_matches(item, answer)
+                for item, answer in zip(value, candidate)
+            )
+            for candidate in allowed
+        )
+    return any(
+        _bfcl_normalized_value(value) == _bfcl_normalized_value(candidate)
+        for candidate in allowed
+    )
+
+
 def _bfcl_call_matches(
     actual: dict[str, Any],
     expected: dict[str, Any],
@@ -755,10 +799,7 @@ def _bfcl_call_matches(
         if name not in properties or name not in expected_arguments:
             return False, f"unexpected argument {name!r}"
         allowed = expected_arguments[name]
-        if not any(
-            _bfcl_normalized_value(value) == _bfcl_normalized_value(candidate)
-            for candidate in allowed
-        ):
+        if not _bfcl_argument_matches(value, allowed, properties[name]):
             return False, f"argument {name!r} value {value!r} not in {allowed!r}"
     for name, allowed in expected_arguments.items():
         if name not in arguments and "" not in allowed:
