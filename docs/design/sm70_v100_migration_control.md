@@ -45766,3 +45766,195 @@ Interpretation:
   fused variants compile with 31 registers/16 bytes shared/zero stack or
   spills. Compare complete HC with the newly registered up fusion held fixed,
   including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
+- The exact down packet screen completed and is rejected. Same-source
+  complete-HC control `1.989379 ms`, CUDA down plus separate gather
+  `2.072549 ms`, fused down/gather `2.218926 ms`. All intermediate/final
+  outputs and auxiliary sum2 are bitwise, including generation `195841`, but
+  both projection scheduling and distributed polling regress latency. Do
+  not repeat this 81-CTA packet variant unchanged. Evidence:
+  `.artifacts/hc_down_packet/result.json`; no production down route changed.
+
+## Decode-only HC norm weight prefetch, 2026-09-05
+
+- Previous goal turn made progress by registering and validating the up
+  fusion. Its final bounded down queue expired with exit75 before obtaining
+  GPUs, not after a failed GPU test. The same waiting job was resumed only
+  after its terminal status was verified; the down screen then completed.
+- The existing norm source documents that early weight reads help decode but
+  regress larger batches. A decode-only screen keeps the exact two-axis sum,
+  FP16 combine boundary, FP32 RMS/affine operations and their order; only the
+  weight load moves before combine/reduction. Offline SM70 compilation has
+  40 registers for late load and 66 for early, zero stack/local spills, and
+  64 bytes dynamic shared memory. This is not a repeat of failed norm/down
+  fusion or its down-weight-prefetch variants.
+- Complete-HC prototype control `1.982710 ms` -> early norm load
+  `1.942050 ms`, saving `0.040660 ms` (2.05%). Early samples
+  `1.942009/1.942050/1.942132 ms`. Four ranks x16 changing inputs and all
+  post-timing intermediate/final FP16 bits match. The already registered up
+  fusion is fixed on both sides; no new communication path is introduced.
+  Evidence: `.artifacts/hc_norm_prefetch/result.json` and `run.log`.
+- Port the load scheduling only for SM70, FP16, N=1, HC=4, H=2560. Other
+  shapes/dtypes/architectures and prefill retain deferred loads. Targeted CPU
+  dispatch tests **5 passed**, Ruff passed. The registered-kernel A/B with
+  explicit late/early control is pending; no whole-model claim from this
+  microbenchmark. Next also refresh the whole-model trace after the admitted
+  HC changes, with natural-output checks before profiling and one model load.
+- Registered norm kernel A/B at `8f74e4b88b3e2ec63c14d6be69c833e5a569822a`
+  passes all four-rank initial/post-timing FP16 checks. Explicit late-load
+  control `1.982525 ms`, early-load `1.944255 ms`, saving `0.038270 ms`
+  (1.93%); early samples `1.942992/1.944972/1.944255 ms`. The up fusion remains
+  fixed on both sides. Evidence: `.artifacts/hc_norm_prefetch/registered_result.json`.
+- A complete model/trace attempt loaded and captured the actual fused HC
+  route, then failed before generation: the quality harness passed the chat
+  tokenizer's Mapping result as token IDs. This is a harness failure, not a
+  model-output quality result. Engine shutdown released all task GPUs; the
+  failure is retained under `.artifacts/hc_trace_20260905/`. Do not count it
+  as a successful trace or hide the model startup from the attempt record.
+- Fix/preflight before retry: explicitly request `return_dict=False`, normalize
+  Mapping outputs, and validate nonempty integer IDs and vocabulary bounds on
+  CPU before creating the LLM. Both quality prompts pass (71/82 tokens). The
+  installed Nsight CLI and matching QdstrmImporter live under different library
+  roots; invoking the importer directly successfully converts the retained old
+  qdstrm entirely on CPU. No new profiler version or tracing criterion is used.
+- Reuse the skill parser's exact rank/ordinal windows with the old trace's
+  actual NVTX label `execute_context_0(0)_generation_1(1)`. A second SQL pass
+  selects the final mixer's same-stream work after its last HC norm, excluding
+  auxiliary-stream kernels and deduplicating named HC work. The old core bucket
+  is reproduced as `2.658072 ms` rank-average service; additional named HC and
+  final-mixer work brings the semantic total to `2.701252 ms` (rank-max mean
+  `2.726784 ms`). No steady-window final-mixer attribution failures. These
+  service statistics are not an additive whole-model wall-clock TPOT table.
+- A corrected retry is queued in `.artifacts/hc_trace_20260905_retry1/`, using
+  the same 8K/513 untraced and 8K/32 traced cases, current source-matched HC/W2
+  sidecars, and two short natural-EOS/thinking-enabled official-sampling checks
+  before the performance cases. These short checks are not the required final
+  256K quality gate. GPU locks are released before CPU-only report import;
+  an in-scope failure stops the job rather than automatically restarting it.
+
+## Completed HC full-model trace refresh, 2026-09-05
+
+- Corrected retry completed at frozen source `e76a9c8ca3` without further
+  model restarts. Two natural-EOS, thinking-enabled checks pass under official
+  sampling (temperature 1, top-p 0.95, top-k 20, seed 0): arithmetic 118 output
+  tokens and record-copy 110. These short checks do not establish full output
+  quality or the final 256K input boundary. The configured max context is
+  262144, but the timed prompt is 8192 tokens.
+- Same loaded engine: TP4 physical V100-SXM2-32GB GPUs 0-3, PP1, V2, no MTP,
+  no prefix cache, FP16 activations/KV, checkpoint-native NVFP4 experts,
+  online QPN8 disabled, q8192, shared-weight dual CUDA graphs, hybrid PLE.
+  Torch 2.10.0+cu128, CUDA runtime 12.8, Nsight Systems 2022.4.2.50.
+  Untraced 8K/513 case: pure decode **93.433729 tok/s**, **10.702773 ms/token**,
+  prefill 1.162319 s, TTFT 1.165618 s. One measured repeat after one warmup;
+  not a repeated endpoint stability claim. Traced 8K/32 request TPOT is
+  11.511879 ms; do not substitute it for the untraced speed.
+- Retained artifacts: `.artifacts/hc_trace_20260905_retry1/` contains the
+  exact contract/command, quality/result JSON, GPU sampler, raw qdstrm,
+  converted report/SQLite and `per_token.{json,md,csv}`. Manual same-version
+  QdstrmImporter conversion works; GPU reservation was released before this
+  CPU-only conversion. Owned engine/workers/PLE processes and sampler exited;
+  GPUs measured 144/10/10/10 MiB immediately after shutdown. No API is left
+  resident by this task.
+- Same parser rank/ordinal windows and NVTX label as the old trace: 31 x four
+  ranks, 29 middle steps. Kernel-name HC bucket **2.658072 -> 2.165077 ms**;
+  complete semantic HC **2.701252 -> 2.208302 ms** (18.25% reduction).
+  New full-HC p50 2.188509 ms, per-token rank-max mean 2.237414 ms. Preserve
+  the rank-skew/communication outlier; do not drop it to improve the mean.
+  No middle-window final-mixer attribution failures. CPU replay-window
+  boundaries produce small fractional launch-count averages; these are not
+  rounded into exact counts. Values are GPU service sums, not additive wall
+  critical-path TPOT. Full-HC **1.5 ms is not achieved**; remaining gap is
+  0.708302 ms (32.1% of the current measured HC time).
+- Current HC rank-average service: fused up/mix/gather 0.693805 ms; local down
+  0.559589; down gather 0.539501; combine/norm 0.367759; final gate 0.004423;
+  additional semantic work 0.043225. The trace confirms the actual fused
+  route. Endpoint improvement also includes earlier admitted W13/W2 and
+  other changes; do not attribute its entire delta solely to HC or norm.
+- Evidence SHA256: result
+  `83a381288a4fb1edc2966c323be567ace02c754fcc754a67778f73247d5df06a`;
+  quality `b4cb34908ca44eeac449104d2f87da77bcedd3345380876a574e5bbee32c0b33`;
+  nsys-rep `121c8bff98bce955ce13bb13501bcfc1021dffc31a214144191d1fcc7348673d`.
+- PR #481 was externally merged at `205acfb4da`, main merge `755baae1d0`.
+  Norm prefetch was pushed after that PR's merge point and needs a new Draft
+  PR. Continue in owned branch `codex/v100-qwen38-hc-15ms-20260905-1702`, same
+  artifact-preserving worktree. Merge main only AFTER the frozen trace ended
+  (`4b6c2daa1f`); this trace is not a speed claim for the integrated source.
+- Next bounded hypothesis: fused-up H8/512-thread scheduling provides eight
+  row pairs and two serial groups, unlike the rejected H8/256-thread schedule
+  with four serial groups. Keep the same FMA/reduction/rounding and packet
+  protocol; screen against admitted H4/256 on full HC with actual auxiliary
+  sum2 and post-tag-wrap checks. It is unimplemented/unmeasured at this update.
+  Existing logical-lane down split, producer publication, 81-CTA down fusion,
+  and norm/down variants remain rejected; do not repeat unchanged.
+- Post-integration targeted norm dispatch/communicator-owner CPU checks pass
+  **35 tests**. Continuation Draft PR:
+  [#506](https://github.com/1CatAI/1Cat-vLLM/pull/506).
+- H8/512 screen completed at `2c2ec3f38d`: production complete HC
+  **1.948767 ms**, private H4/256 control 1.970251 ms, private H8/512
+  **1.953417 ms**. H8 improves private geometry by 0.016835 ms, but the tested
+  candidate does not beat production (0.004649 ms slower); no production port
+  or endpoint promotion. This does not prove that every source-integrated H8
+  implementation would lose, but it is not sufficient evidence to admit one.
+  Both fused kernels use 30 registers, zero stack/spills; H4 has 192 shared
+  bytes and H8 384. All four ranks x16 changing inputs, 512 actual auxiliary
+  sum2 replays, and post-timing checks are bitwise; generations 146593/195841
+  cross the 16-bit tag boundary. Evidence `.artifacts/hc_up_h8_threads/`, result
+  SHA256 `2b233da24cf9bba28d867fcdb364e6e8dafd873bf467755358bf169fa83f8ea4`.
+  Test exited normally; GPUs0-3 measured 141/7/7/7 MiB. No own queue/model/API
+  remains. Do not repeat this private-pointer H8/512 candidate unchanged.
+
+## HC down counter refresh and packed scatter, 2026-09-05
+
+- Previous goal turn made progress: refreshed full-model HC 2.208302 ms and
+  untraced decode 93.433729 tok/s, and rejected H8/512 private scheduling.
+  Full HC <=1.5 ms remains unachieved. No full-model startup in this turn.
+- Earlier NCU evidence (488 GB/s, 24.23% occupancy) profiled the old 324-row
+  replicated down projection, not today's 81-live-row TP shard. Profile only
+  `_qwen38_hc_down_local_shard_kernel`, grid88/block128, one real layer-0
+  weight on GPU0. Nsight Compute2022.4.1, clock-control none, cache-control all,
+  full counter set, one launch after warmup. New cold-replay diagnostic:
+  7.74 us, 216.88 GB/s, DRAM28.09%, SM5.85%, achieved occupancy6.51%, 40
+  registers, 0.08 eligible warps/scheduler, no-eligible91.84%; long-scoreboard
+  7.7 cycles/issue (63.9%). This is not wall HC timing and the clocks were
+  not locked. Evidence `.artifacts/hc_down_ncu_20260905/`: profile/run scripts,
+  retained NCU report and exported metrics. Privileged profiler exited normally.
+- Reuse the existing full-model SQLite, with no GPU rerun. Align all down
+  gathers by collective ordinal across ranks (2976 =31x96 each), verify
+  participant overlap, retain 29 middle whole-graph groups. Mean service
+  5.620995 us/call comprises 0.732571 us before the latest participant starts
+  and 4.888424 us after; last arrival to last completion5.188404 us. Retain
+  the step18 rank-skew outlier. These diagnostic boundaries differ from the
+  accepted CPU replay windows and do not replace the whole-HC report.
+- SASS confirms the old gather scatters contiguous low-rank rows through
+  scalar U16 stores and per-element routing branches. Change ONLY output
+  placement: aligned first80 values/rank use packed16-byte stores, the final
+  pack scatters one injection and three padding values. Keep the original
+  scalar output fallback for an unaligned weak-contiguous view. No changes
+  to arithmetic, sentinel handling, peer ordering, epoch, IPC layout, up or
+  norm. New gather44-46 registers versus old38; both zero stack/spills.
+- Build a single owner DSO containing production vector scatter and the
+  literal old scalar control, then run a paired full-HC benchmark. Pre-commit
+  source SHA4ef36a70d2 plus communication-file SHA256
+  `fea0d06d29cbcdcc3093a32ccd27aeac92e36e23342e5079063df58ba1b9bf64`.
+  Full HC **1.971644 ->1.899800 ms**, saving **0.071844 ms (3.64%)**;
+  vector samples1.899800/1.899861/1.899677. All four ranks pass raw-bit
+  aligned/unaligned comparisons and guards, 16 full-chain changing inputs,
+  512 actual auxiliary sum2 replays and post-timing bitwise checks. Keep this
+  candidate in DraftPR506; do not subtract its isolated gain directly from
+  the previous model trace or claim the 1.5-ms target.
+- Evidence `.artifacts/hc_down_vector_scatter/`: source-derived sidecar/control,
+  build script/log, paired benchmark/guarded runner, result and SASS. Result
+  SHA256 `f533515ef855ab0de4a1f39c71b5d43f96a7520705b38420288b76b8c94e3963`;
+  binary `fb5ee424a70c7532791d38918530d01f85ee99719a37b931c3c95762d3c0d023`.
+  Main was fetched and unchanged at755baae1d0 before publication.
+- Add the model-free public oracle
+  `benchmarks/kernels/verify_sm70_hc_down_scatter.py`: byte-gather reference,
+  all eight FP16 output alignments, reserved-NaN canonicalization in low-rank,
+  injection and padding positions, outside-buffer guards and CUDA Graph replay.
+  Ruff passes. Its focused GPU execution is queued behind the existing GPU
+  reservation; an earlier probe exited75 without starting a CUDA process.
+  This pending oracle is not yet reported as passed.
+- A separate explicit down register-lookahead screen (8/40 steps) was checked
+  OFFLINE ONLY. Compiler scheduling reduced both to32-register rolling-load
+  code, including a warp-ordering attempt, so the intended lookahead was not
+  established. Do not run these as purported prefetch variants or repeat the
+  previously rejected ordinary CUDA128 down. No GPU startup for this screen.

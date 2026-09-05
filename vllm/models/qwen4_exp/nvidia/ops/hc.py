@@ -282,6 +282,7 @@ def _hc_combine_norm_kernel(
     EPS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     launch_pdl: tl.constexpr,
+    PREFETCH_WEIGHT: tl.constexpr = False,
 ) -> None:
     HC_PAD: tl.constexpr = triton.next_power_of_2(HC)
     NUM_TILES: tl.constexpr = triton.cdiv(HC_DIM, BLOCK_SIZE)
@@ -307,6 +308,8 @@ def _hc_combine_norm_kernel(
     res = tl.load(res_ptr + row * stride_res + offs, mask_inner, other=0.0)
     inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
     block = tl.load(block_ptr + row * stride_block + offs_inner, mask_inner, other=0.0)
+    if PREFETCH_WEIGHT:
+        w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
     inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
     inj = tl.sum(tl.where(offs_hc == stream, inj, 0.0))
     # Round the materialized combine result before normalization. This matches
@@ -323,9 +326,10 @@ def _hc_combine_norm_kernel(
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
-    # Loading the weight earlier helps decode but keeps the tile live across
-    # the reduction and regresses larger batches, so defer it to the norm.
-    w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
+    # Decode can hide this load behind combine/reduction. Keep prefill's
+    # deferred load: the longer live range regresses larger batches.
+    if not PREFETCH_WEIGHT:
+        w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
     y = out * rrms
     y += y * w.to(tl.float32)
     tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
@@ -355,7 +359,8 @@ def _hc_combine_norm(
     # The M=1 SM70 path is register-bound with the generic 512-wide tile.
     # A 1024-wide tile keeps identical reduction/rounding results and is
     # measurably faster on V100; retain the generic tile for larger batches.
-    BLOCK_SIZE = 1024 if N == 1 and current_platform.is_device_capability(70) else 512
+    sm70_decode = N == 1 and current_platform.is_device_capability(70)
+    BLOCK_SIZE = 1024 if sm70_decode else 512
     _hc_combine_norm_kernel[(N, hc_count)](
         block_output,
         residual,
@@ -374,6 +379,12 @@ def _hc_combine_norm(
         EPS=eps,
         BLOCK_SIZE=BLOCK_SIZE,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        PREFETCH_WEIGHT=(
+            sm70_decode
+            and hc_dim == 2560
+            and hc_count == 4
+            and residual.dtype == torch.float16
+        ),
         num_warps=4,
     )
     return out, y
