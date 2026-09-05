@@ -100,9 +100,25 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
         std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS");
     if (blocks != nullptr) {
       const int parsed = std::atoi(blocks);
-      if (parsed > 0 && parsed <= kSm70Tp4PushAllreduceBlocks) return parsed;
+      const int min_blocks = (bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                             (kSm70Tp4PushAllreduceThreads * 16);
+      // This push kernel handles one pack per thread, without a grid-stride
+      // loop. An undersized launch silently leaves the output tail unwritten.
+      if (parsed >= min_blocks && parsed <= kSm70Tp4PushAllreduceBlocks) {
+        return parsed;
+      }
     }
     return bytes == kSm70Tp4PushAllreduceQwen38M4Bytes ? 10 : 20;
+  }
+  // Experimental message-size admission, independent of model or batch shape.
+  // Preserve the established launch choices above. Each thread handles one
+  // 16-byte pack, and the persistent buffer remains bounded by its old size.
+  const char* small =
+      std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES");
+  if (small != nullptr && std::strcmp(small, "1") == 0 && bytes > 0 &&
+      bytes <= kSm70Tp4PushAllreduceBytes && bytes % 16 == 0) {
+    return static_cast<int>((bytes + kSm70Tp4PushAllreduceThreads * 16 - 1) /
+                            (kSm70Tp4PushAllreduceThreads * 16));
   }
   const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
   return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&

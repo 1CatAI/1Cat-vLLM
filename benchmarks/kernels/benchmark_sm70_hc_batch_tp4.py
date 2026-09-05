@@ -9,6 +9,7 @@ Real weights, synthetic activations; this is not a model-quality test.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -57,6 +58,9 @@ def main():
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pair", choices=("attn", "mlp"), default="attn")
     p.add_argument("--mode", choices=("full", "down"), default="full")
+    p.add_argument(
+        "--profile", action="store_true", help="Capture graph nodes, skip timing sweep"
+    )
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
@@ -192,6 +196,30 @@ def main():
                     )
                 checks.append(row)
             assert all(c["finite"] for row in checks for c in row)
+            if args.profile:
+                for _ in range(30):
+                    graphs[0].replay()
+                    graphs[1].replay()
+                torch.cuda.synchronize()
+                check_exclusive()
+                dist.barrier()
+                torch.cuda.profiler.start()
+                for _ in range(3):
+                    for which, name in ((0, "hc.baseline"), (1, "hc.candidate")):
+                        with torch.cuda.nvtx.range(name):
+                            graphs[which].replay()
+                            torch.cuda.synchronize()
+                        dist.barrier()
+                torch.cuda.profiler.stop()
+                check_exclusive()
+                if rank == 0:
+                    print(
+                        "HC profile completed; trace is composition evidence, "
+                        "not a speed gate.",
+                        flush=True,
+                    )
+                del graphs, outputs
+                continue
             times = [[], []]
             for sample in range(5):
                 for which in (0, 1) if sample % 2 == 0 else (1, 0):
@@ -228,10 +256,23 @@ def main():
                 print(json.dumps(gathered), flush=True)
             del graphs, outputs
         if rank == 0:
+            library = os.environ.get("VLLM_SM70_CUSTOM_AR_LIBRARY")
+            runtime = {
+                "custom_ar_library": library,
+                "small_message_push": os.environ.get(
+                    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "0"
+                ),
+            }
+            if library:
+                runtime["custom_ar_sha256"] = hashlib.sha256(
+                    Path(library).read_bytes()
+                ).hexdigest()
             args.out.parent.mkdir(exist_ok=True, parents=True)
             args.out.write_text(
                 json.dumps(
-                    dict(args=vars(args), results=results), default=str, indent=2
+                    dict(args=vars(args), results=results, runtime=runtime),
+                    default=str,
+                    indent=2,
                 )
                 + "\n"
             )
