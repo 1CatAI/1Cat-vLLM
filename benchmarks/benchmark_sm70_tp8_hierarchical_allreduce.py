@@ -53,10 +53,15 @@ def _capture_custom(
 class JoinStage:
     """Reproduce a multi-stream projection join before each collective."""
 
-    def __init__(self, *, collectives: int, seed: int, rank: int) -> None:
+    def __init__(
+        self, *, collectives: int, elements: int, seed: int, rank: int
+    ) -> None:
+        if elements % 4096 != 0:
+            raise ValueError("join-work elements must be a multiple of 4096")
+        tokens = elements // 4096
         generator = torch.Generator(device="cuda").manual_seed(seed + rank)
         self.x = torch.randn(
-            (1, 256), device="cuda", dtype=torch.float16, generator=generator
+            (tokens, 256), device="cuda", dtype=torch.float16, generator=generator
         )
         self.main_weight = torch.randn(
             (4096, 256), device="cuda", dtype=torch.float16, generator=generator
@@ -67,13 +72,16 @@ class JoinStage:
             )
             for n in (2048, 1024, 512)
         ]
-        self.main_out = torch.empty((1, 4096), device="cuda", dtype=torch.float16)
+        self.main_out = torch.empty((tokens, 4096), device="cuda", dtype=torch.float16)
         self.aux_outs = [
-            torch.empty((1, weight.shape[0]), device="cuda", dtype=torch.float16)
+            torch.empty((tokens, weight.shape[0]), device="cuda", dtype=torch.float16)
             for weight in self.aux_weights
         ]
         self.bias = torch.randn(
-            (1, 4096), device="cuda", dtype=torch.float16, generator=generator
+            (tokens, 4096),
+            device="cuda",
+            dtype=torch.float16,
+            generator=generator,
         )
         self.reduce_input = torch.empty_like(self.main_out)
         self.reduce_output = torch.empty_like(self.main_out)
@@ -145,6 +153,7 @@ def _output_stats(
 ) -> dict[str, float | str | bool]:
     host_output = output.detach().cpu()
     diff = host_output.float() - expected
+    expected_output = expected.to(host_output.dtype)
     digest = _digest(host_output)
     digests: list[str | None] = [None] * dist.get_world_size()
     dist.all_gather_object(digests, digest)
@@ -153,25 +162,115 @@ def _output_stats(
         "mean_abs": float(diff.abs().mean().item()),
         "sha256": digest,
         "all_ranks_bitwise_equal": len(set(digests)) == 1,
+        "bitwise_equal_fixed_tree_reference": torch.equal(host_output, expected_output),
     }
 
 
 def _expected_sum(inp: torch.Tensor) -> torch.Tensor:
     gathered: list[torch.Tensor | None] = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, inp.detach().cpu())
-    return torch.stack(
-        [tensor.float() for tensor in gathered if tensor is not None]
-    ).sum(dim=0)
+    tensors = [tensor.float() for tensor in gathered if tensor is not None]
+    lower = tensors[0].clone()
+    upper = tensors[4].clone()
+    for tensor in tensors[1:4]:
+        lower.add_(tensor)
+    for tensor in tensors[5:8]:
+        upper.add_(tensor)
+    return lower + upper
+
+
+def _benchmark_sum2(
+    *,
+    custom: CustomAllreduce,
+    inp_a: torch.Tensor,
+    inp_b: torch.Tensor,
+    collectives: int,
+    warmup: int,
+    iterations: int,
+    repeats: int,
+) -> dict[str, object]:
+    local_sum = torch.empty_like(inp_a)
+    baseline_out = torch.empty_like(inp_a)
+    fused_out = torch.empty_like(inp_a)
+
+    def baseline_warm() -> None:
+        for _ in range(collectives):
+            torch.add(inp_a, inp_b, out=local_sum)
+            custom.all_reduce(local_sum, out=baseline_out, registered=False)
+
+    def baseline_capture() -> None:
+        for _ in range(collectives):
+            torch.add(inp_a, inp_b, out=local_sum)
+            custom.all_reduce(local_sum, out=baseline_out, registered=True)
+
+    baseline_graph = _capture_custom(custom, baseline_warm, baseline_capture)
+
+    def fused_warm() -> None:
+        torch.add(inp_a, inp_b, out=local_sum)
+        for _ in range(collectives):
+            custom.all_reduce(local_sum, out=fused_out, registered=False)
+
+    def fused_capture() -> None:
+        for _ in range(collectives):
+            custom.all_reduce_sum2(inp_a, inp_b, out=fused_out)
+
+    fused_graph = _capture_custom(custom, fused_warm, fused_capture)
+
+    baseline_graph.replay()
+    fused_graph.replay()
+    torch.cuda.synchronize()
+    expected = _expected_sum(torch.add(inp_a, inp_b))
+    baseline_output = _output_stats(baseline_out, expected)
+    fused_output = _output_stats(fused_out, expected)
+
+    baseline_samples = []
+    fused_samples = []
+    for repeat in range(repeats):
+        order = (
+            ((baseline_graph, baseline_samples), (fused_graph, fused_samples))
+            if repeat % 2 == 0
+            else ((fused_graph, fused_samples), (baseline_graph, baseline_samples))
+        )
+        for graph, samples in order:
+            samples.append(
+                _rank_max(
+                    _measure_graph(
+                        graph,
+                        collectives=collectives,
+                        warmup=warmup,
+                        iterations=iterations,
+                    )
+                )
+            )
+
+    baseline_median = statistics.median(baseline_samples)
+    fused_median = statistics.median(fused_samples)
+    return {
+        "baseline_add_then_hierarchical": {
+            "rank_max_samples_ms": baseline_samples,
+            "rank_max_median_ms": baseline_median,
+            "output": baseline_output,
+        },
+        "fused_sum2_hierarchical": {
+            "rank_max_samples_ms": fused_samples,
+            "rank_max_median_ms": fused_median,
+            "output": fused_output,
+        },
+        "speedup": baseline_median / fused_median,
+        "projected_graph_saving_ms": collectives * (baseline_median - fused_median),
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--collectives", type=int, default=87)
+    parser.add_argument("--elements", type=int, choices=(4096, 8 * 4096), default=4096)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260803)
     parser.add_argument("--join-work", action="store_true")
+    parser.add_argument("--sum2", action="store_true")
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
 
@@ -197,9 +296,63 @@ def main() -> int:
         )
 
     generator = torch.Generator(device=device).manual_seed(args.seed + rank)
-    inp = torch.randn((4096,), dtype=torch.float16, device=device, generator=generator)
+    inp = torch.randn(
+        (args.elements,), dtype=torch.float16, device=device, generator=generator
+    )
+    if args.sum2:
+        inp_b = torch.randn(
+            (args.elements,), dtype=torch.float16, device=device, generator=generator
+        )
+        payload = {
+            "contract": {
+                "world_size": world_size,
+                "elements": inp.numel(),
+                "bytes": inp.numel() * inp.element_size(),
+                "dtype": str(inp.dtype),
+                "cuda_graph": True,
+                "collectives_per_graph": args.collectives,
+                "warmup": args.warmup,
+                "iterations": args.iterations,
+                "repeats": args.repeats,
+                "seed": args.seed,
+                "sum2": True,
+            },
+            **_benchmark_sum2(
+                custom=custom,
+                inp_a=inp,
+                inp_b=inp_b,
+                collectives=args.collectives,
+                warmup=args.warmup,
+                iterations=args.iterations,
+                repeats=args.repeats,
+            ),
+        }
+        if rank == 0:
+            encoded = json.dumps(payload, indent=2)
+            print(encoded)
+            if args.output_json is not None:
+                args.output_json.parent.mkdir(parents=True, exist_ok=True)
+                args.output_json.write_text(encoded + "\n", encoding="utf-8")
+        torch.cuda.synchronize()
+        dist.barrier()
+        custom.close()
+        communicator.destroy()
+        dist.barrier()
+        dist.destroy_process_group()
+        fused_output = payload["fused_sum2_hierarchical"]["output"]
+        return (
+            0
+            if fused_output["all_ranks_bitwise_equal"]
+            and fused_output["bitwise_equal_fixed_tree_reference"]
+            else 1
+        )
     if args.join_work:
-        nccl_stage = JoinStage(collectives=args.collectives, seed=args.seed, rank=rank)
+        nccl_stage = JoinStage(
+            collectives=args.collectives,
+            elements=args.elements,
+            seed=args.seed,
+            rank=rank,
+        )
 
         def run_nccl() -> None:
             nccl_stage.run(communicator.all_reduce)
@@ -221,7 +374,10 @@ def main() -> int:
 
     if args.join_work:
         custom_stage = JoinStage(
-            collectives=args.collectives, seed=args.seed, rank=rank
+            collectives=args.collectives,
+            elements=args.elements,
+            seed=args.seed,
+            rank=rank,
         )
 
         def run_custom_warm() -> None:
@@ -326,7 +482,7 @@ def main() -> int:
             "output": custom_output,
         },
         "speedup": nccl_median / custom_median,
-        "projected_87_call_saving_ms": 87 * (nccl_median - custom_median),
+        "projected_graph_saving_ms": args.collectives * (nccl_median - custom_median),
     }
     if rank == 0:
         encoded = json.dumps(payload, indent=2)
@@ -341,7 +497,12 @@ def main() -> int:
     communicator.destroy()
     dist.barrier()
     dist.destroy_process_group()
-    return 0 if custom_output["all_ranks_bitwise_equal"] else 1
+    return (
+        0
+        if custom_output["all_ranks_bitwise_equal"]
+        and custom_output["bitwise_equal_fixed_tree_reference"]
+        else 1
+    )
 
 
 if __name__ == "__main__":

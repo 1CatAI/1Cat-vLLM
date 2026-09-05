@@ -692,8 +692,7 @@ class Glm5NextDecoderLayer(nn.Module):
         if (
             _DEBUG_DFLASH_TARGET_TRACE
             and self.layer_idx == 3
-            and positions.numel() > 1
-            and int(positions[0].item()) >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
+            and 1 < positions.numel() <= 8
         ):
             arm_dflash_nvfp4_trace()
         if self._mlp_is_moe:

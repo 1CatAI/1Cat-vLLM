@@ -45128,6 +45128,120 @@ Interpretation:
   quality-audited, checkpoint-code-preserving B1 operator path. Test services
   were stopped after collection and all four V100s returned to idle memory.
 
+## 2026-09-02 GLM-5.3 DFlash2 TP8 verifier under 30 ms
+
+- Draft PR #454 is stacked on GLM DFlash2 Draft PR #404. The owned branch is
+  `codex/v100-glm53-dflash2-verifier30-20260901-165322`; the quality and
+  performance source is `561b7007f12e78ed626041ae58fa1d51cc8486f9` and the
+  loaded SM70 extension SHA256 is
+  `e0e88d7629c81a808f4bebb17045757d4af5b99fd2c9db0f558ac7d6d7de4a15`.
+- The frozen contract is GLM-5.3-Flash-NVFP4, FP16 target execution, E4M3 FP8
+  target KV, DFlash2 q7 probabilistic sampling, TP8/PP1, eight V100-SXM2-32GB
+  GPUs, one live request, CUDA Graph, and no MTP. This is the PP-free verifier
+  lower bound; it does not replace the accepted TP4/PP2 service topology.
+- The matched verifier series moved from `33.2440 ms/round` to `32.7333 ms`
+  with exact cuBLASLt KDA projections, then `30.1857 ms` with fused GDN
+  metadata, and finally `29.91297 ms` with the native q8 mHC post+dot kernel.
+  The source-default three-seed rerun records `29.88682 ms/round` across 74
+  rounds and `172.2715 tok/s` weighted pure decode.
+- The final sampler step assigns eight warps only to the exact SM70 GLM5
+  target shape: batch 8, vocabulary 154,880, top-k disabled, and top-p
+  enabled. The existing default-on environment switch remains its immediate
+  rollback. A candidate/control/candidate sandwich records `29.847545`,
+  `30.210515`, and `30.049566 ms/round`; the two-candidate mean is
+  `29.948555 ms/round`, `0.261959 ms` or 0.87% below the four-warp control.
+  Individual runs can still land slightly above 30 ms, so this is a mean
+  steady-shape closure rather than an every-run upper bound.
+- A matched seed-zero graph-node trace has the same 128 output tokens, token
+  hash, and 23 verification steps on both schedules. `_topk_topp_kernel`
+  falls from `303.237 us` to `207.963 us` per rank/round, a `95.273 us`
+  (31.4%) reduction. One candidate trace step has 4.8 ms of rank-start skew;
+  traced interval means are therefore diagnostic composition evidence, not
+  the accepted endpoint latency.
+- The accepted mHC kernel uses CUDA `half`, round-to-nearest FP16 stores, and
+  source-order `value += comb * residual` / `dot += weight * mapped`
+  accumulation. Its six outputs are bitwise equal to the retained FP32 staged
+  implementation. The earlier explicit-`fmaf` version was faster but changed
+  seven of 131,072 FP16 residual elements by one ULP and changed the token
+  hash, so it remains rejected.
+- The official no-request-seed 128-question GSM8K audit with proposal
+  calibration `0.9/0.95` records `124/128` accuracy, zero invalid answers, and
+  128 natural stops. Mean completion tokens per verification step are
+  `5.787283`, passing the `5.78` release gate; token-weighted acceptance is
+  `5.573722`, passing the `4.85` implementation gate.
+- The post-sampler-change repeat again records `124/128`, zero invalid
+  answers, and 128 natural stops. Mean completion tokens per verification step
+  are `5.784293`; token-weighted acceptance is `5.561909`. Both gates pass,
+  and acceptance min/P50/P90/P99/max are unchanged from the earlier audit.
+  Weighted pure decode is `180.008 tok/s`; mean per-request steady decode is
+  `190.320 tok/s`, aggregate output throughput is `106.575 tok/s`, and mean
+  TPOT is `5.4041 ms`. Across all 38,236 completion tokens, total decode time
+  divided by all 6,873 verification steps is `30.8020 ms/round`; the longer
+  contexts and request transitions make this a different contract from the
+  short steady-shape 29.95 ms sandwich.
+- A paired fixed-seed 128-question audit records `122/128`, zero invalid
+  answers, 128 natural stops, `5.753127` mean completion tokens per verifier
+  step, and `5.602134` token-weighted acceptance. The more aggressive
+  `0.8/0.95` candidate is rejected because it produced one length stop and one
+  invalid answer on the same fixed seed.
+- The official run averages `187.4022 tok/s` steady decode and `101.2123 tok/s`
+  aggregate output throughput. Mean/P50/P90/P99 TPOT is
+  `5.4907/5.2661/6.2850/9.3154 ms`. Each rank reports 1.7 GiB available for KV
+  and 34,071 logical KV tokens at 0.90 memory utilization. During steady
+  generation all eight GPUs report 100% GPU utilization and about 38-39%
+  memory-controller utilization.
+- The narrow runtime selector applies the qualified flags only to SM70,
+  ModelOpt NVFP4 GLM5, FP16, probabilistic q7 DFlash2, TP8/PP1, no-DBO
+  contracts. It preserves every explicit override, keeps sparse target
+  rejection and the rejected MoE QPN W13 route disabled, and chooses regular
+  `torch.compile`; AOT compile measured `30.98 ms/round` with an exact output
+  prefix and is rejected for missing the 30 ms latency gate.
+- A historical upstream single-pass top-p kernel is also rejected: it is
+  faster but changes 703 mask elements on a random GLM-shaped exactness test.
+  Non-default top-p tile sizes likewise change the mask. An eight-warp
+  rejection block-stat candidate changed the accepted-token chain despite
+  matching isolated intermediate buffers and was removed. Compact target
+  rejection does not apply because the official target contract has top-k
+  disabled; forcing top-k 20 would change the target distribution.
+- Raw endpoint and quality artifacts are under
+  `.artifacts/glm53_dflash2_verifier30/`, notably
+  `q8_tp8pp1_multiseed012_topponly8_source_default_prop09_candidate_20260902.json`,
+  `q8_tp8pp1_multiseed012_topponly4_rollback_prop09_control_20260902.json`,
+  `q8_tp8pp1_topponly8_final_round_nodes.json`,
+  `q8_tp8pp1_gsm8k128_topponly8_source_default_prop09_top095_official_quality_20260902.json`,
+  and
+  `q8_tp8pp1_gsm8k128_source_default_aot0_prop09_top095_seed20260902_quality_20260902.json`.
+
+## 2026-09-02 GLM-5.3 TP8 fused KDA f_b/g_b closure
+
+- The native SM70 KDA f_b/g_b operator now admits the exact TP8
+  `B=1..8, N=1024, K=128` shape while retaining the existing TP4 `N=2048`
+  specialization. Its CUDA Graph replay is stable, and the focused V100
+  operator plus environment-gate suite reports 11 passed cases.
+- A 128-token-warm, ten-seed low-overhead A/B records `29.6850 ms/round` with
+  fusion and `29.9173 ms/round` without it, saving `0.2323 ms` or 0.78%.
+  Removing the first three requests still saves `0.1834 ms`. Earlier short-
+  warmup outliers are rejected as lazy-module startup measurements.
+- Same-seed node traces preserve the token hash and 23 verification steps.
+  Per rank/round they replace 68 CUTLASS `32x32x64 TN` projection launches with
+  34 native launches. The TP GPU-sum delta is `78.562 - 33.705 = 44.857 ms`
+  over 24 rounds and eight ranks, or `0.2336 ms/rank/round`, independently
+  explaining the endpoint result.
+- The official 128-question, 4096-token audit records `123/128` accuracy,
+  zero invalid answers, 128 natural stops, `5.827398` mean completion tokens
+  per verification step, and `5.585305` token-weighted acceptance. Both release
+  gates pass. Weighted pure decode is `187.716 tok/s`; the full long-output
+  audit averages `29.6639 ms` across 6,805 verification steps.
+- `VLLM_SM70_GLM53_TP8_FUSED_FG_B=1` is added only to the existing audited
+  SM70 GLM-5.3 NVFP4 DFlash2 TP8/PP1 default set. Its global default remains
+  off, explicit `0` remains the immediate rollback, and TP4/PP2 plus unrelated
+  model, quantization, topology, dtype, and draft routes are unchanged.
+- New raw evidence is under `.artifacts/glm53_dflash2_verifier30/`:
+  `q8_tp8pp1_10seed_topponly8_fusedfg1024_candidate3_warm128_20260902.json`,
+  `q8_tp8pp1_10seed_topponly8_fusedfg1024_control2_warm128_20260902.json`,
+  `q8_tp8pp1_fusedfg1024_topponly8_round_nodes.json`, and
+  `q8_tp8pp1_gsm8k128_topponly8_fusedfg1024_source_default_prop09_top095_official_quality_20260902.json`.
+
 ## 2026-09-03 Qwen3.8 unified prefill/decode compilation
 
 - The matched TP4/no-MTP evidence separated the regression from PLE residency.
@@ -45526,3 +45640,78 @@ Interpretation:
   output-quality gate with further material changes. Do not claim the old
   full-model HC bucket moved `2.658 -> 1.999 ms`, or that the `1.5-ms` target
   was achieved. All task-owned GPU tests/queues exited; other tasks continue.
+
+## 2026-09-03 GLM-5.3 DFlash2 TP4/PP2 256K cache and verifier audit
+
+- Draft PR #456 is stacked on verifier PR #454. The frozen contract is eight
+  V100-SXM2-32GB GPUs, TP4/PP2 with layer partition `24,21`, GLM-5.3-Flash
+  NVFP4 target execution in FP16, E4M3 target KV, official probabilistic q7
+  DFlash2, one live request, CUDA Graph, and AOT compile. No INT8 dense or KDA
+  path is admitted.
+- GLM's target Mamba state forces a 2,304-token MLA manager block. Charging
+  each DFlash sliding-window layer at that block size wasted about 1.6 GiB on
+  every PP1 rank. The cache planner now reblocks the draft attention to the
+  largest aligned divisor whose real page fits an MLA tensor slot: 1,152
+  tokens and 1,198,080 padded bytes for this model. Draft pages share the
+  unused MLA slot for the same globally exclusive block ID; no cache value,
+  scale, dtype, attention window, or block-owner lifetime changes.
+- At `gpu_memory_utilization=0.93`, every run reports 333,796 logical KV
+  tokens, or 1.27 concurrent 262,144-token requests. PP0 has 2.20 GiB
+  available and needs 1.05 GiB; PP1 has 1.14-1.16 GiB available and needs
+  0.89 GiB. The pool block is 7,644,672 bytes on PP0 and 6,370,560 bytes on
+  PP1. Model loading is 24.95 GiB/rank on PP0 and 25.85 GiB/rank on PP1,
+  where the approximately 0.90-GiB difference is the resident drafter.
+- The exact boundary run uses 262,136 prompt tokens plus eight output tokens
+  at `max_model_len=262144`. It finishes normally with no cache corruption.
+  Prefill takes 1,160.21 seconds and boundary decode is 1.825 token/s because
+  the real 256K sparse-attention work is included; this is a capacity proof,
+  not the short-context verifier speed result.
+- Three 128-question audits at the 256K service configuration record
+  `122/128`, `119/128`, and `123/128` accuracy. The fixed-seed runs have zero
+  invalid answers and 128 natural stops. The official unseeded run records
+  one length stop, `0.78125%` invalid answers, and `5.81257` mean completion
+  tokens per verification step, above the 5.78 release threshold. Pooled
+  acceptance is 5.46934-5.53801 on the fixed-seed routes, above the 4.85
+  implementation threshold.
+- Robust full-round cost is 43.440, 43.709, and 44.160 ms when each complete
+  128-request audit sums decode time and divides by all verification rounds.
+  Mean steady accepted-token throughput is 130.589-132.127 token/s. Two
+  deterministic dataset-0 AOT1 runs have identical 207-token output arrays
+  and measure 42.643 and 42.836 ms/round. Single unrelated stochastic
+  requests ranged more widely and are not used as a stable speed claim.
+- Temporary V2 CUDA-event probes localize a representative 42.486-ms round:
+  PP0 target forward 19.281 ms, PP1 target forward 16.109 ms, target logits
+  plus rejection sampling 1.282 ms, request-state update 0.034 ms, DFlash
+  proposal 3.456 ms, PP broadcast GPU work 0.124 ms, and about 2.200 ms of
+  remaining CPU scheduler/PP handoff. The two sequential target stages alone
+  are 35.390 ms. Resident NCCL wait kernels are dependency waits and are not
+  added again as communication service.
+- The retained exact KDA candidate lets every row lane directly load the
+  cached input half2 and removes the row-0 warp shuffle while preserving the
+  FP32 FMA and reduction order. The q8 microbenchmark is bitwise equal and
+  moves 126.222 to 114.924 microseconds (`+9.8%` effective bandwidth). Rows-8
+  CTA and forced 32-register launch-bound variants regress to 132.407 and
+  131.568 microseconds and were removed. The full-model output remains exact;
+  endpoint movement is below run-to-run noise, so only the operator result is
+  claimed.
+- Shared-expert side-stream execution remains enabled. A retained serialized
+  trace is about 1.23 ms/round slower. TP4 shared+routed `all_reduce_sum2` was
+  also left off: unmatched route smokes did not establish a benefit and were
+  not promoted. The quality-rejected TP4 push collective remains off.
+- The latest SGLang PP work does not provide a mergeable latency escape hatch.
+  GLM-5 speculative decoding plus PP issue #23162 is a closed RFC with no
+  linked implementation and keeps target PP stages serial. Parallel-spec
+  roadmap #27462 lists DFlash's hidden-state data plane and the PP handshake
+  as future/unvalidated work. Cross-round enumeration is not quality-neutral
+  for this hidden-state-conditioned drafter without that data plane.
+- Strict TP4/PP2 does not meet the requested 32-ms full-round ceiling. It
+  would require at least 10.5 ms, about 24.7%, below the stable 42.5-ms short
+  round, while the sequential target forwards already exceed 32 ms before
+  sampling and drafting. The same packed-cache code gives TP8/PP1 309,806 KV
+  tokens (1.18x 256K) and a 31.093-ms q8 round, but that is an explicitly
+  different topology and must not be reported as TP4/PP2.
+- Nsight Compute hardware-counter collection remains unavailable with
+  `ERR_NVGPUCTRPERM`. The host also rejects application-clock changes for the
+  current user; V100 application clocks remain 877/1290 MHz rather than the
+  supported 877/1530-MHz maximum. Neither unavailable counter values nor a
+  locked-clock speed projection is used as measured evidence.

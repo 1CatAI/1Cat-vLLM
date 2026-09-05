@@ -78,7 +78,11 @@ def test_sm70_topk_topp_8_warp_policy(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "0")
     assert not use_8_warps(cuda, 8, 248_320, True, True)
 
+    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1")
     assert not use_8_warps(cuda, 16, 128_000, True, True)
+    assert use_8_warps(cuda, 8, 154_880, False, True)
+    assert not use_8_warps(cuda, 8, 154_880, True, True)
+    assert not use_8_warps(cuda, 16, 154_880, False, True)
     assert not use_8_warps(cuda, 16, 248_320, False, True)
     assert not use_8_warps(torch.device("cpu"), 16, 248_320, True, True)
 
@@ -112,6 +116,37 @@ def test_sm70_topk_topp_b8_b16_8_warps_matches_rollback(
     monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1")
     envs.disable_envs_cache()
     candidate = apply_top_k_top_p_triton(logits.clone(), k, p)
+
+    torch.accelerator.synchronize()
+    assert torch.equal(candidate, rollback)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_sm70_glm53_topp_b8_8_warps_matches_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("The eight-warp production schedule is SM70-only")
+
+    import vllm.envs as envs
+    from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+    generator = Generator(device="cuda").manual_seed(20260902)
+    logits = torch.randn(
+        (8, 154_880),
+        generator=generator,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    p = torch.full((8,), 0.95, device="cuda", dtype=torch.float32)
+
+    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "0")
+    envs.disable_envs_cache()
+    rollback = apply_top_k_top_p_triton(logits.clone(), None, p)
+
+    monkeypatch.setenv("VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS", "1")
+    envs.disable_envs_cache()
+    candidate = apply_top_k_top_p_triton(logits.clone(), None, p)
 
     torch.accelerator.synchronize()
     assert torch.equal(candidate, rollback)

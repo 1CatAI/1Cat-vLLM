@@ -823,6 +823,110 @@ __global__ void nvfp4_qpn_w2_reduce_sm70_kernel(
   }
 }
 
+template <bool kW13>
+__global__ void nvfp4_glm53_moe_q8_qpn_sm70_kernel(
+    const half* __restrict__ input, const uint32_t* __restrict__ weights,
+    const half* __restrict__ scales, const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ sorted_row_idx, half* __restrict__ output) {
+  constexpr int kSplits = kW13 ? 3 : 1;
+  constexpr int kN = kW13 ? 512 : 4096;
+  constexpr int kK = kW13 ? 4096 : 256;
+  constexpr int kGroupsK16 = kK / 16;
+  constexpr int kGroupsK8 = kK / 8;
+  constexpr int kTilesN32 = kN / 32;
+  __shared__ float partials[kSplits][32];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x;
+  const int route = blockIdx.y;
+  const int source_slot = __ldg(sorted_row_idx + route);
+  const int expert = __ldg(expert_ids + source_slot);
+  if (expert < 0 || expert >= 288) {
+    if (threadIdx.x < 32) {
+      output[static_cast<size_t>(route) * kN + tile * 32 + threadIdx.x] =
+          __float2half(0.0f);
+    }
+    return;
+  }
+
+  const int quadpair = (lane >> 2) & 3;
+  const int a_row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int packed_col =
+      ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
+  int group_begin = 0;
+  int group_end = kGroupsK16;
+  if constexpr (kW13) {
+    // TurboMind's CTA-K32 split-3 scheduler assigns 42/43/43 chunks.
+    group_begin = warp == 0 ? 0 : (warp == 1 ? 84 : 170);
+    group_end = warp == 0 ? 84 : (warp == 1 ? 170 : 256);
+  }
+
+  const size_t words_per_expert = static_cast<size_t>(kK) * kN / 8;
+  const uint32_t* expert_weights =
+      weights + static_cast<size_t>(expert) * words_per_expert;
+  const size_t scales_per_expert = static_cast<size_t>(kK >> 4) * kN;
+  const half* expert_scales =
+      scales + static_cast<size_t>(expert) * scales_per_expert;
+  const half* input_row = input + static_cast<size_t>(route) * kK;
+
+  float accum[8] = {};
+#pragma unroll 4
+  for (int group = group_begin; group < group_end; ++group) {
+    const size_t tile_group_base =
+        (static_cast<size_t>(tile) * kGroupsK8 + group * 2) * 32 + packed_col;
+    const unsigned packed0 = __ldcs(expert_weights + tile_group_base);
+    const unsigned packed1 = __ldcs(expert_weights + tile_group_base + 32);
+    const size_t scale_index =
+        (static_cast<size_t>(group) * kTilesN32 + tile) * 32 + packed_col;
+    const half scalar = __ldg(expert_scales + scale_index);
+    const half2 scale =
+        __hmul2(__halves2half2(scalar, scalar), __float2half2_rn(16384.0f));
+
+    half2 decoded[8];
+    dequant_e2m1x8(packed0, scale, decoded);
+    dequant_e2m1x8(packed1, scale, decoded + 4);
+    const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
+
+    uint4 input01 = make_uint4(0, 0, 0, 0);
+    uint4 input23 = make_uint4(0, 0, 0, 0);
+    if (a_row == 0) {
+      input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+      input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);
+    }
+    const unsigned* a0 = reinterpret_cast<const unsigned*>(&input01);
+    const unsigned* a1 = reinterpret_cast<const unsigned*>(&input23);
+    VLLM_SM70_MMA_8N8K4(accum, a0[0], a0[1], b[0], b[1]);
+    VLLM_SM70_MMA_8N8K4(accum, a0[2], a0[3], b[2], b[3]);
+    VLLM_SM70_MMA_8N8K4(accum, a1[0], a1[1], b[4], b[5]);
+    VLLM_SM70_MMA_8N8K4(accum, a1[2], a1[3], b[6], b[7]);
+  }
+
+  if ((lane & 17) == 0) {
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+      for (int offset = 0; offset < 2; ++offset) {
+        const int index = pair * 4 + offset;
+        const int local_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+        partials[warp][quadpair * 8 + local_col] = accum[index];
+      }
+    }
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+    float value = partials[0][lane];
+    if constexpr (kW13) {
+      // TurboMind serial split-K executes split1+split0, then split2+prior.
+      value = __fadd_rn(partials[2][lane],
+                        __fadd_rn(partials[1][lane], partials[0][lane]));
+    }
+    output[static_cast<size_t>(route) * kN + tile * 32 + lane] =
+        __float2half(value);
+  }
+}
+
 template <int kSplitK>
 void launch_mxfp4_qpn_m1(torch::Tensor out, torch::Tensor input,
                          torch::Tensor weights, torch::Tensor scales,
@@ -1267,6 +1371,70 @@ void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(weight.data_ptr<at::Half>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_glm53_moe_q8_qpn_sm70_out(torch::Tensor out, torch::Tensor input,
+                                     torch::Tensor weights,
+                                     torch::Tensor scales,
+                                     torch::Tensor expert_ids,
+                                     torch::Tensor sorted_row_idx, bool w13) {
+  TORCH_CHECK(out.is_cuda() && input.is_cuda() && weights.is_cuda() &&
+                  scales.is_cuda() && expert_ids.is_cuda() &&
+                  sorted_row_idx.is_cuda(),
+              "nvfp4_glm53_moe_q8_qpn_sm70_out: tensors must be CUDA");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 &&
+                  input.scalar_type() == torch::kFloat16 &&
+                  weights.scalar_type() == torch::kInt32 &&
+                  scales.scalar_type() == torch::kFloat16 &&
+                  expert_ids.scalar_type() == torch::kInt32 &&
+                  sorted_row_idx.scalar_type() == torch::kInt32,
+              "nvfp4_glm53_moe_q8_qpn_sm70_out: dtype mismatch");
+  TORCH_CHECK(out.is_contiguous() && input.is_contiguous() &&
+                  weights.is_contiguous() && scales.is_contiguous() &&
+                  expert_ids.is_contiguous() && sorted_row_idx.is_contiguous(),
+              "nvfp4_glm53_moe_q8_qpn_sm70_out: tensors must be contiguous");
+  TORCH_CHECK(out.dim() == 2 && input.dim() == 2 && weights.dim() == 3 &&
+                  scales.dim() == 3 && expert_ids.numel() == 64 &&
+                  sorted_row_idx.numel() == 64,
+              "nvfp4_glm53_moe_q8_qpn_sm70_out: q8 rank/route mismatch");
+  TORCH_CHECK(input.get_device() == out.get_device() &&
+                  input.get_device() == weights.get_device() &&
+                  input.get_device() == scales.get_device() &&
+                  input.get_device() == expert_ids.get_device() &&
+                  input.get_device() == sorted_row_idx.get_device(),
+              "nvfp4_glm53_moe_q8_qpn_sm70_out: device mismatch");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto* properties = at::cuda::getDeviceProperties(input.get_device());
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "nvfp4_glm53_moe_q8_qpn_sm70_out: requires SM70");
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (w13) {
+    TORCH_CHECK(input.sizes() == torch::IntArrayRef({64, 4096}) &&
+                    out.sizes() == torch::IntArrayRef({64, 512}) &&
+                    weights.sizes() == torch::IntArrayRef({288, 4096, 64}) &&
+                    scales.sizes() == torch::IntArrayRef({288, 256, 512}),
+                "nvfp4_glm53_moe_q8_qpn_sm70_out: W13 shape mismatch");
+    nvfp4_glm53_moe_q8_qpn_sm70_kernel<true><<<dim3(16, 64), 96, 0, stream>>>(
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        expert_ids.data_ptr<int32_t>(), sorted_row_idx.data_ptr<int32_t>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+  } else {
+    TORCH_CHECK(input.sizes() == torch::IntArrayRef({64, 256}) &&
+                    out.sizes() == torch::IntArrayRef({64, 4096}) &&
+                    weights.sizes() == torch::IntArrayRef({288, 256, 512}) &&
+                    scales.sizes() == torch::IntArrayRef({288, 16, 4096}),
+                "nvfp4_glm53_moe_q8_qpn_sm70_out: W2 shape mismatch");
+    nvfp4_glm53_moe_q8_qpn_sm70_kernel<false><<<dim3(128, 64), 32, 0, stream>>>(
+        reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+        reinterpret_cast<const uint32_t*>(weights.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        expert_ids.data_ptr<int32_t>(), sorted_row_idx.data_ptr<int32_t>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

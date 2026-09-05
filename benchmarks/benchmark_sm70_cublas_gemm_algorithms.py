@@ -34,6 +34,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20260823)
+    parser.add_argument(
+        "--reference-mode",
+        choices=("batch", "rowwise"),
+        default="batch",
+        help="Compare against one batched GEMM or independent M1 GEMMs.",
+    )
     return parser.parse_args()
 
 
@@ -167,7 +173,15 @@ def _run_shape(
         (args.k, n), generator=generator, device=device, dtype=torch.float16
     ).mul_(0.02)
     reference = torch.empty((args.m, n), device=device, dtype=torch.float16)
-    torch.mm(inputs, weight, out=reference)
+    if args.reference_mode == "rowwise":
+        for row_idx in range(args.m):
+            torch.mm(
+                inputs[row_idx : row_idx + 1],
+                weight,
+                out=reference[row_idx : row_idx + 1],
+            )
+    else:
+        torch.mm(inputs, weight, out=reference)
     torch.accelerator.synchronize()
 
     algorithms = [_CUBLAS_GEMM_DEFAULT_TENSOR_OP] + list(
@@ -238,6 +252,7 @@ def main() -> int:
             "iters": args.iters,
             "trials": args.trials,
             "seed": args.seed,
+            "reference_mode": args.reference_mode,
         },
         "shapes": shapes,
     }

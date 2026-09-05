@@ -23,6 +23,7 @@ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _QWEN38_QPN_M1_W13_SPLIT_K,
     ModelOptNvFp4SM70MoEMethod,
     _mtp_weighted_reduce,
+    _prepare_compact_expert_groups,
     _prepare_compact_slot_groups,
     _prepare_single_token_slots,
     _raw_scales_match_prepared,
@@ -508,6 +509,25 @@ def test_nvfp4_compact_groups_reject_work_above_80_rows(total_slots):
         _prepare_compact_slot_groups(
             sorted_expert_ids, compact_offsets, active_expert_ids
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
+    reason="requires an exact SM70 CUDA device",
+)
+def test_nvfp4_compact_expert_groups_merge_duplicate_rows_and_pad_tail():
+    sorted_expert_ids = torch.tensor(
+        [3, 3, 7, 9, 9, 9, 15, 21], dtype=torch.int32, device="cuda"
+    )
+    compact_offsets = torch.empty(9, dtype=torch.int32, device="cuda")
+    active_expert_ids = torch.empty(8, dtype=torch.int32, device="cuda")
+
+    _prepare_compact_expert_groups(
+        sorted_expert_ids, compact_offsets, active_expert_ids
+    )
+
+    assert compact_offsets.cpu().tolist() == [0, 2, 3, 6, 7, 8, 8, 8, 8]
+    assert active_expert_ids.cpu().tolist() == [3, 7, 9, 15, 21, 0, 0, 0]
 
 
 @pytest.mark.skipif(
