@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--library", type=Path, required=True)
     experiment = parser.add_mutually_exclusive_group()
     experiment.add_argument("--w13-pair", action="store_true")
+    experiment.add_argument("--w13-single-tile", action="store_true")
     experiment.add_argument("--scale-layout", action="store_true")
     parser.add_argument("--routes", required=True, help="Glob of saved [M,10] tensors")
     parser.add_argument("--route-limit", type=int, default=1)
@@ -47,9 +48,12 @@ def main():
     assert torch.cuda.get_device_capability() == (7, 0)
     torch.ops.load_library(str(args.library.resolve()))
     native = torch.ops._C
+    w13_variant = args.w13_pair or args.w13_single_tile
     candidate = (
         torch.ops._C_moe_scale_layout
         if args.scale_layout
+        else torch.ops._C_moe_single_tile
+        if args.w13_single_tile
         else torch.ops._C_moe_pair
         if args.w13_pair
         else torch.ops._C_moe_locality
@@ -71,7 +75,7 @@ def main():
         if args.scale_layout
         else {
             str(mode): list(candidate.resources(mode))
-            for mode in ((4, 5, 8) if args.w13_pair else (1, 2, 4))
+            for mode in ((4, 5, 8) if w13_variant else (1, 2, 4))
         }
     )
     if args.scale_layout:
@@ -94,7 +98,7 @@ def main():
             (0, 1, 2, 3)
             if args.scale_layout
             else (0, 1)
-            if args.w13_pair
+            if w13_variant
             else (0, 1, 2, 4)
         )
         outputs = {mode: torch.empty_like(x) for mode in modes}
@@ -107,7 +111,7 @@ def main():
                 return
             run = (
                 candidate.run
-                if args.w13_pair and mode
+                if w13_variant and mode
                 else native.nvfp4_grouped_w13_sm70_out
             )
             run(mid, x, w13, s13, ids, rows, experts, sizes, total, split, True)
@@ -127,7 +131,7 @@ def main():
             )
             if args.scale_layout and mode & 2:
                 candidate.nvfp4_grouped_w2_sm70_out(*params)
-            elif mode == 0 or args.w13_pair or args.scale_layout:
+            elif mode == 0 or w13_variant or args.scale_layout:
                 native.nvfp4_grouped_w2_sm70_out(*params)
             else:
                 candidate.w2(*params, mode)
@@ -176,7 +180,7 @@ def main():
                 (("w13", w13_call), ("w2", w2_call))
                 if args.scale_layout
                 else (("w13", w13_call),)
-                if args.w13_pair
+                if w13_variant
                 else (("w2", w2_call),)
             )
             scopes = [
@@ -210,6 +214,7 @@ def main():
         "tp4_rank": 0,
         "synthetic_activations": True,
         "w13_pair": args.w13_pair,
+        "w13_single_tile": args.w13_single_tile,
         "scale_layout": args.scale_layout,
         "graph_unroll": 16,
         "torch": torch.__version__,

@@ -1994,6 +1994,139 @@ compute process after cleanup. Multiprocessing printed semaphore/shared-
 memory tracker shutdown warnings; no persistent GPU allocation was observed.
 No API or queued GPU job remains from this task.
 
+### Separate MoE/HC quality arms and fixed-trajectory decode diagnosis
+
+At the same runtime source `b6c18db202`, the two missing factor arms ran the
+unchanged 80-case API manifest: grouped MoE only and batch HC only. All
+payloads, prompt token IDs, seeds and dataset hashes match earlier runs.
+Both return 80 successful natural completions, with no JSON Schema failures.
+Worker logs confirm grouped MoE at graph widths 8/16 in the first arm and
+batch HC at widths 2/4/8/16 in the second. The GDN copy flag remains 0.
+
+| Natural generation subset | Original | MoE only | HC only | Both |
+| --- | ---: | ---: | ---: | ---: |
+| Simple | 15/16 | 14/16 | 14/16 | 14/16 |
+| Parallel | 12/16 | 11/16 | 12/16 | 12/16 |
+| Multiple | 14/16 | 14/16 | 14/16 | 14/16 |
+| Irrelevance | 13/16 | 12/16 | 12/16 | 11/16 |
+| **BFCL total** | **54/64** | **51/64** | **52/64** | **51/64** |
+| Schema | 16/16 | 16/16 | 16/16 | 16/16 |
+
+The loss sets differ. Both isolated arms miss `simple_python_14`,
+`parallel_1`, `irrelevance_1`, and fix control's `parallel_8`; MoE-only
+additionally misses `parallel_15`. These are not the earlier combined arm's
+four losses. Inspection finds a JSON code block instead of a protocol call,
+missing calls, or an unnecessary tool, not transport errors silently dropped
+by the scorer. No answer alternatives or scoring rules were changed.
+All prompt IDs match; 31 outputs differ from original in each arm, including
+five first-token differences for each isolated arm and eight for the earlier
+combined arm. First-token differences cannot be attributed solely to a
+decode-only arithmetic change without examining prefill/initial sampling.
+
+The [upstream reproducibility documentation](https://docs.vllm.ai/en/stable/usage/reproducibility/)
+does not promise online reproducibility from seed alone. Local MRv2 source
+keys its Gumbel noise by request seed, absolute position and token ID, not
+batch row, so the observation is not itself proof of a row-dependent RNG
+bug. We do not enable batch-invariant mode or change production scheduling
+to obtain a passing score; upstream's documented batch-invariance hardware
+requirement is SM80+, and this would change the performance contract.
+
+To separate free-running branch changes from conditional model probabilities,
+an **artifact-only diagnostic sampler** retains 64 original BFCL trajectories,
+up to 64 tokens each (3654 total). Reserved seeds 30260905+index force only
+these trajectories; ordinary 20260905+index quality requests pass through the
+original sampler untouched. Standard MRv2 raw-logprob reporting then scores
+the forced chosen token before temperature/top-k/top-p. These are model-
+generated control continuations, **not human references, a corpus PPL score,
+or free-running quality acceptance**. They must never be deployed or counted
+as throughput. CPU mapping checks cover unknown seeds, partial prefill,
+position limits and row permutation. Every API response must match the full
+reference token sequence and return finite logprobs.
+
+One additional unchanged natural-quality replay precedes the diagnostic in
+each server. Original now scores **55/64**, combined candidate **54/64**;
+both still score Schema 16/16. Retain these alongside the earlier 54/51,
+not as replacements or a best-of selection. Same-seed online scores move;
+the available samples still do not establish quality noninferiority.
+
+All 3654 forced tokens match in both arms. Per-worker telemetry verifies
+GPU/CPU seed copies and identical row/position coverage across all four TP
+ranks. Control includes 116 pure C16 decode steps; the comparison uses only
+matching case/token positions when reporting same-width results:
+
+| Diagnostic scope | Tokens | Mean candidate-minus-control NLL | Mean absolute delta | Max absolute delta |
+| --- | ---: | ---: | ---: | ---: |
+| First token / prefill | 64 | -0.0432653 | 0.1700534 | 1.6726222 |
+| All continuation decode | 3590 | -0.0009651 | 0.0126083 | 2.6824248 |
+| Matched pure C16 decode | 1622 | +0.0013119 | 0.0084666 | 2.6824248 |
+
+Positive NLL delta means lower candidate probability for the retained token.
+The per-case mean decode delta's paired bootstrap 95% interval is
+[-0.0031603, +0.0015295] nats; it does not show a clear average deterioration
+or prove noninferiority. The large tails must not be hidden by that average.
+The largest same-width tail is `parallel_7`, offset27, token271, prompt length
+301: control logprob -0.657897 versus candidate -3.340321. Mixed-width rows
+and prefill-state differences remain confounders even with fixed continuations.
+No C4 same-width intersection exists and C8 has only 19 tokens: do not call
+this complete C4/C8 quality admission.
+
+Relevant existing repair found during source review:
+[PR #494](https://github.com/1CatAI/1Cat-vLLM/pull/494), fixed SHA
+`5fa8a605dab12cc9ee15459d9ac6b88d95c7be3a`, stabilizes physical-KV-allocation-
+dependent page4 attention reduction order. Its author demonstrates a causal
+prefill defect on AWQ and also documents independent HC reduced-precision
+GEMM and FP16 collective effects. **That does not establish the cause of
+our NVFP4 tails.** Next validate this existing narrow repair rather than
+duplicate it. Its branch's complete `qsa.py` is older: replacing that whole
+file would remove our batched two-warp partial, output-gate fusion and
+selector sidecar support. Only the PR's planner delta may be reused; a
+rebuilt Flash-V100 binary is required. No PR was merged and no runtime fix
+or precision/NCCL default from that investigation has been applied here.
+
+Artifacts: `.artifacts/batch-api-{moe-only,hc-only}/ablation-tools-v1.json`,
+`.artifacts/batch-teacher-{control,candidate}/` (natural responses, forced
+responses and four `teacher-rows-<pid>.jsonl` files),
+`.artifacts/batch-teacher-comparison-v1.json`. Manifest SHA256:
+`cb7afc127b1909399f811b216e288b680077695a651c55ef3e842596fff44461`.
+Forced control/candidate response SHA256:
+`5a479f76d0ebf4da4a0b1698c749d46f703042326cffb9b49657ef2f1ecc5906` /
+`8c8171226767ddfd2696db9123b724911c8a81b149e2e137e7e8d634289b6794`.
+The four finite API jobs completed with client/server status 0; all their
+workers exited and ports 18186/18187/18189/18190 closed. No owned GPU model
+or service remains. An initial teacher launcher syntax error was caught by
+`bash -n` before any GPU launch and repaired in the artifact script.
+
+### One physical N32 tile per MoE CTA: reject both resource variants
+
+Interleaved W13 gate/up pairs fit within a single physical N32 tile. The new
+benchmark splits the old two-tile CTA into two independent CTAs, keeping
+identical dot products, Split-K accumulation order and FP16 boundaries.
+All seven changed-route/input/poisoned graph cases preserve intermediate
+and final outputs. No production dispatch changes.
+
+The unbounded candidate is slower on the captured route at M4/M8/M16:
+complete MoE **58.886/90.502/125.811 -> 62.989/91.322/128.250 us**.
+At C16, registers grow 40 -> 52 despite halving shared memory 17408 -> 8704
+bytes and CTA threads 512 -> 256. Static occupancy limits drop 48 -> 32 warps.
+The second, compile-time `MOE_SINGLE_TILE_BOUND` screen constrains Split8
+to six resident CTAs: compiler resources become 40 registers, 8704 shared
+bytes and zero spills, with a 48-warp resource ceiling. It is still slower:
+captured C16 complete MoE **126.093 ->139.232 us**, W13 alone
+**78.547 ->90.957 us**. Better theoretical occupancy is not proof of better
+actual throughput. No NCU achieved-occupancy/bandwidth claim is made.
+Both variants help some shared-ten-expert synthetic cases but fail the real-
+route gate; reject them without endpoint reruns or a workload-specific
+production switch. The bounded follow-up stops at C16 instead of expanding
+a failing variant across more widths.
+
+Sources: `benchmarks/kernels/sm70_moe_w13_single_tile.cu` and the existing
+paired screen's `--w13-single-tile`. Binary unbounded SHA256:
+`eeff87ee7846240295f8557de6ce137aa351a9fef52f7342359dd31eb3ecd162`.
+Artifacts: `.artifacts/moe-w13-single-tile{,-bound}/screen-v1.{json,log}`,
+CPU-only build logs and finite task launchers. Both GPU jobs have exited.
+The last actual C4/C8/C16 throughput is still 216.496/364.129/589.860 tok/s,
+not new measurements from these failed micros. Goals remain unmet.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
