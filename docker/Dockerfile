@@ -423,15 +423,23 @@ ENV CCACHE_DIR=/root/.cache/ccache
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "$USE_SCCACHE" != "1" ]; then \
-        # Clean any existing CMake artifacts
-        rm -rf .deps && \
+        set -x; \
+        python3 -c "import sys; print(sys.executable)" > /tmp/dg_pythons.txt; \
+        cat /tmp/dg_pythons.txt; \
+        rm -rf .deps build dist && \
         mkdir -p .deps && \
+        # 注释整块 _C_stable_libtorch 扩展，缺失mxfp4_experts_quant.cu源码
+        sed -i '/define_extension_target(_C_stable_libtorch)/,/END_EXTENSION_TARGET/s/^/#/' /workspace/CMakeLists.txt; \
+        # 全局删除 --py-limited-api=cp38 参数
+        find /workspace -type f \( -name "*.sh" -o -name "Dockerfile*" -o -name "*.py" -o -name "*.yml" -o -name "*.yaml" \) -exec sed -i 's/ --py-limited-api=cp38//g' {} + ; \
         export VLLM_USE_PRECOMPILED="${VLLM_USE_PRECOMPILED}" && \
         export VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_MERGE_BASE_COMMIT}" && \
         export VLLM_DOCKER_BUILD_CONTEXT=1 && \
         export DEEPGEMM_PYTHON_INTERPRETERS=$(cat /tmp/dg_pythons.txt) && \
-        python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38; \
+        python3 -u setup.py bdist_wheel --dist-dir=dist 2>&1; \
     fi
+
+
 
 #################### CSRC BUILD IMAGE ####################
 
