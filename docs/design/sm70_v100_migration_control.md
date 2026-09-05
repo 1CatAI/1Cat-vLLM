@@ -45378,3 +45378,34 @@ Interpretation:
   explicit late/early control is pending; no whole-model claim from this
   microbenchmark. Next also refresh the whole-model trace after the admitted
   HC changes, with natural-output checks before profiling and one model load.
+- Registered norm kernel A/B at `8f74e4b88b3e2ec63c14d6be69c833e5a569822a`
+  passes all four-rank initial/post-timing FP16 checks. Explicit late-load
+  control `1.982525 ms`, early-load `1.944255 ms`, saving `0.038270 ms`
+  (1.93%); early samples `1.942992/1.944972/1.944255 ms`. The up fusion remains
+  fixed on both sides. Evidence: `.artifacts/hc_norm_prefetch/registered_result.json`.
+- A complete model/trace attempt loaded and captured the actual fused HC
+  route, then failed before generation: the quality harness passed the chat
+  tokenizer's Mapping result as token IDs. This is a harness failure, not a
+  model-output quality result. Engine shutdown released all task GPUs; the
+  failure is retained under `.artifacts/hc_trace_20260905/`. Do not count it
+  as a successful trace or hide the model startup from the attempt record.
+- Fix/preflight before retry: explicitly request `return_dict=False`, normalize
+  Mapping outputs, and validate nonempty integer IDs and vocabulary bounds on
+  CPU before creating the LLM. Both quality prompts pass (71/82 tokens). The
+  installed Nsight CLI and matching QdstrmImporter live under different library
+  roots; invoking the importer directly successfully converts the retained old
+  qdstrm entirely on CPU. No new profiler version or tracing criterion is used.
+- Reuse the skill parser's exact rank/ordinal windows with the old trace's
+  actual NVTX label `execute_context_0(0)_generation_1(1)`. A second SQL pass
+  selects the final mixer's same-stream work after its last HC norm, excluding
+  auxiliary-stream kernels and deduplicating named HC work. The old core bucket
+  is reproduced as `2.658072 ms` rank-average service; additional named HC and
+  final-mixer work brings the semantic total to `2.701252 ms` (rank-max mean
+  `2.726784 ms`). No steady-window final-mixer attribution failures. These
+  service statistics are not an additive whole-model wall-clock TPOT table.
+- A corrected retry is queued in `.artifacts/hc_trace_20260905_retry1/`, using
+  the same 8K/513 untraced and 8K/32 traced cases, current source-matched HC/W2
+  sidecars, and two short natural-EOS/thinking-enabled official-sampling checks
+  before the performance cases. These short checks are not the required final
+  256K quality gate. GPU locks are released before CPU-only report import;
+  an in-scope failure stops the job rather than automatically restarting it.
