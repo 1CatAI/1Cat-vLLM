@@ -443,18 +443,31 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not isinstance(
+        unquantized_head = isinstance(
             self.lm_head.quant_method,
             (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
-        ):
-            raise ValueError(
-                "DFlash2 requires an unquantized target LM head for candidate TopK; "
-                f"got {type(self.lm_head.quant_method).__name__}."
+        )
+        if not unquantized_head:
+            if not envs.VLLM_SM70_DFLASH2_QUANT_LM_HEAD:
+                raise ValueError(
+                    "DFlash2 requires an unquantized target LM head for "
+                    "candidate TopK; got "
+                    f"{type(self.lm_head.quant_method).__name__}. Set "
+                    "VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1 to use the "
+                    "dense-logit fallback over the quantized head."
+                )
+            logger.info_once(
+                "VLLM_SM70_DFLASH2_QUANT_LM_HEAD=1: DFlash2 candidate TopK "
+                "uses the dense-logit fallback over the quantized target "
+                "LM head (%s).",
+                type(self.lm_head.quant_method).__name__,
             )
 
         selector = self.model.candidate_selector
-        local_candidates = self.lm_head.maybe_get_sm70_dflash2_top20(
-            hidden_states, selector.top_k
+        local_candidates = (
+            self.lm_head.maybe_get_sm70_dflash2_top20(hidden_states, selector.top_k)
+            if unquantized_head
+            else None
         )
         if local_candidates is None:
             logits = self.lm_head.quant_method.apply(
