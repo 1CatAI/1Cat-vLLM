@@ -1939,6 +1939,61 @@ was enabled. Next combine this local gain with the existing batch candidate
 only after matching endpoint and original-production quality comparisons;
 the 238/420/728 tok/s targets and full quality admission remain open.
 
+### Original-production API comparator completed: quality gate remains open
+
+The missing original-production control now completed at source
+`eb40e649ac02fddfb0652a83bd96a369ba69785d`, using the same pinned native
+owner and Flash-V100 package. All existing runtime settings match the
+retained candidate API workload except the experimental grouped MoE and
+batch HC flags are explicitly **0**. The new GDN split-copy flag is also
+explicitly **0**; the retained candidate predates that implementation.
+Thus this comparison does **not** test the new copy-only optimization.
+The idle profiler wrapper/configuration is omitted; no new speed trace or
+throughput result is claimed.
+
+All 80 request payloads, seeds, dataset hashes and order match the retained
+candidate, verified before and after execution. Sampling remains temperature
+1.0/top-k20/top-p0.95, thinking off, max16384 and natural termination.
+Client peak is 16; mixed request lengths are not a fixed GPU C16 benchmark.
+All requests succeed with 50 `tool_calls` and 30 `stop`, no truncation.
+
+| Subset | Original production | Earlier grouped-MoE + batch-HC candidate |
+| --- | ---: | ---: |
+| BFCL simple | 15/16 | 14/16 |
+| BFCL parallel | 12/16 | 12/16 |
+| BFCL multiple | 14/16 | 14/16 |
+| BFCL irrelevance | 13/16 | 11/16 |
+| **BFCL total** | **54/64** | **51/64** |
+| JSONSchemaBench | **16/16** | **16/16** |
+
+There are four candidate losses and one candidate win: `simple_python_7`
+(unit spelling outside the reference alternatives), `parallel_0` (one of
+two requested calls omitted), `irrelevance_4` and `irrelevance_8` (unneeded
+tools called) versus the candidate win on `parallel_8` (control emits the
+wrong qualified tool name). This is an adverse small-sample task-score
+signal, **not established causal degradation**. The one-sided exact paired
+sign probability for at least four losses among five discordant cases is
+6/32 = 0.1875; it neither establishes a regression nor proves noninferiority.
+Do not promote existing batch HC/grouped-MoE numerics from the candidate-
+only scores or use the new copy kernel's bitwise checks to dismiss it.
+
+Next localize the signal by separating grouped-MoE and HC in a matched
+diagnostic ablation, preserving the full fixed quality manifest for admission.
+Do not alter the accepted answer list or report an easier discordant-only
+subset as a recovered dataset score. Endpoint/C1 and additional coding/
+teacher-forced-decode quality gates remain outstanding; all production
+defaults remain unchanged and PR #504 remains Draft.
+
+Artifacts: `.artifacts/batch-original-api-quality/{control-tools-v1.json,
+paired-v1.json,control-v1.env,server-v1.log,client-v1.log}` and
+`.artifacts/run_original_api_quality.sh`. Raw control response SHA256:
+`54c971cc863b1d4f7ec5ffc3ef95984aea1ef187294f22814ef04d4f0b6fdfcf`.
+The finite launcher reports `client_status=0 server_status=0`. API PID
+2030560 and worker PIDs 2030652--2030655 exited; GPU0--3 have no owned
+compute process after cleanup. Multiprocessing printed semaphore/shared-
+memory tracker shutdown warnings; no persistent GPU allocation was observed.
+No API or queued GPU job remains from this task.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
