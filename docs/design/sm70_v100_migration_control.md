@@ -45143,6 +45143,25 @@ Interpretation:
   timing when another task began a TP4 model run on GPUs 0-3. Its partial log
   is `production_run.log`, not a failed numerical gate or performance result.
   The guarded runner now checks both locks and actual device memory before
-  launch. Production GPU validation and the next combined full-model
-  quality/performance gate remain pending; do not claim 100 tok/s or promote
-  an endpoint from the isolated 0.041-ms saving.
+  launch. Subsequent exit-75 lock waits are not model/GPU test attempts.
+- Final production gate at source `aaf63696b6`: all 96 real weight pairs x 16
+  changing inputs x four ranks pass bitwise, including 512 graph replays with
+  the actual sum2 route on an auxiliary stream. HC block, injection, and sum2
+  each have zero differing FP16 bits on every rank. The independent GPU
+  hidden-shard test is `1 passed, 18 deselected`; CPU dispatch remains
+  `13 passed`.
+- Three production paired samples are control
+  `1.738315/1.739291/1.738595 ms` and hidden
+  `1.689020/1.690590/1.690003 ms`. Medians are
+  `1.738595 -> 1.690003 ms`, saving **0.048592 ms (2.79%)** per 96 Mix calls;
+  ranges are below 0.1%. Runtime is Torch `2.10.0+cu128`, CUDA `12.8`, with
+  the SM70 sidecar compiled by NVCC `12.0.140`. Binary SHA256:
+  `a1fa27c23aea3ee2a7030017ee404c9d2bcb1f3c03889461a070c1f4daded4dd`.
+  Results/logs: `.artifacts/hc_hidden_shard/production_result.json` and
+  `production_final.log`. Result SHA256:
+  `6bf2c047430e586bf1814fbf8ae0fd09a335d4c59decc8d6fff4c5ca6aa37750`.
+- All task-owned GPU tests and lock holders exited after validation. Other
+  tasks' model workers/API were not stopped. No full-model startup or endpoint
+  was launched for this small HC increment. The next combined full-model
+  quality/performance gate remains pending; do not claim 100 tok/s or promote
+  an endpoint from the isolated 0.049-ms saving.

@@ -1008,9 +1008,28 @@ were bitwise but slower than the selected two-row/eight-warp schedule.
 
 These are Mix-only graph measurements: they exclude HC combine/RMSNorm and
 must not be subtracted directly from the 2.658-ms full-HC trace service sum.
-The retained improvement is about 2.3%, not the initial 20% screening target
-and not an end-to-end tokens/s claim. The 100-tok/s endpoint target remains
-unproven by this change.
+The initial prototype improvement is about 2.3%, not the initial 20% screening
+target and not an end-to-end tokens/s claim.
+
+The committed production implementation (`aaf63696b6`) subsequently passes
+the registered-op gate: 96 real weight pairs x 16 changing inputs x four
+ranks, including 512 graph replays overlapping the actual sum2 route on an
+auxiliary stream. All HC block, injection, and sum2 outputs have zero FP16 bit
+mismatches. The independent hidden-shard GPU unit test passes, as do all 13
+CPU dispatch tests. With Torch `2.10.0+cu128`, runtime CUDA `12.8`, and the
+SM70 extension compiled by NVCC `12.0.140`, three paired timings are:
+
+| Production dispatch | Paired samples (ms) | Median (ms) |
+| --- | --- | ---: |
+| Existing gate shard | 1.738315 / 1.739291 / 1.738595 | 1.738595 |
+| New hidden shard | 1.689020 / 1.690590 / 1.690003 | 1.690003 |
+
+The final Mix-only saving is **0.048592 ms (2.79%)**; each variant's sample
+range is below 0.1%. No full-model startup is justified by this small increment
+alone. Combine it with other admitted exact candidates for the next matched
+endpoint gate; natural-output quality and the required 256K boundary remain
+part of endpoint promotion. The 100-tok/s target remains unproven by this
+change.
 
 Reproduce the production-dispatch gate without loading the entire model:
 
