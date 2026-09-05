@@ -44414,9 +44414,82 @@ Interpretation:
   and the global split-partial workspace route was about `130 us`. Neither is
   retained in production. The accepted kernel theoretically removes about
   `0.403 ms/token` over 34 KDA calls; this is a projection, not an end-to-end
-  result. Production admission still requires a compiled `_C` route hit,
-  real-model token/logit audit, and same-contract unprofiled TP4/PP2 A/B before
-  a new per-token trace is accepted.
+  result. The following stability and quality audit records the compiled `_C`
+  route hit, real-model output gates, and same-contract unprofiled TP4/PP2
+  result required for production admission.
+
+## 2026-08-28 GLM-5.3 TP4/PP2 stability and output-quality audit
+
+- The production audit uses source
+  `5de4e1c063747af776b9f834d4ea36b053549a84`, Torch `2.10.0+cu128`, CUDA
+  `12.8`, and eight 32-GiB V100-SXM2 GPUs. The `_C` binary is SM70-only and
+  has SHA256
+  `65b424044f4237557226025078a80b9e949c62a9946843ea2652a099299bd627`.
+  Public main contains the same exact KDA route and default-on rollback gate
+  through merged repair PR #396. Subsequent main changes are exact Qwen3.8 or
+  Quark routes; there are no later GLM model or KDA source changes.
+- The frozen speed contract is GLM-5.3-Flash-NVFP4, `modelopt_fp4` routed-MoE
+  weights, FP16 non-expert weights, FP8 E4M3 KV cache, TP4/PP2 with layer
+  partition `24,21`, B1, no MTP, `max_model_len=4096`, 1,024 input tokens,
+  256 greedy output tokens with EOS ignored, and `FULL_DECODE_ONLY` CUDA Graph
+  capture at B1. Runtime logs hit GLM sparse MLA, exact KDA GEMV, fused KDA
+  f/g, native/Triton mHC, TurboMind NVFP4 MoE, custom TP4 all-reduce, and the
+  full decode graph.
+- Three prefix-cache-reset, unprofiled repeats measure steady decode at
+  `53.013085`, `53.018516`, and `53.017527 token/s`, mean
+  `53.016376 token/s`. Mean TPOT is `18.862097 ms`; the full range is only
+  `0.005431 token/s` (`0.01024%`). All three 256-token outputs have hash
+  `a28466cfa75e5850b532fabf18ead71af6a044ab69f17763327cea7522540343`.
+  This is the accepted stable baseline; neither `62` nor `75 token/s` is a
+  measured result for this contract.
+- The same repeats measure 1,024-token prefill at `3.845156`, `3.851318`, and
+  `3.850663 s`, mean `3.849045 s` or `266.039984 token/s`. Mean first-token
+  latency is `3.851276 s`. This is a 1K-prefill result, not a projection for
+  longer contexts. Single quality-worker cross-checks are only
+  `240.7-241.4 token/s` because they use separate one-shot worker startups;
+  they are not substituted for the stable three-repeat baseline.
+- At `gpu_memory_utilization=0.90`, the limiting worker reports `2.94 GiB`
+  available for KV, `255,122` aggregate GPU KV-cache tokens, and `62.29x`
+  maximum concurrency at 4,096 tokens. A separate `max_model_len=8192` audit
+  reports `326,769` tokens and `39.89x`; hybrid-cache block geometry changes
+  with maximum length, so those token capacities must not be compared as a
+  simple byte ratio.
+- Official quality sampling follows the checkpoint generation config:
+  temperature `1.0`, top-p `0.95`, top-k `-1`, EOS enabled, and fixed seed
+  `20260828`. Eight external prompts cover arithmetic, executable Python,
+  medication safety, strict JSON, translation, logic, kernel-validation
+  concepts, and code-only stable deduplication. With the template's default
+  Max reasoning and budgets extended from 1,024 through 4,096 tokens, six
+  tasks naturally stop and pass task-level review. The algorithm and
+  code-only tasks consume all 4,096 tokens without closing `</think>` or
+  producing a visible answer, so default Max reasoning is `6/8`, not a full
+  quality pass.
+- GLM's chat template ignores `enable_thinking`; both true and false render
+  `Reasoning Effort: Max` with identical prompt hashes. The actual control is
+  the model-specific `reasoning_effort`. Re-running the two failed tasks with
+  `reasoning_effort=low` makes both stop naturally at 514 and 62 tokens. Both
+  code blocks parse; the longest-run implementation passes six external
+  execution cases and the stable-unique implementation passes four. The
+  longest-run response contains one incorrect tie assertion in its explanation
+  and immediately corrects it; the implementation and final assertion are
+  correct, but this remains a minor model-text issue rather than a kernel
+  failure.
+- Kernel-causal gates remain clean: the exact KDA on/off A/B produced identical
+  full token sequences, the real checkpoint audit was bitwise exact for all
+  68 comparisons, each three-run greedy determinism set is exact, and repeated
+  quality runs retain stable speed hashes. There is no observed acceleration
+  or FP8-KV corruption in these short-context tests. This does not justify an
+  unconditional default-Max quality claim: production should pass
+  `reasoning_effort=low` for concise code/structured requests and reserve Max
+  for workloads with a sufficiently large reasoning budget.
+- Retained speed evidence is
+  `/data/minimax-h3/task-cache/glm53-nvfp4-sm70-20260827/`
+  `postmain_5de4e1c063_exact_kda_fp8kv_tp4pp2_i1024_o256_r3_20260828.json`.
+  Quality evidence is in the sibling `quality_official_*q1024`,
+  `quality_official_*q2048_remaining7`,
+  `quality_official_*q4096_remaining4`, and `quality_reasoning_low_*code2`
+  JSON artifacts. The fixed prompt set has SHA256
+  `cb8f877ca930299393816d06fb1584c2227f2c3971206fd622955a032c451d0d`.
 
 ## 2026-08-28 Qwen3.8 NVFP4 indexed-A prefill audit
 
