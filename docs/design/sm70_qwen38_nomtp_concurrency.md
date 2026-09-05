@@ -779,6 +779,145 @@ teacher-forced decode through the new route; coding/tool/schema score tests
 must actually contain active M8/M16 batches. Keep default dispatch unchanged
 until end-to-end, quality and C1-regression gates pass.
 
+## HC batch follow-up and attribution correction (2026-09-05)
+
+Source anchor remains `94dd55c899be8c4725eab55374393b10315ca718`; there is
+no new production route or new endpoint result in this follow-up. Reaching
+C16 728 tok/s from the retained 27.371 ms step requires a further 5.393 ms
+step reduction, not another sub-millisecond dispatch tweak.
+
+Offline reanalysis uses complete `(globalPid, correlationId)` graph groups:
+four ranks each have nine complete 1,976-node graphs in the retained
+pre-grouped trace. Dropping the first/last complete graph leaves seven steps
+on all four ranks. Exact launch geometry, same-stream reduction adjacency and
+source order identify 97 HC down/up calls (48*2 plus final mixer), 36 GDN
+inputs, 12 QSA inputs/index projections and 48 shared-expert/router calls.
+This is inferred role attribution, not module NVTX measurement.
+
+Dense model-graph service, excluding outside-graph LM-head/sampling:
+
+| Role, including its split-K reduction | Rank/graph mean ms |
+| --- | ---: |
+| HC down/inject + up | 3.558 |
+| GDN qkvz + b/a | 2.023 |
+| Attention/PLE output | 1.192 |
+| Shared expert gate/up + down | 0.992 |
+| Router projection | 0.816 |
+| QSA qkvg + index projection | 0.661 |
+| PLE input projection | 0.091 |
+| Total | 9.334 |
+
+HC postops add 1.074 ms of service. These terms overlap other streams and
+are not independently removable wall time. They describe the old graph,
+not the grouped candidate's current per-kernel costs.
+
+**Correction to the early trace interpretation:** wall minus summed GPU
+service (about 0.543 ms in the old interval parser) is not total device idle
+time or a closed host residual. Complete-graph kernel interval union gives
+27.449 ms activity envelope, 26.854 ms service sum and 25.520 ms union busy:
+1.334 ms of overlapped service and 1.929 ms of no-kernel gaps. The latter
+contains 1.434 ms across about 1,533 gaps shorter than 2 us, 0.362 ms of
+2--10 us gaps and 0.133 ms of longer gaps. Copies/dependencies may occupy
+those gaps; they are not proof of CPU overhead or guaranteed fusion savings.
+Reproducer/report: `.artifacts/raw-audit/attribute_c16_complete_graphs.py`
+and `c16-bottleneck-audit-20260905.md` in the same directory.
+
+### FP16 tensor-core HC fusion screen: rejected
+
+A materially different candidate from the prior slow SIMT/Triton pointwise
+projection uses Volta `mma.m8n8k4`, packed FP16 weights, 8-row tiles, shared
+FP16 gates and fused ordered sigmoid/mix. Down uses global/intra-CTA Split-K
+and a tail that retains FP16 rounding before SiLU/injection. No activation
+or weight quantization is introduced. The later vector-load variant shares
+weights across all 16 rows and replaces scalar half loads with 128-bit loads.
+
+Actual layer-0 attention-HC weights, synthetic activations at scales
+0.25/1/3, alternating A/B, 32 complete HC chains per graph, five samples:
+
+| Initial screen | Baseline complete chain | Candidate | Decision |
+| --- | ---: | ---: | --- |
+| M8, fuse up/mix only | 33.658 us | 42.706 us | Slower |
+| M16, fuse up/mix only | 33.726 us | 40.970 us | Slower |
+| M8, full chain, best screened split20 | 32.698 us | 39.966 us | Slower |
+| M16, full chain, best screened split20 | 34.571 us | 42.443 us | Slower |
+
+Repeated changed-input graph replay after poisoning workspaces matches eager
+candidate outputs. Up-only injection is exact; full-chain injection differs
+because FP32 reduction association changes. These numerical checks are not
+model-quality scores. No candidate is admitted. The prototype also requires
+13.125 MiB of extra packed weights per HC pair (1.23 GiB across 96 pairs),
+so packing must not be described as a free runtime improvement.
+
+Artifacts: `.artifacts/raw-audit/hc-batch-v1.json` (native SHA256
+`ac87b87aad8116332c02b83ea3a614ca24d63a461ab1bab90cd8f1de4ba9ea97`).
+Vector-load screen: `hc-batch-v2-vector.{json,log}`. Another workload entered
+GPU0--3 during the vector test despite cooperative locks; its unstable timing
+samples are contaminated and cannot support a performance claim. It did not
+establish a gain; do not promote it or repeat a full model run for this path.
+Subsequent distributed tests check foreign GPU processes before and after
+each timed group and fail closed if exclusivity is lost.
+
+### Batched TP4 HC output sharding: also rejected
+
+The next bounded screen borrows the output-sharding idea of PR #481, but
+uses batched local linears and existing disjoint-output SM70 reductions,
+including communication and data movement. It does not copy the M1 kernel
+or communicator ABI, and does not widen its production guard.
+Each rank computes 80 low-rank coordinates (rank3 also publishes injection),
+then optionally computes/mixes 640 hidden coordinates across all HC branches.
+Zero-filled disjoint publication uses the existing communicator's reductions.
+All four ranks use the same inputs and retain the original weight precision.
+
+Actual layer-0 attention-HC pair, M16, five alternating timing samples, 16
+complete chains per graph, 40 replays/sample, maximum rank duration:
+
+| Distributed screen | Matched replicated baseline | Candidate | Decision |
+| --- | ---: | ---: | --- |
+| Shard down and up; two reductions | 33.992 us | 41.787 us | Slower |
+| Shard down only; one reduction | 33.285 us | 43.504 us | Slower |
+
+Baseline sample ranges are 33.960--34.003 and 33.261--33.314 us; candidate
+ranges are 41.414--41.950 and 42.846--43.552 us respectively. Runtime logs
+confirm the existing SM70 communicator and push-buffer registration. Foreign
+process checks before/after each timed group pass in both distributed runs.
+This is not an NCCL-only surrogate or a sum of independently timed pieces.
+
+Changed-input, poisoned-workspace Graph replay equals candidate eager output
+on all four ranks at all three activation scales. Against the replicated
+baseline, block relative-L2 reaches `2.981e-4` and injection `4.385e-4`; max
+absolute differences are `0.00390625` and `0.0078125`. There is no model-score
+pass. Both variants fail the performance screen before endpoint admission.
+
+The combination of smaller local GEMMs, scatter and collectives is slower;
+the complete-chain test alone does not separate their individual causality.
+Do not claim that dividing weight bytes by four yields a fourfold compute
+speedup, or that all the regression is communication. No more context or
+batch sweeps are warranted for these unmodified implementations. The next
+useful diagnostic is a short **single-HC** stage timeline of the local GEMMs,
+publication and reductions before designing a fused compute/publication op.
+
+Portable commands (task uv Python/torchrun, real checkpoint supplied locally):
+
+```bash
+.venv/bin/python benchmarks/kernels/benchmark_sm70_hc_batch.py \
+  --model "$MODEL" --pairs attn --tokens 8,16 --out hc-packed.json
+.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_batch_tp4.py \
+  --model "$MODEL" --tokens 16 --mode full --out hc-tp4.json
+```
+
+Use `--mode down` for the one-reduction ablation. Actual launcher/cache and
+results live in `.artifacts/raw-audit/run_hc{,_tp4}_screen.sh`,
+`hc-batch-tp4-v1.{json,log}` and `hc-batch-tp4-down-v1.{json,log}`.
+The task-created uv Python is `.artifacts/raw-audit/.venv/bin/python`,
+Torch `2.10.0+cu128`, CUDA toolkit 12.8, V100-SXM2-32GB. The communicator is
+the same frozen sidecar as the earlier engine tests, not a new ABI/build.
+All applicable staged pre-commit hooks pass. Only benchmark/diagnostic files
+are added: no production defaults, model weights, sampling or kernel routes
+change. All microbenchmark workers/lock holders exit and GPU0--3 are released;
+unrelated services are untouched. Current accepted endpoint evidence remains
+the prior grouped candidate's 27.371 ms, still pending model-quality admission.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
