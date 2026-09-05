@@ -1423,6 +1423,62 @@ deterministic 8K/256 C1/4/8/16 speed probe. This small health screen is not
 final dataset/tool/schema/PPL admission. End-to-end and quality targets remain
 unmet pending results; no production default changed.
 
+### Concurrent API quality coverage and upstream review (2026-09-05)
+
+The existing BFCL/JSONSchemaBench API runner sends requests serially. It cannot
+prove that a new batch-only HC path preserves tool/schema quality. Add
+`benchmarks/benchmark_sm70_batch_tool_quality.py`, reusing the existing BFCL
+name/argument scorer, JSON Schema normalization/validation and SSE collector.
+The fixed subset is 16 entries from each of four BFCL categories plus 16
+size-stratified WashingtonPost schemas (80 total), unchanged between arms.
+Sampling defaults to temperature 1, top-k 20, top-p 0.95, natural EOS and 16K
+maximum. Thinking is explicitly selectable and must match between arms.
+No tools are executed; this is a scored first-turn API subset, not multi-turn
+agent task completion or the official leaderboard.
+
+The client retains input manifests/source hashes, per-case seed, complete
+payload/SSE/outputs, transport failures without retries, and request overlap.
+Incomplete streams and length-truncated JSON cannot pass just because a JSON
+fragment parses. Observed client concurrency is not evidence of actual GPU
+batch width: worker dispatch/trace remains required. Run as a module:
+
+```bash
+python -m benchmarks.benchmark_sm70_batch_tool_quality \
+  --base-url http://127.0.0.1:18184 --model FlashNext \
+  --bfcl-dir "$BFCL_DATA" --schema-dir "$JSONSCHEMA_WASHINGTONPOST" \
+  --concurrency 16 --output "$RESULT_JSON"
+```
+
+Use the task virtualenv's Python, not system Python. The `--dry-run` CPU pass
+selects all 80 real cached cases and validates their schemas. Client unit
+tests verify actual overlap at C1/4/8/16, stable case/seed order, retained
+transport failures, malformed tool names and truncated/schema-invalid output:
+12 passed. These are harness checks; API quality scores remain pending.
+
+The full-model speed/health task waited on confirmed foreign workers and
+reservation ownership rather than preempting them. While still queued, its
+first waiter was terminated deliberately to fix a CPU-reproduced tokenizer
+contract: `apply_chat_template` returns `BatchEncoding` by default here.
+Explicit `return_dict=False` and a one-time vocabulary-size lookup now validate
+all 16 GSM8K prompts before model construction. The repaired CPU preflight
+passes; no model startup was spent on either harness repair. A single
+replacement control waiter is retained, not duplicate GPU jobs.
+
+Primary-source review:
+
+- [vLLM/HPC-Ops low-latency MoE](https://vllm.ai/blog/2026-07-06-vllm-hpc-ops)
+  motivates indexed input reads, shared routing/task maps and occupancy-first
+  scheduling. Our grouped native-NVFP4 path already reads original tokens by
+  route and shares groups between W13/W2. Its static grids still reserve
+  worst-case route tiles, a possible next screen after the current full-model
+  comparison. This is a hypothesis, not a measured speedup. Hopper FP8/PDL
+  mechanisms cannot be transplanted to SM70; retain TurboMind/native NVFP4.
+- [AMoE asynchronous expert serving](https://arxiv.org/abs/2505.08944)
+  trades queuing/rebatching against latency. It is not a shortcut to the fixed
+  C1/4/8/16 interactive-step targets, and is not selected for this patch.
+- PR #506 was inspected: its remaining norm-prefetch work targets single-token
+  HC. Keep this comparison frozen; do not mix it into a batch-fusion A/B.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
