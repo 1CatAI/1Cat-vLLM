@@ -45165,3 +45165,84 @@ Interpretation:
   was launched for this small HC increment. The next combined full-model
   quality/performance gate remains pending; do not claim 100 tok/s or promote
   an endpoint from the isolated 0.049-ms saving.
+
+## Full HC <= 1.5 ms target, 2026-09-05
+
+- The user explicitly set the next target to full HyperConnection latency
+  below `1.5 ms/token`, with no precision reduction. Preserve checkpoint FP16
+  weights/activations, FP32 accumulation, and the established rounding/order
+  contract. A Mix-only result does not satisfy this target. Final acceptance
+  requires matched full-model trace attribution and output quality, not just
+  an isolated graph score.
+- The old `2.658-ms` trace bucket was grouped by HC kernel names. It excluded
+  the final mixer's ordinary down/up projections (classified as dense work).
+  The new semantic HC microbenchmark includes these as well: 96 layer Mix
+  pairs, 95 combine/norm calls, two grouped input norms, the PLE boundary's
+  separate combine, and the final projection/SiLU/gate-mix path. Attention,
+  MoE, and PLE computation are excluded; attention/MoE outputs are fixed
+  external inputs. This is not a full-model run or an endpoint TPOT metric.
+- Frozen source `50f9fbe3749ecd673fee1aef361afd8db98e914a`, same Torch
+  `2.10.0+cu128`, CUDA runtime `12.8`, TP4 V100-SXM2-32GB, and source-matched
+  HC sidecar as the preceding screen. Public integration advanced to
+  `9ed8697ac0` during this work; the candidate kernel source was not changed
+  to mix unrelated integration changes into the comparison.
+- Complete HC microbenchmark medians are gate-sharded `2.277335 ms` and
+  current hidden-sharded `2.106689 ms`. Hidden samples are
+  `2.103712/2.106914/2.106689 ms`. All intermediate state, normalized state,
+  block input, injection, and final-mixer output tensors are bitwise across
+  all four ranks and 16 changing input cases. This cannot be reported as
+  `2.658 -> 2.107 ms` improvement: source scope, tracing, and workload differ.
+- Independent component graph medians are down `0.486018 ms`, down gather
+  `0.305125 ms`, hidden up/mix `0.505760 ms`, output gather `0.212166 ms`,
+  95 combine/norm calls `0.311712 ms`, and final mixer including its norm
+  `0.032160 ms`. Do not add these to close the complete graph: dependencies,
+  cache state, and the final norm overlap between component scopes differ.
+- `benchmarks/kernels/benchmark_sm70_hc_full_chain.py` provides the portable
+  complete-HC registered-op gate. It initializes cuBLAS before capture and
+  checks exclusive GPU process ownership around timing groups. The initial
+  artifact harness missed cuBLAS warmup and failed at handle creation during
+  capture; this was corrected once before the accepted baseline. No model
+  startup was involved.
+- Exact physical down expansion (128/256 threads with original 40-term FMA
+  chains and XOR tail tree) passes the full four-rank bitwise gate. Another
+  task entered the GPUs during timing; its large timing variance is not
+  accepted performance evidence. Neither CUDA down variant is admitted.
+  Ownership checks now also run during timing, not just before launch.
+- A materially different combine/norm + down prototype preserves Triton's
+  original two-axis norm reduction and uses four producer CTAs with
+  release/acquire readiness, instead of the old changed-order cooperative
+  reduction/global grid barrier. Cooperative launch bounds the residency
+  requirement. It passes the full bitwise gate but loses: matched hidden
+  `2.105330 ms`, fused without prefetch `2.134842 ms`, fused with four-chunk
+  prefetch `2.125169 ms`. Do not admit these variants.
+- One targeted follow-up prefetches all 40 immutable weight chunks before
+  consuming normalized input. A tensor-gather implementation was rejected at
+  compile/resource inspection (32 KiB dynamic shared memory, 255 registers,
+  480-byte stack frame, large generated code) without a GPU timing trial.
+  The static-register revision compiles with 125 registers, 64 bytes dynamic
+  shared memory and no stack/local spill. Its full-chain gate passes bitwise,
+  but matched medians are `2.109467 -> 2.159213 ms` (regression). Stop this
+  combine/norm + down fusion direction; do not repeat the failed variants.
+- A separate exact FP16 layout prototype packs four successive down chunks
+  into each 16-byte vector read and interleaves up's four branch rows by
+  hidden coordinate. Arithmetic order is unchanged; decode-only packed
+  shards cost `316538880 bytes` (`301.875 MiB`) extra per rank if both are
+  retained. The packed down compiles with 31 registers, 16 bytes shared
+  memory, no stack/local spill. All full-chain variants pass bitwise. Matched
+  medians are hidden `2.114089 ms`, packed down `2.174867 ms`, packed up
+  `2.100613 ms`, both `2.159398 ms`. Down/both are rejected; up's isolated
+  `0.013476-ms` saving is too small to justify admission on this evidence
+  alone. No production weight-loader or kernel route has changed for it.
+- The portable registered-op benchmark also passes 16 changing inputs on all
+  four ranks. Medians are gate `2.277540 ms`, hidden `2.111058 ms`; hidden
+  samples are `2.109891/2.111399/2.111058 ms`. It agrees with the artifact
+  harness, and remains an isolated complete-HC measurement, not endpoint TPOT.
+- Local evidence lives under `.artifacts/hc_full_chain/`:
+  `baseline.json`, `baseline_warm.log`, `down_schedules.json` (contended
+  timing, quality only), `fused_norm_down.json`, `fused40.json`, `packed.json`,
+  `public_baseline.json`, compiler logs and resource artifacts. The guarded
+  queue completed all three pending jobs and released its GPUs. Other
+  API/model tasks were not terminated. No full-model startup was involved.
+  The `1.5 ms` goal remains active and unachieved. Next screen targets hidden
+  up/local-mix/output-gather fusion with private per-CTA communication epochs,
+  distinct from the previously rejected branch-sharded/global-counter fusion.
