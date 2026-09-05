@@ -2981,6 +2981,13 @@ def _custom_ar_op(name: str):
     return getattr(torch.ops._C_custom_ar, name)
 
 
+def _custom_ar_owner_namespace():
+    # The opaque communicator belongs to the DSO that initialized it. A new
+    # optional op must not fall through to another DSO with a different ABI.
+    sidecar = torch.ops._C_custom_ar_flashnext
+    return sidecar if hasattr(sidecar, "init_custom_ar") else torch.ops._C_custom_ar
+
+
 def init_custom_ar(
     ipc_tensors: list[torch.Tensor],
     rank_data: torch.Tensor,
@@ -3170,7 +3177,9 @@ def sm70_tp4_push_allreduce_buffer_size() -> int:
 
 
 def sm70_tp8_hierarchical_push_allreduce_buffer_size() -> int:
-    return _custom_ar_op("sm70_tp8_hierarchical_push_allreduce_buffer_size")()
+    return (
+        _custom_ar_owner_namespace().sm70_tp8_hierarchical_push_allreduce_buffer_size()
+    )
 
 
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
@@ -3184,7 +3193,7 @@ def register_sm70_tp4_push_allreduce_buffer(fa: int, ipc_tensors: list[int]) -> 
 def register_sm70_tp8_hierarchical_push_allreduce_buffer(
     fa: int, ipc_tensors: list[int]
 ) -> None:
-    _custom_ar_op("register_sm70_tp8_hierarchical_push_allreduce_buffer")(
+    _custom_ar_owner_namespace().register_sm70_tp8_hierarchical_push_allreduce_buffer(
         fa, ipc_tensors
     )
 
