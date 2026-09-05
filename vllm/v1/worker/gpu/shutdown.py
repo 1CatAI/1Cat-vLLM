@@ -23,6 +23,10 @@ def _clear_loaded_gpu_workspaces() -> None:
             "vllm.model_executor.layers.quantization.sm70_turbomind",
             "clear_sm70_turbomind_workspaces",
         ),
+        (
+            "vllm.model_executor.layers.quantization.nvfp4_sm70_moe",
+            "clear_sm70_nvfp4_moe_workspaces",
+        ),
     )
     for module_name, function_name in cleanup_functions:
         module = sys.modules.get(module_name)

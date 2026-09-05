@@ -21,6 +21,14 @@ throughput from the same `max_num_seqs=16` engine is:
 Raw baseline:
 `.artifacts/qwen38_flash_next_no_mtp_concurrency/result.json`.
 
+Measurement correction (2026-09-05): the initial fixed-width tables below
+used client `get_output()` blocking wait, not complete inter-token intervals.
+They remain historical diagnostics and must not be described as end-to-end
+throughput. The reaccounted engine-timestamp results below supersede that
+accounting, without rerunning or changing any prompt, seed, output, or frozen
+70 tokens/s reference. The original request-level baseline and fixed-width
+steady-state measurements also remain distinct contracts.
+
 ## Evidence-first sequence
 
 1. Generalize the native NVFP4 QPN expert route from token counts 1 and 5 to
@@ -35,6 +43,457 @@ Raw baseline:
 5. Run one C1/C4/C8/C16 end-to-end acceptance test after admitted candidates
    have enough projected savings; do not repeatedly relaunch the full model.
 
+## Baseline trace and contract separation
+
+The historical E4M3-KV SPEED-Bench result (`C8=465.24`, `C16=772.44`) is not
+the baseline above. It used 1K input, E4M3 KV, the official low-entropy prompt
+set, stochastic generation, and natural EOS. The frozen baseline here uses 8K
+independent prompts, checkpoint-native FP16 KV, greedy generation, and 512
+forced output tokens. The historical result proves that the requested scaling
+is possible on these GPUs, but it is not interchangeable evidence.
+
+A fixed-live-width C16 graph-node trace was captured after the microbenchmarks
+justified profiling. Ubuntu installed the Nsight target and importer in
+different roots, so the raw QDSTRM was recovered directly with
+`/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter`; the model was not run a
+second time. The accepted trace contains 12 graph replays on four TP ranks.
+After removing two head and tail samples, eight steady steps average 28.847 ms
+maximum-rank replay interval and 28.304 ms maximum-rank summed GPU service.
+Wall minus GPU service is only 0.543 ms, so the remaining C16 gap is on the GPU
+critical path rather than in request timing or scheduler bookkeeping.
+
+The principal service terms are direct NVFP4 W13 (5.583 ms), direct NVFP4 W2
+(2.573 ms), sparse QSA attention (1.840 ms), GDN recurrent update (1.351 ms),
+and TP communication (1.625 ms). Dense FP16 CUTLASS/cuBLAS kernels account for
+roughly another 8.9 ms when the broad 16x16 signature and the split-K
+main/reduction signatures are combined. The parser's `LM-head/sample` label
+includes that broad CUTLASS signature and must not be read as 5.736 ms of LM
+head alone. The accepted artifacts are under
+`.artifacts/qwen38_nomtp_concurrency/profiles/`
+`c16_graph_node_batch_qpn_v6_static_fallback*`.
+
+## Microbenchmark decisions
+
+### Native NVFP4 direct batch route: admitted
+
+The existing checkpoint NVFP4 packing is unchanged. Direct dispatch reads the
+same packed weights with FP16 inputs and FP32 HMMA accumulation while avoiding
+expert sort and replicated-input materialization. Production grouped-GEMM
+accumulation was screened independently at each graph width. The retained
+performance splits are:
+
+| Tokens | W13 split-K | Warm saving over 48 layers | Cold diagnostic saving |
+| ---: | ---: | ---: | ---: |
+| 4 | 5 | 1.59--2.13 ms | 5.41--8.06 ms |
+| 8 | 4 | 1.53--2.80 ms | 4.62--7.08 ms |
+| 16 | 1 | 0.05--4.09 ms | 17.01--17.60 ms |
+
+The ranges cover the two endpoint patterns: all rows reuse ten experts versus
+every routed row selecting a distinct expert. The cold numbers are planning
+diagnostics, not an additive endpoint claim. Direct-kernel output is replay
+deterministic. A same-process grouped comparison was bitwise equal for the
+reported runs, but that is not a portable quality proof: TurboMind can choose
+a different CTA/split reduction order when autotuning in another process.
+Final admission therefore requires an independent FP32 reference plus endpoint
+dataset scores. The M16 overlap case is effectively neutral while distinct
+routes improve strongly. The exact shape/capability fallback remains available
+through `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE=0`.
+
+### Router top-k: admitted pending endpoint quality battery
+
+The SM70 E512/K10 router is now selected for every live width from M1 through
+M16 instead of only M1/M5 and the three target widths. At M4/M8/M16 it reduces
+a 48-layer micro-round by 0.335/0.342/0.343 ms (2.33--2.35x). A separate sweep
+of M2/M3/M6/M7/M9--M15 saves 0.330--0.433 ms per 48 layers. Expert IDs and
+source-row maps are exact. Normalized FP32 route weights differ by at most
+`2.24e-8`, inside the existing M1/M5 `1e-7` contract. This closes the generic
+router fallback while requests enter or leave a batch without binding the
+optimization to a configured concurrency. The endpoint quality battery remains
+mandatory before this extension is called release-ready.
+
+### TP4 push collective: admitted
+
+For one regular and one shared+routed sum2 reduction per layer, 48 layers:
+
+| Tokens | Pull | Push | Saving | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 1.169 ms | 0.355 ms | 0.814 ms | 3.30x |
+| 8 | 1.289 ms | 0.441 ms | 0.848 ms | 2.92x |
+| 16 | 1.183 ms | 0.651 ms | 0.532 ms | 1.82x |
+
+All four ranks are bitwise equal for exact-integer, signed-zero, and
+model-scale dynamic graph inputs. Dispatch is restricted to fully connected
+SM70 TP4, CUDA Graph capture, FP16 payloads of exactly 20/40/80 KiB, and has an
+explicit `VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH=0` rollback.
+
+### Sparse QSA partial launch: admitted; split cap rejected
+
+Keeping the production split count and changing only the partial kernel from
+four to two warps is bitwise equal at M2/M4/M8/M16. The projected 12-layer
+savings are approximately 0.19/0.24/0.34/0.84 ms against the old four-warp
+launch. A broader BLOCK_N sweep confirms that 16 remains the SM70 winner;
+BLOCK_N=8 does not satisfy Triton's tensor-core K requirement and BLOCK_N=32
+is slower. An M8/M16 split-count cap to 32/16 projected another 0.14/0.16 ms
+per 12-layer round, but changed the FP32 merge association and produced a
+maximum FP16 output difference of `6.11e-5`. In the fixed C16 endpoint run,
+the cap plus the exact expert-pack candidate measured 28.861 ms versus the
+28.815 ms baseline and retained only 4 of 16 greedy completion hashes. The cap
+was therefore removed; only the bitwise two-warp partial launch remains.
+
+### M4/M8/M16 W13/SwiGLU fusion: admitted pending endpoint battery
+
+For the production interleaved gate/up layout, one CTA now computes a gate/up
+tile pair and applies the existing FP16 SwiGLU epilogue without writing the
+320-column intermediate. M4 retains the admitted five-way K reduction, M8 the
+four-way reduction, and M16 the single-way reduction; each split partial is
+summed and rounded in the same order as the direct QPN route before SwiGLU.
+Static and changed-expert CUDA Graph replay are bitwise equal to that direct
+route at all three widths. The fused route inherits any tiny direct-vs-grouped
+reduction difference; it introduces no additional numerical difference.
+
+Against direct W13 plus the already fused W2 path, the incremental 48-layer
+saving is about 0--0.12 ms at M4, 0.46--0.54 ms at M8, and 0.25--0.28 ms at
+M16. The route is limited to exact M4/M8/M16, TP4, E512/K10, H2560/I160 and
+has a default-on rollback switch. The kernel explicitly supports both the
+ordinary and interleaved W13 layouts; selection therefore depends on its own
+operator capability, not on whether the separate large-prefill fused-SwiGLU
+operator is present in an overlay build.
+
+### Parallel W2 plus weighted reduction: admitted pending endpoint battery
+
+The first W2-fusion prototype serialized ten experts in one warp and was
+removed. The retained design assigns one warp to each of the ten routed slots
+inside a token/output-tile CTA, rounds each HMMA result to the same FP16 route
+value, then lets warp zero accumulate those values in fixed slot order with
+FP32 FMA. It removes the routed W2 global write/read and standalone reduction
+without changing weights or activation precision.
+
+At M1/M4/M8/M16 it saves another 1.56/4.10--6.39/5.69--6.79/6.70--9.32 us
+per layer over the direct QPN path. All eight static endpoint comparisons are
+bitwise equal to that direct path. Dynamic CUDA Graph replay with changed
+expert IDs and route weights is exact at M4/M8/M16; M1 differs from the
+grouped baseline by at most `4.77e-7`, but remains bitwise equal to the direct
+path and is therefore not selected by the new batch gate. The M2/M4/M8/M16 route
+is default-on only when the exact SM70 TP4 E512/K10/H2560/I160 contract and
+operator capability are present; setting
+`VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2=0` restores the two-stage path.
+
+Earlier trace interpretation incorrectly attributed M1/M2/M4 observations to
+TP sequence splitting. The fixed-width trace and four-rank tensor dump prove
+that a global C16 step executes M16 expert tensors on every TP rank. The lower
+widths came from requests leaving the batch in the earlier request-level
+trace. M2 remains useful for those live-width transitions: a checkpoint-backed
+screen selected split-K 10 for direct M2 W13. Direct W13/W2 saves
+1.69--1.72 ms per 48-layer M2 round; adding the fixed-order fused W2 raises
+that to 1.80--1.83 ms. Dynamic expert-ID and route-weight replay remains
+bitwise equal to the direct path; the maximum difference from grouped dispatch
+is `2.38e-7`. Fusing W13+SwiGLU at M2 regresses about 0.13 ms per round, so M2
+uses direct W13 plus fused W2 while the W13 epilogue fusion remains M4/M8/M16.
+
+### Cross-token expert packing: rejected after endpoint validation
+
+A four-rank C16 tensor capture records identical E512/K10 routes on every TP
+replica. Across all 48 layers, 160 routes select a mean 87.3 unique experts;
+66.6% of routes belong to an expert selected more than once. Packing up to
+eight rows for the same expert therefore has a real reuse opportunity.
+
+The first compact implementation lost that opportunity to an O(routes squared)
+planner. Replacing it with one shared-memory expert counter per expert reduces
+planning from 15.15 to roughly 4--6 us per layer. A fixed-grid packed W13 plus
+four-warps-per-CTA W2 implementation is bitwise equal to the current direct
+route on all 48 captured layers. A repeated same-environment run measured
+165.74 us direct versus 156.57 us packed, or 0.440 ms projected saving across
+48 layers. A 128-group grid severely regresses synthetic routes above 128
+groups, so it is not a production choice.
+
+The route distribution is request-dependent and the speed crossover is around
+96 groups. More importantly, the combined fixed C16 endpoint run did not turn
+the micro saving into wall-time benefit: 28.861 ms / 554.38 tok/s versus the
+28.815 ms / 555.26 tok/s baseline. The production dispatch and build wiring
+were removed rather than retaining a speculative opt-in. The task-local
+evidence is in
+`.artifacts/qwen38_nomtp_concurrency/c16_topk_ids_analysis.json` and
+`.artifacts/qwen38_nomtp_concurrency/expert_pack_m16_route_sweep_production.json`.
+
+### Shared-expert gate fusion at M1--M16: admitted pending endpoint battery
+
+The existing native shared-expert gate kernel was artificially restricted to
+one row even though its implementation is row-independent. Selecting it by the
+measured live shape (`1 <= M <= 16`) fuses the FP16 gate dot, sigmoid, and
+in-place output multiply for all small CUDA-graph widths. On checkpoint gate
+weights it saves 0.250--0.320 ms per 48-layer round at M4/M8/M16. The first
+model-scale comparison was bitwise equal; a broader dynamic replay sweep found
+one non-bitwise case out of 32 at M16, bounded to `1.22e-4` maximum absolute
+error and `1.45e-4` relative L2. Extreme synthetic activation scaling is not
+bitwise invariant, so this is a score-gated scheduling/numerical candidate, not
+an exact-arithmetic claim. The existing
+`VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION=0` rollback remains available.
+
+The first fixed-width endpoint log exposed an integration miss: construction
+compared the global shared-expert intermediate width (`640`) with the local
+TP4 width (`160`), so the measured kernel existed but the model never selected
+it. Eligibility now checks the actual local projection contract instead:
+gate/up partitions `(160, 160)`, down input `160`, and hidden input/output
+`2560`. This is a capability/shape check rather than a model-name or
+configured-batch check. A subsequent endpoint must print the shared-gate route
+log before its projected saving is credited.
+
+### Raw E4M3 scale bandwidth: experimental, default off
+
+The checkpoint stores one-byte E4M3 block scales plus one FP32 global scale per
+expert, while the previous loader permanently expanded every block scale to
+FP16. Keeping only the checkpoint representation removes about 1.875 GiB of
+persistent scale tensors per TP rank. A reusable per-device FP16 workspace of
+about 50 MiB materializes scales for prefill and other generic shapes. Decode
+widths 2--16 instead reconstruct the effective scale in-register and never pay
+the workspace expansion on the hot path.
+
+The fast SM70 decode reconstruction uses a high/low half split of the global
+scale. This is not a universal identity for every legal E4M3 code and global
+scale. Production therefore does not infer safety from the model name or
+quantization label. During loading, each layer temporarily constructs the old
+prepared-FP16 tensors, reconstructs every W13 and W2 scale with both the strict
+prefill arithmetic and the proposed decode arithmetic, and requires
+`torch.equal` over the complete tensors. Decode comparison is against the
+effective `prepared_half * 2**14` consumed by HMMA; dividing a candidate back
+before comparison can hide mismatches through FP16 subnormal rounding. A
+mismatch warns and retains the established prepared-FP16 route in automatic
+mode; an explicitly forced raw route fails startup. Generic/prefill expansion
+uses the strict FP32 multiply and FP16 rounding order independently of this
+fast-path capability result.
+
+The checkpoint audit sampled 3,072,000 physical block codes across layer 0 and
+ten experts: all codes were in the normal positive interval 73--126, with no
+zero, subnormal, sign, infinity, or NaN encodings. Inverse recovery from the
+prepared scales had zero mismatches. All 73,728 gate/up/down global-scale
+tensors across 48 layers were audited, yielding 470 distinct global scales.
+Simulation over those globals and every observed-range code had zero mismatch;
+smaller legal codes do produce counterexamples and are the reason the runtime
+full-tensor capability check is mandatory.
+
+On actual routed checkpoint weights, strict expansion and fast validation were
+bitwise equal. The fixed fused route changed one 48-layer round by
+0.121/0.584/0.340 ms at M4/M8/M16 respectively. The generic raw-kernel screen for
+otherwise uncovered M3/M5/M7/M10/M15 remained bitwise equal and changed the
+round by +0.008/+0.302/+0.456/+0.431/+0.241 ms versus already prepared scales;
+its benefit is avoiding a much larger per-entry scale expansion, not beating a
+resident prepared tensor. These are microbenchmark results only. The raw route
+remains pending full-model quality admission before it can be credited to the
+production baseline. That micro comparison used direct kernels on both sides;
+it did not prove that enabling raw storage preserved the production dispatcher.
+
+The production-loader/apply audit found that M3 and M7 were changing from
+grouped TurboMind to QPN when raw storage was enabled. On actual layer-0/rank-0
+weights this produced up to `2.38e-7` absolute output differences, despite
+exact scales. Storage and dispatch are now independent:
+
+- `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=1` changes only scale storage.
+- `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE=1` independently extends QPN
+  to every live width 2--16, for both prepared and raw storage. Default off;
+  the existing 2/4/8/16 split choices remain unchanged.
+- Both switches remain experimental pending quality scores. Dynamic extension
+  must not silently accompany a memory-format optimization.
+
+After separation, real layer-0/rank-0 loader/apply comparisons are bitwise
+equal at all M1--M16 plus M784 prefill with dynamic extension off, and at
+all M1--M16 with it on. Small-width eager and CUDA Graph results agree.
+Earlier boundary coverage also passed all 30 combinations of layers 0/23/47,
+TP ranks 0/3, and M1/4/8/16/784 using all 512 experts per sampled layer.
+These are real checkpoint weights with synthetic activations, not a full
+model quality score. All 256 E4M3 encodings, signed zero, subnormal/NaN
+rejection, W13 global-slot layout, effective-scale admission, and changed-input
+Graph replay have focused native tests.
+
+Task evidence:
+`.artifacts/raw-audit/{decoupled_storage_v2,decoupled_dynamic_v2,`
+`layers_boundary_ranks_v1}.json` and `pytest-admission-v2.log` (52 passed).
+The updated native `_C` SHA256 is
+`6db72e5d72ed051423ce5dc62f5a935e716c02e85c3c423c92edc96fcce51fa3`.
+
+The portable reproduction is now in
+`benchmarks/kernels/verify_sm70_nvfp4_moe_raw_storage.py`, taking an explicit
+`--model` directory instead of a developer-specific model path. It fails on
+numerical mismatch and uses one GPU to inspect the selected TP4 shards:
+
+```bash
+CUDA_VISIBLE_DEVICES=<idle-gpu> .venv/bin/python \
+  benchmarks/kernels/verify_sm70_nvfp4_moe_raw_storage.py \
+  --model <checkpoint-directory> --layers 0,23,47 --ranks 0,3 \
+  --tokens 1,4,8,16,784 --out raw-storage.json
+```
+
+Add `--dynamic` for the independently controlled M2--M16 QPN extension.
+CPU regression coverage across MoE admission, shared-gate/QSA shape policies,
+and shutdown cleanup passes 108 tests; six GPU-only cases were skipped in
+that CPU run. This is separate from the 52 focused tests above, which included
+the new native raw-scale tests on an idle V100.
+
+### Endpoint run: directional only
+
+One post-candidate 8K/512 run measured C1/C4/C8/C16 at
+79.906/196.021/318.883/475.165 aggregate tokens/s. This is a directional
+improvement of 12.9/19.7/13.5/7.7% over the frozen run, but tokenizer and kernel
+caches were not identical between launches. It therefore does not replace the
+frozen baseline or satisfy the final paired acceptance gate. A subsequent
+call-chain audit found that this run also predated effective production-namespace
+registration of the parallel W2 operator, and an intermediate edit had disabled
+the shared-gate fusion at model construction. Both integration defects are now
+covered by focused tests; the directional result must not be credited with
+either projected saving.
+
+The next endpoint result uses `EngineCoreOutputs` rather than request-level
+first/last timestamps. A sample is admitted only when scheduler running width
+equals C, no requests are waiting, exactly C outputs are returned, every
+request emits one token, and neither a prefill marker nor a finished request is
+present. Eight head and tail samples are discarded. This avoids charging the
+large staggered admission spans (up to about two seconds at C16) to steady
+decode and makes the 16.81/19.05/21.98 ms C4/C8/C16 target thresholds directly
+testable.
+
+The first fixed-live-width candidate completed with all intended graph routes
+visible in the production call chain. M4/M8/M16 selected the widened router,
+direct NVFP4 QPN expert path, fixed-order W2/weighted-reduce fusion, sparse-QSA
+partial specialization, and TP4 push collective; M16 additionally selected the
+W13/SwiGLU fusion. After discarding eight head and tail samples, the medians
+were:
+
+| Live width | Legacy receive wait | Reciprocal-wait estimate | Fixed-70 estimate | Gate |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 12.181 ms | 82.096 tok/s | 117.3% | reference |
+| 4 | 18.522 ms | 215.963 tok/s | 77.1% | fail 85% |
+| 8 | 22.469 ms | 356.054 tok/s | 63.6% | fail 75% |
+| 16 | 28.815 ms | 555.259 tok/s | 49.6% | fail 65% |
+
+This is substantially better than the request-level frozen result, but it does
+not meet the 238/420/728 tok/s acceptance targets. The residual grows with the
+number of live routed rows, so subsequent work stays focused on cold expert
+weight service and batch dense projections rather than scheduler constants.
+Raw evidence is in
+`.artifacts/qwen38_nomtp_concurrency/fixed_width_candidate_v1.json`.
+
+### Paired production build and corrected timing (2026-09-05)
+
+The raw/prepared pair uses the same production-built MoE operators and
+Python code, TP4 V100, Torch 2.10/CUDA 12.8, 8K prompts, 256 forced output
+tokens, no MTP, FP16 KV, Prefix Cache/Mamba align, 256K maximum length, 2048
+prefill chunk and max-num-seqs 16. Its compiled `_C` SHA256 is
+`04818aa069b7098927fdb4a47d516d2b316f081afd68f3612634fd2e7af5fdb3`.
+The later admission fix above was rebuilt separately; these endpoint numbers
+must not be presented as measurements of that newer binary.
+Both arms still use the same pinned custom-allreduce and FlashQLA sidecars;
+this is not a clean-wheel deployment gate. Their respective SHA256 values are
+`4fdf9148b4d21951b7f40edd54a43be0ce387bbf4eb86ce010845f702531e55d` and
+`c8bd7650444ec56cfe2576c044d8f5f438b0a352877064bbb51ac0510dc2ea2c`.
+
+Client receive wait excludes processing between receives. The corrected
+accounting includes only consecutive eligible engine output timestamps, trims
+eight head/tail samples, and computes aggregate tokens divided by summed
+interval time. No GPU rerun was needed. Four accounting regression tests cover
+client wait, prefill gaps, insufficient data, and mean-vs-median throughput.
+
+| C | Prepared mean step | Raw mean step | Prepared tok/s | Raw tok/s | Raw fixed-70 efficiency | Target |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 12.398 ms | 12.361 ms | 80.66 | 80.90 | reference | 70 |
+| 4 | 18.826 ms | 18.769 ms | 212.48 | 213.11 | 76.1% | 85% |
+| 8 | 22.386 ms | 22.022 ms | 357.37 | 363.28 | 64.9% | 75% |
+| 16 | 29.829 ms | 29.593 ms | 536.38 | 540.67 | 48.3% | 65% |
+
+These are paired-run diagnostics, not passed performance/quality gates. Raw
+storage frees about 1.73 GiB per worker (reported model memory 21.27 ->
+19.54 GiB), but its incremental C8/C16 aggregate gain is only 1.66%/0.80%.
+Full-model greedy completion hashes differ in some requests, including C1.
+The dynamic-width dispatcher explains an identified difference, not the C1
+case. Autotuned prefill reduction order is a hypothesis, not an established
+root cause. Full-model quality and the remaining mismatch audit are still
+required; keep raw storage off by default and do not promote this Draft PR.
+
+Original paired artifacts are
+`.artifacts/qwen38_nomtp_concurrency/fixed_width_{prepared,raw}_production_v1.json`.
+The unchanged records are reaccounted in
+`.artifacts/raw-audit/engine_intervals_reaccounted_v2.json`. The benchmark now
+records raw-storage and dynamic-dispatch switches separately and uses complete
+engine intervals for acceptance. The 238/420/728 tok/s targets are unchanged
+and remain unmet.
+
+### Related work and next bounded screen
+
+PR #481 (`codex/v100-qwen38-nomtp-token-trace-20260903-173451`) is a related
+single-request no-MTP campaign, not another source of accepted batch numbers.
+Its latest inspected commit is `30f81105621e9f39e6b3bf9d816f77d63acd8307`.
+It adds exact PLE primitives, a different shared-gate kernel, and a QSA
+output-gate epilogue. Reuse and widen those implementations only after a
+paired M4/M8/M16 operator screen, rather than writing competing kernels.
+Its shared-gate and W13 edits overlap this branch and need explicit
+consolidation before integration; do not merge both blindly or count their
+savings twice. Single-row acceptance does not prove multi-row graph safety.
+In particular, the inspected #481 shared-gate construction still checks the
+global `intermediate_size == 160`, while this checkpoint supplies 640 and TP4
+local projection partitions are 160. Preserve this branch's local-shape
+admission fix when consolidating; an operator-only win is not a route-hit.
+
+No additional endpoint run is justified by the small raw-scale gain alone.
+Keep the existing C16 trace as the optimization guide (about 8 ms direct MoE
+and 8.9 ms dense FP16 service), finish the C1 mismatch localization, then
+screen reusable batch epilogues before another full-model measurement.
+
+### Rejected screens
+
+- GDN CTA-group-block sweeps change a 36-layer round by only about 0.01 ms;
+  the current setting remains unchanged.
+- The apparent M8 FP16-padding gain was allocator/order noise. A fixed-pointer,
+  alternating A/B test reduces the real weighted saving to 0.338 ms; M4 is
+  only 0.128 ms and two shapes are not bitwise equal. No production padding
+  route is added.
+- The prior MTP campaign already measured the SM70 port of SGLang's persistent
+  HC-mix kernel at 40.5x slower and found only 0.190 ms from unquantized FP16
+  projection substitution. Those dead ends are not rerun here.
+- A second HC experiment fused the FP16 HC up projection with the following
+  gate-mix operation. It regressed one call from 12.29/13.00/15.10 us to
+  163.94/164.81/166.40 us at M4/M8/M16, or about 14.5 ms across the 96 calls
+  in one round. It also changed some FP32 results, so it was rejected before
+  production integration.
+- A follow-up exact launch-geometry screen covered the existing HC gate-mix
+  and combine-norm Triton kernels at M4/M8/M16. The best bitwise gate-mix
+  schedules save only about 0.04--0.09 ms per complete round. The faster M16
+  combine-norm schedule changes the normalized tensor, while the fastest
+  bitwise schedule is effectively the current one. No production policy was
+  added for this sub-millisecond noise-floor result. Raw evidence is in
+  `.artifacts/qwen38_nomtp_concurrency/hc_postops_batch_v1.json`.
+- Real-checkpoint generic TurboMind FP16 projection substitutions were either
+  slower in the hot-cache regime or changed outputs by about `1e-3`; none are
+  admitted.
+- A cuBLASLt heuristic sweep covered all algorithms returned for the eight
+  dominant M16 FP16 projection shapes. The exact algorithms are already at or
+  within measurement noise of the PyTorch choice. Permitting alternate FP32
+  association order projects only about 0.08 ms total saving while producing
+  relative-L2 differences around `3.6e-4`; this does not justify a new 64 MiB
+  workspace or a numerical risk. The apparent 0.93 ms of split-K reduction in
+  the trace is part of the fastest complete algorithm, not removable overhead
+  in isolation.
+- FP16 GDN recurrent state saves only about 0.04/0.12/0.77 ms at M4/M8/M16,
+  while state and output relative-L2 errors are roughly 26--29%. It remains a
+  capacity experiment and is rejected under the quality gate.
+- A per-expert 256-entry FP16 scale LUT is bitwise exact but adds a dependent
+  random load; it regresses the M16 direct path and is rejected.
+- Concatenating the FP16 GDN qkvz and b/a projections saves only
+  0.41--0.44 ms in the serial 36-layer cost model. It also changes b/a at M8
+  and M16 (maximum absolute difference up to `2.44e-4`) because cuBLAS chooses
+  a different reduction for the wider output. The small saving cannot justify
+  the extra packed weights and numerical change, so this route is rejected.
+- Running the existing FP16 GDN qkvz and b/a projections concurrently is
+  bitwise exact before and after changed-input CUDA Graph replay. The actual
+  production custom-op boundary, however, saves only 0.071/0.072/0.067 ms per
+  36-layer M4/M8/M16 round, far below the 0.2 ms integration threshold. The
+  initial bare-`torch.mm` screen overestimated the realizable overlap, so the
+  multi-stream production edit was removed. Evidence is in
+  `.artifacts/qwen38_nomtp_concurrency/gdn_parallel_input_production_v1.json`.
+- Sorting QSA selector indices before sparse attention does not provide useful
+  locality at these widths. Excluding the sort itself, the projected saving is
+  only 0.020/0.002/0.006 ms per 12-layer M4/M8/M16 round, and restoring the
+  original order still changes the FP16 result by up to `1.22e-4`. The runtime
+  route remains unsorted. Evidence is in
+  `.artifacts/qwen38_nomtp_concurrency/qsa_index_order_v1.json`.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
@@ -48,4 +507,3 @@ Raw baseline:
 - Runtime selection must be capability- and shape-based. It must not bind the
   model to one concurrency, KV dtype, maximum sequence count, or scheduler
   setting.
-

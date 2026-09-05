@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.model_executor.layers.quantization import modelopt
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
@@ -17,18 +18,34 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
 )
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+    _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K,
+    _QWEN38_QPN_BATCH_W13_SPLIT_K,
     ModelOptNvFp4SM70MoEMethod,
     _mtp_weighted_reduce,
     _prepare_compact_slot_groups,
     _prepare_single_token_slots,
+    _raw_scales_match_prepared,
     _single_token_weighted_reduce,
     _use_compact_grouped,
     _use_qwen38_indexed_prefill,
+    _use_qwen38_qpn_batch_decode,
+    _use_qwen38_qpn_batch_fused_w2,
+    _use_qwen38_qpn_batch_fused_w13,
     _use_qwen38_qpn_m1_decode,
     _use_qwen38_qpn_mtp5_decode,
     _validate_weight_layout,
     validate_nvfp4_sm70_moe_contract,
 )
+
+
+def test_qwen38_qpn_batch_uses_screened_splits():
+    assert _QWEN38_QPN_BATCH_W13_SPLIT_K == {2: 10, 4: 5, 8: 4, 16: 1}
+
+
+def test_qwen38_qpn_batch_covers_dynamic_graph_widths():
+    assert set(_QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K) == set(range(2, 17))
+    for tokens, split_k in _QWEN38_QPN_BATCH_W13_SPLIT_K.items():
+        assert _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K[tokens] == split_k
 
 
 @pytest.mark.parametrize(
@@ -126,6 +143,13 @@ def test_qwen38_fast_prefill_defaults_on_and_can_be_disabled(monkeypatch):
     monkeypatch.setenv(name, "0")
     assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
 
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE"
+    monkeypatch.delenv(name, raising=False)
+    assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE
+
+    monkeypatch.setenv(name, "1")
+    assert envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE
+
 
 @pytest.mark.parametrize(
     ("field", "value"),
@@ -197,6 +221,161 @@ def test_qwen38_indexed_prefill_is_default_on_and_exact_shape_only(monkeypatch):
 
     layer.moe_config.tp_size = 2
     assert not _use_qwen38_indexed_prefill(layer, x, topk_ids)
+
+
+@pytest.mark.parametrize("tokens", (2, 4, 8, 16))
+def test_qwen38_qpn_batch_decode_defaults_on_and_is_shape_gated(monkeypatch, tokens):
+    layer = SimpleNamespace(
+        moe_config=_qwen4_moe_contract(),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+    )
+    x = torch.empty(tokens, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(tokens, 10, dtype=torch.int32)
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", raising=False)
+    assert _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "0")
+    assert not _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "1")
+    assert _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+    assert not _use_qwen38_qpn_batch_decode(layer, x[:, :-1], topk_ids)
+    assert not _use_qwen38_qpn_batch_decode(layer, x, topk_ids.long())
+
+    layer.moe_config.tp_size = 2
+    assert not _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+
+
+@pytest.mark.parametrize("tokens", (3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15))
+@pytest.mark.parametrize("raw_scale", (False, True))
+def test_qwen38_qpn_dynamic_widths_are_independent_of_scale_storage(
+    monkeypatch, tokens, raw_scale
+):
+    layer = SimpleNamespace(
+        moe_config=_qwen4_moe_contract(),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+        sm70_nvfp4_qwen38_raw_scale=raw_scale,
+    )
+    x = torch.empty(tokens, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(tokens, 10, dtype=torch.int32)
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", raising=False)
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE"
+    monkeypatch.delenv(name, raising=False)
+    assert not _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+
+    monkeypatch.setenv(name, "1")
+    assert _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "0")
+    assert not _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+
+
+@pytest.mark.parametrize("interleaved", (False, True))
+@pytest.mark.parametrize("mismatch", (None, "prefill", "decode"))
+def test_raw_scale_admission_checks_prefill_and_effective_decode(
+    monkeypatch, interleaved, mismatch
+):
+    # A decode-scale mismatch can disappear after dividing by 2**14 and
+    # rounding to stored FP16 subnormals. Admission must compare BEFORE that
+    # lossy division, exactly where the QPN HMMA consumes the scale.
+    prepared = torch.tensor([2**-24], dtype=torch.float16)
+    effective = prepared * 16384.0
+    changed_effective = torch.nextafter(
+        effective, torch.full_like(effective, torch.inf)
+    )
+    assert torch.equal(changed_effective / 16384.0, prepared)
+    workspace = torch.empty_like(prepared)
+    codes = torch.zeros(1, dtype=torch.uint8)
+    globals_ = torch.ones(1, dtype=torch.float32)
+    calls = []
+
+    def expand(out, actual_codes, actual_globals, actual_interleaved, fast):
+        assert actual_codes is codes
+        assert actual_globals is globals_
+        assert actual_interleaved == interleaved
+        calls.append(fast)
+        if fast:
+            out.copy_(changed_effective if mismatch == "decode" else effective)
+        else:
+            out.copy_(prepared * 2 if mismatch == "prefill" else prepared)
+
+    monkeypatch.setattr(sm70_ops, "nvfp4_expand_raw_scales_sm70_out", expand)
+    assert _raw_scales_match_prepared(
+        workspace, codes, globals_, prepared, interleaved
+    ) == (mismatch is None)
+    assert calls == ([False] if mismatch == "prefill" else [False, True])
+
+
+@pytest.mark.parametrize("tokens", (4, 8, 16))
+def test_qwen38_qpn_batch_fused_w13_defaults_on_and_is_shape_gated(monkeypatch, tokens):
+    layer = SimpleNamespace(
+        moe_config=_qwen4_moe_contract(),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+        sm70_nvfp4_qwen38_fused_swiglu_prefill=True,
+        swiglu_limit=None,
+    )
+    x = torch.empty(tokens, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(tokens, 10, dtype=torch.int32)
+    monkeypatch.setattr(
+        sm70_ops,
+        "has_nvfp4_qpn_w13_swiglu_batch_dispatch",
+        lambda: True,
+    )
+
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13"
+    monkeypatch.delenv(name, raising=False)
+    assert _use_qwen38_qpn_batch_fused_w13(layer, x, topk_ids)
+
+    monkeypatch.setenv(name, "0")
+    assert not _use_qwen38_qpn_batch_fused_w13(layer, x, topk_ids)
+
+    monkeypatch.setenv(name, "1")
+    assert not _use_qwen38_qpn_batch_fused_w13(layer, x[:1], topk_ids[:1])
+    layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = False
+    assert _use_qwen38_qpn_batch_fused_w13(layer, x, topk_ids)
+
+
+@pytest.mark.parametrize("tokens", (2, 4, 8, 16))
+def test_qwen38_qpn_batch_fused_w2_defaults_on_and_is_shape_gated(monkeypatch, tokens):
+    layer = SimpleNamespace(
+        moe_config=_qwen4_moe_contract(),
+        sm70_nvfp4_num_experts=512,
+        sm70_nvfp4_hidden_size=2560,
+        sm70_nvfp4_intermediate_size=160,
+        sm70_nvfp4_top_k=10,
+    )
+    x = torch.empty(tokens, 2560, dtype=torch.float16)
+    topk_ids = torch.empty(tokens, 10, dtype=torch.int32)
+    monkeypatch.setattr(
+        sm70_ops,
+        "has_nvfp4_qpn_w2_reduce_dispatch",
+        lambda: True,
+    )
+
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2"
+    monkeypatch.delenv(name, raising=False)
+    assert _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids)
+
+    monkeypatch.setenv(name, "0")
+    assert not _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids)
+
+    monkeypatch.setenv(name, "1")
+    assert not _use_qwen38_qpn_batch_fused_w2(layer, x[:1], topk_ids[:1])
+    monkeypatch.setattr(
+        sm70_ops,
+        "has_nvfp4_qpn_w2_reduce_dispatch",
+        lambda: False,
+    )
+    assert not _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids)
 
 
 def test_qwen38_qpn_mtp5_decode_is_opt_in_and_exact_shape_only(monkeypatch):

@@ -523,6 +523,40 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor expert_ids, bool broadcast_input,
                                int64_t split_k);
 
+void nvfp4_expand_raw_scales_sm70_out(torch::Tensor out,
+                                      torch::Tensor scale_codes,
+                                      torch::Tensor global_scales,
+                                      bool interleaved_w13,
+                                      bool fast_decode_rounding);
+
+void nvfp4_moe_qpn_raw_scale_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weights,
+                                      torch::Tensor scale_codes,
+                                      torch::Tensor global_scales,
+                                      torch::Tensor expert_ids,
+                                      bool broadcast_input,
+                                      bool interleaved_w13, int64_t split_k);
+
+void nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scales, torch::Tensor expert_ids, bool interleaved);
+
+void nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scale_codes, torch::Tensor global_scales,
+    torch::Tensor expert_ids, bool interleaved);
+
+void nvfp4_moe_qpn_w2_reduce_sm70_out(torch::Tensor out, torch::Tensor input,
+                                      torch::Tensor weights,
+                                      torch::Tensor scales,
+                                      torch::Tensor expert_ids,
+                                      torch::Tensor topk_weights);
+
+void nvfp4_moe_qpn_raw_w2_reduce_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor weights,
+    torch::Tensor scale_codes, torch::Tensor global_scales,
+    torch::Tensor expert_ids, torch::Tensor topk_weights);
+
 void nvfp4_moe_qpn_mtp5_sm70_out(torch::Tensor out, torch::Tensor input,
                                  torch::Tensor weights, torch::Tensor scales,
                                  torch::Tensor expert_ids, bool broadcast_input,

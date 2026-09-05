@@ -50,7 +50,11 @@ def test_compile_wrapper_cleanup_is_idempotent():
 
 
 def test_sm70_workspace_cleanup_releases_all_tensor_owners():
-    from vllm.model_executor.layers.quantization import fp8, sm70_turbomind
+    from vllm.model_executor.layers.quantization import (
+        fp8,
+        nvfp4_sm70_moe,
+        sm70_turbomind,
+    )
     from vllm.v1.attention.backends import flash_attn_v100
     from vllm.v1.worker.gpu.shutdown import _clear_loaded_gpu_workspaces
 
@@ -77,6 +81,7 @@ def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     fp8._sm70_fp8_prefill_dense_workspaces[(0, tensor.dtype)] = tensor
     fp8._sm70_fp8_qpn8_pp2_tp4_workspaces[(0, tensor.dtype)] = tensor
     sm70_turbomind._nvfp4_qpn4_dense_workspaces[(0, tensor.dtype)] = tensor
+    nvfp4_sm70_moe._qwen38_raw_scale_workspaces[0] = tensor
 
     _clear_loaded_gpu_workspaces()
 
@@ -88,6 +93,7 @@ def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     assert not fp8._sm70_fp8_prefill_dense_workspaces
     assert not fp8._sm70_fp8_qpn8_pp2_tp4_workspaces
     assert not sm70_turbomind._nvfp4_qpn4_dense_workspaces
+    assert not nvfp4_sm70_moe._qwen38_raw_scale_workspaces
 
 
 def test_mrv2_shutdown_drops_target_draft_graph_and_model_refs(monkeypatch):

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark the opt-in SM70 TP4 push collective for Qwen3.8 MTP4.
+"""Benchmark the opt-in SM70 TP4 push collective for Qwen3.8.
 
 This captures both the existing pull path and the candidate push path in one
 ``torchrun`` lifetime.  Each graph mirrors one 48-layer verifier round: one
-regular all-reduce and one shared+routed sum2 all-reduce per layer, both with
-the exact FP16 [5, 2560] payload.
+regular all-reduce and one shared+routed sum2 all-reduce per layer. The default
+remains the FP16 [5, 2560] MTP4 payload; ``--tokens`` also screens no-MTP
+concurrency widths.
 
 Example:
   CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 \
@@ -24,16 +25,16 @@ import torch.distributed as dist
 
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
-_TOKENS = 5
 _HIDDEN_SIZE = 2560
 _LAYERS = 48
 _MTP5_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5"
+_BATCH_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH"
 
 
-def _make_inputs(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _make_inputs(rank: int, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda")
     generator.manual_seed(20260828 + rank)
-    shape = (_TOKENS, _HIDDEN_SIZE)
+    shape = (tokens, _HIDDEN_SIZE)
     input_a = (
         torch.randn(shape, device="cuda", generator=generator, dtype=torch.float32)
         * 0.03
@@ -51,8 +52,10 @@ def _capture_round(
     input_b: torch.Tensor,
     *,
     push: bool,
+    tokens: int,
 ) -> tuple[torch.cuda.CUDAGraph, list[torch.Tensor]]:
-    os.environ[_MTP5_ENV] = "1" if push else "0"
+    os.environ[_MTP5_ENV] = "1" if push and tokens == 5 else "0"
+    os.environ[_BATCH_ENV] = "1" if push and tokens in (4, 8, 16) else "0"
     torch.accelerator.synchronize()
     dist.barrier()
     regular_outputs = [torch.empty_like(input_a) for _ in range(_LAYERS)]
@@ -189,6 +192,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--timing-repeats", type=int, default=4)
+    parser.add_argument("--tokens", type=int, choices=(4, 5, 8, 16), default=5)
     parser.add_argument("--json-out")
     args = parser.parse_args()
     if args.warmup < 0 or args.iterations <= 0 or args.timing_repeats <= 0:
@@ -198,9 +202,7 @@ def main() -> None:
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size != 4:
-        raise ValueError(
-            f"Qwen3.8 MTP5 push benchmark requires TP4, got TP{world_size}"
-        )
+        raise ValueError(f"Qwen3.8 push benchmark requires TP4, got TP{world_size}")
 
     torch.accelerator.set_device_index(local_rank)
     dist.init_process_group(backend="nccl")
@@ -218,16 +220,16 @@ def main() -> None:
         if communicator.sm70_tp4_push_buffer_ptrs is None:
             raise RuntimeError("SM70 TP4 push buffer was not registered")
 
-        input_a, input_b = _make_inputs(rank)
+        input_a, input_b = _make_inputs(rank, args.tokens)
         if rank == 0:
             print("[tp4-mtp5-ar] capture baseline pull graph", flush=True)
         baseline_graph, baseline_outputs = _capture_round(
-            communicator, input_a, input_b, push=False
+            communicator, input_a, input_b, push=False, tokens=args.tokens
         )
         if rank == 0:
             print("[tp4-mtp5-ar] capture candidate push graph", flush=True)
         candidate_graph, candidate_outputs = _capture_round(
-            communicator, input_a, input_b, push=True
+            communicator, input_a, input_b, push=True, tokens=args.tokens
         )
         if rank == 0:
             print("[tp4-mtp5-ar] compare dynamic graph outputs", flush=True)
@@ -263,7 +265,7 @@ def main() -> None:
         savings_ms = control_ms - candidate_ms
         result = {
             "world_size": world_size,
-            "shape": [_TOKENS, _HIDDEN_SIZE],
+            "shape": [args.tokens, _HIDDEN_SIZE],
             "dtype": "float16",
             "layers": _LAYERS,
             "collectives_per_round": collectives,
@@ -304,6 +306,7 @@ def main() -> None:
             raise SystemExit(1)
     finally:
         os.environ[_MTP5_ENV] = "0"
+        os.environ[_BATCH_ENV] = "0"
         communicator.close()
         dist.destroy_process_group(gloo_group)
         dist.destroy_process_group()

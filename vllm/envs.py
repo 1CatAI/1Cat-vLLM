@@ -185,6 +185,11 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
+    VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL: bool = True
@@ -231,6 +236,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
     VLLM_SM70_TP4_PUSH_ALLREDUCE: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5: bool = False
+    VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -1876,6 +1882,51 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1"))
     ),
+    # Direct Qwen3.8 expert route for CUDA Graph local widths 2, 4, 8, and 16. It
+    # retains native NVFP4 weights, FP16 activations, and FP32 accumulation
+    # while skipping expert sort and input expansion. Exact shape/capability
+    # gates preserve the generic fallback.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE", "1"))
+    ),
+    # Experimental extension to every live width in 2..16, independent of
+    # scale storage. Changing RAW_SCALE must not also change which widths use
+    # QPN versus grouped TurboMind (which can use a different reduction order).
+    # Keep off until dynamic-width endpoint quality admission is complete.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE", "0"))
+    ),
+    # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
+    # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the
+    # existing interleaved native-NVFP4 layout. M2 retains its faster separate
+    # activation. Set to 0 to retain the standalone activation path.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13",
+                "1",
+            )
+        )
+    ),
+    # Fuse the direct Qwen3.8 W2 projection with its fixed-order FP32 weighted
+    # reduction. Ten warps compute the ten routed slots in parallel; the
+    # capability and shape gate keeps every other MoE route unchanged.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2",
+                "1",
+            )
+        )
+    ),
+    # Keep native E4M3 block-scale codes resident and reconstruct their exact
+    # FP16 values in the QPN decode kernels. Generic/prefill TurboMind routes
+    # use one reusable expansion workspace, so this reduces persistent scale
+    # memory instead of retaining a second representation. Experimental until
+    # full-model prefill/decode quality admission is complete.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE", "0"))
+    ),
     # Exact TP4 Qwen3.8 W13 prefill route. It retains the stable expert sort
     # and unpermute maps but reads original token rows through TurboMind's
     # indexed-A iterator instead of materializing top-k replicated FP16 rows.
@@ -2111,6 +2162,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only. Keep opt-in until the TP4 dynamic-graph gate is recorded.
     "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5": lambda: bool(
         int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "0"))
+    ),
+    # Bitwise-equal push collectives for FP16 [4|8|16, 2560] payloads on
+    # fully-connected SM70 TP4 CUDA Graphs. Other shapes, topologies, devices,
+    # and eager execution retain the normal custom-allreduce path.
+    "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH", "1"))
     ),
     # Optional task-built custom-AR fragment. Operators present in the sidecar
     # override the production namespace; every other operator falls back.

@@ -697,6 +697,49 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("nvfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
            &nvfp4_moe_qpn_m1_sm70_out);
 
+  ops.def(
+      "nvfp4_expand_raw_scales_sm70_out("
+      "Tensor(a!) out, Tensor scale_codes, Tensor global_scales, "
+      "bool interleaved_w13, bool fast_decode_rounding) -> ()");
+  ops.impl("nvfp4_expand_raw_scales_sm70_out", torch::kCUDA,
+           &nvfp4_expand_raw_scales_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_raw_scale_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scale_codes, "
+      "Tensor global_scales, Tensor expert_ids, bool broadcast_input, "
+      "bool interleaved_w13, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_raw_scale_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_raw_scale_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool interleaved) -> ()");
+  ops.impl("nvfp4_moe_qpn_w13_swiglu_batch_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_w13_swiglu_batch_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scale_codes, "
+      "Tensor global_scales, Tensor expert_ids, bool interleaved) -> ()");
+  ops.impl("nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_w2_reduce_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, Tensor topk_weights) -> ()");
+  ops.impl("nvfp4_moe_qpn_w2_reduce_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_w2_reduce_sm70_out);
+
+  ops.def(
+      "nvfp4_moe_qpn_raw_w2_reduce_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scale_codes, "
+      "Tensor global_scales, Tensor expert_ids, Tensor topk_weights) -> ()");
+  ops.impl("nvfp4_moe_qpn_raw_w2_reduce_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_raw_w2_reduce_sm70_out);
+
   // Keep the five-row verifier on a distinct schema so an old extension that
   // only supports the ten-route M=1 contract cannot be selected accidentally.
   ops.def(
