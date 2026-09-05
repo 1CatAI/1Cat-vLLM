@@ -36,6 +36,7 @@ Mode = Literal[
 ]
 MoEActual = Literal[
     "indexed_prefill",
+    "indexed_prefill_chunked_w2",
     "batched",
     "batched_per_expert_dispatch",
     "batched_w13_per_expert_dispatch",
@@ -722,7 +723,10 @@ def _classify_moe_results(
 
 
 def _stage_from_name(name: str) -> str:
-    match = re.search(r"_(w13_gate_up|silu_and_mul|w2_sorted_output)$", name)
+    match = re.search(
+        r"_(w13_gate_up|silu_and_mul|w2_sorted_output|final_weighted_output)$",
+        name,
+    )
     return match.group(1) if match else "unknown"
 
 
@@ -876,7 +880,14 @@ def _service_moe_permute_inputs(
     input: torch.Tensor,
     topk_ids: torch.Tensor,
     num_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Run both production MoE permute forms and prove their row mapping agrees."""
     for op_name in (
         "moe_permute_with_scratch",
@@ -981,6 +992,8 @@ def _service_moe_permute_inputs(
         input_row_indices,
         expert_offsets64.to(torch.int32),
         expert_offsets64,
+        metadata_scratch["inv_permuted_idx"],
+        metadata_scratch["permuted_idx"],
     )
 
 
@@ -1170,8 +1183,14 @@ def _check_awq_moe(
     _require_torch_op("awq_gemm_sm70")
     _require_torch_op("awq_moe_build_strided_ptrs")
     _require_torch_op("awq_moe_gemm_sm70_out")
-    if actual_impl == "indexed_prefill":
+    indexed_prefill_impl = actual_impl in (
+        "indexed_prefill",
+        "indexed_prefill_chunked_w2",
+    )
+    if indexed_prefill_impl:
         _require_torch_op("awq_moe_indexed_dense_w13_sm70_out")
+    if actual_impl == "indexed_prefill_chunked_w2":
+        _require_torch_op("awq_moe_chunked_w2_sm70_out")
     if actual_impl in (
         "batched",
         "batched_per_expert_dispatch",
@@ -1254,7 +1273,9 @@ def _check_awq_moe(
 
     hidden_size = int(w13_qweight.shape[1])
     input_row_indices = None
-    if actual_impl == "indexed_prefill":
+    inv_permuted_idx = None
+    permuted_idx = None
+    if indexed_prefill_impl:
         if (
             num_experts != 512
             or top_k != 10
@@ -1270,6 +1291,8 @@ def _check_awq_moe(
             input_row_indices,
             expert_offsets,
             expert_offsets64,
+            inv_permuted_idx,
+            permuted_idx,
         ) = _service_moe_permute_inputs(
             indexed_input,
             topk_ids,
@@ -1297,7 +1320,7 @@ def _check_awq_moe(
     single_token_offsets64 = None
     single_token_inv_permuted_idx = None
     single_token_sorted_expert_ids = None
-    if actual_impl == "indexed_prefill":
+    if indexed_prefill_impl:
         assert input_row_indices is not None
         sm70_ops.awq_moe_indexed_dense_w13_sm70_out(
             gate_up_actual,
@@ -1474,7 +1497,7 @@ def _check_awq_moe(
             w13_q_ld,
             w13_n,
         )
-    if actual_impl == "indexed_prefill":
+    if indexed_prefill_impl:
         gate_up_expected = torch.empty_like(gate_up_actual)
         sm70_ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
             gate_up_expected,
@@ -1514,11 +1537,63 @@ def _check_awq_moe(
         silu_and_mul(intermediate_actual, gate_up_actual)
     silu_and_mul(intermediate_expected, gate_up_expected)
 
-    if sorted_output_actual is None:
+    if sorted_output_actual is None and actual_impl != "indexed_prefill_chunked_w2":
         sorted_output_actual = torch.empty(
             (total_slots, hidden_out), dtype=torch.float16, device=device
         )
-    if actual_impl in ("batched", "batched_w13_per_expert_dispatch"):
+    if actual_impl == "indexed_prefill_chunked_w2":
+        assert inv_permuted_idx is not None
+        assert permuted_idx is not None
+        if m < 8192:
+            raise ValueError(
+                "indexed_prefill_chunked_w2 requires at least 8192 tokens."
+            )
+        topk_weights = _make_topk_weights(top_k, device).expand(m, -1).contiguous()
+        final_output_actual = torch.empty(
+            (m, hidden_size), dtype=torch.float16, device=device
+        )
+        chunk_tokens = 6144
+        tail_tokens = m % chunk_tokens
+        if 0 < tail_tokens < 2048:
+            raise ValueError(
+                "indexed_prefill_chunked_w2 requires an empty or at least "
+                "2048-token tail."
+            )
+        chunk_slots = chunk_tokens * top_k
+        chunk_output = torch.empty(
+            (chunk_slots, hidden_out), dtype=torch.float16, device=device
+        )
+        chunk_expert_offsets = torch.empty(
+            num_experts + 1, dtype=torch.int32, device=device
+        )
+        chunk_range_begin = torch.empty(num_experts, dtype=torch.int32, device=device)
+        chunk_range_end = torch.empty_like(chunk_range_begin)
+        chunk_a_indices = torch.empty(chunk_slots, dtype=torch.int32, device=device)
+        chunk_inv_permuted_idx = torch.empty_like(chunk_a_indices)
+        sm70_ops.awq_moe_chunked_w2_sm70_out(
+            final_output_actual,
+            chunk_output,
+            intermediate_actual,
+            expert_offsets,
+            permuted_idx,
+            topk_weights,
+            chunk_expert_offsets,
+            chunk_range_begin,
+            chunk_range_end,
+            chunk_a_indices,
+            chunk_inv_permuted_idx,
+            w2_ptrs_w,
+            w2_ptrs_s,
+            m,
+            top_k,
+            num_experts,
+            int(w2_tm_weight.shape[1]),
+            hidden_out,
+            hidden_size,
+            group_size,
+            chunk_tokens,
+        )
+    elif actual_impl in ("batched", "batched_w13_per_expert_dispatch"):
         sm70_ops.awq_moe_gemm_sm70_out(
             sorted_output_actual,
             intermediate_actual,
@@ -1621,8 +1696,10 @@ def _check_awq_moe(
             w2_q_ld,
             hidden_out,
         )
-    if actual_impl == "indexed_prefill":
-        sorted_output_expected = torch.empty_like(sorted_output_actual)
+    if indexed_prefill_impl:
+        sorted_output_expected = torch.empty(
+            (total_slots, hidden_out), dtype=torch.float16, device=device
+        )
         sm70_ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
             sorted_output_expected,
             intermediate_expected,
@@ -1646,7 +1723,19 @@ def _check_awq_moe(
             w2_q_ld,
             hidden_out,
         )
-    if actual_impl == "legacy_single_token_compact":
+    if actual_impl == "indexed_prefill_chunked_w2":
+        assert inv_permuted_idx is not None
+        assert final_output_actual is not None
+        final_output_expected = torch.empty_like(final_output_actual)
+        torch.ops._moe_C.moe_unpermute(
+            sorted_output_expected,
+            topk_weights,
+            inv_permuted_idx,
+            None,
+            top_k,
+            final_output_expected,
+        )
+    elif actual_impl == "legacy_single_token_compact":
         assert final_output_actual is not None
         assert single_token_inv_permuted_idx is not None
         topk_weights = _make_topk_weights(top_k, device)
@@ -1698,7 +1787,10 @@ def _check_awq_moe(
             layer=awq_moe_layer,
         )
     )
-    if actual_impl != "legacy_single_token_compact":
+    if actual_impl not in (
+        "legacy_single_token_compact",
+        "indexed_prefill_chunked_w2",
+    ):
         results.append(
             _with_moe_metadata(
                 _stats(
@@ -1743,7 +1835,7 @@ def _check_awq_moe(
                 "weight_scale_dtype": str(w13_scales.dtype),
                 "reference_impl": (
                     "materialized_per_expert_dispatch"
-                    if actual_impl == "indexed_prefill"
+                    if indexed_prefill_impl
                     else "per_expert_dense"
                 ),
             }
@@ -2871,6 +2963,7 @@ def _parse_args() -> argparse.Namespace:
         "--awq-moe-actual",
         choices=[
             "indexed_prefill",
+            "indexed_prefill_chunked_w2",
             "batched",
             "batched_per_expert_dispatch",
             "batched_w13_per_expert_dispatch",

@@ -3432,6 +3432,83 @@ if hasattr(torch.ops._C, "awq_moe_active_dense_stage_sm70_out"):
         return None
 
 
+def awq_moe_chunked_w2_sm70_out(
+    out: torch.Tensor,
+    chunk_output: torch.Tensor,
+    input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    permuted_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    chunk_expert_offsets: torch.Tensor,
+    chunk_range_begin: torch.Tensor,
+    chunk_range_end: torch.Tensor,
+    chunk_a_indices: torch.Tensor,
+    chunk_inv_permuted_idx: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    k: int,
+    n: int,
+    hidden_logical_size: int,
+    group_size: int,
+    chunk_tokens: int,
+) -> None:
+    _op("awq_moe_chunked_w2_sm70_out")(
+        out,
+        chunk_output,
+        input,
+        expert_offsets,
+        permuted_idx,
+        topk_weights,
+        chunk_expert_offsets,
+        chunk_range_begin,
+        chunk_range_end,
+        chunk_a_indices,
+        chunk_inv_permuted_idx,
+        ptrs_w,
+        ptrs_s,
+        num_tokens,
+        top_k,
+        num_experts,
+        k,
+        n,
+        hidden_logical_size,
+        group_size,
+        chunk_tokens,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_chunked_w2_sm70_out"):
+
+    @register_fake("_C::awq_moe_chunked_w2_sm70_out")
+    def _awq_moe_chunked_w2_sm70_out_fake(
+        out: torch.Tensor,
+        chunk_output: torch.Tensor,
+        input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        permuted_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        chunk_expert_offsets: torch.Tensor,
+        chunk_range_begin: torch.Tensor,
+        chunk_range_end: torch.Tensor,
+        chunk_a_indices: torch.Tensor,
+        chunk_inv_permuted_idx: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_tokens: int,
+        top_k: int,
+        num_experts: int,
+        k: int,
+        n: int,
+        hidden_logical_size: int,
+        group_size: int,
+        chunk_tokens: int,
+    ) -> None:
+        return None
+
+
 def awq_moe_single_token_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
