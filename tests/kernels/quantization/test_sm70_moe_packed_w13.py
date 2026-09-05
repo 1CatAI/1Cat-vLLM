@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark-only grouped W13: no default runtime route is changed.
+"""Experimental grouped W13/W2: no default runtime route is changed.
 
 Set a task-owned TORCH_EXTENSIONS_DIR and build with CUDA 12.8 on SM70.
 """
@@ -21,14 +21,15 @@ def weights():
         pytest.skip("Set task-owned TORCH_EXTENSIONS_DIR")
     source = (
         Path(__file__).resolve().parents[3]
-        / "benchmarks/kernels/sm70_moe_packed_w13.cu"
+        / "csrc/sm70_turbomind/ops/nvfp4_grouped_decode_sm70.cu"
     )
-    load(
-        name="sm70_moe_packed_w13_screen",
-        sources=[str(source)],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
-        is_python_module=False,
-    )
+    if not hasattr(torch.ops._C, "nvfp4_grouped_w13_sm70_out"):
+        load(
+            name="sm70_moe_packed_w13_screen",
+            sources=[str(source)],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+            is_python_module=False,
+        )
     torch.manual_seed(123)
     return (
         torch.randint(0, 2**31 - 1, (512, 2560, 40), device="cuda", dtype=torch.int32),
@@ -58,10 +59,10 @@ def test_regroup_graph_covers_every_route(weights, tokens):
     reference = torch.empty_like(reduced)
 
     def run():
-        torch.ops.sm70_packed_screen.run(
+        torch.ops._C.nvfp4_grouped_w13_sm70_out(
             out, x, w, s, ids, rows, experts, sizes, total, 8, False
         )
-        torch.ops.sm70_packed_screen.w2(
+        torch.ops._C.nvfp4_grouped_w2_sm70_out(
             reduced, routed, out, w2, s2, topk, rows, experts, sizes, total
         )
 
@@ -127,7 +128,7 @@ def test_same_split_matches_production(weights, tokens, split, interleaved):
     sizes = torch.empty_like(experts)
     total = torch.empty(1, device="cuda", dtype=torch.int32)
     ops.nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(expected, x, w, s, ids, interleaved)
-    torch.ops.sm70_packed_screen.run(
+    torch.ops._C.nvfp4_grouped_w13_sm70_out(
         out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
     )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)

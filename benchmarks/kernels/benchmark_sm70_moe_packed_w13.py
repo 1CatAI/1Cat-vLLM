@@ -3,7 +3,7 @@
 # ruff: noqa: B023
 """Paired graph screen, including grouping, W13/SiLU and unchanged fused W2.
 
-This builds a benchmark-only CUDA extension, not a production override. Use
+Uses production native ops, or builds the same source for standalone screening. Use
 --model for actual checkpoint weights; otherwise only synthetic screening is
 performed. Activations are synthetic in both modes. No model quality claim.
 Loop-local closures are consumed synchronously before advancing the loop.
@@ -137,14 +137,18 @@ def main():
         raise RuntimeError("SM70 only")
     if "TORCH_EXTENSIONS_DIR" not in os.environ:
         raise RuntimeError("Set a task-owned TORCH_EXTENSIONS_DIR")
-    source = Path(__file__).with_name("sm70_moe_packed_w13.cu")
-    load(
-        name="sm70_moe_packed_w13_screen",
-        sources=[str(source)],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
-        is_python_module=False,
-        verbose=True,
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "csrc/sm70_turbomind/ops/nvfp4_grouped_decode_sm70.cu"
     )
+    if not ops.has_nvfp4_grouped_decode_dispatch():
+        load(
+            name="sm70_moe_packed_w13_screen",
+            sources=[str(source)],
+            extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+            is_python_module=False,
+            verbose=True,
+        )
     torch.manual_seed(20260905)
     if args.model:
         w13, s13, w2, s2 = checkpoint_weights(
@@ -200,7 +204,7 @@ def main():
             )
 
         def candidate(split):
-            torch.ops.sm70_packed_screen.run(
+            torch.ops._C.nvfp4_grouped_w13_sm70_out(
                 packed_mid,
                 x,
                 w13,
@@ -214,7 +218,7 @@ def main():
                 args.interleaved,
             )
             if args.packed_w2:
-                torch.ops.sm70_packed_screen.w2(
+                torch.ops._C.nvfp4_grouped_w2_sm70_out(
                     packed_out,
                     routed_out,
                     packed_mid,

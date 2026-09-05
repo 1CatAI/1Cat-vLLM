@@ -24,6 +24,7 @@ from safetensors import safe_open
 
 from vllm import _sm70_ops as ops
 from vllm import envs
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     ModelOptNvFp4SM70MoEMethod,
     MoEActivation,
@@ -49,6 +50,11 @@ def main():
     parser.add_argument("--tokens", default="1,3,4,7,8,16,32,128,784")
     parser.add_argument("--out", required=True)
     parser.add_argument("--dynamic", action="store_true")
+    parser.add_argument(
+        "--grouped",
+        action="store_true",
+        help="Audit grouped decode instead of raw-scale storage",
+    )
     args = parser.parse_args()
     layers = tuple(map(int, args.layers.split(",")))
     ranks = tuple(map(int, args.ranks.split(",")))
@@ -60,7 +66,9 @@ def main():
     os.environ["VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE"] = str(int(args.dynamic))
     if torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("This kernel audit requires SM70")
-    if not ops.has_nvfp4_qpn_raw_scale_dispatch():
+    if args.grouped and not ops.has_nvfp4_grouped_decode_dispatch():
+        raise RuntimeError("Build the grouped-decode native operators first")
+    if not args.grouped and not ops.has_nvfp4_qpn_raw_scale_dispatch():
         raise RuntimeError("Build the raw-scale native operators first")
     model = args.model
     index = json.loads((model / "model.safetensors.index.json").read_text())[
@@ -145,7 +153,12 @@ def main():
                 }
 
             def make(raw, tensors=tensors):
-                os.environ["VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE"] = str(int(raw))
+                os.environ["VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE"] = str(
+                    int(raw and not args.grouped)
+                )
+                os.environ["VLLM_SM70_NVFP4_MOE_GROUPED_DECODE"] = str(
+                    int(raw and args.grouped)
+                )
                 envs.disable_envs_cache()
                 layer = SimpleNamespace(
                     moe_config=cfg,
@@ -166,7 +179,9 @@ def main():
             del make, tensors
             scales = {}
             interleaved_w13 = raw.sm70_nvfp4_qwen38_fused_swiglu_prefill
-            for stage, interleaved in (("w13", interleaved_w13), ("w2", False)):
+            for stage, interleaved in (
+                () if args.grouped else (("w13", interleaved_w13), ("w2", False))
+            ):
                 expected = getattr(prepared, f"{stage}_tm_scales")
                 dest = torch.empty_like(expected)
                 codes = getattr(raw, f"{stage}_raw_scale_codes")
@@ -188,18 +203,39 @@ def main():
                 vals, ids = torch.topk(scores, 10, dim=-1)
                 ids = ids.int().contiguous()
                 weights = torch.softmax(vals, dim=-1)
+
+                def apply(layer, tokens=tokens, x=x, weights=weights, ids=ids):
+                    context = ForwardContext(
+                        no_compile_layers={},
+                        slot_mapping={},
+                        attn_metadata={
+                            "attn": SimpleNamespace(
+                                max_query_len=1 if tokens <= 16 else tokens
+                            )
+                        },
+                    )
+                    with override_forward_context(context):
+                        return method.apply(layer, x, weights, ids, None, None)
+
                 # Run same allocation/shape twice to distinguish nondeterminism.
-                a = method.apply(prepared, x, weights, ids, None, None).clone()
-                aa = method.apply(prepared, x, weights, ids, None, None).clone()
-                b = method.apply(raw, x, weights, ids, None, None).clone()
-                bb = method.apply(raw, x, weights, ids, None, None).clone()
+                a = apply(prepared).clone()
+                aa = apply(prepared).clone()
+                b = apply(raw).clone()
+                bb = apply(raw).clone()
+                if args.grouped:
+                    torch.testing.assert_close(b, a, rtol=1e-3, atol=1e-5)
                 row = dict(
                     layer=layer_no,
                     rank=rank,
                     tokens=tokens,
                     dynamic_decode=args.dynamic,
+                    grouped_decode=args.grouped,
                     scales=scales,
-                    raw_vs_prepared=error(b, a),
+                    **{
+                        (
+                            "grouped_vs_prepared" if args.grouped else "raw_vs_prepared"
+                        ): error(b, a)
+                    },
                     prepared_repeat=error(aa, a),
                     raw_repeat=error(bb, b),
                 )
@@ -207,7 +243,7 @@ def main():
                     graph = torch.cuda.CUDAGraph()
                     torch.accelerator.synchronize()
                     with torch.cuda.graph(graph):
-                        bgraph = method.apply(raw, x, weights, ids, None, None)
+                        bgraph = apply(raw)
                     for _ in range(3):
                         graph.replay()
                     row["graph_vs_eager"] = error(bgraph, b)
@@ -219,7 +255,11 @@ def main():
             torch.accelerator.empty_cache()
     Path(args.out).write_text(json.dumps(rows, indent=2) + "\n")
     for row in rows:
-        checks = [row[k] for k in ("raw_vs_prepared", "prepared_repeat", "raw_repeat")]
+        checks = [row[k] for k in ("prepared_repeat", "raw_repeat")]
+        if not args.grouped:
+            checks.append(row["raw_vs_prepared"])
+        elif row["tokens"] != 16:
+            checks.append(row["grouped_vs_prepared"])
         checks.extend(row["scales"].values())
         if "graph_vs_eager" in row:
             checks.append(row["graph_vs_eager"])

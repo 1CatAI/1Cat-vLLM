@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
+    VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
@@ -1895,6 +1896,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep off until dynamic-width endpoint quality admission is complete.
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE", "0"))
+    ),
+    # Experimental grouped native-NVFP4 W13/W2 decode. Local weight shapes and
+    # attention metadata gates preserve M1, prefill and multi-token verify.
+    # Default off pending endpoint and model-quality admission.
+    "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))
     ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
     # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the

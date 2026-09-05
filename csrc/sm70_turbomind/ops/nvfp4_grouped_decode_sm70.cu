@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Benchmark-only multi-row W13 candidate. No production dispatcher uses this.
+// Experimental multi-row native-NVFP4 decode. Python dispatch defaults off.
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -288,18 +288,20 @@ void w2(torch::Tensor out, torch::Tensor routed, torch::Tensor x,
 }
 }  // namespace
 
-TORCH_LIBRARY(sm70_packed_screen, m) {
+TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
-      "run(Tensor(a!) out, Tensor x, Tensor w, Tensor s, Tensor ids, "
+      "nvfp4_grouped_w13_sm70_out(Tensor(a!) out, Tensor x, Tensor w, Tensor "
+      "s, Tensor ids, "
       "Tensor(b!) rows, Tensor(c!) experts, Tensor(d!) sizes, Tensor(e!) "
       "total, "
       "int split, bool interleaved) -> ()");
   m.def(
-      "w2(Tensor(a!) out, Tensor(b!) routed, Tensor x, Tensor w, Tensor s, "
+      "nvfp4_grouped_w2_sm70_out(Tensor(a!) out, Tensor(b!) routed, Tensor x, "
+      "Tensor w, Tensor s, "
       "Tensor topk, Tensor rows, Tensor experts, Tensor sizes, Tensor total) "
       "-> ()");
 }
-TORCH_LIBRARY_IMPL(sm70_packed_screen, CUDA, m) {
-  m.impl("run", &run);
-  m.impl("w2", &w2);
+TORCH_LIBRARY_IMPL(_C, CUDA, m) {
+  m.impl("nvfp4_grouped_w13_sm70_out", &run);
+  m.impl("nvfp4_grouped_w2_sm70_out", &w2);
 }

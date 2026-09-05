@@ -674,6 +674,111 @@ unfinished optimization track.
 Keep Draft; neither default enablement nor a release claim is authorized by
 these microbenchmarks.
 
+## Guarded production integration (2026-09-05)
+
+Starting source is `992a9375153d307c119c7b2dc6311a938bae3791`, owned PR #474,
+same original integration base and performance contract as above. The former
+benchmark CUDA source is moved to
+`csrc/sm70_turbomind/ops/nvfp4_grouped_decode_sm70.cu` and included in the SM70
+native build. Both operations register in `_C`, with Python wrappers and fake
+implementations; tests and the standalone screen reuse this source rather
+than maintaining a second kernel copy.
+
+`VLLM_SM70_NVFP4_MOE_GROUPED_DECODE=1` enables the experimental route at load
+time; **the default remains 0**. Admission uses the actual local
+E512/H2560/I160/top10 shape, native packed weights and prepared FP16 scales,
+without a model-name, TP-degree, KV-dtype, maximum-sequence-count or prefill
+chunk-size restriction. Raw-scale storage, clamped SwiGLU and unsupported
+shapes retain the old route. An eligible explicit opt-in with missing native
+operations fails at startup. Runtime initially admits the screened M8/split4
+and M16/split8 specializations; all other widths retain their prior paths.
+
+Crucially, an M16 input is not necessarily 16 single-token decode requests.
+The opaque MoE call checks existing CPU attention metadata to reject prefill,
+mixed batches and multi-token verification. Missing/list/unknown metadata
+fails closed. The decision is cached only within that `ForwardContext`, not
+across requests or graph captures. There is no `.item()` or device-to-host
+transfer in this route selection. Per-layer integer metadata is allocated
+before capture (6,404 bytes/layer); W2 reuses the existing routed-output
+workspace. There is no new process-global tensor cache.
+
+Native rebuild succeeded. Tested `_C` SHA256:
+`76f106f86f7e7bdf5f8a51b64378fee7ee09ba8a6d3cb51e699a944985711858`.
+Validation so far:
+
+- Existing mixed-NVFP4 and initial dispatch suites: 91 passed / 5 GPU-only
+  skipped in the CPU run. Final dispatch suite including fake-op execution
+  and CPU-integer metadata guards: 33 passed. These suites overlap; do not
+  sum them.
+- The 22 grouped-operator GPU tests pass against the production `_C`, not the
+  former benchmark namespace.
+- All applicable staged pre-commit hooks pass, including mypy, Python/CUDA
+  formatting, Markdown lint and source-header checks.
+- Real checkpoint layer-0/rank-0 **loader + `ModelOptNvFp4SM70MoEMethod.apply`**
+  audit selects M8/M16 in logs. M1/M4/M8 and fallback M17/M32/M784 are exact
+  against disabled control. M16 max-abs `2.38419e-7`, relative L2 `1.38547e-4`;
+  repeated calls and CUDA Graph versus eager are exact. These are operator
+  checks with synthetic activations, not model-quality acceptance.
+- Artifact: `.artifacts/raw-audit/grouped-production-apply-v1.json`; command:
+  `benchmarks/kernels/verify_sm70_nvfp4_moe_raw_storage.py --grouped --model
+  <model-dir> --layers 0 --ranks 0 --tokens 1,4,8,16,17,32,784 --out <result>`.
+
+The control/candidate/control engine experiment completed under
+`.artifacts/grouped-runtime/{control_before,candidate,control_after}.{log,json}`.
+All arms use the same new `_C`, source, uv Python, custom-AR/FlashQLA sidecars,
+TP4, no MTP, FP16 KV, FP32 GDN state, max length 262144, prefix/Mamba align,
+2048 prefill chunk, max-seqs16, 8192 input / 256 forced output, and widths
+1/4/8/16. Only the grouped-decode opt-in differs; raw storage and dynamic QPN
+dispatch stay off. This source-build experiment is not a clean-wheel gate.
+The launcher waits for cooperative locks **and actual idle GPUs** and never
+terminates another task to make room. Report engine intervals, not receive
+wait or the microbenchmark projection.
+
+### Actual engine results
+
+Baseline below is tokens divided by the mean complete step time of the two
+disabled runs, not a historical speed figure. All four workers in the enabled
+arm used full CUDA graphs; M8/M16 grouped dispatch is confirmed in capture
+logs. The QSA page4-XQA import fallback warning also occurs in the retained old
+baseline logs: all these arms use the same Triton sparse QSA path. Do not claim
+that the standalone page4-XQA implementation was exercised.
+
+| C | Control-before step | Candidate step | Control-after step | Baseline tok/s | Candidate tok/s | Throughput change | Fixed-70 efficiency / goal |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 12.275 ms | 12.280 ms | 12.267 ms | 81.493 | 81.435 | -0.07% | reference |
+| 4 | 18.671 ms | 18.645 ms | 18.694 ms | 214.108 | 214.535 | +0.20% | 76.62% / 85% |
+| 8 | 22.212 ms | 22.040 ms | 22.239 ms | 359.942 | 362.981 | +0.84% | 64.82% / 75% |
+| 16 | 29.566 ms | 27.371 ms | 29.589 ms | 540.951 | 584.568 | +8.06% | 52.19% / 65% |
+
+C16 saves **2.207 ms per complete step**, confirming most of the 2.470 ms
+microbenchmark projection in this fixed workload. C1 satisfies the <=1%
+regression screen. C4 does not select the new route, so its small difference
+is not credited as an optimization. C8 is only a small gain; none of the
+238/420/728 tok/s goals is met. This one bracketed experiment is not a
+confidence interval across independent repeated campaigns or other contexts.
+
+All C1 completions are identical. C4/C8/C16 completions differ even between
+the two disabled controls; enabled C4 matches the second disabled control.
+That establishes baseline run-to-run token variability, **not its cause or
+quality impact**. Do not label all differences as new-kernel damage, harmless
+rounding, or proof of quality. Preserve the token IDs for subsequent score
+tests/first-divergence diagnosis. Greedy identity is not the release criterion.
+
+All three engines and their workers shut down; no task API remains resident.
+The longstanding Python resource-tracker shared-memory cleanup warning occurs
+at shutdown, as in prior baseline logs; it is not evidence of a new GPU leak.
+GPU0--3 were rechecked after completion and only the desktop process remained.
+Final source adds a CPU-integer metadata type guard (non-integer metadata
+fails closed without tensor comparisons); this guard does not change the
+screened host-integer decisions. No second full-model run is claimed for that
+defensive type check or whitespace-only CUDA formatting.
+
+Quality admission remains pending. In particular, prefill perplexity alone
+does not exercise a decode-only optimization. Any PPL claim must include
+teacher-forced decode through the new route; coding/tool/schema score tests
+must actually contain active M8/M16 batches. Keep default dispatch unchanged
+until end-to-end, quality and C1-regression gates pass.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its

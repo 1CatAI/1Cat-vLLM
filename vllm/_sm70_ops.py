@@ -182,6 +182,61 @@ def has_nvfp4_qpn_w13_swiglu_batch_dispatch() -> bool:
     ) or hasattr(torch.ops._C, "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out")
 
 
+def has_nvfp4_grouped_decode_dispatch() -> bool:
+    return all(
+        hasattr(torch.ops._C, name)
+        for name in ("nvfp4_grouped_w13_sm70_out", "nvfp4_grouped_w2_sm70_out")
+    )
+
+
+def nvfp4_grouped_w13_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    split: int,
+    interleaved: bool,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w13_sm70_out(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    )
+
+
+def nvfp4_grouped_w2_sm70_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_sm70_out(
+        out, routed, x, w, s, topk, rows, experts, sizes, total
+    )
+
+
+if has_nvfp4_grouped_decode_dispatch():
+
+    @register_fake("_C::nvfp4_grouped_w13_sm70_out")
+    def _grouped_w13_fake(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    ):
+        return None
+
+    @register_fake("_C::nvfp4_grouped_w2_sm70_out")
+    def _grouped_w2_fake(out, routed, x, w, s, topk, rows, experts, sizes, total):
+        return None
+
+
 def has_nvfp4_qpn_w2_reduce_dispatch() -> bool:
     return hasattr(
         torch.ops._C_qwen38,

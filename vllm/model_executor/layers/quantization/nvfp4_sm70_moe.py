@@ -18,6 +18,7 @@ from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -212,6 +213,67 @@ def _use_qwen38_qpn_batch_fused_w13(
         and layer.swiglu_limit is None
         and sm70_ops.has_nvfp4_qpn_w13_swiglu_batch_dispatch()
         and _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+    )
+
+
+def _grouped_decode_context_ok() -> bool:
+    """Use CPU metadata, never GPU readback, to exclude prefill and verify."""
+    if not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    # DBO/list metadata needs per-microbatch ownership, not a shared decision.
+    if not isinstance(metadata, dict) or not metadata:
+        return False
+    key = "sm70_grouped_moe_decode"
+    if key not in context.additional_kwargs:
+        seen_decode = False
+        allowed = True
+        for meta in metadata.values():
+            prefills = getattr(meta, "num_prefills", 0)
+            prefill_tokens = getattr(meta, "num_prefill_tokens", 0)
+            if (
+                not isinstance(prefills, int)
+                or not isinstance(prefill_tokens, int)
+                or prefills != 0
+                or prefill_tokens != 0
+            ):
+                allowed = False
+                break
+            max_query = getattr(meta, "max_query_len", None)
+            if max_query is not None:
+                if not isinstance(max_query, int) or max_query != 1:
+                    allowed = False
+                    break
+                seen_decode = True
+            num_decodes = getattr(meta, "num_decodes", None)
+            if num_decodes is not None:
+                decode_tokens = getattr(meta, "num_decode_tokens", None)
+                if (
+                    not isinstance(num_decodes, int)
+                    or not isinstance(decode_tokens, int)
+                    or decode_tokens != num_decodes
+                ):
+                    allowed = False
+                    break
+                seen_decode |= num_decodes > 0
+        context.additional_kwargs[key] = bool(allowed and seen_decode)
+    return bool(context.additional_kwargs[key])
+
+
+def _use_grouped_decode(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+    """Local operator contract only; no TP/KV/scheduler/model-name binding."""
+    return bool(
+        getattr(layer, "sm70_nvfp4_grouped_decode", False)
+        and x.ndim == 2
+        and x.shape[0] in (8, 16)
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and _grouped_decode_context_ok()
     )
 
 
@@ -866,6 +928,34 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_qwen38_raw_scale = raw_scale
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
+        grouped_requested = bool(
+            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+            and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
+            == (512, 2560, 160, 10)
+            and not raw_scale
+            and layer.swiglu_limit is None
+        )
+        if grouped_requested and not sm70_ops.has_nvfp4_grouped_decode_dispatch():
+            raise RuntimeError(
+                "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native build."
+            )
+        layer.sm70_nvfp4_grouped_decode = grouped_requested
+        if grouped_requested:
+            # Layer-owned metadata; W2 reuses sorted_output. No process-global
+            # cache or additional activation buffer inside graph capture.
+            device = layer.w13_tm_weight.device
+            layer._nvfp4_grouped_rows = torch.empty(
+                160, 8, dtype=torch.int32, device=device
+            )
+            layer._nvfp4_grouped_experts = torch.empty(
+                160, dtype=torch.int32, device=device
+            )
+            layer._nvfp4_grouped_sizes = torch.empty(
+                160, dtype=torch.int32, device=device
+            )
+            layer._nvfp4_grouped_total = torch.empty(
+                1, dtype=torch.int32, device=device
+            )
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight
@@ -1146,6 +1236,38 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
+        if _use_grouped_decode(layer, x, topk_ids):
+            sm70_ops.nvfp4_grouped_w13_sm70_out(
+                buffers["intermediate"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                topk_ids.view(-1),
+                layer._nvfp4_grouped_rows,
+                layer._nvfp4_grouped_experts,
+                layer._nvfp4_grouped_sizes,
+                layer._nvfp4_grouped_total,
+                4 if num_tokens == 8 else 8,
+                interleaved_w13,
+            )
+            sm70_ops.nvfp4_grouped_w2_sm70_out(
+                output,
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                topk_weights,
+                layer._nvfp4_grouped_rows,
+                layer._nvfp4_grouped_experts,
+                layer._nvfp4_grouped_sizes,
+                layer._nvfp4_grouped_total,
+            )
+            logger.info_once(
+                "Experimental SM70 grouped native-NVFP4 decode selected "
+                "(tokens=%d, W13/W2 share route groups).",
+                num_tokens,
+            )
+            return output
         direct_single_token = num_tokens == 1
         direct_qpn_m1 = _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
         direct_qpn_batch = _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
