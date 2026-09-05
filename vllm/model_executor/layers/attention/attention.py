@@ -178,24 +178,21 @@ def _init_kv_cache_quant(
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
                 CompressedTensorsKVCacheMethod,
             )
-            uses_base_scale_processing = (
-                type(quant_method).process_weights_after_loading
-                is BaseKVCacheMethod.process_weights_after_loading
-            )
-            # CompressedTensorsKVCacheMethod overrides process_weights_after_loading
-            # to load checkpoint KV scales, but its override also implements the
-            # SM70 unit-scale override (its _force_unit_fp8_e5m2_kv_scales branch),
-            # so it is compatible with the unit-scale override path.
-            is_compressed_tensors_kv = isinstance(
-                quant_method, CompressedTensorsKVCacheMethod
+
+            # Both implementations honor the unit-scale override. Check the
+            # effective method so a subclass with different scale processing
+            # does not silently inherit permission to ignore checkpoint scales.
+            uses_unit_scale_processing = type(
+                quant_method
+            ).process_weights_after_loading in (
+                BaseKVCacheMethod.process_weights_after_loading,
+                CompressedTensorsKVCacheMethod.process_weights_after_loading,
             )
             has_checkpoint_kv_scheme = (
                 getattr(quant_method.quant_config, "kv_cache_scheme", None) is not None
             )
             unit_scale_compatible = (
-                uses_base_scale_processing
-                or is_compressed_tensors_kv
-                or not has_checkpoint_kv_scheme
+                uses_unit_scale_processing or not has_checkpoint_kv_scheme
             )
             if not sm70_flash_v100 or not unit_scale_compatible:
                 raise ValueError(
