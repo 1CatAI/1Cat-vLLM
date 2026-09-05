@@ -57,7 +57,7 @@ def main():
     p.add_argument("--tokens", default="4,8,16")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pair", choices=("attn", "mlp"), default="attn")
-    p.add_argument("--mode", choices=("full", "down"), default="full")
+    p.add_argument("--mode", choices=("full", "down", "fused"), default="full")
     p.add_argument(
         "--weight-copies",
         type=int,
@@ -68,6 +68,7 @@ def main():
         "--profile", action="store_true", help="Capture graph nodes, skip timing sweep"
     )
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--check-only", action="store_true", help="Skip performance timing")
     args = p.parse_args()
     if args.weight_copies <= 0:
         p.error("--weight-copies must be positive")
@@ -111,6 +112,11 @@ def main():
 
     ca = CustomAllreduce(group, rank, max_size=128 * 1024)
     assert not ca.disabled
+    if args.mode == "fused":
+        assert hasattr(torch.ops._C_custom_ar_flashnext, "hc_down_gather"), (
+            "Build sm70_hc_push_gather.cuh into the SAME custom-AR sidecar "
+            "that owns this communicator"
+        )
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -146,6 +152,8 @@ def main():
             full_down = torch.empty_like(sparse_down)
             sparse_output = x.new_empty(m, 2560)
             output = torch.empty_like(sparse_output)
+            fused_lora = x.new_empty(m, 320)
+            fused_injection = x.new_empty(m, 4)
 
             def baseline(index=0):
                 wd, wu, _, _ = weights[index]
@@ -155,9 +163,18 @@ def main():
                     :, 320:324
                 ]
 
-            def candidate(registered, index=0):
+            def candidate(registered, index=0, use_fused=True):
                 _, wu, local_wd, local_wu = weights[index]
                 d = torch.nn.functional.linear(x, local_wd)
+                if args.mode == "fused" and use_fused:
+                    torch.ops._C_custom_ar_flashnext.hc_down_gather(
+                        ca._ptr, d, fused_injection, fused_lora
+                    )
+                    gate = torch.nn.functional.linear(fused_lora, local_wu)
+                    torch.ops._C_custom_ar_flashnext.hc_mix_gather(
+                        ca._ptr, gate, x, output
+                    )
+                    return output, fused_injection
                 scatter_down[(m,)](d, sparse_down, RANK=rank)
                 ca.all_reduce(sparse_down, out=full_down, registered=registered)
                 lora = hc_silu(full_down[:, :320], 4)
@@ -191,8 +208,16 @@ def main():
                 dist.broadcast(x, 0)
                 expected = tuple(t.clone() for t in baseline())
                 actual = tuple(t.clone() for t in candidate(False))
+                if args.mode == "fused":
+                    unfused = candidate(False, use_fused=False)
+                    # Compare the fused publication separately from the local
+                    # GEMM's already documented difference versus replicated.
+                    for a, b in zip(actual, unfused):
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
                 sparse_down.fill_(float("nan"))
                 output.fill_(float("nan"))
+                fused_lora.fill_(float("nan"))
+                fused_injection.fill_(float("nan"))
                 graphs[1].replay()
                 torch.cuda.synchronize()
                 row = []
@@ -236,7 +261,7 @@ def main():
                 del graphs, outputs
                 continue
             times = [[], []]
-            for sample in range(5):
+            for sample in range(0 if args.check_only else 5):
                 for which in (0, 1) if sample % 2 == 0 else (1, 0):
                     for _ in range(20):
                         graphs[which].replay()
@@ -259,10 +284,11 @@ def main():
             local_result = dict(
                 rank=rank,
                 tokens=m,
-                baseline_us=statistics.median(times[0]),
-                candidate_us=statistics.median(times[1]),
+                baseline_us=statistics.median(times[0]) if times[0] else None,
+                candidate_us=statistics.median(times[1]) if times[1] else None,
                 times=times,
                 checks=checks,
+                fused_postops_zero_tolerance_check_passed=args.mode == "fused",
             )
             gathered = [None] * 4
             dist.all_gather_object(gathered, local_result, group=group)
