@@ -45901,3 +45901,60 @@ Interpretation:
   SHA256 `2b233da24cf9bba28d867fcdb364e6e8dafd873bf467755358bf169fa83f8ea4`.
   Test exited normally; GPUs0-3 measured 141/7/7/7 MiB. No own queue/model/API
   remains. Do not repeat this private-pointer H8/512 candidate unchanged.
+
+## HC down counter refresh and packed scatter, 2026-09-05
+
+- Previous goal turn made progress: refreshed full-model HC 2.208302 ms and
+  untraced decode 93.433729 tok/s, and rejected H8/512 private scheduling.
+  Full HC <=1.5 ms remains unachieved. No full-model startup in this turn.
+- Earlier NCU evidence (488 GB/s, 24.23% occupancy) profiled the old 324-row
+  replicated down projection, not today's 81-live-row TP shard. Profile only
+  `_qwen38_hc_down_local_shard_kernel`, grid88/block128, one real layer-0
+  weight on GPU0. Nsight Compute2022.4.1, clock-control none, cache-control all,
+  full counter set, one launch after warmup. New cold-replay diagnostic:
+  7.74 us, 216.88 GB/s, DRAM28.09%, SM5.85%, achieved occupancy6.51%, 40
+  registers, 0.08 eligible warps/scheduler, no-eligible91.84%; long-scoreboard
+  7.7 cycles/issue (63.9%). This is not wall HC timing and the clocks were
+  not locked. Evidence `.artifacts/hc_down_ncu_20260905/`: profile/run scripts,
+  retained NCU report and exported metrics. Privileged profiler exited normally.
+- Reuse the existing full-model SQLite, with no GPU rerun. Align all down
+  gathers by collective ordinal across ranks (2976 =31x96 each), verify
+  participant overlap, retain 29 middle whole-graph groups. Mean service
+  5.620995 us/call comprises 0.732571 us before the latest participant starts
+  and 4.888424 us after; last arrival to last completion5.188404 us. Retain
+  the step18 rank-skew outlier. These diagnostic boundaries differ from the
+  accepted CPU replay windows and do not replace the whole-HC report.
+- SASS confirms the old gather scatters contiguous low-rank rows through
+  scalar U16 stores and per-element routing branches. Change ONLY output
+  placement: aligned first80 values/rank use packed16-byte stores, the final
+  pack scatters one injection and three padding values. Keep the original
+  scalar output fallback for an unaligned weak-contiguous view. No changes
+  to arithmetic, sentinel handling, peer ordering, epoch, IPC layout, up or
+  norm. New gather44-46 registers versus old38; both zero stack/spills.
+- Build a single owner DSO containing production vector scatter and the
+  literal old scalar control, then run a paired full-HC benchmark. Pre-commit
+  source SHA4ef36a70d2 plus communication-file SHA256
+  `fea0d06d29cbcdcc3093a32ccd27aeac92e36e23342e5079063df58ba1b9bf64`.
+  Full HC **1.971644 ->1.899800 ms**, saving **0.071844 ms (3.64%)**;
+  vector samples1.899800/1.899861/1.899677. All four ranks pass raw-bit
+  aligned/unaligned comparisons and guards, 16 full-chain changing inputs,
+  512 actual auxiliary sum2 replays and post-timing bitwise checks. Keep this
+  candidate in DraftPR506; do not subtract its isolated gain directly from
+  the previous model trace or claim the 1.5-ms target.
+- Evidence `.artifacts/hc_down_vector_scatter/`: source-derived sidecar/control,
+  build script/log, paired benchmark/guarded runner, result and SASS. Result
+  SHA256 `f533515ef855ab0de4a1f39c71b5d43f96a7520705b38420288b76b8c94e3963`;
+  binary `fb5ee424a70c7532791d38918530d01f85ee99719a37b931c3c95762d3c0d023`.
+  Main was fetched and unchanged at755baae1d0 before publication.
+- Add the model-free public oracle
+  `benchmarks/kernels/verify_sm70_hc_down_scatter.py`: byte-gather reference,
+  all eight FP16 output alignments, reserved-NaN canonicalization in low-rank,
+  injection and padding positions, outside-buffer guards and CUDA Graph replay.
+  Ruff passes. Its focused GPU execution is queued behind the existing GPU
+  reservation; an earlier probe exited75 without starting a CUDA process.
+  This pending oracle is not yet reported as passed.
+- A separate explicit down register-lookahead screen (8/40 steps) was checked
+  OFFLINE ONLY. Compiler scheduling reduced both to32-register rolling-load
+  code, including a warp-ordering attempt, so the intended lookahead was not
+  established. Do not run these as purported prefetch variants or repeat the
+  previously rejected ordinary CUDA128 down. No GPU startup for this screen.

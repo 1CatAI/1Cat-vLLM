@@ -161,25 +161,37 @@ __global__ void __launch_bounds__(128, 1)
       if (!has_empty_slot) break;
     }
 
+    // The first 80 values are contiguous low-rank rows. Keep them packed:
+    // scalar per-element routing otherwise emits dozens of predicated U16
+    // stores for every source rank. Only the last pack needs injection/padding
+    // scatter. Preserve support for a weak-contiguous unaligned output view.
+    static_assert(kQwen38HcDownLocalLoraElements % kElementsPerPack == 0);
+    static_assert(kQwen38HcDownLocalElements -
+                      kQwen38HcDownLocalLoraElements == kElementsPerPack);
   #pragma unroll
     for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      if (offset < kQwen38HcDownLocalLoraElements / kElementsPerPack) {
+        auto* destination =
+            output + source_rank * kQwen38HcDownLocalLoraElements;
+        if (reinterpret_cast<uintptr_t>(destination) % alignof(P) == 0) {
+          reinterpret_cast<P*>(destination)[offset] = peer_values[source_rank];
+        } else {
   #pragma unroll
-      for (int element = 0; element < P::size; ++element) {
-        const int local_element = offset * kElementsPerPack + element;
-        if (local_element < kQwen38HcDownLocalLoraElements) {
-          output[source_rank * kQwen38HcDownLocalLoraElements + local_element] =
-              peer_values[source_rank].data[element];
-        } else if (local_element == kQwen38HcDownLocalLoraElements) {
-          output[ngpus * kQwen38HcDownLocalLoraElements + source_rank] =
-              peer_values[source_rank].data[element];
-        } else if (local_element < kQwen38HcDownLiveElements) {
-          const int local_padding = local_element -
-                                    kQwen38HcDownLocalLoraElements -
-                                    kQwen38HcDownLocalInjectionElements;
+          for (int element = 0; element < kElementsPerPack; ++element) {
+            destination[offset * kElementsPerPack + element] =
+                peer_values[source_rank].data[element];
+          }
+        }
+      } else {
+        output[ngpus * kQwen38HcDownLocalLoraElements + source_rank] =
+            peer_values[source_rank].data[0];
+  #pragma unroll
+        for (int padding = 0; padding < kQwen38HcDownLocalPaddingElements;
+             ++padding) {
           output[ngpus * (kQwen38HcDownLocalLoraElements +
-                          kQwen38HcDownLocalInjectionElements) +
-                 source_rank * kQwen38HcDownLocalPaddingElements +
-                 local_padding] = peer_values[source_rank].data[element];
+                         kQwen38HcDownLocalInjectionElements) +
+                 source_rank * kQwen38HcDownLocalPaddingElements + padding] =
+              peer_values[source_rank].data[1 + padding];
         }
       }
     }
