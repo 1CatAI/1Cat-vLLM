@@ -45478,3 +45478,51 @@ Interpretation:
   The `1.5 ms` goal remains active and unachieved. Next screen targets hidden
   up/local-mix/output-gather fusion with private per-CTA communication epochs,
   distinct from the previously rejected branch-sharded/global-counter fusion.
+- The new hidden-sharded 80-CTA CUDA up/mix/output-gather prototype uses exact
+  FP16-value-plus-generation packets and independent two-slot CTA epochs;
+  no global completion counter or sentinel-value substitution. Its full-chain
+  16-input/four-rank gate passes bitwise. Matched medians are control
+  `2.105945 ms`, CUDA up/mix with separate gather `2.265607 ms`, fused gather
+  `2.180970 ms`. Fusion saves `0.084637 ms` relative to the CUDA split version,
+  but the projection schedule loses more: the net result is slower and is
+  rejected. Evidence: `up_gather.json`, source snapshot `up_gather80.cu`.
+  A bounded 160/320-CTA follow-up tests whether more projection parallelism can
+  retain the communication saving; each tile has its own private peer buffer
+  and generation counters. This is not a new production route.
+- The bounded scalar-load follow-up is also not admitted: control
+  `2.108150 ms`; 160-CTA local/fused `2.161794/2.103446 ms`; 320-CTA
+  local/fused `2.139696/2.183004 ms`. The best saving is only `0.004704 ms`.
+  All four ranks pass the 16-input bitwise gate and a second comparison after
+  generation `146593` (two 16-bit wraps). Evidence: `up_gather_tiled.json`.
+- SASS inspection identifies scalar U16 weight loads and shared-lora staging
+  in the CUDA prototype. A separate LDG128 revision removes staging while
+  preserving all arithmetic/rounding. It passes the initial four-rank
+  16-input gate, but another task enters during timing; the benchmark rejects
+  the sample and exits. This is a contention-aborted result, not a numerical
+  failure or a speed claim (`up_gather_vector.log`). A bounded follow-up also
+  distributes the four branch sigmoids over four times as many active lanes
+  at the existing gate-materialization barrier, without an extra barrier or
+  changed FP16 boundary. Its 80/160-CTA full-chain gate is pending.
+- The repeated contention is localized to a separate GPU reservation held
+  across another suite's model restarts. The guarded runner now honors that
+  existing flock as well as this task's GPU locks, without truncating the
+  other lease file. Do not enter the reserved suite's between-model gaps,
+  interrupt it, or accept contended timing. The vector/parallel-gate kernel
+  compiles without spills; its queued GPU screen remains pending.
+- The vector-load/parallel-gate screen subsequently completed under the
+  shared reservation. It produces the first material complete-chain win in
+  this follow-up: control `2.108826 ms`, 160-CTA local-only `2.068084 ms`,
+  160-CTA fused `1.999374 ms`. The full-chain saving is **`0.109452 ms`
+  (`5.19%`)**; fused samples are `1.999995/1.999374/1.998002 ms`. The 80-CTA
+  fused version is `2.082618 ms` and is not selected. There is no packed-weight
+  copy. All intermediate/final outputs pass bitwise on four ranks over 16
+  changing input cases and again after generation `146593` (two tag wraps).
+  Evidence: `up_gather_vector.json` and `up_gather_vector_final.log`; source
+  SHA256 `10d65cb0b979a51b3e6cf712dd3c535d93f66e4b418909adeec1616077c4def5`.
+- This is still an artifact prototype, not a registered production-path or
+  whole-model result. Next: port the selected 160-CTA kernel/private channel
+  with extension-capability fallback, then validate production dispatch and
+  actual auxiliary-stream sum2 coexistence. Batch the full-model trace and
+  output-quality gate with further material changes. Do not claim the old
+  full-model HC bucket moved `2.658 -> 1.999 ms`, or that the `1.5-ms` target
+  was achieved. All task-owned GPU tests/queues exited; other tasks continue.
