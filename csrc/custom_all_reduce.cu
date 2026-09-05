@@ -229,6 +229,137 @@ DINLINE float qwen38_hc_divide_by_count(float value) {
   return result;
 }
 
+// Stream-ordered TP4 HC calls share per-CTA counters. Cooperative launch
+// keeps every CTA eligible to make progress while polling its remote peers.
+// Pack an exact FP16 output and its 16-bit generation into one aligned word:
+// readiness never escapes or changes a floating-point value (including NaNs).
+// Two slots are sufficient: a rank cannot produce generation g+2 until every
+// peer has produced g+1, hence completed its reads of g. Tag wrap is safe for
+// the same reason; only adjacent generations can be in flight.
+__device__ __forceinline__ uint4 qwen38_hc_load8(const half* p) {
+  uint4 v;
+  asm volatile("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+}
+__device__ __forceinline__ float qwen38_hc_half_at(uint4 v, int i) {
+  const uint32_t word = i < 2 ? v.x : i < 4 ? v.y : i < 6 ? v.z : v.w;
+  return __half2float(__ushort_as_half((word >> ((i & 1) * 16)) & 0xffffu));
+}
+
+__global__ void __launch_bounds__(256)
+    sm70_qwen38_hc_up_mix_push(const half* lora, const half* weight,
+                               const half* branches, half* output,
+                               RankData peers, int rank) {
+  constexpr int Hidden = 4;
+  // Constant parameter indices avoid materializing RankData in local memory.
+  const void* local_peer = rank == 0   ? peers.ptrs[0]
+                           : rank == 1 ? peers.ptrs[1]
+                           : rank == 2 ? peers.ptrs[2]
+                                       : peers.ptrs[3];
+  auto* local = const_cast<char*>(reinterpret_cast<const char*>(local_peer));
+  auto* counters =
+      reinterpret_cast<uint32_t*>(local + kSm70Qwen38HcUpFusedEpochOffset);
+  __shared__ float gates[Hidden * 4];
+  __shared__ float partial[Hidden * 4][2];
+  const int t = threadIdx.x;
+  const int lane = t & 31, warp = t >> 5;
+  const int pair = warp >> 1, kg = warp & 1, kp = kg * 32 + lane;
+  uint4 lora_values;
+  if (kp < 40) lora_values = qwen38_hc_load8(lora + kp * 8);
+  // Same 8-term FMA chain, XOR tree, cross-warp add and FP16 gate boundary
+  // as the accepted Triton up projection. Only the row assignment changes.
+  #pragma unroll
+  for (int group = 0; group < Hidden / 2; ++group) {
+    const int a = group * 8 + pair, b = a + 4;
+    const int ra = (a % 4) * 2560 + rank * 640 + blockIdx.x * Hidden + a / 4;
+    const int rb = (b % 4) * 2560 + rank * 640 + blockIdx.x * Hidden + b / 4;
+    float va = 0.f, vb = 0.f;
+    if (kp < 40) {
+      const int k = kp * 8;
+      const uint4 wa = qwen38_hc_load8(weight + ra * 320 + k);
+      const uint4 wb = qwen38_hc_load8(weight + rb * 320 + k);
+      const float x1 = qwen38_hc_half_at(lora_values, 1);
+      va = __fmul_rn(x1, qwen38_hc_half_at(wa, 1));
+      vb = __fmul_rn(x1, qwen38_hc_half_at(wb, 1));
+      va = __fmaf_rn(qwen38_hc_half_at(lora_values, 0),
+                     qwen38_hc_half_at(wa, 0), va);
+      vb = __fmaf_rn(qwen38_hc_half_at(lora_values, 0),
+                     qwen38_hc_half_at(wb, 0), vb);
+  #pragma unroll
+      for (int e = 2; e < 8; ++e) {
+        const float x = qwen38_hc_half_at(lora_values, e);
+        va = __fmaf_rn(x, qwen38_hc_half_at(wa, e), va);
+        vb = __fmaf_rn(x, qwen38_hc_half_at(wb, e), vb);
+      }
+    }
+  #pragma unroll
+    for (int d = 16; d > 0; d >>= 1) {
+      va = __fadd_rn(va, __shfl_xor_sync(0xffffffff, va, d));
+      vb = __fadd_rn(vb, __shfl_xor_sync(0xffffffff, vb, d));
+    }
+    if (lane == 0) {
+      partial[a][kg] = va;
+      partial[b][kg] = vb;
+    }
+  }
+  __syncthreads();
+  if (t < Hidden * 4)
+    gates[t] = qwen38_hc_sigmoid_fp32(
+        __half2float(__float2half_rn(__fadd_rn(partial[t][0], partial[t][1]))));
+  __syncthreads();
+  if (t < Hidden) {
+    const int h = blockIdx.x * Hidden + t;
+    float mixed = 0.f;
+  #pragma unroll
+    for (int branch = 0; branch < 4; ++branch)
+      mixed = __fmaf_rn(gates[t * 4 + branch],
+                        __half2float(branches[branch * 2560 + rank * 640 + h]),
+                        mixed);
+    float scaled;
+    asm("div.full.f32 %0, %1, %2;" : "=f"(scaled) : "f"(mixed), "f"(4.f));
+    const half value = __float2half_rn(scaled);
+    {
+      const uint32_t generation = counters[blockIdx.x] + 1u;
+      const uint32_t tag = generation & 0xffffu;
+      const uint32_t packet = (tag << 16) | __half_as_ushort(value);
+      const int slot = (generation & 1u) * 4 * 640;
+  #pragma unroll
+      for (int dest = 0; dest < 4; ++dest) {
+        if (dest == rank) continue;
+        auto* p = reinterpret_cast<uint32_t*>(
+                      const_cast<char*>(
+                          reinterpret_cast<const char*>(peers.ptrs[dest])) +
+                      kSm70Qwen38HcUpFusedPacketOffset) +
+                  slot + rank * 640 + h;
+        asm volatile("st.volatile.global.u32 [%0], %1;" ::"l"(p), "r"(packet)
+                     : "memory");
+      }
+      output[rank * 640 + h] = value;
+  #pragma unroll
+      for (int src = 0; src < 4; ++src) {
+        if (src == rank) continue;
+        auto* p = reinterpret_cast<uint32_t*>(
+                      local + kSm70Qwen38HcUpFusedPacketOffset) +
+                  slot + src * 640 + h;
+        uint32_t received;
+        do {
+          asm volatile("ld.volatile.global.u32 %0, [%1];"
+                       : "=r"(received)
+                       : "l"(p)
+                       : "memory");
+        } while ((received >> 16) != tag);
+        output[src * 640 + h] = __ushort_as_half(received & 0xffffu);
+      }
+    }
+  }
+  {
+    __syncthreads();
+    if (t == 0) counters[blockIdx.x] += 1;
+  }
+}
+
 template <int ngpus, int Rank, bool GatherOutput = false>
 __global__ void __launch_bounds__(512, 1)
     sm70_qwen38_hc_gate_push_mix(RankData push_buffers,
@@ -747,6 +878,41 @@ void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
       break;
   }
   #undef VLLM_LAUNCH_QWEN38_HC_GATE
+#endif
+}
+
+void sm70_qwen38_hc_up_mix_allgather(fptr_t _fa, torch::Tensor& lora,
+                                     torch::Tensor& weight,
+                                     torch::Tensor& branches,
+                                     torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC up/mix is unavailable on ROCm");
+#else
+  TORCH_CHECK(lora.is_cuda());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(lora));
+  for (const auto* tensor : {&lora, &weight, &branches, &output}) {
+    TORCH_CHECK(tensor->device() == lora.device());
+    TORCH_CHECK(tensor->scalar_type() == at::ScalarType::Half);
+    TORCH_CHECK(tensor->is_contiguous());
+  }
+  TORCH_CHECK(lora.numel() == 336 && weight.numel() == 10240 * 320 &&
+              branches.numel() == 10240 && output.numel() == 2560);
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(lora.data_ptr()) % 16 == 0 &&
+              reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0);
+  auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(fa->world_size_ == 4 && fa->fully_connected_ &&
+              fa->sm70_tp4_push_buffers_registered_);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const half* lp = reinterpret_cast<const half*>(lora.data_ptr());
+  const half* wp = reinterpret_cast<const half*>(weight.data_ptr());
+  const half* xp = reinterpret_cast<const half*>(branches.data_ptr());
+  half* out = reinterpret_cast<half*>(output.data_ptr());
+  auto peers = fa->sm70_tp4_push_buffers_;
+  int rank = fa->rank_;
+  void* args[] = {&lp, &wp, &xp, &out, &peers, &rank};
+  CUDACHECK(cudaLaunchCooperativeKernel(
+      reinterpret_cast<void*>(vllm::sm70_qwen38_hc_up_mix_push),
+      dim3(vllm::kSm70Qwen38HcUpFusedBlocks), dim3(256), args, 0, stream));
 #endif
 }
 

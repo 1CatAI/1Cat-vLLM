@@ -45715,3 +45715,33 @@ Interpretation:
   current user; V100 application clocks remain 877/1290 MHz rather than the
   supported 877/1530-MHz maximum. Neither unavailable counter values nor a
   locked-clock speed projection is used as measured evidence.
+
+## Registered HC up/mix/gather port, 2026-09-05
+
+- Previous goal turn made progress: the complete-HC prototype improved by
+  `0.109452 ms`, with bitwise evidence. The current goal remains full HC below
+  `1.5 ms/token` on matched whole-model trace, no MTP or precision reduction.
+- Port only the selected 160-CTA/vector-load/parallel-gate kernel. Preserve
+  original FP32 FMA/reduction order and FP16 boundaries. Append a 21,120-byte
+  private packet/counter region to the existing communicator allocation;
+  legacy HC and auxiliary MoE layouts are unchanged. Start from zero counters
+  and publish generation one first. No extra weight copy or public switch.
+- Add `sm70_qwen38_hc_up_mix_allgather` to production binding, owner-DSO
+  facade, communicator, and model dispatch. Keep split-hidden and gate-sharded
+  fallbacks for older owner DSOs. Never borrow the new op from another DSO,
+  which may have allocated a different buffer extent.
+- Extend the complete-HC benchmark with `--fused-up`, forced control dispatch,
+  16 changing-input checks, 512 replays with actual sum2 on an auxiliary
+  stream, and a post-timing bitwise check after generation wrap. The legacy
+  Mix-only benchmark also explicitly disables the new route in its controls.
+- CPU dispatch/owner/fallback suite: **20 passed**. Ruff on affected Python
+  files and changed-line clang-format pass. Source-matched sidecar compiles;
+  dynamic `RankData` indexing initially introduced a 64-byte stack frame.
+  Constant parameter indices remove it before GPU testing: selected kernel
+  uses 31 registers, 192 bytes shared memory, zero stack or spill traffic.
+- Evidence is under `.artifacts/hc_up_fused_production/`: `cpu_tests.log`,
+  `build_final.log`, source-only sidecar builder, guarded `run_when_idle.sh`.
+  Registered GPU gate is pending at this update; no whole model was started.
+  Public integration was fetched at `2b89b77e3882423d1c93e01faf8c1db43f6650f4`;
+  keep the candidate's existing integration base `fbcef6e2f9` frozen for this
+  paired screen rather than mixing unrelated model-route updates into it.

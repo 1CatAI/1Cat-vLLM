@@ -732,6 +732,11 @@ void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
                              torch::Tensor& branches, torch::Tensor& output);
 void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
                                      torch::Tensor& output);
+
+void sm70_qwen38_hc_up_mix_allgather(fptr_t _fa, torch::Tensor& lora,
+                                     torch::Tensor& weight,
+                                     torch::Tensor& branches,
+                                     torch::Tensor& output);
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                  fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,

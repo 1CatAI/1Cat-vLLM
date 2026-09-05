@@ -501,6 +501,18 @@ class CustomAllreduce:
     ) -> None:
         ops.sm70_qwen38_hc_output_allgather(self._ptr, local_block, output)
 
+    def supports_sm70_qwen38_hc_up_mix_allgather(self) -> bool:
+        return ops.supports_sm70_qwen38_hc_up_mix_allgather()
+
+    def sm70_qwen38_hc_up_mix_allgather(
+        self,
+        lora: torch.Tensor,
+        weight: torch.Tensor,
+        branches: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        ops.sm70_qwen38_hc_up_mix_allgather(self._ptr, lora, weight, branches, output)
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,

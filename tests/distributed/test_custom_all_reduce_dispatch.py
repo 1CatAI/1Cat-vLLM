@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -41,35 +41,78 @@ def test_should_custom_ar_rejects_unsupported_dtype(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("sidecar_owner", [False, True])
 @pytest.mark.parametrize("owner_has_op", [False, True])
-def test_hc_output_gather_stays_in_communicator_dso(
-    monkeypatch: pytest.MonkeyPatch, sidecar_owner: bool, owner_has_op: bool
+@pytest.mark.parametrize(
+    "op_name,num_inputs",
+    [("sm70_qwen38_hc_output_allgather", 1), ("sm70_qwen38_hc_up_mix_allgather", 3)],
+)
+def test_hc_gather_stays_in_communicator_dso(
+    monkeypatch: pytest.MonkeyPatch,
+    sidecar_owner: bool,
+    owner_has_op: bool,
+    op_name: str,
+    num_inputs: int,
 ) -> None:
     base = SimpleNamespace(init_custom_ar=Mock())
     sidecar = SimpleNamespace()
     if sidecar_owner:
         sidecar.init_custom_ar = Mock()
     owner, other = (sidecar, base) if sidecar_owner else (base, sidecar)
-    other.sm70_qwen38_hc_output_allgather = Mock()
+    setattr(other, op_name, Mock())
     if owner_has_op:
-        owner.sm70_qwen38_hc_output_allgather = Mock()
+        setattr(owner, op_name, Mock())
     monkeypatch.setattr(torch.ops, "_C_custom_ar", base)
     monkeypatch.setattr(torch.ops, "_C_custom_ar_flashnext", sidecar)
-    assert ops.supports_sm70_qwen38_hc_output_allgather() == owner_has_op
+    assert getattr(ops, f"supports_{op_name}")() == owner_has_op
+    tensors = [torch.empty(16) for _ in range(num_inputs + 1)]
     if owner_has_op:
-        local = torch.empty(640)
-        output = torch.empty(2560)
-        ops.sm70_qwen38_hc_output_allgather(123, local, output)
-        owner.sm70_qwen38_hc_output_allgather.assert_called_once_with(
-            123, local, output
-        )
+        getattr(ops, op_name)(123, *tensors)
+        getattr(owner, op_name).assert_called_once_with(123, *tensors)
     else:
         # An old sidecar must not borrow the new op from a rebuilt base wheel,
         # and a sidecar without init must not receive the base wheel's pointer.
         with pytest.raises(AttributeError):
-            ops.sm70_qwen38_hc_output_allgather(
-                123, torch.empty(640), torch.empty(2560)
-            )
-    other.sm70_qwen38_hc_output_allgather.assert_not_called()
+            getattr(ops, op_name)(123, *tensors)
+    getattr(other, op_name).assert_not_called()
+
+
+@pytest.mark.parametrize("fused,hidden", [(True, True), (False, True), (False, False)])
+def test_hc_model_selects_available_owner_route(monkeypatch, fused, hidden) -> None:
+    import vllm.distributed.parallel_state as parallel
+    import vllm.models.qwen4_exp.nvidia.sm70_fp16_hc as hc
+
+    comm = SimpleNamespace(
+        rank=0,
+        can_sm70_qwen38_hc_shard=Mock(return_value=True),
+        supports_sm70_qwen38_hc_up_mix_allgather=Mock(return_value=fused),
+        supports_sm70_qwen38_hc_output_allgather=Mock(return_value=hidden),
+        sm70_qwen38_hc_down_allgather=Mock(),
+        sm70_qwen38_hc_up_mix_allgather=Mock(),
+        sm70_qwen38_hc_output_allgather=Mock(),
+        sm70_qwen38_hc_gate_mix=Mock(),
+    )
+    tp = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=comm))
+    monkeypatch.setattr(parallel, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(hc, "_runtime_ok", lambda *args: True)
+    for name in (
+        "_qwen38_hc_down_local_shard_kernel",
+        "_qwen38_hc_up_hidden_shard_kernel",
+        "_qwen38_hc_up_local_gate_kernel",
+    ):
+        monkeypatch.setattr(hc, name, MagicMock())
+    block, injection = hc._qwen38_sm70_fp16_fused_hc(
+        torch.empty(1, 10240), torch.empty(0), torch.empty(0)
+    )
+    assert block.shape == (1, 2560) and injection.shape == (1, 4)
+    comm.sm70_qwen38_hc_down_allgather.assert_called_once()
+    expected = (
+        "up_mix_allgather" if fused else "output_allgather" if hidden else "gate_mix"
+    )
+    for name in ("up_mix_allgather", "output_allgather", "gate_mix"):
+        op = getattr(comm, f"sm70_qwen38_hc_{name}")
+        if name == expected:
+            op.assert_called_once()
+        else:
+            op.assert_not_called()
 
 
 @pytest.mark.parametrize("sidecar_owner", [False, True])

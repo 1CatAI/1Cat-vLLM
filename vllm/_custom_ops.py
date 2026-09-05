@@ -3129,6 +3129,22 @@ def sm70_qwen38_hc_output_allgather(
     _custom_ar_owner_namespace().sm70_qwen38_hc_output_allgather(fa, local_block, out)
 
 
+def supports_sm70_qwen38_hc_up_mix_allgather() -> bool:
+    return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_up_mix_allgather")
+
+
+def sm70_qwen38_hc_up_mix_allgather(
+    fa: int,
+    lora: torch.Tensor,
+    weight: torch.Tensor,
+    branches: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_up_mix_allgather(
+        fa, lora, weight, branches, out
+    )
+
+
 def top1_argmax(
     fa: int,
     input_pair: torch.Tensor,
