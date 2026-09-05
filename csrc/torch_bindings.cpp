@@ -696,6 +696,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_single_token_sm70_out);
 
   ops.def(
+      "awq_moe_qpn_m1_sm70_out(Tensor(a!) out, Tensor(b!) intermediate, "
+      "Tensor input, Tensor w13, Tensor s13, Tensor w2, Tensor s2, "
+      "Tensor ids, Tensor topk) -> ()");
+  ops.impl("awq_moe_qpn_m1_sm70_out", torch::kCUDA, &awq_moe_qpn_m1_sm70_out);
+
+  ops.def(
       "fp8_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
       "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");

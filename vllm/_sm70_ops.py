@@ -1954,7 +1954,7 @@ for _raw_namespace, _raw_prefix in (
             scale_codes,
             global_scales,
             interleaved_w13,
-            fast_decode_rounding: None
+            fast_decode_rounding: (None)
         )
     if hasattr(_raw_namespace, "nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out"):
         register_fake(f"{_raw_prefix}::nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out")(
@@ -1964,7 +1964,7 @@ for _raw_namespace, _raw_prefix in (
             scale_codes,
             global_scales,
             expert_ids,
-            interleaved: None
+            interleaved: (None)
         )
     if hasattr(_raw_namespace, "nvfp4_moe_qpn_raw_w2_reduce_sm70_out"):
         register_fake(f"{_raw_prefix}::nvfp4_moe_qpn_raw_w2_reduce_sm70_out")(
@@ -1974,7 +1974,7 @@ for _raw_namespace, _raw_prefix in (
             scale_codes,
             global_scales,
             expert_ids,
-            topk_weights: None
+            topk_weights: (None)
         )
 
 
@@ -3757,6 +3757,39 @@ if hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out"):
         out: torch.Tensor,
         top_k: int,
         hidden_logical_size: int,
+    ) -> None:
+        return None
+
+
+def awq_moe_qpn_m1_sm70_out(
+    out: torch.Tensor,
+    intermediate: torch.Tensor,
+    input: torch.Tensor,
+    w13: torch.Tensor,
+    s13: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    ids: torch.Tensor,
+    topk: torch.Tensor,
+) -> None:
+    _op("awq_moe_qpn_m1_sm70_out")(
+        out, intermediate, input, w13, s13, w2, s2, ids, topk
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_qpn_m1_sm70_out"):
+
+    @register_fake("_C::awq_moe_qpn_m1_sm70_out")
+    def _awq_moe_qpn_m1_sm70_out_fake(
+        out: torch.Tensor,
+        intermediate: torch.Tensor,
+        input: torch.Tensor,
+        w13: torch.Tensor,
+        s13: torch.Tensor,
+        w2: torch.Tensor,
+        s2: torch.Tensor,
+        ids: torch.Tensor,
+        topk: torch.Tensor,
     ) -> None:
         return None
 
