@@ -45830,3 +45830,58 @@ Interpretation:
   before the performance cases. These short checks are not the required final
   256K quality gate. GPU locks are released before CPU-only report import;
   an in-scope failure stops the job rather than automatically restarting it.
+
+## Completed HC full-model trace refresh, 2026-09-05
+
+- Corrected retry completed at frozen source `e76a9c8ca3` without further
+  model restarts. Two natural-EOS, thinking-enabled checks pass under official
+  sampling (temperature 1, top-p 0.95, top-k 20, seed 0): arithmetic 118 output
+  tokens and record-copy 110. These short checks do not establish full output
+  quality or the final 256K input boundary. The configured max context is
+  262144, but the timed prompt is 8192 tokens.
+- Same loaded engine: TP4 physical V100-SXM2-32GB GPUs 0-3, PP1, V2, no MTP,
+  no prefix cache, FP16 activations/KV, checkpoint-native NVFP4 experts,
+  online QPN8 disabled, q8192, shared-weight dual CUDA graphs, hybrid PLE.
+  Torch 2.10.0+cu128, CUDA runtime 12.8, Nsight Systems 2022.4.2.50.
+  Untraced 8K/513 case: pure decode **93.433729 tok/s**, **10.702773 ms/token**,
+  prefill 1.162319 s, TTFT 1.165618 s. One measured repeat after one warmup;
+  not a repeated endpoint stability claim. Traced 8K/32 request TPOT is
+  11.511879 ms; do not substitute it for the untraced speed.
+- Retained artifacts: `.artifacts/hc_trace_20260905_retry1/` contains the
+  exact contract/command, quality/result JSON, GPU sampler, raw qdstrm,
+  converted report/SQLite and `per_token.{json,md,csv}`. Manual same-version
+  QdstrmImporter conversion works; GPU reservation was released before this
+  CPU-only conversion. Owned engine/workers/PLE processes and sampler exited;
+  GPUs measured 144/10/10/10 MiB immediately after shutdown. No API is left
+  resident by this task.
+- Same parser rank/ordinal windows and NVTX label as the old trace: 31 x four
+  ranks, 29 middle steps. Kernel-name HC bucket **2.658072 -> 2.165077 ms**;
+  complete semantic HC **2.701252 -> 2.208302 ms** (18.25% reduction).
+  New full-HC p50 2.188509 ms, per-token rank-max mean 2.237414 ms. Preserve
+  the rank-skew/communication outlier; do not drop it to improve the mean.
+  No middle-window final-mixer attribution failures. CPU replay-window
+  boundaries produce small fractional launch-count averages; these are not
+  rounded into exact counts. Values are GPU service sums, not additive wall
+  critical-path TPOT. Full-HC **1.5 ms is not achieved**; remaining gap is
+  0.708302 ms (32.1% of the current measured HC time).
+- Current HC rank-average service: fused up/mix/gather 0.693805 ms; local down
+  0.559589; down gather 0.539501; combine/norm 0.367759; final gate 0.004423;
+  additional semantic work 0.043225. The trace confirms the actual fused
+  route. Endpoint improvement also includes earlier admitted W13/W2 and
+  other changes; do not attribute its entire delta solely to HC or norm.
+- Evidence SHA256: result
+  `83a381288a4fb1edc2966c323be567ace02c754fcc754a67778f73247d5df06a`;
+  quality `b4cb34908ca44eeac449104d2f87da77bcedd3345380876a574e5bbee32c0b33`;
+  nsys-rep `121c8bff98bce955ce13bb13501bcfc1021dffc31a214144191d1fcc7348673d`.
+- PR #481 was externally merged at `205acfb4da`, main merge `755baae1d0`.
+  Norm prefetch was pushed after that PR's merge point and needs a new Draft
+  PR. Continue in owned branch `codex/v100-qwen38-hc-15ms-20260905-1702`, same
+  artifact-preserving worktree. Merge main only AFTER the frozen trace ended
+  (`4b6c2daa1f`); this trace is not a speed claim for the integrated source.
+- Next bounded hypothesis: fused-up H8/512-thread scheduling provides eight
+  row pairs and two serial groups, unlike the rejected H8/256-thread schedule
+  with four serial groups. Keep the same FMA/reduction/rounding and packet
+  protocol; screen against admitted H4/256 on full HC with actual auxiliary
+  sum2 and post-tag-wrap checks. It is unimplemented/unmeasured at this update.
+  Existing logical-lane down split, producer publication, 81-CTA down fusion,
+  and norm/down variants remain rejected; do not repeat unchanged.
