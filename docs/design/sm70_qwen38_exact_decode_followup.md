@@ -42,6 +42,64 @@ unrelated GPU owners. Keep failed paths and raw evidence.
 
 ## Current status
 
-Router 32-bit-key candidate added behind an internal constexpr, default off
-pending GPU exactness and paired speed screening. QSA runtime build and sparse
-address candidate pending. No new performance or model-quality claim yet.
+Draft PR #507 is stacked on #506. The three operator paths are implemented;
+matching whole-model performance and long-context health checks are pending.
+
+The router keeps the original 8-warp FP32 max/exp/normalization tree. Its
+32-bit key is selected only for existing FP16 E512/K10 M1 routing. Signed-zero,
+NaN/Inf, ties, all raw half encodings and finite shuffled inputs are covered:
+1,280 rows are bitwise equal, plus16 changed-input/poisoned graph replays.
+After warmup, eight alternating-order A/B pairs measure48 calls at
+**0.252652 ->0.203530ms** (save0.049121ms). An earlier non-interleaved screen
+drifted in clock state and is retained but not used for the accepted delta.
+
+The QSA sidecar builder compiles the production header, exposes a version
+marker and a literal old generic-kernel control.72 cases cover M1/M2, lengths
+0/1/511/512/2048/2304/2305/4096/65536, ties, signed-zero and non-finite scores;
+all selected IDs are exact.16 changed-input/poisoned graph replays pass.
+Twelve calls at live lengths2048–2169 measure **0.258196 ->0.111665ms**.
+Source-overlay services must pin the freshly built library through existing
+`VLLM_SM70_QSA_TOPK_LIBRARY`; do not infer native-binary freshness from Python
+source or an old unversioned log message. The endpoint trace must prove the
+decode-specialized symbol is present. Header SHA256:
+`e09d4af611894d2c3613ea1d5ac50e1fd2606f729e6fa7c45eb8079fcc6b9508`.
+Sidecar SHA256:
+`e56d7874877dddb88589a7e08ecbe9074f7f7532af1be764ab5f47a9b8aa8165`.
+
+QSA address resolution retains logical ordering/duplicates and validity,
+precomputes physical token slots, and removes the dependent page-table load
+from the unchanged partial attention arithmetic. It is limited to SM70,
+FP16 M1/Q6/KV1/D256/page400/selection2051 and signed-int32-safe physical slots.
+Other shapes, cache formats and prefill keep the original path. Eight changing
+graph scenarios per length test page relocation, invalid pages/indices and
+requests, duplicates and poisoned outputs; all outputs are bitwise identical.
+Public production-dispatch screen (12 attention+merge calls, resolver included):
+
+| Cache context | Original ms | Resolved ms |
+|---|---:|---:|
+|8192|0.345016|0.318909|
+|32768|0.384205|0.367094|
+|262144|0.365860|0.323968|
+
+These are operator service times, not additive endpoint savings. The256K row
+is an operator cache-size check, not a256K model-input quality acceptance.
+CPU dispatcher/QSA launch suites:49 passed,1 skipped (GPU-only). Targeted Ruff
+checks pass. No new lower-precision weights, KV or arithmetic introduced.
+
+Reproduction (project Python environment, SM70 GPU ownership required):
+
+```bash
+CUDA_HOME=/usr TORCH_CUDA_ARCH_LIST=7.0 .venv/bin/python \
+  benchmarks/kernels/build_sm70_qsa_topk_sidecar.py --build-dir .artifacts/qsa-build
+.venv/bin/python benchmarks/kernels/verify_sm70_qsa_router_exact.py \
+  --qsa-library .artifacts/qsa-build/vllm_qsa_decode_topk_sm70.so \
+  --out .artifacts/operators.json
+.venv/bin/python benchmarks/kernels/verify_sm70_qsa_resolved.py \
+  .artifacts/address.json
+```
+
+Raw task artifacts: `.artifacts/three_paths/operators_interleaved.json`,
+`address_production.json`, build/queue logs. All standalone GPU screens exited.
+One combined endpoint is prepared in `.artifacts/endpoint/`: same8K/513r3
+baseline and8K/32 trace, plus261632-token natural-output health and262143+1
+context-boundary request. These long tests are explicitly not retrieval scores.

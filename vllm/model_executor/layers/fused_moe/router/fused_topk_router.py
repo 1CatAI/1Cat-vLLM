@@ -62,9 +62,11 @@ def _sm70_qwen38_router_topk_kernel(
         tl.static_assert(E == 512 and BLOCK_E == 512)
         bits = sort_logits.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
         key = tl.where(bits < 0, bits ^ 0x8000, bits ^ 0xFFFF) & 0xFFFF
-        packed = (key << 9) | offsets
+        # Original int64 sort is signed: flip the key sign bit when moving
+        # to a positive 25-bit key so positive logits still precede negatives.
+        packed = ((key ^ 0x8000) << 9) | offsets
         sorted_packed = tl.sort(packed, descending=False)
-        sorted_keys = sorted_packed >> 9
+        sorted_keys = (sorted_packed >> 9) ^ 0x8000
         sorted_ids = sorted_packed & 0x1FF
         sorted_bits = tl.where(
             (sorted_keys & 0x8000) != 0,
@@ -84,9 +86,7 @@ def _sm70_qwen38_router_topk_kernel(
         sorted_keys = ((sorted_packed >> 32) & 0xFFFFFFFF).to(tl.int32)
         sorted_ids = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
         sorted_sign = sorted_keys >> 31
-        sorted_bits = tl.where(
-            sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32
-        )
+        sorted_bits = tl.where(sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32)
         sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
 
     raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
@@ -121,6 +121,7 @@ def _sm70_qwen38_router_topk(
         K=10,
         M=num_tokens,
         BLOCK_E=512,
+        PACKED_HALF_KEY=(gating_output.dtype == torch.float16 and num_tokens == 1),
         num_warps=8,
     )
 
