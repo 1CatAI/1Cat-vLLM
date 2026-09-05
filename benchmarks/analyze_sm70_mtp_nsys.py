@@ -24,6 +24,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--out-prefix", type=Path, required=True)
     parser.add_argument("--top-n", type=int, default=30)
+    parser.add_argument(
+        "--target-graph-id",
+        type=int,
+        help="CUDA graph id encoded in the high 32 bits of graphNodeId.",
+    )
+    parser.add_argument(
+        "--draft-graph-id",
+        type=int,
+        help="CUDA graph id encoded in the high 32 bits of graphNodeId.",
+    )
     return parser.parse_args()
 
 
@@ -90,7 +100,14 @@ def _category(name: str, short_name: str) -> str:
         return "Target GDN / causal conv"
     if "kernel_unified_attention" in name_lower:
         return "MTP draft attention"
-    if "flash_attention_decode" in name_lower or "pagedattention" in name_lower:
+    if any(
+        marker in name_lower
+        for marker in (
+            "flash_attention_decode",
+            "flash_attention_forward_kernel_paged",
+            "pagedattention",
+        )
+    ):
         return "Target FlashAttn V100"
     if any(
         marker in name_lower
@@ -99,10 +116,33 @@ def _category(name: str, short_name: str) -> str:
             "allreduce",
             "all_reduce",
             "nccldevkernel",
+            "sm70_tp8_hierarchical",
         )
     ):
         return "TP communication"
-    if "reshape_and_cache" in name_lower or "kv_cache" in name_lower:
+    if any(
+        marker in name_lower
+        for marker in (
+            "sm70_glm_mhc",
+            "sm70_mhc_",
+        )
+    ):
+        return "mHC"
+    if any(
+        marker in name_lower
+        for marker in (
+            "grouped_topk",
+            "moerouting",
+            "moe_sort",
+            "finalizemoe",
+        )
+    ):
+        return "MoE routing"
+    if (
+        "reshape_and_cache" in name_lower
+        or "kv_cache" in name_lower
+        or "fp8_kv" in name_lower
+    ):
         return "KV-cache update"
 
     if any(
@@ -136,6 +176,8 @@ def _category(name: str, short_name: str) -> str:
         or "cublas" in name_lower
         or "gemv2t_kernel" in name_lower
         or "splitkreduce" in name_lower
+        or "volta_fp16" in name_lower
+        or "volta_sgemm" in name_lower
     ):
         return "CUTLASS/cuBLAS FP16 GEMM/GEMV"
     if any(
@@ -171,7 +213,7 @@ def _category(name: str, short_name: str) -> str:
 
 def _load_kernels(
     connection: sqlite3.Connection,
-) -> list[tuple[int, int, int, int | None, int | None, str, str]]:
+) -> list[tuple[int, int, int, int | None, int | None, int | None, str, str]]:
     strings = {
         row[0]: row[1] or ""
         for row in connection.execute("SELECT id, value FROM StringIds")
@@ -183,6 +225,7 @@ def _load_kernels(
             device,
             correlation_id,
             global_pid,
+            graph_node_id,
             strings[demangled],
             strings[short],
         )
@@ -192,10 +235,11 @@ def _load_kernels(
             device,
             correlation_id,
             global_pid,
+            graph_node_id,
             demangled,
             short,
         ) in connection.execute(
-            "SELECT start, end, deviceId, correlationId, globalPid, "
+            "SELECT start, end, deviceId, correlationId, globalPid, graphNodeId, "
             "demangledName, shortName "
             "FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start"
         )
@@ -213,7 +257,7 @@ def _memcpy_category(copy_kind: int) -> str:
 
 def _load_memcpys(
     connection: sqlite3.Connection,
-) -> list[tuple[int, int, int, int | None, int | None, int]]:
+) -> list[tuple[int, int, int, int | None, int | None, int | None, int]]:
     table_exists = connection.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
         "AND name='CUPTI_ACTIVITY_KIND_MEMCPY'"
@@ -221,19 +265,70 @@ def _load_memcpys(
     if not table_exists:
         return []
     return [
-        (start, end, device, correlation_id, global_pid, copy_kind)
+        (
+            start,
+            end,
+            device,
+            correlation_id,
+            global_pid,
+            graph_node_id,
+            copy_kind,
+        )
         for (
             start,
             end,
             device,
             correlation_id,
             global_pid,
+            graph_node_id,
             copy_kind,
         ) in connection.execute(
-            "SELECT start, end, deviceId, correlationId, globalPid, copyKind "
+            "SELECT start, end, deviceId, correlationId, globalPid, "
+            "graphNodeId, copyKind "
             "FROM CUPTI_ACTIVITY_KIND_MEMCPY ORDER BY start"
         )
     ]
+
+
+def _normalize_windows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_windows = payload["tokens"]
+    windows = []
+    for index, raw_window in enumerate(raw_windows):
+        window = dict(raw_window)
+        start_ns = int(window["start_ns"])
+        if "end_ns" not in window:
+            if index + 1 < len(raw_windows):
+                end_ns = int(raw_windows[index + 1]["start_ns"])
+            else:
+                interval_ms = float(
+                    window.get("interval_ms", window.get("rank_interval_max_ms", 0.0))
+                )
+                end_ns = start_ns + round(interval_ms * 1_000_000)
+            window["end_ns"] = end_ns
+        window.setdefault("interval_ms", float(window.get("rank_interval_max_ms", 0.0)))
+        window.setdefault(
+            "gpu_wall_ms",
+            float(window.get("rank_gpu_activity_envelope_max_ms", 0.0)),
+        )
+        window.setdefault("token", int(window.get("decode_step", index + 1)))
+        windows.append(window)
+    return windows
+
+
+def _graph_scope(
+    graph_node_id: int | None,
+    *,
+    target_graph_id: int | None,
+    draft_graph_id: int | None,
+) -> str | None:
+    if graph_node_id is None:
+        return None
+    graph_id = graph_node_id >> 32
+    if target_graph_id is not None and graph_id == target_graph_id:
+        return "target_full_graph"
+    if draft_graph_id is not None and graph_id == draft_graph_id:
+        return "draft_piecewise_graph"
+    return None
 
 
 def _load_graph_launches(
@@ -320,7 +415,7 @@ def _category_stats(
 
 def _analyze(args: argparse.Namespace) -> dict[str, Any]:
     payload = json.loads(args.windows_json.read_text(encoding="utf-8"))
-    all_windows = payload["tokens"]
+    all_windows = _normalize_windows(payload)
     edge_drop = int(payload.get("edge_drop", 0))
     windows = all_windows[edge_drop:-edge_drop] if edge_drop else all_windows
     connection = sqlite3.connect(args.sqlite)
@@ -373,6 +468,7 @@ def _analyze(args: argparse.Namespace) -> dict[str, Any]:
             device,
             correlation_id,
             global_pid,
+            graph_node_id,
             name,
             short_name,
         ) in kernels:
@@ -388,19 +484,38 @@ def _analyze(args: argparse.Namespace) -> dict[str, Any]:
             kernel_key = (display_name, category)
             kernel_ms[kernel_key] += duration_ms
             kernel_counts[kernel_key] += 1
-            if correlation_id is not None and global_pid is not None:
+            explicit_scope = _graph_scope(
+                graph_node_id,
+                target_graph_id=args.target_graph_id,
+                draft_graph_id=args.draft_graph_id,
+            )
+            if explicit_scope is not None:
+                matching_scopes = (explicit_scope,)
+            elif correlation_id is not None and global_pid is not None:
                 correlation_key = (correlation_id, global_pid >> 24)
-                for scope, correlation_set in scope_correlation_sets.items():
-                    if correlation_key in correlation_set:
-                        scope_device_categories[scope][device][category] += duration_ms
-                        scope_device_category_counts[scope][device][category] += 1
-                        scope_category_counts[scope][category] += 1
-                        extent = scope_device_extents[scope].setdefault(
-                            device, [start, end]
-                        )
-                        extent[0] = min(extent[0], start)
-                        extent[1] = max(extent[1], end)
-        for start, end, device, correlation_id, global_pid, copy_kind in memcpys:
+                matching_scopes = tuple(
+                    scope
+                    for scope, correlation_set in scope_correlation_sets.items()
+                    if correlation_key in correlation_set
+                )
+            else:
+                matching_scopes = ()
+            for scope in matching_scopes:
+                scope_device_categories[scope][device][category] += duration_ms
+                scope_device_category_counts[scope][device][category] += 1
+                scope_category_counts[scope][category] += 1
+                extent = scope_device_extents[scope].setdefault(device, [start, end])
+                extent[0] = min(extent[0], start)
+                extent[1] = max(extent[1], end)
+        for (
+            start,
+            end,
+            device,
+            correlation_id,
+            global_pid,
+            graph_node_id,
+            copy_kind,
+        ) in memcpys:
             if start < start_ns:
                 continue
             if start >= end_ns:
@@ -409,18 +524,29 @@ def _analyze(args: argparse.Namespace) -> dict[str, Any]:
             category = _memcpy_category(copy_kind)
             device_categories[device][category] += duration_ms
             category_counts[category] += 1
-            if correlation_id is not None and global_pid is not None:
+            explicit_scope = _graph_scope(
+                graph_node_id,
+                target_graph_id=args.target_graph_id,
+                draft_graph_id=args.draft_graph_id,
+            )
+            if explicit_scope is not None:
+                matching_scopes = (explicit_scope,)
+            elif correlation_id is not None and global_pid is not None:
                 correlation_key = (correlation_id, global_pid >> 24)
-                for scope, correlation_set in scope_correlation_sets.items():
-                    if correlation_key in correlation_set:
-                        scope_device_categories[scope][device][category] += duration_ms
-                        scope_device_category_counts[scope][device][category] += 1
-                        scope_category_counts[scope][category] += 1
-                        extent = scope_device_extents[scope].setdefault(
-                            device, [start, end]
-                        )
-                        extent[0] = min(extent[0], start)
-                        extent[1] = max(extent[1], end)
+                matching_scopes = tuple(
+                    scope
+                    for scope, correlation_set in scope_correlation_sets.items()
+                    if correlation_key in correlation_set
+                )
+            else:
+                matching_scopes = ()
+            for scope in matching_scopes:
+                scope_device_categories[scope][device][category] += duration_ms
+                scope_device_category_counts[scope][device][category] += 1
+                scope_category_counts[scope][category] += 1
+                extent = scope_device_extents[scope].setdefault(device, [start, end])
+                extent[0] = min(extent[0], start)
+                extent[1] = max(extent[1], end)
         window_rows.append(
             {
                 "window": int(window["token"]),
@@ -521,6 +647,8 @@ def _analyze(args: argparse.Namespace) -> dict[str, Any]:
         "sqlite": str(args.sqlite),
         "windows_json": str(args.windows_json),
         "window_semantics": "one TP verifier/MTP round, not one emitted token",
+        "target_graph_id": args.target_graph_id,
+        "draft_graph_id": args.draft_graph_id,
         "steady_windows": len(window_rows),
         "interval_ms": _stats([row["interval_ms"] for row in window_rows]),
         "gpu_wall_ms": gpu_wall_ms,

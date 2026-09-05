@@ -431,8 +431,8 @@ class ParallelConfig:
                 f"but found: {self._api_process_rank}"
             )
 
-        if envs.VLLM_PLE_CPU_OFFLOAD and not self._ple_offload_ipc_path:
-            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
+        if envs.VLLM_PLE_CPU_OFFLOAD:
+            self.ensure_ple_offload_ipc_path()
 
         if self.all2all_backend in ["pplx", "naive"]:
             logger.warning(
@@ -500,6 +500,11 @@ class ParallelConfig:
             )
 
         return self
+
+    def ensure_ple_offload_ipc_path(self) -> None:
+        """Initialize the shared PLE endpoint after late config defaults."""
+        if not self._ple_offload_ipc_path:
+            self._ple_offload_ipc_path = get_open_zmq_ipc_path()
 
     @property
     def world_size_across_dp(self) -> int:

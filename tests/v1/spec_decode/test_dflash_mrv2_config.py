@@ -75,6 +75,42 @@ def test_mrv2_dflash_preserves_target_scheduler_token_budget() -> None:
     assert scheduler.max_num_scheduled_tokens == 4096
 
 
+@pytest.mark.parametrize("target_capacity", [8, 64])
+def test_dflash_embedding_buffer_covers_expanded_query_capacity(
+    monkeypatch, target_capacity
+) -> None:
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as module
+
+    def init_base(self, config, device):
+        self.device = device
+        self.dtype = torch.float16
+        self.hidden_size = 3
+        self.max_num_tokens = target_capacity
+        self.max_num_reqs = 4
+        self.num_speculative_steps = 7
+        self.speculative_config = config.speculative_config
+        self.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(dflash_config={})
+        )
+
+    monkeypatch.setattr(module.DraftModelSpeculator, "__init__", init_base)
+    monkeypatch.setattr(
+        module, "InputBuffers", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(module, "get_dflash_model_draft_tokens", lambda config: 7)
+    monkeypatch.setattr(module, "get_parallel_drafting_token_id", lambda config: 0)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.qwen3_dflash.dflash_has_any_non_causal",
+        lambda config: False,
+    )
+    config = SimpleNamespace(speculative_config=SimpleNamespace())
+    speculator = module.DFlashSpeculator(config, torch.device("cpu"))
+    capacity = max(target_capacity, 4 * 8)
+    assert speculator.max_num_tokens == capacity
+    assert speculator.hidden_states.shape == (capacity, 3)
+    assert speculator.inputs_embeds.shape == (capacity, 3)
+
+
 def test_dflash_capture_uses_its_own_persistent_slot_mapping(monkeypatch) -> None:
     query_slots = torch.zeros((2, 16), dtype=torch.int64)
     seen: dict[str, torch.Tensor] = {}

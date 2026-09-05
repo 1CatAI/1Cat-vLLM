@@ -42,7 +42,7 @@ def _measure_ms(call, *, warmups: int, repeats: int) -> float:
 
 
 def _logical_indices(
-    *, rows: int, seq_len: int, overlap: float, seed: int
+    *, rows: int, seq_len: int, overlap: float, seed: int, independent: bool
 ) -> torch.Tensor:
     """Build 2051-token selections with controlled adjacent-row Page4 overlap."""
     generator = torch.Generator().manual_seed(seed)
@@ -65,7 +65,7 @@ def _logical_indices(
         ]
         pages = torch.cat((shared, unique))
         tokens = (pages[:, None] * 4 + torch.arange(4)).flatten()
-        query_position = seq_len - rows + row
+        query_position = seq_len - 1 if independent else seq_len - rows + row
         tail = torch.arange(query_position - 2, query_position + 1)
         selections.append(torch.cat((tokens, tail)).to(torch.int32))
     return torch.stack(selections)
@@ -74,6 +74,8 @@ def _logical_indices(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=8192)
+    parser.add_argument("--rows", type=int, choices=(5, 8, 16), default=5)
+    parser.add_argument("--independent-requests", action="store_true")
     parser.add_argument("--overlap", type=float, default=0.82)
     parser.add_argument("--warmups", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=200)
@@ -90,12 +92,14 @@ def main() -> int:
     if not all(hasattr(flash_attn_v100_cuda, name) for name in required):
         raise RuntimeError("Flash-V100 was not built with grouped Page4 operators")
 
-    rows = 5
-    padded_rows = 8
+    rows = args.rows
+    padded_rows = ((rows + 7) // 8) * 8
     heads = 6
     head_dim = 256
     page_size = 784
-    num_cache_blocks = (args.seq_len + page_size - 1) // page_size
+    blocks_per_request = (args.seq_len + page_size - 1) // page_size
+    num_requests = rows if args.independent_requests else 1
+    num_cache_blocks = blocks_per_request * num_requests
     torch.manual_seed(args.seed)
     query = torch.randn((rows, heads, head_dim), device="cuda", dtype=torch.float16)
     key_cache = torch.randn(
@@ -109,18 +113,29 @@ def main() -> int:
         seq_len=args.seq_len,
         overlap=args.overlap,
         seed=args.seed,
+        independent=args.independent_requests,
     ).to("cuda")
-    block_table = torch.arange(num_cache_blocks, dtype=torch.int32, device="cuda")[
-        None, :
-    ]
-    token_to_req = torch.zeros(rows, dtype=torch.int32, device="cuda")
-    query_positions = torch.arange(
-        args.seq_len - rows,
-        args.seq_len,
-        dtype=torch.int64,
-        device="cuda",
+    block_table = torch.arange(num_cache_blocks, dtype=torch.int32, device="cuda").view(
+        num_requests, blocks_per_request
     )
-    sequence_lengths = torch.tensor([args.seq_len], dtype=torch.int32, device="cuda")
+    token_to_req = (
+        torch.arange(rows, dtype=torch.int32, device="cuda")
+        if args.independent_requests
+        else torch.zeros(rows, dtype=torch.int32, device="cuda")
+    )
+    query_positions = (
+        torch.full((rows,), args.seq_len - 1, dtype=torch.int64, device="cuda")
+        if args.independent_requests
+        else torch.arange(
+            args.seq_len - rows,
+            args.seq_len,
+            dtype=torch.int64,
+            device="cuda",
+        )
+    )
+    sequence_lengths = torch.full(
+        (num_requests,), args.seq_len, dtype=torch.int32, device="cuda"
+    )
     reference = torch.empty_like(query)
     xqa_candidate = torch.empty_like(query)
 
@@ -166,6 +181,9 @@ def main() -> int:
             padded_query_positions,
             sequence_lengths,
             candidate,
+            "auto",
+            1.0,
+            1.0,
             flash_attn_v100_cuda,
         )
 
@@ -180,6 +198,9 @@ def main() -> int:
             query_positions,
             sequence_lengths,
             xqa_candidate,
+            "auto",
+            1.0,
+            1.0,
         )
         if result is None:
             raise RuntimeError("Flash-V100 XQA Page4 route is unavailable")
@@ -209,6 +230,7 @@ def main() -> int:
         "sm": list(torch.cuda.get_device_capability()),
         "rows": rows,
         "padded_rows": padded_rows,
+        "independent_requests": args.independent_requests,
         "seq_len": args.seq_len,
         "selection_width": indices.shape[1],
         "requested_page_overlap": args.overlap,

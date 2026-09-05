@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import get_dflash_model_draft_tokens
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -67,6 +69,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 device=device,
             )
         self.hidden_states = torch.zeros(
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+        )
+        # Keep embedding outside the compiled forward, with a graph-stable
+        # buffer sized after the draft query capacity has been expanded.
+        self.inputs_embeds = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
         if self.draft_block < self.num_speculative_steps:
@@ -133,6 +140,117 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_kv_cache_group_id: int = -1
         self._context_only_prefill_logged = False
         self._query_slot_mappings: torch.Tensor | None = None
+        self._debug_proposal_stages = bool(
+            int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
+        )
+        self._debug_real_proposal = False
+        self._debug_input_dump_count = 0
+        self._debug_tensor_dump_dir = os.getenv(
+            "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR", ""
+        ).strip()
+        self._debug_tensor_dump_limit = max(
+            0, int(os.getenv("VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT", "2"))
+        )
+        self._debug_tensor_dump_count = 0
+
+    def _debug_proposal_stage(self, stage: str) -> None:
+        if getattr(self, "_debug_proposal_stages", False):
+            logger.info("DFlash proposal stage: %s", stage)
+
+    def _debug_dump_real_proposal(
+        self,
+        input_batch: InputBatch,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        projected_hidden_states: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        num_target_tokens: int,
+        num_query_tokens: int,
+    ) -> None:
+        """Save one complete real-request DFlash boundary for offline A/B."""
+        if (
+            not self._debug_tensor_dump_dir
+            or not self._debug_real_proposal
+            or self._debug_tensor_dump_count >= self._debug_tensor_dump_limit
+            or get_tensor_model_parallel_rank() != 0
+        ):
+            return
+
+        def cpu(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.detach().cpu().clone()
+
+        num_reqs = input_batch.num_reqs
+        num_samples = num_reqs * self.draft_block
+        context_slot_mappings = [
+            cpu(mapping[:num_target_tokens]) for mapping in self._context_slot_mappings
+        ]
+        query_slot_mappings = {
+            int(gid): cpu(self._require_query_slot_mappings()[gid, :num_query_tokens])
+            for gid in self.draft_kv_cache_group_ids
+        }
+        payload = {
+            "request_ids": list(input_batch.req_ids[:num_reqs]),
+            "tp_rank": get_tensor_model_parallel_rank(),
+            "pp_rank": get_pp_group().rank_in_group,
+            "num_reqs": num_reqs,
+            "num_target_tokens": num_target_tokens,
+            "num_query_tokens": num_query_tokens,
+            "draft_block": self.draft_block,
+            "target_input_ids": cpu(input_batch.input_ids[:num_target_tokens]),
+            "target_positions": cpu(input_batch.positions[:num_target_tokens]),
+            "target_query_start_loc": cpu(input_batch.query_start_loc[: num_reqs + 1]),
+            "target_seq_lens": cpu(input_batch.seq_lens[:num_reqs]),
+            "target_idx_mapping": cpu(input_batch.idx_mapping[:num_reqs]),
+            "last_hidden_states": cpu(last_hidden_states[:num_target_tokens]),
+            "aux_hidden_states": (
+                [cpu(hidden[:num_target_tokens]) for hidden in aux_hidden_states]
+                if aux_hidden_states
+                else None
+            ),
+            "projected_hidden_states": cpu(projected_hidden_states[:num_target_tokens]),
+            "num_sampled": cpu(num_sampled[:num_reqs]),
+            "num_rejected": cpu(num_rejected[:num_reqs]),
+            "last_sampled": cpu(last_sampled),
+            "next_prefill_tokens": cpu(next_prefill_tokens),
+            "draft_input_ids": cpu(self.input_buffers.input_ids[:num_query_tokens]),
+            "draft_input_embeds": cpu(self.inputs_embeds[:num_query_tokens]),
+            "draft_positions": cpu(self.input_buffers.positions[:num_query_tokens]),
+            "draft_query_start_loc": cpu(
+                self.input_buffers.query_start_loc[: num_reqs + 1]
+            ),
+            "draft_seq_lens": cpu(self.input_buffers.seq_lens[:num_reqs]),
+            "context_positions": cpu(self.context_positions[:num_target_tokens]),
+            "context_slot_mappings": context_slot_mappings,
+            "query_slot_mappings": query_slot_mappings,
+            "sample_indices": cpu(self.sample_indices[:num_samples]),
+            "sample_pos": cpu(self.sample_pos[:num_samples]),
+            "sample_idx_mapping": cpu(self.sample_idx_mapping[:num_samples]),
+            "draft_tokens": cpu(self.draft_tokens[:num_reqs]),
+        }
+        debug_tensor_names = (
+            "_debug_backbone_hidden_states",
+            "_debug_candidate_ids",
+            "_debug_unary_logits",
+            "_debug_lattice_scores",
+        )
+        payload["dflash2"] = {
+            name.removeprefix("_debug_"): cpu(tensor[:num_reqs])
+            for name in debug_tensor_names
+            if (tensor := getattr(self, name, None)) is not None
+        }
+        os.makedirs(self._debug_tensor_dump_dir, exist_ok=True)
+        dump_index = self._debug_tensor_dump_count
+        dump_path = os.path.join(
+            self._debug_tensor_dump_dir,
+            f"proposal_{dump_index:02d}_pp{get_pp_group().rank_in_group}_"
+            f"tp{get_tensor_model_parallel_rank()}_pid{os.getpid()}.pt",
+        )
+        torch.save(payload, dump_path)
+        self._debug_tensor_dump_count += 1
+        logger.warning("Saved DFlash real-request tensor boundary to %s", dump_path)
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -140,6 +258,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         return replace(
             self.vllm_config,
             model_config=self.draft_model_config,
+            parallel_config=self.speculative_config.draft_parallel_config,
             attention_config=replace(
                 self.vllm_config.attention_config,
                 use_non_causal=self.requires_non_causal,
@@ -214,6 +333,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             target_attn_groups,
         )
 
+        # FlashAttention's AOT split schedule is wrong for a windowed drafter,
+        # and the global window scan can leave it enabled depending on the
+        # target backend. Resolve the drafter's own builders explicitly.
+        for groups in self.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                if getattr(builder, "aot_schedule", False) and getattr(
+                    builder.kv_cache_spec, "sliding_window", None
+                ):
+                    cast(Any, builder).aot_schedule = False
+
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
         ]
@@ -283,10 +413,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
+            self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                self.input_buffers.input_ids[:num_tokens]
+            )
             last_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
+                input_ids=None,
                 positions=self.input_buffers.positions[:num_tokens],
-                inputs_embeds=None,
+                inputs_embeds=self.inputs_embeds[:num_tokens],
             )
         return last_hidden_states
 
@@ -299,6 +432,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        self._debug_proposal_stage("draft forward begin")
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -306,19 +440,22 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        self._debug_proposal_stage("draft forward end")
         num_sample = num_reqs * self.draft_block
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        # sample_pos is the predicted token's position Q; verification keys
-        # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
+        # sample_pos is the predicted token's position P. Sampling keys a draw
+        # by the position before the sampled token, P-1.
+        self._debug_proposal_stage("draft sampling begin")
         draft_tokens = self.sample_draft(
             sample_hidden_states,
-            self.sample_pos[:num_sample] - 2,
+            self.sample_pos[:num_sample] - 1,
             self.sample_idx_mapping[:num_sample],
             self.temperature,
             self.seeds,
             self.sample_col[:num_sample],
             self.draft_logits,
         )
+        self._debug_proposal_stage("draft sampling end")
         self.draft_tokens[:num_reqs, : self.draft_block] = draft_tokens.view(
             num_reqs, self.draft_block
         )
@@ -422,12 +559,38 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
         self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
+        self._debug_real_proposal = not dummy_run and not is_profile
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
+            if (
+                getattr(self, "_debug_proposal_stages", False)
+                and getattr(self, "_debug_real_proposal", False)
+                and getattr(self, "_debug_input_dump_count", 0) < 2
+            ):
+                aux_stats = []
+                for layer_idx, aux_hidden in enumerate(aux_hidden_states):
+                    row = aux_hidden[num_target_tokens - 1].detach().float().reshape(-1)
+                    aux_stats.append(
+                        {
+                            "layer": layer_idx,
+                            "shape": tuple(aux_hidden.shape),
+                            "sum": float(row.sum().item()),
+                            "sqsum": float((row * row).sum().item()),
+                            "absmax": float(row.abs().max().item()),
+                            "sample": row[:8].cpu().tolist(),
+                        }
+                    )
+                logger.info(
+                    "DFlash real target-hidden diagnostic: positions=%s "
+                    "input_ids=%s aux=%s",
+                    input_batch.positions[:num_target_tokens].tolist(),
+                    input_batch.input_ids[:num_target_tokens].tolist(),
+                    aux_stats,
+                )
             with record_function_or_nullcontext("dflash: concatenate target hidden"):
                 combined_target_hidden = torch.cat(aux_hidden_states, dim=-1)
             with record_function_or_nullcontext("dflash: project target hidden"):
@@ -437,6 +600,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         with record_function_or_nullcontext("dflash: stage target hidden"):
             self.hidden_states[:num_target_tokens].copy_(
                 hidden_states[:num_target_tokens]
+            )
+        if (
+            getattr(self, "_debug_proposal_stages", False)
+            and getattr(self, "_debug_real_proposal", False)
+            and getattr(self, "_debug_input_dump_count", 0) < 2
+        ):
+            row = hidden_states[num_target_tokens - 1].detach().float().reshape(-1)
+            logger.info(
+                "DFlash real projected-hidden diagnostic: shape=%s sum=%.9g "
+                "sqsum=%.9g absmax=%.9g sample=%s",
+                tuple(hidden_states.shape),
+                float(row.sum().item()),
+                float((row * row).sum().item()),
+                float(row.abs().max().item()),
+                row[:8].cpu().tolist(),
+            )
+            self._debug_input_dump_count = (
+                getattr(self, "_debug_input_dump_count", 0) + 1
             )
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -509,12 +690,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        self._debug_proposal_stage("context kv begin")
         with record_function_or_nullcontext("dflash: materialize context kv"):
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
                 context_slots,
             )
+        self._debug_proposal_stage("context kv end")
 
         if not dummy_run and _is_context_only_prefill(input_batch):
             # Intermediate chunked-prefill steps only need to materialize the
@@ -541,6 +724,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self._apply_ngram_assist(num_reqs)
             return self.draft_tokens[:num_reqs]
 
+        self._debug_proposal_stage("query preparation begin")
         with record_function_or_nullcontext("dflash: query and selector"):
             # Every DFlash step has exactly num_query_per_req tokens, so we can
             # use FULL CUDA graphs.
@@ -572,6 +756,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.kv_cache_config,
             )
 
+            self._debug_proposal_stage("query preparation end")
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.query_cudagraph_manager is not None
                 self.query_cudagraph_manager.run_fullgraph(batch_desc)
@@ -585,7 +770,20 @@ class DFlashSpeculator(DraftModelSpeculator):
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
 
+        self._debug_proposal_stage("query and selector end")
         self._apply_ngram_assist(num_reqs)
+        self._debug_dump_real_proposal(
+            input_batch,
+            last_hidden_states,
+            aux_hidden_states,
+            hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            num_target_tokens,
+            num_query_tokens,
+        )
 
         return self.draft_tokens[:num_reqs]
 

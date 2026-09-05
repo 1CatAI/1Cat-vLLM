@@ -18,6 +18,8 @@ from torch.nn import Parameter
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config.vllm import get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -40,6 +42,18 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+_DEBUG_DFLASH_NVFP4_TRACE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
+)
+_DFLASH_NVFP4_TRACE_ARMED = False
+
+
+def arm_dflash_nvfp4_trace() -> None:
+    global _DFLASH_NVFP4_TRACE_ARMED
+    if _DEBUG_DFLASH_NVFP4_TRACE:
+        _DFLASH_NVFP4_TRACE_ARMED = True
+
+
 _SUPPORTED_CONTRACTS: Final = {
     # (hidden size, global expert intermediate size, experts, top-k)
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
@@ -56,6 +70,81 @@ _QWEN38_QPN_M1_W13_SPLIT_K: Final = 16
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
 _QWEN38_QPN_MTP5_W13_SPLIT_K: Final = 4
+# Split choices retained by the per-width performance screen. The direct
+# kernel is deterministic, but TurboMind's grouped baseline can autotune to a
+# different reduction order in a new process; quality admission therefore
+# uses an independent FP32 oracle and endpoint datasets, not baseline bitwise
+# identity alone.
+_QWEN38_QPN_BATCH_W13_SPLIT_K: Final = {2: 10, 4: 5, 8: 4, 16: 1}
+_QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K: Final = {
+    2: 10,
+    3: 8,
+    4: 5,
+    5: 4,
+    6: 8,
+    7: 8,
+    8: 4,
+    9: 4,
+    10: 4,
+    11: 4,
+    12: 4,
+    13: 5,
+    14: 5,
+    15: 4,
+    16: 1,
+}
+_QWEN38_QPN_BATCH_FUSED_W13_TOKENS: Final = frozenset((4, 8, 16))
+_QWEN38_RAW_SCALE_WORKSPACE_ELEMENTS: Final = 512 * 160 * 320
+_qwen38_raw_scale_workspaces: dict[int, torch.Tensor] = {}
+
+
+def clear_sm70_nvfp4_moe_workspaces() -> None:
+    """Release process-global Qwen3.8 raw-scale expansion workspaces."""
+    _qwen38_raw_scale_workspaces.clear()
+
+
+def _raw_scales_match_prepared(
+    workspace: torch.Tensor,
+    codes: torch.Tensor,
+    globals_: torch.Tensor,
+    prepared: torch.Tensor,
+    interleaved: bool,
+) -> bool:
+    """Admit both prefill scales and the effective QPN decode scales."""
+    sm70_ops.nvfp4_expand_raw_scales_sm70_out(
+        workspace, codes, globals_, interleaved, False
+    )
+    if not torch.equal(workspace, prepared):
+        return False
+    sm70_ops.nvfp4_expand_raw_scales_sm70_out(
+        workspace, codes, globals_, interleaved, True
+    )
+    return torch.equal(workspace, prepared * 16384.0)
+
+
+def _get_qwen38_raw_scale_workspace(device: torch.device) -> torch.Tensor:
+    # The persistent views below share one expansion buffer across layers.
+    # Concurrent microbatches could overwrite it before a GEMM consumes it.
+    # Reject at load time, without adding synchronization to decode.
+    config = get_current_vllm_config_or_none()
+    if config is not None and config.parallel_config.use_ubatching:
+        raise NotImplementedError(
+            "SM70 raw-scale storage uses a shared expansion workspace and "
+            "cannot be combined with DBO or microbatching. Disable "
+            "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE to use prepared scales."
+        )
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    workspace = _qwen38_raw_scale_workspaces.get(device_index)
+    if workspace is None:
+        workspace = torch.empty(
+            _QWEN38_RAW_SCALE_WORKSPACE_ELEMENTS,
+            dtype=torch.float16,
+            device=device,
+        )
+        _qwen38_raw_scale_workspaces[device_index] = workspace
+    return workspace
 
 
 def _use_qwen38_qpn_m1_decode(
@@ -77,6 +166,31 @@ def _use_qwen38_qpn_m1_decode(
         and int(layer.sm70_nvfp4_hidden_size) == 2560
         and int(layer.sm70_nvfp4_intermediate_size) == 160
         and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_glm53_qpn_w13_q8(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    fused_permute: bool,
+) -> bool:
+    """Admit the exact GLM-5.3 TP8 eight-token W13 route."""
+    return bool(
+        fused_permute
+        and getattr(layer, "sm70_glm53_qpn_w13_q8", False)
+        and x.shape == (8, 4096)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (8, 8)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 8
+        and int(layer.sm70_nvfp4_num_experts) == 288
+        and int(layer.sm70_nvfp4_hidden_size) == 4096
+        and int(layer.sm70_nvfp4_intermediate_size) == 256
+        and int(layer.sm70_nvfp4_top_k) == 8
     )
 
 
@@ -106,6 +220,124 @@ def _use_qwen38_indexed_prefill(
         and int(layer.sm70_nvfp4_hidden_size) == 2560
         and int(layer.sm70_nvfp4_intermediate_size) == 160
         and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_qwen38_qpn_batch_decode(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit the screened Qwen3.8 TP4 no-MTP CUDA Graph batch widths."""
+    tokens = x.shape[0]
+    split_table = (
+        _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K
+        if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE
+        else _QWEN38_QPN_BATCH_W13_SPLIT_K
+    )
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE
+        and tokens in split_table
+        and x.shape == (tokens, 2560)
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (tokens, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_qwen38_qpn_batch_fused_w13(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit the retained split-preserving W13+SwiGLU fusion widths."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13
+        and x.shape[0] in _QWEN38_QPN_BATCH_FUSED_W13_TOKENS
+        and layer.swiglu_limit is None
+        and sm70_ops.has_nvfp4_qpn_w13_swiglu_batch_dispatch()
+        and _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
+    )
+
+
+def _grouped_decode_context_ok() -> bool:
+    """Use CPU metadata, never GPU readback, to exclude prefill and verify."""
+    if not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    # DBO/list metadata needs per-microbatch ownership, not a shared decision.
+    if not isinstance(metadata, dict) or not metadata:
+        return False
+    key = "sm70_grouped_moe_decode"
+    if key not in context.additional_kwargs:
+        seen_decode = False
+        allowed = True
+        for meta in metadata.values():
+            prefills = getattr(meta, "num_prefills", 0)
+            prefill_tokens = getattr(meta, "num_prefill_tokens", 0)
+            if (
+                not isinstance(prefills, int)
+                or not isinstance(prefill_tokens, int)
+                or prefills != 0
+                or prefill_tokens != 0
+            ):
+                allowed = False
+                break
+            max_query = getattr(meta, "max_query_len", None)
+            if max_query is not None:
+                if not isinstance(max_query, int) or max_query != 1:
+                    allowed = False
+                    break
+                seen_decode = True
+            num_decodes = getattr(meta, "num_decodes", None)
+            if num_decodes is not None:
+                decode_tokens = getattr(meta, "num_decode_tokens", None)
+                if (
+                    not isinstance(num_decodes, int)
+                    or not isinstance(decode_tokens, int)
+                    or decode_tokens != num_decodes
+                ):
+                    allowed = False
+                    break
+                seen_decode |= num_decodes > 0
+        context.additional_kwargs[key] = bool(allowed and seen_decode)
+    return bool(context.additional_kwargs[key])
+
+
+def _use_grouped_decode(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+    """Local operator contract only; no TP/KV/scheduler/model-name binding."""
+    return bool(
+        getattr(layer, "sm70_nvfp4_grouped_decode", False)
+        and x.ndim == 2
+        and x.shape[0] in (8, 16)
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and _grouped_decode_context_ok()
+    )
+
+
+def _use_qwen38_qpn_batch_fused_w2(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit the fixed-order parallel W2 reduction for direct batch QPN."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2
+        and sm70_ops.has_nvfp4_qpn_w2_reduce_dispatch()
+        and _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
     )
 
 
@@ -315,6 +547,104 @@ def _prepare_compact_slot_groups(
     )
 
 
+@triton.jit
+def _prepare_compact_expert_groups_kernel(
+    sorted_expert_ids_ptr,
+    compact_offsets_ptr,
+    active_expert_ids_ptr,
+    TOTAL_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    valid = offsets < TOTAL_SLOTS
+    expert_ids = tl.load(
+        sorted_expert_ids_ptr + offsets,
+        mask=valid,
+        other=-1,
+    )
+    previous_ids = tl.load(
+        sorted_expert_ids_ptr + offsets - 1,
+        mask=valid & (offsets > 0),
+        other=-2,
+    )
+    is_boundary = valid & ((offsets == 0) | (expert_ids != previous_ids))
+    active_indices = tl.cumsum(is_boundary.to(tl.int32), axis=0) - 1
+
+    tl.store(
+        compact_offsets_ptr + offsets,
+        TOTAL_SLOTS,
+        mask=offsets <= TOTAL_SLOTS,
+    )
+    tl.store(
+        active_expert_ids_ptr + offsets,
+        0,
+        mask=valid,
+    )
+    tl.store(
+        compact_offsets_ptr + active_indices,
+        offsets,
+        mask=is_boundary,
+    )
+    tl.store(
+        active_expert_ids_ptr + active_indices,
+        expert_ids,
+        mask=is_boundary,
+    )
+
+
+def _prepare_compact_expert_groups(
+    sorted_expert_ids: torch.Tensor,
+    compact_offsets: torch.Tensor,
+    active_expert_ids: torch.Tensor,
+) -> None:
+    total_slots = sorted_expert_ids.numel()
+    max_slots = _COMPACT_GROUPED_MAX_SLOTS
+    if not (0 < total_slots <= max_slots):
+        raise ValueError(f"Unsupported SM70 NVFP4 active-expert slots: {total_slots}")
+    block = triton.next_power_of_2(total_slots + 1)
+    _prepare_compact_expert_groups_kernel[(1,)](
+        sorted_expert_ids,
+        compact_offsets,
+        active_expert_ids,
+        TOTAL_SLOTS=total_slots,
+        BLOCK=block,
+        num_warps=1,
+    )
+
+
+def _use_glm53_grouped_expert_rows(
+    layer: RoutedExperts,
+    num_tokens: int,
+) -> bool:
+    return bool(
+        envs.VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS
+        and num_tokens > 1
+        and _use_compact_grouped(num_tokens, int(layer.sm70_nvfp4_top_k))
+        and int(layer.moe_config.tp_size) in (4, 8)
+        and int(layer.sm70_nvfp4_num_experts) == 288
+        and int(layer.sm70_nvfp4_hidden_size) == 4096
+        and int(layer.sm70_nvfp4_intermediate_size) in (256, 512)
+        and int(layer.sm70_nvfp4_top_k) == 8
+    )
+
+
+def _use_glm53_fused_permute_q8(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    return bool(
+        getattr(layer, "sm70_glm53_fused_permute_q8", False)
+        and _use_glm53_grouped_expert_rows(layer, x.shape[0])
+        and tuple(x.shape) == (8, 4096)
+        and x.is_contiguous()
+        and tuple(topk_ids.shape) == (8, 8)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_ids.device == x.device
+    )
+
+
 def _use_compact_grouped(num_tokens: int, top_k: int) -> bool:
     """Bound compact dispatch by its routed-row workload, not batch size."""
     total_slots = num_tokens * top_k
@@ -323,17 +653,7 @@ def _use_compact_grouped(num_tokens: int, top_k: int) -> bool:
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
     """Reject every topology outside the validated SM70 NVFP4 contract."""
-    if moe.tp_size not in _SUPPORTED_TP_SIZES:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
-            f"sizes {_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
-        )
     local_intermediate = moe.intermediate_size_per_partition
-    if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
-            f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
-        )
     global_intermediate = local_intermediate * max(moe.tp_size, 1)
     contract = (
         moe.hidden_dim,
@@ -341,6 +661,17 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
         moe.num_experts,
         moe.experts_per_token,
     )
+    glm53_tp8 = moe.tp_size == 8 and contract == (4096, 2048, 288, 8)
+    if moe.tp_size not in _SUPPORTED_TP_SIZES and not glm53_tp8:
+        raise NotImplementedError(
+            "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
+            f"sizes {_SUPPORTED_TP_SIZES}, plus GLM-5.3 TP8; got {moe.tp_size}."
+        )
+    if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
+        raise NotImplementedError(
+            "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
+            f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
+        )
     if contract not in _SUPPORTED_CONTRACTS:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE shape is not validated: "
@@ -431,8 +762,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if (
             envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE
-            and not sm70_ops.has_nvfp4_qpn_m1_dispatch()
-        ):
+            or envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE
+        ) and not sm70_ops.has_nvfp4_qpn_m1_dispatch():
             missing.append("nvfp4_moe_qpn_m1_sm70_out")
         w2_direct_reduce_requested = bool(
             envs.VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE
@@ -567,12 +898,100 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         fast_prefill = bool(
             fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
         )
+        raw_scale_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE
+            and int(layer.moe_config.tp_size) == 4
+            and num_experts == 512
+            and hidden == 2560
+            and intermediate == 160
+            and int(layer.moe_config.experts_per_token) == 10
+        )
+        raw_scale_available = sm70_ops.has_nvfp4_qpn_raw_scale_dispatch()
+        raw_scale_explicit = "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE" in os.environ
+        if raw_scale_requested and not raw_scale_available and raw_scale_explicit:
+            raise RuntimeError(
+                "SM70 Qwen3.8 raw E4M3 scale storage requires the matching "
+                "QPN decode and prefill-expansion operators."
+            )
+        if raw_scale_requested and not raw_scale_available:
+            logger.warning_once(
+                "The default SM70 Qwen3.8 raw E4M3 scale operators are not "
+                "present; retaining persistent FP16 prepared scales. An "
+                "explicit opt-in fails closed."
+            )
+        raw_scale = bool(raw_scale_requested and raw_scale_available)
+
+        glm53_fused_permute_requested = bool(
+            envs.VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8
+            and int(layer.moe_config.tp_size) in (4, 8)
+            and num_experts == 288
+            and hidden == 4096
+            and intermediate in (256, 512)
+            and int(layer.moe_config.experts_per_token) == 8
+        )
+        glm53_fused_permute_available = hasattr(
+            torch.ops._C, "sm70_glm53_moe_permute_q8_out"
+        )
+        glm53_fused_permute_explicit = (
+            "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8" in os.environ
+        )
+        if (
+            glm53_fused_permute_requested
+            and not glm53_fused_permute_available
+            and glm53_fused_permute_explicit
+        ):
+            raise RuntimeError(
+                "SM70 GLM-5.3 fused q8 MoE permute requires the TurboMind "
+                "extension with sm70_glm53_moe_permute_q8_out."
+            )
+        if glm53_fused_permute_requested and not glm53_fused_permute_available:
+            logger.warning_once(
+                "The default SM70 GLM-5.3 fused q8 MoE permute op is absent "
+                "from the loaded extension; retaining the generic graph-safe "
+                "permute route. Explicit opt-in fails closed."
+            )
+        glm53_fused_permute_q8 = bool(
+            glm53_fused_permute_requested and glm53_fused_permute_available
+        )
+        glm53_qpn_w13_requested = bool(
+            envs.VLLM_SM70_GLM53_MOE_QPN_W13_Q8
+            and glm53_fused_permute_q8
+            and int(layer.moe_config.tp_size) == 8
+            and num_experts == 288
+            and hidden == 4096
+            and intermediate == 256
+            and int(layer.moe_config.experts_per_token) == 8
+        )
+        glm53_qpn_w13_available = hasattr(
+            torch.ops._C, "nvfp4_glm53_moe_q8_qpn_sm70_out"
+        )
+        glm53_qpn_w13_explicit = "VLLM_SM70_GLM53_MOE_QPN_W13_Q8" in os.environ
+        if (
+            glm53_qpn_w13_requested
+            and not glm53_qpn_w13_available
+            and glm53_qpn_w13_explicit
+        ):
+            raise RuntimeError(
+                "SM70 GLM-5.3 TP8 q8 W13 QPN requires the TurboMind extension "
+                "with nvfp4_glm53_moe_q8_qpn_sm70_out."
+            )
+        if glm53_qpn_w13_requested and not glm53_qpn_w13_available:
+            logger.warning_once(
+                "The default SM70 GLM-5.3 TP8 q8 W13 QPN op is absent; "
+                "retaining the exact TurboMind split-3 path. Explicit opt-in "
+                "fails closed."
+            )
+        glm53_qpn_w13_q8 = bool(glm53_qpn_w13_requested and glm53_qpn_w13_available)
 
         w13_tm_weights: list[torch.Tensor] = []
         w13_tm_scales: list[torch.Tensor] = []
+        w13_raw_scale_codes: list[torch.Tensor] = []
+        w13_raw_global_scales: list[torch.Tensor] = []
         w13_meta: list[torch.Tensor] = []
         w2_tm_weights: list[torch.Tensor] = []
         w2_tm_scales: list[torch.Tensor] = []
+        w2_raw_scale_codes: list[torch.Tensor] = []
+        w2_raw_global_scales: list[torch.Tensor] = []
         w2_meta: list[torch.Tensor] = []
         for expert_id in range(num_experts):
             w13_packed = unpack_mxfp4_weight(layer.w13_weight[expert_id].data)
@@ -588,13 +1007,25 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             w13_tm_weights.append(prepared_w13[0])
             w13_tm_scales.append(prepared_w13[1])
+            if raw_scale:
+                if fused_swiglu_prefill:
+                    physical_global = w13_global.repeat(
+                        intermediate // 32
+                    ).repeat_interleave(32)
+                else:
+                    physical_global = w13_global.repeat_interleave(intermediate)
+                w13_raw_scale_codes.append(
+                    (prepared_w13[1].float() / physical_global[None, :].float())
+                    .to(torch.float8_e4m3fn)
+                    .view(torch.uint8)
+                    .contiguous()
+                )
+                w13_raw_global_scales.append(w13_global.contiguous())
             w13_meta.append(prepared_w13[2])
 
             w2_packed = unpack_mxfp4_weight(layer.w2_weight[expert_id].data)
-            w2_scales = (
-                layer.w2_weight_scale[expert_id].float()
-                * layer.w2_weight_scale_2[expert_id].float()
-            )
+            w2_global = layer.w2_weight_scale_2[expert_id].float().reshape(())
+            w2_scales = layer.w2_weight_scale[expert_id].float() * w2_global
             prepared_w2 = sm70_ops.nvfp4_sm70_prepare(
                 w2_packed,
                 w2_scales.half().t().contiguous(),
@@ -602,14 +1033,71 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             w2_tm_weights.append(prepared_w2[0])
             w2_tm_scales.append(prepared_w2[1])
+            if raw_scale:
+                w2_raw_scale_codes.append(
+                    (prepared_w2[1].float() / w2_global)
+                    .to(torch.float8_e4m3fn)
+                    .view(torch.uint8)
+                    .contiguous()
+                )
+                w2_raw_global_scales.append(w2_global.reshape(1))
             w2_meta.append(prepared_w2[2])
 
         layer.w13_tm_weight = Parameter(
             torch.stack(w13_tm_weights), requires_grad=False
         )
-        layer.w13_tm_scales = Parameter(torch.stack(w13_tm_scales), requires_grad=False)
         layer.w2_tm_weight = Parameter(torch.stack(w2_tm_weights), requires_grad=False)
-        layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
+        prepared_w13_scales = torch.stack(w13_tm_scales)
+        prepared_w2_scales = torch.stack(w2_tm_scales)
+        if raw_scale:
+            raw_w13_codes = torch.stack(w13_raw_scale_codes)
+            raw_w13_globals = torch.stack(w13_raw_global_scales).float()
+            raw_w2_codes = torch.stack(w2_raw_scale_codes)
+            raw_w2_globals = torch.stack(w2_raw_global_scales).float()
+            scale_workspace = _get_qwen38_raw_scale_workspace(
+                layer.w13_tm_weight.device
+            )
+            w13_workspace = scale_workspace.view(512, 160, 320)
+            w2_workspace = scale_workspace[: 512 * 10 * 2560].view(512, 10, 2560)
+            w13_exact = _raw_scales_match_prepared(
+                w13_workspace,
+                raw_w13_codes,
+                raw_w13_globals,
+                prepared_w13_scales,
+                fused_swiglu_prefill,
+            )
+            w2_exact = _raw_scales_match_prepared(
+                w2_workspace,
+                raw_w2_codes,
+                raw_w2_globals,
+                prepared_w2_scales,
+                False,
+            )
+            if not (w13_exact and w2_exact):
+                if raw_scale_explicit:
+                    raise RuntimeError(
+                        "SM70 Qwen3.8 raw E4M3 scale reconstruction is not "
+                        "bitwise equal to the prepared FP16 checkpoint scales."
+                    )
+                logger.warning_once(
+                    "SM70 Qwen3.8 raw E4M3 scale reconstruction did not match "
+                    "the prepared checkpoint scales; retaining the FP16 scale "
+                    "representation."
+                )
+                raw_scale = False
+
+        if raw_scale:
+            layer.w13_raw_scale_codes = Parameter(raw_w13_codes, requires_grad=False)
+            layer.w13_raw_global_scales = Parameter(
+                raw_w13_globals, requires_grad=False
+            )
+            layer.w2_raw_scale_codes = Parameter(raw_w2_codes, requires_grad=False)
+            layer.w2_raw_global_scales = Parameter(raw_w2_globals, requires_grad=False)
+            layer.w13_tm_scales = w13_workspace
+            layer.w2_tm_scales = w2_workspace
+        else:
+            layer.w13_tm_scales = Parameter(prepared_w13_scales, requires_grad=False)
+            layer.w2_tm_scales = Parameter(prepared_w2_scales, requires_grad=False)
 
         w13_k_ld = int(w13_meta[0][0].item())
         w13_q_ld = int(w13_meta[0][1].item())
@@ -683,11 +1171,43 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
         layer.sm70_nvfp4_qwen38_fused_swiglu_decode = fused_swiglu_decode
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
+        layer.sm70_nvfp4_qwen38_raw_scale = raw_scale
         layer.sm70_nvfp4_qwen38_w2_direct_reduce = bool(
             w2_direct_reduce_requested and w2_direct_reduce_available
         )
+
+        layer.sm70_glm53_fused_permute_q8 = glm53_fused_permute_q8
+        layer.sm70_glm53_qpn_w13_q8 = glm53_qpn_w13_q8
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
+        grouped_requested = bool(
+            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+            and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
+            == (512, 2560, 160, 10)
+            and not raw_scale
+            and layer.swiglu_limit is None
+        )
+        if grouped_requested and not sm70_ops.has_nvfp4_grouped_decode_dispatch():
+            raise RuntimeError(
+                "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native build."
+            )
+        layer.sm70_nvfp4_grouped_decode = grouped_requested
+        if grouped_requested:
+            # Layer-owned metadata; W2 reuses sorted_output. No process-global
+            # cache or additional activation buffer inside graph capture.
+            device = layer.w13_tm_weight.device
+            layer._nvfp4_grouped_rows = torch.empty(
+                160, 8, dtype=torch.int32, device=device
+            )
+            layer._nvfp4_grouped_experts = torch.empty(
+                160, dtype=torch.int32, device=device
+            )
+            layer._nvfp4_grouped_sizes = torch.empty(
+                160, dtype=torch.int32, device=device
+            )
+            layer._nvfp4_grouped_total = torch.empty(
+                1, dtype=torch.int32, device=device
+            )
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight
@@ -709,6 +1229,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             _GRAPH_SAFE_MAX_TOKENS,
             _COMPACT_GROUPED_MAX_SLOTS,
         )
+        if raw_scale:
+            logger.info_once(
+                "SM70 Qwen3.8 raw E4M3 expert-scale storage enabled; "
+                "generic and prefill routes share one FP16 expansion workspace."
+            )
         if fused_swiglu_prefill:
             logger.info_once(
                 "SM70 Qwen3.8 indexed-A fused-SwiGLU prefill candidate "
@@ -723,6 +1248,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 fast grouped prefill enabled "
                 "(zero-copy W13 N256+N64, cached-B W2)."
+            )
+        if glm53_fused_permute_q8:
+            logger.info_once(
+                "SM70 GLM-5.3 exact fused q8 MoE permute enabled "
+                "(M8/K8/E288 stable sort and materialized expert rows)."
             )
 
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
@@ -965,18 +1495,92 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         split_fused_indexed_w13 = fused_indexed_w13 and bool(
             getattr(layer, "sm70_nvfp4_qwen38_fast_prefill", False)
         )
+        glm53_fused_permute_q8 = _use_glm53_fused_permute_q8(layer, x, topk_ids)
+        glm53_qpn_w13_q8 = _use_glm53_qpn_w13_q8(
+            layer,
+            x,
+            topk_ids,
+            fused_permute=glm53_fused_permute_q8,
+        )
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
+        if _use_grouped_decode(layer, x, topk_ids):
+            sm70_ops.nvfp4_grouped_w13_sm70_out(
+                buffers["intermediate"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                topk_ids.view(-1),
+                layer._nvfp4_grouped_rows,
+                layer._nvfp4_grouped_experts,
+                layer._nvfp4_grouped_sizes,
+                layer._nvfp4_grouped_total,
+                4 if num_tokens == 8 else 8,
+                interleaved_w13,
+            )
+            sm70_ops.nvfp4_grouped_w2_sm70_out(
+                output,
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                topk_weights,
+                layer._nvfp4_grouped_rows,
+                layer._nvfp4_grouped_experts,
+                layer._nvfp4_grouped_sizes,
+                layer._nvfp4_grouped_total,
+            )
+            logger.info_once(
+                "Experimental SM70 grouped native-NVFP4 decode selected "
+                "(tokens=%d, W13/W2 share route groups).",
+                num_tokens,
+            )
+            return output
         direct_single_token = num_tokens == 1
         direct_qpn_m1 = _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
+        direct_qpn_batch = _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
         direct_qpn_mtp5 = _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
-        if direct_qpn_m1 or direct_qpn_mtp5:
-            w13_split_k = (
-                _QWEN38_QPN_M1_W13_SPLIT_K
-                if direct_qpn_m1
-                else _QWEN38_QPN_MTP5_W13_SPLIT_K
+        raw_scale = bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False))
+        if os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1" and num_tokens <= 16:
+            logger.warning_once(
+                "SM70 Qwen3.8 QPN route debug: tokens=%d x_shape=%s "
+                "x_stride=%s x_dtype=%s x_contiguous=%s ids_shape=%s "
+                "ids_stride=%s ids_dtype=%s ids_contiguous=%s tp=%s "
+                "experts=%s hidden=%s intermediate=%s top_k=%s "
+                "m1=%s batch=%s mtp5=%s compiling=%s capturing=%s.",
+                num_tokens,
+                tuple(x.shape),
+                tuple(x.stride()),
+                x.dtype,
+                x.is_contiguous(),
+                tuple(topk_ids.shape),
+                tuple(topk_ids.stride()),
+                topk_ids.dtype,
+                topk_ids.is_contiguous(),
+                layer.moe_config.tp_size,
+                layer.sm70_nvfp4_num_experts,
+                layer.sm70_nvfp4_hidden_size,
+                layer.sm70_nvfp4_intermediate_size,
+                layer.sm70_nvfp4_top_k,
+                direct_qpn_m1,
+                direct_qpn_batch,
+                direct_qpn_mtp5,
+                torch.compiler.is_compiling(),
+                torch.cuda.is_current_stream_capturing(),
             )
+        if direct_qpn_m1 or direct_qpn_batch or direct_qpn_mtp5:
+            if direct_qpn_m1:
+                w13_split_k = _QWEN38_QPN_M1_W13_SPLIT_K
+            elif direct_qpn_batch:
+                split_table = (
+                    _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K
+                    if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE
+                    else _QWEN38_QPN_BATCH_W13_SPLIT_K
+                )
+                w13_split_k = split_table[num_tokens]
+            else:
+                w13_split_k = _QWEN38_QPN_MTP5_W13_SPLIT_K
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 direct expert path enabled "
                 "(TP4, E512/K10, tokens=%d, W13 split%d, W2 split1).",
@@ -985,18 +1589,16 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             )
             route_ids = topk_ids.view(-1)
             direct_op = (
-                sm70_ops.nvfp4_moe_qpn_m1_sm70_out
-                if direct_qpn_m1
-                else sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out
+                sm70_ops.nvfp4_moe_qpn_mtp5_sm70_out
+                if direct_qpn_mtp5
+                else sm70_ops.nvfp4_moe_qpn_m1_sm70_out
             )
+            fused_batch_w13 = _use_qwen38_qpn_batch_fused_w13(layer, x, topk_ids)
             fused_w13_decode = bool(
                 direct_qpn_m1
+                and not raw_scale
                 and interleaved_w13
-                and getattr(
-                    layer,
-                    "sm70_nvfp4_qwen38_fused_swiglu_decode",
-                    False,
-                )
+                and getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_decode", False)
             )
             if fused_w13_decode:
                 sm70_ops.nvfp4_qwen38_w13_fused_swiglu_out(
@@ -1006,24 +1608,63 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     layer.w13_tm_scales,
                     route_ids,
                 )
-            else:
-                direct_op(
-                    buffers["gate_up"],
-                    x,
-                    layer.w13_tm_weight,
-                    layer.w13_tm_scales,
-                    route_ids,
-                    True,
-                    w13_split_k,
+            elif fused_batch_w13:
+                logger.info_once(
+                    "SM70 Qwen3.8 NVFP4 direct W13+SwiGLU fusion enabled (tokens=%d).",
+                    num_tokens,
                 )
+                if raw_scale:
+                    sm70_ops.nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out(
+                        buffers["intermediate"],
+                        x,
+                        layer.w13_tm_weight,
+                        layer.w13_raw_scale_codes,
+                        layer.w13_raw_global_scales,
+                        route_ids,
+                        interleaved_w13,
+                    )
+                else:
+                    sm70_ops.nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(
+                        buffers["intermediate"],
+                        x,
+                        layer.w13_tm_weight,
+                        layer.w13_tm_scales,
+                        route_ids,
+                        interleaved_w13,
+                    )
+            else:
+                if raw_scale:
+                    sm70_ops.nvfp4_moe_qpn_raw_scale_sm70_out(
+                        buffers["gate_up"],
+                        x,
+                        layer.w13_tm_weight,
+                        layer.w13_raw_scale_codes,
+                        layer.w13_raw_global_scales,
+                        route_ids,
+                        True,
+                        interleaved_w13,
+                        w13_split_k,
+                    )
+                else:
+                    direct_op(
+                        buffers["gate_up"],
+                        x,
+                        layer.w13_tm_weight,
+                        layer.w13_tm_scales,
+                        route_ids,
+                        True,
+                        w13_split_k,
+                    )
                 self._apply_swiglu(
                     layer,
                     buffers["intermediate"],
                     buffers["gate_up"],
                     interleaved=interleaved_w13,
                 )
-            if direct_qpn_m1 and bool(
-                getattr(layer, "sm70_nvfp4_qwen38_w2_direct_reduce", False)
+            if (
+                direct_qpn_m1
+                and not raw_scale
+                and getattr(layer, "sm70_nvfp4_qwen38_w2_direct_reduce", False)
             ):
                 sm70_ops.nvfp4_qwen38_w2_direct_reduce_out(
                     output,
@@ -1034,15 +1675,54 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     topk_weights,
                 )
                 return output
-            direct_op(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                layer.w2_tm_weight,
-                layer.w2_tm_scales,
-                route_ids,
-                False,
-                _QWEN38_QPN_M1_W2_SPLIT_K,
-            )
+            if _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids):
+                logger.info_once(
+                    "SM70 Qwen3.8 NVFP4 direct W2+weighted-reduce fusion "
+                    "enabled (tokens=%d).",
+                    num_tokens,
+                )
+                if raw_scale:
+                    sm70_ops.nvfp4_moe_qpn_raw_w2_reduce_sm70_out(
+                        output,
+                        buffers["intermediate"],
+                        layer.w2_tm_weight,
+                        layer.w2_raw_scale_codes,
+                        layer.w2_raw_global_scales,
+                        route_ids,
+                        topk_weights,
+                    )
+                else:
+                    sm70_ops.nvfp4_moe_qpn_w2_reduce_sm70_out(
+                        output,
+                        buffers["intermediate"],
+                        layer.w2_tm_weight,
+                        layer.w2_tm_scales,
+                        route_ids,
+                        topk_weights,
+                    )
+                return output
+            if raw_scale:
+                sm70_ops.nvfp4_moe_qpn_raw_scale_sm70_out(
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    layer.w2_tm_weight,
+                    layer.w2_raw_scale_codes,
+                    layer.w2_raw_global_scales,
+                    route_ids,
+                    False,
+                    False,
+                    _QWEN38_QPN_M1_W2_SPLIT_K,
+                )
+            else:
+                direct_op(
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    layer.w2_tm_weight,
+                    layer.w2_tm_scales,
+                    route_ids,
+                    False,
+                    _QWEN38_QPN_M1_W2_SPLIT_K,
+                )
             if direct_qpn_m1:
                 _single_token_weighted_reduce(
                     buffers["sorted_output"], topk_weights, output
@@ -1060,6 +1740,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = top_k
+        elif glm53_fused_permute_q8:
+            sm70_ops.sm70_glm53_moe_permute_q8_out(
+                x,
+                topk_ids,
+                buffers["permuted_input"],
+                buffers["sorted_row_idx"],
+                buffers["inv_permuted_idx"],
+                buffers["compact_offsets"],
+                buffers["active_expert_ids"],
+            )
+            stage_offsets = buffers["compact_offsets"]
+            stage_expert_ids = buffers["active_expert_ids"]
+            stage_experts = slots
         else:
             output.zero_()
             topk_ids_i32 = buffers["topk_ids"]
@@ -1105,8 +1798,17 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["expert_offsets64"], non_blocking=True
             )
 
-        if not direct_single_token and _use_compact_grouped(num_tokens, top_k):
-            _prepare_compact_slot_groups(
+        if (
+            not direct_single_token
+            and not glm53_fused_permute_q8
+            and _use_compact_grouped(num_tokens, top_k)
+        ):
+            prepare_groups = (
+                _prepare_compact_expert_groups
+                if _use_glm53_grouped_expert_rows(layer, num_tokens)
+                else _prepare_compact_slot_groups
+            )
+            prepare_groups(
                 buffers["permuted_experts_id"],
                 buffers["compact_offsets"],
                 buffers["active_expert_ids"],
@@ -1114,10 +1816,18 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
-        elif not direct_single_token:
+        elif not direct_single_token and not glm53_fused_permute_q8:
             stage_offsets = buffers["expert_offsets"]
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
+
+        if raw_scale:
+            sm70_ops.nvfp4_expand_raw_scales_sm70_out(
+                layer.w13_tm_scales,
+                layer.w13_raw_scale_codes,
+                layer.w13_raw_global_scales,
+                interleaved_w13,
+            )
 
         if split_fused_indexed_w13:
             logger.info_once(
@@ -1187,6 +1897,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer.sm70_nvfp4_w13_n_dim,
                 layer.sm70_nvfp4_group_size,
             )
+        elif glm53_qpn_w13_q8:
+            logger.info_once(
+                "SM70 GLM-5.3 TP8 q8 exact W13 QPN path enabled "
+                "(CTA-K32 split-3 accumulation tree)."
+            )
+            sm70_ops.nvfp4_glm53_moe_q8_qpn_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                topk_ids.view(-1),
+                buffers["sorted_row_idx"],
+                True,
+            )
         else:
             sm70_ops.nvfp4_moe_dense_stage_sm70_out(
                 buffers["gate_up"],
@@ -1206,6 +1930,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["intermediate"],
                 buffers["gate_up"],
                 interleaved=interleaved_w13,
+            )
+        if raw_scale:
+            sm70_ops.nvfp4_expand_raw_scales_sm70_out(
+                layer.w2_tm_scales,
+                layer.w2_raw_scale_codes,
+                layer.w2_raw_global_scales,
+                False,
             )
         sm70_ops.nvfp4_moe_dense_stage_sm70_out(
             buffers["sorted_output"],
@@ -1228,10 +1959,39 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 buffers["sorted_output"],
                 topk_weights,
                 buffers["inv_permuted_idx"],
-                buffers["expert_offsets64"],
+                None if glm53_fused_permute_q8 else buffers["expert_offsets64"],
                 top_k,
                 output,
             )
+        global _DFLASH_NVFP4_TRACE_ARMED
+        if _DFLASH_NVFP4_TRACE_ARMED and num_tokens > 1:
+            _DFLASH_NVFP4_TRACE_ARMED = False
+            actual = output.clone()
+            reference_rows = []
+            for token_idx in range(num_tokens):
+                reference_rows.append(
+                    self.apply(
+                        layer,
+                        x[token_idx : token_idx + 1],
+                        topk_weights[token_idx : token_idx + 1],
+                        topk_ids[token_idx : token_idx + 1],
+                        None,
+                        None,
+                    ).clone()
+                )
+            reference = torch.cat(reference_rows, dim=0)
+            delta = (actual - reference).float().reshape(num_tokens, -1)
+            logger.warning(
+                "DFLASH_TARGET_NVFP4_SEQUENCE_DELTA tokens=%d "
+                "max_by_token=%s mean_by_token=%s sqsum_by_token=%s "
+                "routes=%s",
+                num_tokens,
+                delta.abs().amax(dim=1).cpu().tolist(),
+                delta.abs().mean(dim=1).cpu().tolist(),
+                (delta * delta).sum(dim=1).cpu().tolist(),
+                topk_ids.detach().cpu().tolist(),
+            )
+            output.copy_(actual)
         return output
 
     def apply_monolithic(

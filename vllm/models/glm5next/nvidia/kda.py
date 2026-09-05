@@ -10,7 +10,7 @@ from torch import nn
 import vllm._sm70_ops as sm70_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import divide
+from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops.kda import (
@@ -48,9 +48,153 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
 
+_DEBUG_DFLASH_TARGET_FINITE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
+)
+_DEBUG_DFLASH_TARGET_TRACE = bool(
+    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
+)
+_DFLASH_KDA_TRACE_SEEN: set[tuple[str, str]] = set()
+_DFLASH_KDA_TRACE_ARMED_PREFIXES: set[str] = set()
+_DFLASH_KDA_TRACE_TOKEN_INDEX: dict[str, int] = {}
+
+
+def arm_dflash_target_kda_trace(prefix: str, token_index: int) -> None:
+    if _DEBUG_DFLASH_TARGET_TRACE:
+        _DFLASH_KDA_TRACE_ARMED_PREFIXES.add(prefix)
+        _DFLASH_KDA_TRACE_TOKEN_INDEX[prefix] = token_index
+
+
+def _debug_dflash_kda_finite(
+    prefix: str, stage: str, tensor: torch.Tensor | None
+) -> None:
+    if (
+        not _DEBUG_DFLASH_TARGET_FINITE
+        or tensor is None
+        or tensor.shape[-2 if tensor.ndim >= 2 else 0] <= 1
+    ):
+        return
+    finite = torch.isfinite(tensor)
+    if bool(finite.all().item()):
+        return
+    finite_values = tensor[finite]
+    finite_max = (
+        float(finite_values.abs().max().item()) if finite_values.numel() else 0.0
+    )
+    if tensor.ndim >= 2:
+        token_dim = 1 if tensor.ndim >= 3 else 0
+        moved = (~finite).movedim(token_dim, 0).reshape(tensor.shape[token_dim], -1)
+        bad_by_token = moved.sum(dim=1).tolist()
+    else:
+        bad_by_token = [int((~finite).sum().item())]
+    logger.error(
+        "DFlash target KDA nonfinite: prefix=%s stage=%s shape=%s "
+        "nonfinite=%d nan=%d posinf=%d neginf=%d finite_max=%s "
+        "bad_by_token=%s",
+        prefix,
+        stage,
+        tuple(tensor.shape),
+        int((~finite).sum().item()),
+        int(torch.isnan(tensor).sum().item()),
+        int(torch.isposinf(tensor).sum().item()),
+        int(torch.isneginf(tensor).sum().item()),
+        finite_max,
+        bad_by_token,
+    )
+
+
+def _debug_dflash_kda_trace(
+    prefix: str,
+    stage: str,
+    tensor: torch.Tensor,
+    token_dim: int,
+    state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+) -> None:
+    if (
+        not _DEBUG_DFLASH_TARGET_TRACE
+        or get_tensor_model_parallel_rank() != 0
+        or prefix not in _DFLASH_KDA_TRACE_ARMED_PREFIXES
+        or tensor.shape[token_dim] > 8
+        or (state_indices is not None and not bool((state_indices >= 0).any().item()))
+    ):
+        return
+    key = (prefix, stage)
+    if key in _DFLASH_KDA_TRACE_SEEN:
+        return
+    _DFLASH_KDA_TRACE_SEEN.add(key)
+    token_index = min(
+        _DFLASH_KDA_TRACE_TOKEN_INDEX.get(prefix, 0), tensor.shape[token_dim] - 1
+    )
+    row = tensor.select(token_dim, token_index).detach().float().reshape(-1)
+    state_row = (
+        None
+        if state_indices is None
+        else state_indices[0].detach().cpu().reshape(-1).tolist()
+    )
+    accepted = (
+        None
+        if num_accepted_tokens is None
+        else num_accepted_tokens.detach().cpu().reshape(-1).tolist()
+    )
+    logger.warning(
+        "DFLASH_TARGET_KDA_TRACE prefix=%s stage=%s shape=%s "
+        "state_row=%s accepted=%s sum=%.9g sqsum=%.9g absmax=%.9g sample=%s",
+        prefix,
+        stage,
+        tuple(tensor.shape),
+        state_row,
+        accepted,
+        float(row.sum().item()),
+        float((row * row).sum().item()),
+        float(row.abs().max().item()),
+        row[:8].cpu().tolist(),
+    )
+
+
+def _debug_dflash_sequence_delta(
+    prefix: str,
+    stage: str,
+    actual: torch.Tensor,
+    reference: torch.Tensor,
+    token_dim: int,
+) -> None:
+    if (
+        not _DEBUG_DFLASH_TARGET_TRACE
+        or get_tensor_model_parallel_rank() != 0
+        or prefix not in _DFLASH_KDA_TRACE_ARMED_PREFIXES
+    ):
+        return
+    key = (prefix, stage)
+    if key in _DFLASH_KDA_TRACE_SEEN:
+        return
+    _DFLASH_KDA_TRACE_SEEN.add(key)
+    delta = (actual - reference).detach().float().movedim(token_dim, 0)
+    delta = delta.reshape(delta.shape[0], -1)
+    logger.warning(
+        "DFLASH_TARGET_KDA_SEQUENCE_DELTA prefix=%s stage=%s "
+        "max_by_token=%s mean_by_token=%s sqsum_by_token=%s",
+        prefix,
+        stage,
+        delta.abs().amax(dim=1).cpu().tolist(),
+        delta.abs().mean(dim=1).cpu().tolist(),
+        (delta * delta).sum(dim=1).cpu().tolist(),
+    )
+
 
 def _sm70_exact_kda_gemv_enabled() -> bool:
     return os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "1") != "0"
+
+
+def _sm70_glm53_tp8_cublaslt_enabled() -> bool:
+    return (
+        os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0") != "0"
+        and torch.version.cuda == "12.8"
+    )
+
+
+def _sm70_glm53_tp8_fused_fg_b_enabled() -> bool:
+    return os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0") != "0"
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
@@ -207,17 +351,41 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
-        self._use_sm70_fused_fg_b_decode = (
+        use_sm70_tp4_fused_fg_b = (
             current_platform.is_cuda()
             and current_platform.get_device_capability() == (7, 0)
             and self.tp_size == 4
             and self.head_dim == 128
             and self.local_projection_size == 2048
         )
+        use_sm70_tp8_fused_fg_b = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.tp_size == 8
+            and self.head_dim == 128
+            and self.local_projection_size == 1024
+            and _sm70_glm53_tp8_fused_fg_b_enabled()
+        )
+        self._use_sm70_fused_fg_b_decode = (
+            use_sm70_tp4_fused_fg_b or use_sm70_tp8_fused_fg_b
+        )
         self._use_sm70_exact_kda_gemv = (
             self._use_sm70_fused_fg_b_decode
             and self.hidden_size == 4096
             and _sm70_exact_kda_gemv_enabled()
+        )
+        self._use_sm70_fp32_recurrent_output = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.head_dim == 128
+        )
+        self._use_sm70_glm53_tp8_cublaslt = (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+            and self.tp_size == 8
+            and self.hidden_size == 4096
+            and self.local_projection_size == 1024
+            and _sm70_glm53_tp8_cublaslt_enabled()
         )
 
         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
@@ -305,6 +473,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             quant_config=self.quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        self.in_proj_qkvbfg_a._sm70_glm53_tp8_cublaslt = (
+            self._use_sm70_glm53_tp8_cublaslt
+        )
+        self.o_proj._sm70_glm53_tp8_cublaslt = self._use_sm70_glm53_tp8_cublaslt
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -347,7 +519,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         weight = self.in_proj_qkvbfg_a.weight
         use_sm70_exact_gemv = (
             self._use_sm70_exact_kda_gemv
-            and num_tokens == 1
+            and 1 <= num_tokens <= 8
             and hidden_states.dtype == torch.float16
             and weight.dtype == torch.float16
             and hidden_states.is_contiguous()
@@ -361,14 +533,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     "Rebuild vLLM from source with CUDA arch 7.0."
                 )
             projected = torch.empty(
-                (1, 6416),
+                (num_tokens, 6416),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
             sm70_ops.sm70_glm53_fp16_gemv_out(projected, hidden_states, weight)
-            logger.info_once("SM70 GLM KDA exact FP16 GEMV decode path enabled.")
+            logger.info_once("SM70 GLM KDA exact FP16 B1-B8 projection path enabled.")
         else:
             projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+        _debug_dflash_kda_finite(self.prefix, "projection", projected)
+        _debug_dflash_kda_trace(
+            self.prefix, "projection_full", projected, 0, None, None
+        )
         qkv, beta_raw, f_a, g_a = projected.split(
             [
                 3 * self.local_projection_size,
@@ -385,14 +561,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # / spec-verify steps then skip the _cast_sigmoid kernel and its fp32
         # intermediate entirely.
         beta = beta_raw.unsqueeze(0)
-        if self._use_sm70_fused_fg_b_decode and num_tokens == 1:
+        if self._use_sm70_fused_fg_b_decode and 1 <= num_tokens <= 8:
             if not hasattr(torch.ops._C, "sm70_glm_kda_fg_b_out"):
                 raise RuntimeError(
                     "SM70 GLM KDA decode requires the native fused f_b/g_b op. "
                     "Rebuild vLLM from source with CUDA arch 7.0."
                 )
             g1 = torch.empty(
-                (1, self.local_projection_size),
+                (num_tokens, self.local_projection_size),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
@@ -405,18 +581,37 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 self.f_b_proj.weight,
                 self.g_b_proj.weight,
             )
-            logger.info_once("SM70 GLM KDA fused f_b/g_b decode path enabled.")
+            logger.info_once("SM70 GLM KDA fused B1-B8 f_b/g_b path enabled.")
         else:
             g1 = self.f_b_proj(f_a)[0]
             g_proj_states = self.g_b_proj(g_a)[0]
+        _debug_dflash_kda_finite(self.prefix, "gates", g1)
+        _debug_dflash_kda_finite(self.prefix, "output_gate", g_proj_states)
+        _debug_dflash_kda_trace(self.prefix, "gates", g1, 0, None, None)
+        _debug_dflash_kda_trace(
+            self.prefix, "output_gate", g_proj_states, 0, None, None
+        )
         g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
 
         # Must stay 3D: rms_norm_gated reads H from g.shape[-2].
         g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
 
+        is_recurrent_step = num_tokens <= self.num_spec + 1
+        attn_metadata_raw = get_forward_context().attn_metadata
+        if isinstance(attn_metadata_raw, dict):
+            layer_metadata = attn_metadata_raw.get(self.prefix)
+            if isinstance(layer_metadata, GDNAttentionMetadata):
+                is_recurrent_step = layer_metadata.num_prefills == 0
+        core_output_dtype = (
+            torch.float32
+            if self._use_sm70_fp32_recurrent_output
+            and hidden_states.dtype == torch.float16
+            and is_recurrent_step
+            else hidden_states.dtype
+        )
         core_attn_out = torch.empty(
             (1, num_tokens, self.local_num_heads, self.head_dim),
-            dtype=hidden_states.dtype,
+            dtype=core_output_dtype,
             device=hidden_states.device,
         )
         # Call the decorated eager break directly so host-side prefill branches
@@ -427,9 +622,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             beta=beta,
             core_attn_out=core_attn_out,
         )
-        core_attn_out = self.o_norm(core_attn_out, g2)
+        if core_output_dtype != hidden_states.dtype:
+            core_attn_out = self.o_norm(
+                core_attn_out,
+                g2,
+                out_dtype=hidden_states.dtype,
+            )
+            logger.info_once(
+                "SM70 GLM KDA keeps recurrent output in FP32 through RMSNorm."
+            )
+        else:
+            core_attn_out = self.o_norm(core_attn_out, g2)
+        _debug_dflash_kda_trace(self.prefix, "normalized", core_attn_out, 1, None, None)
         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
-        return self.o_proj(core_attn_out)[0]
+        projected_output = self.o_proj(core_attn_out)[0]
+        _debug_dflash_kda_trace(
+            self.prefix, "output_projection", projected_output, 0, None, None
+        )
+        return projected_output
 
     @eager_break_during_capture
     def _forward(
@@ -479,6 +689,19 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # Layout is process-global and resolved once at init (see __init__).
         if not self._conv_state_dim_first:
             conv_state = conv_state.transpose(-1, -2)
+
+        trace_state_indices = (
+            spec_state_indices_tensor if use_spec else non_spec_state_indices_tensor
+        )
+        if trace_state_indices is not None and attn_metadata_narrowed.num_prefills == 0:
+            _debug_dflash_kda_trace(
+                self.prefix,
+                "projection",
+                qkv_proj_states,
+                0,
+                trace_state_indices,
+                num_accepted_tokens,
+            )
 
         # One merged short-conv over q|k|v instead of three separate calls. The
         # 1D conv is independent per channel, so concatenating q/k/v along the
@@ -530,11 +753,46 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
 
         # --- causal conv1d: spec (draft-verify) path ---
+        debug_spec_conv_reference = None
         if use_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
             conv_mql = spec_state_indices_tensor.size(-1)
+            debug_spec_sequence = (
+                _DEBUG_DFLASH_TARGET_TRACE
+                and get_tensor_model_parallel_rank() == 0
+                and self.prefix in _DFLASH_KDA_TRACE_ARMED_PREFIXES
+                and self.prefix.endswith(".layers.0.self_attn")
+                and num_spec_decodes == 1
+            )
+            if debug_spec_sequence:
+                assert spec_query_start_loc is not None
+                debug_start = int(spec_query_start_loc[0].item())
+                debug_end = int(spec_query_start_loc[1].item())
+                debug_accepted_offset = int(num_accepted_tokens[0].item()) - 1
+                debug_conv_width = conv_weights.shape[1] - 1
+                debug_conv_state = conv_state[
+                    int(conv_idx[0].item()) : int(conv_idx[0].item()) + 1,
+                    :,
+                    debug_accepted_offset : debug_accepted_offset + debug_conv_width,
+                ].clone()
+                debug_conv_indices = torch.zeros(
+                    (1,), dtype=conv_idx.dtype, device=conv_idx.device
+                )
+                debug_conv_rows = []
+                for token_idx in range(debug_start, debug_end):
+                    debug_conv_rows.append(
+                        causal_conv1d_update(
+                            qkv_spec[token_idx : token_idx + 1].clone(),
+                            debug_conv_state,
+                            conv_weights,
+                            conv_bias,
+                            activation="silu",
+                            conv_state_indices=debug_conv_indices,
+                        )
+                    )
+                debug_spec_conv_reference = torch.cat(debug_conv_rows, dim=0)
             qkv_spec = causal_conv1d_update(
                 qkv_spec,
                 conv_state,
@@ -546,6 +804,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 query_start_loc=spec_query_start_loc,
                 max_query_len=conv_mql,
             )
+            _debug_dflash_kda_trace(
+                self.prefix,
+                "spec_conv",
+                qkv_spec,
+                0,
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+            )
+            if debug_spec_conv_reference is not None:
+                _debug_dflash_sequence_delta(
+                    self.prefix,
+                    "spec_conv_sequential",
+                    qkv_spec[debug_start:debug_end],
+                    debug_spec_conv_reference,
+                    0,
+                )
+            _debug_dflash_kda_finite(self.prefix, "spec_conv", qkv_spec)
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
         # --- causal conv1d: non-spec path (prefill or plain decode) ---
@@ -577,6 +852,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 activation="silu",
                 conv_state_indices=decode_conv_indices,
             )
+            _debug_dflash_kda_trace(
+                self.prefix,
+                "decode_conv",
+                qkv_ns,
+                0,
+                decode_conv_indices,
+                None,
+            )
             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
 
         def _rearr(x):
@@ -593,10 +876,100 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
             else None
         )
+        debug_spec_b1_reference = None
+        debug_spec_sequence_reference = None
         if use_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
             assert spec_query_start_loc is not None
+            if debug_spec_sequence:
+                accepted_offset = num_accepted_tokens[:1].to(torch.long) - 1
+                state_slot = spec_state_indices_tensor[:1].gather(
+                    1, accepted_offset.view(1, 1)
+                )
+                debug_initial_state = recurrent_state.index_select(
+                    0, state_slot.reshape(-1).to(torch.long)
+                ).clone()
+                _debug_dflash_kda_trace(
+                    self.prefix,
+                    "spec_initial_state",
+                    debug_initial_state,
+                    0,
+                    state_slot,
+                    num_accepted_tokens,
+                )
+                debug_spec_b1_reference = torch.empty(
+                    (1, 1, self.local_num_heads, self.head_dim),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+                debug_state_indices = torch.zeros(
+                    (1,),
+                    dtype=spec_state_indices_tensor.dtype,
+                    device=spec_state_indices_tensor.device,
+                )
+                debug_cu_seqlens = torch.tensor(
+                    [0, 1],
+                    dtype=spec_query_start_loc.dtype,
+                    device=spec_query_start_loc.device,
+                )
+                debug_b1_state = debug_initial_state.clone()
+                fused_recurrent_kda(
+                    q=_rearr(q_spec)[:, :1],
+                    k=_rearr(k_spec)[:, :1],
+                    v=_rearr(v_spec)[:, :1],
+                    g=g1_spec[:, :1],
+                    beta=beta_spec[:, :1],
+                    initial_state=debug_b1_state,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=debug_cu_seqlens,
+                    ssm_state_indices=debug_state_indices,
+                    out=debug_spec_b1_reference,
+                    sigmoid_beta=True,
+                    a_log=self.A_log,
+                    g_bias=self.dt_bias,
+                    compute_gate=True,
+                    lower_bound=lower_bound,
+                )
+                debug_spec_sequence_reference = torch.empty(
+                    (
+                        1,
+                        debug_end - debug_start,
+                        self.local_num_heads,
+                        self.head_dim,
+                    ),
+                    dtype=core_attn_out.dtype,
+                    device=core_attn_out.device,
+                )
+                debug_sequence_state = debug_initial_state.clone()
+                for token_idx in range(debug_end - debug_start):
+                    fused_recurrent_kda(
+                        q=_rearr(q_spec)[
+                            :, debug_start + token_idx : debug_start + token_idx + 1
+                        ],
+                        k=_rearr(k_spec)[
+                            :, debug_start + token_idx : debug_start + token_idx + 1
+                        ],
+                        v=_rearr(v_spec)[
+                            :, debug_start + token_idx : debug_start + token_idx + 1
+                        ],
+                        g=g1_spec[
+                            :, debug_start + token_idx : debug_start + token_idx + 1
+                        ],
+                        beta=beta_spec[
+                            :, debug_start + token_idx : debug_start + token_idx + 1
+                        ],
+                        initial_state=debug_sequence_state,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=debug_cu_seqlens,
+                        ssm_state_indices=debug_state_indices,
+                        out=debug_spec_sequence_reference[:, token_idx : token_idx + 1],
+                        sigmoid_beta=True,
+                        a_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        compute_gate=True,
+                        lower_bound=lower_bound,
+                    )
             # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
             # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit and
             # skips its launch + fp32 [n, H, D] intermediate per layer.
@@ -618,6 +991,71 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 compute_gate=True,
                 lower_bound=lower_bound,
             )
+            _debug_dflash_kda_trace(
+                self.prefix,
+                "spec_recurrent",
+                core_attn_out_spec,
+                1,
+                spec_state_indices_tensor,
+                num_accepted_tokens,
+            )
+            if debug_spec_b1_reference is not None:
+                _debug_dflash_kda_trace(
+                    self.prefix,
+                    "spec_b1_reference",
+                    debug_spec_b1_reference,
+                    1,
+                    spec_state_indices_tensor,
+                    num_accepted_tokens,
+                )
+            if debug_spec_sequence_reference is not None:
+                _debug_dflash_sequence_delta(
+                    self.prefix,
+                    "spec_recurrent_sequential",
+                    core_attn_out_spec[:, debug_start:debug_end],
+                    debug_spec_sequence_reference,
+                    1,
+                )
+                _debug_dflash_kda_trace(
+                    self.prefix,
+                    "spec_b1_delta",
+                    core_attn_out_spec[:, :1] - debug_spec_b1_reference,
+                    1,
+                    spec_state_indices_tensor,
+                    num_accepted_tokens,
+                )
+            if _DEBUG_DFLASH_TARGET_FINITE and not bool(
+                torch.isfinite(core_attn_out_spec).all().item()
+            ):
+                state_rows = torch.arange(
+                    num_spec_decodes,
+                    dtype=torch.long,
+                    device=spec_state_indices_tensor.device,
+                )
+                accepted_offsets = (
+                    num_accepted_tokens[:num_spec_decodes].to(torch.long) - 1
+                )
+                state_slots = spec_state_indices_tensor[
+                    state_rows, accepted_offsets
+                ].to(torch.long)
+                selected_state = recurrent_state.index_select(0, state_slots)
+                logger.error(
+                    "DFlash target KDA state diagnostic: prefix=%s "
+                    "accepted=%s state_slots=%s state_finite=%s "
+                    "state_max=%s q_max=%s k_max=%s v_max=%s g_max=%s "
+                    "beta_max=%s",
+                    self.prefix,
+                    num_accepted_tokens[:num_spec_decodes].tolist(),
+                    state_slots.tolist(),
+                    bool(torch.isfinite(selected_state).all().item()),
+                    float(selected_state.abs().max().item()),
+                    float(q_spec.abs().max().item()),
+                    float(k_spec.abs().max().item()),
+                    float(v_spec.abs().max().item()),
+                    float(g1_spec.abs().max().item()),
+                    float(beta_spec.abs().max().item()),
+                )
+            _debug_dflash_kda_finite(self.prefix, "spec_recurrent", core_attn_out_spec)
 
         # --- core attention: non-spec path (prefill or plain decode) ---
         core_attn_out_non_spec = None
@@ -685,6 +1123,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 g_bias=self.dt_bias,
                 compute_gate=True,
                 lower_bound=lower_bound,
+            )
+            _debug_dflash_kda_trace(
+                self.prefix,
+                "decode_recurrent",
+                core_attn_out_non_spec,
+                1,
+                non_spec_state_indices_tensor,
+                None,
             )
 
         # --- merge spec / non-spec outputs back into token order ---

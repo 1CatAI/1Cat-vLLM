@@ -242,6 +242,8 @@ def _benchmark_shape(
         candidates.append(row)
 
     for padded_m in (8, 16):
+        if padded_m < _M:
+            continue
         padded_x = torch.zeros((padded_m, k), dtype=x.dtype, device=x.device)
         padded_x[:_M].copy_(x)
         padded_output = torch.empty((padded_m, n), dtype=x.dtype, device=x.device)
@@ -538,7 +540,17 @@ def _benchmark_hc_pair(
 
 
 def main() -> None:
+    global _M
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        choices=range(1, 17),
+        default=_M,
+        metavar="M",
+        help="Decode/verifier batch width (1..16; default: 5).",
+    )
     parser.add_argument("--warmups", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
@@ -565,6 +577,7 @@ def main() -> None:
     )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
+    _M = args.tokens
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         raise RuntimeError("This benchmark requires an NVIDIA SM70 GPU.")
@@ -621,7 +634,11 @@ def main() -> None:
         "weighted_cost_model": {
             "torch_us": baseline_weighted_us,
             "best_candidate_us": candidate_weighted_us,
-            "speedup": baseline_weighted_us / candidate_weighted_us,
+            "speedup": (
+                baseline_weighted_us / candidate_weighted_us
+                if candidate_weighted_us
+                else None
+            ),
             "saved_us": baseline_weighted_us - candidate_weighted_us,
             "note": (
                 "Serial service-sum model; accepted Nsight graph timing "

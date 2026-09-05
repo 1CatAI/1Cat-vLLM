@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm._sm70_ops as sm70_ops
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -754,7 +755,16 @@ def mhc_fused_post_pre_tilelang(
     use_small_fma = num_tokens <= 16
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
+        # GLM-5.3 verifies eight rows at once. On SM70, grouping twelve of the
+        # 24 outputs per CTA reduces dot-stage scheduling overhead without
+        # changing the per-output FP32 accumulation order.
         tile_n = 2 if num_tokens < 8 else 3
+        if (
+            num_tokens == 8
+            and norm_weight is not None
+            and _is_exact_sm70_glm_mhc(residual_flat, norm_weight)
+        ):
+            tile_n = 12
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
     else:
         if use_deep_gemm:
@@ -782,8 +792,15 @@ def mhc_fused_post_pre_tilelang(
         and hc_mult3 == 24
         and (
             (num_tokens < 8 and tile_n == 2 and n_splits == 8)
-            or (num_tokens == 8 and tile_n == 3 and n_splits == 4)
+            or (num_tokens == 8 and tile_n == 12 and n_splits == 4)
         )
+    )
+    use_sm70_fused_post_dot_q8 = (
+        use_sm70_fp32_stage
+        and envs.VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8
+        and num_tokens == 8
+        and tile_n == 12
+        and n_splits == 4
     )
     use_sm70_triton_large = (
         norm_weight is not None
@@ -809,7 +826,7 @@ def mhc_fused_post_pre_tilelang(
     residual_cur = torch.empty_like(residual_flat)
     residual_cur_fp32 = (
         torch.empty_like(residual_flat, dtype=torch.float32)
-        if use_sm70_fp32_stage
+        if use_sm70_fp32_stage and not use_sm70_fused_post_dot_q8
         else None
     )
     post_mix_cur = torch.empty(
@@ -832,7 +849,31 @@ def mhc_fused_post_pre_tilelang(
     )
 
     if use_small_fma:
-        if use_sm70_fp32_stage:
+        if use_sm70_fused_post_dot_q8:
+            if not hasattr(torch.ops._C, "sm70_glm_mhc_post_dot_q8_out"):
+                raise RuntimeError(
+                    "SM70 GLM mHC fused q8 post+dot requires the native CUDA "
+                    "op. Rebuild vLLM from source with CUDA arch 7.0."
+                )
+            # Output tiling does not change each output's accumulation order.
+            # Six outputs per CTA is the lowest-latency native SM70 variant.
+            native_tile_n = 6
+            logger.info_once(
+                "SM70 GLM mHC fused q8 post+dot path enabled (tile_n=%d).",
+                native_tile_n,
+            )
+            sm70_ops.sm70_glm_mhc_post_dot_q8_out(
+                residual_cur,
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                comb_res_mix_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                x_flat,
+                fn.view(hc_mult3, hc_mult, hidden_size),
+                native_tile_n,
+            )
+        elif use_sm70_fp32_stage:
             assert residual_cur_fp32 is not None
             logger.info_once("SM70 DeepSeek V4 mHC FP32 staging decode path enabled.")
             sm70_mhc_post_fp32_stage_tilelang(

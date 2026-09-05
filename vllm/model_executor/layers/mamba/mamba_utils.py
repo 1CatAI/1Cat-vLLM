@@ -262,10 +262,10 @@ class MambaStateShapeCalculator:
         proj_k_size = num_k_heads * head_k_dim
 
         conv_state_shape = cls._orient_conv_shape(
-            divide(proj_size, tp_world_size), conv_kernel_size - 1
+            divide(proj_size, tp_world_size), conv_kernel_size - 1 + num_spec
         )
         conv_state_k_shape = cls._orient_conv_shape(
-            divide(proj_k_size, tp_world_size), conv_kernel_size - 1
+            divide(proj_k_size, tp_world_size), conv_kernel_size - 1 + num_spec
         )
         recurrent_state_shape = (divide(num_heads, tp_world_size), head_dim, head_dim)
         return (

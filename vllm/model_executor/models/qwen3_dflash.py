@@ -10,6 +10,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -36,6 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal.inputs import NestedTensors
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
@@ -43,6 +45,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
+from .dflash_sm70 import dflash_layered_rms_norm_sm70
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -77,26 +80,6 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     return not all(
         _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
     )
-
-
-def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
-    """The target's RoPE layout, from its first attention layer.
-
-    A DFlash head must rotate Q/K the way the target it was distilled against
-    does, and a mismatch is silent — acceptance collapses but nothing errors and
-    the output stays correct. Draft checkpoints do not carry this, so take it
-    from the target. None if the target uses no RoPE.
-    """
-    language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    for module in language_model.modules():
-        style = getattr(module, "is_neox_style", None)
-        if isinstance(style, bool):
-            return style
-    return None
 
 
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
@@ -240,6 +223,11 @@ class DFlashQwen3Attention(nn.Module):
             is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
+        self.is_neox_style = bool(is_neox_style)
+        logger.info_once(
+            "DFlash draft RoPE layout resolved from its own config: neox=%s.",
+            self.is_neox_style,
+        )
 
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
@@ -263,6 +251,9 @@ class DFlashQwen3Attention(nn.Module):
         # The in-tree FlashAttention-V100 backend uses this marker to select
         # its DFlash-compatible non-causal paged-prefill fallback.
         self.attn.is_dflash_draft_attn = True
+        self.attn.dflash_expected_causal = causal
+        self.attn.dflash_expected_sliding_window = sliding_window
+        self.attn.dflash_rope_is_neox_style = self.is_neox_style
         self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -328,11 +319,10 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # non-causal) from the draft config.
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
 
-        # RoPE layout, copied off the target at load time by the draft loader
-        # (see `dflash_target_rope_is_neox_style`). Checkpoints do not carry it:
-        # a head distilled from an interleaved-RoPE target must rotate the way
-        # that target does, or every drafted Q/K is wrong and acceptance
-        # collapses with no error raised.
+        # RoPE layout. The rotation applies to the draft's own Q/K, so this is
+        # fixed by how the head was distilled, not by the target. A mismatch is
+        # silent and collapses acceptance, so an interleaved-trained checkpoint
+        # must declare it; released DFlash checkpoints otherwise use neox.
         is_neox_style = getattr(config, "is_neox_style", True)
 
         self.self_attn = self.attention_cls(
@@ -518,6 +508,20 @@ class DFlashQwen3Model(nn.Module):
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+        if envs.VLLM_DFLASH_DEBUG_CONTEXT_KV and get_tensor_model_parallel_rank() == 0:
+            row_diffs = (
+                self._k_norm_weights.float()
+                .sub(self._k_norm_weights[0].float())
+                .abs()
+                .amax(dim=-1)
+                .tolist()
+            )
+            logger.warning(
+                "DFlash loaded context K-norm weight diagnostics: shape=%s "
+                "max_diff_from_layer0=%s",
+                tuple(self._k_norm_weights.shape),
+                row_diffs,
+            )
         # The grouped call below relies on the stable-ABI RMSNorm extension
         # selecting one weight row per outer (layer) index. Older binaries
         # silently accepted the 2-D tensor but applied row zero to every
@@ -525,6 +529,7 @@ class DFlashQwen3Model(nn.Module):
         # target-only output quality. Verify the loaded binary once before
         # trusting its grouped result.
         self._batched_k_norm_runtime_verified: bool | None = None
+        self._sm70_context_k_debugged = False
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -639,6 +644,35 @@ class DFlashQwen3Model(nn.Module):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
+        if (
+            all_k.is_cuda
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info_once(
+                "Using the fused per-layer DFlash context K RMSNorm fast path on SM70."
+            )
+            grouped = dflash_layered_rms_norm_sm70(
+                all_k, self._k_norm_weights, self._rms_norm_eps
+            )
+            if (
+                envs.VLLM_DFLASH_DEBUG_CONTEXT_KV
+                and not self._sm70_context_k_debugged
+                and get_tensor_model_parallel_rank() == 0
+                and bool(torch.count_nonzero(all_k).item())
+            ):
+                reference = self._normalize_context_k_per_layer(all_k)
+                diff = grouped.float().sub(reference.float()).abs()
+                logger.warning(
+                    "DFlash fused SM70 context K-norm diagnostics: "
+                    "input_shape=%s max_diff=%.9g mean_diff=%.9g",
+                    tuple(all_k.shape),
+                    float(diff.max().item()),
+                    float(diff.mean().item()),
+                )
+                self._sm70_context_k_debugged = True
+            return grouped
+
         runtime_verified = getattr(self, "_batched_k_norm_runtime_verified", None)
         if runtime_verified is None:
             # This one-time comparison is normally consumed by model profiling

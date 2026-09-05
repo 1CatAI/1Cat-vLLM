@@ -173,15 +173,26 @@ def _init_kv_cache_quant(
                 and not current_platform.has_device_capability(75)
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             )
-            uses_base_scale_processing = (
-                type(quant_method).process_weights_after_loading
-                is BaseKVCacheMethod.process_weights_after_loading
+            # Lazy import: the quantization package imports Attention at module
+            # scope, so importing it here avoids a circular import.
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+                CompressedTensorsKVCacheMethod,
+            )
+
+            # Both implementations honor the unit-scale override. Check the
+            # effective method so a subclass with different scale processing
+            # does not silently inherit permission to ignore checkpoint scales.
+            uses_unit_scale_processing = type(
+                quant_method
+            ).process_weights_after_loading in (
+                BaseKVCacheMethod.process_weights_after_loading,
+                CompressedTensorsKVCacheMethod.process_weights_after_loading,
             )
             has_checkpoint_kv_scheme = (
                 getattr(quant_method.quant_config, "kv_cache_scheme", None) is not None
             )
             unit_scale_compatible = (
-                uses_base_scale_processing or not has_checkpoint_kv_scheme
+                uses_unit_scale_processing or not has_checkpoint_kv_scheme
             )
             if not sm70_flash_v100 or not unit_scale_compatible:
                 raise ValueError(
@@ -679,9 +690,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 decode_sliding_window=anchored_window,
             )
         if self.sliding_window is not None:
-            assert not vllm_config.model_config.use_mla, (
-                "MLA is not supported for slidingwindow"
-            )
+            assert getattr(self, "is_dflash_draft_attn", False) or not (
+                vllm_config.model_config.use_mla
+            ), "MLA is not supported for slidingwindow"
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

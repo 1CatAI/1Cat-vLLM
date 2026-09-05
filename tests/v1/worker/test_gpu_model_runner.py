@@ -1721,6 +1721,66 @@ def test_is_uniform_decode() -> None:
     )
 
 
+def test_compute_force_uniform_decode_rejects_hybrid_prefills() -> None:
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(is_hybrid=True),
+        requests={"req_a": SimpleNamespace(num_prompt_tokens=8)},
+    )
+    compute = GPUModelRunner._compute_force_uniform_decode
+
+    # Exact 1+K shape aliases for MTP0, MTP2, and MTP4 are prefills.
+    for prompt_len in (1, 3, 5):
+        scheduled = _schedule_new_request("req_new")
+        new_req = scheduled.scheduled_new_reqs[0]
+        new_req.prompt_token_ids = list(range(prompt_len))
+        scheduled.num_scheduled_tokens["req_new"] = prompt_len
+        scheduled.total_num_scheduled_tokens = prompt_len
+        force_uniform_decode = compute(runner, scheduled)
+        assert force_uniform_decode is False
+        assert not GPUModelRunner._is_uniform_decode(
+            max_num_scheduled_tokens=prompt_len,
+            uniform_decode_query_len=prompt_len,
+            num_tokens=prompt_len,
+            num_reqs=1,
+            force_uniform_decode=force_uniform_decode,
+        )
+
+    # A fully prefix-cached new request has finished its prompt and can defer
+    # to the normal uniform-decode shape heuristic.
+    prefix_hit = _schedule_new_request("req_new")
+    prefix_hit.scheduled_new_reqs[0].num_computed_tokens = 3
+    assert compute(runner, prefix_hit) is None
+
+    # A later chunk is still prefill until all prompt tokens are computed.
+    chunked_prefill = _schedule_cached_requests(
+        req_ids=["req_a"],
+        num_scheduled_tokens={"req_a": 3},
+        new_token_ids=[[]],
+        num_computed_tokens=[5],
+        num_output_tokens=[0],
+    )
+    assert compute(runner, chunked_prefill) is False
+
+    decode = _schedule_cached_requests(
+        req_ids=["req_a"],
+        num_scheduled_tokens={"req_a": 1},
+        new_token_ids=[[7]],
+        num_computed_tokens=[8],
+        num_output_tokens=[1],
+    )
+    assert compute(runner, decode) is None
+
+    mixed = _schedule_new_request("req_new")
+    mixed.scheduled_cached_reqs = decode.scheduled_cached_reqs
+    mixed.num_scheduled_tokens["req_a"] = 1
+    mixed.total_num_scheduled_tokens += 1
+    assert compute(runner, mixed) is False
+
+    # The guard is intentionally limited to stateful hybrid models.
+    runner.model_config.is_hybrid = False
+    assert compute(runner, _schedule_new_request("req_new")) is None
+
+
 @pytest.mark.skipif(
     current_platform.is_rocm() or current_platform.is_device_capability((7, 0)),
     reason="Attention backend FLASHINFER is not supported on ROCm or SM70.",

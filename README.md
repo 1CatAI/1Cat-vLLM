@@ -475,33 +475,33 @@ After reducing data-movement overhead, the Attention body itself is restructured
 
 Key components include:
 
-### D256 Split-D
+## D256 Split-D
 
 Split D=256 into four D64 slices.
 
 Paired warps share QK probability work while increasing PV parallelism without recomputing the same QK work.
 
-### N32 Online Softmax
+## N32 Online Softmax
 
 Retain causal online-softmax and FP32 accumulation contracts without materializing a full score matrix.
 
-### K-stage Ping-Pong
+## K-stage Ping-Pong
 
 Alternate K/D64 panels across Shared Memory stages to reduce barrier and wait pressure.
 
-### Split-KV3
+## Split-KV3
 
 Split long-prefix KV work into three partitions where useful, then merge FP32 partial state.
 
-### GQA Multi-Head Packing
+## GQA Multi-Head Packing
 
 Pack six GQA query heads into wider Tensor-Core work.
 
-### Wide QK / PV
+## Wide QK / PV
 
 Turn many fragmented small Tensor-Core operations into larger, more regular QK/PV GEMM-style work.
 
-### Prefix / Causal-Tail Separation
+## Prefix / Causal-Tail Separation
 
 Schedule the fully visible long prefix separately from the exact causal tail and merge the online-softmax state.
 
@@ -1171,6 +1171,7 @@ Join the **1Cat-vLLM Open-Source Community Group 5** by scanning the latest QR c
 - [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
 - [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)
 - [marlin_v100](https://github.com/zhinianqin/marlin_v100)
+- [v100-skinny](https://github.com/dnv2003/v100-skinny) — QPN quadpair-N `m8n8k4` decode layout behind the SM70 QPN2 / QPN4 / QPN8 and MXFP4-QPN kernels (MIT; notice retained in `csrc/sm70_turbomind/ops/LICENSE.v100-skinny`)
 
 Special thanks to [@yangzhuxinyzx](https://github.com/yangzhuxinyzx) and [@1CatTCat](https://github.com/1CatTCat) for their outstanding contributions to the continued evolution and performance breakthroughs of **1Cat-vLLM**.
 

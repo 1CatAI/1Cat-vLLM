@@ -275,6 +275,7 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self.current_step = 0
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -441,12 +442,18 @@ class Scheduler(SchedulerInterface):
 
         end = start + num_new_tokens
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            # Only take the aligned end when it advances past `start`. Otherwise
+            # this returns 0, the caller treats that as "cannot schedule", and
+            # the request is skipped on every step while it holds its KV blocks
+            # and encoder-cache entries. The condition recurs whenever the chunk
+            # available this step is shorter than one state block -- e.g. when
+            # the encoder-cache gate caps it just before an image placeholder --
+            # so the request starves indefinitely. Scheduling the shorter,
+            # unaligned chunk only skips this block's Mamba state checkpoint, and
+            # it cannot straddle two state blocks because `aligned_end <= start`
+            # implies `end < next_block_boundary`.
+            if aligned_end > start:
                 end = aligned_end
 
         # The align allocator materializes one recurrent-state column per
@@ -464,6 +471,7 @@ class Scheduler(SchedulerInterface):
         return max(end - start, 0)
 
     def schedule(self) -> SchedulerOutput:
+        self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -503,6 +511,10 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if self.current_step < request.next_decode_eligible_step:
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0

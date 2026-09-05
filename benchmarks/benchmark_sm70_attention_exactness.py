@@ -3929,6 +3929,10 @@ def run_mask_edge_cases(flash_attn_v100: Any) -> list[dict[str, Any]]:
         (69, 16, 6, 1, 256, 16, False),
         (4096, 8, 6, 1, 256, 16, True),
         (4096, 8, 6, 1, 256, 16, False),
+        # GLM-5.3-Flash DFlash2 draft attention geometry. The drafter issues
+        # one anchor plus seven mask queries over a non-causal prefix cache.
+        (181, 8, 32, 8, 128, 16, False),
+        (4096, 8, 32, 8, 128, 16, False),
     ]
     payloads: list[dict[str, Any]] = []
     for seq_len, query_len, q_heads, kv_heads, head_dim, block_size, causal in cases:

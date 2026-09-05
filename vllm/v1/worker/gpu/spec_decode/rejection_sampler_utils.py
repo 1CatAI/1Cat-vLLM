@@ -420,6 +420,7 @@ def _resample_kernel(
         0,  # processed_logits_col_stride
         None,  # processed_logits_col_ptr
         vocab_size,
+        IS_DRAFTING=False,
         APPLY_TEMPERATURE=False,
         USE_FP64=USE_FP64,
     )
@@ -725,6 +726,7 @@ def _dflash2_sparse_topk_rejection_kernel(
         seed,
         pos,
         temperature,
+        IS_DRAFTING=False,
         USE_FP64=USE_FP64,
         APPLY_TEMPERATURE=False,
     )

@@ -436,7 +436,8 @@ __global__ void __launch_bounds__(512, 1)
         float result = 0.0f;
   #pragma unroll
         for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-          const float gate = __half2float(peer_values[source_rank].data[element]);
+          const float gate =
+              __half2float(peer_values[source_rank].data[element]);
           const float branch = __half2float(
               branches[source_rank * kQwen38HcGateLocalElements + hidden]);
           result = __fmaf_rn(qwen38_hc_sigmoid_fp32(gate), branch, result);
@@ -916,9 +917,10 @@ void sm70_qwen38_hc_up_mix_allgather(fptr_t _fa, torch::Tensor& lora,
 }
 
 void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
-                                    torch::Tensor& output) {
+                                     torch::Tensor& output) {
 #if defined(USE_ROCM)
-  TORCH_CHECK(false, "SM70 Qwen3.8 HC output all-gather is unavailable on ROCm");
+  TORCH_CHECK(false,
+              "SM70 Qwen3.8 HC output all-gather is unavailable on ROCm");
 #else
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   TORCH_CHECK(local_block.is_cuda() && output.is_cuda());
@@ -936,13 +938,12 @@ void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
       vllm::kQwen38HcOutputLocalElements / vllm::packed_t<half>::P::size;
   constexpr int kThreads = 32;
   constexpr int kBlocks = (kPackedElements + kThreads - 1) / kThreads;
-  #define VLLM_LAUNCH_QWEN38_HC_OUTPUT(RANK)                              \
-    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK, true>                     \
-        <<<kBlocks, kThreads, 0, stream>>>(                             \
-            fa->sm70_tp4_push_buffers_,                                 \
-            reinterpret_cast<const half*>(local_block.data_ptr()),      \
-            nullptr, reinterpret_cast<half*>(output.data_ptr()),         \
-            kPackedElements)
+  #define VLLM_LAUNCH_QWEN38_HC_OUTPUT(RANK)                                \
+    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK, true>                       \
+        <<<kBlocks, kThreads, 0, stream>>>(                                 \
+            fa->sm70_tp4_push_buffers_,                                     \
+            reinterpret_cast<const half*>(local_block.data_ptr()), nullptr, \
+            reinterpret_cast<half*>(output.data_ptr()), kPackedElements)
   switch (fa->rank_) {
     case 0:
       VLLM_LAUNCH_QWEN38_HC_OUTPUT(0);
@@ -1127,6 +1128,10 @@ int64_t sm70_tp4_push_allreduce_buffer_size() {
   return vllm::kSm70Tp4PushAllreduceBufferBytes;
 }
 
+int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size() {
+  return vllm::kSm70Tp8HierarchicalPushBufferBytes;
+}
+
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
@@ -1148,6 +1153,19 @@ void register_sm70_tp4_push_allreduce_buffer(
     ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
   }
   fa->register_sm70_tp4_push_buffer(ipc_ptrs);
+}
+
+void register_sm70_tp8_hierarchical_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(),
+                 static_cast<size_t>(vllm::kSm70Tp8HierarchicalPushWorldSize));
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(), static_cast<size_t>(fa->world_size_));
+  void* ipc_ptrs[vllm::kSm70Tp8HierarchicalPushWorldSize];
+  for (size_t peer = 0; peer < fake_ipc_ptrs.size(); ++peer) {
+    ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
+  }
+  fa->register_sm70_tp8_hierarchical_push_buffer(ipc_ptrs);
 }
 
 // Use vector<int64_t> to represent byte data for python binding compatibility.

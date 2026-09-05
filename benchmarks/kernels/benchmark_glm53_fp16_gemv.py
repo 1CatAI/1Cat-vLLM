@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -323,9 +324,11 @@ def _benchmark_cuda_chunk_parallel_kernel(
     reference: torch.Tensor,
     fp32_reference: torch.Tensor,
     *,
+    half2_rows: int,
     warmups: int,
     repeats: int,
 ) -> dict[str, Any]:
+    os.environ["VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS"] = str(half2_rows)
     out = torch.empty_like(reference)
 
     def launch() -> None:
@@ -337,6 +340,7 @@ def _benchmark_cuda_chunk_parallel_kernel(
     traffic_bytes = 2 * (weight.numel() + x.numel() + out.numel())
     return {
         "kernel": "cuda_cublas_match_gemv2t",
+        "half2_rows": half2_rows,
         "latency_us": latency_us,
         "effective_gbps": traffic_bytes / (latency_us * 1000.0),
         "exact_equal": torch.equal(out, reference),
@@ -346,7 +350,7 @@ def _benchmark_cuda_chunk_parallel_kernel(
         "max_abs_error": error.abs().max().item(),
         "relative_l2_error": (error.norm() / reference.float().norm()).item(),
         "cosine_similarity": torch.nn.functional.cosine_similarity(
-            out.float(), reference.float()
+            out.float().reshape(1, -1), reference.float().reshape(1, -1)
         ).item(),
         "fp32_reference_relative_l2_error": (
             fp32_error.norm() / fp32_reference.norm()
@@ -621,28 +625,36 @@ def main() -> None:
                             }
                         )
         if args.cuda_kernel_sweep:
-            try:
-                result = _benchmark_cuda_chunk_parallel_kernel(
-                    x,
-                    weight,
-                    reference,
-                    fp32_reference,
-                    warmups=args.warmups,
-                    repeats=args.repeats,
-                )
-            except Exception as exc:
-                result = {
-                    "kernel": "cuda_cublas_match_gemv2t",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            rows.append(
-                {
-                    "shape": [n, k],
-                    "block_k": None,
-                    "num_warps": None,
-                    **result,
-                }
+            x8 = torch.randn((8, k), dtype=torch.float16, device="cuda")
+            reference8 = torch.cat(
+                [torch.nn.functional.linear(x8[i : i + 1], weight) for i in range(8)]
             )
+            fp32_reference8 = torch.nn.functional.linear(x8.float(), weight.float())
+            for half2_rows in (-5, -4, -3, -2, 4, 0, 1, 2, 8, 16):
+                try:
+                    result = _benchmark_cuda_chunk_parallel_kernel(
+                        x8,
+                        weight,
+                        reference8,
+                        fp32_reference8,
+                        half2_rows=half2_rows,
+                        warmups=args.warmups,
+                        repeats=args.repeats,
+                    )
+                except Exception as exc:
+                    result = {
+                        "kernel": "cuda_cublas_match_gemv2t",
+                        "half2_rows": half2_rows,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                rows.append(
+                    {
+                        "shape": [8, n, k],
+                        "block_k": None,
+                        "num_warps": None,
+                        **result,
+                    }
+                )
         for padded_m in (1, 2, 4, 8, 16):
             try:
                 result = _benchmark_padded_cublas_gemm(

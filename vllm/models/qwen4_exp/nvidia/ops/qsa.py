@@ -2116,13 +2116,8 @@ def qsa_sparse_paged_attention(
         not current_platform.has_device_capability(80),
     )
 
-    if (
-        q.shape[0] == 1
-        and group_size == 6
-        and head_dim == 256
-        and current_platform.is_device_capability(70)
-    ):
-        # Exact Qwen4Exp TP4 decode shape. Two warps preserve the existing
+    if _use_sm70_qsa_two_warp_partial(q.shape[0], group_size, head_dim):
+        # Exact Qwen4Exp TP4 decode family. Two warps preserve the existing
         # split/merge arithmetic and cut the partial-kernel time on V100.
         partial_warps = 2
 
@@ -2248,6 +2243,20 @@ def _qsa_sparse_launch_profile(
         partial_warps = 4
         block_n = 16
     return block_n, target_splits, partial_warps
+
+
+def _use_sm70_qsa_two_warp_partial(
+    num_query_tokens: int,
+    group_size: int,
+    head_dim: int,
+) -> bool:
+    """Gate the bitwise small-batch SM70 sparse-QSA launch policy."""
+    return bool(
+        0 < num_query_tokens <= 16
+        and group_size == 6
+        and head_dim == 256
+        and current_platform.is_device_capability(70)
+    )
 
 
 def qsa_store_cache_rows(

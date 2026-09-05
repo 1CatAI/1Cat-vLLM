@@ -55,7 +55,7 @@ def torch_topk(
 @pytest.mark.parametrize(
     "case", ["random", "ties", "signed_zero", "nan", "inf", "negative_inf"]
 )
-@pytest.mark.parametrize("num_tokens", [1, 5])
+@pytest.mark.parametrize("num_tokens", range(1, 17))
 def test_sm70_qwen38_router_topk(case: str, num_tokens: int):
     torch.manual_seed(0)
     gating_output = torch.randn(num_tokens, 512, dtype=torch.float16, device="cuda")

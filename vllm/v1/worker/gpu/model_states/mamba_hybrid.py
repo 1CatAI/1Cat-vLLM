@@ -16,7 +16,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     is_conv_state_dim_first,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.flash_attn_v100 import (
     DFlash2SmallQGroupDescriptor,
@@ -486,26 +486,63 @@ class MambaHybridModelState(DefaultModelState):
 
     def postprocess_state(
         self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
-        self.num_accepted_tokens_gpu[input_batch.idx_mapping] = torch.clamp(
-            num_sampled, min=1
-        )
+        if isinstance(num_sampled, int):
+            num_reqs = idx_mapping.shape[0]
+            if num_reqs:
+                _fill_num_accepted_kernel[(num_reqs,)](
+                    idx_mapping,
+                    self.num_accepted_tokens_gpu,
+                    VALUE=max(num_sampled, 1),
+                )
+        else:
+            num_reqs = idx_mapping.shape[0]
+            if num_reqs:
+                _scatter_num_accepted_kernel[(num_reqs,)](
+                    idx_mapping, num_sampled, self.num_accepted_tokens_gpu
+                )
         if (
             self._align_mode
             and num_computed_tokens is not None
             and self._mamba_ctx is not None
-            and input_batch.num_reqs > 0
+            and idx_mapping.shape[0] > 0
         ):
             run_mamba_align_postprocess(
                 self._mamba_ctx,
-                input_batch.num_reqs,
+                idx_mapping.shape[0],
                 self.num_accepted_tokens_gpu,
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
-                input_batch.idx_mapping,
+                idx_mapping,
             )
+
+
+@triton.jit
+def _fill_num_accepted_kernel(
+    idx_mapping_ptr,
+    num_accepted_ptr,
+    VALUE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + row)
+    if req_state_idx >= 0:
+        tl.store(num_accepted_ptr + req_state_idx, VALUE)
+
+
+@triton.jit
+def _scatter_num_accepted_kernel(
+    idx_mapping_ptr,
+    num_sampled_ptr,
+    num_accepted_ptr,
+):
+    row = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + row)
+    if req_state_idx < 0:
+        return
+    num_sampled = tl.load(num_sampled_ptr + row)
+    tl.store(num_accepted_ptr + req_state_idx, tl.maximum(num_sampled, 1))
