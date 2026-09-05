@@ -1218,6 +1218,10 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         del layer.w2_weight_scale
         del layer.w2_weight_scale_2
         del layer.w2_input_scale
+        # Release unused conversion blocks between layers instead of retaining
+        # their high-water mark throughout model loading. Live prepared weights
+        # and inference buffers are unaffected; this is not an inference hook.
+        torch.accelerator.empty_cache()
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
             "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
