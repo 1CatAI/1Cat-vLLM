@@ -1171,6 +1171,123 @@ unwritten at the 20-KiB case, starting at element 1024. The prior fixed-v4
 loop; it is not evidence of a bug in the unset/default launch geometry.
 Artifact: `.artifacts/raw-audit/smallmsg-undercoverage-old-retry.log`.
 
+### Private HC channel and independent-QSA follow-up (2026-09-05)
+
+The latest remote-state audit found #474 **merged** at `cc22156c2b`, not
+still Draft. The subsequent `de1754f744` fusion was not in that merged head.
+Continue in Draft #504, branch
+`codex/v100-flashnext-batch-hc-qsa-followup-20260905-082250`, worktree
+`worktrees/v100-flashnext-batch-hc-qsa-followup-20260905-082250`, based on
+`755baae1d075ee04fa9096b23fc0225b23589a86` (includes merged #481).
+The fusion-only commit was cherry-picked as `0936cd23ca`; no stale PR edit,
+force-push or automatic performance rebaseline was performed. All following
+retained HC numbers use the **old frozen source and DSO**, not this new main
+or a clean wheel. Full-model quality and 238/420/728 targets remain unmet.
+
+The formerly queued width check completed: M1 through M17 and M24, all four
+ranks and three activation scales, poisoned graph replay equal to eager and
+zero-tolerance equality against the unfused sharded implementation. This
+does not erase the original replicated-GEMM association differences.
+Artifact in the previous worktree:
+`.artifacts/raw-audit/hc-fused-push-v1-width-check.{json,log}`.
+
+The fused benchmark now allocates one **private HC communicator** per TP
+rank, separate from the auxiliary-stream ordinary/sum2 communicator. Both
+are owned by the same DSO. This is a conservative prototype isolation gate,
+not evidence that a shared-channel race occurred. Do not allocate one such
+communicator per HC layer in production: metadata/workspaces (including an
+8-MiB rank-data tensor) cost real memory. Reuse existing dedicated channel
+concepts from #481 when designing production admission, with native owner
+and buffer ABI checks; do not mix lifecycle calls between different DSOs.
+
+Auxiliary stress: M4/M8/M16, 64 cycles each, changed HC and sum2 inputs,
+rank-skewed enqueue order on two streams, 16 sum2 operations per graph.
+HC remains zero-tolerance equal to unfused sharding and auxiliary sum2 is
+exact at all four ranks. This is operator/state evidence only. Artifact:
+`.artifacts/raw-audit/hc-fused-private-aux-v1.{json,log}`. That first auxiliary
+run did not restore the timing input after stress, so its timing is not used
+as the standard performance contract. The benchmark now restores the input.
+
+Separate no-aux standard-input measurement, 16 rotating real-weight copies,
+16 HC calls per graph, five alternating groups, per-group maximum TP rank:
+
+| M | Replicated HC | Private-channel fused HC | Reduction |
+| ---: | ---: | ---: | ---: |
+| 4 | 31.373 us | 26.803 us | 14.57% |
+| 8 | 32.150 us | 27.346 us | 14.95% |
+| 16 | 34.197 us | 28.754 us | 15.92% |
+
+Artifact: `.artifacts/raw-audit/hc-fused-private-perf-v2.{json,log}`.
+DSO SHA256 remains
+`62d77f78b48837565cd1f132f55766d81ad9747ff65121383eb9782862a9e69d`.
+These are the conservative current HC micro figures. The 96-call projection
+is only 0.44--0.52 ms, not an endpoint saving. Different processes/clocks do
+not permit attributing the entire difference from the earlier 19--20%
+screen to channel isolation. No new production hook/default is enabled.
+
+**QSA import/admission audit:** the retained source-build launcher appends
+an obsolete `v100-qwen38-exact-decode80-20260829-030630/flash-attention-v100`
+source tree that has no native `.so`. CPU-only reproduction matches the
+import failure recorded at line 424 of `grouped-runtime/control_before.log`.
+A package-scoped bootstrap successfully imports the old task's built
+Flash-V100 package (grouped ABI 2), without broadly inserting `build/lib`
+and changing other dependencies. Native SHA256:
+`daa665b9e81914de1b477e278524fccdfd45d39f09193f67268f48604ac92b49`.
+
+Crucially, `_use_sm70_qsa_xqa_page4` defaults to **rows >=64** for FP16 KV,
+and the frozen launcher does not override it. The import warning is from
+prefill, not proof that C4/C8/C16 decode lost an admitted native route.
+Do not present this as the root cause of slow batch decode or silently
+lower the threshold. `benchmark_sm70_qsa_batch_routes.py` instead screens
+forced Triton, direct XQA and padded grouped Page4 for independent requests,
+including padding/planning/copies, random physical pages, six changed-input
+and slot-map graph replays, and an explicit FP32 selected-attention oracle.
+Grouped reuse must not assume adjacent rows share request KV. The existing
+MTP benchmark's `xqa` wrapper can itself select grouped mode for M>=8; the
+new screen calls each native route directly to keep labels unambiguous.
+
+The first native micro reached the GPU, then failed M1 FP32-oracle tolerance
+(max reported failing difference `0.00308471`, versus `atol=0.002`). No timing
+was admitted. Source audit then found its reused MTP benchmark generator
+always appends the last three tokens. That is **not the production QSA
+contract**: the compressed selection has 512 complete Page4 blocks plus
+only `visible_length % 4` open-tail tokens and `-1` padding. At length 8192
+there is no open tail, and direct XQA correctly excludes that noncanonical
+extra data. This failed input is not evidence of model-quality degradation.
+The first log did not label the failing route, so do not assert it proved
+a specific native kernel error. Artifact: `.artifacts/qsa-native-frozen-v1.log`.
+
+The old generator is now corrected for both independent decode requests and
+causal MTP rows (shared pages must be complete for the earliest query).
+New CPU metadata coverage: **24 passed** across M4/M5/M8/M16, independent
+versus single-request rows, and three overlap levels. Existing current-main
+QSA launch/route tests: **27 passed, 1 GPU-only skip**. These are metadata
+checks, not GPU/model quality. The new native screen uses the production
+expansion operator, independently checks its output against Torch integer
+arithmetic, masks invalid indices in its FP32 oracle, and sweeps all four
+tail residues. It restores the declared 8192 length for timing. Tolerances
+are unchanged; failed routes retain per-route diagnostics and no admitted
+timing. The redundant v2 diagnostic waiter was stopped before GPU launch;
+v3 canonical run is queued behind verified foreign GPU ownership.
+Do not edit its live shell launcher or restart it merely because it waits.
+
+New-base sidecar compile/import passed (CUDA 12.8 / Torch 2.10, SM70,
+`-O3 -DNDEBUG -lineinfo`), SHA256
+`872f4e3a37cdf57c2e5ddd010c7b95cd968e4f8d6f5a64fd79fff87063c51f8a`.
+It resolves lifecycle plus batch HC methods to the same sidecar namespace
+and reports the new 720000-byte push allocation. **Not yet GPU tested**.
+This benchmark-only sidecar does not expose #481's M1 HC methods; do not
+use it for an endpoint/C1 comparison or production deployment. The future
+integration must preserve all existing native features and separately
+validate the loaded owner's capabilities. All prior private-HC GPU evidence
+remains explicitly tied to the frozen old DSO rather than this new binary.
+
+New-worktree CPU test logs: `.artifacts/qsa-cpu-tests.log` and
+`.artifacts/qsa-benchmark-indices-tests.log`. Canonical GPU result locations:
+`.artifacts/qsa-native-frozen-v3-canonical.{json,log}` (inspect completion,
+not file presence, before citing results). Latest endpoint and model-score
+status are unchanged; do not convert this metadata repair to throughput.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its

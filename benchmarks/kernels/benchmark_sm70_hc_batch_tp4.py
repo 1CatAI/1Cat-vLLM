@@ -69,6 +69,12 @@ def main():
     )
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--check-only", action="store_true", help="Skip performance timing")
+    p.add_argument(
+        "--aux-check",
+        type=int,
+        default=0,
+        help="Fused mode only: interleave this many auxiliary sum2 graph replays",
+    )
     args = p.parse_args()
     if args.weight_copies <= 0:
         p.error("--weight-copies must be positive")
@@ -112,11 +118,18 @@ def main():
 
     ca = CustomAllreduce(group, rank, max_size=128 * 1024)
     assert not ca.disabled
+    hc_ca = None
     if args.mode == "fused":
         assert hasattr(torch.ops._C_custom_ar_flashnext, "hc_down_gather"), (
             "Build sm70_hc_push_gather.cuh into the SAME custom-AR sidecar "
             "that owns this communicator"
         )
+        # Reuse the existing communicator implementation, but give HC a
+        # separate packet/epoch channel from auxiliary-stream collectives.
+        hc_ca = CustomAllreduce(group, rank, max_size=128 * 1024)
+        assert not hc_ca.disabled
+    elif args.aux_check:
+        p.error("--aux-check requires --mode fused")
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -168,11 +181,11 @@ def main():
                 d = torch.nn.functional.linear(x, local_wd)
                 if args.mode == "fused" and use_fused:
                     torch.ops._C_custom_ar_flashnext.hc_down_gather(
-                        ca._ptr, d, fused_injection, fused_lora
+                        hc_ca._ptr, d, fused_injection, fused_lora
                     )
                     gate = torch.nn.functional.linear(fused_lora, local_wu)
                     torch.ops._C_custom_ar_flashnext.hc_mix_gather(
-                        ca._ptr, gate, x, output
+                        hc_ca._ptr, gate, x, output
                     )
                     return output, fused_injection
                 scatter_down[(m,)](d, sparse_down, RANK=rank)
@@ -236,6 +249,53 @@ def main():
                     )
                 checks.append(row)
             assert all(c["finite"] for row in checks for c in row)
+            if args.aux_check:
+                performance_input = x.clone()
+                aux_input = x.new_full((m, 2560), (rank + 1) / 64)
+                aux_output = torch.empty_like(aux_input)
+                aux_stream = torch.cuda.Stream()
+                aux_graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                dist.barrier()
+                with ca.capture(), torch.cuda.graph(aux_graph, stream=aux_stream):
+                    for _ in range(16):
+                        ca.all_reduce_sum2(aux_input, aux_input, out=aux_output)
+                for cycle in range(args.aux_check):
+                    # Distinct epochs/data, with deliberately skewed stream
+                    # enqueue order across ranks. Never run unfused HC's ca
+                    # collectives concurrently with this same auxiliary ca.
+                    x.normal_().mul_(0.25 + cycle % 3)
+                    dist.broadcast(x, 0)
+                    expected_hc = tuple(
+                        t.clone() for t in candidate(False, use_fused=False)
+                    )
+                    aux_input.fill_((rank + 1 + cycle % 13) / 64)
+                    aux_output.fill_(float("nan"))
+                    output.fill_(float("nan"))
+                    fused_lora.fill_(float("nan"))
+                    fused_injection.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    if (rank + cycle) % 2:
+                        with torch.cuda.stream(aux_stream):
+                            aux_graph.replay()
+                        graphs[1].replay()
+                    else:
+                        graphs[1].replay()
+                        with torch.cuda.stream(aux_stream):
+                            aux_graph.replay()
+                    torch.cuda.synchronize()
+                    for a, b in zip(outputs[1], expected_hc):
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
+                    expected_aux = (20 + 8 * (cycle % 13)) / 64
+                    torch.testing.assert_close(
+                        aux_output,
+                        torch.full_like(aux_output, expected_aux),
+                        rtol=0,
+                        atol=0,
+                    )
+                x.copy_(performance_input)
+                del aux_graph, aux_stream, aux_input, aux_output, performance_input
             if args.profile:
                 for _ in range(30):
                     graphs[0].replay()
@@ -289,6 +349,8 @@ def main():
                 times=times,
                 checks=checks,
                 fused_postops_zero_tolerance_check_passed=args.mode == "fused",
+                auxiliary_interleaved_replays=args.aux_check,
+                auxiliary_hc_inputs_changed=bool(args.aux_check),
             )
             gathered = [None] * 4
             dist.all_gather_object(gathered, local_result, group=group)
@@ -304,6 +366,7 @@ def main():
                     "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "0"
                 ),
                 "calls_per_graph": calls_per_graph,
+                "private_hc_channel": hc_ca is not None,
                 "replicated_weight_bytes": sum(
                     w.numel() * w.element_size() for ws in weights for w in ws[:2]
                 ),
@@ -325,6 +388,8 @@ def main():
                 + "\n"
             )
     finally:
+        if hc_ca is not None:
+            hc_ca.close()
         ca.close()
         dist.destroy_process_group(group)
         dist.destroy_process_group()
