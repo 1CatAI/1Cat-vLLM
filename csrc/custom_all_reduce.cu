@@ -100,6 +100,8 @@ constexpr int kQwen38HcDownGatheredElements =
 constexpr int kQwen38HcGateLocalElements = 2560;
 constexpr int kQwen38HcGateGatheredElements =
     kQwen38HcGateLocalElements * kSm70Tp4PushAllreduceWorldSize;
+constexpr int kQwen38HcOutputLocalElements =
+    kQwen38HcGateLocalElements / kSm70Tp4PushAllreduceWorldSize;
 
 template <int ngpus, int Rank>
 __global__ void __launch_bounds__(128, 1)
@@ -227,7 +229,7 @@ DINLINE float qwen38_hc_divide_by_count(float value) {
   return result;
 }
 
-template <int ngpus, int Rank>
+template <int ngpus, int Rank, bool GatherOutput = false>
 __global__ void __launch_bounds__(512, 1)
     sm70_qwen38_hc_gate_push_mix(RankData push_buffers,
                                  const half* __restrict__ local_gate,
@@ -285,18 +287,31 @@ __global__ void __launch_bounds__(512, 1)
       if (!has_empty_slot) break;
     }
 
-  #pragma unroll
-    for (int element = 0; element < P::size; ++element) {
-      const int hidden = offset * P::size + element;
-      float result = 0.0f;
+    if constexpr (GatherOutput) {
+      // Up already mixed all branches for 640 hidden coordinates. Gather
+      // these final FP16 values, without a second arithmetic/rounding step.
+      // Reuse the isolated HC gate channel and its existing epoch protocol;
+      // the MoE/shared-expert stream uses a separate channel.
   #pragma unroll
       for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
-        const float gate = __half2float(peer_values[source_rank].data[element]);
-        const float branch = __half2float(
-            branches[source_rank * kQwen38HcGateLocalElements + hidden]);
-        result = __fmaf_rn(qwen38_hc_sigmoid_fp32(gate), branch, result);
+        reinterpret_cast<P*>(
+            output + source_rank * kQwen38HcOutputLocalElements)[offset] =
+            peer_values[source_rank];
       }
-      output[hidden] = __float2half_rn(qwen38_hc_divide_by_count(result));
+    } else {
+  #pragma unroll
+      for (int element = 0; element < P::size; ++element) {
+        const int hidden = offset * P::size + element;
+        float result = 0.0f;
+  #pragma unroll
+        for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+          const float gate = __half2float(peer_values[source_rank].data[element]);
+          const float branch = __half2float(
+              branches[source_rank * kQwen38HcGateLocalElements + hidden]);
+          result = __fmaf_rn(qwen38_hc_sigmoid_fp32(gate), branch, result);
+        }
+        output[hidden] = __float2half_rn(qwen38_hc_divide_by_count(result));
+      }
     }
 
     P empty;
@@ -731,6 +746,52 @@ void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
       break;
   }
   #undef VLLM_LAUNCH_QWEN38_HC_GATE
+#endif
+}
+
+void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,
+                                    torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 Qwen3.8 HC output all-gather is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(local_block.is_cuda() && output.is_cuda());
+  TORCH_CHECK(local_block.device() == output.device());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(local_block));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  TORCH_CHECK_EQ(fa->world_size_, vllm::kSm70Tp4PushAllreduceWorldSize);
+  TORCH_CHECK(fa->fully_connected_ && fa->sm70_tp4_push_buffers_registered_);
+  TORCH_CHECK_EQ(local_block.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(output.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(local_block.numel(), vllm::kQwen38HcOutputLocalElements);
+  TORCH_CHECK_EQ(output.numel(), vllm::kQwen38HcGateLocalElements);
+  TORCH_CHECK(local_block.is_contiguous() && output.is_contiguous());
+  constexpr int kPackedElements =
+      vllm::kQwen38HcOutputLocalElements / vllm::packed_t<half>::P::size;
+  constexpr int kThreads = 32;
+  constexpr int kBlocks = (kPackedElements + kThreads - 1) / kThreads;
+  #define VLLM_LAUNCH_QWEN38_HC_OUTPUT(RANK)                              \
+    vllm::sm70_qwen38_hc_gate_push_mix<4, RANK, true>                     \
+        <<<kBlocks, kThreads, 0, stream>>>(                             \
+            fa->sm70_tp4_push_buffers_,                                 \
+            reinterpret_cast<const half*>(local_block.data_ptr()),      \
+            nullptr, reinterpret_cast<half*>(output.data_ptr()),         \
+            kPackedElements)
+  switch (fa->rank_) {
+    case 0:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(0);
+      break;
+    case 1:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(1);
+      break;
+    case 2:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(2);
+      break;
+    default:
+      VLLM_LAUNCH_QWEN38_HC_OUTPUT(3);
+      break;
+  }
+  #undef VLLM_LAUNCH_QWEN38_HC_OUTPUT
 #endif
 }
 

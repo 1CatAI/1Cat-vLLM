@@ -12,6 +12,7 @@ from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import (
     _qwen38_hc_down_silu_inject_kernel,
     _qwen38_hc_up_gate_mix_kernel,
     _qwen38_hc_up_gate_mix_row4_kernel,
+    _qwen38_hc_up_hidden_shard_kernel,
     _qwen38_hc_up_local_gate_kernel,
 )
 from vllm.platforms import current_platform
@@ -196,3 +197,49 @@ def test_qwen38_sm70_hc_tp4_compute_shards_are_bitwise() -> None:
         assert torch.equal(gathered_lora, reference_lora)
         assert torch.equal(gathered_injection, reference_injection)
         assert torch.equal(actual_block, reference_block)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability((7, 0)) or not HAS_TRITON,
+    reason="Qwen3.8 HC hidden shards require CUDA SM70 and Triton",
+)
+def test_qwen38_sm70_hc_up_hidden_shards_are_bitwise() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260905)
+    weight = torch.randn(
+        10240, 320, dtype=torch.float16, device="cuda", generator=generator
+    )
+    lora = torch.empty(1, 320, dtype=torch.float16, device="cuda")
+    branches = torch.empty(1, 10240, dtype=torch.float16, device="cuda")
+    expected = torch.empty(1, 2560, dtype=torch.float16, device="cuda")
+    actual = torch.empty_like(expected)
+    for case in range(16):
+        lora.normal_(generator=generator)
+        branches.normal_(generator=generator)
+        if case == 0:
+            lora.zero_()
+        elif case == 1:
+            branches.zero_()
+        elif case == 2:
+            lora.mul_(0.01)
+        _qwen38_hc_up_gate_mix_row4_kernel[(640,)](
+            lora,
+            weight,
+            branches,
+            expected,
+            K=320,
+            HC_DIMENSION=2560,
+            HC_COUNT=4,
+            BLOCK_N=4,
+            BLOCK_K=512,
+            num_warps=8,
+        )
+        for rank in range(4):
+            _qwen38_hc_up_hidden_shard_kernel[(320,)](
+                lora,
+                weight,
+                branches,
+                actual[..., rank * 640 : (rank + 1) * 640],
+                TP_RANK=rank,
+                num_warps=8,
+            )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))

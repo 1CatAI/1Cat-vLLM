@@ -135,6 +135,40 @@ def _qwen38_hc_up_local_gate_kernel(
 
 
 @triton.jit
+def _qwen38_hc_up_hidden_shard_kernel(
+    lora_ptr,
+    weight_ptr,
+    branches_ptr,
+    out_ptr,
+    TP_RANK: tl.constexpr,
+):
+    """Mix all four branches locally for two of this rank's 640 hidden rows."""
+    rows = tl.arange(0, 8)
+    hidden = tl.program_id(0) * 2 + rows // 4
+    checkpoint_row = (rows % 4) * 2560 + TP_RANK * 640 + hidden
+    offsets = tl.arange(0, 512)
+    lora = tl.load(lora_ptr + offsets, offsets < 320, 0).to(tl.float32)
+    weight = tl.load(
+        weight_ptr + checkpoint_row[:, None] * 320 + offsets[None, :],
+        offsets[None, :] < 320,
+        0,
+    )
+    # Keep the existing two-K-warp reduction, FP16 gate boundary, and
+    # branch-ordered FP32 FMA. Only row ownership changes; weights are neither
+    # repacked nor duplicated, and prefill keeps its original layout.
+    gate = tl.sum(lora[None, :] * weight.to(tl.float32), axis=1)
+    gate = gate.to(tl.float16).to(tl.float32).reshape((2, 4))
+    branches = tl.load(branches_ptr + checkpoint_row).to(tl.float32).reshape((2, 4))
+    result = tl.full((2,), 0, tl.float32)
+    for branch in tl.static_range(4):
+        index = tl.full((2, 1), branch, tl.int32)
+        g = tl.gather(gate, index, 1).reshape((2,))
+        x = tl.gather(branches, index, 1).reshape((2,))
+        result = tl.fma(tl.sigmoid(g), x, result)
+    tl.store(out_ptr + tl.program_id(0) * 2 + tl.arange(0, 2), result / 4)
+
+
+@triton.jit
 def _qwen38_hc_up_gate_mix_kernel(
     lora_ptr,
     weight_ptr,
@@ -269,7 +303,6 @@ def _qwen38_sm70_fp16_fused_hc(
         tp_rank = int(custom_ar.rank)
         local_down = x.new_empty((1, 88))
         gathered_down = x.new_empty((1, 336))
-        local_gate = x.new_empty((1, _HC_DIM))
         block = x.new_empty((1, _HC_DIM))
         _qwen38_hc_down_local_shard_kernel[(88,)](
             x,
@@ -279,6 +312,25 @@ def _qwen38_sm70_fp16_fused_hc(
             num_warps=4,
         )
         custom_ar.sm70_qwen38_hc_down_allgather(local_down, gathered_down)
+        if custom_ar.supports_sm70_qwen38_hc_output_allgather():
+            local_block = x.new_empty((1, _HC_DIM // _HC_COUNT))
+            _qwen38_hc_up_hidden_shard_kernel[(320,)](
+                gathered_down,
+                up_weight,
+                x,
+                local_block,
+                TP_RANK=tp_rank,
+                num_warps=8,
+            )
+            custom_ar.sm70_qwen38_hc_output_allgather(local_block, block)
+            logger.info_once(
+                "SM70 Qwen3.8 exact TP4 hidden-sharded FP16 HC route enabled."
+            )
+            return block, gathered_down[..., _HC_RANK : _HC_RANK + _HC_COUNT]
+
+        # An older wheel/sidecar can still use the established gate-sharded
+        # route. Never pass its opaque communicator to a different DSO.
+        local_gate = x.new_empty((1, _HC_DIM))
         _qwen38_hc_up_local_gate_kernel[(triton.cdiv(_HC_DIM, 8),)](
             gathered_down,
             up_weight,

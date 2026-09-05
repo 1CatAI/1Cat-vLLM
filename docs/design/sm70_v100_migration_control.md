@@ -45086,3 +45086,63 @@ Interpretation:
   Triton SiLU fusion changed FP16 results. Moving the add across the custom-op
   boundary without also replacing native SiLU would not remove a launch, so
   no PLE residual source change is admitted from this PR.
+
+## Exact HC three-direction screen, 2026-09-05
+
+- Owner: `codex/v100-qwen38-nomtp-token-trace-20260903-173451`, public Draft
+  PR [#481](https://github.com/1CatAI/1Cat-vLLM/pull/481). Pre-change source
+  `30f81105621e9f39e6b3bf9d816f77d63acd8307`; current integration merge base
+  `fbcef6e2f959e95bbe4ca807931abfa2393546e7`. Work stays in the owned worktree;
+  no direct push to `main` and no change to another task's running API.
+- Frozen operator contract: RadixArk/Qwen3.8-Flash-Next-NVFP4, all 48 layers'
+  attention and MLP HC pairs (96 distinct weights), TP4 V100-SXM2-32GB, M=1,
+  checkpoint FP16 weights/inputs/outputs, FP32 arithmetic, no MTP. These are
+  HC Mix-only CUDA Graph cycles, not full HC, prefill, or endpoint TPOT.
+- Implemented and screened all three research directions: hidden-coordinate
+  ownership, producer-only down publication, and exact logical-lane down
+  splitting with fused reduction/communication. All 96 pairs x 16 changing
+  inputs x four ranks are bitwise for block and injection outputs.
+- Only hidden ownership is retained. It gathers 640 final FP16 values per
+  rank instead of 2,560 gates, with no additional resident weight copy. Two
+  stable paired screens show `1.745654 -> 1.702919` and
+  `1.743988 -> 1.703158 ms` per 96 Mix calls, saving `0.041-0.043 ms` (about
+  2.3-2.4%). Three paired groups use 150 replays each after 1,000 warmups;
+  the second screen's range is below 0.2% for each retained variant.
+- Rejected: direct per-row publication (`2.229951 ms`), its coalesced revision
+  (`2.037357 ms`), and exact one/two/four-part down with the improved
+  half2-load/one-warp gather tail (`1.842709/1.850873/1.864315 ms`). These are
+  slower than the `1.743988-ms` matched control despite preserving precision.
+  The coalesced publication and tail revision were targeted responses to the
+  first screen, not new full-model startups. Do not rescan them unchanged.
+- Hidden two-row/four-warp, four-row/eight-warp, and four-row/sixteen-warp
+  schedules are also bitwise but slower at `1.738779/1.741660/1.719310 ms`.
+  Select two hidden rows and eight warps; do not conflate row tiling with a
+  change to the K-reduction tree.
+- A separate publication prototype single-GPU four-peer emulation passed
+  18 real-weight cases including generation 65535/65536 and signed 32-bit
+  wrap. This is arithmetic/protocol evidence only, not proof of distributed
+  speed or grounds to retain a slower publisher.
+- Source integration retains the existing HC opt-in, exact shape gate, and
+  older-extension fallback. A new capability check follows the communicator's
+  owning DSO, preventing an old sidecar from borrowing a new base-wheel op.
+  The four ownership/capability cases pass; the complete focused CPU dispatch
+  suite is `13 passed`.
+- Reproducible production gate:
+  `benchmarks/kernels/benchmark_sm70_hc_tp4.py --model MODEL --out RESULT`,
+  launched with four torchrun ranks and the source-matched extension. It uses
+  the registered HC custom op, compares forced old dispatch with new dispatch,
+  and checks concurrent sum2 on an auxiliary stream. Detailed launch examples
+  and measurement limitations are in
+  [the decode guide](sm70_qwen38_nvfp4_decode.md#hidden-coordinate-hc-sharding-2026-09-05).
+- Local raw evidence: `.artifacts/hc_hidden_shard/stages_result.json`,
+  `coalesced_result.json`, `single.log`, `dispatch_test.log`, and
+  `build_production.log`. The initial `result.json` had large idle-clock jitter
+  and is not accepted timing evidence. Warmup was added before the stable
+  screens. No full-model load has been performed for this HC screen.
+- The first production validation attempt was stopped by its owner before
+  timing when another task began a TP4 model run on GPUs 0-3. Its partial log
+  is `production_run.log`, not a failed numerical gate or performance result.
+  The guarded runner now checks both locks and actual device memory before
+  launch. Production GPU validation and the next combined full-model
+  quality/performance gate remain pending; do not claim 100 tok/s or promote
+  an endpoint from the isolated 0.041-ms saving.

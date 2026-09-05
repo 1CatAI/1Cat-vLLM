@@ -967,3 +967,62 @@ is bitwise but saves only `0.0046 ms/token`. Checkpoint-native NVFP4 W13
 split-16 retains FP32 MMA accumulation and FP16 output but changes FP32
 summation grouping; it differs from split-8 by one FP16 ULP in about 0.28% of
 sampled outputs, so it is not enabled without a full model quality gate.
+
+### Hidden-coordinate HC sharding, 2026-09-05
+
+The next exact M=1 candidate assigns each TP rank 640 hidden coordinates and
+computes all four branch gates for those coordinates. It preserves the
+checkpoint FP16 weight layout, the two-K-warp FP32 reduction, the FP16 gate
+boundary, FP32 sigmoid and branch-ordered FMA, and the final FP16 output.
+The following collective gathers final hidden slices instead of branch gates:
+each rank sends 1,280 rather than 5,120 bytes to each peer. No extra weight
+copy or precision change is introduced, and prefill is unchanged.
+
+It uses the existing `VLLM_SM70_QWEN38_FUSED_HC_FP16` opt-in and exact TP4
+admission checks. A source-matched custom-AR extension enables the new
+`sm70_qwen38_hc_output_allgather` op; an older extension retains the existing
+gate-sharded path. Capability discovery and dispatch use the DSO that owns the
+opaque communicator, never a different extension's fallback symbol. The new
+gather reuses the isolated HC channel, not the concurrent MoE channel.
+
+The initial screen loads all 96 real HC weight pairs, not a repeated layer-0
+weight. Four V100-SXM2-32GB ranks each report zero FP16 bit mismatches for
+block and injection outputs over 16 changing inputs. After 1,000 warmup graph
+replays, three alternating paired timing groups give the following medians:
+
+| Variant | 96 Mix calls (ms) | Change from control (ms) |
+| --- | ---: | ---: |
+| Current gate-sharded control | 1.743988 | — |
+| Hidden shard, two hidden rows / eight warps | 1.703158 | -0.040830 |
+| Producer-only down publication, coalesced revision | 2.037357 | +0.293369 |
+| Exact down partials + fused tail/gather, one part | 1.842709 | +0.098720 |
+| Same, two parts | 1.850873 | +0.106885 |
+| Same, four parts | 1.864315 | +0.120327 |
+
+Only hidden sharding is retained. The first producer-only version was still
+slower at 2.229951 ms. Coalescing its peer writes reduced that overhead but
+did not beat the control. Fixed-order down splitting also remained slower
+after half2 loads and a one-warp gather tail. None of those losing prototypes
+is part of the production dispatch. Alternative hidden tiles / warp counts
+were bitwise but slower than the selected two-row/eight-warp schedule.
+
+These are Mix-only graph measurements: they exclude HC combine/RMSNorm and
+must not be subtracted directly from the 2.658-ms full-HC trace service sum.
+The retained improvement is about 2.3%, not the initial 20% screening target
+and not an end-to-end tokens/s claim. The 100-tok/s endpoint target remains
+unproven by this change.
+
+Reproduce the production-dispatch gate without loading the entire model:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 VLLM_SM70_TP4_PUSH_ALLREDUCE=1 \
+  .venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  benchmarks/kernels/benchmark_sm70_hc_tp4.py \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --out /path/to/hc-result.json
+```
+
+Use a source-matched wheel or set `VLLM_SM70_CUSTOM_AR_LIBRARY` to an extension
+that contains both the new op and the complete communicator lifecycle. The
+benchmark compares old and new registered-op dispatch, checks all 96 real
+weight pairs, overlaps HC with the actual sum2 CUDA Graph route on an auxiliary
+stream, and reports three paired Mix-only timings separately from correctness.

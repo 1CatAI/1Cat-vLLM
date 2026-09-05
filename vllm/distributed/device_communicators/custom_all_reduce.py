@@ -465,6 +465,14 @@ class CustomAllreduce:
     ) -> None:
         ops.sm70_qwen38_hc_gate_mix(self._ptr, local_gate, branches, output)
 
+    def supports_sm70_qwen38_hc_output_allgather(self) -> bool:
+        return ops.supports_sm70_qwen38_hc_output_allgather()
+
+    def sm70_qwen38_hc_output_allgather(
+        self, local_block: torch.Tensor, output: torch.Tensor
+    ) -> None:
+        ops.sm70_qwen38_hc_output_allgather(self._ptr, local_block, output)
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         inp: torch.Tensor,
