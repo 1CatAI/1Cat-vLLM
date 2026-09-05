@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _prepare_compact_slot_groups,
+    _use_compact_grouped,
 )
 
 if TYPE_CHECKING:
@@ -556,7 +557,8 @@ def _warmup_fp4_dense_layers(
         device = state.weight.device
         k_dim = int(state.weight.shape[0])
         gated_silu = bool(state.gated_silu)
-        n_dim = int(state.output_size) // (2 if gated_silu else 1)
+        kernel_output_size = int(state.padded_output_size or state.output_size)
+        n_dim = kernel_output_size // (2 if gated_silu else 1)
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
@@ -743,12 +745,18 @@ def _warmup_nvfp4_moe_decode_layers(
         device = layer.w13_tm_weight.device
         top_k = int(layer.moe_config.experts_per_token)
         max_experts = int(layer.sm70_nvfp4_num_experts)
-        compact_max_tokens = int(
-            getattr(layer, "sm70_nvfp4_compact_grouped_max_tokens", 8)
+        compact_max_slots = int(
+            getattr(
+                layer,
+                "sm70_nvfp4_compact_grouped_max_slots",
+                8 * top_k,
+            )
         )
         for num_tokens in token_counts:
             total_slots = num_tokens * top_k
-            if num_tokens <= compact_max_tokens:
+            if _use_compact_grouped(num_tokens, top_k) and (
+                total_slots <= compact_max_slots
+            ):
                 stage_experts = total_slots
                 sorted_expert_ids = layer._nvfp4_sm70_dense_expert_ids[:total_slots]
                 expert_offsets = torch.empty(
@@ -839,7 +847,14 @@ def _get_nvfp4_moe_token_counts(
         for layer in moe_layers
     )
     compact_max_tokens = max(
-        int(getattr(layer, "sm70_nvfp4_compact_grouped_max_tokens", 8))
+        int(
+            getattr(
+                layer,
+                "sm70_nvfp4_compact_grouped_max_slots",
+                8 * int(layer.moe_config.experts_per_token),
+            )
+        )
+        // max(int(layer.moe_config.experts_per_token), 1)
         for layer in moe_layers
     )
     max_top_k = max(int(layer.moe_config.experts_per_token) for layer in moe_layers)

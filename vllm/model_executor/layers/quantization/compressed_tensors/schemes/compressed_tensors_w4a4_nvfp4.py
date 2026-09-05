@@ -118,12 +118,21 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 _SM70_NVFP4_QPN2_CONFIGS = {
     # (K, N, fused gated-SiLU): (split-K, independent accumulator chains)
+    (1536, 5120, False): (8, 2),
+    (5120, 3584, False): (16, 2),
+    # Qwen3.8 GDN qkvzba is logically N=4120 on TP4.  QPN2 consumes the
+    # zero-padded physical N=4128 layout and the caller crops the result.
+    (5120, 4128, False): (16, 2),
     (5120, 8704, False): (8, 2),
     (5120, 8704, True): (8, 2),
     (4352, 5120, False): (16, 2),
 }
 _SM70_NVFP4_QPN2_SHAPES = {
     # Checkpoint-native packed tensors are [N, K/2].
+    "in_proj_qkvz": (4120, 2560),
+    "qkv_proj": (3584, 2560),
+    "out_proj": (5120, 768),
+    "o_proj": (5120, 768),
     "gate_up_proj": (8704, 2560),
     "down_proj": (5120, 2176),
 }
@@ -148,6 +157,21 @@ def _is_qpn2_layer(layer: torch.nn.Module) -> bool:
         getattr(layer, "input_size_per_partition", 0) == expected_packed_k * 2
         and getattr(layer, "output_size_per_partition", 0) == expected_n
     )
+
+
+def _pad_qpn2_output_rows(
+    weight: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Pad checkpoint-native output rows to QPN2's 32-column contract."""
+    logical_n = weight.shape[0]
+    physical_n = (logical_n + 31) // 32 * 32
+    if physical_n == logical_n:
+        return weight, scales, physical_n
+    padded_weight = weight.new_zeros((physical_n, weight.shape[1]))
+    padded_scales = scales.new_zeros((physical_n, scales.shape[1]))
+    padded_weight[:logical_n].copy_(weight)
+    padded_scales[:logical_n].copy_(scales)
+    return padded_weight, padded_scales, physical_n
 
 
 def _missing_qpn2_ops() -> list[str]:
@@ -356,8 +380,11 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     )
                     use_qpn2 = False
             if use_qpn2:
+                qpn2_weight, qpn2_weight_scale, qpn2_output_size = (
+                    _pad_qpn2_output_rows(layer.weight.data, layer.weight_scale.data)
+                )
                 qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
-                    layer.weight.data, layer.weight_scale.data
+                    qpn2_weight, qpn2_weight_scale
                 )
                 qpn2_global_scale = float(layer.weight_global_scale.item())
                 qpn2_prefill_enabled = False
@@ -382,7 +409,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             if use_qpn2:
                 suffix = layer.prefix.rsplit(".", 1)[-1]
                 k = layer.input_size_per_partition
-                n = layer.output_size_per_partition
+                n = qpn2_output_size
                 split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[(k, n, False)]
                 layer.register_buffer(
                     "sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False
@@ -392,6 +419,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 )
                 layer.sm70_nvfp4_qpn2 = True
                 layer.sm70_nvfp4_qpn2_global_scale = qpn2_global_scale
+                layer.sm70_nvfp4_qpn2_output_size = qpn2_output_size
                 layer.sm70_nvfp4_qpn2_split_k = split_k
                 layer.sm70_nvfp4_qpn2_nacc = nacc
                 layer.sm70_nvfp4_qpn2_gated_silu = suffix == "gate_up_proj"
@@ -468,20 +496,26 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x_2d = x.reshape(-1, x.shape[-1])
         if x_2d.stride(-1) != 1:
             x_2d = x_2d.contiguous()
-        output_size = layer.output_size_per_partition
+        logical_output_size = layer.output_size_per_partition
+        kernel_output_size = int(
+            getattr(layer, "sm70_nvfp4_qpn2_output_size", logical_output_size)
+        )
         if gated_silu:
-            output_size //= 2
+            logical_output_size //= 2
+            kernel_output_size //= 2
         out_2d = torch.empty(
-            (x_2d.shape[0], output_size), dtype=x.dtype, device=x.device
+            (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
         )
         if x_2d.shape[0] == 0:
-            return out_2d.reshape(*x.shape[:-1], output_size)
+            return out_2d[:, :logical_output_size].reshape(
+                *x.shape[:-1], logical_output_size
+            )
         state = getattr(layer, sm70_tm.STATE_ATTR)
         split_k = int(layer.sm70_nvfp4_qpn2_split_k)
         nacc = int(layer.sm70_nvfp4_qpn2_nacc)
         if gated_silu:
             split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[
-                (x_2d.shape[1], output_size * 2, True)
+                (x_2d.shape[1], kernel_output_size * 2, True)
             ]
         if getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
             sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(
@@ -516,6 +550,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 state.q_ld,
                 gated_silu,
             )
+        if kernel_output_size != logical_output_size:
+            out_2d = out_2d[:, :logical_output_size]
         if bias is not None:
             out_2d.add_(bias)
-        return out_2d.reshape(*x.shape[:-1], output_size)
+        return out_2d.reshape(*x.shape[:-1], logical_output_size)

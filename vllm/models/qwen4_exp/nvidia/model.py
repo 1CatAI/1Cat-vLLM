@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import copy
 from collections.abc import Iterable
 from itertools import islice
 
@@ -10,8 +11,10 @@ from torch import nn
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -26,6 +29,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -97,6 +101,8 @@ except ModuleNotFoundError as exc:
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
+logger = init_logger(__name__)
+
 
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
@@ -116,22 +122,22 @@ def _remap_qsa_cache_scale_name(
 
     Regular attention keeps cache scales below its ``attn`` child. QSA owns
     that cache directly, so only QSA layers need the final path component
-    moved to the owner's persistent ``_k_scale``/``_v_scale`` buffers.
+    moved to the owner's invalid-until-loaded ``k_scale``/``v_scale`` slots.
     """
 
     scale_suffixes = {
-        "k_proj.k_scale": "_k_scale",
-        "k_proj.output_scale": "_k_scale",
-        "attn.k_scale": "_k_scale",
-        "attn._k_scale": "_k_scale",
-        "k_scale": "_k_scale",
-        "_k_scale": "_k_scale",
-        "v_proj.v_scale": "_v_scale",
-        "v_proj.output_scale": "_v_scale",
-        "attn.v_scale": "_v_scale",
-        "attn._v_scale": "_v_scale",
-        "v_scale": "_v_scale",
-        "_v_scale": "_v_scale",
+        "k_proj.k_scale": "k_scale",
+        "k_proj.output_scale": "k_scale",
+        "attn.k_scale": "k_scale",
+        "attn._k_scale": "k_scale",
+        "k_scale": "k_scale",
+        "_k_scale": "k_scale",
+        "v_proj.v_scale": "v_scale",
+        "v_proj.output_scale": "v_scale",
+        "attn.v_scale": "v_scale",
+        "attn._v_scale": "v_scale",
+        "v_scale": "v_scale",
+        "_v_scale": "v_scale",
     }
     for layer_id in qsa_layer_ids:
         marker = f"layers.{layer_id}.self_attn."
@@ -155,6 +161,50 @@ _QWEN4_EXP_IGNORED_MISSING_SUFFIXES = [
     "_weight_scale",
     "_input_scale",
 ]
+
+
+def _validate_qsa_e4m3_scale_load(
+    required_scales: set[str], loaded: set[str], cache_dtype: str
+) -> None:
+    if cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    missing_scales = sorted(required_scales - loaded)
+    if missing_scales:
+        raise ValueError(
+            "QSA E4M3 scale overlay is incomplete; refusing to start. "
+            f"Loaded {len(required_scales) - len(missing_scales)}/"
+            f"{len(required_scales)} local K/V scales. Missing: "
+            + ", ".join(missing_scales)
+        )
+
+
+def _finalize_qsa_e4m3_scale_load(
+    model: nn.Module, loaded: set[str], cache_dtype: str
+) -> None:
+    if cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    # The dedicated PLE process builds the complete model structure on meta but
+    # intentionally streams only the PLE subtree from the checkpoint. It never
+    # executes QSA forward; the GPU workers own and validate the main KV cache.
+    if is_offload_process():
+        return
+    qsa_modules = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, Qwen4ExpQSAAttention)
+    }
+    required_scales = {
+        f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
+    }
+    _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
+    logger.info_once(
+        "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",
+        len(required_scales),
+        len(required_scales),
+    )
+    for module in qsa_modules.values():
+        module.validate_loaded_kv_scales()
+
 
 # The checkpoint keeps down and injection projections separate; runtime packs
 # them into adjacent logical shards of one MergedColumnParallelLinear.
@@ -220,6 +270,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         vllm_config: VllmConfig,
         layer_type: str,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -274,6 +325,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     layer_id=self.layer_idx,
                     quant_config=quant_config,
                     prefix=f"{prefix}.self_attn",
+                    topk_indices_buffer=topk_indices_buffer,
                 )
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
@@ -458,6 +510,7 @@ class Qwen4ExpModel(nn.Module):
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.config = config
+        self._kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
@@ -468,6 +521,17 @@ class Qwen4ExpModel(nn.Module):
             if layer_type == "full_attention"
             and getattr(config, "indexer_n_heads", None) is not None
         )
+        topk_indices_buffer: torch.Tensor | None = None
+        if self._qsa_layer_ids:
+            topk_indices_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                int(config.indexer_budget) + int(config.indexer_compress_ratio) - 1,
+                dtype=torch.int32,
+            )
+            # QSA layers execute serially and consume their selected indices
+            # before the next layer overwrites them, so one model-level
+            # workspace is sufficient for every QSA layer.
+            self.topk_indices_buffer = topk_indices_buffer
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
@@ -476,6 +540,7 @@ class Qwen4ExpModel(nn.Module):
                 vllm_config,
                 layer_type=config.layer_types[layer_idx],
                 prefix=prefix,
+                topk_indices_buffer=topk_indices_buffer,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -635,6 +700,11 @@ class Qwen4ExpModel(nn.Module):
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
         ]
+        if not get_pp_group().is_last_rank:
+            # The final hyper-connection mixer only exists on the last
+            # pipeline rank (see __init__); other ranks must skip its
+            # checkpoint tensors instead of failing the load.
+            skip_substrs.append("hyper_connection_mixer.")
         loader = AutoWeightsLoader(
             self,
             skip_substrs=skip_substrs,
@@ -645,6 +715,70 @@ class Qwen4ExpModel(nn.Module):
             mapper=self.hf_to_vllm_mapper,
         )
         return loaded
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "query_start_loc": 0,
+        "ngram_context": 0,
+        "deepstack_input_embeds": 0,
+    }
+)
+class _Qwen4ExpDecodeGraphModel(nn.Module):
+    """Second compiled view of a Qwen4Exp backbone with shared parameters."""
+
+    def __init__(
+        self,
+        *,
+        target_model: Qwen4ExpModel,
+        vllm_config: VllmConfig,
+    ) -> None:
+        super().__init__()
+        # This is a non-owning view. Registering the target as a child would
+        # duplicate every checkpoint key and runtime-state traversal.
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            query_start_loc,
+            ngram_context,
+            deepstack_input_embeds,
+        )
+
+
+def _make_qwen38_decode_compile_config(vllm_config: VllmConfig) -> VllmConfig:
+    """Build a small-shape compiler config without copying model state."""
+    decode_config = copy.copy(vllm_config)
+    decode_config.scheduler_config = copy.copy(vllm_config.scheduler_config)
+    decode_config.compilation_config = copy.copy(vllm_config.compilation_config)
+
+    compilation_config = decode_config.compilation_config
+    capture_sizes = compilation_config.cudagraph_capture_sizes or [1]
+    max_decode_tokens = max(capture_sizes)
+    decode_config.scheduler_config.max_num_batched_tokens = max_decode_tokens
+    compilation_config.compile_ranges_endpoints = [max_decode_tokens]
+    compilation_config.compile_sizes = []
+    compilation_config.cache_dir = ""
+    compilation_config.local_cache_dir = ""
+    compilation_config.traced_files = set()
+    return decode_config
 
 
 class Qwen4ExpForCausalLM(
@@ -674,6 +808,7 @@ class Qwen4ExpForCausalLM(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        self._qsa_scale_gate_at_this_level = prefix == ""
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -703,6 +838,26 @@ class Qwen4ExpForCausalLM(
         enable_qwen38_sm70_fp16_fused_hc(
             self, self.model_config.dtype, self.vllm_config
         )
+        object.__setattr__(self, "_sm70_decode_graph_model", None)
+
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        """Create the shared-weight decode compiler just before graph capture."""
+        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+            return False
+        if self._sm70_decode_graph_model is None:
+            decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
+            with set_current_vllm_config(decode_config):
+                decode_model = _Qwen4ExpDecodeGraphModel(
+                    target_model=self.model,
+                    vllm_config=decode_config,
+                )
+            object.__setattr__(self, "_sm70_decode_graph_model", decode_model)
+            logger.info_once(
+                "Prepared shared-weight SM70 Qwen3.8 decode compiler for token "
+                "range [1, %d]; large prefill keeps its independent graph.",
+                decode_config.scheduler_config.max_num_batched_tokens,
+            )
+        return True
 
     @staticmethod
     def get_model_state_cls():
@@ -720,7 +875,15 @@ class Qwen4ExpForCausalLM(
     ) -> torch.Tensor | IntermediateTensors:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
-        return self.model(
+        backbone = self.model
+        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+            decode_backbone = self._sm70_decode_graph_model
+            if decode_backbone is None:
+                raise RuntimeError(
+                    "SM70 Qwen3.8 decode graph compiler was not prepared"
+                )
+            backbone = decode_backbone
+        return backbone(
             input_ids,
             positions,
             intermediate_tensors,
@@ -877,7 +1040,10 @@ class Qwen4ExpForCausalLM(
             skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if self._qsa_scale_gate_at_this_level:
+            _finalize_qsa_e4m3_scale_load(self, loaded, self.model._kv_cache_dtype)
+        return loaded
 
 
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
@@ -937,8 +1103,11 @@ class Qwen4ExpForConditionalGeneration(
             self._tower_model_names = []
         else:
             self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
-            self._init_video_pruning(multimodal_config)
             self._tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
+            self.video_pruning_rate = multimodal_config.video_pruning_rate
+            self.is_multimodal_pruning_enabled = (
+                multimodal_config.is_multimodal_pruning_enabled()
+            )
 
             with self._mark_tower_model(vllm_config, {"image", "video"}):
                 self.visual = Qwen3_VisionTransformer(
@@ -1035,6 +1204,10 @@ class Qwen4ExpForConditionalGeneration(
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
 
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        """Forward decode compiler setup to the wrapped language model."""
+        return self.language_model.prepare_sm70_decode_graph_model()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -1052,7 +1225,7 @@ class Qwen4ExpForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
-        hidden_states = self.language_model.model(
+        hidden_states = self.language_model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
@@ -1072,7 +1245,11 @@ class Qwen4ExpForConditionalGeneration(
             skip_substrs=["mtp."],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _finalize_qsa_e4m3_scale_load(
+            self, loaded, self.language_model.model._kv_cache_dtype
+        )
+        return loaded
 
     @classmethod
     def get_mamba_state_dtype_from_config(

@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import msgspec
 import pytest
 import torch
 
 import vllm.envs as envs
+import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.v1.ple_offload import worker as ple_offload_worker
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -141,6 +145,292 @@ def test_ple_offload_rejects_missing_materialized_parameters(
             monkeypatch,
             ["checkpoint.ple.weight"],
         )
+
+
+def test_ple_storage_estimate_deduplicates_shared_storage() -> None:
+    module = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.zeros(16, dtype=torch.float32))
+    module.register_parameter("weight", weight)
+    module.register_buffer("weight_view", weight.detach().view(4, 4))
+
+    estimated = ple_offload_worker._estimate_module_storage_bytes([module])
+
+    assert estimated == weight.untyped_storage().nbytes()
+
+
+def test_ple_auto_numa_uses_gpu_local_allowed_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | set[int]] = []
+
+    def get_mempolicy(mode, *_):
+        mode._obj.value = 4  # MPOL_LOCAL
+        return 0
+
+    fake_libnuma = SimpleNamespace(
+        numa_available=lambda: 0,
+        numa_set_localalloc=lambda: calls.append("localalloc"),
+        get_mempolicy=get_mempolicy,
+    )
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_AUTO_NUMA", True)
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "os",
+        SimpleNamespace(
+            sched_getaffinity=lambda _: {0, 1, 24, 25},
+            sched_setaffinity=lambda _, cpus: calls.append(set(cpus)),
+        ),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "Process",
+        lambda *_: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform.get_all_device_numa_nodes",
+        lambda: [1, 1, 1, 1],
+    )
+    monkeypatch.setattr(
+        "vllm.utils.cpu_resource_utils.get_allowed_cpu_list",
+        lambda: [
+            SimpleNamespace(id=0, numa_node=0),
+            SimpleNamespace(id=1, numa_node=0),
+            SimpleNamespace(id=24, numa_node=1),
+            SimpleNamespace(id=25, numa_node=1),
+        ],
+    )
+    monkeypatch.setattr("vllm.utils.numa_utils.get_libnuma", lambda: fake_libnuma)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(numa_bind_nodes=None),
+    )
+
+    node = ple_offload_worker._configure_ple_numa_locality(config)
+
+    assert node == 1
+    assert calls == ["localalloc", {24, 25}]
+
+
+def test_ple_auto_numa_keeps_cpu_affinity_when_mempolicy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fail_localalloc() -> None:
+        raise PermissionError("set_mempolicy denied")
+
+    fake_libnuma = SimpleNamespace(
+        numa_available=lambda: 0,
+        numa_set_localalloc=fail_localalloc,
+    )
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_AUTO_NUMA", True)
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "os",
+        SimpleNamespace(
+            sched_getaffinity=lambda _: {0, 1},
+            sched_setaffinity=lambda _, cpus: calls.append(set(cpus)),
+        ),
+    )
+    monkeypatch.setattr(
+        "vllm.platforms.current_platform.get_all_device_numa_nodes",
+        lambda: [0],
+    )
+    monkeypatch.setattr(
+        "vllm.utils.cpu_resource_utils.get_allowed_cpu_list",
+        lambda: [
+            SimpleNamespace(id=0, numa_node=0),
+            SimpleNamespace(id=1, numa_node=0),
+        ],
+    )
+    monkeypatch.setattr("vllm.utils.numa_utils.get_libnuma", lambda: fake_libnuma)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(numa_bind_nodes=None),
+    )
+
+    assert ple_offload_worker._configure_ple_numa_locality(config) == 0
+    assert calls == [{0, 1}]
+
+
+def test_ple_prefault_touches_unique_storage_when_capacity_allows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = torch.nn.Module()
+    weight = torch.nn.Parameter(torch.arange(8192, dtype=torch.float32))
+    module.register_parameter("weight", weight)
+    module.register_buffer("weight_view", weight.detach().view(4096, 2))
+    required = weight.untyped_storage().nbytes()
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_PREFAULT", True)
+    monkeypatch.setattr(ple_offload_worker.os, "sysconf", lambda _: 4096)
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(
+            total=64 * ple_offload_worker.GiB_bytes,
+            available=32 * ple_offload_worker.GiB_bytes,
+        ),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "Process",
+        lambda _: SimpleNamespace(
+            memory_full_info=lambda: SimpleNamespace(rss=required, swap=0),
+        ),
+    )
+
+    assert ple_offload_worker._prefault_module_storage([module]) == required
+
+
+def test_ple_prefault_skips_when_host_capacity_is_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    module = torch.nn.Linear(4, 4, bias=False)
+    required = module.weight.untyped_storage().nbytes()
+    gib = ple_offload_worker.GiB_bytes
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_PREFAULT", True)
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=16 * gib, available=1),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "Process",
+        lambda _: SimpleNamespace(
+            memory_full_info=lambda: SimpleNamespace(rss=0, swap=0)
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger=ple_offload_worker.__name__):
+        touched = ple_offload_worker._prefault_module_storage([module])
+
+    assert touched == 0
+    assert required > 0
+    assert "Skipping PLE RAM prefault" in caplog.text
+
+
+def test_ple_host_memory_pressure_warns_without_rejecting(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gib = ple_offload_worker.GiB_bytes
+    monkeypatch.setattr(
+        ple_offload_worker,
+        "_estimate_module_storage_bytes",
+        lambda _: 6 * gib,
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(total=16 * gib, available=8 * gib),
+    )
+    monkeypatch.setattr(
+        ple_offload_worker.psutil,
+        "swap_memory",
+        lambda: SimpleNamespace(used=3 * gib),
+    )
+
+    with caplog.at_level("WARNING", logger=ple_offload_worker.__name__):
+        required = ple_offload_worker._log_ple_host_memory_capacity([])
+
+    assert required == 6 * gib
+    assert "may page its 6.00 GiB table" in caplog.text
+    assert "input-dependent prefill and decode latency" in caplog.text
+
+
+def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
+    """A later batch must not retarget an earlier batch's D2H event."""
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = 0
+    connector.dp_rank = 0
+    connector._uses_cuda_inputs = True
+    connector._request_queue = queue.Queue(maxsize=2)
+    connector._d2h_event_pool = queue.Queue(maxsize=2)
+    first_event = Mock()
+    second_event = Mock()
+    connector._d2h_event_pool.put_nowait(first_event)
+    connector._d2h_event_pool.put_nowait(second_event)
+    enqueue_cuda_inputs = Mock()
+    connector._enqueue_cuda_inputs = enqueue_cuda_inputs  # type: ignore[method-assign]
+
+    connector._launch(num_reqs=4, num_tokens=20)
+    connector._launch(num_reqs=1, num_tokens=5)
+
+    first_pending = connector._request_queue.get_nowait()
+    second_pending = connector._request_queue.get_nowait()
+    assert first_pending is not None
+    assert second_pending is not None
+    assert first_pending.d2h_done_event is first_event
+    assert second_pending.d2h_done_event is second_event
+    assert first_pending.request.num_reqs == 4
+    assert first_pending.request.num_tokens == 20
+    assert second_pending.request.num_reqs == 1
+    assert second_pending.request.num_tokens == 5
+    assert enqueue_cuda_inputs.call_args_list[0].args[1] is first_event
+    assert enqueue_cuda_inputs.call_args_list[1].args[1] is second_event
+    assert connector._d2h_event_pool.empty()
+
+    with pytest.raises(RuntimeError, match="configured concurrent batches"):
+        connector._launch(num_reqs=1, num_tokens=1)
+
+
+def test_ple_offload_request_waits_for_its_bound_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.device = SimpleNamespace(index=0)
+    connector._uses_cuda_inputs = True
+    connector._d2h_event_pool = queue.Queue(maxsize=1)
+    event = Mock()
+    socket = Mock()
+    request = ple_offload_worker.PleOffloadRequest(
+        dp_rank=0,
+        num_tokens=5,
+        num_reqs=1,
+    )
+    pending = ple_offload_connector_module._PendingPleOffloadRequest(request, event)
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.accelerator,
+        "device_index",
+        lambda *_: nullcontext(),
+    )
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.cuda.nvtx,
+        "range",
+        lambda *_: nullcontext(),
+    )
+
+    connector._process_request(pending, socket)
+
+    event.synchronize.assert_called_once_with()
+    socket.send.assert_called_once_with(msgspec.msgpack.encode(request))
+    assert connector._d2h_event_pool.get_nowait() is event
+
+
+def test_ple_offload_preserves_mrv1_cpu_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector._uses_cuda_inputs = False
+    connector._d2h_event_pool = None
+    connector._copy_cpu_inputs = Mock()  # type: ignore[method-assign]
+    socket = Mock()
+    request = ple_offload_worker.PleOffloadRequest(
+        dp_rank=0,
+        num_tokens=3,
+        num_reqs=1,
+    )
+    pending = ple_offload_connector_module._PendingPleOffloadRequest(request, None)
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.cuda.nvtx,
+        "range",
+        lambda *_: nullcontext(),
+    )
+
+    connector._process_request(pending, socket)
+
+    connector._copy_cpu_inputs.assert_called_once_with(request)
+    socket.send.assert_called_once_with(msgspec.msgpack.encode(request))
 
 
 def test_ple_offload_wait_only_waits_for_done(
@@ -320,6 +610,7 @@ def test_only_dp0_tp0_spawns_shared_ple_offload_worker(
     worker = Worker.__new__(Worker)
     worker._ple_offload_enabled = True
     worker._ple_offload_worker_handle = None
+    worker._ple_offload_spawn_config = None
     worker.rank = 0
     worker.local_rank = 0
     worker.vllm_config = SimpleNamespace()
@@ -353,6 +644,45 @@ def test_only_dp0_tp0_spawns_shared_ple_offload_worker(
             )
         ]
         assert worker._ple_offload_worker_handle is handle
+
+
+def test_delayed_ple_spawn_uses_pre_load_config_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    worker = Worker.__new__(Worker)
+    worker._ple_offload_enabled = True
+    worker._ple_offload_worker_handle = None
+    worker._ple_offload_spawn_config = None
+    worker.rank = 0
+    worker.local_rank = 0
+    worker.vllm_config = SimpleNamespace(markers=[])
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_rank=0,
+        data_parallel_size=1,
+        tensor_parallel_size=4,
+        _ple_offload_ipc_path="ipc:///tmp/test-ple-offload",
+    )
+
+    def fake_make_process(*args: object) -> object:
+        calls.append(args)
+        return object()
+
+    monkeypatch.setattr(
+        ple_offload_worker.PleOffloadWorker,
+        "make_process",
+        fake_make_process,
+    )
+
+    worker.prepare_ple_offload_spawn()
+    worker.vllm_config.markers.append("model-load-mutation")
+    worker.spawn_ple_offload()
+
+    spawn_config = calls[0][0]
+    assert isinstance(spawn_config, SimpleNamespace)
+    assert spawn_config.markers == []
+    assert spawn_config is not worker.vllm_config
+    assert worker._ple_offload_spawn_config is None
 
 
 def test_offload_distributed_sets_config_only_for_model_parallel(

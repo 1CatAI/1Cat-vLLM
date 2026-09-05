@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -264,7 +265,7 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         # The first dynamic compile sees prefill (M > 1). Keep the M=1
         # decision inside the opaque op so decode does not inherit a baked-in
         # prefill branch.
-        if bias is None:
+        if bias is None and use_sm70_decode_graph_semantics():
             return torch.ops.vllm.qwen38_sm70_fp16_gemv(x, layer.weight)
         return super().apply(layer, x, bias)
 

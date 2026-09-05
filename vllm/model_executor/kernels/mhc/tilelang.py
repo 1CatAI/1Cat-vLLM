@@ -758,7 +758,13 @@ def mhc_fused_post_pre_tilelang(
         # GLM-5.3 verifies eight rows at once. On SM70, grouping twelve of the
         # 24 outputs per CTA reduces dot-stage scheduling overhead without
         # changing the per-output FP32 accumulation order.
-        tile_n = 2 if num_tokens < 8 else 12
+        tile_n = 2 if num_tokens < 8 else 3
+        if (
+            num_tokens == 8
+            and norm_weight is not None
+            and _is_exact_sm70_glm_mhc(residual_flat, norm_weight)
+        ):
+            tile_n = 12
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
     else:
         if use_deep_gemm:

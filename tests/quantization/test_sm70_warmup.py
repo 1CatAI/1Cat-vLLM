@@ -237,6 +237,35 @@ def test_fp8_warmup_supports_modelopt_turbomind_layout(monkeypatch):
     assert all(call[3:] == (128, 128, 64) for call in calls)
 
 
+def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch):
+    state = SimpleNamespace(
+        weight=torch.empty((32, 4), dtype=torch.int32),
+        scales=torch.empty((2, 32), dtype=torch.float16),
+        group_size=16,
+        k_ld=32,
+        q_ld=32,
+        output_size=24,
+        padded_output_size=32,
+        op_kind="nvfp4",
+        gated_silu=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_gemm_sm70_out_meta", object(), raising=False
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_gemm_sm70_out",
+        lambda *args: calls.append(args),
+    )
+
+    count = warmup._warmup_fp4_dense_layers([state], [1, 4])
+
+    assert count == 2
+    assert [tuple(call[0].shape) for call in calls] == [(1, 32), (4, 32)]
+    assert [tuple(call[1].shape) for call in calls] == [(1, 32), (4, 32)]
+
+
 def _nvfp4_moe_layer() -> nn.Module:
     layer = nn.Module()
     layer.sm70_nvfp4_moe = True
@@ -249,7 +278,7 @@ def _nvfp4_moe_layer() -> nn.Module:
     layer.sm70_nvfp4_w2_n_dim = 2048
     layer.sm70_nvfp4_group_size = 16
     layer.sm70_nvfp4_graph_safe_max_tokens = 18
-    layer.sm70_nvfp4_compact_grouped_max_tokens = 10
+    layer.sm70_nvfp4_compact_grouped_max_slots = 80
     layer.w13_tm_weight = nn.Parameter(
         torch.empty((1, 1), dtype=torch.uint8), requires_grad=False
     )
@@ -337,7 +366,7 @@ def test_nvfp4_moe_warmup_includes_opted_in_cuda_graph_shapes(monkeypatch):
     ) == [*range(1, 11), 18, 20, 40, 60, 80]
 
 
-def test_nvfp4_moe_warmup_uses_slot_compact_through_b10(monkeypatch):
+def test_nvfp4_moe_warmup_uses_slot_compact_through_80_rows(monkeypatch):
     layer = _nvfp4_moe_layer()
     calls = []
     monkeypatch.setattr(
@@ -371,7 +400,7 @@ def test_nvfp4_moe_warmup_uses_slot_compact_through_b10(monkeypatch):
     assert calls[2][2].tolist() == list(range(81))
 
 
-def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b10(monkeypatch):
+def test_nvfp4_moe_warmup_uses_full_expert_groups_above_80_rows(monkeypatch):
     layer = _nvfp4_moe_layer()
     calls = []
     monkeypatch.setattr(

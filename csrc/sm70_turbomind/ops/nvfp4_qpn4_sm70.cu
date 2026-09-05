@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Qwen3.8 NVFP4 M=1 decode kernels for NVIDIA Volta SM70.
+//
+// The QPN4 quadpair-N m8n8k4 layout is derived from dnv2003/v100-skinny (MIT).
+// See LICENSE.v100-skinny in this directory for the retained MIT notice.
 
 #include <torch/all.h>
 #include <torch/library.h>

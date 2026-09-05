@@ -90,6 +90,8 @@ constexpr size_t kSm70Tp4PushAllreduceBytes =
     8 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
+    5 * 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
     ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
@@ -104,7 +106,14 @@ inline int sm70_tp4_push_allreduce_blocks(size_t bytes) {
   if (bytes == kSm70Tp4PushAllreduce8KiBBytes) {
     return 4;
   }
-  return bytes == kSm70Tp4PushAllreduceQwen4ExpBytes ? 3 : 0;
+  if (bytes == kSm70Tp4PushAllreduceQwen4ExpBytes) {
+    return 3;
+  }
+  const char* mtp5 = std::getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5");
+  return bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes && mtp5 != nullptr &&
+                 std::strcmp(mtp5, "1") == 0
+             ? 13
+             : 0;
 }
 
 inline int sm70_gemma_rms_norm_threads() {
@@ -706,6 +715,85 @@ __global__ void __launch_bounds__(1024, 1)
       void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
                           (epoch_offset + rank * packed_stride) * sizeof(P);
       sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[ngpus];
+    while (true) {
+      bool has_empty_slot = false;
+#pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        const void* source =
+            local_storage + kSm70Tp4PushAllreduceSignalBytes +
+            (epoch_offset + source_rank * packed_stride) * sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+#pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+    reinterpret_cast<P*>(output)[offset] =
+        sm70_push_reduce<P, ngpus, A>(peer_values);
+
+    P empty;
+#pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+#pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+                     (epoch_offset + source_rank * packed_stride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty, source, offset);
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[blockIdx.x] = (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+  }
+}
+
+template <int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    sm70_cross_device_reduce_sum2_1stage_push(RankData push_buffers,
+                                              const half* __restrict__ input_a,
+                                              const half* __restrict__ input_b,
+                                              half* __restrict__ output,
+                                              int rank, int packed_size) {
+  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
+  const uint32_t epoch = local_epochs[blockIdx.x];
+  constexpr int packed_stride = kSm70Tp4PushAllreduceBytes / sizeof(P);
+  const int epoch_offset = epoch * ngpus * packed_stride;
+  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (offset < packed_size) {
+    P value_a = reinterpret_cast<const P*>(input_a)[offset];
+    const P value_b = reinterpret_cast<const P*>(input_b)[offset];
+    packed_assign_add(value_a, value_b);
+#pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value_a.data[element]);
+    }
+
+#pragma unroll
+    for (int destination_rank = 0; destination_rank < ngpus;
+         ++destination_rank) {
+      auto* destination_base = const_cast<char*>(
+          reinterpret_cast<const char*>(push_buffers.ptrs[destination_rank]));
+      void* destination = destination_base + kSm70Tp4PushAllreduceSignalBytes +
+                          (epoch_offset + rank * packed_stride) * sizeof(P);
+      sm70_push_store_volatile_16b(value_a, destination, offset);
     }
 
     P peer_values[ngpus];
@@ -2025,6 +2113,21 @@ class CustomAllreduce {
                 sm70_tp8_hierarchical_push_buffers_, input_a, input_b, output,
                 rank_, size);
         return;
+      }
+      if (sm70_tp4_push_buffers_registered_ &&
+          status == cudaStreamCaptureStatusActive &&
+          world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
+          bytes == kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes &&
+          custom_allreduce_current_device_is_sm70()) {
+        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
+        if (push_blocks > 0) {
+          sm70_cross_device_reduce_sum2_1stage_push<
+              kSm70Tp4PushAllreduceWorldSize>
+              <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
+                  sm70_tp4_push_buffers_, input_a, input_b, output, rank_,
+                  size);
+          return;
+        }
       }
     }
     int blocks = std::min(block_limit, (size + threads - 1) / threads);

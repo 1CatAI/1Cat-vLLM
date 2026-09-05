@@ -305,7 +305,7 @@ def fused_moe_kernel_gptq_awq(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["EM"])
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,

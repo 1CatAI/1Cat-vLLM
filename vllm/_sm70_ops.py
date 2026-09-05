@@ -76,7 +76,9 @@ load_deferred_nvfp4_qpn2_prefill_library()
 def _maybe_load_nvfp4_qpn_m1_library() -> None:
     """Load the narrow Qwen3.8 NVFP4 experiment in spawned TP workers."""
     library_path = os.getenv("VLLM_SM70_NVFP4_QPN_M1_LIBRARY")
-    route_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    m1_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1") != "0"
+    mtp5_enabled = os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0") != "0"
+    route_enabled = m1_enabled or mtp5_enabled
     if library_path is not None and route_enabled:
         torch.ops.load_library(library_path)
 
@@ -152,6 +154,13 @@ def has_nvfp4_qpn_m1_dispatch() -> bool:
     )
 
 
+def has_nvfp4_qpn_mtp5_dispatch() -> bool:
+    """Reject extensions that only implement the legacy ten-route kernel."""
+    return hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out") or hasattr(
+        torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"
+    )
+
+
 def silu_and_mul_interleaved(out: torch.Tensor, input: torch.Tensor) -> None:
     _op("silu_and_mul_interleaved")(out, input)
 
@@ -193,6 +202,41 @@ if hasattr(torch.ops._C, "awq_sm70_prepare"):
         tm_scales = torch.empty(
             (num_groups, n),
             dtype=torch.int32,
+            device=qweight.device,
+        )
+        meta = torch.empty((2,), dtype=torch.int64, device=qweight.device)
+        return [tm_weight, tm_scales, meta]
+
+
+def awq_sm70_prepare_compact(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    interleave_gated_silu: bool = False,
+) -> list[torch.Tensor]:
+    return _op("awq_sm70_prepare_compact")(
+        qweight, scales, qzeros, group_size, interleave_gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "awq_sm70_prepare_compact"):
+
+    @register_fake("_C::awq_sm70_prepare_compact")
+    def _awq_sm70_prepare_compact_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor,
+        group_size: int,
+        interleave_gated_silu: bool,
+    ) -> list[torch.Tensor]:
+        del qzeros, group_size, interleave_gated_silu
+        n = qweight.size(1) * 8
+        num_groups = scales.size(0)
+        tm_weight = torch.empty_like(qweight)
+        tm_scales = torch.empty(
+            (num_groups, n, 3),
+            dtype=torch.uint8,
             device=qweight.device,
         )
         meta = torch.empty((2,), dtype=torch.int64, device=qweight.device)
@@ -1581,6 +1625,56 @@ if hasattr(torch.ops._C, "nvfp4_glm53_moe_q8_qpn_sm70_out"):
         return None
 
 
+def nvfp4_moe_qpn_mtp5_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    broadcast_input: bool,
+    split_k: int,
+) -> None:
+    _qwen38_qpn8_op("nvfp4_moe_qpn_mtp5_sm70_out")(
+        out,
+        input,
+        weights,
+        scales,
+        expert_ids,
+        broadcast_input,
+        split_k,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_qpn_mtp5_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_qpn_mtp5_sm70_out")
+    def _nvfp4_moe_qpn_mtp5_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C_qwen38, "nvfp4_moe_qpn_mtp5_sm70_out"):
+
+    @register_fake("_C_qwen38::nvfp4_moe_qpn_mtp5_sm70_out")
+    def _nvfp4_moe_qpn_mtp5_sm70_out_sidecar_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        scales: torch.Tensor,
+        expert_ids: torch.Tensor,
+        broadcast_input: bool,
+        split_k: int,
+    ) -> None:
+        return None
+
+
 def nvfp4_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -2782,6 +2876,53 @@ if hasattr(torch.ops._C, "awq_moe_dense_stage_sm70_out"):
     def _awq_moe_dense_stage_sm70_out_fake(
         out: torch.Tensor,
         input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        dense_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+def awq_moe_indexed_dense_w13_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    input_row_indices: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    dense_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("awq_moe_indexed_dense_w13_sm70_out")(
+        out,
+        input,
+        input_row_indices,
+        expert_offsets,
+        dense_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_indexed_dense_w13_sm70_out"):
+
+    @register_fake("_C::awq_moe_indexed_dense_w13_sm70_out")
+    def _awq_moe_indexed_dense_w13_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        input_row_indices: torch.Tensor,
         expert_offsets: torch.Tensor,
         dense_expert_ids: torch.Tensor,
         ptrs_w: torch.Tensor,

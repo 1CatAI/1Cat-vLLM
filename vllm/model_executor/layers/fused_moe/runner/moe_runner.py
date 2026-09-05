@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -598,6 +599,8 @@ class MoERunner(MoERunnerInterface):
         fused_output: torch.Tensor,
     ) -> bool:
         if shared_output is None:
+            return False
+        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and not use_sm70_decode_graph_semantics():
             return False
         if not current_platform.is_cuda():
             return False

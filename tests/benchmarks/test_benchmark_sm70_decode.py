@@ -1,9 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import subprocess
 import types
 
-from benchmarks import benchmark_sm70_decode, benchmark_sm70_model_tokens
+from benchmarks import (
+    benchmark_sm70_decode,
+    benchmark_sm70_dflash2_gsm8k,
+    benchmark_sm70_model_tokens,
+    benchmark_sm70_serving_quality,
+)
+
+
+def test_dflash_quality_git_provenance_is_optional(monkeypatch, tmp_path):
+    def fail(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])
+
+    monkeypatch.setattr(benchmark_sm70_dflash2_gsm8k.subprocess, "check_output", fail)
+
+    assert benchmark_sm70_dflash2_gsm8k._git_sha(tmp_path) is None
+
+
+def test_dflash_quality_persists_completed_case(tmp_path):
+    path = tmp_path / "quality.partial.jsonl"
+    output = types.SimpleNamespace(
+        outputs=[
+            types.SimpleNamespace(
+                token_ids=[3, 5, 8],
+                finish_reason="stop",
+                stop_reason=None,
+                text="answer",
+            )
+        ]
+    )
+
+    benchmark_sm70_dflash2_gsm8k._append_partial_case(
+        path,
+        dataset_index=7,
+        request_seed=42,
+        output=output,
+    )
+
+    assert json.loads(path.read_text()) == {
+        "dataset_index": 7,
+        "finish_reason": "stop",
+        "output_tokens": 3,
+        "request_seed": 42,
+        "stop_reason": None,
+        "text": "answer",
+        "token_ids": [3, 5, 8],
+    }
 
 
 def test_sm70_fa2_d256_prefill_status_reports_import_error(monkeypatch):
@@ -104,6 +151,40 @@ def test_spec_decoding_delta_reports_one_sequential_prompt():
     assert metrics["num_accepted_tokens"] == 7
     assert metrics["accepted_tokens_per_pos"] == [3, 2, 2]
     assert metrics["mean_acceptance_length"] == 2.75
+
+
+def test_serving_quality_preserves_all_dflash_positions():
+    prefix = "vllm:spec_decode_num_accepted_tokens_per_pos_total:position_"
+    before = {
+        "vllm:spec_decode_num_drafts_total": 10.0,
+        "vllm:spec_decode_num_draft_tokens_total": 70.0,
+        "vllm:spec_decode_num_accepted_tokens_total": 35.0,
+        **{f"{prefix}{pos}": float(10 - pos) for pos in range(7)},
+    }
+    after = {
+        "vllm:spec_decode_num_drafts_total": 12.0,
+        "vllm:spec_decode_num_draft_tokens_total": 84.0,
+        "vllm:spec_decode_num_accepted_tokens_total": 42.0,
+        **{f"{prefix}{pos}": float(12 - pos) for pos in range(7)},
+    }
+
+    delta = benchmark_sm70_serving_quality._counter_delta(before, after)
+
+    assert delta is not None
+    assert delta["accepted_tokens_per_pos"] == [2.0] * 7
+    summary = benchmark_sm70_serving_quality._summarize_spec_metrics(
+        [
+            {"serving_metrics_delta": delta},
+            {
+                "serving_metrics_delta": {
+                    **delta,
+                    "accepted_tokens_per_pos": [1.0, 1.0, 1.0],
+                }
+            },
+        ]
+    )
+    assert summary is not None
+    assert summary["accepted_tokens_per_pos"] == [3.0, 3.0, 3.0, 2.0, 2.0, 2.0, 2.0]
 
 
 def test_sm70_policy_records_generic_mtp_moe_tuning(monkeypatch):

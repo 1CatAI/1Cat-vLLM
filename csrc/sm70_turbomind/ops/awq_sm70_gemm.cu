@@ -3132,11 +3132,35 @@ torch::Tensor interleave_gated_silu_cols(torch::Tensor tensor) {
   return torch::stack({first, second}, -1).reshape(tensor.sizes());
 }
 
-std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
-                                            torch::Tensor scales,
-                                            torch::Tensor qzeros,
-                                            int64_t group_size,
-                                            bool interleave_gated_silu) {
+__global__ void pack_awq_compact_source_kernel(uint32_t* packed,
+                                               const half* scales,
+                                               const uint8_t* zeros,
+                                               int64_t numel) {
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < numel) {
+    const uint16_t scale_bits = __half_as_ushort(scales[idx]);
+    packed[idx] = static_cast<uint32_t>(scale_bits) |
+                  (static_cast<uint32_t>(zeros[idx]) << 16);
+  }
+}
+
+__global__ void compact_awq_stats_kernel(uint8_t* compact,
+                                         const uint32_t* packed,
+                                         int64_t numel) {
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < numel) {
+    const uint32_t value = packed[idx];
+    compact[idx * 3] = static_cast<uint8_t>(value);
+    compact[idx * 3 + 1] = static_cast<uint8_t>(value >> 8);
+    compact[idx * 3 + 2] = static_cast<uint8_t>(value >> 16);
+  }
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare_impl(
+    torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros,
+    int64_t group_size, bool interleave_gated_silu, bool compact_metadata) {
   validate_awq_inputs(qweight, scales, qzeros);
 
   qweight = qweight.contiguous();
@@ -3245,21 +3269,36 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
   for (int i = 0; i < 8; ++i) {
     zordered.push_back(zslices[awq_order[i]]);
   }
-  auto zeros_half =
-      torch::stack(zordered, -1).reshape({num_groups, n}).to(torch::kFloat16);
+  auto zeros_u8 = torch::stack(zordered, -1).reshape({num_groups, n});
   if (interleave_gated_silu) {
     scales = interleave_gated_silu_cols(scales);
-    zeros_half = interleave_gated_silu_cols(zeros_half);
+    zeros_u8 = interleave_gated_silu_cols(zeros_u8);
   }
 
-  auto fused = torch::empty(
-      {num_groups, n * 2},
-      torch::TensorOptions().device(scales.device()).dtype(torch::kFloat16));
-  turbomind::fuse_scales_and_zeros(
-      reinterpret_cast<half*>(fused.data_ptr<at::Half>()),
-      reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
-      reinterpret_cast<half*>(zeros_half.data_ptr<at::Half>()), scales.numel(),
-      stream);
+  torch::Tensor source_stats;
+  if (compact_metadata) {
+    source_stats = torch::empty(
+        {num_groups, n},
+        torch::TensorOptions().device(scales.device()).dtype(torch::kInt32));
+    constexpr int kThreads = 256;
+    const int blocks =
+        static_cast<int>((scales.numel() + kThreads - 1) / kThreads);
+    pack_awq_compact_source_kernel<<<blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<uint32_t*>(source_stats.data_ptr<int32_t>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        zeros_u8.data_ptr<uint8_t>(), scales.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  } else {
+    auto zeros_half = zeros_u8.to(torch::kFloat16);
+    source_stats = torch::empty(
+        {num_groups, n * 2},
+        torch::TensorOptions().device(scales.device()).dtype(torch::kFloat16));
+    turbomind::fuse_scales_and_zeros(
+        reinterpret_cast<half*>(source_stats.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(zeros_half.data_ptr<at::Half>()),
+        scales.numel(), stream);
+  }
 
   const auto order_s = conv_s->order;
   const bool is_A_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
@@ -3282,18 +3321,52 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
     q_desc = turbomind::gemm::transpose(q_desc);
   }
 
-  auto tm_scales = torch::empty(
+  auto tm_stats = torch::empty(
       {num_groups, n},
       torch::TensorOptions().device(scales.device()).dtype(torch::kInt32));
-  TORCH_CHECK(conv_s->Convert(fused.data_ptr(), s_desc, tm_scales.data_ptr(),
-                              q_desc, stream) == 0,
+  TORCH_CHECK(conv_s->Convert(source_stats.data_ptr(), s_desc,
+                              tm_stats.data_ptr(), q_desc, stream) == 0,
               "awq_sm70_prepare: scale conversion failed.");
+
+  torch::Tensor tm_scales = tm_stats;
+  if (compact_metadata) {
+    tm_scales = torch::empty(
+        {num_groups, n, 3},
+        torch::TensorOptions().device(scales.device()).dtype(torch::kUInt8));
+    constexpr int kThreads = 256;
+    const int blocks =
+        static_cast<int>((tm_stats.numel() + kThreads - 1) / kThreads);
+    compact_awq_stats_kernel<<<blocks, kThreads, 0, stream>>>(
+        tm_scales.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(tm_stats.data_ptr<int32_t>()),
+        tm_stats.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 
   auto meta = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64));
   meta.index_put_({0}, k_desc.ld);
-  meta.index_put_({1}, q_desc.ld);
+  // q_ld is an internal contract between prepare, pointer construction and
+  // the SM70 iterator.  Its sign distinguishes compact 3-byte statistics;
+  // the magnitude remains the logical TurboMind leading dimension.
+  meta.index_put_({1}, compact_metadata ? -q_desc.ld : q_desc.ld);
 
   return {tm_weight, tm_scales, meta};
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
+                                            torch::Tensor scales,
+                                            torch::Tensor qzeros,
+                                            int64_t group_size,
+                                            bool interleave_gated_silu) {
+  return awq_sm70_prepare_impl(qweight, scales, qzeros, group_size,
+                               interleave_gated_silu, false);
+}
+
+std::vector<torch::Tensor> awq_sm70_prepare_compact(
+    torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros,
+    int64_t group_size, bool interleave_gated_silu) {
+  return awq_sm70_prepare_impl(qweight, scales, qzeros, group_size,
+                               interleave_gated_silu, true);
 }
 
 std::vector<torch::Tensor> uint4_sm70_prepare(torch::Tensor qweight,
@@ -3826,6 +3899,7 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
                        bool gated_silu,
                        const turbomind::gemm::TileAllReduceParam* tile_reduce) {
+  const bool compact_metadata = q_ld < 0;
   TORCH_CHECK(in_feats.is_cuda(), "awq_gemm_sm70: input must be CUDA.");
   TORCH_CHECK(tm_weight.is_cuda(), "awq_gemm_sm70: weight must be CUDA.");
   TORCH_CHECK(tm_scales.is_cuda(), "awq_gemm_sm70: scales must be CUDA.");
@@ -3834,8 +3908,10 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
               "awq_gemm_sm70: input must be float16.");
   TORCH_CHECK(tm_weight.scalar_type() == torch::kInt32,
               "awq_gemm_sm70: weight must be int32.");
-  TORCH_CHECK(tm_scales.scalar_type() == torch::kInt32,
-              "awq_gemm_sm70: scales must be int32.");
+  TORCH_CHECK(
+      (!compact_metadata && tm_scales.scalar_type() == torch::kInt32) ||
+          (compact_metadata && tm_scales.scalar_type() == torch::kUInt8),
+      "awq_gemm_sm70: scales must be int32, or uint8 with compact q_ld.");
   TORCH_CHECK(out.scalar_type() == torch::kFloat16,
               "awq_gemm_sm70: output must be float16.");
 
@@ -3852,6 +3928,14 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   TORCH_CHECK(tm_scales.size(0) == k / group_size,
               "awq_gemm_sm70: scale groups mismatch.");
   TORCH_CHECK(tm_scales.size(1) == n, "awq_gemm_sm70: scale shape mismatch.");
+  if (compact_metadata) {
+    TORCH_CHECK(tm_scales.dim() == 3 && tm_scales.size(2) == 3 &&
+                    tm_scales.is_contiguous(),
+                "awq_gemm_sm70: compact scales must be contiguous [G,N,3].");
+  } else {
+    TORCH_CHECK(tm_scales.dim() == 2,
+                "awq_gemm_sm70: regular scales must be rank 2.");
+  }
   TORCH_CHECK(out.size(0) == m,
               "awq_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
@@ -3927,7 +4011,7 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   if (is_A_s) {
     desc_V = turbomind::gemm::transpose(desc_V);
   }
-  desc_V.ld = static_cast<int>(q_ld);
+  desc_V.ld = static_cast<int>(compact_metadata ? -q_ld : q_ld);
 
   turbomind::gemm::MatrixLayout desc_D{
       turbomind::kHalf,    turbomind::gemm::kRowMajor,      static_cast<int>(m),
@@ -3956,10 +4040,15 @@ void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
   auto& workspace_holder = get_workspace(device, stream);
   auto& gemm = get_gemm(device);
 
+  void* stats_ptr = tm_scales.data_ptr();
+  if (compact_metadata) {
+    stats_ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stats_ptr) |
+                                        uintptr_t{1});
+  }
   const int ec = gemm.Run(op, 1.f, in_feats.data_ptr(), desc_A, nullptr, desc_U,
-                          tm_weight.data_ptr(), desc_B, tm_scales.data_ptr(),
-                          desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(),
-                          desc_D, workspace_holder.workspace, stream);
+                          tm_weight.data_ptr(), desc_B, stats_ptr, desc_V, 0.f,
+                          out.data_ptr(), desc_D, out.data_ptr(), desc_D,
+                          workspace_holder.workspace, stream);
   TORCH_CHECK(ec == 0, "awq_gemm_sm70: TurboMind GEMM failed.");
 }
 
@@ -6051,6 +6140,13 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                           group_size, interleave_gated_silu);
 }
 
+std::vector<torch::Tensor> awq_sm70_prepare_compact(
+    torch::Tensor _kernel, torch::Tensor _scaling_factors, torch::Tensor _zeros,
+    int64_t group_size, bool interleave_gated_silu) {
+  return vllm::awq_sm70::awq_sm70_prepare_compact(
+      _kernel, _scaling_factors, _zeros, group_size, interleave_gated_silu);
+}
+
 void awq_sm70_dequantize_out(torch::Tensor out, torch::Tensor _kernel,
                              torch::Tensor _scaling_factors,
                              int64_t group_size) {
@@ -6439,12 +6535,15 @@ namespace {
 
 __global__ void awq_moe_fill_strided_ptrs_kernel(
     turbomind::gemm::StridedPtr* ptrs, char* base, int64_t expert_stride,
-    int stride, int64_t num_experts) {
+    int stride, int64_t num_experts, bool compact_metadata) {
   const int64_t expert_id =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (expert_id < num_experts) {
+    const uintptr_t data_ptr =
+        reinterpret_cast<uintptr_t>(base + expert_id * expert_stride);
     ptrs[expert_id] = {
-        base + expert_id * expert_stride,
+        reinterpret_cast<void*>(
+            data_ptr | (compact_metadata ? uintptr_t{1} : uintptr_t{0})),
         stride,
     };
   }
@@ -6466,6 +6565,13 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
               "awq_moe_build_strided_ptrs: weights dim0 != num_experts.");
   TORCH_CHECK(tm_scales.size(0) == num_experts,
               "awq_moe_build_strided_ptrs: scales dim0 != num_experts.");
+  if (q_ld < 0) {
+    TORCH_CHECK(tm_scales.scalar_type() == torch::kUInt8 &&
+                    tm_scales.dim() == 4 && tm_scales.size(3) == 3 &&
+                    tm_scales.is_contiguous(),
+                "awq_moe_build_strided_ptrs: compact scales must be "
+                "contiguous uint8 [E,G,N,3].");
+  }
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(tm_weights));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -6476,6 +6582,7 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
       tm_scales.stride(0) * tm_scales.element_size();
   char* w_base = static_cast<char*>(tm_weights.data_ptr());
   char* s_base = static_cast<char*>(tm_scales.data_ptr());
+  const bool compact_metadata = q_ld < 0;
 
   // StridedPtr is 16 bytes (__align__(16): void* ptr + int stride + padding).
   const int64_t buf_bytes = num_experts * 16;
@@ -6487,10 +6594,12 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
   const int blocks = static_cast<int>((num_experts + kThreads - 1) / kThreads);
   awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
       reinterpret_cast<turbomind::gemm::StridedPtr*>(w_tensor.data_ptr()),
-      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts);
+      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts, false);
   awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
       reinterpret_cast<turbomind::gemm::StridedPtr*>(s_tensor.data_ptr()),
-      s_base, s_expert_stride, static_cast<int>(q_ld), num_experts);
+      s_base, s_expert_stride,
+      static_cast<int>(compact_metadata ? -q_ld : q_ld), num_experts,
+      compact_metadata);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {w_tensor, s_tensor};
@@ -6817,7 +6926,8 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
     torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce);
+    bool weighted_reduce, int64_t logical_total_tokens,
+    torch::Tensor a_indices);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -7636,7 +7746,8 @@ void awq_moe_gemm_sm70_out_impl(
     bool per_expert_dispatch = false,
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
-    bool weighted_reduce = false) {
+    bool weighted_reduce = false, int64_t logical_total_tokens = -1,
+    torch::Tensor a_indices = torch::Tensor()) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "awq_moe_gemm_sm70: input must be CUDA float16.");
@@ -7659,6 +7770,8 @@ void awq_moe_gemm_sm70_out_impl(
               "awq_moe_gemm_sm70: invalid dimensions.");
   TORCH_CHECK(k % group_size == 0,
               "awq_moe_gemm_sm70: input dim must be divisible by group size.");
+  TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
+              "awq_moe_gemm_sm70: input shape mismatch.");
   torch::Tensor b_group_indices_flat = b_group_indices;
   const bool use_b_group_indices =
       b_group_indices.defined() && b_group_indices.numel() > 0;
@@ -7675,7 +7788,25 @@ void awq_moe_gemm_sm70_out_impl(
   const int device = sorted_input.get_device();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  const int64_t total_tokens = sorted_input.size(0);
+  const int64_t input_tokens = sorted_input.size(0);
+  const int64_t total_tokens =
+      logical_total_tokens > 0 ? logical_total_tokens : input_tokens;
+  const bool use_a_indices = a_indices.defined() && a_indices.numel() > 0;
+  torch::Tensor a_indices_flat = a_indices;
+  if (use_a_indices) {
+    TORCH_CHECK(a_indices.is_cuda() &&
+                    a_indices.scalar_type() == torch::kInt32 &&
+                    a_indices.is_contiguous(),
+                "awq_moe_gemm_sm70: A row indices must be contiguous CUDA "
+                "int32.");
+    a_indices_flat = a_indices.view({-1});
+    TORCH_CHECK(a_indices_flat.numel() >= total_tokens,
+                "awq_moe_gemm_sm70: A row indices size mismatch.");
+  } else {
+    TORCH_CHECK(input_tokens == total_tokens,
+                "awq_moe_gemm_sm70: non-indexed input rows must match "
+                "logical rows.");
+  }
   TORCH_CHECK(out.size(0) == total_tokens,
               "awq_moe_gemm_sm70: output rows must match input rows.");
   TORCH_CHECK(out.stride(1) == 1,
@@ -7717,10 +7848,11 @@ void awq_moe_gemm_sm70_out_impl(
       turbomind::gemm::kRowMajor,
       static_cast<int>(total_tokens),
       static_cast<int>(k),
-      static_cast<int>(k),
+      static_cast<int>(sorted_input.stride(0)),
   };
   desc_A.num = static_cast<int>(num_experts);
   desc_A.offsets = expert_offsets.data_ptr<int>();
+  desc_A.idxs = use_a_indices ? a_indices_flat.data_ptr<int>() : nullptr;
 
   turbomind::gemm::MatrixLayout desc_U{};
 
@@ -7850,6 +7982,53 @@ void awq_moe_gemm_sm70_per_expert_dispatch_out(
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
                              gated_silu, torch::Tensor(), true);
+}
+
+void awq_moe_indexed_dense_w13_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
+    torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
+    torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
+    int64_t n, int64_t group_size) {
+  constexpr int kQwen38TopK = 10;
+  TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
+                  input.scalar_type() == torch::kFloat16 && input.is_cuda() &&
+                  input.is_contiguous(),
+              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 CUDA FP16 "
+              "[tokens, 2560] input is required.");
+  TORCH_CHECK(num_experts == 512 && k == 2560 && n == 320 && group_size == 32,
+              "awq_moe_indexed_dense_w13_sm70_out: exact Qwen3.8 TP4 W13 "
+              "g32 contract is required.");
+  TORCH_CHECK(input_row_indices.is_cuda() &&
+                  input_row_indices.scalar_type() == torch::kInt32 &&
+                  input_row_indices.is_contiguous() &&
+                  input_row_indices.numel() == input.size(0) * kQwen38TopK,
+              "awq_moe_indexed_dense_w13_sm70_out: input row indices must "
+              "contain exactly tokens*10 contiguous CUDA int32 entries.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous() &&
+                  expert_offsets.numel() >= num_experts + 1,
+              "awq_moe_indexed_dense_w13_sm70_out: expert offsets must be "
+              "contiguous CUDA int32 with num_experts+1 entries.");
+  TORCH_CHECK(dense_expert_ids.is_cuda() &&
+                  dense_expert_ids.scalar_type() == torch::kInt32 &&
+                  dense_expert_ids.is_contiguous() &&
+                  dense_expert_ids.numel() >= num_experts,
+              "awq_moe_indexed_dense_w13_sm70_out: dense expert IDs must be "
+              "contiguous CUDA int32.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == input_row_indices.numel() &&
+                  out.size(1) == n && out.stride(1) == 1,
+              "awq_moe_indexed_dense_w13_sm70_out: output shape mismatch.");
+
+  static std::atomic<unsigned> logged_awq_indexed_prefill{0u};
+  maybe_log_sm70_moe_route_once(
+      logged_awq_indexed_prefill,
+      "SM70 Qwen3.8 AWQ indexed-A W13 prefill path enabled C++ op reached",
+      input, input_row_indices.numel(), num_experts);
+  awq_moe_gemm_sm70_out_impl(
+      out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
+      false, dense_expert_ids, true, torch::Tensor(), torch::Tensor(), false,
+      input_row_indices.numel(), input_row_indices);
 }
 
 torch::Tensor awq_moe_gemm_sm70(torch::Tensor sorted_input,

@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import subprocess
 import time
@@ -17,17 +18,31 @@ from pathlib import Path
 from typing import Any
 
 import regex as re
-from benchmark_sm70_decode import (
-    _diff_spec_metrics,
-    _hash_ids,
-    _json_safe,
-    _module_file,
-    _module_realpath,
-    _parse_extra_engine_args,
-    _request_metrics_dict,
-    _spec_metrics_snapshot,
-    _tracked_env,
-)
+
+if __package__:
+    from benchmarks.benchmark_sm70_decode import (
+        _diff_spec_metrics,
+        _hash_ids,
+        _json_safe,
+        _module_file,
+        _module_realpath,
+        _parse_extra_engine_args,
+        _request_metrics_dict,
+        _spec_metrics_snapshot,
+        _tracked_env,
+    )
+else:
+    from benchmark_sm70_decode import (
+        _diff_spec_metrics,
+        _hash_ids,
+        _json_safe,
+        _module_file,
+        _module_realpath,
+        _parse_extra_engine_args,
+        _request_metrics_dict,
+        _spec_metrics_snapshot,
+        _tracked_env,
+    )
 
 INVALID_ANSWER = -9_999_999
 IMPLEMENTATION_MIN_ACCEPTANCE_LENGTH = 4.85
@@ -151,6 +166,43 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_sha(path: Path) -> str | None:
+    """Return repository provenance without making benchmark data disposable."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=path,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _append_partial_case(
+    path: Path,
+    *,
+    dataset_index: int,
+    request_seed: int | None,
+    output: Any,
+) -> None:
+    """Durably retain a completed case before a long quality run finishes."""
+    result = output.outputs[0]
+    record = {
+        "dataset_index": dataset_index,
+        "request_seed": request_seed,
+        "output_tokens": len(result.token_ids),
+        "finish_reason": result.finish_reason,
+        "stop_reason": result.stop_reason,
+        "text": result.text,
+        "token_ids": list(result.token_ids),
+    }
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, sort_keys=True) + "\n")
+        file.flush()
+        os.fsync(file.fileno())
 
 
 def _request_seeds(args: argparse.Namespace) -> list[int | None]:
@@ -392,6 +444,9 @@ def main() -> int:
     outputs = []
     request_spec_metrics = []
     case_inputs = []
+    partial_path = args.out.with_suffix(args.out.suffix + ".partial.jsonl")
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path.write_text("", encoding="utf-8")
     for seed_base in request_seeds:
         if args.sequential:
             seed_outputs = []
@@ -410,12 +465,19 @@ def main() -> int:
                     skip_special_tokens=False,
                 )
                 request_spec_before = _spec_metrics_snapshot(llm)
-                seed_outputs.append(llm.generate([prompt], sampling, use_tqdm=False)[0])
+                generated = llm.generate([prompt], sampling, use_tqdm=False)[0]
+                seed_outputs.append(generated)
                 request_spec_after = _spec_metrics_snapshot(llm)
                 seed_spec_metrics.append(
                     _diff_spec_metrics(request_spec_before, request_spec_after)
                 )
                 actual_seeds.append(request_seed)
+                _append_partial_case(
+                    partial_path,
+                    dataset_index=dataset_index,
+                    request_seed=request_seed,
+                    output=generated,
+                )
         else:
             sampling = SamplingParams(
                 temperature=args.temperature,
@@ -428,6 +490,15 @@ def main() -> int:
             seed_outputs = llm.generate(prompts, sampling, use_tqdm=False)
             seed_spec_metrics = [None] * len(seed_outputs)
             actual_seeds = [seed_base] * len(seed_outputs)
+            for (dataset_index, _row), generated in zip(
+                rows, seed_outputs, strict=True
+            ):
+                _append_partial_case(
+                    partial_path,
+                    dataset_index=dataset_index,
+                    request_seed=seed_base,
+                    output=generated,
+                )
         outputs.extend(seed_outputs)
         request_spec_metrics.extend(seed_spec_metrics)
         case_inputs.extend(
@@ -536,11 +607,8 @@ def main() -> int:
     )
     payload = {
         "contract": {
-            "source_sha": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=Path(__file__).resolve().parents[1],
-                text=True,
-            ).strip(),
+            "source_sha": _git_sha(Path(__file__).resolve().parents[1]),
+            "partial_result_file": str(partial_path),
             "mode": args.mode,
             "dataset": str(args.dataset),
             "dataset_sha256": _sha256_file(args.dataset),

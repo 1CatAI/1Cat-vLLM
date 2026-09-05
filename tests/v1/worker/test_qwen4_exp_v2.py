@@ -3,10 +3,12 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -18,6 +20,89 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle_speculator
+
+
+def test_qsa_request_count_is_not_a_triton_compile_key() -> None:
+    for kernel in (
+        qsa_ops._qsa_mqa_paged_kernel,
+        qsa_ops._qsa_sparse_paged_gqa_splitk_kernel,
+    ):
+        assert "num_requests" in kernel.do_not_specialize
+
+
+@pytest.mark.parametrize(
+    ("capture_sizes", "decode_query_len", "max_num_reqs", "expected"),
+    [
+        ([1, 2, 4, 5, 8, 9, 10, 15, 18, 20], 5, 4, (1, 2, 3, 4)),
+        ([5, 10, 15, 20, 25], 5, 3, (1, 2, 3)),
+        ([1, 2, 4, 8], 5, 4, (1,)),
+        (None, 5, 4, (1,)),
+        ([5], 0, 4, ()),
+        ([5], 5, 0, ()),
+    ],
+)
+def test_mtp_decode_warmup_uses_graph_request_shapes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+    max_num_reqs: int,
+    expected: tuple[int, ...],
+) -> None:
+    assert (
+        eagle_speculator._mtp_decode_warmup_request_sizes(
+            capture_sizes,
+            decode_query_len,
+            max_num_reqs,
+        )
+        == expected
+    )
+
+
+def test_mtp_moe_warmup_executes_each_captured_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    speculator = eagle_speculator.EagleSpeculator.__new__(
+        eagle_speculator.EagleSpeculator
+    )
+    speculator.method = "mtp"
+    speculator.device = torch.device("cuda")
+    speculator.num_speculative_steps = 4
+    speculator.max_num_reqs = 4
+    speculator.max_num_tokens = 64
+    speculator._sm70_mtp_moe_warmed = False
+    speculator.draft_model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(
+            num_experts_per_tok=10,
+            moe_intermediate_size=640,
+        ),
+        get_num_experts=lambda: 512,
+        get_hidden_size=lambda: 2560,
+    )
+    speculator.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[1, 2, 4, 5, 8, 9, 10, 15, 18, 20]
+        ),
+    )
+    dummy_run = mock.Mock()
+    monkeypatch.setattr(
+        eagle_speculator.current_platform,
+        "is_device_capability",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(eagle_speculator.envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True)
+    monkeypatch.setattr(torch.accelerator, "synchronize", mock.Mock())
+
+    assert speculator.warmup_sm70_mtp_moe_kernels(dummy_run) == (
+        "mtp_draft_moe_prefill_m16",
+        "mtp_draft_moe_decode_reqs_1_2_3_4",
+    )
+    assert dummy_run.call_args_list == [
+        mock.call(16),
+        mock.call(5, uniform_decode=True),
+        mock.call(10, uniform_decode=True),
+        mock.call(15, uniform_decode=True),
+        mock.call(20, uniform_decode=True),
+    ]
 
 
 def test_qwen4_exp_mtp_v2_unpacks_logits_and_feedback_hidden_states(
