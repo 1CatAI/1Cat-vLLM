@@ -19,7 +19,11 @@ from torch.nn import Parameter
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.config.vllm import get_current_vllm_config_or_none
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    is_uniform_decode_metadata,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
@@ -272,43 +276,11 @@ def _grouped_decode_context_ok() -> bool:
     if not is_forward_context_available():
         return False
     context = get_forward_context()
-    metadata = context.attn_metadata
-    # DBO/list metadata needs per-microbatch ownership, not a shared decision.
-    if not isinstance(metadata, dict) or not metadata:
-        return False
     key = "sm70_grouped_moe_decode"
     if key not in context.additional_kwargs:
-        seen_decode = False
-        allowed = True
-        for meta in metadata.values():
-            prefills = getattr(meta, "num_prefills", 0)
-            prefill_tokens = getattr(meta, "num_prefill_tokens", 0)
-            if (
-                not isinstance(prefills, int)
-                or not isinstance(prefill_tokens, int)
-                or prefills != 0
-                or prefill_tokens != 0
-            ):
-                allowed = False
-                break
-            max_query = getattr(meta, "max_query_len", None)
-            if max_query is not None:
-                if not isinstance(max_query, int) or max_query != 1:
-                    allowed = False
-                    break
-                seen_decode = True
-            num_decodes = getattr(meta, "num_decodes", None)
-            if num_decodes is not None:
-                decode_tokens = getattr(meta, "num_decode_tokens", None)
-                if (
-                    not isinstance(num_decodes, int)
-                    or not isinstance(decode_tokens, int)
-                    or decode_tokens != num_decodes
-                ):
-                    allowed = False
-                    break
-                seen_decode |= num_decodes > 0
-        context.additional_kwargs[key] = bool(allowed and seen_decode)
+        context.additional_kwargs[key] = is_uniform_decode_metadata(
+            context.attn_metadata
+        )
     return bool(context.additional_kwargs[key])
 
 

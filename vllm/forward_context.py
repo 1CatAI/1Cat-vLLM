@@ -221,6 +221,43 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def is_uniform_decode_metadata(metadata: Any) -> bool:
+    """Recognize one-token decode using CPU metadata, without GPU readback.
+
+    List/DBO metadata needs its own per-microbatch ownership. Unknown or
+    tensor-valued counters fail closed rather than synchronizing the device.
+    """
+    if not isinstance(metadata, dict) or not metadata:
+        return False
+    seen_decode = False
+    for meta in metadata.values():
+        prefills = getattr(meta, "num_prefills", 0)
+        prefill_tokens = getattr(meta, "num_prefill_tokens", 0)
+        if (
+            not isinstance(prefills, int)
+            or not isinstance(prefill_tokens, int)
+            or prefills != 0
+            or prefill_tokens != 0
+        ):
+            return False
+        max_query = getattr(meta, "max_query_len", None)
+        if max_query is not None:
+            if not isinstance(max_query, int) or max_query != 1:
+                return False
+            seen_decode = True
+        num_decodes = getattr(meta, "num_decodes", None)
+        if num_decodes is not None:
+            decode_tokens = getattr(meta, "num_decode_tokens", None)
+            if (
+                not isinstance(num_decodes, int)
+                or not isinstance(decode_tokens, int)
+                or decode_tokens != num_decodes
+            ):
+                return False
+            seen_decode |= num_decodes > 0
+    return seen_decode
+
+
 def create_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
