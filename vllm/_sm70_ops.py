@@ -208,6 +208,41 @@ if hasattr(torch.ops._C, "awq_sm70_prepare"):
         return [tm_weight, tm_scales, meta]
 
 
+def awq_sm70_prepare_compact(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    interleave_gated_silu: bool = False,
+) -> list[torch.Tensor]:
+    return _op("awq_sm70_prepare_compact")(
+        qweight, scales, qzeros, group_size, interleave_gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "awq_sm70_prepare_compact"):
+
+    @register_fake("_C::awq_sm70_prepare_compact")
+    def _awq_sm70_prepare_compact_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        qzeros: torch.Tensor,
+        group_size: int,
+        interleave_gated_silu: bool,
+    ) -> list[torch.Tensor]:
+        del qzeros, group_size, interleave_gated_silu
+        n = qweight.size(1) * 8
+        num_groups = scales.size(0)
+        tm_weight = torch.empty_like(qweight)
+        tm_scales = torch.empty(
+            (num_groups, n, 3),
+            dtype=torch.uint8,
+            device=qweight.device,
+        )
+        meta = torch.empty((2,), dtype=torch.int64, device=qweight.device)
+        return [tm_weight, tm_scales, meta]
+
+
 def awq_sm70_dequantize_out(
     out: torch.Tensor,
     qweight: torch.Tensor,
