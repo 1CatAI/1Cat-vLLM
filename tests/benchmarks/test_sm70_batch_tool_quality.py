@@ -98,5 +98,8 @@ def test_bfcl_uses_tool_name_and_arguments_not_just_valid_json():
         "tool_calls": [{"function": function}],
     }
     assert not score_case(case, response)
+    response["finish_reason"] = "stop"
+    assert score_case(case, response)
+    response["finish_reason"] = "tool_calls"
     function["name"] = '{"name": "sum"}'
     assert score_case(case, response)

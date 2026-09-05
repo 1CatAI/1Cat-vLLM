@@ -1560,6 +1560,37 @@ GPUs/locks, refuses port/artifact overwrite and shuts down its own API by PID
 plus process-start generation. It is a finite quality/profile job, not a
 resident API. No API quality or new trace result exists at this update.
 
+### API/trace launcher repair before weight loading (2026-09-05)
+
+The first API/trace job obtained the GPUs, then failed before worker/model
+weight loading. The task-only `hc_api_entry.py` executed `runpy.run_module`
+at import time. Multiprocessing `spawn` re-imported it as `__mp_main__`,
+started a second API in the child, overwrote the task PID file, and raised
+the explicit bootstrapping-phase error. This is a test-launcher failure, not
+a model-output result. The job ended with client/nsys status 1; both API PIDs
+were confirmed gone and no task-owned GPU worker remained. No quality cases
+or trace timing from this attempt are admitted.
+
+Keep `.artifacts/hc-api-trace/{server-v1.log,client-v1.log,api.pid}` and the
+original launcher as evidence. The repaired entry
+`.artifacts/hc_api_entry_v2.py` guards both CLI invocation and PID writes
+under `if __name__ == "__main__"`. CPU `runpy.run_path(...,
+run_name="__mp_main__")` verifies that import leaves argv unchanged and
+creates neither API nor PID-file side effects. The guarded V2 launcher uses
+the separate `.artifacts/hc-api-trace-v2/` output directory, retains
+PID-generation cleanup and port/artifact refusal, and waits on both locks and
+real compute processes. Exactly one replacement job is queued after the
+first was proven terminal. It polls at 2 seconds with 20-second status output;
+no occupied GPU is preempted. No V2 quality/trace result yet at this update.
+
+The concurrent API scorer also now rejects a response that contains tool
+calls but reports a non-tool `finish_reason`, even if its name/arguments are
+otherwise correct. The existing 12-test CPU suite covers this added negative
+case and passes. This repairs a validation gap, not evidence that the current
+API actually emits that defect. Do not substitute a prefill-only PPL run for
+decode-path quality: the new HC/grouped-MoE candidates explicitly fall back
+on prefill and such a run would not exercise their changed arithmetic.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its

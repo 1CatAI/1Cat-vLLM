@@ -109,6 +109,8 @@ def score_case(case, response):
         return ["request failed"]
     if response.get("finish_reason") not in ("stop", "tool_calls"):
         errors.append(f"incomplete output: {response.get('finish_reason')!r}")
+    if response.get("tool_calls") and response.get("finish_reason") != "tool_calls":
+        errors.append("tool calls have an incorrect finish_reason")
     if case["suite"] == "json_schema":
         try:
             jsonschema.validate(json.loads(response["content"]), case["schema"])
