@@ -176,6 +176,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
 
   ops.def(
+      "awq_sm70_prepare_compact(Tensor _kernel, Tensor _scaling_factors, "
+      "Tensor _zeros, int group_size, bool interleave_gated_silu) -> "
+      "Tensor[]");
+  ops.impl("awq_sm70_prepare_compact", torch::kCUDA, &awq_sm70_prepare_compact);
+
+  ops.def(
       "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size) -> ()");
   ops.impl("awq_sm70_dequantize_out", torch::kCUDA, &awq_sm70_dequantize_out);
