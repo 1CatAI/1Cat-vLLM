@@ -55,6 +55,8 @@ _ROLE_PLANS: tuple[tuple[str, tuple[int, int], _GemvPlan], ...] = (
     (_ROUTER_SUFFIX, (512, 2560), _GemvPlan(1024, 8, 0)),
 )
 
+# Retain the legacy two-argument custom-op behavior for external callers.
+# Model layers pass their role explicitly: same-shape GDN/QSA plans differ.
 _SHAPE_PLANS = {shape: plan for _, shape, plan in _ROLE_PLANS}
 
 
@@ -161,8 +163,11 @@ def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
-def _qwen38_sm70_fp16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    plan = _SHAPE_PLANS.get((weight.shape[0], weight.shape[1]))
+def _qwen38_sm70_fp16_gemv(
+    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+) -> torch.Tensor:
+    shape = (weight.shape[0], weight.shape[1])
+    plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
     if plan is None or not _runtime_ok(x, weight):
         return torch.nn.functional.linear(x, weight)
 
@@ -180,7 +185,9 @@ def _qwen38_sm70_fp16_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     return out
 
 
-def _qwen38_sm70_fp16_gemv_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _qwen38_sm70_fp16_gemv_fake(
+    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
 
@@ -266,7 +273,9 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         # decision inside the opaque op so decode does not inherit a baked-in
         # prefill branch.
         if bias is None and use_sm70_decode_graph_semantics():
-            return torch.ops.vllm.qwen38_sm70_fp16_gemv(x, layer.weight)
+            return torch.ops.vllm.qwen38_sm70_fp16_gemv(
+                x, layer.weight, getattr(layer, "prefix", "")
+            )
         return super().apply(layer, x, bias)
 
 

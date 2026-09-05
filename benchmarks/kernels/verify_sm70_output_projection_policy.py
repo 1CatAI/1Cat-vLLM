@@ -93,6 +93,28 @@ def main():
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
     }
+    live_outputs = []
+
+    def production():
+        live_outputs.clear()
+        for i, weight in enumerate(weights):
+            live_outputs.append(
+                torch.ops.vllm.qwen38_sm70_fp16_gemv(
+                    x[i : i + 1], weight, names[i].removesuffix(".weight")
+                )
+            )
+
+    gp = capture(production)
+    for replay in range(16):
+        x.normal_()
+        for value in live_outputs:
+            value.fill_(float("nan"))
+        ga.replay()
+        gp.replay()
+        assert torch.equal(
+            a.view(torch.int16), torch.cat(live_outputs).view(torch.int16)
+        ), replay
+    result["production_custom_op_graph_replays"] = 16
     args.out.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)
 
