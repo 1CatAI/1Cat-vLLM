@@ -1064,8 +1064,13 @@ route if needed. Optional-op capability and dispatch must come from the DSO
 that owns the communicator, including the extended allocation layout.
 
 The preceding **prototype** complete-HC screen measures `2.108826 ->
-1.999374 ms` (5.19%) with bitwise intermediate/final outputs. Production
-dispatch and auxiliary-stream gates remain pending at this source update.
+1.999374 ms` (5.19%) with bitwise intermediate/final outputs. The subsequent
+registered production gate at `0303b82d1e` measures **`2.109529 -> 1.994807 ms`
+(5.44%)**. All four ranks pass the 16-input intermediate/final checks, 512
+auxiliary sum2 replays, and post-timing checks after packet generation wrap.
+Fused samples are `1.994807/1.993735/1.996370 ms`, versus split-hidden
+`2.109556/2.109529/2.109242 ms`. Runtime is Torch `2.10.0+cu128`, CUDA `12.8`,
+TP4 V100-SXM2-32GB; the sidecar was compiled with NVCC `12.0.140`.
 The `1.5-ms` whole-HC target and endpoint speed are not established by this
 microbenchmark. The old `2.658-ms` whole-model trace uses a different scope
 and must not be compared directly to it.
