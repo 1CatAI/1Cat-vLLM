@@ -569,6 +569,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_dense_stage_sm70_out);
 
   ops.def(
+      "awq_moe_indexed_dense_w13_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
+      "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_indexed_dense_w13_sm70_out", torch::kCUDA,
+           &awq_moe_indexed_dense_w13_sm70_out);
+
+  ops.def(
       "awq_moe_active_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
       "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "
