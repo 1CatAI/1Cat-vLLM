@@ -42,7 +42,8 @@ def sm70_platform(monkeypatch: pytest.MonkeyPatch) -> None:
         "current_platform",
         SimpleNamespace(
             is_cuda=lambda: True,
-            is_device_capability=lambda capability: capability == (7, 0),
+            device_count=lambda: 1,
+            is_device_capability=lambda capability, device_id=0: capability == (7, 0),
         ),
     )
 
@@ -113,7 +114,8 @@ def test_engine_contract_rejects_non_sm70(monkeypatch: pytest.MonkeyPatch):
         "current_platform",
         SimpleNamespace(
             is_cuda=lambda: True,
-            is_device_capability=lambda capability: False,
+            device_count=lambda: 1,
+            is_device_capability=lambda capability, device_id=0: False,
         ),
     )
 
