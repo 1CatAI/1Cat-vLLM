@@ -477,6 +477,7 @@ class CustomAllreduce:
             and branches.dtype == torch.float16
             and branches.shape == (1, 10240)
             and branches.is_contiguous()
+            and ops.supports_sm70_qwen38_hc_shard()
         )
 
     def sm70_qwen38_hc_down_allgather(
