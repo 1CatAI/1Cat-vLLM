@@ -45885,3 +45885,19 @@ Interpretation:
   sum2 and post-tag-wrap checks. It is unimplemented/unmeasured at this update.
   Existing logical-lane down split, producer publication, 81-CTA down fusion,
   and norm/down variants remain rejected; do not repeat unchanged.
+- Post-integration targeted norm dispatch/communicator-owner CPU checks pass
+  **35 tests**. Continuation Draft PR:
+  [#506](https://github.com/1CatAI/1Cat-vLLM/pull/506).
+- H8/512 screen completed at `2c2ec3f38d`: production complete HC
+  **1.948767 ms**, private H4/256 control 1.970251 ms, private H8/512
+  **1.953417 ms**. H8 improves private geometry by 0.016835 ms, but the tested
+  candidate does not beat production (0.004649 ms slower); no production port
+  or endpoint promotion. This does not prove that every source-integrated H8
+  implementation would lose, but it is not sufficient evidence to admit one.
+  Both fused kernels use 30 registers, zero stack/spills; H4 has 192 shared
+  bytes and H8 384. All four ranks x16 changing inputs, 512 actual auxiliary
+  sum2 replays, and post-timing checks are bitwise; generations 146593/195841
+  cross the 16-bit tag boundary. Evidence `.artifacts/hc_up_h8_threads/`, result
+  SHA256 `2b233da24cf9bba28d867fcdb364e6e8dafd873bf467755358bf169fa83f8ea4`.
+  Test exited normally; GPUs0-3 measured 141/7/7/7 MiB. No own queue/model/API
+  remains. Do not repeat this private-pointer H8/512 candidate unchanged.
