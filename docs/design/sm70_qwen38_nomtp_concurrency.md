@@ -1748,6 +1748,49 @@ the replacement strided-grid job has its own `strided-v1` outputs and
 `.artifacts/qsa-scorer-strided-launch-v2.log`. All benchmark processes are
 finite; no API is left resident.
 
+### Grid-stride scorer follow-up: short gain, long gate still fails
+
+Both finite strided-grid jobs subsequently acquired idle GPUs, completed all
+12 row/length cases, passed the four exact changed-input/length graph replay
+checks per case, and released their CUDA processes. The first used the
+committed benchmark at `3f1fa2d06e`; the second additionally records compiled
+resources and tests a one-stage inner loop while preserving the baseline's
+two-stage setting. There is no resident model/API or queued GPU task left
+from these screens.
+
+The two-stage strided-64 C16/8K scorer improves **65.229 -> 44.954 us**.
+However its C16/256K result is **1105.306 -> 1174.477 us** (6.26% slower).
+Strided-128 reduces that long penalty to 2.26%, still outside the 1% gate.
+These are same-process micro pairs, not an end-to-end gain. C1/long and C4/long
+regress more; a blanket smaller grid would sacrifice existing useful paths.
+
+The final one-stage screen does not rescue the long boundary. C16/8K
+strided-64 is **65.075 -> 44.493 us**, but C16/256K strided-256 is
+**1104.128 -> 1118.720 us** (1.32% slower). Compiled resources for the C16
+baseline/strided kernel are **40960/40960 shared bytes**, **224/238 registers
+per thread**, zero spills, two warps. Reducing the requested loop stages did
+not reduce the shared-memory footprint. Do not attribute the regression to a
+proved shared-memory occupancy change: the compiled limits do not show that.
+These are compiler resource facts, not NCU achieved-occupancy/HBM counters.
+
+Reject promotion/default enablement of both fixed contiguous grouping and
+the fixed bounded-grid variant. The ~20-us short scorer saving is only about
+0.24 ms across 12 layers even before endpoint validation, far short of the
+remaining C16 5.15-ms gap. Next prioritize the **6.85-ms routed MoE family**
+and the 2.0-ms sparse-attention forward within QSA, using this new graph
+attribution. Do not keep sweeping scorer parameters or reload the full model
+to chase this small, currently non-admitted result. Any future scorer work
+must address long-grid scheduling while retaining its actual live-length
+coverage and existing C1 path.
+
+Artifacts: `.artifacts/qsa-scorer-grid/strided-v1.{json,log,env,source-sha}`
+(JSON SHA256 `fb4600da38fbd4e64ffebd79cfa77bd2557a556d1af61bde7b0d0a6c7dd44bc8`),
+`strided-stage1-v1.{json,log,env,source-sha}` and corresponding task launchers.
+The stage-1 source is the resource-reporting benchmark change accompanying
+this worklog; it does not modify any runtime module. Full C1/C4/C8/C16
+performance admission and original-production quality comparisons remain
+open. The owned PR remains Draft and all production defaults are unchanged.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its

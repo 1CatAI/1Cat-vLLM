@@ -21,7 +21,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import _qsa_mqa_paged_kernel
 from vllm.triton_utils import triton
 
 
-def run_case(rows, length, groups, repeats):
+def run_case(rows, length, groups, repeats, strided_stages=2):
     device = torch.device("cuda")
     # FlashNext's indexer projection is replicated, NOT sharded over TP4.
     heads, dim, ratio, page_size, table_width = 4, 128, 4, 196, 335
@@ -52,7 +52,7 @@ def run_case(rows, length, groups, repeats):
             else triton.cdiv(columns, block_n * group)
         )
         kernel = strided_qsa_mqa_paged_kernel if strided else _qsa_mqa_paged_kernel
-        kernel[(rows, grid)](
+        return kernel[(rows, grid)](
             q,
             cache,
             table,
@@ -79,16 +79,22 @@ def run_case(rows, length, groups, repeats):
             BLOCK_N=block_n,
             BLOCK_D=dim,
             TILES_PER_PROG=1 if strided else group,
-            STAGES=2,
+            STAGES=strided_stages if strided else 2,
             MAX_N=16,
             COMPRESS_RATIO=ratio,
             num_warps=2,
         )
 
     graphs = {}
+    resources = {}
     for group in groups:
         for _ in range(3):
-            launch(group)
+            compiled = launch(group)
+        resources[group] = {
+            "shared_bytes": compiled.metadata.shared,
+            "registers_per_thread": compiled.n_regs,
+            "spills": compiled.n_spills,
+        }
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch(group)
@@ -136,6 +142,7 @@ def run_case(rows, length, groups, repeats):
         "capacity_columns": columns,
         "index_heads": heads,
         "head_dim": dim,
+        "strided_stages": strided_stages,
         "exact_changed_replays": 4,
         "groups": {
             str(group): {
@@ -153,6 +160,7 @@ def run_case(rows, length, groups, repeats):
                 ),
                 "median_us": statistics.median(values),
                 "samples_us": values,
+                "compiled_resources": resources[group],
             }
             for group, values in timings.items()
         },
@@ -167,6 +175,7 @@ def main():
     )
     parser.add_argument("--groups", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--strided-grids", type=int, nargs="*", default=[])
+    parser.add_argument("--strided-stages", type=int, choices=[1, 2], default=2)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -184,7 +193,7 @@ def main():
     for rows in args.rows:
         for length in args.lengths:
             modes = args.groups + [-grid for grid in args.strided_grids]
-            result = run_case(rows, length, modes, args.repeats)
+            result = run_case(rows, length, modes, args.repeats, args.strided_stages)
             results.append(result)
             print(json.dumps(result), flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
