@@ -24,6 +24,13 @@ _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _SM70_QSA_TOPK_LIBRARY = os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY")
 if _SM70_QSA_TOPK_LIBRARY is not None:
     torch.ops.load_library(_SM70_QSA_TOPK_LIBRARY)
+    _topk_version = getattr(
+        torch.ops._C_qsa_sm70, "decode_specialization_version", None
+    )
+    if _topk_version is not None:
+        logger.info(
+            "SM70 QSA source-overlay decode specialization version %d.", _topk_version()
+        )
 
 if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 
@@ -529,6 +536,50 @@ def _qsa_xqa_page4_table_kernel(
     )
 
 
+@triton.jit
+def _qsa_resolve_physical_indices_kernel(
+    indices_ptr,
+    table_ptr,
+    token_to_req_ptr,
+    output_ptr,
+    stride_indices_row,
+    stride_table_req,
+    num_cache_blocks,
+    num_requests,
+    TOPK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    request = tl.load(token_to_req_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    token = tl.load(
+        indices_ptr + row * stride_indices_row + columns, mask=columns < TOPK, other=-1
+    )
+    safe_token = tl.maximum(token, 0)
+    page = safe_token // PAGE_SIZE
+    valid = (
+        (columns < TOPK)
+        & (request >= 0)
+        & (request < num_requests)
+        & (token >= 0)
+        & (page < PAGE_TABLE_WIDTH)
+    )
+    physical = tl.load(
+        table_ptr + safe_request * stride_table_req + page, mask=valid, other=-1
+    )
+    valid &= (physical >= 0) & (physical < num_cache_blocks)
+    # Keep logical order, duplicates and invalid slots. Never sort by page.
+    slot = physical.to(tl.int64) * PAGE_SIZE + safe_token % PAGE_SIZE
+    tl.store(
+        output_ptr + row * TOPK + columns,
+        tl.where(valid, slot, -1),
+        mask=columns < TOPK,
+    )
+
+
 @triton.jit(do_not_specialize=["num_requests"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
@@ -571,6 +622,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     KV_E4M3: tl.constexpr,
+    RESOLVED_INDICES: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -614,19 +666,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         safe_token = tl.maximum(logical_token, 0)
         logical_page = safe_token // PAGE_SIZE
         page_offset = safe_token % PAGE_SIZE
-        valid = (
-            (request >= 0)
-            & (request < num_requests)
-            & (logical_token >= 0)
-            & (logical_page < PAGE_TABLE_WIDTH)
-        )
-        physical_page = tl.load(
-            block_table_ptr
-            + safe_request * stride_table_req
-            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
-            mask=valid,
-            other=-1,
-        )
+        valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
+        if RESOLVED_INDICES:
+            physical_page = logical_page
+        else:
+            valid &= logical_page < PAGE_TABLE_WIDTH
+            physical_page = tl.load(
+                block_table_ptr
+                + safe_request * stride_table_req
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=valid,
+                other=-1,
+            )
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
@@ -2006,6 +2057,20 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     )
 
 
+def _use_sm70_qsa_resolved_indices(q, k_cache, indices, kv_cache_dtype):
+    """Admit only the measured checkpoint-FP16 M1 TP4 cache geometry."""
+    return bool(
+        current_platform.is_device_capability(70)
+        and q.shape == (1, 6, 256)
+        and q.dtype == k_cache.dtype == torch.float16
+        and k_cache.shape[1:] == (400, 1, 256)
+        and k_cache.shape[0] * 400 < 2**31
+        and indices.shape == (1, 2051)
+        and indices.dtype == torch.int32
+        and kv_cache_dtype in ("auto", "float16")
+    )
+
+
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2107,6 +2172,28 @@ def qsa_sparse_paged_attention(
                 _qsa_output_gate(xqa_output, output_gate_view)
             return xqa_output
 
+    resolved_indices = _use_sm70_qsa_resolved_indices(
+        q, k_cache, logical_indices, kv_cache_dtype
+    )
+    if resolved_indices:
+        physical_indices = torch.empty_like(logical_indices)
+        _qsa_resolve_physical_indices_kernel[(1, triton.cdiv(2051, 256))](
+            logical_indices,
+            block_table,
+            token_to_req,
+            physical_indices,
+            logical_indices.stride(0),
+            block_table.stride(0),
+            k_cache.shape[0],
+            block_table.shape[0],
+            TOPK=2051,
+            PAGE_SIZE=400,
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            BLOCK=256,
+            num_warps=4,
+        )
+        logical_indices = physical_indices
+
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     base_programs = q.shape[0] * k_cache.shape[2]
@@ -2184,6 +2271,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
+        RESOLVED_INDICES=resolved_indices,
         num_warps=partial_warps,
         num_stages=2,
     )
