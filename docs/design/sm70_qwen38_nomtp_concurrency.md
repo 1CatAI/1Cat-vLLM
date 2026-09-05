@@ -1791,6 +1791,154 @@ this worklog; it does not modify any runtime module. Full C1/C4/C8/C16
 performance admission and original-production quality comparisons remain
 open. The owned PR remains Draft and all production defaults are unchanged.
 
+### MoE reuse follow-up: locality is small; paired projection rejected
+
+Two benchmark-only CUDA prototypes were completed against the production
+native NVFP4 grouped kernels at source `a5bceb3006`. Both use actual layer-0,
+TP4-rank-0 checkpoint weights, synthetic FP16 activations, captured C16
+routes (sliced for M4/M8), distinct-expert and shared-ten-expert patterns.
+Five alternating-order timing samples use 16 calls per CUDA Graph and ten
+replays per sample. Complete MoE includes the route planner, W13, W2 and
+original-slot-order FP32 weighted reduction. No production dispatch changed.
+
+W2 locality maps four warps to `(4 groups, 1 output tile)`, `(2 groups,
+2 tiles)` or `(1 group, 4 tiles)`. For the captured 99-group C16 case,
+complete MoE changes **125.978 -> 123.782 us** with two adjacent N tiles;
+W2-only changes **42.099 -> 40.083 us**. The four-tile complete result is
+123.795 us. The isomorphic one-tile sidecar already measures 124.525 us,
+so the entire original-to-four-tile gain cannot be attributed to locality:
+all sidecar variants use 52 registers versus the original's 44. At M4,
+distinct/captured complete timings with four tiles regress
+58.758/59.283 -> 59.488/59.667 us. M4 is a grouped-kernel screen, not the
+current production M4 dispatch. Seven changed-input/route/poisoned-buffer
+replays produce exactly equal final outputs at every screened case.
+The layer-0 C16 saving projected over 48 calls is only about **0.105 ms**,
+not a measured model gain. Do not run an endpoint battery or enable it by
+default on that basis.
+
+The W13 paired-projection prototype reuses one input fragment for gate and
+up in the same warp, retaining separate accumulators, original Split-K sum
+order, and FP16 projection/SiLU/product boundaries. It passes seven changed
+graph-replay cases with exactly equal W13 intermediates and final outputs,
+but is slower. Captured M4/M8/M16 complete MoE:
+**58.842/90.554/125.894 -> 62.099/99.584/129.677 us**. C16 W13 alone:
+**78.874 -> 83.296 us**. Distinct and shared-ten patterns also regress.
+Reject this implementation. For Split8, registers grow 40 -> 63 and CTA
+threads shrink 512 -> 256, with the same 17408 shared bytes and no spills.
+Static resource bounds allow three original CTAs (48 warps) versus four
+paired CTAs (32 warps) per SM. These are compiler/occupancy API limits, not
+measured active warps, achieved bandwidth or proof of a particular stall.
+
+Sources: `benchmark_sm70_moe_w2_locality.py`, `sm70_moe_w2_locality.cu`,
+`sm70_moe_w13_paired.cu` under `benchmarks/kernels/`. CPU-only builds use
+CUDA 12.8, Torch 2.10.0+cu128, explicit `TORCH_CUDA_ARCH_LIST=7.0` and no
+CUDA device initialization. W2/paired binary SHA256 respectively:
+`95ddcccad85149d873611a37cfcd7f2667e4a3382ccee9bf7294c8806efd8fdb`,
+`4c3c0c0cfb8cbf86f789ee4ac69793d64623d158d868ab9f2e5e3f93de01c5f0`.
+Artifacts: `.artifacts/moe-{w2-locality,w13-paired}/screen-v1.{json,log,env,source-sha}`.
+Both GPU jobs exited; no model was loaded and no API remains from them.
+
+This follows the locality/Split-K questions in the
+[PyTorch MoE kernel report](https://pytorch.org/blog/accelerating-moe-model/),
+not its A100/H100 performance claims. The
+[Volta tuning guide](https://docs.nvidia.com/cuda/archive/11.0/volta-tuning-guide/index.html)
+informs the static resource interpretation; it does not establish our
+achieved occupancy.
+
+The old 48-layer C16 route capture contains 87.292 unique experts and
+87.854 eight-row groups per layer on average. Each valid group logically
+loads 409600 weight + 102400 scale bytes for W13 and 204800 weight + 51200
+scale bytes for W2. Total logical weight/scale traffic is **3,238,656,000
+bytes**. Dividing by the V100's nominal 900 GB/s gives 3.599 ms, but this
+is only an ideal streaming estimate: the cohort is not the current Nsight
+sample, caches can reuse group data, and instructions/activations/outputs
+are not included. Do not present the ratio to 6.85 ms as measured DRAM
+utilization or a guaranteed removable wall cost. The remaining full-step
+gap will require more than the small W2 mapping gain.
+
+Source/stream ordering also shows that shared-expert projection, sigmoid
+and multiply run on the stream opposite routed MoE. For example, one
+interior graph's first layer finishes the shared branch at 0.494 ms while
+W2 finishes at 0.552 ms. Its inferred ~1.0-ms total service is not a
+separate 1.0-ms critical-path saving. Do not sum a prospective shared-gate
+fusion gain with MoE service as if both were independent endpoint wins.
+
+### Scale-layout screen and a profitable copy-only GDN batch fallback
+
+The tile-major scale-layout MoE screen has also completed. It transposes
+only prepared FP16 scale storage to match the packed weights' traversal;
+both matrix products, group planning, reductions and rounding remain
+unchanged. All seven changed-input/route poisoned replays match the original
+W13 intermediate and complete output. At captured C16, complete MoE is
+**125.408 -> 122.438 us** with both layouts changed; W13-only layout is
+122.880 us. At distinct M4, changing both layouts instead regresses
+**57.530 -> 58.592 us** (1.85%). W13-only has no >1% regression in this
+small screen but its saving is too small to justify a production repack or
+full-model launch. Do not count the ~0.14-ms layer-0 projection as an
+endpoint gain or claim zero extra production scale storage. Keep this
+variant benchmark-only. Binary SHA256:
+`1a3394849e2739e7b4a1bafb53dcbf52ddf31ccbdeacec4a87bf342888ceb1f4`.
+Artifacts: `.artifacts/moe-scale-layout/screen-v1.{json,log,env,source-sha}`;
+the compiled source is retained in `.artifacts/sm70_moe_scale_layout.cu`
+and its formatted benchmark copy. The job respected live foreign ownership,
+then completed and released GPU0.
+
+Source/trace audit found a separate, avoidable serial batch cost: the opaque
+single-token GDN input custom op falls back at M>1 to **two original GEMMs
+plus four `.contiguous()` kernels**. The four copies are visible immediately
+after GDN b/a reduction on all 36 GDN layers. The new copy-only kernel
+combines those copies into one; it does not concatenate GEMM weights,
+reassociate accumulation, fuse nonlinear arithmetic, alter scales or use
+INT8. The original single-token GEMV remains unchanged.
+
+The standalone micro uses real layer-0/TP4-rank-0 FP16 weights, synthetic
+inputs and 16 distinct allocations of the same weights (not 16 actual
+layers), exceeding L2. Five alternating graph samples include both unchanged
+GEMMs and all output copies. After moving the kernel into the runtime module,
+the same screen rechecks that exact source:
+
+| M | Original complete input projection, us | Fused copies, us |
+| ---: | ---: | ---: |
+| 2 | 62.150 | 51.088 |
+| 4 | 59.430 | 48.950 |
+| 8 | 59.504 | 49.427 |
+| 16 | 60.774 | 50.509 |
+| 32 | 62.077 | 52.250 |
+| 64 | 80.662 | 71.581 |
+
+C16 copy-only is approximately 7.0 -> 1.5 us. The complete-chain saving
+projects to about **0.37 ms over 36 layers**, not a measured engine gain.
+This will not independently close the remaining 5.15-ms C16 step gap.
+All 65536 FP16 bit patterns, including NaN payloads, pass each store branch;
+four poisoned changed-input graph replays at each production-width screen
+are bitwise equal. The public registered op's CPU/GPU suite reports
+**35 passed**, including changed input/weights, graph replay, explicit
+fusion route-hit tracking, unsupported fallback and unchanged M1.
+These are operator gates, not dataset-quality admission.
+
+Combined CPU regression: **74 passed, eight GPU cases skipped, three old
+HC GPU cases explicitly deselected**. The first CPU-only attempt selected
+those three HC cases because their existing physical-device check ignores
+`CUDA_VISIBLE_DEVICES=''`; all failed during CUDA initialization, not in an
+operator. The corrected invocation excludes only those three GPU tests.
+The new suite's eight CUDA cases are covered by the owned 35-pass GPU run.
+
+Runtime opt-in: `VLLM_SM70_GDN_BATCH_SPLIT_COPY=1`, **default 0**. Local
+admission requires SM70, packed 2D FP16 QKVZ/b/a outputs with the existing
+custom op's local dimensions and M>1. It has no upper batch, maxseq, chunk,
+KV dtype or checkpoint-name condition. CPU, empty, M1, strided, wrong-dtype
+and unsupported outputs retain the original fallback. No persistent cache
+or extra model-weight copy is introduced. The existing custom op's fake
+output shapes and non-aliasing/contiguity contract stay unchanged.
+
+Micro/runtime artifacts:
+`.artifacts/gdn-projection-split/screen-v1.{json,log}` and
+`.artifacts/gdn-projection-split-runtime/{screen-v2.json,screen-v2.log,pytest-v2.log}`.
+Both jobs exited and released their GPU processes. No production default
+was enabled. Next combine this local gain with the existing batch candidate
+only after matching endpoint and original-production quality comparisons;
+the 238/420/728 tok/s targets and full quality admission remain open.
+
 ## Acceptance gates
 
 - A microbenchmark candidate must improve median CUDA Graph replay time at its
