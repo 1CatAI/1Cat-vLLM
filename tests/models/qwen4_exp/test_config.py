@@ -53,7 +53,8 @@ def test_sm70_v2_route_accepts_prefix_caching(
     assert "mrope_interleaved" not in vllm_config.model_config.hf_config.rope_parameters
 
 
-def test_initial_sm70_route_rejects_multimodal_tower(
+@pytest.mark.skip_global_cleanup
+def test_sm70_route_accepts_multimodal_tower_and_preserves_mrope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -79,8 +80,9 @@ def test_initial_sm70_route_rejects_multimodal_tower(
         speculative_config=None,
     )
 
-    with pytest.raises(NotImplementedError, match="--language-model-only"):
-        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+    Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+    assert text_config.rope_parameters == {"mrope_section": [11, 11, 10]}
 
 
 @pytest.mark.parametrize(

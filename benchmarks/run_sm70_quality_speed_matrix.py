@@ -204,21 +204,21 @@ def _make_chat_prompt(
     content: str,
     *,
     enable_thinking: bool,
+    reasoning_effort: str | None = None,
 ) -> str:
     messages = [{"role": "user", "content": content}]
+    template_kwargs: dict[str, Any] = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": enable_thinking,
+    }
+    if reasoning_effort is not None:
+        template_kwargs["reasoning_effort"] = reasoning_effort
     try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=enable_thinking,
-        )
+        return tokenizer.apply_chat_template(messages, **template_kwargs)
     except TypeError:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        template_kwargs.pop("enable_thinking")
+        return tokenizer.apply_chat_template(messages, **template_kwargs)
 
 
 def _safe_delta(end: float, start: float) -> float | None:
@@ -327,7 +327,13 @@ def _max_same_line_run(text: str) -> int:
     return best
 
 
-def _quality_metrics(text: str, token_ids: list[int]) -> dict[str, Any]:
+def _quality_metrics(
+    text: str,
+    token_ids: list[int],
+    *,
+    finish_reason: str | None = None,
+    chat_prompt: str | None = None,
+) -> dict[str, Any]:
     bad_markers = [
         "rgba(rgba",
         "UTF-UTF",
@@ -338,6 +344,17 @@ def _quality_metrics(text: str, token_ids: list[int]) -> dict[str, Any]:
         "\ufffd",
     ]
     marker_hits = {m: text.count(m) for m in bad_markers if m in text}
+    expects_reasoning_close = bool(
+        chat_prompt is not None and chat_prompt.rstrip().endswith("<think>")
+    )
+    reasoning_closed = "</think>" in text if expects_reasoning_close else None
+    if expects_reasoning_close and reasoning_closed:
+        visible_final_chars = len(text.split("</think>", 1)[1].strip())
+    elif expects_reasoning_close:
+        visible_final_chars = 0
+    else:
+        visible_final_chars = len(text.strip())
+
     metrics = {
         "chars": len(text),
         "tokens": len(token_ids),
@@ -353,10 +370,17 @@ def _quality_metrics(text: str, token_ids: list[int]) -> dict[str, Any]:
         "max_same_line_run": _max_same_line_run(text),
         "replacement_char_count": text.count("\ufffd"),
         "bad_marker_hits": marker_hits,
+        "expects_reasoning_close": expects_reasoning_close,
+        "reasoning_closed": reasoning_closed,
+        "visible_final_chars": visible_final_chars,
     }
     failures = []
-    if metrics["tokens"] < 64:
+    if metrics["tokens"] < 64 and finish_reason != "stop":
         failures.append("too_few_output_tokens")
+    if expects_reasoning_close and not reasoning_closed:
+        failures.append("unclosed_reasoning")
+    elif visible_final_chars == 0:
+        failures.append("missing_final_answer")
     if metrics["max_same_token_run"] > 48:
         failures.append("same_token_run")
     if metrics["max_digit_run"] > 80:
@@ -488,6 +512,7 @@ def _run_worker(args: argparse.Namespace) -> int:
             tokenizer,
             prompt["content"],
             enable_thinking=args.enable_thinking,
+            reasoning_effort=args.reasoning_effort,
         )
         for repeat_idx in range(args.quality_repeat):
             request = llm.generate([chat_prompt], official_sampling)[0]
@@ -499,8 +524,14 @@ def _run_worker(args: argparse.Namespace) -> int:
                     "finish_reason": q_finish_reason,
                     "stop_reason": q_stop_reason,
                     "prompt_tokens": len(request.prompt_token_ids or []),
+                    "chat_prompt_hash": _sha256_text(chat_prompt),
                     "token_ids": token_ids,
-                    "metrics": _quality_metrics(text, token_ids),
+                    "metrics": _quality_metrics(
+                        text,
+                        token_ids,
+                        finish_reason=q_finish_reason,
+                        chat_prompt=chat_prompt,
+                    ),
                     "preview": text[:1000],
                     "tail": text[-1000:],
                 }
@@ -510,6 +541,7 @@ def _run_worker(args: argparse.Namespace) -> int:
         tokenizer,
         DETERMINISM_PROMPT,
         enable_thinking=args.enable_thinking,
+        reasoning_effort=args.reasoning_effort,
     )
     det_sampling = SamplingParams(
         max_tokens=256,
@@ -526,8 +558,14 @@ def _run_worker(args: argparse.Namespace) -> int:
             {
                 "finish_reason": det_finish_reason,
                 "stop_reason": det_stop_reason,
+                "chat_prompt_hash": _sha256_text(det_prompt),
                 "token_ids": token_ids,
-                "metrics": _quality_metrics(text, token_ids),
+                "metrics": _quality_metrics(
+                    text,
+                    token_ids,
+                    finish_reason=det_finish_reason,
+                    chat_prompt=det_prompt,
+                ),
                 "preview": text[:800],
             }
         )
@@ -535,10 +573,9 @@ def _run_worker(args: argparse.Namespace) -> int:
     deterministic_exact = len(set(det_hashes)) == 1
     deterministic_steady_state_exact = det_hashes[-2] == det_hashes[-1]
 
-    case_quality_passed = (
-        all(record["metrics"]["passed"] for record in quality_records)
-        and deterministic_exact
-    )
+    # Token equality is reported below as a stability diagnostic. Quality
+    # admission depends on completed, healthy answers, not greedy identity.
+    case_quality_passed = all(record["metrics"]["passed"] for record in quality_records)
     payload = {
         "case": {
             "name": args.case_name,
@@ -584,6 +621,7 @@ def _run_worker(args: argparse.Namespace) -> int:
                 "max_tokens": args.quality_max_tokens,
                 "ignore_eos": False,
                 "enable_thinking": args.enable_thinking,
+                "reasoning_effort": args.reasoning_effort,
             },
             "records": quality_records,
             "determinism": {
@@ -724,7 +762,9 @@ def _write_summary(out_dir: Path, rows: list[dict[str, Any]]) -> None:
             "",
             "Quality gates: official generation_config sampling, no ignore_eos; "
             "fatal gates are repeated windows, long digit/same-token runs, bad "
-            "markers, and greedy repeat determinism mismatch.",
+            "markers, unclosed reasoning, and a missing visible final answer. "
+            "Greedy token equality is diagnostic only. Naturally stopped "
+            "nonempty short answers are allowed.",
         ]
     )
     (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -808,6 +848,8 @@ def _run_matrix(args: argparse.Namespace) -> int:
             ]
             if not args.enable_thinking:
                 cmd.append("--disable-thinking")
+            if args.reasoning_effort is not None:
+                cmd.extend(["--reasoning-effort", args.reasoning_effort])
             for engine_arg in args.engine_arg:
                 cmd.extend(["--engine-arg", engine_arg])
             for prompt_id in args.quality_prompt_id or []:
@@ -878,6 +920,11 @@ def _parse_args() -> argparse.Namespace:
         "--disable-thinking", action="store_false", dest="enable_thinking"
     )
     parser.set_defaults(enable_thinking=True)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "high", "max"),
+        help="Model-specific chat-template reasoning effort.",
+    )
     parser.add_argument("--engine-arg", action="append", default=[])
     parser.add_argument("--out", type=Path)
     return parser.parse_args()

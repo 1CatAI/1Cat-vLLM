@@ -20,19 +20,35 @@ from pathlib import Path
 from typing import Any
 
 import regex as re
-from benchmark_sm70_model_tokens import (
-    _parse_extra_engine_args,
-    _sm70_attention_policy,
-    _sm70_comm_policy,
-    _sm70_gdn_fla_policy,
-    _sm70_graph_policy,
-    _sm70_moe_policy,
-    _sm70_sampling_policy,
-    _sm70_tune_policy,
-    _sm70_turbomind_policy,
-    _tracked_env,
-)
-from run_sm70_release_matrix import _fixed_quality_contract_failures
+
+if __package__:
+    from benchmarks.benchmark_sm70_model_tokens import (
+        _parse_extra_engine_args,
+        _sm70_attention_policy,
+        _sm70_comm_policy,
+        _sm70_gdn_fla_policy,
+        _sm70_graph_policy,
+        _sm70_moe_policy,
+        _sm70_sampling_policy,
+        _sm70_tune_policy,
+        _sm70_turbomind_policy,
+        _tracked_env,
+    )
+    from benchmarks.run_sm70_release_matrix import _fixed_quality_contract_failures
+else:
+    from benchmark_sm70_model_tokens import (
+        _parse_extra_engine_args,
+        _sm70_attention_policy,
+        _sm70_comm_policy,
+        _sm70_gdn_fla_policy,
+        _sm70_graph_policy,
+        _sm70_moe_policy,
+        _sm70_sampling_policy,
+        _sm70_tune_policy,
+        _sm70_turbomind_policy,
+        _tracked_env,
+    )
+    from run_sm70_release_matrix import _fixed_quality_contract_failures
 
 DEFAULT_PROMPTS = [
     "Write one sentence about deterministic validation.",
@@ -172,12 +188,16 @@ def _counter_delta(
     accepted_tokens = delta.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
     generation_tokens = delta.get("vllm:generation_tokens_total", 0.0)
     prompt_tokens = delta.get("vllm:prompt_tokens_total", 0.0)
+    position_prefix = "vllm:spec_decode_num_accepted_tokens_per_pos_total:position_"
+    position_indices = [
+        int(key.removeprefix(position_prefix))
+        for key in delta
+        if key.startswith(position_prefix)
+        and key.removeprefix(position_prefix).isdigit()
+    ]
     per_position = [
-        delta.get(
-            f"vllm:spec_decode_num_accepted_tokens_per_pos_total:position_{pos}",
-            0.0,
-        )
-        for pos in range(4)
+        delta.get(f"{position_prefix}{pos}", 0.0)
+        for pos in range(max(position_indices, default=-1) + 1)
     ]
     return {
         "raw": delta,
@@ -415,9 +435,17 @@ def _summarize_spec_metrics(records: list[dict[str, Any]]) -> dict[str, Any] | N
     total_accepted_tokens = sum(
         float(item["num_accepted_tokens"]) for item in per_request
     )
+    num_positions = max(
+        (len(item["accepted_tokens_per_pos"]) for item in per_request), default=0
+    )
     per_position = [
-        sum(float(item["accepted_tokens_per_pos"][pos]) for item in per_request)
-        for pos in range(4)
+        sum(
+            float(item["accepted_tokens_per_pos"][pos])
+            if pos < len(item["accepted_tokens_per_pos"])
+            else 0.0
+            for item in per_request
+        )
+        for pos in range(num_positions)
     ]
     return {
         "num_drafts": total_drafts,

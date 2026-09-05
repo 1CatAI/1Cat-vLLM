@@ -29,6 +29,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Maximum query length supported by grouped DFlash2 verification");
   m.def("grouped_sparse_page4_fwd", &flash_attention_grouped_sparse_page4,
         "Grouped exact QSA page4 attention over paged KV cache (Volta)");
+  m.def("grouped_sparse_page4_abi_version",
+        &flash_attention_grouped_sparse_page4_abi_version,
+        "Grouped sparse page4 forward ABI version");
   m.def("grouped_sparse_page4_plan_fwd",
         &flash_attention_grouped_sparse_page4_plan,
         "Build grouped exact QSA page4 tables over paged KV cache (Volta)");

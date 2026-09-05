@@ -26,6 +26,28 @@ from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+def _kernel_prefill_warmup_token_counts(
+    model_runner: GPUModelRunner,
+    default_prompt_len: int,
+) -> tuple[int, ...]:
+    """Collect per-request prefill sizes advertised by active kernel owners."""
+    max_tokens = min(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        model_runner.max_model_len,
+    )
+    token_counts = {default_prompt_len}
+    static_context = model_runner.compilation_config.static_forward_context
+    for layer in static_context.values():
+        for token_count in getattr(layer, "kernel_warmup_prefill_token_counts", ()):
+            if (
+                isinstance(token_count, int)
+                and not isinstance(token_count, bool)
+                and default_prompt_len < token_count <= max_tokens
+            ):
+                token_counts.add(token_count)
+    return tuple(sorted(token_counts))
+
+
 def _reserved_block_count(
     num_tokens: int,
     kv_cache_spec: KVCacheSpec,
@@ -85,33 +107,16 @@ def warmup_kernels(
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
     # query length exceeds decode_query_len (= 1 + num_spec_steps), preventing
     # it from being misclassified as a uniform decode batch.
-    prompt_len = 2 + num_spec_steps
-    prompt_token_ids = list(range(prompt_len))
-    # After prefill, decode generates 1 verified + num_spec_steps draft tokens.
-    decode_len = prompt_len + 1 + num_spec_steps
+    default_prompt_len = 2 + num_spec_steps
+    prompt_lengths = _kernel_prefill_warmup_token_counts(
+        model_runner, default_prompt_len
+    )
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
 
-    # Compute per-request block counts for each KV cache group.
     block_count = _warmup_block_counter(model_runner)
     kv_cache_specs = [group.kv_cache_spec for group in kv_cache_groups]
-    prefill_block_counts = [block_count(prompt_len, spec) for spec in kv_cache_specs]
-    decode_block_counts = [block_count(decode_len, spec) for spec in kv_cache_specs]
-    decode_block_deltas = [
-        d - p for d, p in zip(decode_block_counts, prefill_block_counts)
-    ]
-    max_blocks_per_req = sum(decode_block_counts)
-
-    num_reqs = min(
-        model_runner.scheduler_config.max_num_seqs,
-        model_runner.scheduler_config.max_num_batched_tokens
-        // max(prompt_len, 1 + num_spec_steps),
-        # Reserve block 0 (null block) and ensure we have enough blocks.
-        max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
-    )
-
-    req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
 
     # SamplingParams exercising all sampling features.
     if model_runner.is_pooling_model:
@@ -121,82 +126,121 @@ def warmup_kernels(
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
 
-    # Assign distinct block IDs per request per group. 0 null block, start from 1.
-    next_block_id = 1
-
-    def _alloc_blocks(num_blocks: int) -> list[int]:
-        nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
-
-    # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
-    new_reqs = [
-        NewRequestData.from_request(
-            Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
-            prefill_token_ids=prompt_token_ids,
-        )
-        for i in range(num_reqs)
-    ]
-
-    prefill_output = SchedulerOutput.make_empty()
-    prefill_output.scheduled_new_reqs = new_reqs
-    prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
-    prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
-    prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
-
-    # Disable KV connector for warmup run.
+    # Disable KV connector for all warmup runs. Kernel-advertised profiles run
+    # with one request so adding an operator does not silently multiply startup
+    # work by max_num_seqs.
     model_runner.kv_connector.set_disabled(True)
-    worker_execute_model(prefill_output)
-
-    if not model_runner.is_pooling_model:
-        # Warm up sampler and perform a decode step for non-pooling models.
-
-        grammar_output = None
-        if model_runner.is_last_pp_rank:
-            # Build a GrammarOutput to exercise the structured output bitmask
-            # kernel during the prefill step.
-            vocab_size = model_runner.model_config.get_vocab_size()
-            bitmask_width = (vocab_size + 31) // 32
-            grammar_bitmask = np.full(
-                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
+    try:
+        for profile_idx, prompt_len in enumerate(prompt_lengths):
+            prompt_token_ids = list(range(prompt_len))
+            decode_len = prompt_len + 1 + num_spec_steps
+            prefill_block_counts = [
+                block_count(prompt_len, spec) for spec in kv_cache_specs
+            ]
+            decode_block_counts = [
+                block_count(decode_len, spec) for spec in kv_cache_specs
+            ]
+            decode_block_deltas = [
+                d - p for d, p in zip(decode_block_counts, prefill_block_counts)
+            ]
+            max_blocks_per_req = sum(decode_block_counts)
+            num_reqs = min(
+                model_runner.scheduler_config.max_num_seqs,
+                model_runner.scheduler_config.max_num_batched_tokens
+                // max(prompt_len, 1 + num_spec_steps),
+                # Reserve block 0 (null block) and ensure enough blocks.
+                max(
+                    1,
+                    (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req,
+                ),
             )
-            grammar_output = GrammarOutput(
-                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
-            )
+            if profile_idx:
+                num_reqs = min(num_reqs, 1)
+            if num_reqs <= 0:
+                continue
 
-        worker_sample_tokens(grammar_output)
+            req_ids = [f"_warmup_{profile_idx}_{i}_" for i in range(num_reqs)]
+            next_block_id = 1
 
-        # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
-        cached_req_data = CachedRequestData.make_empty()
-        cached_req_data.req_ids = list(req_ids)
-        cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
-        cached_req_data.num_output_tokens = [1] * num_reqs
-        new_block = any(decode_block_deltas)
-        cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
-            for _ in range(num_reqs)
-        ]
+            def _alloc_blocks(num_blocks: int) -> list[int]:
+                nonlocal next_block_id
+                return list(
+                    range(next_block_id, next_block_id := next_block_id + num_blocks)
+                )
 
-        decode_output = SchedulerOutput.make_empty()
-        decode_output.scheduled_cached_reqs = cached_req_data
-        decode_output.num_scheduled_tokens = {
-            req_id: 1 + num_spec_steps for req_id in req_ids
-        }
-        if num_spec_steps > 0:
-            decode_output.scheduled_spec_decode_tokens = {
-                req_id: [0] * num_spec_steps for req_id in req_ids
-            }
-        decode_output.total_num_scheduled_tokens = sum(
-            decode_output.num_scheduled_tokens.values()
-        )
-        decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            new_reqs = [
+                NewRequestData.from_request(
+                    Request(
+                        req_ids[i],
+                        prompt_token_ids,
+                        sampling_params,
+                        pooling_params,
+                    ),
+                    block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+                    prefill_token_ids=prompt_token_ids,
+                )
+                for i in range(num_reqs)
+            ]
 
-        worker_execute_model(decode_output)
-        worker_sample_tokens(None)
+            prefill_output = SchedulerOutput.make_empty()
+            prefill_output.scheduled_new_reqs = new_reqs
+            prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
+            prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
+            prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+            worker_execute_model(prefill_output)
 
-    # Clean up - process finish_req_ids.
-    cleanup_output = SchedulerOutput.make_empty()
-    cleanup_output.finished_req_ids = set(req_ids)
-    worker_execute_model(cleanup_output)
-    model_runner.kv_connector.set_disabled(False)
+            if not model_runner.is_pooling_model:
+                grammar_output = None
+                if profile_idx == 0 and model_runner.is_last_pp_rank:
+                    # Exercise the structured-output bitmask once; extra
+                    # operator profiles only need the model path.
+                    vocab_size = model_runner.model_config.get_vocab_size()
+                    bitmask_width = (vocab_size + 31) // 32
+                    grammar_bitmask = np.full(
+                        (len(req_ids), bitmask_width),
+                        fill_value=-1,
+                        dtype=np.int32,
+                    )
+                    grammar_output = GrammarOutput(
+                        structured_output_request_ids=req_ids,
+                        grammar_bitmask=grammar_bitmask,
+                    )
+                worker_sample_tokens(grammar_output)
+
+                cached_req_data = CachedRequestData.make_empty()
+                cached_req_data.req_ids = list(req_ids)
+                cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
+                cached_req_data.num_output_tokens = [1] * num_reqs
+                new_block = any(decode_block_deltas)
+                cached_req_data.new_block_ids = [
+                    (
+                        tuple(_alloc_blocks(n) for n in decode_block_deltas)
+                        if new_block
+                        else None
+                    )
+                    for _ in range(num_reqs)
+                ]
+
+                decode_output = SchedulerOutput.make_empty()
+                decode_output.scheduled_cached_reqs = cached_req_data
+                decode_output.num_scheduled_tokens = {
+                    req_id: 1 + num_spec_steps for req_id in req_ids
+                }
+                if num_spec_steps > 0:
+                    decode_output.scheduled_spec_decode_tokens = {
+                        req_id: [0] * num_spec_steps for req_id in req_ids
+                    }
+                decode_output.total_num_scheduled_tokens = sum(
+                    decode_output.num_scheduled_tokens.values()
+                )
+                decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+
+                worker_execute_model(decode_output)
+                worker_sample_tokens(None)
+
+            cleanup_output = SchedulerOutput.make_empty()
+            cleanup_output.finished_req_ids = set(req_ids)
+            worker_execute_model(cleanup_output)
+    finally:
+        model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

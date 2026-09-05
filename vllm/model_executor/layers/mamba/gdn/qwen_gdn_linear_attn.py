@@ -15,6 +15,7 @@ from torch import nn
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     divide,
@@ -1353,7 +1354,11 @@ def _sm70_compile_graph_slice_dim(
 ) -> torch.Tensor:
     if dim < 0:
         dim += tensor.ndim
-    if start == 0 or not envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH:
+    if (
+        start == 0
+        or not envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        or not use_sm70_decode_graph_semantics()
+    ):
         slices = [slice(None)] * tensor.ndim
         slices[dim] = slice(start, start + size)
         return tensor[tuple(slices)]
@@ -2676,7 +2681,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         group_width_qkvz = q_size + k_size + v_size + z_size
         group_width_ba = 2 * ba_size
 
-        if envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH:
+        if (
+            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and use_sm70_decode_graph_semantics()
+        ):
             q_idx = _sm70_compile_graph_interleaved_indices(
                 ng, group_width_qkvz, 0, q_size, mixed_qkvz.device
             )
@@ -2790,7 +2798,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_start = value_start + v_size
         a_start = ba_size
 
-        if envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH:
+        if (
+            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and use_sm70_decode_graph_semantics()
+        ):
             q_idx = _sm70_compile_graph_interleaved_indices(
                 ng, group_width_qkvz, 0, q_size, mixed_qkvz.device
             )
@@ -4135,6 +4146,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         use_qwen38_fused_input = bool(
             getattr(self, "sm70_qwen38_fp16_fused_input", False)
+            and use_sm70_decode_graph_semantics()
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
         if use_qwen38_fused_input:

@@ -3,6 +3,7 @@
 
 from copy import deepcopy
 
+from benchmarks.benchmark_dsv4_dspark_long_context import _build_messages
 from benchmarks.benchmark_dsv4_gsm8k_api import _last_integer
 from benchmarks.compare_dsv4_quality_results import (
     _compare_gsm8k,
@@ -16,6 +17,15 @@ def test_last_integer_normalizes_signed_integral_decimal() -> None:
     assert _last_integer("answer: 12.0") == 12
     assert _last_integer("answer: 12.5") is None
     assert _last_integer("no numeric answer") is None
+
+
+def test_long_context_cases_diverge_before_the_cached_filler() -> None:
+    left = _build_messages(4, "CASE-32K")
+    right = _build_messages(4, "CASE-64K")
+
+    assert left[0]["content"] != right[0]["content"]
+    assert "CASE-32K" in left[0]["content"]
+    assert "CASE-64K" in right[0]["content"]
 
 
 def _gsm8k_artifact(predictions: list[int | None]) -> dict:

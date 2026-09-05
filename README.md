@@ -10,6 +10,11 @@
 
 ### Modern LLM inference for NVIDIA Tesla V100 / SM70
 
+>recommend models:
+>QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
+>RadixArk/Qwen3.8-Flash-Next-NVFP4
+>incoai/Qwen3.8-27B-DFlash2
+
 <strong>4× Tesla V100 16GB · Qwen3.8-27B-NVFP4 + DFlash2 · ≈260 tok/s</strong>
 
 > Tesla V100 was released in 2017.
@@ -1166,6 +1171,7 @@ Join the **1Cat-vLLM Open-Source Community Group 5** by scanning the latest QR c
 - [lmdeploy / TurboMind](https://github.com/InternLM/lmdeploy)
 - [flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)
 - [marlin_v100](https://github.com/zhinianqin/marlin_v100)
+- [v100-skinny](https://github.com/dnv2003/v100-skinny) — QPN quadpair-N `m8n8k4` decode layout behind the SM70 QPN2 / QPN4 / QPN8 and MXFP4-QPN kernels (MIT; notice retained in `csrc/sm70_turbomind/ops/LICENSE.v100-skinny`)
 
 Special thanks to [@yangzhuxinyzx](https://github.com/yangzhuxinyzx) and [@1CatTCat](https://github.com/1CatTCat) for their outstanding contributions to the continued evolution and performance breakthroughs of **1Cat-vLLM**.
 

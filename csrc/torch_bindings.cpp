@@ -176,6 +176,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
 
   ops.def(
+      "awq_sm70_prepare_compact(Tensor _kernel, Tensor _scaling_factors, "
+      "Tensor _zeros, int group_size, bool interleave_gated_silu) -> "
+      "Tensor[]");
+  ops.impl("awq_sm70_prepare_compact", torch::kCUDA, &awq_sm70_prepare_compact);
+
+  ops.def(
       "awq_sm70_dequantize_out(Tensor(a!) out, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size) -> ()");
   ops.impl("awq_sm70_dequantize_out", torch::kCUDA, &awq_sm70_dequantize_out);
@@ -569,6 +575,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &awq_moe_dense_stage_sm70_out);
 
   ops.def(
+      "awq_moe_indexed_dense_w13_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
+      "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("awq_moe_indexed_dense_w13_sm70_out", torch::kCUDA,
+           &awq_moe_indexed_dense_w13_sm70_out);
+
+  ops.def(
       "awq_moe_active_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
       "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "
@@ -696,6 +710,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
   ops.impl("nvfp4_moe_qpn_m1_sm70_out", torch::kCUDA,
            &nvfp4_moe_qpn_m1_sm70_out);
+
+  // Keep the five-row verifier on a distinct schema so an old extension that
+  // only supports the ten-route M=1 contract cannot be selected accidentally.
+  ops.def(
+      "nvfp4_moe_qpn_mtp5_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor weights, Tensor scales, "
+      "Tensor expert_ids, bool broadcast_input, int split_k) -> ()");
+  ops.impl("nvfp4_moe_qpn_mtp5_sm70_out", torch::kCUDA,
+           &nvfp4_moe_qpn_mtp5_sm70_out);
 
   ops.def(
       "nvfp4_moe_dense_stage_sm70_out("

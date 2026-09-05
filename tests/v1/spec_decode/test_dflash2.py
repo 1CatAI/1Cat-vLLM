@@ -352,6 +352,18 @@ def test_glm5_dflash_tp4_push_allreduce_is_quality_safe_by_default(monkeypatch):
         envs.disable_envs_cache()
 
 
+def test_sm70_tp4_push_allreduce_mtp5_is_opt_in(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", raising=False)
+    envs.disable_envs_cache()
+    try:
+        assert not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5
+        monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5", "1")
+        envs.disable_envs_cache()
+        assert envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5
+    finally:
+        envs.disable_envs_cache()
+
+
 @pytest.mark.parametrize(
     ("model_type", "method", "tp_size", "is_sm70"),
     [
@@ -392,7 +404,9 @@ def test_glm5_dflash_tp4_push_allreduce_preserves_explicit_override(monkeypatch)
 def _glm5_dflash_acceptance_config():
     return (
         SimpleNamespace(
-            hf_text_config=SimpleNamespace(model_type="glm5_next_text"),
+            hf_text_config=SimpleNamespace(
+                model_type="glm5_next_text", num_hidden_layers=45
+            ),
             quantization="modelopt_fp4",
         ),
         SimpleNamespace(
@@ -418,6 +432,17 @@ def test_glm5_dflash_tp4_pp2_auto_selects_quality_path(monkeypatch):
     )
 
     assert {name: os.environ.get(name) for name in expected} == expected
+
+
+@pytest.mark.parametrize("num_layers", [32, 46, 70, None])
+def test_glm5_partition_does_not_override_other_layer_counts(monkeypatch, num_layers):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    model, spec, parallel = _glm5_dflash_acceptance_config()
+    model.hf_text_config.num_hidden_layers = num_layers
+    _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+        model, spec, parallel, is_sm70=True
+    )
+    assert "VLLM_PP_LAYER_PARTITION" not in os.environ
 
 
 @pytest.mark.parametrize(
@@ -1789,6 +1814,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         cp_interleave=1,
     )
     speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
+    speculator._query_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._layer_group_idx = None
     speculator._context_only_prefill_logged = False
     speculator._prepare_ngram_assist = Mock(

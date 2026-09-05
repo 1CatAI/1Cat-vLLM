@@ -104,7 +104,9 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
     assert len(request.spec_token_ids) == expected_num_spec_tokens
 
 
-def test_v2_pp_spec_decode_respects_pipeline_cadence():
+def test_v2_pp_spec_decode_respects_pipeline_cadence(monkeypatch):
+    # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
     scheduler = create_scheduler(
         async_scheduling=True,
         pipeline_parallel_size=2,

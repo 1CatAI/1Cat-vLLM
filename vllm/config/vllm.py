@@ -81,7 +81,8 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
-_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
+_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
+_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     # This is the target projection's memory-neutral FP8 layout, not the
@@ -151,6 +152,47 @@ def _is_sm70_dflash2_verifier_contract(
     )
 
 
+def _is_sm70_qwen38_nomtp_dual_compile_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit only the exact Qwen3.8 TP4 no-MTP dual-compile topology."""
+    if (
+        model_config is None
+        or parallel_config is None
+        or speculative_config is not None
+    ):
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    supported_architecture = "Qwen4ExpForCausalLM" in architectures or (
+        "Qwen4ExpForConditionalGeneration" in architectures
+        and multimodal_config is not None
+        and getattr(multimodal_config, "language_model_only", False)
+    )
+    return bool(
+        supported_architecture
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 2560
+        and getattr(hf_text_config, "num_hidden_layers", None) == 48
+        and getattr(hf_text_config, "num_experts", None) == 512
+        and getattr(hf_text_config, "num_experts_per_tok", None) == 10
+        and getattr(hf_text_config, "moe_intermediate_size", None) == 640
+        and getattr(hf_text_config, "hc_count", None) == 4
+        and getattr(hf_text_config, "hc_lowrank", None) == 320
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 2
+        and getattr(hf_text_config, "indexer_head_dim", None) == 128
+        and getattr(hf_text_config, "indexer_budget", None) == 2048
+        and getattr(hf_text_config, "indexer_compress_ratio", None) == 4
+        and getattr(parallel_config, "tensor_parallel_size", None) == 4
+        and getattr(parallel_config, "pipeline_parallel_size", None) == 1
+    )
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -159,6 +201,19 @@ def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
             os.environ[env_name] = env_value
             applied.append(env_name)
     return tuple(applied)
+
+
+def _apply_sm70_qwen38_hybrid_ple_defaults(
+    parallel_config: ParallelConfig,
+) -> None:
+    """Enable hybrid PLE and complete its late-bound parallel config."""
+    os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
+    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
+    # ParallelConfig is validated before these model-aware defaults are
+    # applied, so initialize the endpoint that its validator would have
+    # created for an explicit PLE configuration.
+    parallel_config.ensure_ple_offload_ipc_path()
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
@@ -246,10 +301,13 @@ def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
         return
 
     accepted_defaults = {
-        "VLLM_PP_LAYER_PARTITION": "24,21",
         "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
         "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
     }
+    # A fixed partition must account for every layer. Other layer counts
+    # retain the normal partitioner rather than inheriting a 45-layer split.
+    if getattr(model_config.hf_text_config, "num_hidden_layers", None) == 45:
+        accepted_defaults["VLLM_PP_LAYER_PARTITION"] = "24,21"
     configured = []
     overrides = []
     for name, value in accepted_defaults.items():
@@ -276,6 +334,20 @@ def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
             "output-quality gates before production use.",
             ", ".join(overrides),
         )
+
+
+def _sm70_speculative_cudagraph_capture_sizes(
+    max_num_seqs: int,
+    decode_query_len: int,
+) -> list[int]:
+    """Return bounded auxiliary and verifier shapes without a TP contract."""
+    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
+        max_num_seqs,
+        decode_query_len,
+    )
+    return sorted(
+        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
+    )
 
 
 class OptimizationLevel(IntEnum):
@@ -1718,6 +1790,47 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
+            if (
+                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                )
+                and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                and (
+                    envs.VLLM_SM70_QWEN38_FP16_GEMV
+                    or envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16
+                    or envs.VLLM_SM70_QWEN38_FUSED_HC_FP16
+                )
+                and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in os.environ
+            ):
+                os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
+                logger.info_once(
+                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                    "large prefill and FULL decode graphs share one model."
+                )
+            if (
+                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                )
+                and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+                and not any(
+                    name in os.environ
+                    for name in (
+                        "VLLM_SM70_QWEN38_HYBRID_PLE",
+                        "VLLM_PLE_CPU_OFFLOAD",
+                        "VLLM_PLE_DISK_OFFLOAD",
+                    )
+                )
+            ):
+                _apply_sm70_qwen38_hybrid_ple_defaults(self.parallel_config)
+                logger.info_once(
+                    "Auto-enabling hybrid PLE for the SM70 Qwen3.8 "
+                    "dual-compile lane: async disk-mmap prefill plus local "
+                    "pinned-UVA decode."
+                )
             if _is_sm70_dflash2_verifier_contract(
                 self.model_config,
                 self.speculative_config,
@@ -1796,31 +1909,15 @@ class VllmConfig:
                             )
                         else:
                             cudagraph_capture_sizes = (
-                                [1, 2, 4, 8, 9, 18]
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else [1, 2, 4, 8, 9]
-                            )
-                            max_graph_reqs = (
-                                4
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else 1
-                            )
-                            max_graph_reqs = min(
-                                max(int(self.scheduler_config.max_num_seqs), 1),
-                                max_graph_reqs,
-                            )
-                            cudagraph_capture_sizes = sorted(
-                                set(cudagraph_capture_sizes)
-                                | {
-                                    decode_query_len * num_reqs
-                                    for num_reqs in range(1, max_graph_reqs + 1)
-                                }
+                                _sm70_speculative_cudagraph_capture_sizes(
+                                    self.scheduler_config.max_num_seqs,
+                                    decode_query_len,
+                                )
                             )
                             logger.info_once(
-                                "Using SM70 speculative verifier cudagraph shapes "
-                                "%sx1..%s for Flash-V100 compile graph.",
-                                decode_query_len,
-                                max_graph_reqs,
+                                "Using bounded SM70 speculative cudagraph token "
+                                "shapes %s for Flash-V100 compile graph.",
+                                tuple(cudagraph_capture_sizes),
                             )
                     elif cudagraph_capture_sizes != [1, 2]:
                         logger.info_once(
@@ -2469,7 +2566,7 @@ class VllmConfig:
         """
         if self.speculative_config is not None:
             scheduled_token_delta = (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             )
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -2487,7 +2584,10 @@ class VllmConfig:
                     " to accommodate the additional draft token slots, or decrease"
                     " num_speculative_tokens or max_num_seqs."
                 )
-            if self.scheduler_config.max_num_scheduled_tokens < 8192:
+            if (
+                scheduled_token_delta > 0
+                and self.scheduler_config.max_num_scheduled_tokens < 8192
+            ):
                 logger.warning_once(
                     "max_num_scheduled_tokens is set to"
                     f" {self.scheduler_config.max_num_scheduled_tokens} based on"
@@ -2499,7 +2599,7 @@ class VllmConfig:
 
             max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
             if max_num_batched_tokens < max_num_scheduled_tokens + (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             ):
                 raise ValueError(
@@ -2708,16 +2808,15 @@ class VllmConfig:
         if (
             compile_range_end is not None
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
             and compilation_config.mode == CompilationMode.VLLM_COMPILE
             and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         ):
-            # FULL decode capture can enter the compiled piecewise wrapper with
+            # FULL capture can enter the compiled piecewise wrapper with
             # max_num_batched_tokens + one decode token. Keep scheduler capacity
             # unchanged, but allow the wrapper to select a compiled range.
             compile_range_end += 1
             logger.info_once(
-                "Extending SM70 Flash-V100 0.0.3 decode-only compile range "
+                "Extending SM70 Flash-V100 0.0.3 compile range "
                 "endpoint to %d for CUDA graph capture.",
                 compile_range_end,
             )

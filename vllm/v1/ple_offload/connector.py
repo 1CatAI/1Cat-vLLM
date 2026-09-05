@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
@@ -14,6 +15,7 @@ import torch.nn as nn
 import zmq
 from cuda.bindings import driver as cuda_driver
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
@@ -27,6 +29,14 @@ from vllm.v1.ple_offload.protocol import (
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _PendingPleOffloadRequest:
+    """Bind request metadata to its MRV2 D2H completion event."""
+
+    request: PleOffloadRequest
+    d2h_done_event: torch.cuda.Event | None
 
 
 def _cuda_check(result: Any, operation: str) -> Any:
@@ -92,18 +102,20 @@ class PleOffloadConnector:
         self._validate_input_sources()
 
         self._pinned_input_buffers: list[torch.Tensor] = []
-        # PLE rejects DBO, and each forward consumes its output before the
-        # next launch, so one pending request is sufficient.
-        self._request_queue: queue.Queue[PleOffloadRequest | None] = queue.Queue(
-            maxsize=1
+        # MRV2 may queue more than one batch under asynchronous scheduling.
+        # MRV1 remains strictly serialized and retains its existing depth-one
+        # CPU staging contract.
+        request_queue_size = (
+            vllm_config.max_concurrent_batches if self._uses_cuda_inputs else 1
+        )
+        self._request_queue: queue.Queue[_PendingPleOffloadRequest | None] = (
+            queue.Queue(maxsize=request_queue_size)
         )
         self._request_thread: threading.Thread | None = None
         self._request_thread_ready = threading.Event()
         self._zmq_ctx: zmq.Context | None = None
         self._registration_socket: zmq.Socket | None = None
-        self._d2h_stream: torch.cuda.Stream | None = None
-        self._input_ready_event: torch.cuda.Event | None = None
-        self._d2h_done_event: torch.cuda.Event | None = None
+        self._d2h_event_pool: queue.Queue[torch.cuda.Event] | None = None
 
         try:
             self._zmq_ctx = zmq.Context()
@@ -117,9 +129,11 @@ class PleOffloadConnector:
                 with torch.accelerator.device_index(self.device.index):
                     self._pin_input_buffers()
                     if self._uses_cuda_inputs:
-                        self._d2h_stream = torch.cuda.Stream(device=self.device)
-                        self._input_ready_event = torch.cuda.Event()
-                        self._d2h_done_event = torch.cuda.Event()
+                        self._d2h_event_pool = queue.Queue(
+                            maxsize=vllm_config.max_concurrent_batches
+                        )
+                        for _ in range(vllm_config.max_concurrent_batches):
+                            self._d2h_event_pool.put_nowait(torch.cuda.Event())
                 self._start_request_thread(ipc_addr)
         except Exception:
             self.close()
@@ -251,7 +265,7 @@ class PleOffloadConnector:
             raise RuntimeError("Timed out starting the PLE request thread")
 
     def _request_loop(self, ipc_addr: str) -> None:
-        """Stage fixed runner inputs, then notify the CPU worker."""
+        """Wait for staged inputs, then notify the CPU worker."""
         socket: zmq.Socket | None = None
         try:
             if self._zmq_ctx is None:
@@ -272,15 +286,33 @@ class PleOffloadConnector:
             if socket is not None:
                 socket.close(linger=0)
 
-    def _process_request(self, request: PleOffloadRequest, socket: zmq.Socket) -> None:
-        """Stage one batch from fixed sources and publish its request."""
+    def _process_request(
+        self,
+        pending: _PendingPleOffloadRequest,
+        socket: zmq.Socket,
+    ) -> None:
+        """Wait for one staged batch and publish its request."""
+        request = pending.request
+        event = pending.d2h_done_event
         if self._uses_cuda_inputs:
-            self._copy_cuda_inputs(request)
+            event_pool = self._d2h_event_pool
+            if event_pool is None or event is None:
+                raise RuntimeError("MRV2 PLE request is missing its D2H event")
+            with (
+                torch.accelerator.device_index(self.device.index),
+                torch.cuda.nvtx.range("ple_offload.wait_d2h"),
+            ):
+                event.synchronize()
         else:
+            if event is not None:
+                raise RuntimeError("MRV1 PLE request unexpectedly has a D2H event")
             self._copy_cpu_inputs(request)
 
         with torch.cuda.nvtx.range("ple_offload.send_request"):
             socket.send(msgspec.msgpack.encode(request))
+        if event is not None:
+            assert self._d2h_event_pool is not None
+            self._d2h_event_pool.put_nowait(event)
 
     def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
         """Stage MRV1's existing CPU mirrors in the notifier thread."""
@@ -332,38 +364,38 @@ class PleOffloadConnector:
             ):
                 raise ValueError(f"PLE {name} source is incompatible")
 
-    def _copy_cuda_inputs(self, request: PleOffloadRequest) -> None:
-        """Stage MRV2 inputs on the background D2H stream."""
-        if (
-            self._d2h_stream is None
-            or self._input_ready_event is None
-            or self._d2h_done_event is None
-        ):
-            raise RuntimeError("PLE D2H resources are not initialized")
+    def _enqueue_cuda_inputs(
+        self,
+        request: PleOffloadRequest,
+        d2h_done_event: torch.cuda.Event,
+    ) -> None:
+        """Stage MRV2 inputs on the model stream and record completion.
 
+        The request owns ``d2h_done_event`` until its shared inputs are visible
+        to the CPU worker. Reusing one background-stream event lets a later
+        batch retarget the event before the previous request has consumed its
+        inputs, which can deadlock CUDA Graph replay when the batch size changes.
+        """
         with torch.accelerator.device_index(self.device.index):
-            with torch.cuda.stream(self._d2h_stream):
-                self._d2h_stream.wait_event(self._input_ready_event)
-                with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
-                    self._input_ids_buf[: request.num_tokens].copy_(
-                        self._input_ids_source[: request.num_tokens],
+            stream = torch.cuda.current_stream(self.device)
+            with torch.cuda.nvtx.range("ple_offload.copy_input_ids"):
+                self._input_ids_buf[: request.num_tokens].copy_(
+                    self._input_ids_source[: request.num_tokens],
+                    non_blocking=True,
+                )
+            with torch.cuda.nvtx.range("ple_offload.copy_query_start_loc"):
+                self._query_start_loc_buf[: request.num_reqs + 1].copy_(
+                    self._query_start_loc_source[: request.num_reqs + 1],
+                    non_blocking=True,
+                )
+            if self._ngram_context_buf is not None:
+                assert self._ngram_context_source is not None
+                with torch.cuda.nvtx.range("ple_offload.copy_ngram_context"):
+                    self._ngram_context_buf[: request.num_reqs].copy_(
+                        self._ngram_context_source[: request.num_reqs],
                         non_blocking=True,
                     )
-                with torch.cuda.nvtx.range("ple_offload.copy_query_start_loc"):
-                    self._query_start_loc_buf[: request.num_reqs + 1].copy_(
-                        self._query_start_loc_source[: request.num_reqs + 1],
-                        non_blocking=True,
-                    )
-                if self._ngram_context_buf is not None:
-                    assert self._ngram_context_source is not None
-                    with torch.cuda.nvtx.range("ple_offload.copy_ngram_context"):
-                        self._ngram_context_buf[: request.num_reqs].copy_(
-                            self._ngram_context_source[: request.num_reqs],
-                            non_blocking=True,
-                        )
-                self._d2h_done_event.record(self._d2h_stream)
-            with torch.cuda.nvtx.range("ple_offload.wait_d2h"):
-                self._d2h_done_event.synchronize()
+            d2h_done_event.record(stream)
 
     def _launch(
         self,
@@ -376,27 +408,38 @@ class PleOffloadConnector:
         if self.tp_rank != 0:
             return
 
-        if self._uses_cuda_inputs:
-            assert self._input_ready_event is not None
-            # The background copy stream waits for runner input production
-            # without making the model stream wait for D2H completion.
-            self._input_ready_event.record(torch.cuda.current_stream(self.device))
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
         )
-        self._request_queue.put_nowait(request)
+        d2h_done_event = None
+        if self._uses_cuda_inputs:
+            if self._d2h_event_pool is None:
+                raise RuntimeError("PLE D2H event pool is not initialized")
+            try:
+                d2h_done_event = self._d2h_event_pool.get_nowait()
+            except queue.Empty as exc:
+                raise RuntimeError(
+                    "PLE has more MRV2 requests than configured concurrent batches"
+                ) from exc
+            self._enqueue_cuda_inputs(request, d2h_done_event)
+        self._request_queue.put_nowait(
+            _PendingPleOffloadRequest(request, d2h_done_event)
+        )
 
     def prepare_forward(
         self,
         num_reqs: int,
         num_tokens: int,
         dummy_run: bool,
+        use_local_model: bool = False,
     ) -> None:
         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
+            return
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_local_model:
             return
         self._launch(num_reqs, num_tokens)
 
@@ -435,9 +478,7 @@ class PleOffloadConnector:
         if self._pinned_input_buffers:
             with torch.accelerator.device_index(self.device.index):
                 self._unpin_input_buffers()
-        self._d2h_done_event = None
-        self._input_ready_event = None
-        self._d2h_stream = None
+        self._d2h_event_pool = None
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)
             self._registration_socket = None
