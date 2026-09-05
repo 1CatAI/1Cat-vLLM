@@ -15,6 +15,7 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
     set_current_vllm_config,
 )
@@ -1884,3 +1885,58 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+def _spec_config_for(vllm_config, method: str):
+    kwargs = dict(
+        target_model_config=vllm_config.model_config,
+        target_parallel_config=vllm_config.parallel_config,
+        method=method,
+        num_speculative_tokens=2,
+    )
+    if method == "ngram":
+        kwargs.update(prompt_lookup_min=2, prompt_lookup_max=3)
+    elif method == "draft_model":
+        kwargs["model"] = vllm_config.model_config.model
+    return SpeculativeConfig(**kwargs)
+
+
+@pytest.mark.parametrize("method", ["ngram", "draft_model", "extract_hidden_states"])
+def test_non_last_pp_rank_profiles_with_speculative_config(
+    dist_init, monkeypatch: pytest.MonkeyPatch, method: str
+):
+    """Regression for #439.
+
+    The draft model lives on the last PP rank only, so ``self.drafter`` is
+    created there only. Every rank, however, runs memory profiling
+    (``_dummy_run`` -> ``_build_attention_metadata``) and the KV-cache
+    initialisation, and both probe ``self.drafter``. On a non-last rank
+    that used to raise AttributeError before the first request arrived.
+    """
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.get_pp_group",
+        lambda: SimpleNamespace(
+            world_size=2,
+            rank=0,
+            rank_in_group=0,
+            is_first_rank=True,
+            is_last_rank=False,
+        ),
+    )
+    vllm_config = get_vllm_config()
+    vllm_config.speculative_config = _spec_config_for(vllm_config, method)
+    with set_current_vllm_config(vllm_config):
+        runner = GPUModelRunner(vllm_config, DEVICE_TYPE)
+        runner.load_model()
+        current_platform.update_block_size_for_backend(vllm_config)
+        kv_cache_config = get_kv_cache_configs(
+            vllm_config, [runner.get_kv_cache_spec()], [GiB_bytes]
+        )[0]
+        # The real initialize_kv_cache(), not the trimmed test helper: it is
+        # the entry point for three of the drafter-only assertions.
+        runner.initialize_kv_cache(kv_cache_config)
+        # force_attention takes the profiling run through
+        # _build_attention_metadata, the frame in the reported traceback.
+        runner._dummy_run(num_tokens=16, is_profile=True, force_attention=True)
+        # Non-last ranks build no drafter -- but the attribute must exist.
+        assert runner.drafter is None

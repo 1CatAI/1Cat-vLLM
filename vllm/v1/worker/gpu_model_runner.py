@@ -1534,6 +1534,7 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
                 | Qwen4ExpMTPProposer
+                | None
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -1607,6 +1608,15 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
+        elif self.speculative_config:
+            # Non-last PP ranks never build a drafter (the entire draft
+            # model lives on the last rank, see the note above), but code
+            # that runs on every rank probes the attribute -- the
+            # attention-metadata builder does so during memory profiling,
+            # long before any request arrives. Bind it so those
+            # isinstance() checks fall through instead of raising
+            # AttributeError.
+            self.drafter = None
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             draft_config = self.speculative_config.draft_model_config
@@ -7654,10 +7664,11 @@ class GPUModelRunner(
             draft_confidence_logits=draft_confidence_logits,
         )
         target_candidate_ids = self.rejection_sampler.take_last_target_candidate_ids()
-        if target_candidate_ids is not None and hasattr(
-            self.drafter, "update_dynamic_draft_vocab"
-        ):
-            self.drafter.update_dynamic_draft_vocab(
+        update_dynamic_draft_vocab = getattr(
+            getattr(self, "drafter", None), "update_dynamic_draft_vocab", None
+        )
+        if target_candidate_ids is not None and update_dynamic_draft_vocab is not None:
+            update_dynamic_draft_vocab(
                 target_candidate_ids,
                 sampler_output.sampled_token_ids,
             )
@@ -10214,13 +10225,13 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if (drafter := getattr(self, "drafter", None)) is not None:
                     logger.info_once("Loading drafter model...")
-                    if hasattr(self.drafter, "load_model"):
-                        self.drafter.load_model(self.model)
+                    if hasattr(drafter, "load_model"):
+                        drafter.load_model(self.model)
                     if (
-                        hasattr(self.drafter, "model")
-                        and is_mixture_of_experts(self.drafter.model)
+                        hasattr(drafter, "model")
+                        and is_mixture_of_experts(drafter.model)
                         and self.parallel_config.enable_eplb
                     ):
                         assert not self.parallel_config.enable_elastic_ep, (
@@ -10238,7 +10249,7 @@ class GPUModelRunner(
                                 self.parallel_config, self.device
                             )
                         self.eplb_state.add_model(
-                            self.drafter.model,
+                            drafter.model,
                             spec_config.draft_model_config,
                         )
                         eplb_models += 1
@@ -11160,10 +11171,14 @@ class GPUModelRunner(
                     hidden_states
                 )
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -12158,9 +12173,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -12211,9 +12230,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -12682,6 +12705,7 @@ class GPUModelRunner(
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()
+            and get_pp_group().is_last_rank
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
             # validate all draft model layers belong to the same kv cache
