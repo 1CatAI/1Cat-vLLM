@@ -193,22 +193,33 @@ __global__ void mxfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   }
 }
 
-template <int kSplitK, bool kFusedSwiGLU = false>
+template <int kSplitK, bool kFusedSwiGLU = false, bool kStaticW13 = false,
+          bool kPrefetch = false, int kSplitBlocks = 1>
 __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
                                          const uint32_t* __restrict__ weights,
                                          const half* __restrict__ scales,
                                          const int32_t* __restrict__ expert_ids,
-                                         half* __restrict__ output, int n,
-                                         int k, bool broadcast_input) {
+                                         half* __restrict__ output, int runtime_n,
+                                         int runtime_k, bool broadcast_input,
+                                         float* split_partials = nullptr) {
+  static_assert(kSplitK % kSplitBlocks == 0);
+  static_assert(!kStaticW13 || (kFusedSwiGLU && kSplitK == 16));
+  static_assert(kSplitBlocks == 1 || kStaticW13);
+  const int n = kStaticW13 ? 320 : runtime_n;
+  const int k = kStaticW13 ? 2560 : runtime_k;
   __shared__ float partials[kSplitK][32];
 
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
+  const int warp = (threadIdx.x >> 5) +
+                   (kSplitBlocks > 1 ? blockIdx.z * (kSplitK / kSplitBlocks) : 0);
   const int tile = blockIdx.x;
   const int route = blockIdx.y;
   const int expert = __ldg(expert_ids + route);
   if (expert < 0 || expert >= 512) {
-    if constexpr (kFusedSwiGLU) {
+    if constexpr (kSplitBlocks > 1) {
+      split_partials[((route * (n / 32) + tile) * kSplitK + warp) * 32 + lane] =
+          0.0f;
+    } else if constexpr (kFusedSwiGLU) {
       if (threadIdx.x < 16) {
         output[static_cast<size_t>(route) * (n / 2) + tile * 16 + threadIdx.x] =
             __float2half(0.0f);
@@ -242,17 +253,44 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
   const int input_route = broadcast_input ? route / 10 : route;
   const half* input_row = input + static_cast<size_t>(input_route) * k;
 
+  unsigned next_packed0 = 0;
+  unsigned next_packed1 = 0;
+  half next_scale = __float2half(0.0f);
+  if constexpr (kPrefetch) {
+    const size_t base =
+        (static_cast<size_t>(tile) * groups_k8 + group_begin * 2) * 32 + packed_col;
+    next_packed0 = __ldcs(expert_weights + base);
+    next_packed1 = __ldcs(expert_weights + base + 32);
+    next_scale = __ldg(expert_scales +
+                      (static_cast<size_t>(group_begin) * tiles_n32 + tile) * 32 +
+                      packed_col);
+  }
+
   float accum[8] = {};
 #pragma unroll 4
   for (int group = group_begin; group < group_begin + groups_per_warp;
        ++group) {
     const size_t tile_group_base =
         (static_cast<size_t>(tile) * groups_k8 + group * 2) * 32 + packed_col;
-    const unsigned packed0 = __ldcs(expert_weights + tile_group_base);
-    const unsigned packed1 = __ldcs(expert_weights + tile_group_base + 32);
+    unsigned packed0;
+    unsigned packed1;
     const size_t scale_index =
         (static_cast<size_t>(group) * tiles_n32 + tile) * 32 + packed_col;
-    const half scalar = __ldg(expert_scales + scale_index);
+    half scalar;
+    if constexpr (kPrefetch) {
+      packed0 = next_packed0;
+      packed1 = next_packed1;
+      scalar = next_scale;
+      if (group + 1 < group_begin + groups_per_warp) {
+        next_packed0 = __ldcs(expert_weights + tile_group_base + 64);
+        next_packed1 = __ldcs(expert_weights + tile_group_base + 96);
+        next_scale = __ldg(expert_scales + scale_index + tiles_n32 * 32);
+      }
+    } else {
+      packed0 = __ldcs(expert_weights + tile_group_base);
+      packed1 = __ldcs(expert_weights + tile_group_base + 32);
+      scalar = __ldg(expert_scales + scale_index);
+    }
     // dequant_e2m1x8 materializes the FP4 payload with a 2^-14 exponent
     // offset so that every E2M1 value can be formed with integer bit ops.
     // MXFP4 folds the matching 2^14 correction into its exponent scale;
@@ -286,10 +324,16 @@ __global__ void nvfp4_qpn_m1_sm70_kernel(const half* __restrict__ input,
       for (int offset = 0; offset < 2; ++offset) {
         const int index = pair * 4 + offset;
         const int local_col = offset | (((lane >> 1) & 1) << 1) | (pair << 2);
-        partials[warp][quadpair * 8 + local_col] = accum[index];
+        if constexpr (kSplitBlocks > 1) {
+          split_partials[((route * tiles_n32 + tile) * kSplitK + warp) * 32 +
+                         quadpair * 8 + local_col] = accum[index];
+        } else {
+          partials[warp][quadpair * 8 + local_col] = accum[index];
+        }
       }
     }
   }
+  if constexpr (kSplitBlocks > 1) return;
   __syncthreads();
 
   if (warp == 0) {

@@ -45958,3 +45958,26 @@ Interpretation:
   code, including a warp-ordering attempt, so the intended lookahead was not
   established. Do not run these as purported prefetch variants or repeat the
   previously rejected ordinary CUDA128 down. No GPU startup for this screen.
+
+## 2026-09-06 exact M1 projection and W13 follow-up (#510)
+
+Stacked on #507/bbdf0af5c9; integration remains public/main755baae1d0.
+The latest measured endpoint remains98.965175 tok/s, not100. This follow-up
+has launched no full model. Details and artifacts are in
+`docs/design/sm70_qwen38_projection_w13_followup.md`.
+
+- Fix the same-shape GDN/QSA role-policy overwrite while preserving legacy
+  two-argument calls and all FP16/FP32 arithmetic.48 real output projections
+  save0.008681ms;64 input-changing graph checks and16 production-op graph
+  checks are bitwise. CPU29 pass/3 GPU-only deselections plus1 export pass.
+- W13 fixed geometry saves only0.000714ms/48 calls; register reduction alone
+  did not remove the small-grid/load-dependency bottleneck. Do not repeat as
+  a proposed large speedup. Counter baseline:352GB/s,30.55% occupancy,
+  66.95% no-eligible cycles,46.6% long-scoreboard share.
+- Next-group weight/scale prefetch is exact over64 changing graph replays
+  but saves only0.007588ms/48 calls. No production launcher enables it.
+- Same16-partial-group distribution across2/4 CTAs is a benchmark-only
+  candidate awaiting idle GPU time. Merge/workspace cost must be included;
+  do not confuse it with changing numerical split-K grouping.
+- Ordinary output GEMV already uses64-bit vectorized loads in its PTX.
+  Do not repeat speculative scalar-to-vector rewrites without new evidence.
