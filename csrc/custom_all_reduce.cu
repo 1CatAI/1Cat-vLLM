@@ -8,6 +8,9 @@
 #include <torch/all.h>
 
 #include "custom_all_reduce.cuh"
+#if !defined(USE_ROCM)
+  #include "sm70_hc_batch.cuh"
+#endif
 
 // Fake pointer type, must match fptr_t type in ops.h.
 // We use this type alias to indicate when pointers are passed in as int64_t.
@@ -794,6 +797,24 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
       throw std::runtime_error(
           "custom allreduce sum2 only supports float32, float16 and bfloat16");
   }
+}
+
+void sm70_qwen38_hc_batch_down(fptr_t ptr, torch::Tensor input,
+                               torch::Tensor injection, torch::Tensor lora) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  sm70_hc_batch::run<false>(ptr, input, injection, lora);
+#endif
+}
+
+void sm70_qwen38_hc_batch_mix(fptr_t ptr, torch::Tensor gate,
+                              torch::Tensor branches, torch::Tensor output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 batch HC is unavailable on ROCm");
+#else
+  sm70_hc_batch::run<true>(ptr, gate, branches, output);
+#endif
 }
 
 void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,

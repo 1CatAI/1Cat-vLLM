@@ -840,6 +840,11 @@ class Qwen4ExpForCausalLM(
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
+    def prepare_sm70_batch_hc(self) -> None:
+        from .sm70_batch_hc import prepare_sm70_batch_hc
+
+        prepare_sm70_batch_hc(self)
+
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
@@ -1207,6 +1212,9 @@ class Qwen4ExpForConditionalGeneration(
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Forward decode compiler setup to the wrapped language model."""
         return self.language_model.prepare_sm70_decode_graph_model()
+
+    def prepare_sm70_batch_hc(self) -> None:
+        self.language_model.prepare_sm70_batch_hc()
 
     def forward(
         self,

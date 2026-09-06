@@ -172,7 +172,9 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN4_EXP_ONLINE_QPN8: bool = False
     VLLM_SM70_QWEN38_FP16_GEMV: bool = False
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
+    VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
+    VLLM_SM70_QWEN38_BATCH_HC_FP16: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
@@ -1784,11 +1786,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0"))
     ),
+    # Copy-only batched fallback fusion: keep both GDN GEMMs unchanged.
+    # Experimental until complete-model performance and quality gates pass.
+    "VLLM_SM70_GDN_BATCH_SPLIT_COPY": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_BATCH_SPLIT_COPY", "0"))
+    ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
     # stages while retaining FP16 checkpoint weights and inter-stage rounding.
     # This remains opt-in pending the same model-level quality gates as GEMV.
     "VLLM_SM70_QWEN38_FUSED_HC_FP16": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_FUSED_HC_FP16", "0"))
+    ),
+    # Experimental FP16 HC batch fusion; no model-quality/default admission yet.
+    "VLLM_SM70_QWEN38_BATCH_HC_FP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN38_BATCH_HC_FP16", "0"))
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while

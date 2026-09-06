@@ -51,13 +51,46 @@ def mix_scatter(gate, x, out, RANK: tl.constexpr):
     tl.store(out + row * 2560 + col, acc / 4)
 
 
+def shard_weights(down, up, rank, layout):
+    """Screen zero-copy output shards; do not change production weight loading."""
+    up_view = up.view(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+    if layout == "views":
+        # Extra eight down rows are unused except rank3's four injections.
+        # The kernel already discards other ranks' col80..87 outputs.
+        return down.narrow(0, rank * 80, 88), up_view
+    if layout == "down-view":
+        local_down = down.narrow(0, rank * 80, 88)
+    else:
+        local_down = down.new_zeros(88, 10240)
+        local_down[:80].copy_(down[rank * 80 : (rank + 1) * 80])
+        if rank == 3:
+            local_down[80:84].copy_(down[320:324])
+    return local_down, up_view.reshape(2560, 320).contiguous()
+
+
+def up_projection(lora, weight, output):
+    if weight.ndim == 2:
+        return torch.nn.functional.linear(lora, weight)
+    # Each branch writes disjoint columns of each output row. The batch
+    # dimension shares the lora input (stride zero), never the output cells.
+    torch.bmm(
+        lora.unsqueeze(0).expand(4, -1, -1),
+        weight.transpose(1, 2),
+        out=output.view(lora.shape[0], 4, 640).transpose(0, 1),
+    )
+    return output
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--tokens", default="4,8,16")
     p.add_argument("--layer", type=int, default=0)
     p.add_argument("--pair", choices=("attn", "mlp"), default="attn")
-    p.add_argument("--mode", choices=("full", "down"), default="full")
+    p.add_argument("--mode", choices=("full", "down", "fused"), default="full")
+    p.add_argument(
+        "--weight-layout", choices=("packed", "down-view", "views"), default="packed"
+    )
     p.add_argument(
         "--weight-copies",
         type=int,
@@ -68,6 +101,13 @@ def main():
         "--profile", action="store_true", help="Capture graph nodes, skip timing sweep"
     )
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--check-only", action="store_true", help="Skip performance timing")
+    p.add_argument(
+        "--aux-check",
+        type=int,
+        default=0,
+        help="Fused mode only: interleave this many auxiliary sum2 graph replays",
+    )
     args = p.parse_args()
     if args.weight_copies <= 0:
         p.error("--weight-copies must be positive")
@@ -111,6 +151,18 @@ def main():
 
     ca = CustomAllreduce(group, rank, max_size=128 * 1024)
     assert not ca.disabled
+    hc_ca = None
+    if args.mode == "fused":
+        assert hasattr(torch.ops._C_custom_ar_flashnext, "hc_down_gather"), (
+            "Build sm70_hc_push_gather.cuh into the SAME custom-AR sidecar "
+            "that owns this communicator"
+        )
+        # Reuse the existing communicator implementation, but give HC a
+        # separate packet/epoch channel from auxiliary-stream collectives.
+        hc_ca = CustomAllreduce(group, rank, max_size=128 * 1024)
+        assert not hc_ca.disabled
+    elif args.aux_check:
+        p.error("--aux-check requires --mode fused")
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -125,18 +177,10 @@ def main():
     injection = weight(".block_inject_weight.weight")
     down = torch.cat((down, injection, down.new_zeros(12, 10240)))
     up = weight(".input_mix_weight_up.weight")
-    local_down_w = down.new_zeros(88, 10240)
-    local_down_w[:80].copy_(down[rank * 80 : (rank + 1) * 80])
-    if rank == 3:
-        local_down_w[80:84].copy_(down[320:324])
-    local_up_w = (
-        up.view(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
-        .reshape(2560, 320)
-        .contiguous()
-    )
-    weights = [(down, up, local_down_w, local_up_w)]
+    weights = [(down, up, *shard_weights(down, up, rank, args.weight_layout))]
     for _ in range(args.weight_copies - 1):
-        weights.append(tuple(w.clone() for w in weights[0]))
+        wd, wu = down.clone(), up.clone()
+        weights.append((wd, wu, *shard_weights(wd, wu, rank, args.weight_layout)))
     results = []
     try:
         for m in map(int, args.tokens.split(",")):
@@ -146,6 +190,9 @@ def main():
             full_down = torch.empty_like(sparse_down)
             sparse_output = x.new_empty(m, 2560)
             output = torch.empty_like(sparse_output)
+            fused_lora = x.new_empty(m, 320)
+            fused_injection = x.new_empty(m, 4)
+            local_gate = x.new_empty(m, 2560)
 
             def baseline(index=0):
                 wd, wu, _, _ = weights[index]
@@ -155,9 +202,18 @@ def main():
                     :, 320:324
                 ]
 
-            def candidate(registered, index=0):
+            def candidate(registered, index=0, use_fused=True):
                 _, wu, local_wd, local_wu = weights[index]
                 d = torch.nn.functional.linear(x, local_wd)
+                if args.mode == "fused" and use_fused:
+                    torch.ops._C_custom_ar_flashnext.hc_down_gather(
+                        hc_ca._ptr, d, fused_injection, fused_lora
+                    )
+                    gate = up_projection(fused_lora, local_wu, local_gate)
+                    torch.ops._C_custom_ar_flashnext.hc_mix_gather(
+                        hc_ca._ptr, gate, x, output
+                    )
+                    return output, fused_injection
                 scatter_down[(m,)](d, sparse_down, RANK=rank)
                 ca.all_reduce(sparse_down, out=full_down, registered=registered)
                 lora = hc_silu(full_down[:, :320], 4)
@@ -165,7 +221,7 @@ def main():
                     return hc_gate_mix(
                         x, torch.nn.functional.linear(lora, wu), 4
                     ), full_down[:, 320:324]
-                gate = torch.nn.functional.linear(lora, local_wu)
+                gate = up_projection(lora, local_wu, local_gate)
                 mix_scatter[(m, 10)](gate, x, sparse_output, RANK=rank)
                 ca.all_reduce(sparse_output, out=output, registered=registered)
                 return output, full_down[:, 320:324]
@@ -191,8 +247,16 @@ def main():
                 dist.broadcast(x, 0)
                 expected = tuple(t.clone() for t in baseline())
                 actual = tuple(t.clone() for t in candidate(False))
+                if args.mode == "fused":
+                    unfused = candidate(False, use_fused=False)
+                    # Compare the fused publication separately from the local
+                    # GEMM's already documented difference versus replicated.
+                    for a, b in zip(actual, unfused):
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
                 sparse_down.fill_(float("nan"))
                 output.fill_(float("nan"))
+                fused_lora.fill_(float("nan"))
+                fused_injection.fill_(float("nan"))
                 graphs[1].replay()
                 torch.cuda.synchronize()
                 row = []
@@ -211,6 +275,53 @@ def main():
                     )
                 checks.append(row)
             assert all(c["finite"] for row in checks for c in row)
+            if args.aux_check:
+                performance_input = x.clone()
+                aux_input = x.new_full((m, 2560), (rank + 1) / 64)
+                aux_output = torch.empty_like(aux_input)
+                aux_stream = torch.cuda.Stream()
+                aux_graph = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                dist.barrier()
+                with ca.capture(), torch.cuda.graph(aux_graph, stream=aux_stream):
+                    for _ in range(16):
+                        ca.all_reduce_sum2(aux_input, aux_input, out=aux_output)
+                for cycle in range(args.aux_check):
+                    # Distinct epochs/data, with deliberately skewed stream
+                    # enqueue order across ranks. Never run unfused HC's ca
+                    # collectives concurrently with this same auxiliary ca.
+                    x.normal_().mul_(0.25 + cycle % 3)
+                    dist.broadcast(x, 0)
+                    expected_hc = tuple(
+                        t.clone() for t in candidate(False, use_fused=False)
+                    )
+                    aux_input.fill_((rank + 1 + cycle % 13) / 64)
+                    aux_output.fill_(float("nan"))
+                    output.fill_(float("nan"))
+                    fused_lora.fill_(float("nan"))
+                    fused_injection.fill_(float("nan"))
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    if (rank + cycle) % 2:
+                        with torch.cuda.stream(aux_stream):
+                            aux_graph.replay()
+                        graphs[1].replay()
+                    else:
+                        graphs[1].replay()
+                        with torch.cuda.stream(aux_stream):
+                            aux_graph.replay()
+                    torch.cuda.synchronize()
+                    for a, b in zip(outputs[1], expected_hc):
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
+                    expected_aux = (20 + 8 * (cycle % 13)) / 64
+                    torch.testing.assert_close(
+                        aux_output,
+                        torch.full_like(aux_output, expected_aux),
+                        rtol=0,
+                        atol=0,
+                    )
+                x.copy_(performance_input)
+                del aux_graph, aux_stream, aux_input, aux_output, performance_input
             if args.profile:
                 for _ in range(30):
                     graphs[0].replay()
@@ -236,7 +347,7 @@ def main():
                 del graphs, outputs
                 continue
             times = [[], []]
-            for sample in range(5):
+            for sample in range(0 if args.check_only else 5):
                 for which in (0, 1) if sample % 2 == 0 else (1, 0):
                     for _ in range(20):
                         graphs[which].replay()
@@ -259,10 +370,13 @@ def main():
             local_result = dict(
                 rank=rank,
                 tokens=m,
-                baseline_us=statistics.median(times[0]),
-                candidate_us=statistics.median(times[1]),
+                baseline_us=statistics.median(times[0]) if times[0] else None,
+                candidate_us=statistics.median(times[1]) if times[1] else None,
                 times=times,
                 checks=checks,
+                fused_postops_zero_tolerance_check_passed=args.mode == "fused",
+                auxiliary_interleaved_replays=args.aux_check,
+                auxiliary_hc_inputs_changed=bool(args.aux_check),
             )
             gathered = [None] * 4
             dist.all_gather_object(gathered, local_result, group=group)
@@ -278,11 +392,19 @@ def main():
                     "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES", "0"
                 ),
                 "calls_per_graph": calls_per_graph,
+                "private_hc_channel": hc_ca is not None,
                 "replicated_weight_bytes": sum(
                     w.numel() * w.element_size() for ws in weights for w in ws[:2]
                 ),
                 "sharded_weight_bytes": sum(
                     w.numel() * w.element_size() for ws in weights for w in ws[2:]
+                ),
+                "additional_sharded_storage_bytes": sum(
+                    shard.numel() * shard.element_size()
+                    for ws in weights
+                    for original, shard in zip(ws[:2], ws[2:])
+                    if original.untyped_storage().data_ptr()
+                    != shard.untyped_storage().data_ptr()
                 ),
             }
             if library:
@@ -299,6 +421,8 @@ def main():
                 + "\n"
             )
     finally:
+        if hc_ca is not None:
+            hc_ca.close()
         ca.close()
         dist.destroy_process_group(group)
         dist.destroy_process_group()

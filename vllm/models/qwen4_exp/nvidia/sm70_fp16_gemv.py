@@ -59,6 +59,69 @@ _SHAPE_PLANS = {shape: plan for _, shape, plan in _ROLE_PLANS}
 
 
 @triton.jit
+def _qwen38_gdn_projection_split_kernel(
+    qkvz,
+    ba,
+    qkv,
+    z,
+    b,
+    a,
+    QKV: tl.constexpr,
+    Z: tl.constexpr,
+    B: tl.constexpr,
+    A: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    value = tl.load(qkvz + row * (QKV + Z) + col, col < QKV + Z, other=0)
+    tl.store(qkv + row * QKV + col, value, col < QKV)
+    tl.store(z + row * Z + col - QKV, value, (col >= QKV) & (col < QKV + Z))
+    if tl.program_id(1) == 0:
+        tl.static_assert(B + A <= BLOCK)
+        gate_col = tl.arange(0, BLOCK)
+        gate = tl.load(ba + row * (B + A) + gate_col, gate_col < B + A, other=0)
+        tl.store(b + row * B + gate_col, gate, gate_col < B)
+        tl.store(a + row * A + gate_col - B, gate, (gate_col >= B) & (gate_col < B + A))
+
+
+def _split_gdn_projection_outputs(qkvz, ba):
+    m = qkvz.shape[0]
+    out = tuple(qkvz.new_empty((m, n)) for n in (2560, 1536, 12, 12))
+    _qwen38_gdn_projection_split_kernel[(m, triton.cdiv(4096, 256))](
+        qkvz,
+        ba,
+        *out,
+        QKV=2560,
+        Z=1536,
+        B=12,
+        A=12,
+        BLOCK=256,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool:
+    # This copy-only operation does not change either GEMM. Keep the existing
+    # M1 path and all unsupported layouts; no maximum batch/sequence binding.
+    return bool(
+        envs.VLLM_SM70_GDN_BATCH_SPLIT_COPY
+        and _is_packed_row_major(qkvz)
+        and _is_packed_row_major(ba)
+        and qkvz.shape[0] > 1
+        and qkvz.shape[1] == 4096
+        and ba.shape == (qkvz.shape[0], 24)
+        and qkvz.dtype == ba.dtype == torch.float16
+        and qkvz.is_cuda
+        and ba.is_cuda
+        and qkvz.device == ba.device
+        and current_platform.is_device_capability(70)
+    )
+
+
+@triton.jit
 def _qwen38_fp16_row_gemv_kernel(
     x_ptr,
     weight_ptr,
@@ -204,6 +267,9 @@ def _qwen38_sm70_fp16_gdn_input(
     ):
         qkvz = torch.nn.functional.linear(x, qkvz_weight)
         ba = torch.nn.functional.linear(x, ba_weight)
+        if _can_fuse_gdn_projection_split(qkvz, ba):
+            logger.info_once("SM70 GDN batched projection split-copy fusion enabled.")
+            return _split_gdn_projection_outputs(qkvz, ba)
         return (
             qkvz[..., :2560].contiguous(),
             qkvz[..., 2560:].contiguous(),
