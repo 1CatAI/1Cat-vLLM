@@ -31,8 +31,11 @@ def cuda_bridge():
     fi._QSA_ZERO.pop(zero.device)
 
 
-@pytest.mark.parametrize("rows", [4, 16])
-def test_qsa_bridge_graph_and_materialized_gate(cuda_bridge, monkeypatch, rows):
+@pytest.mark.parametrize("rows", [4, 8, 9, 15, 16])
+@pytest.mark.parametrize("kv_heads,selected", [(1, 2051), (2, 2051), (1, 15), (1, 65)])
+def test_qsa_bridge_graph_and_materialized_gate(
+    cuda_bridge, monkeypatch, rows, kv_heads, selected
+):
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
         _qsa_output_gate,
         qsa_sparse_paged_attention,
@@ -42,6 +45,11 @@ def test_qsa_bridge_graph_and_materialized_gate(cuda_bridge, monkeypatch, rows):
     monkeypatch.setenv("VLLM_SM70_FLASHINFER_BATCH", "0")
     torch.manual_seed(37)
     q, k, v, indices, table, requests = make_case(rows)
+    if kv_heads != 1:
+        q = q.repeat(1, kv_heads, 1)
+        k = k.repeat(1, 1, kv_heads, 1)
+        v = v.repeat(1, 1, kv_heads, 1)
+    indices = indices[:, :selected]
     output = torch.empty_like(q)
     gate = torch.randn_like(q)
 

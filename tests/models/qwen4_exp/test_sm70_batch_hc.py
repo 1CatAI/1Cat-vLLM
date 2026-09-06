@@ -85,6 +85,62 @@ def test_original_gemv_fallback_is_not_replaced_by_linear(monkeypatch):
     assert seen == ["gemv"]
 
 
+@pytest.mark.parametrize("rows", (2, 4, 8, 16))
+@pytest.mark.parametrize("rank", range(4))
+def test_batch_hc_preserves_full_down_and_only_shards_up(monkeypatch, rows, rank):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    envs.disable_envs_cache()
+    x = torch.empty(rows, 10240, dtype=torch.float16)
+    down = torch.empty(336, 10240, dtype=x.dtype)
+    up = torch.empty(10240, 320, dtype=x.dtype)
+    packed = torch.empty(2560, 320, dtype=x.dtype)
+    projected = torch.arange(rows * 336, dtype=torch.float32).reshape(rows, 336)
+    projected = projected.to(x.dtype)
+    lora = torch.empty(rows, 320, dtype=x.dtype)
+    gate = torch.empty(rows, 2560, dtype=x.dtype)
+    calls = []
+
+    def linear(value, weight):
+        if weight is down:
+            assert value is x
+            calls.append("full_down")
+            return projected
+        assert weight is packed and value is lora
+        calls.append("sharded_up")
+        return gate
+
+    def silu(value, groups):
+        assert groups == 4
+        torch.testing.assert_close(value, projected[:, :320])
+        calls.append("silu")
+        return lora
+
+    def mix(ptr, actual_gate, actual_x, block):
+        assert ptr == 42 and actual_gate is gate and actual_x is x
+        calls.append("mix")
+        block.zero_()
+
+    monkeypatch.setattr(hc, "_decode_context_ok", lambda: True)
+    monkeypatch.setattr(
+        hc,
+        "_channel",
+        lambda: NS(rank=rank, _ptr=42, can_sm70_qwen38_hc_batch=lambda x: True),
+    )
+    monkeypatch.setattr(torch.nn.functional, "linear", linear)
+    monkeypatch.setattr(hc, "hc_silu", silu)
+    monkeypatch.setattr(
+        ops,
+        "sm70_qwen38_hc_batch_down",
+        lambda *a: pytest.fail("down must not be sharded or gathered"),
+    )
+    monkeypatch.setattr(ops, "sm70_qwen38_hc_batch_mix", mix)
+    block, injection = hc._batch_hc(x, down, up, packed, True, False)
+    assert calls == ["full_down", "silu", "sharded_up", "mix"]
+    assert block.shape == (rows, 2560)
+    assert injection.is_contiguous()
+    torch.testing.assert_close(injection, projected[:, 320:324], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rank", range(4))
 def test_up_shard_reload_keeps_captured_pointer_and_is_nonpersistent(rank):
     child = nn.Module()

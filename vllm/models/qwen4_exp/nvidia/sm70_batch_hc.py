@@ -155,15 +155,21 @@ def _batch_hc(
     ):
         channel = _channel()
     if channel is not None and channel.can_sm70_qwen38_hc_batch(x):
-        local_down = down.narrow(0, channel.rank * 80, 88)
-        projected = torch.nn.functional.linear(x, local_down)
-        lora = x.new_empty((x.shape[0], 320))
-        injection = x.new_empty((x.shape[0], 4))
+        # Preserve the original down GEMM geometry and FP16 rounding. Sharding
+        # its output changes the cuBLAS reduction and compounds across HC
+        # modules. Only shard the up projection, whose input is now identical
+        # to the original path on every rank.
+        projected = torch.nn.functional.linear(x, down)
+        lora = hc_silu(projected[:, :320], 4)
+        injection = projected[:, 320:324].contiguous()
         block = x.new_empty((x.shape[0], 2560))
-        ops.sm70_qwen38_hc_batch_down(channel._ptr, projected, injection, lora)
         gate = torch.nn.functional.linear(lora, packed_up)
         ops.sm70_qwen38_hc_batch_mix(channel._ptr, gate, x, block)
-        logger.info_once("Using experimental SM70 batch HC (rows=%d).", x.shape[0])
+        logger.info_once(
+            "Using experimental SM70 batch HC with replicated down and sharded up "
+            "(rows=%d).",
+            x.shape[0],
+        )
         return block, injection
 
     if legacy_fused:

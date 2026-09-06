@@ -6,7 +6,13 @@
 #include <torch/library.h>
 #include <torch/types.h>
 
-#include <flashinfer/attention/sm70/qsa_decode.cuh>
+#if defined(FI_QSA_WMMA_COMPAT) && FI_QSA_WMMA_COMPAT
+  #include <flashinfer/attention/sm70/qsa_wmma_decode.cuh>
+  #define FI_QSA_NAMESPACE _C_flashinfer_qsa_sm70_compat
+#else
+  #include <flashinfer/attention/sm70/qsa_decode.cuh>
+  #define FI_QSA_NAMESPACE _C_flashinfer_qsa_sm70
+#endif
 
 namespace {
 using namespace flashinfer::attention::sm70;
@@ -95,11 +101,20 @@ void run(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   p.kv_chunk_size_ptr = p.kv_tile_indices + rows * splits;
   p.q_stride_n = q.stride(0);
   p.q_stride_h = q.stride(1);
-#define DISPATCH(G)                                                         \
-  case G:                                                                   \
-    LaunchQSADecode<G>(p, reinterpret_cast<half*>(output.data_ptr()), rows, \
-                       splits, stream);                                     \
-    break
+#if defined(FI_QSA_WMMA_COMPAT) && FI_QSA_WMMA_COMPAT
+  #define DISPATCH(G)                                                        \
+    case G:                                                                  \
+      LaunchQSAWMMACompatible<G>(p,                                          \
+                                 reinterpret_cast<half*>(output.data_ptr()), \
+                                 rows, splits, selected, stream);            \
+      break
+#else
+  #define DISPATCH(G)                                                         \
+    case G:                                                                   \
+      LaunchQSADecode<G>(p, reinterpret_cast<half*>(output.data_ptr()), rows, \
+                         splits, stream);                                     \
+      break
+#endif
   switch (group) {
     DISPATCH(1);
     DISPATCH(2);
@@ -112,11 +127,11 @@ void run(torch::Tensor q, torch::Tensor k, torch::Tensor v,
 }
 }  // namespace
 
-TORCH_LIBRARY_FRAGMENT(_C_flashinfer_qsa_sm70, m) {
+TORCH_LIBRARY_FRAGMENT(FI_QSA_NAMESPACE, m) {
   m.def(
       "run(Tensor q, Tensor k, Tensor v, Tensor indices, Tensor table, "
       "Tensor requests, Tensor(a!) offsets, Tensor(b!) metadata, Tensor zero, "
       "Tensor(c!) partial, Tensor(d!) lse, Tensor(e!) output, int splits) -> "
       "()");
 }
-TORCH_LIBRARY_IMPL(_C_flashinfer_qsa_sm70, CUDA, m) { m.impl("run", &run); }
+TORCH_LIBRARY_IMPL(FI_QSA_NAMESPACE, CUDA, m) { m.impl("run", &run); }

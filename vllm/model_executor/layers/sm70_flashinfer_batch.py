@@ -97,7 +97,10 @@ def prepare(model: torch.nn.Module, device: torch.device) -> None:
         _MQA_SMS[concrete_device] = torch.cuda.get_device_properties(
             concrete_device
         ).multi_processor_count
-    if hasattr(torch.ops._C_flashinfer_qsa_sm70, "run"):
+    if any(
+        hasattr(getattr(torch.ops, ns), "run")
+        for ns in ("_C_flashinfer_qsa_sm70_compat", "_C_flashinfer_qsa_sm70")
+    ):
         concrete_device = torch.empty(0, device=device).device
         if concrete_device not in _QSA_ZERO:
             _QSA_ZERO[concrete_device] = torch.zeros(
@@ -161,7 +164,10 @@ def prepare(model: torch.nn.Module, device: torch.device) -> None:
         "local fallback, no M1/HC change.",
         count,
         hasattr(torch.ops._C_flashinfer_mqa_sm70, "run"),
-        hasattr(torch.ops._C_flashinfer_qsa_sm70, "run"),
+        any(
+            hasattr(getattr(torch.ops, ns), "run")
+            for ns in ("_C_flashinfer_qsa_sm70_compat", "_C_flashinfer_qsa_sm70")
+        ),
     )
 
 
@@ -246,7 +252,25 @@ def try_qsa(q, k, v, indices, table, requests, out):
     ):
         return None
     rows, heads, dim = q.shape
-    splits = 16 if rows >= 16 else 32
+    compatible = hasattr(torch.ops._C_flashinfer_qsa_sm70_compat, "run")
+    if compatible:
+        from vllm.models.qwen4_exp.nvidia.ops.qsa import _qsa_sparse_launch_profile
+
+        # Match the production 16-token tile partition as well as FP16 P.
+        # The SIMT experiment uses a different split profile and remains
+        # available only when explicitly preloaded for counterfactual audits.
+        group = heads // k.shape[2]
+        block_n, target_splits, _ = _qsa_sparse_launch_profile(
+            rows * k.shape[2], 1 << (group - 1).bit_length(), True
+        )
+        if block_n != 16 or indices.shape[1] <= 0:
+            return None
+        tiles = (indices.shape[1] + block_n - 1) // block_n
+        splits = min(target_splits, 1 << (tiles.bit_length() - 1))
+        op = torch.ops._C_flashinfer_qsa_sm70_compat.run
+    else:
+        splits = 16 if rows >= 16 else 32
+        op = torch.ops._C_flashinfer_qsa_sm70.run
     width = ((indices.shape[1] + splits - 1) // splits) * splits
     offsets = torch.empty((rows, width), device=q.device, dtype=torch.int64)
     metadata = torch.empty(
@@ -256,7 +280,7 @@ def try_qsa(q, k, v, indices, table, requests, out):
         (rows, splits, heads, dim), device=q.device, dtype=torch.float32
     )
     lse = torch.empty((rows, splits, heads), device=q.device, dtype=torch.float32)
-    torch.ops._C_flashinfer_qsa_sm70.run(
+    op(
         q,
         k,
         v,
@@ -271,7 +295,12 @@ def try_qsa(q, k, v, indices, table, requests, out):
         out,
         splits,
     )
-    logger.info_once("Selected FlashInfer SM70 sparse QSA batch route, rows=%d.", rows)
+    logger.info_once(
+        "Selected FlashInfer SM70 sparse QSA batch route, rows=%d, "
+        "FP16-P compatibility=%s.",
+        rows,
+        compatible,
+    )
     return out
 
 

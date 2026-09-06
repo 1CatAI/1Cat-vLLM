@@ -18,7 +18,7 @@ CCCL_SHA = "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116"
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def build():
+def build(*, compatibility=False):
     from torch.utils.cpp_extension import load
 
     source = Path(
@@ -49,7 +49,9 @@ def build():
     if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
         raise RuntimeError("Set TORCH_CUDA_ARCH_LIST=7.0 explicitly")
     return load(
-        name="flashinfer_qsa_sm70_v1",
+        name="flashinfer_qsa_sm70_compat_v1"
+        if compatibility
+        else "flashinfer_qsa_sm70_v1",
         sources=[str(ROOT / "benchmarks/csrc/sm70_flashinfer_qsa_decode.cu")],
         extra_include_paths=[
             str(ROOT / "flashinfer-sm70/include"),
@@ -66,6 +68,7 @@ def build():
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
+            f"-DFI_QSA_WMMA_COMPAT={int(compatibility)}",
         ],
         is_python_module=False,
         verbose=True,
@@ -75,7 +78,7 @@ def build():
 class FlashInferQSA:
     """Persistent single-stream workspace; use distinct instances per stream."""
 
-    def __init__(self, q, selection_width, splits):
+    def __init__(self, q, selection_width, splits, *, compatibility=False):
         if q.ndim != 3 or q.shape[2] != 256 or q.dtype != torch.float16:
             raise ValueError("QSA prototype needs FP16 [rows, heads, 256] queries")
         if not 1 <= splits <= 64 or selection_width <= 0:
@@ -97,9 +100,15 @@ class FlashInferQSA:
             (rows, splits, heads), device=q.device, dtype=torch.float32
         )
         self.output = torch.empty_like(q, memory_format=torch.contiguous_format)
+        namespace = (
+            torch.ops._C_flashinfer_qsa_sm70_compat
+            if compatibility
+            else torch.ops._C_flashinfer_qsa_sm70
+        )
+        self.run = namespace.run
 
     def __call__(self, q, k, v, indices, table, requests):
-        torch.ops._C_flashinfer_qsa_sm70.run(
+        self.run(
             q,
             k,
             v,

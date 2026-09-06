@@ -839,3 +839,88 @@ or resident service remains. Do not preempt other tasks or describe these
 queued checks as passed. Resume HC single-GPU isolation and then the focused
 four-rank EOS diagnostic after resources are actually free. Source runtime
 defaults remain unchanged; fixed quality and E2E admission are still pending.
+
+### Implemented numerical repairs and new micro gates
+
+After the preceding lease-only attempt, resources became available. HC stage
+isolation now reproduces the saved failure and completes 16 inputs across all
+96 real HC weights. Up-only sharding is bitwise identical at every arithmetic
+intermediate; down-only and combined sharding reproduce the drift. The runtime
+now preserves the original full `336 x 10240` down GEMM and its FP16 output,
+then shards only up and retains the existing fused mix/gather. It no longer
+runs the down-shard collective. This is not an IPC workaround or precision
+change. M1 and prefill fallbacks are untouched.
+
+Four-rank complete HC Graph replays pass the existing **every-intermediate
+atol=rtol=3e-3** gate at B4/8/16, with 16 changing inputs plus post-timing
+checks. Unlike the single-device projection isolation, the full native chain
+is not bitwise identical. Five alternating paired timing blocks give:
+
+| Rows | Original HC chain ms | Repaired chain ms | Paired reduction, 95% CI |
+|---|---:|---:|---:|
+| 4 | 3.68872 | 3.67303 | 0.422% [0.407%, 0.438%] |
+| 8 | 3.79545 | 3.78903 | 0.213% [0.154%, 0.272%] |
+| 16 | 4.01596 | 4.01972 | -0.092% [-0.116%, -0.068%] |
+
+These include all HC norms and the final mixer, not attention/MoE/PLE
+computation. B16 has **no speed admission**. HC remains opt-in; do not claim
+that preserving correctness also preserved the old sharded-down speedup.
+Artifacts: `hc-projection-ablation-v1` and `hc-up-only-b{4,8,16}-v1`.
+
+The native sparse-QSA compatibility experiment uses Volta WMMA FP32 QK/PV
+accumulation, the production 16-token tile partition and an explicit FP16 P
+boundary, retaining the FP32 denominator, ordered selections and original
+output gate. Pinned FlashInfer virtual-page preparation and FP32 cascade
+remain in use. This is a separate native namespace, not a Triton call hidden
+under a FlashInfer name. No EOS suppression or sampling change is introduced.
+
+On 36 retained real QSA inputs, median relative L2 versus production changes
+from **1.27593e-4 to 5.34201e-5**. Eight changing Graph replays at each of
+B1/2/4/8/16/32/64 pass the 2e-3 envelope, including empty/duplicate/invalid
+selections and relocated pages. Whole-QSA micro timings including preparation
+and merge improve over production by B4 **6.62%**, B8 **38.27%**, B16 **49.57%**;
+paired 95% CIs are [6.38%,6.86%], [37.93%,38.59%], [49.43%,49.71%]. The new
+kernel is slower than the numerically different SIMT experiment; that speed
+tradeoff is recorded, not hidden. Artifact: `qsa-compat-replay-v1`.
+
+Runtime capability dispatch now recognizes the compatibility namespace and
+uses its matching split partition and call-local scratch. Explicit old SIMT
+preloads remain available for the registered counterfactual. CPU routing and
+HC tests: **84 passed**. Actual compatibility bridge with output gating and
+changing-input CUDA Graph: **2 passed**. These checks do not establish model
+quality, repair the EOS case by themselves, or constitute new E2E numbers.
+The focused four-rank diagnostic and natural 80-case model gates are running;
+the experimental parent remains default off and #523 remains Draft.
+
+The dynamic-shape audit then found that the first compatibility wrapper's
+fixed B4/B8/B16 split rule did not cover intermediate live widths, multiple
+KV heads, or short selections. The `repaired-quality80-v2/compat_hc` model
+attempt was stopped before producing quality/speed results, and its artifacts
+are retained. Reuse `_qsa_sparse_launch_profile` and its maximum-useful-split
+rule instead. Expanded CPU checks: **118 passed**; real bridge tests at
+B4/8/9/15/16 with one/two KV heads and selection lengths 15/65/2051:
+**20 passed**, including eager/Graph equality and the existing output gate.
+Do not mistake the initial fixed-width micro timing for dynamic-shape coverage.
+
+Both registered EOS teacher-prefix arms now completed twice. All four ranks
+agree bitwise, both A/A repeats agree, and the arms' first-token raw logits
+are bitwise identical. At offset 51 (position 468, seed 20260922), the
+production-sparse MQA+GDN arm's [newline, EOS] raw logits are
+**[26.09375, 27.25]**, versus **[26.015625, 27.671875]** for old SIMT QSA.
+After the unchanged top-k/top-p processing, probabilities are respectively
+**[0.239349, 0.760651]** and **[0.160266, 0.839734]**. The unchanged stateless
+draw selects newline in the first arm and EOS in the second, in every rank
+and repeat. This proves a decode-induced probability shift, not a parser,
+seed or first-prefill divergence. It does not isolate every arithmetic
+suboperation or prove the replacement passes natural quality. Captures and
+summary: `parallel-eos-v1/{mqa_gdn,candidate,summary-v1.json}`.
+
+The fresh combined natural run is `repaired-quality80-v3/compat_hc`; it retains
+original prompts, seeds and max16K/natural EOS, with grouped-MoE experiments
+off to isolate these repairs. Only after each original suite meets the
+repaired production control and the EOS case passes does its driver reuse
+the same engine for the unchanged 8K/256 fixed-width speed runner (SHA256
+`c969b3e8087c2777fc6857c2b30c6aa81ed54558cef6c64c181c2ca1f4a60c9a`).
+This is an original80 prerequisite, **not** expanded multi-seed quality
+admission. The native QSA experiment binary used in these checks has SHA256
+`a0b12d034bc12569c85ecfda68369b6ca26b700929627c37ca97f49bafa7be17`.

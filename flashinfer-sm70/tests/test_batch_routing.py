@@ -78,6 +78,42 @@ def test_unprepared_qsa_does_not_allocate_workspace():
     assert fi.try_qsa(q, None, None, None, None, None, None) is None
 
 
+@pytest.mark.parametrize("rows", [4, 8, 9, 15, 16])
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("kv_heads,selected", [(1, 2051), (2, 2051), (1, 15), (1, 65)])
+def test_qsa_compatibility_owns_partition_and_call_local_scratch(
+    monkeypatch, rows, compatible, kv_heads, selected
+):
+    calls = []
+    native = NS(run=lambda *args: calls.append(args))
+    monkeypatch.setattr(torch.ops, "_C_flashinfer_qsa_sm70", native)
+    monkeypatch.setattr(
+        torch.ops, "_C_flashinfer_qsa_sm70_compat", native if compatible else NS()
+    )
+    q = torch.empty(rows, 6 * kv_heads, 256, dtype=torch.float16)
+    k = torch.empty(rows, 64, kv_heads, 256, dtype=q.dtype)
+    indices = torch.empty(rows, selected, dtype=torch.int32)
+    table = torch.empty(rows, 1, dtype=torch.int32)
+    requests = torch.arange(rows, dtype=torch.int32)
+    out = torch.empty_like(q)
+    zero = torch.zeros(256, dtype=q.dtype)
+    monkeypatch.setitem(fi._QSA_ZERO, q.device, zero)
+    for _ in range(2):
+        assert fi.try_qsa(q, k, k, indices, table, requests, out) is out
+    if compatible:
+        programs = rows * kv_heads
+        target = 64 if programs <= 8 else 32 if programs < 32 else 8
+        splits = min(target, 1 << (((selected + 15) // 16).bit_length() - 1))
+    else:
+        splits = 16 if rows >= 16 else 32
+    assert len(calls) == 2
+    assert calls[0][-1] == splits
+    assert calls[0][8] is zero and calls[0][11] is out
+    assert calls[0][9].shape == (rows, splits, 6 * kv_heads, 256)
+    for index in (6, 7, 9, 10):
+        assert calls[0][index].data_ptr() != calls[1][index].data_ptr()
+
+
 def test_unprepared_mqa_does_not_allocate_or_read_metadata():
     q = torch.empty(8, 4, 128, dtype=torch.float16)
     assert not fi.try_mqa(q, None, None, None, None, None, 4, 1.0, None, None)
