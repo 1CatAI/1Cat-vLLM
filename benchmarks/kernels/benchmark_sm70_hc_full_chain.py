@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from statistics import median
 from types import SimpleNamespace
@@ -37,12 +38,14 @@ from vllm.models.qwen4_exp.nvidia.ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+from vllm.models.qwen4_exp.nvidia.sm70_batch_hc import _batch_hc
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--rows", type=int, choices=(1, 4, 8, 16), default=1)
     parser.add_argument("--quality-inputs", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=1000)
     parser.add_argument("--replays", type=int, default=150)
@@ -58,6 +61,12 @@ def main() -> None:
         help="Auxiliary sum2 replays per changing input with --fused-up",
     )
     args = parser.parse_args()
+    if args.out.exists():
+        parser.error("Refusing to overwrite previous evidence")
+    if args.rows > 1 and args.fused_up:
+        parser.error(
+            "--fused-up is the original M1 comparison; batch compares full chains"
+        )
     if args.fused_up and not envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1:
         raise RuntimeError(
             "Set VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1=1 for the aux gate"
@@ -72,7 +81,14 @@ def main() -> None:
     dist.init_process_group("nccl")
     group = dist.new_group(backend="gloo")
     comm = CustomAllreduce(group=group, device=local_rank, max_size=8 * 1024 * 1024)
+    batch_comm = None
     try:
+        if args.rows > 1:
+            batch_comm = CustomAllreduce(
+                group=group, device=local_rank, max_size=128 * 1024
+            )
+            if not batch_comm.supports_sm70_qwen38_hc_batch():
+                raise RuntimeError("Load the source-matched batch HC communicator")
         owned_pids = [None] * 4
         dist.all_gather_object(owned_pids, os.getpid(), group=group)
 
@@ -125,14 +141,30 @@ def main() -> None:
         final_up = get(prefix + "hyper_connection_mixer.input_mix_weight_up.weight")
         gen = torch.Generator(device="cuda").manual_seed(20260905)
         initial = torch.randn(
-            (1, 10240), device="cuda", dtype=torch.float16, generator=gen
+            (args.rows, 10240), device="cuda", dtype=torch.float16, generator=gen
         )
         cores = torch.randn(
-            (96, 1, 2560), device="cuda", dtype=torch.float16, generator=gen
+            (96, args.rows, 2560), device="cuda", dtype=torch.float16, generator=gen
         )
-        if not comm.can_sm70_qwen38_hc_shard(initial):
+        if args.rows == 1 and not comm.can_sm70_qwen38_hc_shard(initial):
             raise RuntimeError("The exact TP4 HC route is unavailable")
-        tp = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=comm))
+        if batch_comm is not None and not batch_comm.can_sm70_qwen38_hc_batch(initial):
+            raise RuntimeError("Batch HC does not support the requested rows")
+        tp = SimpleNamespace(
+            device_communicator=SimpleNamespace(
+                ca_comm=comm, sm70_hc_batch_comm=batch_comm
+            )
+        )
+        up_shards = (
+            [
+                up.view(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+                .reshape(2560, 320)
+                .contiguous()
+                for _, up in weights
+            ]
+            if args.rows > 1
+            else []
+        )
         if args.fused_up:
             sum_gen = torch.Generator(device="cuda").manual_seed(20260905 + rank)
             sum_a = torch.randn(
@@ -157,7 +189,7 @@ def main() -> None:
             return combined, hc_gate_mix(xn, gate, 4)
 
         # A model's normal warmup initializes cuBLAS before graph capture.
-        finish(initial, torch.zeros((1, 4), device="cuda", dtype=torch.float16))
+        finish(initial, torch.zeros((args.rows, 4), device="cuda", dtype=torch.float16))
         torch.cuda.synchronize()
 
         def capture(mode: str, overlap: bool = False):
@@ -179,7 +211,12 @@ def main() -> None:
                     "supports_sm70_qwen38_hc_up_mix_allgather",
                     return_value=mode == "fused",
                 ),
+                patch(
+                    "vllm.models.qwen4_exp.nvidia.sm70_batch_hc._decode_context_ok",
+                    return_value=mode == "batch",
+                ),
                 comm.capture(),
+                batch_comm.capture() if batch_comm is not None else nullcontext(),
                 torch.cuda.graph(graph),
             ):
                 main_stream = torch.cuda.current_stream()
@@ -197,9 +234,14 @@ def main() -> None:
                         state, xn = hc_combine_norm(
                             state, cores[i - 1], injection, norms[i], 1e-6, 4
                         )
-                    block, injection = torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
-                        xn, down, up
-                    )
+                    if args.rows > 1:
+                        block, injection = _batch_hc(
+                            xn, down, up, up_shards[i], True, False
+                        )
+                    else:
+                        block, injection = torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
+                            xn, down, up
+                        )
                     outputs.extend((state, xn, block, injection))
                     if aux is not None:
                         with torch.cuda.stream(aux):
@@ -211,7 +253,13 @@ def main() -> None:
             dist.barrier()
             return graph, outputs, sums
 
-        timed_modes = ("hidden", "fused") if args.fused_up else ("gate", "hidden")
+        timed_modes = (
+            ("legacy", "batch")
+            if args.rows > 1
+            else ("hidden", "fused")
+            if args.fused_up
+            else ("gate", "hidden")
+        )
         graphs = {mode: capture(mode) for mode in timed_modes}
         if args.fused_up:
             graphs["fused_aux"] = capture("fused", overlap=True)
@@ -236,6 +284,14 @@ def main() -> None:
                     [x.flatten().view(torch.int16) for x in graphs[mode][1]]
                 )
                 diffs[mode] = int(torch.count_nonzero(expected != actual))
+                if args.rows > 1:
+                    # Preserve the original M1 bitwise gate. The batched
+                    # sharded GEMMs have independent rounding; bound every
+                    # intermediate instead of silently ignoring differences.
+                    for a, b in zip(
+                        graphs[mode][1], graphs[timed_modes[0]][1], strict=True
+                    ):
+                        torch.testing.assert_close(a, b, atol=3e-3, rtol=3e-3)
             sum_diff = 0
             if args.fused_up:
                 actual_sum = torch.stack(graphs["fused_aux"][2])
@@ -272,7 +328,7 @@ def main() -> None:
         )
         if rank == 0:
             print({"quality": quality}, flush=True)
-        if any(q["mismatches"] for q in quality):
+        if args.rows == 1 and any(q["mismatches"] for q in quality):
             raise RuntimeError("Full HC outputs are not bitwise")
         ensure_exclusive()
         for mode in timed_modes:
@@ -282,7 +338,7 @@ def main() -> None:
             torch.cuda.synchronize()
             dist.barrier()
         samples = {mode: [] for mode in timed_modes}
-        for repeat in range(3):
+        for repeat in range(5):
             modes = timed_modes if repeat % 2 == 0 else timed_modes[::-1]
             for mode in modes:
                 ensure_exclusive()
@@ -313,7 +369,7 @@ def main() -> None:
             {"rank": rank, "hc_mismatches": diffs, "sum2_mismatches": sum_diff},
             group=group,
         )
-        if any(
+        if args.rows == 1 and any(
             any(q["hc_mismatches"].values()) or q["sum2_mismatches"]
             for q in post_quality
         ):
@@ -340,6 +396,10 @@ def main() -> None:
                 "gpu": torch.cuda.get_device_name(),
                 "visible_devices": visible,
                 "quality": quality,
+                "rows": args.rows,
+                "numerical_gate": "bitwise"
+                if args.rows == 1
+                else "every intermediate atol=rtol=3e-3",
                 "quality_inputs": args.quality_inputs,
                 "post_timing_quality": post_quality,
                 "aux_stress_replays": args.quality_inputs * args.aux_stress_replays
@@ -351,6 +411,8 @@ def main() -> None:
             args.out.write_text(json.dumps(result, indent=2) + "\n")
             print(json.dumps(result, indent=2), flush=True)
     finally:
+        if batch_comm is not None:
+            batch_comm.close()
         comm.close()
         dist.destroy_process_group(group)
         dist.destroy_process_group()

@@ -1070,6 +1070,22 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
+    if envs.VLLM_SM70_FLASHINFER_BATCH:
+        from vllm.model_executor.layers.sm70_flashinfer_batch import try_mqa
+
+        if try_mqa(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            float(score_divisor),
+            logits,
+            visible_blocks,
+        ):
+            return logits, visible_blocks
     sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
     # On V100 the GB300 decode tile leaves the 128-d scorer badly
     # under-occupied. A 32-column, two-warp tile preserves the selected QSA

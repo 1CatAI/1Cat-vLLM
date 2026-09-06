@@ -755,6 +755,31 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
 endif()
 
+# Native SM70 FlashInfer adapters live in a separate, opt-in fragment. This
+# does not relink the existing model/quantization kernels or require a user JIT.
+if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
+  set(VLLM_SM70_FLASHINFER_SRCS "csrc/flashinfer_sm70/qsa_mqa.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_SM70_FLASHINFER_SRCS}"
+    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+  define_extension_target(
+    _sm70_flashinfer_C
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${VLLM_SM70_FLASHINFER_SRCS}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/flashinfer-sm70/include"
+    USE_SABI 3
+    WITH_SOABI)
+  set_target_properties(_sm70_flashinfer_C PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
+  target_compile_definitions(_sm70_flashinfer_C PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
+  target_link_libraries(_sm70_flashinfer_C PRIVATE
+    "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
+endif()
+
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)

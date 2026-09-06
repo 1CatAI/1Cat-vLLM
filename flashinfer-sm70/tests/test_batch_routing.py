@@ -78,6 +78,51 @@ def test_unprepared_qsa_does_not_allocate_workspace():
     assert fi.try_qsa(q, None, None, None, None, None, None) is None
 
 
+def test_unprepared_mqa_does_not_allocate_or_read_metadata():
+    q = torch.empty(8, 4, 128, dtype=torch.float16)
+    assert not fi.try_mqa(q, None, None, None, None, None, 4, 1.0, None, None)
+
+
+@pytest.mark.parametrize("rows,workers", [(4, 160), (8, 160), (16, 320)])
+def test_mqa_dispatch_preserves_int64_positions_and_caller_outputs(
+    monkeypatch, rows, workers
+):
+    # CPU-only dispatch test: substitute the op, not a CUDA implementation.
+    device = torch.device("cpu")
+    monkeypatch.setitem(fi._MQA_SMS, device, 80)
+    seen = []
+    monkeypatch.setattr(
+        torch.ops._C_flashinfer_mqa_sm70,
+        "run",
+        lambda *args: seen.append(args),
+        raising=False,
+    )
+    q = torch.empty(rows, 4, 128, dtype=torch.float16)
+    k = torch.empty(rows, 196, 1, 128, dtype=torch.float16)
+    table = torch.empty(rows, 1, dtype=torch.int32)
+    requests = torch.arange(rows, dtype=torch.int32)
+    positions = torch.arange(rows, dtype=torch.int64)
+    lengths = torch.full_like(requests, 196)
+    out = torch.empty(rows, 196)
+    visible = torch.empty_like(requests)
+    assert fi.try_mqa(
+        q, k, table, requests, positions, lengths, 4, 128**0.5, out, visible
+    )
+    assert len(seen) == 1
+    assert seen[0][4] is positions
+    assert seen[0][6] is out and seen[0][7] is visible
+    assert seen[0][-1] == workers
+    assert seen[0][8].shape == (workers + 1, 2)
+    # Other dtype/layout/components fall back locally, without attempting CUDA.
+    assert not fi.try_mqa(
+        q.float(), k, table, requests, positions, lengths, 4, 1.0, out, visible
+    )
+    assert not fi.try_mqa(
+        q, k, table, requests.long(), positions, lengths, 4, 1.0, out, visible
+    )
+    assert len(seen) == 1
+
+
 def test_cpu_prepare_is_a_noop(monkeypatch):
     monkeypatch.setattr(
         torch.ops, "load_library", lambda *_: pytest.fail("unexpected load")

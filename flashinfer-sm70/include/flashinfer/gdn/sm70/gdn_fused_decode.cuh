@@ -141,7 +141,7 @@ __device__ __forceinline__ void grid_barrier() {
 // pointers are genuinely disjoint buffers and keep the qualifier.  The read
 // path pays for this: loads from the pools can no longer be promoted to
 // ld.global.nc. There is no production dispatch for this prototype yet.
-template <bool kB1>
+template <bool kB1, int Phase = 0>
 __global__ void gdn_fused_decode_kernel(
     const f16* __restrict__ hidden, const f16* __restrict__ w_ba,
     const f16* __restrict__ mixed_qkv, const f16* __restrict__ conv_weight,
@@ -156,84 +156,87 @@ __global__ void gdn_fused_decode_kernel(
   int nthreads = gridDim.x * blockDim.x;
   const int Beff = kB1 ? 1 : B;
 
-  // ---- Phase A1: GEMV partials ----
-  // tasks: (split in 0..GEMV_NSPLIT-1) x (b) x (col in 0..N_BA-1). Partials
-  // are stored split-major per (col, b) so the gate reduction reads them with
-  // warp-coalesced loads.
-  long gemv_tasks = (long)GEMV_NSPLIT * Beff * N_BA;
-  for (long t = tid; t < gemv_tasks; t += nthreads) {
-    int col = t % N_BA;
-    long r = t / N_BA;
-    int b;
-    int split;
-    if constexpr (kB1) {
-      b = 0;
-      split = (int)r;
-    } else {
-      b = r % B;
-      split = r / B;
+  if constexpr (Phase != 2) {
+    // ---- Phase A1: GEMV partials ----
+    // tasks: (split in 0..GEMV_NSPLIT-1) x (b) x (col in 0..N_BA-1). Partials
+    // are stored split-major per (col, b) so the gate reduction reads them with
+    // warp-coalesced loads.
+    long gemv_tasks = (long)GEMV_NSPLIT * Beff * N_BA;
+    for (long t = tid; t < gemv_tasks; t += nthreads) {
+      int col = t % N_BA;
+      long r = t / N_BA;
+      int b;
+      int split;
+      if constexpr (kB1) {
+        b = 0;
+        split = (int)r;
+      } else {
+        b = r % B;
+        split = r / B;
+      }
+      const f16* hrow = hidden + (long)b * HIDDEN;
+      float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+      int k = split;
+      for (; k + 3 * GEMV_NSPLIT < HIDDEN; k += 4 * GEMV_NSPLIT) {
+        a0 += __half2float(hrow[k]) * __half2float(w_ba[(long)k * N_BA + col]);
+        a1 += __half2float(hrow[k + GEMV_NSPLIT]) *
+              __half2float(w_ba[(long)(k + GEMV_NSPLIT) * N_BA + col]);
+        a2 += __half2float(hrow[k + 2 * GEMV_NSPLIT]) *
+              __half2float(w_ba[(long)(k + 2 * GEMV_NSPLIT) * N_BA + col]);
+        a3 += __half2float(hrow[k + 3 * GEMV_NSPLIT]) *
+              __half2float(w_ba[(long)(k + 3 * GEMV_NSPLIT) * N_BA + col]);
+      }
+      for (; k < HIDDEN; k += GEMV_NSPLIT)
+        a0 += __half2float(hrow[k]) * __half2float(w_ba[(long)k * N_BA + col]);
+      ba_part[((long)col * Beff + b) * GEMV_NSPLIT + split] =
+          (a0 + a1) + (a2 + a3);
     }
-    const f16* hrow = hidden + (long)b * HIDDEN;
-    float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-    int k = split;
-    for (; k + 3 * GEMV_NSPLIT < HIDDEN; k += 4 * GEMV_NSPLIT) {
-      a0 += __half2float(hrow[k]) * __half2float(w_ba[(long)k * N_BA + col]);
-      a1 += __half2float(hrow[k + GEMV_NSPLIT]) *
-            __half2float(w_ba[(long)(k + GEMV_NSPLIT) * N_BA + col]);
-      a2 += __half2float(hrow[k + 2 * GEMV_NSPLIT]) *
-            __half2float(w_ba[(long)(k + 2 * GEMV_NSPLIT) * N_BA + col]);
-      a3 += __half2float(hrow[k + 3 * GEMV_NSPLIT]) *
-            __half2float(w_ba[(long)(k + 3 * GEMV_NSPLIT) * N_BA + col]);
-    }
-    for (; k < HIDDEN; k += GEMV_NSPLIT)
-      a0 += __half2float(hrow[k]) * __half2float(w_ba[(long)k * N_BA + col]);
-    ba_part[((long)col * Beff + b) * GEMV_NSPLIT + split] =
-        (a0 + a1) + (a2 + a3);
-  }
 
-  // ---- Phase A2: conv (independent of gemv) ----
-  long conv_tasks = (long)Beff * QKV_DIM;
-  for (long t = tid; t < conv_tasks; t += nthreads) {
-    int b;
-    int c;
-    if constexpr (kB1) {
-      b = 0;
-      c = (int)t;
-    } else {
-      b = t / QKV_DIM;
-      c = t % QKV_DIM;
+    // ---- Phase A2: conv (independent of gemv) ----
+    long conv_tasks = (long)Beff * QKV_DIM;
+    for (long t = tid; t < conv_tasks; t += nthreads) {
+      int b;
+      int c;
+      if constexpr (kB1) {
+        b = 0;
+        c = (int)t;
+      } else {
+        b = t / QKV_DIM;
+        c = t % QKV_DIM;
+      }
+      int idx = state_indices[b];
+      // Padded row: owns no conv-state slot, so neither shift it nor append to
+      // it. conv_out for this row stays whatever the scratch held -- the delta
+      // phase skips the same row, so nothing reads it.
+      if (idx < 0) continue;
+      // conv_state addressing is stride-parameterized: the pool arrives as a
+      // logical [P, QKV_DIM, CONV_STATE_LEN] view of either a DS-dense pool
+      // (strides p,3,1 -> per-thread 3-element rows) or a transposed SD pool
+      // (strides p,1,QKV_DIM -> fully coalesced across channels, the vLLM
+      // default). Pure index arithmetic; the update math is identical.
+      const f16* st =
+          conv_state + (long)idx * conv_stride_p + (long)c * conv_stride_c;
+      f16 s0 = st[0], s1 = st[conv_stride_t], s2 = st[2 * conv_stride_t];
+      // mixed_qkv rows may be strided (e.g. a view into a wider projection).
+      f16 xr = mixed_qkv[(long)b * qkv_stride + c];
+      const f16* w = conv_weight + (long)c * CONV_WIDTH;
+      // vLLM's FP16 conv actually emits mul.f16 then cvt.f32.f16, with
+      // FP32 accumulation. Preserve those load-bearing product roundings;
+      // widening before the multiply changes this model's recurrent inputs.
+      float y = conv_bias ? __half2float(conv_bias[c]) : 0.f;
+      y += __half2float(__hmul(s0, w[0]));
+      y += __half2float(__hmul(s1, w[1]));
+      y += __half2float(__hmul(s2, w[2]));
+      y += __half2float(__hmul(xr, w[3]));
+      conv_out[(long)b * QKV_DIM + c] = __float2half_rn(siluf(y));
+      f16* uc =
+          updated_conv + (long)idx * conv_stride_p + (long)c * conv_stride_c;
+      uc[0] = s1;
+      uc[conv_stride_t] = s2;
+      uc[2 * conv_stride_t] = xr;
     }
-    int idx = state_indices[b];
-    // Padded row: owns no conv-state slot, so neither shift it nor append to
-    // it. conv_out for this row stays whatever the scratch held -- the delta
-    // phase skips the same row, so nothing reads it.
-    if (idx < 0) continue;
-    // conv_state addressing is stride-parameterized: the pool arrives as a
-    // logical [P, QKV_DIM, CONV_STATE_LEN] view of either a DS-dense pool
-    // (strides p,3,1 -> per-thread 3-element rows) or a transposed SD pool
-    // (strides p,1,QKV_DIM -> fully coalesced across channels, the vLLM
-    // default). Pure index arithmetic; the update math is identical.
-    const f16* st =
-        conv_state + (long)idx * conv_stride_p + (long)c * conv_stride_c;
-    f16 s0 = st[0], s1 = st[conv_stride_t], s2 = st[2 * conv_stride_t];
-    // mixed_qkv rows may be strided (e.g. a view into a wider projection).
-    f16 xr = mixed_qkv[(long)b * qkv_stride + c];
-    const f16* w = conv_weight + (long)c * CONV_WIDTH;
-    // vLLM's FP16 conv actually emits mul.f16 then cvt.f32.f16, with
-    // FP32 accumulation. Preserve those load-bearing product roundings;
-    // widening before the multiply changes this model's recurrent inputs.
-    float y = conv_bias ? __half2float(conv_bias[c]) : 0.f;
-    y += __half2float(__hmul(s0, w[0]));
-    y += __half2float(__hmul(s1, w[1]));
-    y += __half2float(__hmul(s2, w[2]));
-    y += __half2float(__hmul(xr, w[3]));
-    conv_out[(long)b * QKV_DIM + c] = __float2half_rn(siluf(y));
-    f16* uc =
-        updated_conv + (long)idx * conv_stride_p + (long)c * conv_stride_c;
-    uc[0] = s1;
-    uc[conv_stride_t] = s2;
-    uc[2 * conv_stride_t] = xr;
   }
+  if constexpr (Phase == 1) return;
 
   // ---- Pre-barrier prefetch of this warp's first delta task's state rows.
   // The state pool is read-only until phase C, and each row is written only
@@ -275,7 +278,10 @@ __global__ void gdn_fused_decode_kernel(
     }
   }
 
-  grid_barrier();
+  // Split-phase launches use stream ordering for this producer/consumer
+  // boundary and do not reserve the whole cooperative grid. Arithmetic,
+  // half round trips and ownership of each state row are unchanged.
+  if constexpr (Phase == 0) grid_barrier();
 
   // ---- Phase C: delta (gate reduced inline from ba_part) ----
   for (long w = gwarp; w < warps_needed; w += nwarps) {

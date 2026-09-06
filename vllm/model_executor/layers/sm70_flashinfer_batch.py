@@ -8,6 +8,7 @@ All scratch tensors are call-local so different graph/ubatch streams cannot
 overwrite a shared mutable workspace. Only the zero page and weights persist.
 """
 
+import importlib.util
 import os
 
 import torch
@@ -19,6 +20,7 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 _QSA_ZERO: dict[torch.device, torch.Tensor] = {}
+_MQA_SMS: dict[torch.device, int] = {}
 
 
 def copy_derived_buffer(layer, name, value):
@@ -68,6 +70,17 @@ def prepare(model: torch.nn.Module, device: torch.device) -> None:
         path = os.environ.get(key)
         if path:
             torch.ops.load_library(path)
+    # Wheel-native fragment. Probes may preload the same operator explicitly;
+    # never load a second definition or compile on a serving worker.
+    if not hasattr(torch.ops._C_flashinfer_mqa_sm70, "run"):
+        spec = importlib.util.find_spec("vllm._sm70_flashinfer_C")
+        if spec is not None and spec.origin is not None:
+            torch.ops.load_library(spec.origin)
+    if hasattr(torch.ops._C_flashinfer_mqa_sm70, "run"):
+        concrete_device = torch.empty(0, device=device).device
+        _MQA_SMS[concrete_device] = torch.cuda.get_device_properties(
+            concrete_device
+        ).multi_processor_count
     if hasattr(torch.ops._C_flashinfer_qsa_sm70, "run"):
         concrete_device = torch.empty(0, device=device).device
         if concrete_device not in _QSA_ZERO:
@@ -115,7 +128,12 @@ def prepare(model: torch.nn.Module, device: torch.device) -> None:
         layer._sm70_fi_ready = True
         count += 1
     logger.info(
-        "Prepared FlashInfer SM70 GDN probe for %d layers; no M1/HC change.", count
+        "FlashInfer SM70 experimental capabilities: GDN layers=%d, MQA=%s, "
+        "sparse QSA=%s; missing components use "
+        "local fallback, no M1/HC change.",
+        count,
+        hasattr(torch.ops._C_flashinfer_mqa_sm70, "run"),
+        hasattr(torch.ops._C_flashinfer_qsa_sm70, "run"),
     )
 
 
@@ -227,3 +245,46 @@ def try_qsa(q, k, v, indices, table, requests, out):
     )
     logger.info_once("Selected FlashInfer SM70 sparse QSA batch route, rows=%d.", rows)
     return out
+
+
+def try_mqa(q, k, table, requests, positions, lengths, ratio, divisor, out, visible):
+    """Opt-in device-planned scorer, called inside the opaque QSA boundary."""
+    sms = _MQA_SMS.get(q.device)
+    if (
+        sms is None
+        or not 4 <= q.shape[0] <= 16
+        or q.dtype != torch.float16
+        or k.dtype != torch.float16
+        or q.shape[2] != 128
+        or q.shape[1] != 4
+        or q.stride(2) != 1
+        or k.stride(3) != 1
+        or any(t.device != q.device for t in (k, table, requests, positions, lengths))
+        or any(t.dtype != torch.int32 for t in (table, requests, lengths))
+        or positions.dtype not in (torch.int32, torch.int64)
+        or any(not t.is_contiguous() for t in (requests, positions, lengths))
+        or table.stride(1) != 1
+        or any(t.data_ptr() % 16 or any(s % 8 for s in t.stride()[:-1]) for t in (q, k))
+    ):
+        return False
+    workers = sms * (4 if q.shape[0] >= 16 else 2)
+    schedule = torch.empty((workers + 1, 2), dtype=torch.int32, device=q.device)
+    torch.ops._C_flashinfer_mqa_sm70.run(
+        q,
+        k,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        visible,
+        schedule,
+        ratio,
+        divisor,
+        workers,
+    )
+    logger.info_once(
+        "Selected FlashInfer SM70 device-planned QSA MQA scorer, rows=%d.",
+        q.shape[0],
+    )
+    return True

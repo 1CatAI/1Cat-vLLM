@@ -341,3 +341,148 @@ Keep #523 Draft and the parent switch default-off. All diagnostic workers
 exited; GPU 4--7 returned to 7 MiB each, with no compute processes. No remote
 API was changed. Loader/shared-memory teardown warnings are retained in the
 logs; no persistent GPU allocation remained.
+
+### Device-planned MQA implementation (2026-09-06, not quality-admitted)
+
+Upstream head was rechecked once and remains
+`6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f`. The SM70 adaptation follows the
+official attention-score scheduler's live-tile prefix scan and contiguous
+balanced worker assignment; it does not compile the SM100 kernel for Volta.
+The new scorer uses FP16 WMMA with FP32 accumulation, 64-column tiles,
+vectorized eight-half loads and padded shared leading dimensions. A one-warp
+device planner runs on every invocation, including graph replay. Caller-owned
+schedule/output buffers retain stable graph addresses. No host length readback
+or capacity-sized empty CTA grid is required.
+
+The native implementation supports int32 and int64 positions. Initial runtime
+admission is the measured H4/D128, R4--16 geometry, independent of model name,
+TP degree and configured maximum batch. Other shapes fall back locally.
+The parent `VLLM_SM70_FLASHINFER_BATCH` remains **default off**. Runtime imports
+the packaged `_sm70_flashinfer_C` fragment, not a development JIT library.
+CMake, setup.py, manifest and source/license notice now include that fragment.
+This is not yet a full built-and-installed wheel acceptance test.
+
+Formal CMake component artifact:
+`.artifacts/wheel-native-stage/vllm/_sm70_flashinfer_C.abi3.so`, SHA256
+`1b2a2336d6dc22d207111008ed8c83cc97eac67f6ff0917dcb7e1ad456634edf`.
+It passes **31 GPU tests** (`mqa-wheel-tests-v1.log`): FP64 oracle, both position
+dtypes including overflow boundaries, strided layouts, graph length changes,
+empty/padded rows, invalid pages, two-stream separate workspaces, and an audit
+that counts every logical tile exactly once. CPU routing/compiled-boundary
+tests pass **29/29** (`fi-cpu-v2.log`).
+
+The five alternating A/B blocks in `mqa-selector-v1.json` include the existing
+exact top-k and page/index expansion, but **exclude final sparse attention and
+the model**. Inputs are synthetic at real indexer geometry; this is not a
+captured-activation or end-to-end result. Eight changing graph replays per case
+produce identical selected indices.
+
+| Rows | Context | Existing index chain, us | New index chain, us | Reduction |
+| --- | --- | ---: | ---: | ---: |
+| 4 | 8K | 49.17248 | 40.56064 | 17.51% |
+| 8 | 8K | 61.15328 | 42.27072 | 30.88% |
+| 16 | 8K | 92.03712 | 53.99552 | 41.33% |
+| 4 | 64K | 161.86369 | 124.08832 | 23.34% |
+| 8 | 64K | 216.81152 | 149.88288 | 30.87% |
+| 16 | 64K | 367.85152 | 237.88544 | 35.33% |
+
+Within-run paired log-ratio 95% intervals have positive lower bounds for these
+six cases; they are not cross-run or model-quality confidence intervals.
+`sm70_paired_stats.py` requires five paired blocks and uses Student-t(df=4).
+Its seven CPU tests pass. Do not multiply layer service savings and report
+the sum as measured end-to-end gain.
+
+Preserved rejected attempts: v1 had an incorrect lexicographic worker-end
+condition, redundantly executing later rows while writing the same values;
+numeric equality alone missed it. The tile-visit audit now detects this.
+Corrected scalar/shared-unskewed v2 remained slower; vector loads and shared
+padding were necessary. Logs `mqa-screen-v1.*`, `mqa-screen-v2.*` and
+`mqa-native-trace-v2.nsys-rep` retain the failures. NCU counters were denied
+(`ERR_NVGPUCTRPERM`); no counter-based occupancy or bandwidth claim is made.
+
+GDN's separate BA/conv prepare and state-update prototype preserves all outputs,
+BA partials, conv and recurrent states exactly across 256 changing-history
+steps at R1/4/8/16/32/64 (`gdn-phases-v1.*`). Its first timing run accidentally
+retained a padded last row; those timings are invalid for full-width claims.
+The benchmark now restores all live rows before timing; rerun is pending.
+No two-phase GDN runtime route has been admitted. The HC 96-module full-chain
+benchmark has been extended to B4/8/16 and five alternating blocks; GPU
+validation is pending. MoE device compaction and TP overlap remain unimplemented.
+
+### First-prefill boundary localization (control only)
+
+Artifacts: `.artifacts/run-prefill-boundary.py`, corresponding shell/bootstrap,
+`prefill-boundary-v2.log`, and `prefill-boundary-v1/boundary-rank*-step*.pt`.
+One control-only engine, no FlashInfer experiment, executes two cold passes
+over the same 16 teacher prompts. Maximum output is one forced reference token
+for diagnosis only, not the registered quality battery or a performance run.
+
+On **all four ranks**, step 0 versus step 4 has bitwise-identical input IDs,
+positions, query boundaries, request seeds and PLE ngram context. All six
+requests are cold prefills. Layer 0 and layer 1 GDN projection inputs, conv
+outputs, zero initial states and recurrent outputs are all bitwise identical.
+Physical state IDs differ as expected after fresh allocation. Nevertheless,
+the final hidden tensor [2048,2560] differs on 4,826,852 elements, max absolute
+delta 31.966796875 and relative L2 0.2170600146; first-token logprob variation
+also reproduces. This is **not** evidence of quality safety or a proven cause.
+It localizes the first divergence downstream of the captured early GDN work;
+inspect the next layers, first QSA/PLE, HC and MoE boundaries next. Do not blame
+the new native scorer, which was disabled throughout this run.
+
+All diagnostic model workers shut down normally; no remote service changed.
+The adverse BFCL results remain unresolved and the new whole-model performance,
+full wheel, expanded quality battery and default promotion are still pending.
+
+### Root-cause closure and reuse of existing PR #494
+
+The follow-up capture `prefill-boundary-later-v1/` (log
+`prefill-boundary-later-v2.log`) localizes the first difference to layer 3
+QSA on all four ranks. Its input hidden states, Q/K/V, gate, positions,
+selected token IDs, and effective logical K/V read back after the cache update
+are bitwise identical. The first QSA output alone differs (rank 0 relative
+L2 `9.7149867e-5`, max absolute `0.00048828125`), followed by progressively
+larger downstream differences; final hidden relative L2 is `0.22358379`.
+CPU FP64 causal attention on the captured cold-prefix keys confirms both
+outputs have small local numerical error, not corrupted K/V. This local
+oracle does not establish model-quality noninferiority.
+
+An isolated diagnostic alternative used logical request/page hash identities
+and ordered collision resolution. Twelve relocations of the *same real Q/K/V*
+changed 162,113--303,033 output elements in the old planner, versus zero in the
+diagnostic alternative. The latter preserves grouped attention and FP16/FP32
+types but costs about 451 vs 434 us for captured 2048-row
+planner+attention+gate; this is a stability repair, not a speed win.
+Six planner tests plus 31 MQA tests pass (37 total); its six planner cases pass
+memcheck with zero errors. The first sanitizer attempt lacked an injection
+library, so it is not counted. Successful log: `canonical-memcheck-v2.log`.
+Proof binary: `.artifacts/mqa-plus-canonical-proof/vllm/_sm70_flashinfer_C.abi3.so`,
+SHA256 `23a202e5f4d7c5a9bccb73e4eba577b85fe090ead5e672ac039a1223adc521c1`.
+
+Changing only that planner in one additional cold-prefill engine eliminates
+the observed A/A instability: all four ranks, all four scheduler-step pairs,
+and their final hidden tensors match bitwise. All 16 first-token logprobs match
+exactly (previous diagnostic mean absolute delta 0.60679578, maximum 1.85863316).
+Artifacts: `prefill-boundary-canonical-v1/`, its launch log and
+`prefill-boundary-canonical-compare-r*.log`. This is a causal diagnostic for
+the allocation-order defect, **not a new task score or a validation of #494's
+binary**.
+
+The subsequent overlap review found existing open **#494**, reviewed source
+`5fa8a605dab12cc9ee15459d9ac6b88d95c7be3a`, already fixes this same defect.
+It additionally preserves cross-request physical-page deduplication and fixes
+the separate XQA tail. Reuse that reviewed patch rather than publish a competing
+implementation. The new alternative planner, binding and tests were removed
+from build/runtime/source delivery and retained only in
+`.artifacts/canonical-prototype-source/`. Its results above are independent
+NVFP4 root-cause evidence, not a claim of authorship of the existing repair.
+The frozen performance binary did not include #494. Integration/build/testing
+of #494 is the next dependency step; do not mix its forthcoming results with
+the retired alternative's proof.
+
+The corrected full-width GDN phase screen is complete on GPU 0
+(`gdn-phases-v2.json`). All 256 history steps and output/conv/state/BA partials
+remain exact at B1/4/8/16/32/64. Splitting the phases regresses B4/8/16 by
+9.43%/15.80%/3.81%; keep it out of their runtime. B1/B32/B64 improvements are
+4.22%/0.51%/3.91%, not admissions or justification to replace the existing M1
+route. No new end-to-end score has been measured. CPU routing, statistics and
+compiled-boundary tests now pass 36/36 (`fi-cpu-v4.log`).

@@ -50,6 +50,32 @@ void run(torch::Tensor hidden, torch::Tensor weights, torch::Tensor qkv,
   TORCH_CHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0 &&
               state.stride(0) % 4 == 0);
   const int block = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+#if defined(FI_GDN_TWO_PHASE) && FI_GDN_TWO_PHASE
+  const int prep_grid = props->multiProcessorCount * 4;
+  const int state_grid =
+      (B * HV * D + ROWS_PER_WARP * 8 - 1) / (ROWS_PER_WARP * 8);
+  #define LAUNCH_PHASE(B1, PHASE, GRID)                                  \
+    gdn_fused_decode_kernel<B1, PHASE><<<GRID, block, 0, stream>>>(      \
+        (const half*)hidden.data_ptr(), (const half*)weights.data_ptr(), \
+        (const half*)qkv.data_ptr(), (const half*)conv_w.data_ptr(),     \
+        conv_bias.numel() ? (const half*)conv_bias.data_ptr() : nullptr, \
+        (const half*)conv.data_ptr(), A_log.data_ptr<float>(),           \
+        (const half*)dt_bias.data_ptr(), state.data_ptr<float>(),        \
+        indices.data_ptr<int>(), 1.f / sqrtf(float(D)), state.stride(0), \
+        qkv.stride(0), conv.stride(0), conv.stride(1), conv.stride(2),   \
+        (half*)output.data_ptr(), (half*)conv.data_ptr(),                \
+        state.data_ptr<float>(), partial.data_ptr<float>(),              \
+        (half*)conv_out.data_ptr(), B)
+  if (B == 1) {
+    LAUNCH_PHASE(true, 1, prep_grid);
+    LAUNCH_PHASE(true, 2, state_grid);
+  } else {
+    LAUNCH_PHASE(false, 1, prep_grid);
+    LAUNCH_PHASE(false, 2, state_grid);
+  }
+  #undef LAUNCH_PHASE
+#else
   int occupancy = 0;
   if (B == 1) {
     C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -61,7 +87,6 @@ void run(torch::Tensor hidden, torch::Tensor weights, torch::Tensor qkv,
   TORCH_CHECK(occupancy > 0);
   const int needed = (B * HV * D + ROWS_PER_WARP * 8 - 1) / (ROWS_PER_WARP * 8);
   const int grid = std::min(needed, occupancy * props->multiProcessorCount);
-  auto stream = at::cuda::getCurrentCUDAStream();
   TORCH_CHECK(props->cooperativeLaunch,
               "GDN grid sync needs cooperative launch");
   cudaLaunchConfig_t config{};
@@ -73,25 +98,26 @@ void run(torch::Tensor hidden, torch::Tensor weights, torch::Tensor qkv,
   attribute.val.cooperative = 1;
   config.attrs = &attribute;
   config.numAttrs = 1;
-#define LAUNCH(B1)                                                          \
-  C10_CUDA_CHECK(cudaLaunchKernelEx(                                        \
-      &config, gdn_fused_decode_kernel<B1>, (const half*)hidden.data_ptr(), \
-      (const half*)weights.data_ptr(), (const half*)qkv.data_ptr(),         \
-      (const half*)conv_w.data_ptr(),                                       \
-      conv_bias.numel() ? (const half*)conv_bias.data_ptr() : nullptr,      \
-      (const half*)conv.data_ptr(), A_log.data_ptr<float>(),                \
-      (const half*)dt_bias.data_ptr(), state.data_ptr<float>(),             \
-      indices.data_ptr<int>(), 1.f / sqrtf(float(D)), state.stride(0),      \
-      qkv.stride(0), conv.stride(0), conv.stride(1), conv.stride(2),        \
-      (half*)output.data_ptr(), (half*)conv.data_ptr(),                     \
-      state.data_ptr<float>(), partial.data_ptr<float>(),                   \
-      (half*)conv_out.data_ptr(), B))
+  #define LAUNCH(B1)                                                          \
+    C10_CUDA_CHECK(cudaLaunchKernelEx(                                        \
+        &config, gdn_fused_decode_kernel<B1>, (const half*)hidden.data_ptr(), \
+        (const half*)weights.data_ptr(), (const half*)qkv.data_ptr(),         \
+        (const half*)conv_w.data_ptr(),                                       \
+        conv_bias.numel() ? (const half*)conv_bias.data_ptr() : nullptr,      \
+        (const half*)conv.data_ptr(), A_log.data_ptr<float>(),                \
+        (const half*)dt_bias.data_ptr(), state.data_ptr<float>(),             \
+        indices.data_ptr<int>(), 1.f / sqrtf(float(D)), state.stride(0),      \
+        qkv.stride(0), conv.stride(0), conv.stride(1), conv.stride(2),        \
+        (half*)output.data_ptr(), (half*)conv.data_ptr(),                     \
+        state.data_ptr<float>(), partial.data_ptr<float>(),                   \
+        (half*)conv_out.data_ptr(), B))
   if (B == 1) {
     LAUNCH(true);
   } else {
     LAUNCH(false);
   }
-#undef LAUNCH
+  #undef LAUNCH
+#endif
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 }  // namespace
