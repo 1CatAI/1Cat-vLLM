@@ -764,3 +764,78 @@ source checks pass (`hot-chain-precommit-v8.log`). All model, benchmark and
 waiter processes owned by this follow-up have exited. Subsequent GPU 0--3
 and 4--7 allocations belong to other task leases and were not interrupted;
 there is no task-owned resident API or new remote service.
+
+### Numerical isolation follow-up: EOS boundary and HC projection stages
+
+The last measured E2E comparison remains C4/C8/C16
+**232.169/390.046/630.996 tok/s**, +6.98%/+7.00%/+7.35% versus the original
+performance control. It is still not quality-admitted. The newer MQA and
+stable-planner savings have **not** been measured in a new E2E campaign.
+
+Inspecting the retained repaired-quality outputs further localizes
+`parallel_1`: MQA+GDN and the sparse-QSA combined arm share their first
+**51 output tokens** exactly. The first tool call is complete and identical.
+At zero-based offset 51, MQA+GDN emits newline token `198`, then a second
+`calculate_em_force` call with `d_time=10`; native sparse QSA emits EOS
+`248046`. Completion lengths are 105 versus 52 tokens. This is premature
+generation termination, **not a parser dropping a generated second call**.
+It does not identify which numerical change shifted the EOS draw.
+
+The new CPU counterfactual retains Q/K/V, index order, duplicate/invalid
+selections, reference 16-column split boundaries and the output/gate casts.
+Everything else is evaluated in FP64, changing only the probability
+materialization before PV. On all **36** previously retained QSA inputs,
+restoring the FP16 probability cast is closer to the recorded production
+output: median relative L2 **1.27622e-4 -> 3.82219e-5**, median per-case error
+reduction **70.34%**. This supports that rounding as a substantial source of
+the *operator* difference. These inputs came from the earlier shadow run,
+not the repaired `parallel_1` EOS step; CPU arithmetic is not an exact CUDA
+emulator. Do not interpret the result as permission to blindly round the
+native kernel, reduce state precision, or declare model noninferiority.
+
+Reproducible numerical tool and sanity tests:
+
+```bash
+CUDA_VISIBLE_DEVICES='' .venv/bin/python \
+  benchmarks/kernels/benchmark_sm70_qsa_rounding_isolation.py \
+  --captures .artifacts/quality-shadow-v2 \
+  --out .artifacts/qsa-rounding-isolation-v1.json
+CUDA_VISIBLE_DEVICES='' .venv/bin/python -m pytest -q \
+  tests/kernels/test_sm70_qsa_rounding_isolation.py \
+  flashinfer-sm70/tests/test_batch_routing.py \
+  flashinfer-sm70/tests/test_compiled_gdn_boundary.py \
+  flashinfer-sm70/tests/test_paired_stats.py
+```
+
+The combined CPU suite passes **45 tests** (`arithmetic-routing-cpu-v1.log`),
+including three new tests for duplicate weighting, invalid/NaN padding and
+keeping the denominator unrounded. The counterfactual artifact is
+`qsa-rounding-isolation-v1.{json,log}`, JSON SHA256
+`05d6b8e1704feaf39503cbbfdbb52bcef673098719d428ffd46679c2546d1db9`.
+
+For HC, `benchmark_sm70_hc_arithmetic_isolation.py` now separates full
+sharding, down-only sharding, and up-only sharding across the 96-module
+arithmetic chain on one GPU. It must first reproduce the saved four-rank
+failure exactly and retains the same 3e-3 absolute/relative envelope.
+It does not measure collective performance or replace the distributed/full
+model gate. Retaining the reference down projection while sharding only up
+is a test hypothesis, **not an implemented or validated serving repair**.
+
+A focused, diagnostic-only teacher manifest also freezes the original
+16-case parallel cohort through offset 51, using the existing per-case seeds
+and trajectories. It will compare raw/processed logits and the stateless
+EOS-versus-newline draw on all four ranks, with A/A repeats, before another
+natural quality run. Manifest `parallel-eos-teacher-manifest-v1.json`, SHA256
+`2f179c9940d28bd9a631821bd669926e5b11d5f29423f6f2a47f2092f9be01d2`.
+Launchers/hooks stay in task artifacts and require explicit diagnostic
+environment variables; they are not serving code. The spawn import check
+passes without CUDA initialization. **This model diagnostic has not run.**
+
+The HC launcher waited its ten-minute lease window and returned code 75;
+a fresh attempt was also blocked by live foreign GPU processes, even after
+one lease owner exited. No HC GPU result file was produced and no model
+diagnostic was launched. The waiter has exited; no task-owned GPU process
+or resident service remains. Do not preempt other tasks or describe these
+queued checks as passed. Resume HC single-GPU isolation and then the focused
+four-rank EOS diagnostic after resources are actually free. Source runtime
+defaults remain unchanged; fixed quality and E2E admission are still pending.
