@@ -204,3 +204,140 @@ no compute processes; the old local API unit is inactive/disabled (MainPID 0).
 Unrelated GPU 0--3 processes and remote services were not touched. Engine
 shutdown logs also retain Python resource-tracker shared-memory cleanup
 warnings seen in the control; do not mislabel these as persistent GPU usage.
+
+## Quality root-cause follow-up: same-input shadows
+
+Continue the owned #523 scope at `25fd594d9c`; do not duplicate component PRs
+or change production precision to fit the small task-score sample. Inspecting
+raw responses excludes a parser-only explanation: new failures contain no
+call or an actual irrelevant call. However, the QSA-only comparison changes
+the **first generated token in 11/80 cases**, including both recurring
+irrelevance failures, despite identical prompts. Prefill/admission variation
+must be separated from decode arithmetic before assigning causality.
+
+An artifact-only eager shadow run follows the original path for all actual
+outputs/state updates. Rank 0 also computes new QSA on identical Q/K/V and
+new GDN on cloned indexed initial states. Eight retained prompts and up to
+48 output tokens are diagnostic input acquisition, **not quality scores**.
+Other ranks do not run shadows/collectives. No production sampler, weights,
+state dtype or output-selection policy is changed.
+
+The first attempt stopped at callable-RPC serialization restrictions before
+requests. Replaced that diagnostic trigger with recognition of the retained
+request seeds; no insecure-serialization flag is enabled. Successful run:
+`.artifacts/quality-shadow-v2.log`, with records/captured QSA inputs under
+`.artifacts/quality-shadow-v2/`. All workers exited and GPU 4--7 returned to
+7 MiB. An unrelated job owned the cards while this task waited for the lease.
+
+Collected 144 GDN and 48 QSA comparisons (B8/B6/B5), plus 50 sampler records:
+
+- GDN Z projection and convolution state: **bitwise equal** in all records.
+- Maximum GDN output relative L2: `4.8673613e-5`; maximum recurrent-state
+  relative L2: `1.7772339e-5`. Early B8 records alone had state errors around
+  `1e-8`; do not report that as the worst of the completed run.
+- Maximum QSA candidate-vs-FP64-oracle relative L2: `1.9871883e-5` versus
+  reference-vs-oracle `1.8209650e-4`. The candidate is closer to the oracle
+  in **all 48** matched comparisons. Preserve ordered/duplicate selections
+  and the FP16-output/FP32-gate boundary in the oracle.
+- No future or sequence-out-of-bounds selected positions, sampled-logit NaNs,
+  or positive infinities in this diagnostic scope.
+
+This does not establish whole-model noninferiority, CUDA Graph long-history
+quality, or a causal explanation for the 52 -> 49 task-score result. It does
+argue against blindly reducing new QSA precision or blaming GDN state
+corruption without further evidence. Next isolate schedule/prefill and
+sampling-trajectory confounders using matched conditional probabilities and
+an unchanged-data A/A control. Preserve the old adverse scores.
+
+### Fixed-cohort and conditional-probability diagnostic
+
+Artifacts: `.artifacts/run-quality-cohort.py`,
+`.artifacts/run-quality-cohort.sh`, `.artifacts/compare-quality-cohort.py`,
+and `.artifacts/quality-cohort-v1/`. This retains all original 80 rendered
+prompts, per-case seeds, 16K maximum output, natural EOS, schemas, parsers and
+scorers. It changes only admission for a diagnostic: five fixed groups of
+16, cold prefix reset per group, pause scheduling before enqueue and resume
+after all group members are queued. The original continuous-admission
+negative screen is NOT replaced by this diagnostic.
+
+Two aborted diagnostic attempts are retained. The first teacher manifest
+was corrupted by truncated tool output; validate JSON before constructing
+the engine (`teacher-manifest-valid.json` is the valid input). The second
+completed the first group but failed in artifact-side output association:
+`enqueue()` returns randomized internal IDs whereas `RequestOutput` uses
+external IDs. The corrected runner snapshots the engine's own mapping
+while scheduling is paused; a CPU fake-engine test covers this association.
+Do not disable request-ID randomization or insecure-RPC serialization guards.
+
+Successful control log: `quality-cohort-v1/control-ids-fixed.log`. No new
+FlashInfer operators are selected in this control. The two natural-EOS
+repeats score BFCL **51/64 and 52/64**, JSON Schema **16/16 both**, with no
+length truncations. **22/80 full outputs and 8/80 first tokens differ even
+within this unchanged control engine.** This is direct evidence that a
+single matched-seed score is not a deterministic attribution test. It does
+not establish whether residual variation comes from prefill cohorts after
+admission, numerical reduction/order, state lifetime or another mechanism.
+
+The separate teacher probe follows 16 retained historical-control sequences
+(2,225 tokens). It is diagnostic conditional NLL, not a task score, PPL
+benchmark or speed measurement. All four control ranks report identical
+349-step seed/position cohort traces, and CPU/GPU request seeds agree.
+25 CPU routing/compiled-boundary tests pass.
+
+Candidate log: `quality-cohort-v1/candidate.log`; comparison:
+`quality-cohort-v1/comparison.txt`. Both native FlashInfer routes are observed
+in CUDA Graph capture. Natural results (not release admission):
+
+| Path | BFCL repeat 1 | BFCL repeat 2 | JSON Schema both | Truncated |
+| --- | ---: | ---: | ---: | ---: |
+| Unchanged control | 51/64 | 52/64 | 16/16 | 0 |
+| GDN + QSA candidate | 50/64 | 51/64 | 16/16 | 0 |
+
+The candidate A/A changes 23/80 full outputs and 8/80 first tokens. Preserve
+these adverse comparisons and the original 52 -> 49 result; repeated tests
+are neither independent extra dataset items nor grounds for picking the
+best score. The original pair has five newly failed and two improved BFCL
+cases; its exact paired two-sided test gives p=0.453125. Lack of significance
+is NOT evidence of noninferiority.
+
+The candidate-minus-control conditional NLL mean is `+0.00310631` over 2,225
+tokens (positive is worse on the retained reference continuation); maximum
+absolute delta is `1.93978739`. For first tokens alone, mean absolute delta
+is `0.54163724`, versus `0.00885871` at offsets >=64. The four-rank
+seed/position traces match exactly across arms. This points toward the
+prefill/first-token portion, but needs a conditional A/A floor before
+attributing the change to the new compiled boundary or kernels.
+
+### Conditional control A/A floor and current decision
+
+An additional control-only load runs the exact same 16 continuations twice,
+with no intervening natural generation and no new FlashInfer operators.
+Runner: `.artifacts/run-quality-teacher-aa.py`; command:
+`FI_TEACHER_AA=1 bash .artifacts/run-quality-cohort.sh control`.
+Log: `.artifacts/quality-teacher-aa-v1.log`; raw probabilities and four-rank
+metadata: `.artifacts/quality-teacher-aa-v1/`. All 2,225 forced tokens match;
+all four 698-step traces match, and their 349-step halves match each other.
+
+| Diagnostic | Mean NLL delta, all tokens | First-token mean absolute delta | Maximum absolute delta |
+| --- | ---: | ---: | ---: |
+| Candidate vs control | +0.00310631 | 0.54163724 | 1.93978739 |
+| Control repeat 2 vs repeat 1 | +0.00435804 | 0.80130252 | 3.39355850 |
+
+Thus the unchanged control itself exhibits conditional-probability variation
+at least as large in these aggregate measures as the candidate comparison.
+This prevents assigning the task-score loss specifically to FlashInfer.
+It does NOT prove all variation has the same cause, that state handling is
+correct, or that the candidate is quality-equivalent. Investigate shared
+prefill/first-token computation and state initialization/reuse first. Next
+use a fixed-trajectory prefill boundary/state capture to locate the earliest
+divergence; do not randomly change sampling, precision or decode fusion.
+The AWQ FP16 atomic weighted epilogue found by source search is not on this
+NVFP4 prefill path; do not claim it as the cause without a route-hit.
+
+No production math, kernels, sampler or defaults changed in this follow-up.
+The earlier ~7% unprofiled speed gain remains an experimental result for the
+same implementation, not a new speed measurement or quality admission.
+Keep #523 Draft and the parent switch default-off. All diagnostic workers
+exited; GPU 4--7 returned to 7 MiB each, with no compute processes. No remote
+API was changed. Loader/shared-memory teardown warnings are retained in the
+logs; no persistent GPU allocation remained.
