@@ -7,4 +7,5 @@ include CMakeLists.txt
 
 recursive-include cmake *
 recursive-include csrc *
+recursive-include flashinfer-sm70/include *.cuh
 recursive-include flash_qla *.py *.cu LICENSE

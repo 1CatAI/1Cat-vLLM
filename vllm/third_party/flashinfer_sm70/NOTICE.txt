@@ -1,0 +1,16 @@
+FlashInfer SM70 adapters in 1Cat-vLLM
+
+Distributed under the Apache License, Version 2.0 (see the distribution LICENSE).
+
+The paged MQA scheduling algorithm is adapted from FlashInfer, commit
+6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f:
+  flashinfer/attn_scores/kernels/schedule_kernel.py
+Copyright (c) 2025 FlashInfer team.
+That source is adapted from TensorRT-LLM's PagedMQALogitsMetadataKernel.
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+The native FP16 Volta QSA scorer, runtime integration and modifications are
+Copyright contributors to the vLLM project, distributed under Apache-2.0.
+
+This is an architecture-specific adaptation maintained by 1Cat-vLLM, not
+an assertion of official FlashInfer SM70 support or upstream endorsement.

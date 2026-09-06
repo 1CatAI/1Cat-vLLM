@@ -4047,7 +4047,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
-        if _sm70_qwen_gdn_input_core_boundary_enabled():
+        # Keep the compiled boundary independent of the example prefill size.
+        # vLLM reuses this graph for decode; try_gdn must inspect the actual
+        # shape and scheduler metadata INSIDE the opaque op on each capture.
+        if _sm70_qwen_gdn_input_core_boundary_enabled() or (
+            getattr(self, "_sm70_fi_ready", False) and use_sm70_decode_graph_semantics()
+        ):
             z = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -7255,6 +7260,24 @@ def qwen_gdn_input_projection_core(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
 
+    if getattr(self, "_sm70_fi_ready", False):
+        from vllm.model_executor.layers.sm70_flashinfer_batch import try_gdn
+
+        raw_metadata = forward_context.attn_metadata
+        metadata = (
+            raw_metadata.get(layer_name) if isinstance(raw_metadata, dict) else None
+        )
+        if try_gdn(
+            self,
+            hidden_states,
+            z_out,
+            core_attn_out,
+            conv_state_cache,
+            ssm_state_cache,
+            metadata,
+        ):
+            return z_out, core_attn_out
+
     hidden_states = _sm70_dump_gdn_projection_tensor(
         "gdn_hidden_states_input_core",
         layer_name,
@@ -7285,6 +7308,21 @@ def qwen_gdn_input_projection_core(
             "SM70 GDN QPN8 N4096 plus FP16 b/a N24 split route enabled."
         )
         z = z_out
+    elif (
+        getattr(self, "_sm70_fi_ready", False)
+        and getattr(self, "sm70_qwen38_fp16_fused_input", False)
+        and use_sm70_decode_graph_semantics()
+        and not _sm70_gdn_projection_dump_requested(layer_name)
+    ):
+        # The opt-in boundary also sees M1 and prefill. Preserve their existing
+        # projection implementation, including the fused FP16 M1 kernel,
+        # instead of silently replacing it with separate QKVZ and BA GEMMs.
+        mixed_qkv, z, b, a = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(
+            hidden_states,
+            self.in_proj_qkvz.weight,
+            self.in_proj_ba.weight,
+        )
+        z_out.copy_(z.reshape_as(z_out))
     else:
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)

@@ -10,6 +10,7 @@ import os
 import regex as re
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
@@ -443,7 +444,6 @@ def _qsa_xqa_page4_table_kernel(
     OUTPUT_PAGES: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
     PHYSICAL_PAGE_STRIDE: tl.constexpr,
-    TAIL_MARKER: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     slots = tl.arange(0, BLOCK_PAGES)
@@ -508,13 +508,16 @@ def _qsa_xqa_page4_table_kernel(
     physical_microblock = (
         tl.maximum(physical_page, 0) * PHYSICAL_PAGE_STRIDE + page_offset // 4
     )
+    # Sort by logical token, not allocator-dependent physical page ID. Keep
+    # the partial causal page after all complete pages and invalid slots last.
+    logical_key = safe_token.to(tl.int64) << 31
     encoded = tl.where(
         valid & is_complete,
-        physical_microblock,
+        logical_key | physical_microblock.to(tl.int64),
         tl.where(
             valid & is_tail,
-            physical_microblock + TAIL_MARKER,
-            2147483647,
+            (1 << 62) | logical_key | physical_microblock.to(tl.int64),
+            9223372036854775807,
         ),
     )
     tl.store(
@@ -1069,6 +1072,22 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
+    if envs.VLLM_SM70_FLASHINFER_BATCH:
+        from vllm.model_executor.layers.sm70_flashinfer_batch import try_mqa
+
+        if try_mqa(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            float(score_divisor),
+            logits,
+            visible_blocks,
+        ):
+            return logits, visible_blocks
     sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
     # On V100 the GB300 decode tile leaves the 128-d scorer badly
     # under-occupied. A 32-column, two-warp tile preserves the selected QSA
@@ -1561,7 +1580,7 @@ def _qsa_xqa_page4_block_table(
     rows = logical_indices.shape[0]
     encoded_pages = torch.empty(
         (rows, _SM70_QSA_XQA_PAGE4_PAGES),
-        dtype=torch.int32,
+        dtype=torch.int64,
         device=logical_indices.device,
     )
     xqa_sequence_lengths = torch.empty(
@@ -1587,14 +1606,13 @@ def _qsa_xqa_page4_block_table(
         OUTPUT_PAGES=_SM70_QSA_XQA_PAGE4_PAGES,
         BLOCK_PAGES=1024,
         PHYSICAL_PAGE_STRIDE=physical_page_stride,
-        TAIL_MARKER=_SM70_QSA_XQA_PAGE4_MARKER,
         num_warps=4,
     )
     sorted_pages = torch.sort(encoded_pages, dim=1).values
     physical_pages = torch.bitwise_and(
         sorted_pages,
         _SM70_QSA_XQA_PAGE4_MARKER - 1,
-    )
+    ).to(torch.int32)
     return physical_pages, xqa_sequence_lengths
 
 
@@ -2076,6 +2094,18 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA output gate must be contiguous in head dimension")
     if not q.shape[0]:
         return out
+
+    if envs.VLLM_SM70_FLASHINFER_BATCH and not kv_e4m3:
+        from vllm.model_executor.layers.sm70_flashinfer_batch import try_qsa
+
+        fi_output = try_qsa(
+            q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        )
+        if fi_output is not None:
+            # Retain the existing FP16 materialization before the FP32 gate.
+            if output_gate_view is not None:
+                _qsa_output_gate(fi_output, output_gate_view)
+            return fi_output
 
     if _use_sm70_qsa_xqa_page4(
         q,

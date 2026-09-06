@@ -14,6 +14,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cub/block/block_radix_sort.cuh>
 
 #include "fp8_kv_utils.cuh"
 #include "fused_mma.h"
@@ -3659,10 +3660,23 @@ constexpr int kGroupedSparseQueries = 8;
 constexpr int kGroupedSparsePlannerThreads = 512;
 constexpr int kGroupedSparseHashCapacity = 8192;
 constexpr unsigned long long kGroupedSparseEmptyEntry = 0x00000000ffffffffULL;
+constexpr int kGroupedSparseItemsPerThread =
+    kGroupedSparseHashCapacity / kGroupedSparsePlannerThreads;
+using GroupedSparseSort =
+    cub::BlockRadixSort<unsigned long long, kGroupedSparsePlannerThreads,
+                        kGroupedSparseItemsPerThread, unsigned long long>;
+// Hash entries plus logical owners exactly fit Volta's 96 KiB opt-in limit.
+// After loading both into registers, reuse this storage for sorting and scans.
+constexpr size_t kGroupedSparsePlannerSharedMemory =
+    kGroupedSparseHashCapacity *
+    (sizeof(unsigned long long) + sizeof(uint32_t));
+static_assert(sizeof(GroupedSparseSort::TempStorage) <=
+              kGroupedSparsePlannerSharedMemory);
 
 __device__ __forceinline__ void grouped_sparse_hash_insert(
-    unsigned long long* __restrict__ hash_table, const int physical_microblock,
-    const uint32_t token_mask) {
+    unsigned long long* __restrict__ hash_table,
+    uint32_t* __restrict__ logical_owners, const int physical_microblock,
+    const uint32_t token_mask, const int query, const int logical_token) {
   if (physical_microblock < 0 || token_mask == 0) {
     return;
   }
@@ -3675,13 +3689,17 @@ __device__ __forceinline__ void grouped_sparse_hash_insert(
   for (int probe = 0; probe < kGroupedSparseHashCapacity; ++probe) {
     const unsigned long long old =
         atomicCAS(hash_table + slot, kGroupedSparseEmptyEntry, desired);
-    if (old == kGroupedSparseEmptyEntry) {
-      return;
-    }
-    if (static_cast<uint32_t>(old) ==
-        static_cast<uint32_t>(physical_microblock)) {
+    if (old == kGroupedSparseEmptyEntry ||
+        static_cast<uint32_t>(old) ==
+            static_cast<uint32_t>(physical_microblock)) {
       atomicOr(hash_table + slot, static_cast<unsigned long long>(token_mask)
                                       << 32);
+      // Nonnegative int32 tokens use at most 29 bits after division by four.
+      // The first contributing query owns shared pages, independent of request
+      // slot IDs, physical allocation, insertion order, and hash collisions.
+      const uint32_t owner = (static_cast<uint32_t>(query) << 29) |
+                             (static_cast<uint32_t>(logical_token) >> 2);
+      atomicMin(logical_owners + slot, owner);
       return;
     }
     slot = (slot + 1) & (kGroupedSparseHashCapacity - 1);
@@ -3741,15 +3759,13 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
     const int physical_page_stride, const int num_cache_blocks) {
   const int group_idx = blockIdx.x;
   const int tid = threadIdx.x;
-  __shared__ int category_counts[8];
-  __shared__ int category_offsets[8];
-  __shared__ int category_cursors[8];
-  __shared__ int
-      warp_category_prefix[(kGroupedSparsePlannerThreads / kWarpSize) * 8];
   extern __shared__ unsigned long long hash_table[];
+  auto* logical_owners =
+      reinterpret_cast<uint32_t*>(hash_table + kGroupedSparseHashCapacity);
   for (int slot = tid; slot < kGroupedSparseHashCapacity;
        slot += kGroupedSparsePlannerThreads) {
     hash_table[slot] = kGroupedSparseEmptyEntry;
+    logical_owners[slot] = UINT_MAX;
   }
   __syncthreads();
 
@@ -3793,8 +3809,9 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
             first_token, request_idx, request_block_table,
             request_block_table_stride, block_table_width, page_size,
             physical_page_stride, num_cache_blocks);
-        grouped_sparse_hash_insert(hash_table, physical_microblock,
-                                   0xFu << (query * 4));
+        grouped_sparse_hash_insert(hash_table, logical_owners,
+                                   physical_microblock, 0xFu << (query * 4),
+                                   query, first_token);
       } else {
 #pragma unroll
         for (int token_offset = 0; token_offset < 4; ++token_offset) {
@@ -3804,8 +3821,9 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
                 token, request_idx, request_block_table,
                 request_block_table_stride, block_table_width, page_size,
                 physical_page_stride, num_cache_blocks);
-            grouped_sparse_hash_insert(hash_table, physical_microblock,
-                                       1u << (query * 4 + (token & 3)));
+            grouped_sparse_hash_insert(
+                hash_table, logical_owners, physical_microblock,
+                1u << (query * 4 + (token & 3)), query, token);
           }
         }
       }
@@ -3842,10 +3860,45 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
             request_block_table_stride, block_table_width, page_size,
             physical_page_stride, num_cache_blocks);
         const uint32_t tail_mask = ((1u << tail_count) - 1) << (query * 4);
-        grouped_sparse_hash_insert(hash_table, physical_microblock, tail_mask);
+        grouped_sparse_hash_insert(hash_table, logical_owners,
+                                   physical_microblock, tail_mask, query,
+                                   selected_tail_token);
       }
     }
   }
+  __syncthreads();
+
+  // Keep the existing physical-page union and masks, but never let physical
+  // hash slots determine the attention reduction order. Category is primary
+  // to preserve active-tile packing; the logical owner orders each category.
+  unsigned long long entries[kGroupedSparseItemsPerThread];
+  unsigned long long sort_keys[kGroupedSparseItemsPerThread];
+#pragma unroll
+  for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
+    const int slot = tid * kGroupedSparseItemsPerThread + item;
+    const unsigned long long entry = hash_table[slot];
+    entries[item] = entry;
+    const int category =
+        grouped_sparse_active_m_tiles(static_cast<uint32_t>(entry >> 32));
+    sort_keys[item] = static_cast<uint32_t>(entry) == 0xffffffffu
+                          ? ULLONG_MAX
+                          : (static_cast<unsigned long long>(category) << 32) |
+                                logical_owners[slot];
+  }
+  __syncthreads();
+  auto& sort_storage =
+      *reinterpret_cast<GroupedSparseSort::TempStorage*>(hash_table);
+  // Three category bits, 32 owner bits, and one bit separating empty slots.
+  GroupedSparseSort(sort_storage).Sort(sort_keys, entries, 0, 36);
+  __syncthreads();
+#pragma unroll
+  for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
+    hash_table[tid * kGroupedSparseItemsPerThread + item] = entries[item];
+  }
+  auto* category_counts = reinterpret_cast<int*>(logical_owners);
+  int* category_offsets = category_counts + 8;
+  int* category_cursors = category_offsets + 8;
+  int* warp_category_prefix = category_cursors + 8;
   __syncthreads();
 
   if (tid < 8) {
@@ -4006,17 +4059,16 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "grouped sparse page4 planner supports SM70 only");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  constexpr size_t kPlannerSharedMemory =
-      kGroupedSparseHashCapacity * sizeof(unsigned long long);
-  const cudaError_t smem_status = cudaFuncSetAttribute(
-      grouped_sparse_page4_plan_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, kPlannerSharedMemory);
+  const cudaError_t smem_status =
+      cudaFuncSetAttribute(grouped_sparse_page4_plan_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kGroupedSparsePlannerSharedMemory);
   TORCH_CHECK(smem_status == cudaSuccess,
               "Failed to set grouped sparse page4 planner shared memory: ",
               cudaGetErrorString(smem_status));
-  grouped_sparse_page4_plan_kernel<<<static_cast<unsigned>(num_groups),
-                                     kGroupedSparsePlannerThreads,
-                                     kPlannerSharedMemory, stream>>>(
+  grouped_sparse_page4_plan_kernel<<<
+      static_cast<unsigned>(num_groups), kGroupedSparsePlannerThreads,
+      kGroupedSparsePlannerSharedMemory, stream>>>(
       logical_indices.data_ptr<int>(), block_table.data_ptr<int>(),
       token_to_req.data_ptr<int>(), query_positions.data_ptr<int64_t>(),
       sequence_lengths.data_ptr<int>(), output_blocks.data_ptr<int>(),
