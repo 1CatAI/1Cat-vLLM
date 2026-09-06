@@ -88,7 +88,8 @@ class LogitBiasState:
 
         # Min tokens.
         min_tokens = sampling_params.min_tokens
-        min_len = prompt_len + min_tokens
+        # Sampling uses the zero-based position of the last input token.
+        min_len = prompt_len + min_tokens - 1
         self.min_lens.np[req_idx] = min_len
         stop_token_ids = sampling_params.all_stop_token_ids
         if min_tokens > 0 and stop_token_ids:

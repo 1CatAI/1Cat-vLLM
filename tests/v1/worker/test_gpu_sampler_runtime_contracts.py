@@ -14,6 +14,9 @@ from vllm.v1.sample.ops.bad_words import _apply_bad_words_single_batch
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.prompt_logprob import (
+    compute_prompt_logprobs_with_chunking,
+)
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -86,7 +89,8 @@ def _batch(slots):
 
 @pytest.mark.parametrize("vocab_size", [257, 248320])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_full_vocab_logprobs_are_not_the_none_sentinel(vocab_size, mixed):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_full_vocab_logprobs_are_not_the_none_sentinel(vocab_size, mixed, dtype):
     reqs = _request_state(vocab_size)
     sampler = Sampler(2, vocab_size, torch.device("cuda"), reqs)
     slots = []
@@ -106,7 +110,11 @@ def test_full_vocab_logprobs_are_not_the_none_sentinel(vocab_size, mixed):
     sampler.apply_staged_writes()
     batch = _batch(slots)
     assert not sampler.can_use_sm70_greedy_token_fastpath(batch)
-    logits = torch.linspace(-5, 5, vocab_size, device="cuda").repeat(len(slots), 1)
+    logits = (
+        torch.linspace(-5, 5, vocab_size, device="cuda").to(dtype).repeat(len(slots), 1)
+    )
+    # Keep the winner unique even after casting a large vocabulary to FP16.
+    logits[:, -1] = 6
     result = sampler(logits, batch)
     output = result.logprobs_tensors
     assert output is not None
@@ -117,6 +125,28 @@ def test_full_vocab_logprobs_are_not_the_none_sentinel(vocab_size, mixed):
     )
     torch.testing.assert_close(output.logprobs, expected, atol=2e-5, rtol=1e-5)
     assert result.sampled_token_ids[:, 0].tolist() == [vocab_size - 1] * len(slots)
+
+
+@pytest.mark.parametrize("count", [-1, 2])
+def test_prompt_logprobs_shared_helper_across_chunk_boundary(count):
+    vocab_size = 257
+    logits = torch.linspace(-5, 5, vocab_size, device="cuda").half().repeat(1025, 1)
+    prompt_ids = torch.full((1025,), 77, dtype=torch.int64, device="cuda")
+    ids, values, ranks = compute_prompt_logprobs_with_chunking(
+        prompt_ids, logits, lambda chunk: chunk, count
+    )
+    columns = 1 + (vocab_size if count == -1 else count)
+    assert values.shape == (1025, columns)
+    assert values.dtype == torch.float32
+    torch.testing.assert_close(ids[:, 0], prompt_ids)
+    expected = torch.log_softmax(logits.float(), dim=-1).gather(1, ids.long())
+    torch.testing.assert_close(values, expected, atol=2e-5, rtol=1e-5)
+    expected_ranks = (logits >= logits[:, 77:78]).sum(dim=-1)
+    torch.testing.assert_close(ranks, expected_ranks)
+    if count == -1:
+        assert torch.all(
+            ids[:, 1:].sort(dim=-1).values == torch.arange(vocab_size, device="cuda")
+        )
 
 
 @pytest.mark.parametrize("drafts", [[], [7], [7, 8], [7, 8, 7]])
@@ -144,3 +174,62 @@ def test_bad_words_follow_current_draft_prefix(drafts):
         _apply_bad_words_single_batch(expected[row], words, [5, *drafts[:row]])
     state.apply_bad_words(logits, mapping, np.array([slot]), inputs, local_pos)
     torch.testing.assert_close(logits.cpu(), expected, atol=0, rtol=0)
+
+
+def test_min_tokens_graph_replay_crosses_boundary():
+    state = LogitBiasState(1, torch.device("cuda"))
+    state.add_request(0, 17, SamplingParams(min_tokens=2, stop_token_ids=[44]))
+    state.apply_staged_writes()
+    positions = torch.tensor([17], device="cuda")
+    mapping = torch.zeros(1, dtype=torch.int32, device="cuda")
+    template = torch.zeros(1, 128, device="cuda")
+    template[:, 44] = 10
+    output = template.clone()
+    state.apply_logit_bias(output, mapping, np.array([0]), positions)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output.copy_(template)
+        state.apply_logit_bias(output, mapping, np.array([0]), positions)
+    for generated in (1, 2, 3, 1, 2):
+        positions.fill_(17 + generated - 1)
+        graph.replay()
+        assert torch.isneginf(output[0, 44]).item() == (generated < 2)
+
+
+def test_bad_words_graph_replay_and_request_slot_reuse():
+    reqs = _request_state(128)
+    reqs.add_request("first", 2, [1, 2, 5], 3, 8)
+    slot = reqs.req_id_to_index["first"]
+    state = BadWordsState(reqs)
+    words = [[7, 9], [5, 10], [7, 8, 11], [8, 7, 12]]
+    params = SamplingParams(_bad_words_token_ids=words)
+    state.add_request(slot, params)
+    reqs.apply_staged_writes()
+    state.apply_staged_writes()
+    inputs = torch.tensor([5, 7, 8], dtype=torch.int32, device="cuda")
+    positions = torch.arange(3, dtype=torch.int32, device="cuda")
+    mapping = torch.full_like(positions, slot)
+    template = torch.arange(128, device="cuda", dtype=torch.float32).repeat(3, 1)
+    output = template.clone()
+    state.apply_bad_words(output, mapping, np.array([slot]), inputs, positions)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output.copy_(template)
+        state.apply_bad_words(output, mapping, np.array([slot]), inputs, positions)
+    for drafts in ([7, 8], [8, 7], [7, 8]):
+        inputs.copy_(torch.tensor([5, *drafts], dtype=torch.int32, device="cuda"))
+        graph.replay()
+        expected = template.cpu()
+        for row in range(3):
+            _apply_bad_words_single_batch(expected[row], words, [5, *drafts[:row]])
+        torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+    reqs.remove_request("first")
+    reqs.add_request("second", 2, [1, 2, 5], 3, 8)
+    assert reqs.req_id_to_index["second"] == slot
+    state.add_request(slot, SamplingParams())
+    reqs.apply_staged_writes()
+    state.apply_staged_writes()
+    output.copy_(template)
+    state.apply_bad_words(output, mapping, np.array([slot]), inputs, positions)
+    torch.testing.assert_close(output, template, atol=0, rtol=0)

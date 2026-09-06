@@ -78,12 +78,16 @@ def _ranks_kernel(
 def compute_token_logprobs(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> torch.Tensor:
-    # NOTE(woosuk): To save GPU memory, we do not materialize the full
+    # For small requested subsets, avoid materializing the full
     # [batch_size, vocab_size] logprobs tensor. The kernel computes
     # max + logsumexp per row and only emits logprobs at `token_ids`.
     batch_size, vocab_size = logits.shape
     token_ids = token_ids.to(torch.int64)
     num_logprobs = token_ids.shape[1]
+    if num_logprobs >= vocab_size:
+        # Full-vocabulary requests already return a dense row. Avoid expanding
+        # all output IDs into one enormous small-top-k Triton program.
+        return torch.log_softmax(logits.float(), dim=-1).gather(1, token_ids)
     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
     _topk_log_softmax_kernel[(batch_size,)](
         logprobs,
