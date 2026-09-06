@@ -24,7 +24,7 @@ from benchmarks.kernels.flashinfer_sm70_gdn_conv import FusedGDN, build
 from benchmarks.kernels.sm70_paired_stats import paired_latency_interval
 
 
-def screen(rows, weights, steps, repeats):
+def screen(rows, weights, steps, repeats, candidate="two_phase"):
     hidden, hq, hv, wqkv, ba, cw, A, dt = weights
     torch.manual_seed(20260906)
     x = torch.randn(rows, hidden, device="cuda", dtype=torch.float16)
@@ -36,7 +36,9 @@ def screen(rows, weights, steps, repeats):
     indices = torch.arange(rows, device="cuda", dtype=torch.int32)
     packed = ba.T.contiguous()
     bias = x.new_empty(0)
-    ops = [FusedGDN(rows, hq, hv, hidden=hidden, two_phase=p) for p in (False, True)]
+    ops = [
+        FusedGDN(rows, hq, hv, hidden=hidden, **{candidate: p}) for p in (False, True)
+    ]
     calls = [
         lambda i=i: ops[i](
             x, packed, raw, cw, bias, convs[i], A, dt, states[i], indices
@@ -99,6 +101,9 @@ def main():
     parser.add_argument("--baseline-library", type=Path, required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16, 32, 64])
     parser.add_argument("--steps", type=int, default=256)
+    parser.add_argument(
+        "--candidate", choices=("two_phase", "shared_parameters"), default="two_phase"
+    )
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -109,10 +114,15 @@ def main():
     check_exclusive()
     torch.ops.load_library(str(args.baseline_library.resolve()))
     weights = load_weights(args.model)
-    build(hidden=weights[0], q_heads=weights[1], v_heads=weights[2], two_phase=True)
+    build(
+        hidden=weights[0],
+        q_heads=weights[1],
+        v_heads=weights[2],
+        **{args.candidate: True},
+    )
     results = []
     for rows in args.rows:
-        result = screen(rows, weights, args.steps, args.repeats)
+        result = screen(rows, weights, args.steps, args.repeats, args.candidate)
         print(json.dumps(result), flush=True)
         results.append(result)
         check_exclusive()
@@ -120,6 +130,7 @@ def main():
     args.output.write_text(
         json.dumps(
             dict(
+                candidate=args.candidate,
                 scope=(
                     "native GDN BA+conv+recurrent only; not full model quality or speed"
                 ),

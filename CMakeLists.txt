@@ -778,6 +778,32 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   target_compile_definitions(_sm70_flashinfer_C PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
   target_link_libraries(_sm70_flashinfer_C PRIVATE
     "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
+
+  # Independent fragment: component overrides cannot double-register an
+  # existing operator when the MQA-only library is already loaded.
+  set(VLLM_SM70_FLASHINFER_GDN_SRCS
+    "csrc/flashinfer_sm70/gdn_h2560_q4_v12.cu"
+    "csrc/flashinfer_sm70/gdn_h2560_q8_v24.cu"
+    "csrc/flashinfer_sm70/gdn_h2560_q16_v48.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_SM70_FLASHINFER_GDN_SRCS}"
+    CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+  define_extension_target(
+    _sm70_flashinfer_gdn_C
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${VLLM_SM70_FLASHINFER_GDN_SRCS}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/flashinfer-sm70/include"
+    USE_SABI 3
+    WITH_SOABI)
+  set_target_properties(_sm70_flashinfer_gdn_C PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
+  target_compile_definitions(_sm70_flashinfer_gdn_C PRIVATE TORCH_API_INCLUDE_EXTENSION_H)
+  target_link_libraries(_sm70_flashinfer_gdn_C PRIVATE
+    "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so")
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")

@@ -175,6 +175,60 @@ def test_plan_selection_order_and_graph_relocation(extension, page_size):
         assert masks[0, :count].cpu().tolist() == expected_masks
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_plan_live_union_crosses_sort_tiles_during_graph_replay(extension, reverse):
+    # Eight independent requests can contribute 512 complete microblocks and
+    # one partial tail each. Exercise every compact-sort transition, including
+    # empty -> maximum -> empty, without recapturing or changing addresses.
+    sizes = [
+        0,
+        1,
+        511,
+        512,
+        513,
+        1023,
+        1024,
+        1025,
+        2047,
+        2048,
+        2049,
+        4095,
+        4096,
+        4097,
+        4104,
+        0,
+    ]
+    if reverse:
+        sizes.reverse()
+    table = torch.arange(8 * 513, dtype=torch.int32).reshape(8, 513)
+    requests = torch.arange(8, dtype=torch.int32)
+
+    def make_union(size):
+        counts = torch.tensor([size // 8 + (row < size % 8) for row in range(8)])
+        visible = torch.where(counts == 513, 2049, counts * 4).to(torch.int32)
+        indices = torch.arange(WIDTH, dtype=torch.int32).expand(8, -1).clone()
+        indices[indices >= visible[:, None]] = -1
+        return indices, table, requests, visible.to(torch.int64) - 1, visible
+
+    pages, masks, lengths, launch, device_case = run_plan(
+        extension, make_union(0), 4, 1
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for size in sizes:
+        case = make_union(size)
+        for source, target in zip(case, device_case):
+            target.copy_(source)
+        expected_pages, expected_masks = reference(case, 4, 1)
+        for _ in range(2):
+            graph.replay()
+            count = len(expected_pages)
+            assert int(lengths[0]) == count * 4
+            assert pages[0, :count].cpu().tolist() == expected_pages
+            assert masks[0, :count].cpu().tolist() == expected_masks
+
+
 @pytest.mark.parametrize("interleaved", [False, True])
 @pytest.mark.parametrize("kv_dtype", ["auto", "fp8_e4m3"])
 def test_attention_is_bitwise_invariant_to_physical_relocation(

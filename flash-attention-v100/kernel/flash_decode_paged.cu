@@ -15,6 +15,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 
 #include "fp8_kv_utils.cuh"
 #include "fused_mma.h"
@@ -3745,6 +3746,44 @@ __device__ __forceinline__ int grouped_sparse_active_m_tiles(
   return active_m_tiles;
 }
 
+// Sort only the device-compacted live union. The physical-page union, logical
+// owner tie break, category padding and attention arithmetic are unchanged.
+// Compact storage, sorting scratch and category scans reuse the same 96 KiB.
+template <int ITEMS_PER_THREAD>
+__device__ __forceinline__ void grouped_sparse_sort_compacted(
+    unsigned long long* entries_smem, uint32_t* owners_smem,
+    const int live_entries) {
+  using Sort =
+      cub::BlockRadixSort<unsigned long long, kGroupedSparsePlannerThreads,
+                          ITEMS_PER_THREAD, unsigned long long>;
+  static_assert(sizeof(typename Sort::TempStorage) <=
+                kGroupedSparsePlannerSharedMemory);
+  unsigned long long entries[ITEMS_PER_THREAD];
+  unsigned long long keys[ITEMS_PER_THREAD];
+#pragma unroll
+  for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+    const int index = threadIdx.x * ITEMS_PER_THREAD + item;
+    const auto entry =
+        index < live_entries ? entries_smem[index] : kGroupedSparseEmptyEntry;
+    entries[item] = entry;
+    const int category =
+        grouped_sparse_active_m_tiles(static_cast<uint32_t>(entry >> 32));
+    keys[item] = index < live_entries
+                     ? (static_cast<unsigned long long>(category) << 32) |
+                           owners_smem[index]
+                     : ULLONG_MAX;
+  }
+  __syncthreads();
+  auto& scratch = *reinterpret_cast<typename Sort::TempStorage*>(entries_smem);
+  Sort(scratch).Sort(keys, entries, 0, 36);
+  __syncthreads();
+#pragma unroll
+  for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+    entries_smem[threadIdx.x * ITEMS_PER_THREAD + item] = entries[item];
+  }
+  __syncthreads();
+}
+
 __global__
 __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_plan_kernel(
     const int* __restrict__ logical_indices,
@@ -3872,28 +3911,59 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   // hash slots determine the attention reduction order. Category is primary
   // to preserve active-tile packing; the logical owner orders each category.
   unsigned long long entries[kGroupedSparseItemsPerThread];
-  unsigned long long sort_keys[kGroupedSparseItemsPerThread];
+  uint32_t owners[kGroupedSparseItemsPerThread];
+  int local_count = 0;
 #pragma unroll
   for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
     const int slot = tid * kGroupedSparseItemsPerThread + item;
     const unsigned long long entry = hash_table[slot];
     entries[item] = entry;
-    const int category =
-        grouped_sparse_active_m_tiles(static_cast<uint32_t>(entry >> 32));
-    sort_keys[item] = static_cast<uint32_t>(entry) == 0xffffffffu
-                          ? ULLONG_MAX
-                          : (static_cast<unsigned long long>(category) << 32) |
-                                logical_owners[slot];
+    owners[item] = logical_owners[slot];
+    local_count += static_cast<uint32_t>(entry) != 0xffffffffu;
   }
   __syncthreads();
-  auto& sort_storage =
-      *reinterpret_cast<GroupedSparseSort::TempStorage*>(hash_table);
-  // Three category bits, 32 owner bits, and one bit separating empty slots.
-  GroupedSparseSort(sort_storage).Sort(sort_keys, entries, 0, 36);
+  using Scan = cub::BlockScan<int, kGroupedSparsePlannerThreads>;
+  auto& scan_storage = *reinterpret_cast<Scan::TempStorage*>(hash_table);
+  int compact_offset = 0, live_entries = 0;
+  Scan(scan_storage).ExclusiveSum(local_count, compact_offset, live_entries);
+  __syncthreads();
+  // Publish the aggregate outside BlockScan scratch, then read it before
+  // compacted owner writes can overwrite this temporary scalar.
+  if (tid == 0) logical_owners[0] = live_entries;
+  __syncthreads();
+  live_entries = logical_owners[0];
   __syncthreads();
 #pragma unroll
   for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
-    hash_table[tid * kGroupedSparseItemsPerThread + item] = entries[item];
+    if (static_cast<uint32_t>(entries[item]) != 0xffffffffu) {
+      hash_table[compact_offset] = entries[item];
+      logical_owners[compact_offset++] = owners[item];
+    }
+  }
+  __syncthreads();
+  int sorted_items = kGroupedSparsePlannerThreads;
+  while (sorted_items < live_entries) sorted_items *= 2;
+  switch (sorted_items / kGroupedSparsePlannerThreads) {
+    case 1:
+      grouped_sparse_sort_compacted<1>(hash_table, logical_owners,
+                                       live_entries);
+      break;
+    case 2:
+      grouped_sparse_sort_compacted<2>(hash_table, logical_owners,
+                                       live_entries);
+      break;
+    case 4:
+      grouped_sparse_sort_compacted<4>(hash_table, logical_owners,
+                                       live_entries);
+      break;
+    case 8:
+      grouped_sparse_sort_compacted<8>(hash_table, logical_owners,
+                                       live_entries);
+      break;
+    default:
+      grouped_sparse_sort_compacted<16>(hash_table, logical_owners,
+                                        live_entries);
+      break;
   }
   auto* category_counts = reinterpret_cast<int*>(logical_owners);
   int* category_offsets = category_counts + 8;
@@ -3907,7 +3977,7 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
     category_cursors[tid] = 0;
   }
   __syncthreads();
-  for (int slot = tid; slot < kGroupedSparseHashCapacity;
+  for (int slot = tid; slot < sorted_items;
        slot += kGroupedSparsePlannerThreads) {
     const unsigned long long entry = hash_table[slot];
     if (static_cast<uint32_t>(entry) != 0xffffffffu) {
@@ -3930,7 +4000,7 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   constexpr int kPlannerWarps = kGroupedSparsePlannerThreads / kWarpSize;
   const int lane = tid & (kWarpSize - 1);
   const int warp = tid / kWarpSize;
-  for (int chunk_start = 0; chunk_start < kGroupedSparseHashCapacity;
+  for (int chunk_start = 0; chunk_start < sorted_items;
        chunk_start += kGroupedSparsePlannerThreads) {
     const unsigned long long entry = hash_table[chunk_start + tid];
     const uint32_t physical_microblock = static_cast<uint32_t>(entry);

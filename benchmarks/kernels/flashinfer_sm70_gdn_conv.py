@@ -16,13 +16,23 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SHA = "6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f"
 
 
-def namespace(hidden, q_heads, v_heads, rows_per_warp=8, two_phase=False):
+def namespace(
+    hidden, q_heads, v_heads, rows_per_warp=8, two_phase=False, shared_parameters=False
+):
     suffix = "" if rows_per_warp == 8 else f"_r{rows_per_warp}"
     suffix += "_p2" if two_phase else ""
+    suffix += "_shared" if shared_parameters else ""
     return f"_C_flashinfer_gdn_sm70_h{hidden}_q{q_heads}_v{v_heads}{suffix}"
 
 
-def build(hidden=2560, q_heads=4, v_heads=12, rows_per_warp=8, two_phase=False):
+def build(
+    hidden=2560,
+    q_heads=4,
+    v_heads=12,
+    rows_per_warp=8,
+    two_phase=False,
+    shared_parameters=False,
+):
     from torch.utils.cpp_extension import load
 
     if min(hidden, q_heads, v_heads) <= 0 or v_heads % q_heads:
@@ -31,7 +41,9 @@ def build(hidden=2560, q_heads=4, v_heads=12, rows_per_warp=8, two_phase=False):
         raise ValueError("Screened row tiles are 4 or 8")
     if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
         raise RuntimeError("Set TORCH_CUDA_ARCH_LIST=7.0")
-    op_namespace = namespace(hidden, q_heads, v_heads, rows_per_warp, two_phase)
+    op_namespace = namespace(
+        hidden, q_heads, v_heads, rows_per_warp, two_phase, shared_parameters
+    )
     return load(
         name=op_namespace[3:],
         sources=[str(ROOT / "benchmarks/csrc/sm70_flashinfer_gdn_conv.cu")],
@@ -52,6 +64,7 @@ def build(hidden=2560, q_heads=4, v_heads=12, rows_per_warp=8, two_phase=False):
             "-DFI_GDN_CONV_WIDTH=4",
             "-DFI_GDN_CONV_STATE_LEN=3",
             f"-DFI_GDN_TWO_PHASE={int(two_phase)}",
+            f"-DFI_GDN_SHARED_PARAMETERS={int(shared_parameters)}",
         ]
         + ([f"-DFI_GDN_ROWS_PER_WARP={rows_per_warp}"] if rows_per_warp != 8 else []),
         is_python_module=False,
@@ -69,6 +82,7 @@ class FusedGDN:
         hidden=2560,
         rows_per_warp=8,
         two_phase=False,
+        shared_parameters=False,
     ):
         if (
             not 1 <= rows <= 64
@@ -77,7 +91,10 @@ class FusedGDN:
         ):
             raise ValueError("Require 1..64 rows, positive geometry and integral GQA")
         self.run = getattr(
-            torch.ops, namespace(hidden, q_heads, v_heads, rows_per_warp, two_phase)
+            torch.ops,
+            namespace(
+                hidden, q_heads, v_heads, rows_per_warp, two_phase, shared_parameters
+            ),
         ).run
         self.output = torch.empty(
             rows, v_heads, 128, device=device, dtype=torch.float16

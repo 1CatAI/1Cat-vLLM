@@ -486,3 +486,281 @@ remain exact at B1/4/8/16/32/64. Splitting the phases regresses B4/8/16 by
 4.22%/0.51%/3.91%, not admissions or justification to replace the existing M1
 route. No new end-to-end score has been measured. CPU routing, statistics and
 compiled-boundary tests now pass 36/36 (`fi-cpu-v4.log`).
+
+### Adopted #494 and reduced its stable-plan overhead
+
+The reviewed dependency is cherry-picked as `3e0f7a40c1`, retaining the
+original author and sign-offs. Its rebuilt Flash-V100 library passes 78
+QSA/MQA tests in this integration (`pr494-gates-v1.log`), including the 31
+MQA tests above. These are overlapping suites, not 78 additional MQA tests.
+
+Real layer-3 NVFP4 Q/K/V replay also confirms #494 allocation invariance.
+Unlike the retired diagnostic prototype, its fixed 8192-entry radix sort
+costs 653.26 us for captured 2048-row planner + attention + output gate,
+versus 433.00 us in the unsafe frozen reference. Neither timing includes
+the QSA indexer or the complete model. Artifact: `pr494-real-replay-v1.json`.
+Reference #494 library SHA256:
+`a99cce1f5fe32d61ef42525435401c4d24ddff53894eafe64cc534efa937ea23`.
+
+The follow-up retains #494's physical-page union, minimum logical owner,
+category padding and exact sorted order. After loading the hash entries into
+registers, a device block scan compacts valid entries, then chooses a
+512/1024/2048/4096/8192-entry sort. All shared memory is reused within the
+original 96-KiB budget; no host length readback or captured pointer changes
+are introduced. The planner remains 128 registers/thread with zero local
+spills according to `cuobjdump` (static resource data, not measured occupancy).
+
+Current adaptive binary SHA256:
+`1c6fc18851e551950885c48ba0d108be919efcb6f4e0f6ca27e69ecb6e8fcd33`.
+Validation:
+
+- 80 tests pass, including new empty-to-maximum live-union transitions across
+  every sort-size boundary inside one captured graph and in reverse order.
+- Twelve physical relocations of the captured real input are bitwise exact
+  against #494's fixed-sort output, including gate materialization.
+- Five alternating A/B blocks: **653.21 -> 458.50 us**, 29.81% reduction,
+  within-run paired 95% interval **[29.76%, 29.85%]**. This recovers most of
+  the stability-fix overhead; it is not an endpoint speed claim and remains
+  slower than the allocator-dependent unsafe reference.
+- Artifacts: `pr494-adaptive-gates-v1.log`,
+  `pr494-adaptive-real-replay-v1.{json,log}` and both build logs/libraries.
+  The two changing-sort-size graph cases also pass Compute Sanitizer memcheck
+  with zero errors (`pr494-adaptive-memcheck-v1.log`); wider prefill performance
+  and racecheck remain pending.
+
+### GDN shared-parameter screen: reject for C8/C16
+
+An isolated compile-time variant computes the unchanged gate reduction and
+Q/K normalization once per CTA, sharing the results among its eight warps.
+It preserves all FP16 round trips and FP32 state and introduces no global
+workspace. The default kernel does not select this variant.
+
+All B1/2/4/8/16/32/64 cases preserve output, conv, recurrent state and BA
+partials exactly over 256 changing-input graph steps, including slot
+permutation and negative padding. Full-width timing is restored after the
+padding history. Actual checkpoint weights, synthetic hidden inputs:
+
+| Rows | Frozen cooperative us | Shared-parameter us | Reduction |
+| --- | ---: | ---: | ---: |
+| 1 | 9.820 | 9.779 | 0.42% |
+| 2 | 10.424 | 10.557 | -1.28% |
+| 4 | 12.923 | 12.728 | 1.51% |
+| 8 | 22.180 | 22.477 | -1.34% |
+| 16 | 45.926 | 46.326 | -0.87% |
+| 32 | 84.306 | 85.627 | -1.57% |
+| 64 | 163.308 | 165.827 | -1.54% |
+
+The extra CTA barriers/shared accesses erase the eliminated computation in
+the target batch range. This is consistent with the measurement, not an NCU
+stall attribution. Register count is 123 versus 122, no spills, 1036 extra
+shared bytes. Do not enable at C8/C16 or use the tiny M1 difference to replace
+the established M1 route. Artifact: `gdn-shared-v1.{json,log}`. The separate
+split-phase experiment also remains rejected; neither is a runtime default.
+
+### HC gate and repaired quality control
+
+The real 96-module HC graph screen stops at B4's numerical gate; no B4/8/16
+speed result is admitted. Four-rank artifacts localize the first over-envelope
+output to **HC module 9, normalized input (output index 37)**. The same two
+elements exceed `atol=rtol=3e-3` on every rank. The failure itself is retained
+and the tolerance has not been relaxed. Artifacts:
+`hc-full-b4-v1.log`, `hc-full-b4-v2.log`, and
+`hc-full-b4-v2.rank{0,1,2,3}.failure.pt`. A communication-free arithmetic
+replay is prepared to separate GEMM rounding propagation from IPC errors.
+This numerical rejection alone does not quantify task-score regression.
+
+The expanded quality set was frozen before observing any expanded results:
+`expanded-quality-preregistered-v1.json`, SHA256
+`72ad0a68931252ade99ac4b4ed042c8de39a33a7f175c6e085c1850efdd8903d`.
+It retains the original 80 cases, registers BFCL four categories x 128,
+64 schema cases, GSM8K 128, full HumanEval 164, and three fixed seed bases.
+HTTP/SSE, long multi-turn fixtures and the isolated coding evaluator remain
+pending. It is a registration artifact, not completed quality evidence.
+
+A repaired 80-case control now uses the same original prompt IDs, natural
+EOS and 16K limit, with **batch HC and grouped MoE disabled** as well as the
+FlashInfer parent switch. Both arms use the same adaptive #494 library.
+This removes experimental components from the quality truth; do not compare
+its speed to the frozen performance control. On GPU 0--3 the control scores
+51/64 BFCL (15/11/14/11 by category) and 16/16 schema, zero truncations.
+Candidate testing is pending; prior negative BFCL results remain on record.
+Artifacts: `repaired-quality80-v1/control/`, its log and
+`run-repaired-quality80.{py,sh}`. The model's normal shutdown retains one
+resource-tracker shared-memory cleanup warning; this is not a leak-free
+runtime admission. Model workers exited, remote services remain untouched.
+
+### HC arithmetic attribution and compact MoE rejection
+
+The communication-free HC replay now **exactly reproduces both tensors** in
+the saved four-rank failure, using only the same sharded versus replicated
+GEMMs and existing pointwise operations. Common-input probes first differ at
+HC module 0's down projection: 696/1296 FP16 values differ, relative L2
+0.00038058. The independent chains then diverge through injection and
+normalization, reaching the recorded gate failure at module 9. This isolates
+that failure to projection-arithmetic association, not IPC visibility or
+stale buffers. It does not rule out unrelated communication bugs or prove
+model-quality noninferiority. Artifacts: `localize-hc-arithmetic.py`,
+`hc-arithmetic-prefix-v1.{json,log}`. Do not relax the failed gate.
+
+MoE work consumption reused the existing device group table and native
+W13/activation/W2/reduction math. On actual checkpoint layer-0/rank-0 weights
+and captured routes, full-chain microseconds were:
+
+| Rows / groups | Existing | Compact W13+W2 v1 |
+| --- | ---: | ---: |
+| 4 / 40 | 65.338 | 76.832 |
+| 8 / 71 | 97.446 | 140.448 |
+| 16 / 99 | 129.696 | 164.890 |
+
+The first W2 mapping also colocated adjacent N tiles, confounding compaction
+with the previously tested locality idea. A second screen restores the exact
+original four-expert/common-N-tile CTA mapping and tests **W2 only**, without
+rerunning the rejected W13 variants. It still loses: captured C16 W2
+**43.302 -> 53.523 us**, complete MoE **131.411 -> 141.158 us**, paired
+within-run full-chain reduction interval **[-7.64%, -7.35%]**. All seven
+changing-route graph cases preserve W13 and final output exactly, including
+duplicate, invalid and empty-expert work. This rejects these fixed-grid loops,
+not device planning in general; an empty-CTA count alone is insufficient
+evidence of a net win. Artifacts: `moe-compact-w4-v{1,2}.{json,log}` and
+the build logs/binaries. Test data are real weights/routes with synthetic
+activations, not a model-quality result.
+
+The rejected scheduling code is retained **only as a benchmark source** in
+`benchmarks/csrc/sm70_moe_compact_tasks.cu`. The existing production
+`nvfp4_grouped_decode_sm70.cu` was restored unchanged. No CMake or serving
+dispatch selects the benchmark namespace. The pre-retirement source delta is
+retained in `moe-compact-before-retirement.patch` for exact binary provenance.
+
+### Repaired original-80 combined result: still not admitted
+
+The candidate runs on the subsequently freed GPU 4--7; the control used GPU
+0--3, same V100 host, weights, sampling, prompt IDs, cache/state contract and
+fixed cohorts. This is a quality localization run, **not a same-GPU speed
+comparison**. All four candidate workers select GDN, MQA and sparse QSA;
+batch HC and grouped MoE remain disabled in both arms.
+
+| Original subset | Production control | Combined candidate |
+| --- | ---: | ---: |
+| BFCL simple | 15/16 | 15/16 |
+| BFCL parallel | 11/16 | 10/16 |
+| BFCL multiple | 14/16 | 14/16 |
+| BFCL irrelevance | 11/16 | 11/16 |
+| JSON Schema | 16/16 | 16/16 |
+
+No truncations; all 80 first tokens match. Twelve complete outputs differ.
+Only `parallel_1` changes pass/fail: the candidate emits one valid tool call
+instead of the required two. Total BFCL is **51/64 -> 50/64**. The paired
+score delta is -1.5625 percentage points; a conservative 95% interval from
+simultaneous exact-binomial improvement/regression bounds is
+**[-9.5612, +6.5981] pp**. The interval is reported, not used to dismiss the
+negative result or declare noninferiority. This original-80 offline screen
+is not the registered expanded or HTTP/SSE suite.
+
+Artifacts: `repaired-quality80-v1/{control,candidate}/`, both logs,
+`comparison-v1.{json,log}`, and `compare-repaired-quality80.py`. The original
+adverse results remain intact. A scorer-only ablation uses the same fixed
+80 cases and no new seed selection to distinguish MQA from GDN/sparse-QSA
+effects. Full wheel, extended quality and endpoint targets remain unmet;
+keep #523 Draft and `VLLM_SM70_FLASHINFER_BATCH=0` by default.
+
+### Original-80 ablations and packaged GDN follow-up
+
+The same repaired control and original cases now have three additional
+ablations. No seed, prompt, output limit, or failed case was changed:
+
+| Arm | BFCL / 64 | Schema / 16 | New BFCL failures vs control |
+| --- | ---: | ---: | --- |
+| Production control | 51 | 16 | n/a |
+| Device-planned MQA only | 51 | 16 | none |
+| GDN only, prototype library | 52 | 16 | none |
+| MQA + wheel-component GDN, no native sparse QSA | 52 | 16 | none |
+| MQA + GDN + native sparse QSA | 50 | 16 | `parallel_1` |
+
+MQA alone preserves **all 80 complete output token lists**, not just scores.
+GDN-only and MQA+GDN improve `irrelevance_4` and have no newly failing cases;
+their 80 complete output token lists also match each other exactly.
+Their paired BFCL difference is +1.5625 pp, conservative 95% interval
+**[-6.5981, +9.5612] pp**. All arms have zero truncations and identical first
+tokens. These small offline ablations narrow the adverse signal to native
+sparse QSA and its interaction; they do not admit GDN, prove broad
+noninferiority, or substitute for registered multi-seed/HTTP/SSE tests.
+Artifacts: `repaired-quality80-v1/{mqa,gdn,mqa_gdn}/` and
+`comparison-v3.{json,log}`. Earlier comparisons remain intact.
+
+The sparse arithmetic audit identifies a concrete contract difference to
+investigate next. Production Triton attention rounds softmax probabilities
+to FP16 before its PV dot while retaining an FP32 denominator; the pinned
+FlashInfer decoder accumulates FP32 probabilities against converted values.
+Its tile/split reduction order also differs. This is a source-level lead,
+**not causal proof that one cast caused the missing tool call**. Blindly
+adding that cast does not reproduce the other reduction boundaries; a more
+accurate FP64 operator comparison does not clear the observed model failure.
+
+GDN now has a formal `_sm70_flashinfer_gdn_C` CMake/setup component, with
+separate C++ namespaces for H2560/Q4/V12, Q8/V24 and Q16/V48. The benchmark
+and package reuse one binding/header rather than diverging implementations.
+The loader resolves the installed component before capture; explicit
+preloaded prototypes prevent duplicate registration, and missing geometry
+falls back locally. No external path or worker-side compilation is required
+for this component. The source attribution now names the exact upstream
+experimental GDN path. Other shapes remain unsupported, not globally gated
+by TP degree or model name.
+
+The staged CMake component was loaded through normal package discovery in
+the MQA+GDN model arm above, without the external GDN-library override.
+Its SHA256 is
+`4003e0393021456924606ebfe93eb62f4d1dfbbfabedbccb373d859b170295c1`.
+Seven GPU graph tests pass for B1/2/4/8/16/32/64: all three head partitions
+give bitwise identical outputs, conv states and FP32 recurrent states across
+eight changing-input steps, including slot permutation, negative padding,
+SD conv layout and non-dense pool strides. This tests operator geometry
+isolation, **not distributed TP communication**. Artifact:
+`native-gdn-gates-v1.log`; build/install/import provenance is retained in
+`native-gdn-*-v1.log` and `native-gdn-stage/`.
+
+The final formatted source rebuild is staged separately in
+`native-gdn-stage-v2/`, SHA256
+`7cae0a12e1018c44e7a9d5f62a7feec85cd85bbeba92c805d18aa72c2cf2988c`.
+It imports all three namespaces without initializing CUDA. All 30,537 lines
+of disassembled SASS match the tested v1 component exactly; debug/source
+metadata changes the library hash. Artifacts: `native-gdn-build-v2.log`,
+`native-gdn-install-v2.log`, `native-gdn-v{1,2}-real.sass`. The initial
+disassembler lookup under the build CUDA shim failed because that shim has
+no `cuobjdump`; the successful comparison uses `/usr/bin/cuobjdump`, not
+the empty outputs of that failed lookup. Do not relabel the v1 model run as
+a new v2 wheel-install test.
+
+A reload audit also found that an already prepared layer could retain its
+old derived BA weights if a later reload changed to an unsupported dtype,
+layout or geometry. Initial unsupported layers still fall back, but changing
+an already captured contract now fails explicitly and requires graph
+rebuilding; silently leaving `_sm70_fi_ready` with stale weights is forbidden.
+The CPU routing/statistics/compiled-boundary suite now passes **42 tests**
+(`fi-cpu-v6.log`), including absent/preloaded component and reload guards.
+
+Coverage status for this follow-up:
+
+| Hot chain | Implemented / evidenced | Remaining gate |
+| --- | --- | --- |
+| QSA scoring/selection | Device work plan; exact production top-k/index chain wins | Wider routing, long-context and expanded quality |
+| QSA prefill plan | Reused #494; adaptive stable sort recovers overhead | Wider prefill timing and racecheck |
+| Sparse attention | Native prototype reaches actual graph execution | Retained BFCL failure; arithmetic/interaction isolation; packaging |
+| GDN | Native component; projection/BA/conv/state boundary; staged model and geometry tests | Expanded quality, full-chain B-shape admission, full wheel |
+| HC / TP | Full-chain B4 numerical failure localized to projection association | Preserve arithmetic before further overlap work; multistream/IPC gates |
+| MoE | Existing grouping retained; two compact-loop designs measured and rejected | New critical-path evidence before another scheduler change |
+
+The split-phase/shared-parameter GDN variants and compact MoE loops are not
+production selections. The full installable wheel, clean-environment
+acceptance, expanded quality, long-context capacity and new fixed-contract
+end-to-end targets remain unfinished. No 20--30% model-throughput gain or
+release default change is claimed. Keep the Draft scope and parent default
+off; do not alter the remote deployment.
+
+Publishing preflight: `onecat/main` advanced to
+`4366d9d5fe80eeaf79575b51ec36a6a032673df0`. The measured branch is not
+silently rebased onto that changing integration line; merge compatibility
+and a fresh integration gate remain required before promotion. Applicable
+source checks pass (`hot-chain-precommit-v8.log`). All model, benchmark and
+waiter processes owned by this follow-up have exited. Subsequent GPU 0--3
+and 4--7 allocations belong to other task leases and were not interrupted;
+there is no task-owned resident API or new remote service.

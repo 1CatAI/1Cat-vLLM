@@ -288,10 +288,37 @@ def main() -> None:
                     # Preserve the original M1 bitwise gate. The batched
                     # sharded GEMMs have independent rounding; bound every
                     # intermediate instead of silently ignoring differences.
-                    for a, b in zip(
-                        graphs[mode][1], graphs[timed_modes[0]][1], strict=True
+                    for index, (a, b) in enumerate(
+                        zip(graphs[mode][1], graphs[timed_modes[0]][1], strict=True)
                     ):
-                        torch.testing.assert_close(a, b, atol=3e-3, rtol=3e-3)
+                        try:
+                            torch.testing.assert_close(a, b, atol=3e-3, rtol=3e-3)
+                        except AssertionError:
+                            failure = args.out.with_suffix(f".rank{rank}.failure.pt")
+                            torch.save(
+                                {
+                                    "scope": "HC numerical gate failure, not speed",
+                                    "mode": mode,
+                                    "rows": args.rows,
+                                    "output_index": index,
+                                    "hc_module": index // 4,
+                                    "component": (
+                                        "state",
+                                        "normalized",
+                                        "block",
+                                        "injection",
+                                    )[index % 4]
+                                    if index < 384
+                                    else "final_mixer",
+                                    "candidate": a.cpu(),
+                                    "reference": b.cpu(),
+                                    "initial": initial.cpu(),
+                                    "external_core_outputs": cores.cpu(),
+                                },
+                                failure,
+                            )
+                            print(f"HC numerical gate failed: {failure}", flush=True)
+                            raise
             sum_diff = 0
             if args.fused_up:
                 actual_sum = torch.stack(graphs["fused_aux"][2])

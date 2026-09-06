@@ -24,7 +24,10 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
-namespace flashinfer::sm70::gdn {
+#ifndef FI_GDN_IMPL_NAMESPACE
+  #define FI_GDN_IMPL_NAMESPACE flashinfer::sm70::gdn
+#endif
+namespace FI_GDN_IMPL_NAMESPACE {
 
 // Fused GDN decode step for one layer geometry: a single persistent kernel
 // covering the in_proj_ba GEMV, the depthwise causal conv1d update (width 4,
@@ -32,9 +35,9 @@ namespace flashinfer::sm70::gdn {
 // qk-L2-norm, replacing the multi-launch serving chain.
 //
 // The layer geometry is a compile-time parameter of this translation unit,
-// supplied by benchmarks/kernels/flashinfer_sm70_gdn_conv.py (one JIT
-// module and Torch operator namespace per geometry, so multiple TP geometries
-// may coexist in the same process).
+// supplied by the native wheel translation units or the isolated benchmark.
+// Wheel geometries use distinct C++ and Torch namespaces, so several head
+// partitions may coexist without template/constant ODR collisions.
 // Only the sizes change: the block shape, warp->row mapping and reduction
 // trees below are geometry-independent, and the static_asserts state exactly
 // which divisibility relations the code relies on.
@@ -59,6 +62,12 @@ constexpr int HEADS_PER_QK = HV / H_Q;
 #endif
 constexpr int ROWS_PER_WARP = FI_GDN_ROWS_PER_WARP;
 constexpr int GEMV_NSPLIT = 160;
+#ifndef FI_GDN_SHARED_PARAMETERS
+  #define FI_GDN_SHARED_PARAMETERS 0
+#endif
+constexpr bool SHARED_PARAMETERS = FI_GDN_SHARED_PARAMETERS;
+static_assert(!SHARED_PARAMETERS || D % (8 * ROWS_PER_WARP) == 0,
+              "a 256-thread CTA must stay within one recurrent head");
 // The gate reduction below unrolls the GEMV partials as 5 warp-wide loads.
 static_assert(GEMV_NSPLIT == 5 * 32,
               "gate reduction assumes 5 warp-strided loads");
@@ -140,7 +149,7 @@ __device__ __forceinline__ void grid_barrier() {
 // the compiler reorder a pool load across a pool store.  The remaining
 // pointers are genuinely disjoint buffers and keep the qualifier.  The read
 // path pays for this: loads from the pools can no longer be promoted to
-// ld.global.nc. There is no production dispatch for this prototype yet.
+// ld.global.nc. Runtime admission remains opt-in, with FP32 state unchanged.
 template <bool kB1, int Phase = 0>
 __global__ void gdn_fused_decode_kernel(
     const f16* __restrict__ hidden, const f16* __restrict__ w_ba,
@@ -152,6 +161,10 @@ __global__ void gdn_fused_decode_kernel(
     long conv_stride_c, long conv_stride_t, f16* __restrict__ output,
     f16* updated_conv, float* ssm_out, float* __restrict__ ba_part,
     f16* __restrict__ conv_out, int B) {
+  // Each CTA owns half a head (8 warps x 8 rows). The exact same gate and
+  // normalized Q/K were computed eight times. The experimental shared path
+  // evaluates that unchanged reduction once, without another grid barrier.
+  __shared__ float head_parameters[SHARED_PARAMETERS ? 2 * D + 3 : 1];
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int nthreads = gridDim.x * blockDim.x;
   const int Beff = kB1 ? 1 : B;
@@ -331,61 +344,87 @@ __global__ void gdn_fused_decode_kernel(
       for (int r = 0; r < ROWS_PER_WARP; ++r)
         s4[r] = base_srow[r * (D / 4) + lane];
     }
-    // Issue the gate-partial loads early (10 concurrent warp-wide loads) so
-    // they overlap the qk-norm compute below.
-    const float* base_b = ba_part + ((long)h * Beff + b) * GEMV_NSPLIT;
-    const float* base_a = ba_part + ((long)(HV + h) * Beff + b) * GEMV_NSPLIT;
-    float b0 = base_b[lane + 0];
-    float a0v = base_a[lane + 0];
-    float b1 = base_b[lane + 32];
-    float a1v = base_a[lane + 32];
-    float b2 = base_b[lane + 64];
-    float a2v = base_a[lane + 64];
-    float b3 = base_b[lane + 96];
-    float a3v = base_a[lane + 96];
-    float b4 = base_b[lane + 128];
-    float a4v = base_a[lane + 128];
-    float qraw[4], kraw[4];
-    float qss = 0.f, kss = 0.f;
+    float qh[4], kh[4], QK, beta, g;
+    if (!SHARED_PARAMETERS || threadIdx.x < 32) {
+      // Issue the gate-partial loads early (10 concurrent warp-wide loads) so
+      // they overlap the qk-norm compute below.
+      const float* base_b = ba_part + ((long)h * Beff + b) * GEMV_NSPLIT;
+      const float* base_a = ba_part + ((long)(HV + h) * Beff + b) * GEMV_NSPLIT;
+      float b0 = base_b[lane + 0];
+      float a0v = base_a[lane + 0];
+      float b1 = base_b[lane + 32];
+      float a1v = base_a[lane + 32];
+      float b2 = base_b[lane + 64];
+      float a2v = base_a[lane + 64];
+      float b3 = base_b[lane + 96];
+      float a3v = base_a[lane + 96];
+      float b4 = base_b[lane + 128];
+      float a4v = base_a[lane + 128];
+      float qraw[4], kraw[4];
+      float qss = 0.f, kss = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      qraw[i] = __half2float(qb[k0 + i]);
-      kraw[i] = __half2float(kb[k0 + i]);
-      qss += qraw[i] * qraw[i];
-      kss += kraw[i] * kraw[i];
-    }
-    qss = warp_reduce(qss);
-    kss = warp_reduce(kss);
-    qss = __shfl_sync(0xffffffff, qss, 0);
-    kss = __shfl_sync(0xffffffff, kss, 0);
-    float qn = rsqrtf(qss + 1e-6f), kn = rsqrtf(kss + 1e-6f);
-    float qh[4], kh[4], QKp = 0.f;
+      for (int i = 0; i < 4; ++i) {
+        qraw[i] = __half2float(qb[k0 + i]);
+        kraw[i] = __half2float(kb[k0 + i]);
+        qss += qraw[i] * qraw[i];
+        kss += kraw[i] * kraw[i];
+      }
+      qss = warp_reduce(qss);
+      kss = warp_reduce(kss);
+      qss = __shfl_sync(0xffffffff, qss, 0);
+      kss = __shfl_sync(0xffffffff, kss, 0);
+      float qn = rsqrtf(qss + 1e-6f), kn = rsqrtf(kss + 1e-6f);
+      float QKp = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      qh[i] = qraw[i] * qn;
-      kh[i] = kraw[i] * kn;
-      QKp += qh[i] * kh[i];
+      for (int i = 0; i < 4; ++i) {
+        qh[i] = qraw[i] * qn;
+        kh[i] = kraw[i] * kn;
+        QKp += qh[i] * kh[i];
+      }
+      QKp = warp_reduce(QKp);
+      QK = __shfl_sync(0xffffffff, QKp, 0);
+      // gate g,beta reduced from the split-major partials (values now arrived)
+      float accb = ((b0 + b1) + (b2 + b3)) + b4;
+      float acca = ((a0v + a1v) + (a2v + a3v)) + a4v;
+      accb = warp_reduce(accb);
+      acca = warp_reduce(acca);
+      accb = __shfl_sync(0xffffffff, accb, 0);
+      acca = __shfl_sync(0xffffffff, acca, 0);
+      // The f16 round-trip of the two gate sums is load-bearing, not a
+      // leftover: the composable path materializes `ba = (hidden @ w_ba)` as a
+      // f16 tensor and only then widens it for the gates, so the values it
+      // feeds sigmoid/softplus are f16-rounded. Keeping the fp32 accumulator
+      // here would make this kernel *more* precise than the operation it
+      // implements and move the gates off the reference by up to one f16 ulp --
+      // amplified by exp() in the decay gate. Track the composable path's `ba`
+      // dtype, not the accumulator's.
+      beta = sigmoidf(__half2float(__float2half_rn(accb)));
+      float xg = __half2float(__float2half_rn(acca)) + __half2float(dt_bias[h]);
+      g = __expf(-__expf(A_log[h]) * softplusf(xg));
+      if constexpr (SHARED_PARAMETERS) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          head_parameters[k0 + i] = qh[i];
+          head_parameters[D + k0 + i] = kh[i];
+        }
+        if (lane == 0) {
+          head_parameters[2 * D] = QK;
+          head_parameters[2 * D + 1] = beta;
+          head_parameters[2 * D + 2] = g;
+        }
+      }
     }
-    QKp = warp_reduce(QKp);
-    float QK = __shfl_sync(0xffffffff, QKp, 0);
-    // gate g,beta reduced from the split-major partials (values now arrived)
-    float accb = ((b0 + b1) + (b2 + b3)) + b4;
-    float acca = ((a0v + a1v) + (a2v + a3v)) + a4v;
-    accb = warp_reduce(accb);
-    acca = warp_reduce(acca);
-    accb = __shfl_sync(0xffffffff, accb, 0);
-    acca = __shfl_sync(0xffffffff, acca, 0);
-    // The f16 round-trip of the two gate sums is load-bearing, not a leftover:
-    // the composable path materializes `ba = (hidden @ w_ba)` as a f16 tensor
-    // and only then widens it for the gates, so the values it feeds
-    // sigmoid/softplus are f16-rounded. Keeping the fp32 accumulator here
-    // would make this kernel *more* precise than the operation it implements
-    // and move the gates off the reference by up to one f16 ulp -- amplified
-    // by exp() in the decay gate. Track the composable path's `ba` dtype, not
-    // the accumulator's.
-    float beta = sigmoidf(__half2float(__float2half_rn(accb)));
-    float xg = __half2float(__float2half_rn(acca)) + __half2float(dt_bias[h]);
-    float g = __expf(-__expf(A_log[h]) * softplusf(xg));
+    if constexpr (SHARED_PARAMETERS) {
+      __syncthreads();
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        qh[i] = head_parameters[k0 + i];
+        kh[i] = head_parameters[D + k0 + i];
+      }
+      QK = head_parameters[2 * D];
+      beta = head_parameters[2 * D + 1];
+      g = head_parameters[2 * D + 2];
+    }
 #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {
       int v = v0 + r;
@@ -417,7 +456,10 @@ __global__ void gdn_fused_decode_kernel(
       if (lane == 0)
         output[((long)b * HV + h) * D + v] = __float2half_rn(out_v);
     }
+    // All eight warps have identical loop bounds and padding status. Do not
+    // let a faster warp's next head overwrite values still being consumed.
+    if constexpr (SHARED_PARAMETERS) __syncthreads();
   }
 }
 
-}  // namespace flashinfer::sm70::gdn
+}  // namespace FI_GDN_IMPL_NAMESPACE

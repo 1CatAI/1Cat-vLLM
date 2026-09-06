@@ -130,6 +130,72 @@ def test_cpu_prepare_is_a_noop(monkeypatch):
     fi.prepare(torch.nn.Module(), torch.device("cpu"))
 
 
+@pytest.mark.parametrize("existing", ["first", "second"])
+def test_preloaded_component_prevents_duplicate_fragment_registration(
+    monkeypatch, existing
+):
+    from types import SimpleNamespace
+
+    fake_ops = SimpleNamespace(first=SimpleNamespace(), second=SimpleNamespace())
+    getattr(fake_ops, existing).run = lambda: None
+    monkeypatch.setattr(torch, "ops", fake_ops)
+    monkeypatch.setattr(
+        fi.importlib.util, "find_spec", lambda *_: pytest.fail("duplicate lookup")
+    )
+    fi.load_native_fragment("unused", ("first", "second"))
+
+
+@pytest.mark.parametrize("origin", [None, "/package/vllm/native.abi3.so"])
+def test_native_fragment_missing_or_wheel_resolved(monkeypatch, origin):
+    from types import SimpleNamespace
+
+    loaded = []
+    monkeypatch.setattr(
+        torch,
+        "ops",
+        SimpleNamespace(first=SimpleNamespace(), load_library=loaded.append),
+    )
+    monkeypatch.setattr(
+        fi.importlib.util,
+        "find_spec",
+        lambda _: SimpleNamespace(origin=origin) if origin else None,
+    )
+    fi.load_native_fragment("unused", ("first",))
+    assert loaded == ([origin] if origin else [])
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_unsupported_gdn_reload_cannot_keep_stale_derived_weights(
+    monkeypatch, prepared
+):
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+
+    class UnsupportedGDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_k_heads, self.num_v_heads, self.tp_size = 16, 48, 4
+            self.in_proj_ba = NS(weight=None)
+            self.in_proj_qkvz = NS(weight=None)
+            self._sm70_fi_ready = prepared
+
+    for key in ("VLLM_SM70_FLASHINFER_GDN_LIBRARY", "VLLM_SM70_FLASHINFER_QSA_LIBRARY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        qwen_gdn_linear_attn, "QwenGatedDeltaNetAttention", UnsupportedGDN
+    )
+    monkeypatch.setattr(fi, "current_platform", NS(is_device_capability=lambda _: True))
+    monkeypatch.setattr(
+        fi, "get_current_vllm_config", lambda: NS(speculative_config=None)
+    )
+    monkeypatch.setattr(fi, "load_native_fragment", lambda *args: None)
+    layer = UnsupportedGDN()
+    if prepared:
+        with pytest.raises(RuntimeError, match="rebuild CUDA graphs"):
+            fi.prepare(layer, torch.device("cuda"))
+    else:
+        fi.prepare(layer, torch.device("cuda"))
+
+
 def test_weight_reload_preserves_captured_pointer():
     module = torch.nn.Module()
     weight = torch.randn(5, 3).half()

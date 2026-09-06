@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in integration probe for the validated FlashInfer SM70 components.
+"""Opt-in integration probe for FlashInfer-derived SM70 components.
 
 Libraries are built and loaded before graph capture. This module does not JIT
 compile, quantize weights, change scheduler state ownership, or replace HC/M1.
@@ -21,6 +21,18 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 _QSA_ZERO: dict[torch.device, torch.Tensor] = {}
 _MQA_SMS: dict[torch.device, int] = {}
+
+
+def load_native_fragment(module_name: str, namespaces: tuple[str, ...]) -> None:
+    # An explicitly preloaded prototype may own one of these namespaces.
+    # Loading the wheel fragment in that case would register it twice and abort
+    # the process. Preserve the override and locally fall back on missing shapes.
+    if any(hasattr(getattr(torch.ops, name), "run") for name in namespaces):
+        return
+    spec = importlib.util.find_spec(module_name)
+    if spec is not None and spec.origin is not None:
+        torch.ops.load_library(spec.origin)
+        logger.info("Loaded SM70 FlashInfer native fragment: %s", module_name)
 
 
 def copy_derived_buffer(layer, name, value):
@@ -72,10 +84,14 @@ def prepare(model: torch.nn.Module, device: torch.device) -> None:
             torch.ops.load_library(path)
     # Wheel-native fragment. Probes may preload the same operator explicitly;
     # never load a second definition or compile on a serving worker.
-    if not hasattr(torch.ops._C_flashinfer_mqa_sm70, "run"):
-        spec = importlib.util.find_spec("vllm._sm70_flashinfer_C")
-        if spec is not None and spec.origin is not None:
-            torch.ops.load_library(spec.origin)
+    load_native_fragment("vllm._sm70_flashinfer_C", ("_C_flashinfer_mqa_sm70",))
+    load_native_fragment(
+        "vllm._sm70_flashinfer_gdn_C",
+        tuple(
+            f"_C_flashinfer_gdn_sm70_h2560_q{q}_v{v}"
+            for q, v in ((4, 12), (8, 24), (16, 48))
+        ),
+    )
     if hasattr(torch.ops._C_flashinfer_mqa_sm70, "run"):
         concrete_device = torch.empty(0, device=device).device
         _MQA_SMS[concrete_device] = torch.cuda.get_device_properties(
@@ -106,17 +122,29 @@ def prepare(model: torch.nn.Module, device: torch.device) -> None:
             or layer.head_k_dim != 128
             or layer.head_v_dim != 128
             or ba.ndim != 2
+            or qkvz.ndim != 2
             or ba.shape != (2 * vh, qkvz.shape[1])
             or qkvz.shape[0] != (2 * qh + 2 * vh) * 128
             or layer.A_log.dtype != torch.float32
+            or layer.A_log.numel() != vh
             or layer.dt_bias.dtype != torch.float16
+            or layer.dt_bias.numel() != vh
             or layer.conv1d.weight.dtype != torch.float16
+            or layer.conv1d.weight.numel() != (2 * qh + vh) * 128 * 4
             or layer.activation != "silu"
         ):
+            if getattr(layer, "_sm70_fi_ready", False):
+                raise RuntimeError(
+                    "FlashInfer GDN prepared contract changed; rebuild CUDA graphs"
+                )
             continue
         namespace = f"_C_flashinfer_gdn_sm70_h{ba.shape[1]}_q{qh}_v{vh}"
         ops = getattr(torch.ops, namespace)
         if not hasattr(ops, "run"):
+            if getattr(layer, "_sm70_fi_ready", False):
+                raise RuntimeError(
+                    "FlashInfer GDN prepared geometry unavailable; rebuild CUDA graphs"
+                )
             continue
         copy_derived_buffer(layer, "_sm70_fi_ba", ba.t())
         copy_derived_buffer(

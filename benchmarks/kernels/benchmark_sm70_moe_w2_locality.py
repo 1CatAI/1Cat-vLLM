@@ -17,11 +17,13 @@ from pathlib import Path
 
 import torch
 
+from benchmarks.kernels.benchmark_sm70_flashinfer_gdn_conv import check_exclusive
 from benchmarks.kernels.benchmark_sm70_moe_packed_w13 import (
     checkpoint_weights,
     graph,
     latency,
 )
+from benchmarks.kernels.sm70_paired_stats import paired_latency_interval
 
 
 def main():
@@ -32,6 +34,8 @@ def main():
     experiment.add_argument("--w13-pair", action="store_true")
     experiment.add_argument("--w13-single-tile", action="store_true")
     experiment.add_argument("--scale-layout", action="store_true")
+    experiment.add_argument("--compact-tasks", action="store_true")
+    parser.add_argument("--compact-w2-only", action="store_true")
     parser.add_argument("--routes", required=True, help="Glob of saved [M,10] tensors")
     parser.add_argument("--route-limit", type=int, default=1)
     parser.add_argument("--tokens", type=int, nargs="+", default=[4, 8, 16])
@@ -45,12 +49,19 @@ def main():
         parser.error("This paired screen supports M4/8/16")
     if min(args.route_limit, args.repeats, args.samples) < 1:
         parser.error("Counts must be positive")
+    if args.compact_tasks and args.samples != 5:
+        parser.error("Compact-task admission uses five paired timing blocks")
+    if args.compact_w2_only and not args.compact_tasks:
+        parser.error("--compact-w2-only requires --compact-tasks")
     assert torch.cuda.get_device_capability() == (7, 0)
+    check_exclusive()
     torch.ops.load_library(str(args.library.resolve()))
     native = torch.ops._C
     w13_variant = args.w13_pair or args.w13_single_tile
     candidate = (
-        torch.ops._C_moe_scale_layout
+        torch.ops._C_moe_compact_tasks
+        if args.compact_tasks
+        else torch.ops._C_moe_scale_layout
         if args.scale_layout
         else torch.ops._C_moe_single_tile
         if args.w13_single_tile
@@ -72,7 +83,7 @@ def main():
     w13, s13, w2, s2 = checkpoint_weights(args.model, 0, 0, True)
     resources = (
         {}
-        if args.scale_layout
+        if args.scale_layout or args.compact_tasks
         else {
             str(mode): list(candidate.resources(mode))
             for mode in ((4, 5, 8) if w13_variant else (1, 2, 4))
@@ -95,8 +106,10 @@ def main():
         sizes = torch.empty_like(experts)
         total = torch.empty(1, device="cuda", dtype=torch.int32)
         modes = (
-            (0, 1, 2, 3)
-            if args.scale_layout
+            (0, 2)
+            if args.compact_w2_only
+            else (0, 1, 2, 3)
+            if args.scale_layout or args.compact_tasks
             else (0, 1)
             if w13_variant
             else (0, 1, 2, 4)
@@ -104,6 +117,11 @@ def main():
         outputs = {mode: torch.empty_like(x) for mode in modes}
 
         def w13_call(mode=0):
+            if args.compact_tasks and mode & 1:
+                candidate.nvfp4_grouped_w13_sm70_out(
+                    mid, x, w13, s13, ids, rows, experts, sizes, total, split, True
+                )
+                return
             if args.scale_layout and mode & 1:
                 candidate.nvfp4_grouped_w13_sm70_out(
                     mid, x, w13, tile_s13, ids, rows, experts, sizes, total, split, True
@@ -129,9 +147,9 @@ def main():
                 sizes,
                 total,
             )
-            if args.scale_layout and mode & 2:
+            if args.scale_layout and mode & 2 or args.compact_tasks and mode & 2:
                 candidate.nvfp4_grouped_w2_sm70_out(*params)
-            elif mode == 0 or w13_variant or args.scale_layout:
+            elif mode == 0 or w13_variant or args.scale_layout or args.compact_tasks:
                 native.nvfp4_grouped_w2_sm70_out(*params)
             else:
                 candidate.w2(*params, mode)
@@ -177,8 +195,10 @@ def main():
             w13_call()
             count = total.item()
             parts = (
-                (("w13", w13_call), ("w2", w2_call))
-                if args.scale_layout
+                (("w2", w2_call),)
+                if args.compact_w2_only
+                else (("w13", w13_call), ("w2", w2_call))
+                if args.scale_layout or args.compact_tasks
                 else (("w13", w13_call),)
                 if w13_variant
                 else (("w2", w2_call),)
@@ -193,6 +213,7 @@ def main():
                 for sample in range(args.samples):
                     order = modes if sample % 2 == 0 else tuple(reversed(modes))
                     for mode in order:
+                        check_exclusive()
                         times[mode].append(latency(graphs[mode], args.repeats))
                 result = {
                     "m": m,
@@ -205,6 +226,11 @@ def main():
                         str(k): statistics.median(v) for k, v in times.items()
                     },
                     "samples_us": times,
+                    "paired_intervals": {
+                        str(mode): paired_latency_interval(times[0], times[mode])
+                        for mode in modes
+                        if mode and args.samples == 5
+                    },
                 }
                 results.append(result)
                 print(json.dumps(result), flush=True)
@@ -216,6 +242,8 @@ def main():
         "w13_pair": args.w13_pair,
         "w13_single_tile": args.w13_single_tile,
         "scale_layout": args.scale_layout,
+        "compact_tasks": args.compact_tasks,
+        "compact_w2_only": args.compact_w2_only,
         "graph_unroll": 16,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,

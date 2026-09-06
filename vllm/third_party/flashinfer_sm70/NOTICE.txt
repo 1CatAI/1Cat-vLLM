@@ -12,5 +12,12 @@ Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 The native FP16 Volta QSA scorer, runtime integration and modifications are
 Copyright contributors to the vLLM project, distributed under Apache-2.0.
 
+The fused SM70 GDN implementation is adapted from FlashInfer at the same
+commit, flashinfer/gdn_kernels/experimental/kernel/gdn_fused_decode_sm120.cu
+(including the surrounding gate and convolution fusion).
+Copyright (c) 2026 FlashInfer team, Apache-2.0.
+SM70 cooperative synchronization, FP16 materialization, FP32 state handling,
+geometry instantiations and runtime adapters are 1Cat-vLLM modifications.
+
 This is an architecture-specific adaptation maintained by 1Cat-vLLM, not
 an assertion of official FlashInfer SM70 support or upstream endorsement.
