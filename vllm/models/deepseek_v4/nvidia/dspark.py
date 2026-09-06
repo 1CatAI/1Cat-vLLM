@@ -18,6 +18,7 @@ import torch.nn as nn
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -485,6 +486,17 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
+        if (
+            get_pp_group().world_size > 1
+            and "model.embed_tokens.weight" not in loaded_params
+        ):
+            # Under pipeline parallelism the drafter cannot share the
+            # target's embedding (first stage) and runs on its own table;
+            # an unloaded table means random embeddings, not an error.
+            raise RuntimeError(
+                "DSpark drafter: the checkpoint supplied no 'embed.weight' for "
+                "the drafter's own embedding, which pipeline parallelism needs."
+            )
         confidence_weight_name = "model.confidence_head.proj.weight"
         self._confidence_head_loaded = confidence_weight_name in loaded_params
         if self._confidence_head_required and not self._confidence_head_loaded:
@@ -497,6 +509,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def _remap_dspark_name(name: str) -> str | None:
+        if name == "embed.weight":
+            # The target's embedding also fills the drafter's own table. With
+            # PP=1 the proposer replaces it by the shared target embedding
+            # afterwards; under pipeline parallelism the target embedding
+            # lives on the first stage and the drafter on the last, so this
+            # copy is the one the drafter runs on.
+            return "model.embed_tokens.weight"
         match = re.match(r"mtp\.(\d+)\.(.*)", name)
         if match is None:
             return None
