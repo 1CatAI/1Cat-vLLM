@@ -6,6 +6,77 @@
 #pragma once
 #include <flashinfer/norm.cuh>
 namespace flashinfer::sm70::hc {
+// Same fused-add norm algorithm, but a small fixed-width decode row can
+// retain its rounded residual in registers instead of staging/reloading it
+// through shared memory. Geometry specialization is local to this operator.
+template <uint32_t VEC_SIZE, uint32_t D, uint32_t WARPS, typename T, typename B,
+          typename W>
+__global__ void HCCombineNormRegisterKernel(
+    const B* __restrict__ input, const T* __restrict__ residual,
+    const W* __restrict__ weight, const W* __restrict__ injection,
+    T* __restrict__ combined, T* __restrict__ output, uint32_t groups,
+    bool shared_weight, float eps) {
+  constexpr uint32_t THREADS = 32 * WARPS;
+  constexpr uint32_t ROUNDS = ceil_div(D, VEC_SIZE * THREADS);
+  const uint32_t row = blockIdx.x, group = blockIdx.y;
+  const uint32_t tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+  const uint32_t offset = (row * groups + group) * D;
+  const float gate =
+      2.f / (1.f + __expf(-float(injection[row * groups + group]) / groups));
+  vec_t<float, VEC_SIZE> values[ROUNDS];
+  float sum_sq = 0.f;
+#pragma unroll
+  for (uint32_t round = 0; round < ROUNDS; ++round) {
+    const uint32_t col = (round * THREADS + tid) * VEC_SIZE;
+    vec_t<B, VEC_SIZE> bv;
+    vec_t<T, VEC_SIZE> rv;
+    bv.fill(0.f);
+    rv.fill(0.f);
+    if (col < D) {
+      bv.load(input + row * D + col);
+      rv.load(residual + offset + col);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      const float x = float(T(fmaf(float(bv[j]), gate, float(rv[j]))));
+      values[round][j] = x;
+      rv[j] = T(x);
+      sum_sq += x * x;
+    }
+    if (col < D) rv.store(combined + offset + col);
+  }
+#pragma unroll
+  for (uint32_t delta = 16; delta > 0; delta /= 2)
+    sum_sq += math::shfl_xor_sync(sum_sq, delta);
+  __shared__ float sums[WARPS];
+  if (lane == 0) sums[warp] = sum_sq;
+  __syncthreads();
+  if (warp == 0) {
+    sum_sq = lane < WARPS ? sums[lane] : 0.f;
+#pragma unroll
+    for (uint32_t delta = 16; delta > 0; delta /= 2)
+      sum_sq += math::shfl_xor_sync(sum_sq, delta);
+    if (lane == 0) sums[0] = sum_sq;
+  }
+  __syncthreads();
+  const float inv_rms = math::rsqrt(sums[0] / D + eps);
+#pragma unroll
+  for (uint32_t round = 0; round < ROUNDS; ++round) {
+    const uint32_t col = (round * THREADS + tid) * VEC_SIZE;
+    vec_t<W, VEC_SIZE> wv;
+    vec_t<T, VEC_SIZE> result;
+    if (col < D) {
+      wv.load(weight + (shared_weight ? 0 : group * D) + col);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        const float y = values[round][j] * inv_rms;
+        result[j] = T(fmaf(y, float(wv[j]), y));
+      }
+      result.store(output + offset + col);
+    }
+  }
+}
+
 template <uint32_t VEC_SIZE, typename T, typename B, typename W>
 __global__ void HCCombineNormKernel(
     const B* __restrict__ input, const T* __restrict__ residual,

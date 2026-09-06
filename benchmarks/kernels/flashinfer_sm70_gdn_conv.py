@@ -16,19 +16,23 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SHA = "6c14bbd5ff34210404d5d4b5f6ff3b4b2527f59f"
 
 
-def namespace(hidden, q_heads, v_heads):
-    return f"_C_flashinfer_gdn_sm70_h{hidden}_q{q_heads}_v{v_heads}"
+def namespace(hidden, q_heads, v_heads, rows_per_warp=8):
+    suffix = "" if rows_per_warp == 8 else f"_r{rows_per_warp}"
+    return f"_C_flashinfer_gdn_sm70_h{hidden}_q{q_heads}_v{v_heads}{suffix}"
 
 
-def build(hidden=2560, q_heads=4, v_heads=12):
+def build(hidden=2560, q_heads=4, v_heads=12, rows_per_warp=8):
     from torch.utils.cpp_extension import load
 
     if min(hidden, q_heads, v_heads) <= 0 or v_heads % q_heads:
         raise ValueError("Require positive geometry and integral GQA grouping")
+    if rows_per_warp not in (4, 8):
+        raise ValueError("Screened row tiles are 4 or 8")
     if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
         raise RuntimeError("Set TORCH_CUDA_ARCH_LIST=7.0")
+    op_namespace = namespace(hidden, q_heads, v_heads, rows_per_warp)
     return load(
-        name=f"flashinfer_gdn_sm70_h{hidden}_q{q_heads}_v{v_heads}",
+        name=op_namespace[3:],
         sources=[str(ROOT / "benchmarks/csrc/sm70_flashinfer_gdn_conv.cu")],
         extra_include_paths=[str(ROOT / "flashinfer-sm70/include")],
         extra_cuda_cflags=[
@@ -37,7 +41,7 @@ def build(hidden=2560, q_heads=4, v_heads=12):
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
-            f"-DFI_GDN_TORCH_NAMESPACE={namespace(hidden, q_heads, v_heads)}",
+            f"-DFI_GDN_TORCH_NAMESPACE={op_namespace}",
             f"-DFI_GDN_HIDDEN={hidden}",
             f"-DFI_GDN_N_BA={2 * v_heads}",
             f"-DFI_GDN_QKV_DIM={(2 * q_heads + v_heads) * 128}",
@@ -46,21 +50,26 @@ def build(hidden=2560, q_heads=4, v_heads=12):
             "-DFI_GDN_D=128",
             "-DFI_GDN_CONV_WIDTH=4",
             "-DFI_GDN_CONV_STATE_LEN=3",
-        ],
+        ]
+        + ([f"-DFI_GDN_ROWS_PER_WARP={rows_per_warp}"] if rows_per_warp != 8 else []),
         is_python_module=False,
         verbose=True,
     )
 
 
 class FusedGDN:
-    def __init__(self, rows, q_heads=4, v_heads=12, device="cuda", hidden=2560):
+    def __init__(
+        self, rows, q_heads=4, v_heads=12, device="cuda", hidden=2560, rows_per_warp=8
+    ):
         if (
             not 1 <= rows <= 64
             or min(hidden, q_heads, v_heads) <= 0
             or v_heads % q_heads
         ):
             raise ValueError("Require 1..64 rows, positive geometry and integral GQA")
-        self.run = getattr(torch.ops, namespace(hidden, q_heads, v_heads)).run
+        self.run = getattr(
+            torch.ops, namespace(hidden, q_heads, v_heads, rows_per_warp)
+        ).run
         self.output = torch.empty(
             rows, v_heads, 128, device=device, dtype=torch.float16
         )

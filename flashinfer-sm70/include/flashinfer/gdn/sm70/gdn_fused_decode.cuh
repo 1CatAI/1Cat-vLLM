@@ -54,7 +54,10 @@ constexpr int CONV_WIDTH = FI_GDN_CONV_WIDTH;
 constexpr int CONV_STATE_LEN = FI_GDN_CONV_STATE_LEN;
 // v-heads per qk-head: the delta phase maps v-head h to qk-head h/HEADS_PER_QK.
 constexpr int HEADS_PER_QK = HV / H_Q;
-constexpr int ROWS_PER_WARP = 8;
+#ifndef FI_GDN_ROWS_PER_WARP
+  #define FI_GDN_ROWS_PER_WARP 8
+#endif
+constexpr int ROWS_PER_WARP = FI_GDN_ROWS_PER_WARP;
 constexpr int GEMV_NSPLIT = 160;
 // The gate reduction below unrolls the GEMV partials as 5 warp-wide loads.
 static_assert(GEMV_NSPLIT == 5 * 32,

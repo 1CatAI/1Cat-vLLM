@@ -145,7 +145,7 @@ def screen(rows, weights, args):
         torch.empty(rows, hv, device="cuda", dtype=torch.float16),
     )
     out = torch.empty(rows, hv, 128, device="cuda", dtype=torch.float16)
-    candidate = FusedGDN(rows, hq, hv, hidden=hidden)
+    candidate = FusedGDN(rows, hq, hv, hidden=hidden, rows_per_warp=args.rows_per_warp)
 
     def baseline():
         base_in.copy_(raw)
@@ -281,6 +281,7 @@ def screen(rows, weights, args):
         "rows": rows,
         "q_heads": hq,
         "v_heads": hv,
+        "rows_per_warp": args.rows_per_warp,
         "checks": checks,
         "maxima": maxima,
         "independent_history": {
@@ -324,6 +325,7 @@ def main():
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--layer", type=int, default=0)
+    parser.add_argument("--rows-per-warp", type=int, choices=(4, 8), default=8)
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--history-steps", type=int, default=256)
@@ -335,7 +337,7 @@ def main():
     torch.manual_seed(20260906)
     check_exclusive()
     weights = load_weights(args.model, args.layer, args.rank, args.tp)
-    build(*weights[:3])
+    build(*weights[:3], rows_per_warp=args.rows_per_warp)
     for rows in args.rows:
         print(json.dumps(screen(rows, weights, args)), flush=True)
 

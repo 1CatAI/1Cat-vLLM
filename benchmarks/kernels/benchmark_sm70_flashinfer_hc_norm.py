@@ -26,6 +26,7 @@ def screen(rows, dtype, args):
     weight = torch.randn(4 * 2560, device="cuda", dtype=torch.float16) * 0.05
     calls = [lambda: hc_combine_norm(r, b, inj, weight, 1e-6, 4)]
     candidates = [HCNorm(r, warps) for warps in (1, 2, 4, 8)]
+    candidates += [HCNorm(r, warps, registers=True) for warps in (4, 8)]
     calls += [lambda candidate=c: candidate(r, b, inj, weight) for c in candidates]
     graphs = [capture(fn, args.calls) for fn in calls]
     checks = []
@@ -43,7 +44,14 @@ def screen(rows, dtype, args):
             for x, y in zip((candidate.combined, candidate.normalized), eager):
                 torch.testing.assert_close(x, y, atol=0, rtol=0)
             diffs = [error(x, y) for x, y in zip(eager, expected)]
-            checks.append({"cycle": cycle, "warps": candidate.warps, "errors": diffs})
+            checks.append(
+                {
+                    "cycle": cycle,
+                    "warps": candidate.warps,
+                    "registers": candidate.registers,
+                    "errors": diffs,
+                }
+            )
     gate = all(
         d["finite"] and d["relative_l2"] < 1e-3 for c in checks for d in c["errors"]
     )
@@ -52,6 +60,7 @@ def screen(rows, dtype, args):
         "residual_dtype": str(dtype),
         "operator_gate": gate,
         "checks": checks,
+        "variants": [{"warps": c.warps, "registers": c.registers} for c in candidates],
     }
     if gate:
         for _ in range(20):

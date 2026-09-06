@@ -25,7 +25,7 @@ def build():
     if os.environ.get("TORCH_CUDA_ARCH_LIST") != "7.0":
         raise RuntimeError("Set TORCH_CUDA_ARCH_LIST=7.0")
     return load(
-        name="flashinfer_hc_norm_sm70_v1",
+        name="flashinfer_hc_norm_sm70_v2",
         sources=[str(ROOT / "benchmarks/csrc/sm70_flashinfer_hc_norm.cu")],
         extra_include_paths=[
             str(ROOT / "flashinfer-sm70/include"),
@@ -49,10 +49,11 @@ def build():
 
 
 class HCNorm:
-    def __init__(self, residual, warps=4):
+    def __init__(self, residual, warps=4, registers=False):
         self.combined = torch.empty_like(residual)
         self.normalized = torch.empty_like(residual)
         self.warps = warps
+        self.registers = registers
 
     def __call__(self, residual, block, injection, weight, eps=1e-6):
         torch.ops._C_flashinfer_hc_sm70.run(
@@ -64,6 +65,7 @@ class HCNorm:
             self.normalized,
             eps,
             self.warps,
+            self.registers,
         )
         return self.combined, self.normalized
 

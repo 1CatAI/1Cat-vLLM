@@ -95,19 +95,98 @@ private Torch/Triton caches. No service/model engine is launched at this stage.
    coding/tool/schema quality checks, reporting actual routes and pure decode
    separately from prefill/TTFT. Failed operators stay off.
 
-Current result: initial GDN and HC native SM70 builds passed. Cooperative
-GDN builds also passed, including Hq4/Hv12 and Hq8/Hv24 modules loaded in the
-same process; per-geometry Torch namespaces prevent duplicate registration.
-CPU tests: 8 passed, 8 GPU cases skipped (not GPU validation). The component
-benchmark now additionally retains independent reference/candidate state for
-256 steps with dynamic slots, padding and slot recycling; this screen is
-implemented but has not run on GPU yet.
-HC GPU tests include shared/per-branch weights, mixed FP16/FP32 inputs,
-non-power-of-two widths, an independent wider-precision oracle, poisoned
-outputs and graph replay. These are also pending GPU execution.
-GPU correctness, speed and sanitizer results must be recorded before any
-performance claim. GPU 0--3 are reserved by another task;
-honor the paper and 1Cat shared locks, even between its GPU launches.
+Native GDN and HC SM70 builds passed. Cooperative GDN builds also passed,
+including Hq4/Hv12 and Hq8/Hv24 modules loaded in the same process;
+per-geometry Torch namespaces prevent duplicate registration.
+
+### GPU results, 2026-09-06
+
+After the prior lease released GPU 0--3, the `72af224161` tests ran on locked
+GPU 0: **16 passed**, including all 8 GPU cases (33.39 s, including HC build).
+This covers independent GDN histories, DS/SD conv layouts, strided QKV,
+padding/live slot zero, and HC shared/per-branch weights, mixed FP16/FP32,
+non-power-of-two widths, poisoned outputs and graph replay.
+Artifact: `.artifacts/gdn-hc-unit-gpu-v4.log`.
+
+Checkpoint component screen: RadixArk Qwen3.8-Flash-Next-NVFP4, layer 0,
+TP4 rank-0-shaped **FP16** GDN weights, FP32 state, Hq4/Hv12/D128,
+synthetic changing hidden states. The target MoE quantization is not being
+retested here. CUDA Graph, 9 alternating paired samples, 30 calls per graph,
+identical raw-QKV refresh in both arms; no full model launch. GPU clocks use
+automatic boost and were not locked, so use paired deltas, not cross-run
+absolute comparisons. First screen uses 16 local steps and then 256 fully
+independent state-history steps with padding and slot recycling.
+
+| Rows | Existing BA + conv + FlashQLA, us | Fused chain, us | Latency reduction |
+| --- | ---: | ---: | ---: |
+| 1 | 17.237 | 11.674 | 32.28% |
+| 4 | 28.604 | 15.087 | 47.26% |
+| 8 | 33.041 | 22.801 | 30.99% |
+| 16 | 57.344 | 47.343 | 17.44% |
+
+All four independent-history screens pass the unchanged operator gates.
+Worst output relative L2 across those histories is 2.458e-4 and worst FP32
+state relative L2 is 2.636e-5; conv state updates remain exact. These errors
+are not zero and this is not a task-quality admission. The M1 reference
+includes separate BA projection whereas production M1 can fuse QKVZ/BA;
+**do not count the M1 component delta as a production gain**.
+Artifact: `.artifacts/gdn-screen-v1.log`.
+
+Commands inside the owned GPU-lock/environment launcher (the wrapper sets
+the pinned QLA binary, FlashInfer headers and task-private caches):
+
+```bash
+.venv/bin/python -m pytest -q -x --confcutdir=flashinfer-sm70/tests \
+  flashinfer-sm70/tests/test_layer_fusion.py
+.venv/bin/python -m benchmarks.kernels.benchmark_sm70_flashinfer_gdn_conv \
+  --model /path/to/Qwen3.8-Flash-Next-NVFP4 --steps 16
+.venv/bin/python -m benchmarks.kernels.benchmark_sm70_flashinfer_hc_norm
+```
+
+Reference QLA binary SHA256:
+`3982305151798be22a1dabd0140feb085f787e1e76da01f58d8256de66050975`.
+GDN candidate binary SHA256:
+`45cfe0090f43792ac8f4a5a21b9475e988c0f6872c874faf2e5da967db978d66`.
+The 8-row-warp cooperative kernel has 122 registers/thread (M1: 110),
+zero stack/local memory. These are static resources, not measured occupancy.
+
+HC shared-staging version passed all numerical screens but **lost every
+timed shape**. FP16 residual results (best of 1/2/4/8 warps):
+
+| Rows | Existing Triton, us | Best FlashInfer-derived HC, us |
+| --- | ---: | ---: |
+| 1 | 3.164 | 4.321 |
+| 4 | 3.052 | 3.942 |
+| 8 | 2.918 | 3.717 |
+| 16 | 3.144 | 3.953 |
+
+The FP32-residual arm also regressed. Retain the existing production HC;
+do not promote this version on the basis of a FlashInfer label.
+Artifact: `.artifacts/hc-norm-screen-v1.log`. HC v1 binary SHA256:
+`ef905abb8feb41a5887fc64dc45f11dbea97039c60095a1e17b93fbe143d079b`.
+
+### Follow-up candidates and remaining gate
+
+- GDN four-row-per-warp variant: B8/16 independent-history screens pass;
+  paired baseline/candidate medians 36.420/25.054 and 57.344/46.353 us.
+  Registers fall to 89 (M1: 78), still no spills. This is not a same-run
+  eight-versus-four comparison; do not change the default based on the small
+  cross-run difference. Artifact: `.artifacts/gdn-screen-r4-v1.log`.
+- HC register-staging variant: retain materialized FP16/FP32 residuals in
+  registers over the reduction, avoiding the shared-value write/reload.
+  Local D2560, 4/8-warp specialization; all other geometries retain the
+  general component. Native build passes, but GPU correctness/speed is pending.
+  Artifact: `.artifacts/hc-norm-build-v2.log`; binary SHA256:
+  `6087639c2f615ce04775000d556325589f391993c88653a5e3baad04bff347ff`.
+- Updated CPU suite: **8 passed, 12 GPU cases skipped** with GPU hidden.
+  The four additional register-HC cases have not run on GPU. Previous v1 GPU
+  results must not be relabeled as v2 validation.
+- The targeted GDN memcheck attempt did **not** launch: the new QUASAR E4M3
+  task acquired the paper GPU 0--3 lease between component jobs. Exit 75 and
+  an empty sanitizer log are not a pass. Wait for release; never preempt it.
+- No runtime integration, new E2E throughput, or model-quality pass yet.
+  Preserve existing projection/M1 and HC paths until complete-chain gates
+  pass; avoid recomputing BA if using the new fused-input GDN boundary.
 
 Local artifacts: `.artifacts/gdn-build-v1.log`, `gdn-build-v2.log`,
 `gdn-build-cooperative.log`, `gdn-build-multi-geometry.log`,

@@ -139,12 +139,26 @@ def test_gdn_graph_dynamic_slots_and_history(cuda_build, rows, sd_layout):
 def test_hc_graph_rounding_and_shared_weights(
     cuda_hc_build, rows, groups, width, r_dtype, b_dtype, w_dtype, shared, warps
 ):
+    check_hc_graph(rows, groups, width, r_dtype, b_dtype, w_dtype, shared, warps)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("warps", [4, 8])
+def test_hc_register_graph(cuda_hc_build, dtype, warps):
+    check_hc_graph(
+        16, 4, 2560, dtype, torch.float16, torch.float16, True, warps, registers=True
+    )
+
+
+def check_hc_graph(
+    rows, groups, width, r_dtype, b_dtype, w_dtype, shared, warps, registers=False
+):
     torch.manual_seed(19)
     r = torch.randn(rows, groups * width, device="cuda", dtype=r_dtype)
     b = torch.randn(rows, width, device="cuda", dtype=b_dtype)
     inj = torch.randn(rows, groups, device="cuda", dtype=w_dtype)
     w = torch.randn(width if shared else groups * width, device="cuda", dtype=w_dtype)
-    candidate = HCNorm(r, warps)
+    candidate = HCNorm(r, warps, registers=registers)
     call = lambda: candidate(r, b, inj, w)
     graph = capture(call)
     for scale in (0.25, 1.0, 3.0):
