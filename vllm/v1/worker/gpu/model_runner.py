@@ -1751,6 +1751,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.prompt_len.np,
             self.req_states.prefill_len.np,
             self.req_states.num_computed_prefill_tokens,
+            self.req_states.prompt_len.gpu,
         )
 
         # Prepare the model runner output.
