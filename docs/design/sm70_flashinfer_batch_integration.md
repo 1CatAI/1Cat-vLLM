@@ -142,3 +142,65 @@ the default-off test caught a test-order contamination: monkeypatching an
 `envs` module attribute restored a materialized `True` attribute, shadowing
 dynamic environment lookup. Change the test fixture to patch the environment
 variable with the cache disabled instead. Neither v5 nor v6 launched a model.
+
+## Corrected combined result: faster, not admitted
+
+Model source `f45c673898` (runtime fix `2273c24d7d`), log
+`.artifacts/candidate-e2e-v7.log`. Expanded preflight: **29 passed**, including
+four GPU cases, 8.30 seconds. Then one corrected combined model run on the
+same GPU 4--7 and unchanged workload. Worker logs confirm native fused GDN at
+B2/4/8/16 and native FlashInfer QSA at B4/8/16. All ranks prepared 36 GDN
+layers. FULL graph capture completed; no MTP or state-precision change.
+
+| Concurrency | Control tok/s | GDN + QSA tok/s | Gain | Fixed-70 efficiency | Target |
+|---|---:|---:|---:|---:|---:|
+| 1 | 87.750 | 88.556 | +0.92% | n/a | n/a |
+| 4 | 217.026 | 232.169 | +6.98% | 82.92% | 85% |
+| 8 | 364.521 | 390.046 | +7.00% | 69.65% | 75% |
+| 16 | 587.789 | 630.996 | +7.35% | 56.34% | 65% |
+
+Complete engine-step means (ms): C4 **18.431 -> 17.229**, C8
+**21.947 -> 20.510**, C16 **27.221 -> 25.357**. These are unprofiled complete
+decode intervals, not kernel sums, API receive blocking time or MTP rounds.
+All three throughput targets remain unmet. This is one campaign, not a
+cross-run confidence/stability study. Do not generalize its speed to other
+contexts, model quantization, concurrency or serving modes.
+
+| Fixed quality subset | Control | QSA only | GDN + QSA |
+|---|---:|---:|---:|
+| GSM8K health screen | 15/16 | 15/16 | 15/16 |
+| BFCL simple Python | 14/16 | 14/16 | 13/16 |
+| BFCL parallel | 11/16 | 11/16 | 11/16 |
+| BFCL multiple | 14/16 | 14/16 | 14/16 |
+| BFCL irrelevance | 13/16 | 11/16 | 11/16 |
+| BFCL total | 52/64 | 50/64 | 49/64 |
+| JSON Schema | 16/16 | 16/16 | 16/16 |
+
+GSM8K and tool/schema outputs have no length truncations. Quality remains
+**unadmitted**: five BFCL control successes become failures and two failures
+become successes in the combined run. Identical prompts are retained. The
+two irrelevance regressions recur in both candidates (`irrelevance_7` and
+`irrelevance_10`); this is a localization lead, not proof that a specific
+kernel or rounding operation is causal. Small stochastic screens cannot
+establish either broad degradation or noninferiority. No HTTP/SSE transport,
+coding, long-context quality or PPL admission is claimed here.
+
+Decision: keep the integration default **off**, PR #523 **Draft**, existing
+HC norm and production source defaults unchanged. Do not count these faster
+numbers as accepted production performance. Next isolate the QSA arithmetic
+and output-gate drift on retained real trajectories, then GDN independently;
+do not rerun until a narrower check can distinguish a cause. Preserve this
+manifest and sampling, and do not select favorable seeds to clear the gate.
+
+Final artifacts: `.artifacts/e2e/candidate-{speed,gsm8k,offline-tools}.json`
+and the corresponding control files, environment snapshots and GPU metadata.
+The E2E FlashQLA reference binary SHA256 is
+`c8bd7650444ec56cfe2576c044d8f5f438b0a352877064bbb51ac0510dc2ea2c`;
+it is the same pinned library as the frozen HC model baseline. Component
+native libraries remain task-private prebuilt probes, not a release wheel.
+
+All task model workers exited normally. Cleanup check: GPU 4--7 each **7 MiB**,
+no compute processes; the old local API unit is inactive/disabled (MainPID 0).
+Unrelated GPU 0--3 processes and remote services were not touched. Engine
+shutdown logs also retain Python resource-tracker shared-memory cleanup
+warnings seen in the control; do not mislabel these as persistent GPU usage.
