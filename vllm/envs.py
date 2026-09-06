@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_BATCH_SPLIT_COPY: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_BATCH_HC_FP16: bool = False
+    VLLM_SM70_FLASHINFER_BATCH: bool = False
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
     VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION: bool = True
     VLLM_SM70_FP8_QPN8_PP2_TP4: bool = False
@@ -1800,6 +1801,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental FP16 HC batch fusion; no model-quality/default admission yet.
     "VLLM_SM70_QWEN38_BATCH_HC_FP16": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_BATCH_HC_FP16", "0"))
+    ),
+    # Integration probe only; keep off until model quality/performance admission.
+    "VLLM_SM70_FLASHINFER_BATCH": lambda: bool(
+        int(os.getenv("VLLM_SM70_FLASHINFER_BATCH", "0"))
     ),
     # Exact M=1 Qwen3Next/Qwen4Exp shared-expert output gate. This replaces
     # the scalar GEMV, sigmoid, and output multiply with one SM70 kernel while

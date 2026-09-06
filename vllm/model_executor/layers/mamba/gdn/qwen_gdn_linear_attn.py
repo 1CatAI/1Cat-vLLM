@@ -4047,7 +4047,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
-        if _sm70_qwen_gdn_input_core_boundary_enabled():
+        if _sm70_qwen_gdn_input_core_boundary_enabled() or (
+            getattr(self, "_sm70_fi_ready", False)
+            and use_sm70_decode_graph_semantics()
+            and 1 < num_tokens <= 64
+        ):
             z = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -7254,6 +7258,24 @@ def qwen_gdn_input_projection_core(
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
+
+    if getattr(self, "_sm70_fi_ready", False):
+        from vllm.model_executor.layers.sm70_flashinfer_batch import try_gdn
+
+        raw_metadata = forward_context.attn_metadata
+        metadata = (
+            raw_metadata.get(layer_name) if isinstance(raw_metadata, dict) else None
+        )
+        if try_gdn(
+            self,
+            hidden_states,
+            z_out,
+            core_attn_out,
+            conv_state_cache,
+            ssm_state_cache,
+            metadata,
+        ):
+            return z_out, core_attn_out
 
     hidden_states = _sm70_dump_gdn_projection_tensor(
         "gdn_hidden_states_input_core",

@@ -10,6 +10,7 @@ import os
 import regex as re
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
@@ -2076,6 +2077,18 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA output gate must be contiguous in head dimension")
     if not q.shape[0]:
         return out
+
+    if envs.VLLM_SM70_FLASHINFER_BATCH and not kv_e4m3:
+        from vllm.model_executor.layers.sm70_flashinfer_batch import try_qsa
+
+        fi_output = try_qsa(
+            q, k_cache, v_cache, logical_indices, block_table, token_to_req, out
+        )
+        if fi_output is not None:
+            # Retain the existing FP16 materialization before the FP32 gate.
+            if output_gate_view is not None:
+                _qsa_output_gate(fi_output, output_gate_view)
+            return fi_output
 
     if _use_sm70_qsa_xqa_page4(
         q,

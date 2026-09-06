@@ -125,6 +125,10 @@ def process_weights_after_loading(
     # This optional SM70 hook is a no-op unless the experimental route is enabled.
     if prepare_batch_hc := getattr(model, "prepare_sm70_batch_hc", None):
         prepare_batch_hc()
+    if envs.VLLM_SM70_FLASHINFER_BATCH:
+        from vllm.model_executor.layers.sm70_flashinfer_batch import prepare
+
+        prepare(model, target_device)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
