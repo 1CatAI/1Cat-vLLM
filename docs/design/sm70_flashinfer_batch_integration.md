@@ -118,3 +118,17 @@ it produced no performance result. Per-device external campaign leases are
 also respected by the launcher now. All first-comparison workers exited;
 GPU 4 was subsequently acquired by an unrelated sanitizer job, which is not
 terminated by this task.
+
+The next combined attempt at `45711b5e21` passed compilation but failed during
+FULL graph capture, before any quality or speed request. AOT compilation
+preceded KV allocation, so the input/core op received empty 1-D state
+placeholders. The new bridge tried to transpose them. The existing standard
+recurrent core already resolves this case from the scheduler-bound layer
+cache; reuse that contract inside the new runtime bridge. Explicit nonempty
+state inputs must never be replaced. Add both placeholder and explicit-cache
+graph/state tests, including a different layer cache to catch accidental
+replacement, and guard malformed/unbound states before transpose.
+
+Failure log: `.artifacts/candidate-e2e-v3.log`. It is a startup failure, not a
+performance or quality result. Its workers exited. Run the expanded GPU
+bridge suite under the same GPU lease before the next model launch.

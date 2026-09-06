@@ -65,6 +65,14 @@ def test_unprepared_gdn_does_not_touch_projection_or_state():
     assert not fi.try_gdn(NS(), torch.empty(8, 2560), None, None, None, None, None)
 
 
+def test_unbound_aot_placeholders_fall_back_before_transpose():
+    layer = NS(_sm70_fi_ready=True)
+    empty = torch.empty(0)
+    assert not fi.try_gdn(
+        layer, torch.empty(8, 2560), None, None, empty, empty, metadata()
+    )
+
+
 def test_unprepared_qsa_does_not_allocate_workspace():
     q = torch.empty(8, 6, 256, dtype=torch.float16)
     assert fi.try_qsa(q, None, None, None, None, None, None) is None

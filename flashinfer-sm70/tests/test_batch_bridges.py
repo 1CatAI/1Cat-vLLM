@@ -70,7 +70,8 @@ def test_qsa_bridge_graph_and_materialized_gate(cuda_bridge, monkeypatch, rows):
         assert torch.isfinite(output).all() and relative < 5e-3
 
 
-def test_gdn_bridge_independent_state_and_graph(cuda_bridge):
+@pytest.mark.parametrize("empty_aot_placeholders", [False, True])
+def test_gdn_bridge_independent_state_and_graph(cuda_bridge, empty_aot_placeholders):
     from flash_qla.ops.gated_delta_rule.chunk.sm70 import fused_fwd as qla
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 
@@ -98,6 +99,12 @@ def test_gdn_bridge_independent_state_and_graph(cuda_bridge):
     conv = torch.randn(pool, width, 3, device="cuda", dtype=torch.float16) * 0.1
     state = torch.randn(pool, hv, 128, 128, device="cuda") * 0.01
     raw_conv = conv if is_conv_state_dim_first() else conv.transpose(-1, -2)
+    layer.kv_cache = (
+        (raw_conv, state)
+        if empty_aot_placeholders
+        else (raw_conv.clone(), state.clone())
+    )
+    placeholder = hidden.new_empty(0)
     indices = torch.arange(rows, device="cuda", dtype=torch.int32)
     meta = NS(
         num_prefills=0,
@@ -113,7 +120,15 @@ def test_gdn_bridge_independent_state_and_graph(cuda_bridge):
     ref_out = torch.empty_like(z)
 
     def call():
-        assert fi.try_gdn(layer, hidden, z, output, raw_conv, state, meta)
+        assert fi.try_gdn(
+            layer,
+            hidden,
+            z,
+            output,
+            placeholder if empty_aot_placeholders else raw_conv,
+            placeholder if empty_aot_placeholders else state,
+            meta,
+        )
 
     graph = capture(call)
     ref_conv, ref_state = conv.clone(), state.clone()

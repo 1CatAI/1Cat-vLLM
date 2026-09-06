@@ -125,6 +125,16 @@ def try_gdn(layer, hidden, z_out, core_out, conv_cache, state, metadata) -> bool
         metadata, rows
     ):
         return False
+    # As in the existing recurrent core, AOT tracing before KV allocation
+    # can pass empty placeholders. Resolve only those placeholders from the
+    # scheduler-bound layer inside the opaque runtime boundary. Never replace
+    # explicit state arguments (e.g. a graph/ubatch's dedicated cache).
+    if conv_cache.numel() == 0 and state.numel() == 0:
+        cache = getattr(layer, "kv_cache", None)
+        if cache is not None and cache[0].numel() > 0:
+            conv_cache, state = cache[0], cache[1]
+    if conv_cache.ndim != 3 or state.ndim != 4:
+        return False
     conv = conv_cache if is_conv_state_dim_first() else conv_cache.transpose(-1, -2)
     vh = layer.num_v_heads // layer.tp_size
     qh = layer.num_k_heads // layer.tp_size
