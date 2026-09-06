@@ -38,7 +38,8 @@ def test_qsa_bridge_graph_and_materialized_gate(cuda_bridge, monkeypatch, rows):
         qsa_sparse_paged_attention,
     )
 
-    monkeypatch.setattr(envs, "VLLM_SM70_FLASHINFER_BATCH", False)
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_SM70_FLASHINFER_BATCH", "0")
     torch.manual_seed(37)
     q, k, v, indices, table, requests = make_case(rows)
     output = torch.empty_like(q)

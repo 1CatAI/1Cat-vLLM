@@ -132,3 +132,13 @@ replacement, and guard malformed/unbound states before transpose.
 Failure log: `.artifacts/candidate-e2e-v3.log`. It is a startup failure, not a
 performance or quality result. Its workers exited. Run the expanded GPU
 bridge suite under the same GPU lease before the next model launch.
+
+While waiting for the unrelated MTP job, candidate v4 exited at the lease
+gate. Candidate v5's preflight rejected the test launcher's four-visible-GPU
+setting (the component suite intentionally requires one visible GPU); fixed
+the launcher to expose GPU 4 only to pytest, then 4--7 to the model. Candidate
+v6 passed all four GPU bridge cases, including both state-binding cases, but
+the default-off test caught a test-order contamination: monkeypatching an
+`envs` module attribute restored a materialized `True` attribute, shadowing
+dynamic environment lookup. Change the test fixture to patch the environment
+variable with the cache disabled instead. Neither v5 nor v6 launched a model.
