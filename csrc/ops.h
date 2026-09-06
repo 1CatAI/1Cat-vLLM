@@ -518,6 +518,13 @@ void awq_moe_single_token_sm70_out(
     torch::Tensor inv_permuted_idx, int64_t w13_k, int64_t w13_n, int64_t w2_k,
     int64_t w2_n, int64_t group_size, int64_t hidden_logical_size);
 
+void awq_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor intermediate,
+                             const torch::Tensor& input,
+                             const torch::Tensor& w13, const torch::Tensor& s13,
+                             const torch::Tensor& w2, const torch::Tensor& s2,
+                             const torch::Tensor& ids,
+                             const torch::Tensor& topk);
+
 void fp8_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
                            torch::Tensor expert_offsets,
                            torch::Tensor strided_ptrs_w,
