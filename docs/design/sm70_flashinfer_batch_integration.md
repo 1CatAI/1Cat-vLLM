@@ -74,3 +74,47 @@ was stopped and disabled; remote delivery services were not changed. Stop all
 task-owned engine workers after each comparison. Keep this PR Draft until
 the model and quality gates pass. AI-assisted (Codex), DCO sign-off and human
 review required before merge.
+
+## First model comparison and compiled-boundary correction (September 6)
+
+Draft integration PR: #523. Both arms used the frozen speed runner and
+environment above on GPU 4--7. The control reproduced the historical baseline:
+
+| Concurrency | Control tok/s | First candidate tok/s |
+|---|---:|---:|
+| 1 | 87.750 | 87.864 |
+| 4 | 217.026 | 219.474 |
+| 8 | 364.521 | 375.581 |
+| 16 | 587.789 | 612.823 |
+
+These first candidate numbers are **QSA only**, not combined GDN + QSA.
+Although all four ranks prepared 36 GDN layers, no fused GDN route was hit.
+The `1 < num_tokens <= 64` test was outside the opaque input/core boundary:
+the initial large-prefill trace specialized that branch away. Move all shape
+and metadata selection inside the runtime op. Preserve the existing fused
+FP16 input projection on fallback, including M1, instead of substituting
+separate QKVZ/BA GEMMs. The boundary has an extra Z output copy; its M1 cost
+and full-model behavior still need the corrected combined comparison.
+
+Added an export regression using the actual boundary predicate: one large
+example must support the full 1..2048 row range. Reinstating the legacy shape
+guard demonstrably fails export's shape constraints. The corrected predicate
+and original-projection fallback checks pass: **24 CPU tests**, 5.63 seconds.
+The first test attempt had a missing CPU-only op stub; fixed the fixture,
+not the model implementation. The native operator binaries are unchanged.
+
+Quality is **not admitted**: GSM8K is 15/16 with no truncation in both arms,
+but the fixed offline BFCL screen is **52/64 -> 50/64** (irrelevance 13 -> 11).
+JSON Schema remains 16/16. Retain all per-case records; a small stochastic
+screen cannot establish noninferiority, and this negative signal cannot be
+ignored in exchange for C16's 4.3% gain. Do not enable by default.
+
+Artifacts: `.artifacts/e2e/control-*`,
+`.artifacts/e2e/qsa-only-190e5f0225/candidate-*`,
+`.artifacts/control-e2e-v1.log`, `.artifacts/candidate-e2e-v2.log`,
+and `.artifacts/compiled-boundary-cpu-v2.log`.
+Candidate attempt v1 exited at the GPU lease gate (75), before a model run;
+it produced no performance result. Per-device external campaign leases are
+also respected by the launcher now. All first-comparison workers exited;
+GPU 4 was subsequently acquired by an unrelated sanitizer job, which is not
+terminated by this task.
