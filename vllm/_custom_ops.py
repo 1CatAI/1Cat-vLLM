@@ -3113,6 +3113,26 @@ def supports_sm70_qwen38_hc_output_allgather() -> bool:
     return hasattr(_custom_ar_owner_namespace(), "sm70_qwen38_hc_output_allgather")
 
 
+def supports_sm70_qwen38_hc_batch() -> bool:
+    owner = _custom_ar_owner_namespace()
+    return all(
+        hasattr(owner, name)
+        for name in ("sm70_qwen38_hc_batch_down", "sm70_qwen38_hc_batch_mix")
+    )
+
+
+def sm70_qwen38_hc_batch_down(
+    ptr: int, inp: torch.Tensor, injection: torch.Tensor, lora: torch.Tensor
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_batch_down(ptr, inp, injection, lora)
+
+
+def sm70_qwen38_hc_batch_mix(
+    ptr: int, gate: torch.Tensor, branches: torch.Tensor, output: torch.Tensor
+) -> None:
+    _custom_ar_owner_namespace().sm70_qwen38_hc_batch_mix(ptr, gate, branches, output)
+
+
 def supports_sm70_qwen38_hc_shard() -> bool:
     owner = _custom_ar_owner_namespace()
     return all(

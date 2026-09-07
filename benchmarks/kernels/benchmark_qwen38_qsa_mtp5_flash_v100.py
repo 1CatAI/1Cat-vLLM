@@ -44,9 +44,14 @@ def _measure_ms(call, *, warmups: int, repeats: int) -> float:
 def _logical_indices(
     *, rows: int, seq_len: int, overlap: float, seed: int, independent: bool
 ) -> torch.Tensor:
-    """Build 2051-token selections with controlled adjacent-row Page4 overlap."""
+    """Build canonical 512-Page4 selections plus the open causal group tail."""
     generator = torch.Generator().manual_seed(seed)
-    selectable_pages = torch.arange(seq_len // 4 - 1, dtype=torch.int64)
+    earliest_visible = seq_len if independent else seq_len - rows + 1
+    # Every shared/unique page must be complete for every query. In particular,
+    # an MTP row must not select a future compressed page of its own block.
+    selectable_pages = torch.arange(earliest_visible // 4, dtype=torch.int64)
+    if selectable_pages.numel() < 512:
+        raise ValueError("each query must have at least 512 complete Page4 blocks")
     shared_count = round(512 * overlap)
     shared = selectable_pages[
         torch.randperm(selectable_pages.numel(), generator=generator)[:shared_count]
@@ -66,7 +71,10 @@ def _logical_indices(
         pages = torch.cat((shared, unique))
         tokens = (pages[:, None] * 4 + torch.arange(4)).flatten()
         query_position = seq_len - 1 if independent else seq_len - rows + row
-        tail = torch.arange(query_position - 2, query_position + 1)
+        visible = query_position + 1
+        tail = torch.full((3,), -1, dtype=torch.int64)
+        tail_count = visible % 4
+        tail[:tail_count] = torch.arange(visible - tail_count, visible)
         selections.append(torch.cat((tokens, tail)).to(torch.int32))
     return torch.stack(selections)
 
