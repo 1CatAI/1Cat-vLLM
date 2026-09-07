@@ -207,6 +207,16 @@ def has_nvfp4_grouped_decode_dispatch() -> bool:
     )
 
 
+def has_nvfp4_grouped_ep4_decode_dispatch() -> bool:
+    return all(
+        hasattr(torch.ops._C, name)
+        for name in (
+            "nvfp4_grouped_ep4_w13_sm70_out",
+            "nvfp4_grouped_ep4_w2_sm70_out",
+        )
+    )
+
+
 def nvfp4_grouped_w13_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -242,6 +252,70 @@ def nvfp4_grouped_w2_sm70_out(
     )
 
 
+def nvfp4_grouped_ep4_w13_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    expert_start: int,
+    split: int,
+    interleaved: bool,
+    blocks: int,
+) -> None:
+    torch.ops._C.nvfp4_grouped_ep4_w13_sm70_out(
+        out,
+        x,
+        w,
+        s,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        expert_start,
+        split,
+        interleaved,
+        blocks,
+    )
+
+
+def nvfp4_grouped_ep4_w2_sm70_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    topk: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    expert_start: int,
+    blocks: int,
+) -> None:
+    torch.ops._C.nvfp4_grouped_ep4_w2_sm70_out(
+        out,
+        routed,
+        x,
+        w,
+        s,
+        topk,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        expert_start,
+        blocks,
+    )
+
+
 if has_nvfp4_grouped_decode_dispatch():
 
     @register_fake("_C::nvfp4_grouped_w13_sm70_out")
@@ -252,6 +326,45 @@ if has_nvfp4_grouped_decode_dispatch():
 
     @register_fake("_C::nvfp4_grouped_w2_sm70_out")
     def _grouped_w2_fake(out, routed, x, w, s, topk, rows, experts, sizes, total):
+        return None
+
+
+if has_nvfp4_grouped_ep4_decode_dispatch():
+
+    @register_fake("_C::nvfp4_grouped_ep4_w13_sm70_out")
+    def _grouped_ep4_w13_fake(
+        out,
+        x,
+        w,
+        s,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        expert_start,
+        split,
+        interleaved,
+        blocks,
+    ):
+        return None
+
+    @register_fake("_C::nvfp4_grouped_ep4_w2_sm70_out")
+    def _grouped_ep4_w2_fake(
+        out,
+        routed,
+        x,
+        w,
+        s,
+        topk,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        expert_start,
+        blocks,
+    ):
         return None
 
 
@@ -2165,6 +2278,105 @@ if hasattr(torch.ops._C, "nvfp4_moe_dense_stage_sm70_out"):
         k: int,
         n: int,
         group_size: int,
+    ) -> None:
+        return None
+
+
+def nvfp4_moe_fused_swiglu_stage_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    dense_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("nvfp4_moe_fused_swiglu_stage_sm70_out")(
+        out,
+        input,
+        expert_offsets,
+        dense_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+    )
+
+
+def nvfp4_qwen38_ep4_permute_sm70_out(
+    permuted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    input: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_start: int,
+) -> None:
+    _op("nvfp4_qwen38_ep4_permute_sm70_out")(
+        permuted_input,
+        expert_offsets,
+        inv_permuted_idx,
+        input,
+        topk_ids,
+        expert_start,
+    )
+
+
+def nvfp4_qwen38_ep4_combine_sm70_out(
+    out: torch.Tensor,
+    sorted_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+) -> None:
+    _op("nvfp4_qwen38_ep4_combine_sm70_out")(
+        out, sorted_output, topk_weights, inv_permuted_idx
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_fused_swiglu_stage_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_fused_swiglu_stage_sm70_out")
+    def _nvfp4_moe_fused_swiglu_stage_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        dense_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_ep4_permute_sm70_out"):
+
+    @register_fake("_C::nvfp4_qwen38_ep4_permute_sm70_out")
+    def _nvfp4_qwen38_ep4_permute_sm70_out_fake(
+        permuted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
+        input: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_start: int,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "nvfp4_qwen38_ep4_combine_sm70_out"):
+
+    @register_fake("_C::nvfp4_qwen38_ep4_combine_sm70_out")
+    def _nvfp4_qwen38_ep4_combine_sm70_out_fake(
+        out: torch.Tensor,
+        sorted_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        inv_permuted_idx: torch.Tensor,
     ) -> None:
         return None
 

@@ -45766,3 +45766,69 @@ Interpretation:
   fused variants compile with 31 registers/16 bytes shared/zero stack or
   spills. Compare complete HC with the newly registered up fusion held fixed,
   including actual auxiliary sum2 and post-wrap checks. GPU gate pending.
+
+## DeepEP SM70 true-EP screen, 2026-09-07
+
+- The screen uses the fixed FlashNext contract: NVFP4, four V100-SXM2-32GB,
+  no MTP, CUDA Graph, 8,192 input tokens, 256 output tokens, global concurrency
+  16, 262,144 maximum context, prefix caching, Mamba align, FP16 QSA KV, and
+  FP32 GDN state. The topology is real TP2 x DP2 / EP4 sequence parallelism;
+  it is not the earlier TP-local expert filter.
+- The current DeepEP head still requires SM90 features. The bounded port is
+  based on official DeepEP commit `b8d90fb` (the official non-TMA Ampere
+  intranode fallback), compiled with `DISABLE_SM90_FEATURES=1` and
+  `TORCH_CUDA_ARCH_LIST=7.0`. Two SM70 compile/contract changes are required:
+  include `cuda_fp16.h`, and admit FP16 combine dispatch. DeepEP remains an
+  external experiment dependency and is not bundled into the wheel.
+- The exact communication microbenchmark uses four source rows per rank,
+  hidden 2,560, 512 experts and top-k 10. Fixed-capacity graph dispatch plus
+  combine has a median of `0.080896 ms/layer` on all four ranks. Identity
+  dispatch/expert/combine differs from the FP32 reference by at most
+  `0.00390625`, within the FP16 contract. The same harness's independent three
+  all-gather plus one reduce-scatter sequence has medians of
+  `0.163328-0.184320 ms`, but this eager microbenchmark overstates the current
+  graph AG/RS path; the matched model trace already spends only about
+  `0.09-0.10 ms/layer` on the MoE AG/RS operations.
+- The first integrated capture exposed a lifecycle error: vLLM's generic
+  DeepEP cache is weak, because modular prepare/finalize objects normally own
+  the strong handle. This monolithic SM70 quant method owns dispatch itself, so
+  the Buffer was collected and recreated during graph capture. The experiment
+  now holds one Buffer for the communicator lifetime, initializes all four IPC
+  peers before capture, and releases it during communicator teardown. A later
+  startup OOM was removed by releasing raw converted expert tensors before the
+  one-time workspace allocation and reducing the ring from 64 MiB to 8 MiB.
+  FULL graph capture then succeeds on all ranks and logs the dedicated DeepEP
+  route rather than the AG/RS fallback.
+- A 64-output smoke measures `418.784 tok/s` and `38.2058 ms/step`. The formal
+  256-output run supplies 210 steady critical-path steps and measures
+  **`408.609 tok/s` and `39.1572 ms/step`**. The same-source AG/RS EP4 control
+  is **`422.211 tok/s` and `37.8958 ms/step`**. Therefore DeepEP changes
+  throughput by **`-3.22%`** and adds **`1.2615 ms/step`**; it is rejected for
+  default routing. Capacity remains valid at 318,423 cache tokens (1.21 times
+  the 262,144-token boundary).
+- This workload provides almost no sparse communication leverage. With 512
+  experts, top-k 10 and four equal EP ranks, a token misses a given rank with
+  probability approximately `(3/4)^10 = 5.63%`; the expected fanout is 3.775
+  of four ranks. DeepEP consequently transfers about 94.4% of an all-gather's
+  hidden rows. Sixteen requests create only 160 routes over roughly 140-150
+  distinct experts, so most expert weights are used by a single row and a
+  larger expert-local GEMM does not amortize their HBM reads. EP also exposes
+  small-batch rank imbalance, while replicated TP4 shards every selected
+  expert evenly.
+- DeepEP and AG/RS use different FP16 reduction orders. Only 4 of 16 full
+  completion hashes match on the formal run. This is not by itself a quality
+  failure, but the surrounding experimental sparse-QSA/HC route already has
+  an unresolved quality signal, so this screen is not a quality acceptance.
+  No DeepEP result may be promoted before the fixed tool/structured-output
+  battery passes against the production control.
+- Evidence is under `.artifacts/dp-ep-results/`, principally
+  `deepep-sm70-a2a-graph-v1.log`, `c16-deepep-sm70-q8graph-v5.json`, and
+  the matching AG/RS control JSON. The focused contract/lifetime suite passes
+  8 tests; the complete SM70 ModelOpt NVFP4 unit file passes 80 tests. All
+  owned model processes and GPU allocations were released after measurement.
+- Decision: keep this true-EP/DeepEP route experimental and default off. Do
+  not spend the next performance round replacing its already-small transport.
+  Re-open it only if the workload supplies a materially larger expert batch
+  (for example verified multi-token decode) or a measured placement scheme
+  reduces fanout. For the fixed C4/C8/C16 no-MTP target, retain TP4 and attack
+  the larger QSA, GDN, HC and expert-GEMM critical paths.

@@ -608,9 +608,7 @@ class MoERunner(MoERunnerInterface):
             return False
         if self._fused_output_is_reduced:
             return False
-        if self.moe_config.tp_size <= 1:
-            return False
-        if self.moe_config.ep_size != 1 or self.moe_config.pcp_size != 1:
+        if self.moe_config.pcp_size != 1:
             return False
         if (
             shared_output.shape != fused_output.shape
@@ -619,6 +617,18 @@ class MoERunner(MoERunnerInterface):
             return False
 
         tp_size = self.moe_config.tp_size
+        ep_size = self.moe_config.ep_size
+        tp_local_ep4 = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+            and tp_size == 1
+            and ep_size == 4
+            and fused_output.dtype == torch.float16
+            and fused_output.ndim == 2
+            and 0 < fused_output.shape[0] <= 18
+            and fused_output.shape[1] == 2560
+        )
+        if not tp_local_ep4 and (tp_size <= 1 or ep_size != 1):
+            return False
         glm53_q8 = bool(
             envs.VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8
             and tp_size == 8
@@ -627,7 +637,8 @@ class MoERunner(MoERunnerInterface):
         )
         if not envs.VLLM_SM70_MOE_ADD_ALLREDUCE and not glm53_q8:
             return False
-        return tp_size in (2, 4, 6, 8)
+        collective_size = ep_size if tp_local_ep4 else tp_size
+        return collective_size in (2, 4, 6, 8)
 
     def _maybe_sm70_moe_sum2_allreduce(
         self,
@@ -1038,6 +1049,14 @@ class MoERunner(MoERunnerInterface):
         else:
             return hidden_states
 
+    def _quant_method_owns_sm70_deepep_dispatch(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        owns_dispatch = getattr(self._quant_method, "owns_sm70_deepep_dispatch", None)
+        return bool(owns_dispatch is not None and owns_dispatch(layer, hidden_states))
+
     def _forward_impl(
         self,
         layer: torch.nn.Module,
@@ -1083,11 +1102,15 @@ class MoERunner(MoERunnerInterface):
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain
-            hidden_states, router_logits = self._maybe_dispatch(
-                layer,
-                hidden_states,
-                router_logits,
+            quant_owns_dispatch = self._quant_method_owns_sm70_deepep_dispatch(
+                layer, hidden_states
             )
+            if not quant_owns_dispatch:
+                hidden_states, router_logits = self._maybe_dispatch(
+                    layer,
+                    hidden_states,
+                    router_logits,
+                )
 
             shared_output, hidden_states = self._apply_quant_method(
                 layer=layer,
@@ -1097,7 +1120,10 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            return self._maybe_combine(
-                shared_output,
-                hidden_states,
-            )
+            if quant_owns_dispatch:
+                if self.shared_experts is not None:
+                    assert shared_output is not None
+                    return shared_output, hidden_states
+                return hidden_states
+
+            return self._maybe_combine(shared_output, hidden_states)

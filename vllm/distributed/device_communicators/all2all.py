@@ -152,6 +152,11 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         )  # noqa
         super().__init__(cpu_group, tcp_store_group)
         self.handle_cache = Cache()
+        # Some legacy quant methods still own their routing and therefore call
+        # dispatch_router_logits before a modular DeepEP prepare/finalize can
+        # run. Keep an exact AG/RS fallback for those shapes; SM70's dedicated
+        # NVFP4 path bypasses it only for the audited decode contract.
+        self._ag_rs_fallback = AgRsAll2AllManager(cpu_group, tcp_store_group)
 
         # This is the DeepEP default. Stick to it till we can establish
         # reasonable defaults based on profiling.
@@ -166,8 +171,16 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+    ):
+        return self._ag_rs_fallback.dispatch_router_logits(
+            hidden_states,
+            router_logits,
+            is_sequence_parallel=is_sequence_parallel,
+            extra_tensors=extra_tensors,
+        )
 
     def dispatch(
         self,
@@ -180,17 +193,32 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        raise NotImplementedError
+        return self._ag_rs_fallback.dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel=is_sequence_parallel,
+            extra_tensors=extra_tensors,
+        )
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        raise NotImplementedError
+        return self._ag_rs_fallback.combine(
+            hidden_states, is_sequence_parallel=is_sequence_parallel
+        )
 
     def destroy(self):
+        persistent_handle = getattr(self, "_sm70_deepep_handle", None)
+        if persistent_handle is not None and hasattr(persistent_handle, "destroy"):
+            persistent_handle.destroy()
+        self._sm70_deepep_handle = None
         with self.handle_cache._lock:
             for _, handle in self.handle_cache._cache.items():
-                handle.destroy()
+                if handle is persistent_handle:
+                    continue
+                if hasattr(handle, "destroy"):
+                    handle.destroy()
             self.handle_cache._cache.clear()
 
 
@@ -225,8 +253,15 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=False,
             num_qps_per_rank=num_qps_per_rank,
-            explicitly_destroy=True,
         )
+        # EPv2 owns explicit lifecycle, while the official legacy intranode
+        # implementation (used by the SM70 port) predates this argument.
+        import inspect
+
+        import deep_ep  # type: ignore[import-not-found]
+
+        if "explicitly_destroy" in inspect.signature(deep_ep.Buffer).parameters:
+            kwargs["explicitly_destroy"] = True
         return kwargs
 
     def get_handle(self, kwargs):

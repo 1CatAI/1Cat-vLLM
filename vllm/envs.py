@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
+    VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
@@ -1954,6 +1955,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Keep off until dynamic-width endpoint quality admission is complete.
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE", "0"))
+    ),
+    # TP-local EP4 dispatch/combine for Qwen3.8 FlashNext NVFP4. The exact
+    # shape gate uses contiguous 128-expert ownership and keeps the existing
+    # TP-group all-reduce. Opt-in until full-model quality and throughput gates
+    # are recorded.
+    "VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH", "0"))
     ),
     # Experimental grouped native-NVFP4 W13/W2 decode. Local weight shapes and
     # attention metadata gates preserve M1, prefill and multi-token verify.
