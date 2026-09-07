@@ -9631,6 +9631,244 @@ void nvfp4_moe_indexed_fused_swiglu_sm70_out(
       ptrs_s, num_experts, k, n, group_size, true);
 }
 
+namespace {
+
+constexpr int kQwen38Ep4LocalExperts = 128;
+constexpr int kQwen38Ep4TopK = 10;
+constexpr int kQwen38Ep4Hidden = 2560;
+constexpr int kQwen38Ep4MaxTokens = 18;
+
+__global__ void nvfp4_qwen38_ep4_build_metadata_kernel(
+    const int* __restrict__ topk_ids, int* __restrict__ expert_offsets,
+    int* __restrict__ inv_permuted_idx, int slots, int expert_start) {
+  __shared__ int counts[kQwen38Ep4LocalExperts];
+  __shared__ int cursors[kQwen38Ep4LocalExperts];
+
+  if (threadIdx.x < kQwen38Ep4LocalExperts) {
+    counts[threadIdx.x] = 0;
+  }
+  if (threadIdx.x < slots) {
+    inv_permuted_idx[threadIdx.x] = -1;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < slots) {
+    const int local_expert = topk_ids[threadIdx.x] - expert_start;
+    if (0 <= local_expert && local_expert < kQwen38Ep4LocalExperts) {
+      atomicAdd(counts + local_expert, 1);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    int prefix = 0;
+    expert_offsets[0] = 0;
+    for (int expert = 0; expert < kQwen38Ep4LocalExperts; ++expert) {
+      cursors[expert] = prefix;
+      prefix += counts[expert];
+      expert_offsets[expert + 1] = prefix;
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x < slots) {
+    const int local_expert = topk_ids[threadIdx.x] - expert_start;
+    if (0 <= local_expert && local_expert < kQwen38Ep4LocalExperts) {
+      inv_permuted_idx[threadIdx.x] = atomicAdd(cursors + local_expert, 1);
+    }
+  }
+}
+
+__global__ void nvfp4_qwen38_ep4_expand_rows_kernel(
+    const __half* __restrict__ input, const int* __restrict__ inv_permuted_idx,
+    __half* __restrict__ permuted_input, int slots) {
+  const int route = blockIdx.x;
+  if (route >= slots) {
+    return;
+  }
+  const int destination = inv_permuted_idx[route];
+  if (destination < 0) {
+    return;
+  }
+  const int token = route / kQwen38Ep4TopK;
+  const __half2* source =
+      reinterpret_cast<const __half2*>(input + token * kQwen38Ep4Hidden);
+  __half2* destination_row = reinterpret_cast<__half2*>(
+      permuted_input + destination * kQwen38Ep4Hidden);
+  constexpr int kHiddenPairs = kQwen38Ep4Hidden / 2;
+  for (int pair = threadIdx.x; pair < kHiddenPairs; pair += blockDim.x) {
+    destination_row[pair] = source[pair];
+  }
+}
+
+__global__ void nvfp4_qwen38_ep4_combine_kernel(
+    const __half* __restrict__ sorted_output,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ inv_permuted_idx, __half* __restrict__ output,
+    int tokens) {
+  constexpr int kThreads = 256;
+  constexpr int kHiddenPairs = kQwen38Ep4Hidden / 2;
+  constexpr int kTiles = (kHiddenPairs + kThreads - 1) / kThreads;
+  const int token = blockIdx.x / kTiles;
+  const int tile = blockIdx.x % kTiles;
+  if (token >= tokens) {
+    return;
+  }
+  const int pair = tile * kThreads + threadIdx.x;
+  if (pair >= kHiddenPairs) {
+    return;
+  }
+
+  float2 acc = {0.f, 0.f};
+  const int route_base = token * kQwen38Ep4TopK;
+  #pragma unroll
+  for (int slot = 0; slot < kQwen38Ep4TopK; ++slot) {
+    const int route = route_base + slot;
+    const int source_row = inv_permuted_idx[route];
+    if (source_row >= 0) {
+      const __half2 value = reinterpret_cast<const __half2*>(
+          sorted_output + source_row * kQwen38Ep4Hidden)[pair];
+      const float2 value_f = __half22float2(value);
+      const float weight = topk_weights[route];
+      acc.x = fmaf(weight, value_f.x, acc.x);
+      acc.y = fmaf(weight, value_f.y, acc.y);
+    }
+  }
+  reinterpret_cast<__half2*>(output + token * kQwen38Ep4Hidden)[pair] =
+      __floats2half2_rn(acc.x, acc.y);
+}
+
+}  // namespace
+
+void nvfp4_qwen38_ep4_permute_sm70_out(torch::Tensor permuted_input,
+                                       torch::Tensor expert_offsets,
+                                       torch::Tensor inv_permuted_idx,
+                                       torch::Tensor input,
+                                       torch::Tensor topk_ids,
+                                       int64_t expert_start) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                  input.dim() == 2 && input.size(0) > 0 &&
+                  input.size(0) <= kQwen38Ep4MaxTokens &&
+                  input.size(1) == kQwen38Ep4Hidden && input.is_contiguous(),
+              "nvfp4_qwen38_ep4_permute_sm70_out: input must be contiguous "
+              "CUDA FP16 [1..18,2560].");
+  const int64_t tokens = input.size(0);
+  const int64_t slots = tokens * kQwen38Ep4TopK;
+  TORCH_CHECK(topk_ids.is_cuda() && topk_ids.scalar_type() == torch::kInt32 &&
+                  topk_ids.is_contiguous() && topk_ids.dim() == 2 &&
+                  topk_ids.size(0) == tokens &&
+                  topk_ids.size(1) == kQwen38Ep4TopK,
+              "nvfp4_qwen38_ep4_permute_sm70_out: topk_ids must be "
+              "contiguous CUDA int32 [tokens,10].");
+  TORCH_CHECK(permuted_input.is_cuda() &&
+                  permuted_input.scalar_type() == torch::kFloat16 &&
+                  permuted_input.is_contiguous() &&
+                  permuted_input.size(0) == slots &&
+                  permuted_input.size(1) == kQwen38Ep4Hidden,
+              "nvfp4_qwen38_ep4_permute_sm70_out: permuted_input shape "
+              "mismatch.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous() &&
+                  expert_offsets.numel() >= kQwen38Ep4LocalExperts + 1,
+              "nvfp4_qwen38_ep4_permute_sm70_out: expert_offsets must be "
+              "contiguous CUDA int32 [129].");
+  TORCH_CHECK(inv_permuted_idx.is_cuda() &&
+                  inv_permuted_idx.scalar_type() == torch::kInt32 &&
+                  inv_permuted_idx.is_contiguous() &&
+                  inv_permuted_idx.numel() == slots,
+              "nvfp4_qwen38_ep4_permute_sm70_out: inv_permuted_idx shape "
+              "mismatch.");
+  TORCH_CHECK(expert_start >= 0 &&
+                  expert_start + kQwen38Ep4LocalExperts <= 512 &&
+                  expert_start % kQwen38Ep4LocalExperts == 0,
+              "nvfp4_qwen38_ep4_permute_sm70_out: invalid expert_start.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int kThreads = 256;
+  nvfp4_qwen38_ep4_build_metadata_kernel<<<1, kThreads, 0, stream>>>(
+      topk_ids.data_ptr<int32_t>(), expert_offsets.data_ptr<int32_t>(),
+      inv_permuted_idx.data_ptr<int32_t>(), static_cast<int>(slots),
+      static_cast<int>(expert_start));
+  nvfp4_qwen38_ep4_expand_rows_kernel<<<static_cast<int>(slots), kThreads, 0,
+                                        stream>>>(
+      reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+      inv_permuted_idx.data_ptr<int32_t>(),
+      reinterpret_cast<__half*>(permuted_input.data_ptr<at::Half>()),
+      static_cast<int>(slots));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_qwen38_ep4_combine_sm70_out(torch::Tensor out,
+                                       torch::Tensor sorted_output,
+                                       torch::Tensor topk_weights,
+                                       torch::Tensor inv_permuted_idx) {
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
+                  out.is_contiguous() && out.dim() == 2 && out.size(0) > 0 &&
+                  out.size(0) <= kQwen38Ep4MaxTokens &&
+                  out.size(1) == kQwen38Ep4Hidden,
+              "nvfp4_qwen38_ep4_combine_sm70_out: out must be contiguous "
+              "CUDA FP16 [1..18,2560].");
+  const int64_t tokens = out.size(0);
+  const int64_t slots = tokens * kQwen38Ep4TopK;
+  TORCH_CHECK(sorted_output.is_cuda() &&
+                  sorted_output.scalar_type() == torch::kFloat16 &&
+                  sorted_output.is_contiguous() &&
+                  sorted_output.size(0) == slots &&
+                  sorted_output.size(1) == kQwen38Ep4Hidden,
+              "nvfp4_qwen38_ep4_combine_sm70_out: sorted_output shape "
+              "mismatch.");
+  TORCH_CHECK(topk_weights.is_cuda() &&
+                  topk_weights.scalar_type() == torch::kFloat32 &&
+                  topk_weights.is_contiguous() && topk_weights.numel() == slots,
+              "nvfp4_qwen38_ep4_combine_sm70_out: topk_weights must be "
+              "contiguous CUDA FP32 [tokens,10].");
+  TORCH_CHECK(inv_permuted_idx.is_cuda() &&
+                  inv_permuted_idx.scalar_type() == torch::kInt32 &&
+                  inv_permuted_idx.is_contiguous() &&
+                  inv_permuted_idx.numel() == slots,
+              "nvfp4_qwen38_ep4_combine_sm70_out: inv_permuted_idx shape "
+              "mismatch.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int kThreads = 256;
+  constexpr int kHiddenPairs = kQwen38Ep4Hidden / 2;
+  constexpr int kTiles = (kHiddenPairs + kThreads - 1) / kThreads;
+  nvfp4_qwen38_ep4_combine_kernel<<<static_cast<int>(tokens) * kTiles, kThreads,
+                                    0, stream>>>(
+      reinterpret_cast<const __half*>(sorted_output.data_ptr<at::Half>()),
+      topk_weights.data_ptr<float>(), inv_permuted_idx.data_ptr<int32_t>(),
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      static_cast<int>(tokens));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_moe_fused_swiglu_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
+    torch::Tensor dense_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size) {
+  TORCH_CHECK(num_experts == kQwen38Ep4LocalExperts && k == kQwen38Ep4Hidden &&
+                  n == 2 * 640 && group_size == 16,
+              "nvfp4_moe_fused_swiglu_stage_sm70_out: exact Qwen3.8 EP4 "
+              "W13 contract is required.");
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16 &&
+                  input.dim() == 2 && input.size(1) == k &&
+                  input.is_contiguous(),
+              "nvfp4_moe_fused_swiglu_stage_sm70_out: input mismatch.");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
+                  out.dim() == 2 && out.size(0) == input.size(0) &&
+                  out.size(1) == n / 2 && out.is_contiguous(),
+              "nvfp4_moe_fused_swiglu_stage_sm70_out: out mismatch.");
+  TORCH_CHECK(vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled(),
+              "nvfp4_moe_fused_swiglu_stage_sm70_out requires grouped "
+              "dispatch.");
+  nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                               num_experts, k, n, group_size, dense_expert_ids,
+                               false, -1, torch::Tensor(), true);
+}
+
 void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
                                     torch::Tensor expert_offsets,
                                     torch::Tensor dense_expert_ids,
@@ -9692,11 +9930,19 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 256 &&
       ((k == 2048 && (n == 1024 || n == 512 || n == 256)) ||
        (n == 2048 && (k == 512 || k == 256 || k == 128)));
-  const bool exact_qwen4_exp_prefill_shape =
+  const bool exact_qwen4_exp_tp_shape =
       input.size(0) > kNvfp4LegacyCompactGroups && num_experts == 512 &&
       ((k == 2560 && n == 320) || (k == 160 && n == 2560));
+  // In TP-local EP4 every rank receives the same token rows, owns 128 full
+  // experts and reduces its local expert outputs through the existing TP
+  // group.  Keep all 128 (including zero-row experts) in one grouped launch;
+  // the legacy per-expert loop would otherwise create 256 launches per layer.
+  const bool exact_qwen4_exp_ep4_shape =
+      num_experts == 128 &&
+      ((k == 2560 && n == 1280) || (k == 640 && n == 2560));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
-      (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
+      (exact_qwen36_prefill_shape || exact_qwen4_exp_tp_shape ||
+       exact_qwen4_exp_ep4_shape)) {
     static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
         logged_nvfp4_grouped_prefill,

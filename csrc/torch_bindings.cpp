@@ -821,6 +821,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &nvfp4_moe_dense_stage_sm70_out);
 
   ops.def(
+      "nvfp4_moe_fused_swiglu_stage_sm70_out("
+      "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
+      "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_experts, int k, int n, int group_size) -> ()");
+  ops.impl("nvfp4_moe_fused_swiglu_stage_sm70_out", torch::kCUDA,
+           &nvfp4_moe_fused_swiglu_stage_sm70_out);
+
+  ops.def(
+      "nvfp4_qwen38_ep4_permute_sm70_out("
+      "Tensor(a!) permuted_input, Tensor(b!) expert_offsets, "
+      "Tensor(c!) inv_permuted_idx, Tensor input, Tensor topk_ids, "
+      "int expert_start) -> ()");
+  ops.impl("nvfp4_qwen38_ep4_permute_sm70_out", torch::kCUDA,
+           &nvfp4_qwen38_ep4_permute_sm70_out);
+
+  ops.def(
+      "nvfp4_qwen38_ep4_combine_sm70_out("
+      "Tensor(a!) out, Tensor sorted_output, Tensor topk_weights, "
+      "Tensor inv_permuted_idx) -> ()");
+  ops.impl("nvfp4_qwen38_ep4_combine_sm70_out", torch::kCUDA,
+           &nvfp4_qwen38_ep4_combine_sm70_out);
+
+  ops.def(
       "nvfp4_moe_indexed_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
       "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "

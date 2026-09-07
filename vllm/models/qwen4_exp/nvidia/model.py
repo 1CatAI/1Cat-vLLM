@@ -243,9 +243,14 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         parallel_config = vllm_config.parallel_config
-        if parallel_config.use_sequence_parallel_moe:
+        if (
+            parallel_config.use_sequence_parallel_moe
+            and not envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+        ):
             raise NotImplementedError(
-                "Qwen4Exp HC does not support sequence-parallel MoE"
+                "Qwen4Exp HC sequence-parallel MoE is experimental; enable "
+                "VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH only for the "
+                "validated SM70 TP2xDP2/EP4 contract."
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
@@ -281,9 +286,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.config = config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
+        if (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+            and not envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+        ):
             raise NotImplementedError(
-                "Qwen4Exp HC does not support sequence-parallel MoE"
+                "Qwen4Exp HC sequence-parallel MoE is experimental; enable "
+                "VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH only for the "
+                "validated SM70 TP2xDP2/EP4 contract."
             )
         self.ple: Qwen4ExpPLELayer | None = None
         ple_layer_ids = config.ple_layer_ids

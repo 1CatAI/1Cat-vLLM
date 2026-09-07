@@ -109,6 +109,47 @@ def _qwen4_moe_contract(**overrides):
     return SimpleNamespace(**values)
 
 
+def _qwen4_ep4_moe_contract(**overrides):
+    values = {
+        "num_experts": 512,
+        "num_local_experts": 128,
+        "experts_per_token": 10,
+        "hidden_dim": 2560,
+        "intermediate_size_per_partition": 640,
+        "tp_size": 1,
+        "moe_parallel_config": SimpleNamespace(
+            use_all2all_kernels=False,
+            use_ep=True,
+            tp_size=1,
+            ep_size=4,
+        ),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _qwen4_dp_ep4_moe_contract(**overrides):
+    values = {
+        "num_experts": 512,
+        "num_local_experts": 128,
+        "experts_per_token": 10,
+        "hidden_dim": 2560,
+        "intermediate_size_per_partition": 640,
+        "tp_size": 1,
+        "moe_parallel_config": SimpleNamespace(
+            use_all2all_kernels=True,
+            use_ep=True,
+            all2all_backend="allgather_reducescatter",
+            dp_size=2,
+            sp_size=2,
+            tp_size=1,
+            ep_size=4,
+        ),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_mixed_min_capability_requires_exact_sm70_and_both_turbomind_routes():
     with (
         patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
@@ -188,6 +229,99 @@ def test_nvfp4_moe_contract_rejects_unvalidated_shapes(field, value):
 
 def test_nvfp4_moe_contract_accepts_qwen4_exp_tp4():
     validate_nvfp4_sm70_moe_contract(_qwen4_moe_contract())
+
+
+def test_nvfp4_moe_contract_accepts_qwen4_exp_tp_local_ep4():
+    validate_nvfp4_sm70_moe_contract(_qwen4_ep4_moe_contract())
+
+
+def test_nvfp4_moe_contract_gates_qwen4_exp_tp2_dp2_ep4(monkeypatch):
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH"
+    monkeypatch.setenv(name, "0")
+    envs.disable_envs_cache()
+    with pytest.raises(NotImplementedError, match=r"DP\+EP"):
+        validate_nvfp4_sm70_moe_contract(_qwen4_dp_ep4_moe_contract())
+
+    monkeypatch.setenv(name, "1")
+    envs.disable_envs_cache()
+    try:
+        validate_nvfp4_sm70_moe_contract(_qwen4_dp_ep4_moe_contract())
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_nvfp4_moe_contract_accepts_sm70_deepep_tp2_dp2_ep4(monkeypatch):
+    name = "VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH"
+    monkeypatch.setenv(name, "1")
+    envs.disable_envs_cache()
+    contract = _qwen4_dp_ep4_moe_contract()
+    contract.moe_parallel_config.all2all_backend = "deepep_high_throughput"
+    try:
+        validate_nvfp4_sm70_moe_contract(contract)
+    finally:
+        envs.disable_envs_cache()
+
+
+def test_sm70_deepep_buffer_is_owned_for_communicator_lifetime():
+    class FakeManager:
+        def __init__(self):
+            self.calls = 0
+            self._sm70_deepep_handle: object | None = None
+
+        def get_handle(self, kwargs):
+            assert kwargs == {}
+            self.calls += 1
+            return object()
+
+    manager = FakeManager()
+    ep_group = SimpleNamespace(
+        device_communicator=SimpleNamespace(all2all_manager=manager)
+    )
+    with patch(
+        "vllm.model_executor.layers.quantization.nvfp4_sm70_moe.get_ep_group",
+        return_value=ep_group,
+    ):
+        first = ModelOptNvFp4SM70MoEMethod._get_sm70_deepep_buffer()
+        second = ModelOptNvFp4SM70MoEMethod._get_sm70_deepep_buffer()
+
+    assert first is second
+    assert manager._sm70_deepep_handle is first
+    assert manager.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("all2all_backend", "deepep_low_latency"),
+        ("dp_size", 4),
+        ("sp_size", 1),
+        ("ep_size", 2),
+    ],
+)
+def test_nvfp4_moe_contract_rejects_other_dp_ep_topologies(monkeypatch, field, value):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH", "1")
+    envs.disable_envs_cache()
+    contract = _qwen4_dp_ep4_moe_contract()
+    setattr(contract.moe_parallel_config, field, value)
+    try:
+        with pytest.raises(NotImplementedError, match=r"DP\+EP"):
+            validate_nvfp4_sm70_moe_contract(contract)
+    finally:
+        envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ep_size", 2),
+        ("tp_size", 2),
+    ],
+)
+def test_nvfp4_moe_contract_rejects_unvalidated_ep_topology(field, value):
+    contract = _qwen4_ep4_moe_contract()
+    setattr(contract.moe_parallel_config, field, value)
+    with pytest.raises(NotImplementedError, match="EP4 contract"):
+        validate_nvfp4_sm70_moe_contract(contract)
 
 
 def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):

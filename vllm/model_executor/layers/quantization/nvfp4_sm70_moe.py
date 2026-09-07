@@ -11,7 +11,7 @@ expert-weight copy.
 from __future__ import annotations
 
 import os
-from typing import Final
+from typing import Any, Final
 
 import torch
 from torch.nn import Parameter
@@ -19,6 +19,7 @@ from torch.nn import Parameter
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.config.vllm import get_current_vllm_config_or_none
+from vllm.distributed import get_ep_group
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -253,6 +254,38 @@ def _use_qwen38_qpn_batch_decode(
         and int(layer.sm70_nvfp4_hidden_size) == 2560
         and int(layer.sm70_nvfp4_intermediate_size) == 160
         and int(layer.sm70_nvfp4_top_k) == 10
+    )
+
+
+def _use_qwen38_ep4_fastpath(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit the exact TP-local EP4 device dispatch/combine route."""
+    return bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+        and 0 < x.shape[0] <= _GRAPH_SAFE_MAX_TOKENS
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and int(layer.moe_config.tp_size) == 1
+        and int(layer.moe_config.ep_size) == 4
+        and int(layer.sm70_nvfp4_num_experts) == 128
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 640
+        and int(layer.sm70_nvfp4_top_k) == 10
+        and all(
+            hasattr(torch.ops._C, name)
+            for name in (
+                "nvfp4_qwen38_ep4_permute_sm70_out",
+                "nvfp4_qwen38_ep4_combine_sm70_out",
+                "nvfp4_moe_fused_swiglu_stage_sm70_out",
+            )
+        )
     )
 
 
@@ -651,10 +684,83 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
             f"experts={moe.num_experts}, top_k={moe.experts_per_token}. "
             f"Validated contracts: {sorted(_SUPPORTED_CONTRACTS)}."
         )
-    if moe.moe_parallel_config.use_all2all_kernels:
+    dp_ep_contract = (
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+        and moe.moe_parallel_config.use_all2all_kernels
+        and moe.moe_parallel_config.use_ep
+        and moe.moe_parallel_config.all2all_backend
+        in ("allgather_reducescatter", "deepep_high_throughput")
+        and moe.moe_parallel_config.dp_size == 2
+        and moe.moe_parallel_config.sp_size == 2
+        and moe.moe_parallel_config.tp_size == 1
+        and moe.moe_parallel_config.ep_size == 4
+        and moe.num_local_experts == 128
+        and contract == (2560, 640, 512, 10)
+    )
+    if moe.moe_parallel_config.use_all2all_kernels and not dp_ep_contract:
         raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE does not support DP+EP all-to-all."
+            "SM70 TurboMind NVFP4 DP+EP currently supports only the explicit "
+            "Qwen3.8 TP2xDP2/EP4 sequence-parallel experiment with the "
+            "allgather_reducescatter or DeepEP high-throughput backend. "
+            "Other all-to-all topologies "
+            "remain fail-closed."
         )
+    if getattr(moe.moe_parallel_config, "use_ep", False):
+        ep_contract = (
+            moe.moe_parallel_config.tp_size,
+            moe.moe_parallel_config.ep_size,
+            moe.num_local_experts,
+            moe.hidden_dim,
+            moe.intermediate_size_per_partition,
+            moe.num_experts,
+            moe.experts_per_token,
+        )
+        if ep_contract != (1, 4, 128, 2560, 640, 512, 10):
+            raise NotImplementedError(
+                "SM70 TurboMind NVFP4 TP-local expert parallelism currently "
+                "requires the validated EP4 contract "
+                "(TP=1 inside MoE, EP=4, local/global experts=128/512, "
+                "hidden=2560, intermediate=640, top-k=10); got "
+                f"{ep_contract}."
+            )
+
+
+def _validate_expert_placement(layer: RoutedExperts) -> bool:
+    """Validate replicated-TP or the exact TP-local EP4 placement.
+
+    TP-local EP receives replicated token rows from the surrounding TP model.
+    The experimental TP2xDP2 route first gathers sequence-parallel token rows
+    and reduce-scatters the local-expert sum through the standard EP manager.
+    Both retain the same contiguous 128-expert ownership contract.
+    """
+    expert_map = layer.expert_map
+    if expert_map is None:
+        if layer.local_num_experts != layer.global_num_experts:
+            raise NotImplementedError(
+                "SM70 NVFP4 MoE without an expert map requires local and "
+                "global experts to match."
+            )
+        return False
+
+    validate_nvfp4_sm70_moe_contract(layer.moe_config)
+    if tuple(expert_map.shape) != (int(layer.global_num_experts),):
+        raise ValueError(
+            "SM70 NVFP4 EP expert map must contain one entry per global "
+            f"expert; got {tuple(expert_map.shape)} for "
+            f"{layer.global_num_experts} experts."
+        )
+    if expert_map.dtype != torch.int32:
+        raise TypeError("SM70 NVFP4 EP expert map must use int32 entries.")
+    local = expert_map[expert_map >= 0]
+    expected = torch.arange(
+        int(layer.local_num_experts), dtype=torch.int32, device=expert_map.device
+    )
+    if not torch.equal(local, expected):
+        raise ValueError(
+            "SM70 NVFP4 EP currently requires a contiguous linear mapping of "
+            "the rank's global experts to local IDs."
+        )
+    return True
 
 
 def _validate_weight_layout(layer: RoutedExperts) -> None:
@@ -715,6 +821,25 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     @property
     def supports_eplb(self) -> bool:
         return False
+
+    @staticmethod
+    def _get_sm70_deepep_buffer():
+        ep_group = get_ep_group()
+        communicator = ep_group.device_communicator
+        if communicator is None or communicator.all2all_manager is None:
+            raise RuntimeError("SM70 DeepEP requires an initialized EP communicator.")
+        manager: Any = communicator.all2all_manager
+        # DeepEP's generic handle cache intentionally keeps weak references:
+        # modular MoE prepare/finalize objects normally own the strong one.
+        # This quant method owns dispatch itself, so a local-only reference
+        # would be collected after weight post-processing and recreate the
+        # IPC Buffer inside CUDA Graph capture. Keep one manager-scoped handle
+        # alive until communicator teardown instead.
+        handle = getattr(manager, "_sm70_deepep_handle", None)
+        if handle is None:
+            handle = manager.get_handle({})
+            manager._sm70_deepep_handle = handle
+        return handle
 
     def maybe_make_prepare_finalize(
         self,
@@ -808,31 +933,41 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             raise NotImplementedError(
                 "SM70 NVFP4 MoE does not support router weights on input."
             )
-        if layer.expert_map is not None:
-            raise NotImplementedError(
-                "SM70 NVFP4 MoE currently requires fully replicated experts."
-            )
-        if layer.local_num_experts != layer.global_num_experts:
-            raise NotImplementedError(
-                "SM70 NVFP4 MoE currently requires local and global experts to match."
-            )
-
         validate_nvfp4_sm70_moe_contract(layer.moe_config)
+        expert_parallel = _validate_expert_placement(layer)
         _validate_weight_layout(layer)
         num_experts = int(layer.local_num_experts)
         hidden = int(layer.moe_config.hidden_dim)
         intermediate = int(layer.moe_config.intermediate_size_per_partition)
-        fused_swiglu_requested = bool(
-            envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
-            and int(layer.moe_config.tp_size) == 4
+        exact_qwen38_tp4 = bool(
+            int(layer.moe_config.tp_size) == 4
+            and int(layer.moe_config.ep_size) == 1
             and num_experts == 512
             and hidden == 2560
             and intermediate == 160
             and int(layer.moe_config.experts_per_token) == 10
+        )
+        exact_qwen38_ep4 = bool(
+            expert_parallel
+            and int(layer.moe_config.tp_size) == 1
+            and int(layer.moe_config.ep_size) == 4
+            and num_experts == 128
+            and hidden == 2560
+            and intermediate == 640
+            and int(layer.moe_config.experts_per_token) == 10
+        )
+        fused_swiglu_requested = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL
+            and (exact_qwen38_tp4 or exact_qwen38_ep4)
             and layer.swiglu_limit is None
         )
         fused_swiglu_available = hasattr(
-            torch.ops._C, "nvfp4_moe_indexed_fused_swiglu_sm70_out"
+            torch.ops._C,
+            (
+                "nvfp4_moe_fused_swiglu_stage_sm70_out"
+                if exact_qwen38_ep4
+                else "nvfp4_moe_indexed_fused_swiglu_sm70_out"
+            ),
         )
         fused_swiglu_explicit = (
             "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL" in os.environ
@@ -868,7 +1003,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "retaining separate exact W13 and activation kernels."
             )
         fast_prefill = bool(
-            fused_swiglu_prefill and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
+            exact_qwen38_tp4
+            and fused_swiglu_prefill
+            and envs.VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL
         )
         raw_scale_requested = bool(
             envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE
@@ -1141,6 +1278,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             indexed_prefill_requested and indexed_prefill_available
         )
         layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = fused_swiglu_prefill
+        layer.sm70_nvfp4_qwen38_ep4_fastpath = bool(
+            exact_qwen38_ep4 and envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+        )
+        layer.sm70_nvfp4_qwen38_ep4_expert_start = (
+            int(layer.moe_config.ep_rank) * 128 if exact_qwen38_ep4 else 0
+        )
         layer.sm70_nvfp4_qwen38_fused_swiglu_decode = fused_swiglu_decode
         layer.sm70_nvfp4_qwen38_fast_prefill = fast_prefill
         layer.sm70_nvfp4_qwen38_raw_scale = raw_scale
@@ -1190,14 +1333,29 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         del layer.w2_weight_scale
         del layer.w2_weight_scale_2
         del layer.w2_input_scale
+        if (
+            layer.moe_config.moe_parallel_config.all2all_backend
+            == "deepep_high_throughput"
+        ):
+            # CUDA IPC export and peer-handle exchange are illegal once graph
+            # capture starts. Initialize only after releasing this layer's
+            # source tensors to avoid raising the peak weight-conversion use.
+            # All layers share the manager's cached workspace.
+            torch.accelerator.empty_cache()
+            self._get_sm70_deepep_buffer()
+            logger.info_once(
+                "SM70 DeepEP workspace and peer handles initialized before "
+                "CUDA Graph capture."
+            )
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
-            "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
+            "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, EP=%s, "
             "graph_safe_decode=B1-B%d, compact_grouped_decode<=%d routed rows).",
             hidden,
             intermediate,
             num_experts,
             layer.sm70_nvfp4_top_k,
+            expert_parallel,
             _GRAPH_SAFE_MAX_TOKENS,
             _COMPACT_GROUPED_MAX_SLOTS,
         )
@@ -1425,6 +1583,103 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 out, gate_up, float(layer.swiglu_limit)
             )
 
+    @staticmethod
+    def owns_sm70_deepep_dispatch(
+        layer: RoutedExperts,
+        x: torch.Tensor,
+    ) -> bool:
+        """Return whether this call can use the graph-safe SM70 DeepEP route."""
+        parallel = layer.moe_config.moe_parallel_config
+        return bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
+            and parallel.all2all_backend == "deepep_high_throughput"
+            and parallel.use_all2all_kernels
+            and parallel.dp_size == 2
+            and parallel.sp_size == 2
+            and parallel.ep_size == 4
+            and parallel.tp_size == 1
+            and 0 < x.shape[0] <= _GRAPH_SAFE_MAX_TOKENS // parallel.ep_size
+            and x.shape[1] == 2560
+            and x.dtype == torch.float16
+            and x.is_contiguous()
+            and _grouped_decode_context_ok()
+        )
+
+    def _apply_sm70_deepep(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch compact rows over NVLink, run local experts, then combine."""
+        import deep_ep
+
+        buffer = self._get_sm70_deepep_buffer()
+        ep_size = int(layer.moe_config.ep_size)
+        topk_ids_i64 = topk_ids.to(torch.int64)
+        (
+            num_tokens_per_rank,
+            _,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            _,
+        ) = buffer.get_dispatch_layout(topk_ids_i64, layer.global_num_experts)
+        config = deep_ep.Config(2, 4, 64)
+        (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            _,
+            handle,
+            _,
+        ) = buffer.dispatch(
+            x=x,
+            num_tokens_per_rank=num_tokens_per_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            topk_idx=topk_ids_i64,
+            topk_weights=topk_weights,
+            expert_alignment=1,
+            num_worst_tokens=int(x.shape[0]) * ep_size,
+            config=config,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+        if recv_topk_ids is None or recv_topk_weights is None:
+            raise RuntimeError("SM70 DeepEP dispatch did not return routing metadata.")
+
+        expert_start = int(layer.sm70_nvfp4_qwen38_ep4_expert_start)
+        invalid_global_id = layer.global_num_experts - 1 if expert_start == 0 else 0
+        recv_topk_ids = torch.where(
+            recv_topk_ids < 0,
+            invalid_global_id,
+            recv_topk_ids + expert_start,
+        ).to(torch.int32)
+        local_output = self.apply(
+            layer,
+            recv_x,
+            recv_topk_weights,
+            recv_topk_ids,
+            None,
+            None,
+            _sm70_deepep_local=True,
+        )
+        combined, _, _ = buffer.combine(
+            x=local_output,
+            handle=handle,
+            config=config,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+        logger.info_once(
+            "Experimental SM70 DeepEP FP16 dispatch selected "
+            "(TP2xDP2/EP4, local tokens=%d, fixed receive rows=%d).",
+            x.shape[0],
+            recv_x.shape[0],
+        )
+        return combined
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -1433,6 +1688,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        *,
+        _sm70_deepep_local: bool = False,
     ) -> torch.Tensor:
         del shared_experts, shared_experts_input
         if not x.is_cuda or x.dtype != torch.float16 or x.ndim != 2:
@@ -1459,6 +1716,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
+        if not _sm70_deepep_local and self.owns_sm70_deepep_dispatch(layer, x):
+            return self._apply_sm70_deepep(layer, x, topk_weights, topk_ids)
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         interleaved_w13 = bool(
             getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)
@@ -1509,10 +1768,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 num_tokens,
             )
             return output
-        direct_single_token = num_tokens == 1
+        # Direct routes consume global expert IDs as prepared-weight row IDs.
+        # Under EP those IDs must first be mapped and remote routes discarded,
+        # so use the graph-safe permutation path even for one token.
+        direct_single_token = num_tokens == 1 and layer.expert_map is None
         direct_qpn_m1 = _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
         direct_qpn_batch = _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
         direct_qpn_mtp5 = _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+        fast_ep4 = _use_qwen38_ep4_fastpath(layer, x, topk_ids)
         raw_scale = bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False))
         if os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1" and num_tokens <= 16:
             logger.warning_once(
@@ -1702,7 +1965,24 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             else:
                 _mtp_weighted_reduce(buffers["sorted_output"], topk_weights, output)
             return output
-        if direct_single_token:
+        if fast_ep4:
+            logger.info_once(
+                "SM70 Qwen3.8 NVFP4 TP-local EP4 device dispatch enabled "
+                "(tokens=%d, local experts=128).",
+                num_tokens,
+            )
+            sm70_ops.nvfp4_qwen38_ep4_permute_sm70_out(
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                buffers["inv_permuted_idx"],
+                x,
+                topk_ids,
+                int(layer.sm70_nvfp4_qwen38_ep4_expert_start),
+            )
+            stage_offsets = buffers["expert_offsets"]
+            stage_expert_ids = buffers["dense_expert_ids"]
+            stage_experts = int(layer.sm70_nvfp4_num_experts)
+        elif direct_single_token:
             _prepare_single_token_slots(
                 x,
                 topk_ids,
@@ -1773,6 +2053,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         if (
             not direct_single_token
             and not glm53_fused_permute_q8
+            and layer.expert_map is None
             and _use_compact_grouped(num_tokens, top_k)
         ):
             prepare_groups = (
@@ -1801,7 +2082,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 interleaved_w13,
             )
 
-        if split_fused_indexed_w13:
+        if fast_ep4 and interleaved_w13:
+            sm70_ops.nvfp4_moe_fused_swiglu_stage_sm70_out(
+                buffers["intermediate"],
+                buffers["permuted_input"],
+                stage_offsets,
+                stage_expert_ids,
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                stage_experts,
+                layer.sm70_nvfp4_w13_k_dim,
+                layer.sm70_nvfp4_w13_n_dim,
+                layer.sm70_nvfp4_group_size,
+            )
+        elif split_fused_indexed_w13:
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 indexed-A fused-SwiGLU split-W13 "
                 "prefill route enabled (N256+N64)."
@@ -1896,7 +2190,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer.sm70_nvfp4_w13_n_dim,
                 layer.sm70_nvfp4_group_size,
             )
-        if not fused_indexed_w13:
+        if not fused_indexed_w13 and not (fast_ep4 and interleaved_w13):
             self._apply_swiglu(
                 layer,
                 buffers["intermediate"],
@@ -1922,7 +2216,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer.sm70_nvfp4_w2_n_dim,
             layer.sm70_nvfp4_group_size,
         )
-        if direct_single_token:
+        if fast_ep4:
+            sm70_ops.nvfp4_qwen38_ep4_combine_sm70_out(
+                output,
+                buffers["sorted_output"],
+                topk_weights,
+                buffers["inv_permuted_idx"],
+            )
+        elif direct_single_token:
             _single_token_weighted_reduce(
                 buffers["sorted_output"], topk_weights, output
             )

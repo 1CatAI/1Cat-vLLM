@@ -1212,6 +1212,7 @@ class CompilationConfig:
             all2all_backend == "deepep_high_throughput"
             and data_parallel_size > 1
             and self.cudagraph_mode != CUDAGraphMode.NONE
+            and not envs.VLLM_SM70_NVFP4_QWEN38_MOE_EP4_FASTPATH
         ):
             # TODO: Piecewise Cuda graph might be enabled
             # if torch compile cache key issue fixed
