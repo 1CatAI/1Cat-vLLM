@@ -22,9 +22,11 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -45,6 +47,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 )
 
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .mtp_fp8 import dequantize_mtp_fp8_experts
 
 try:
     from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
@@ -66,6 +69,8 @@ from .model import (
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
 )
+
+logger = init_logger(__name__)
 
 
 def _remap_ignored_layers(
@@ -138,6 +143,23 @@ def _validate_mtp_expert_weights_loaded(
         )
 
 
+def _sm70_mtp_fp8_blocks(quant_config) -> dict[str, int]:
+    if quant_config is None or not sm70_tm.is_exact_sm70_cuda_platform():
+        return {}
+    if quant_config.get_name() != "modelopt_mixed":
+        return {}
+    blocks = {}
+    for name, info in quant_config.quantized_layers.items():
+        if (
+            re.fullmatch(r"mtp\.layers\.\d+\.mlp\.experts", name)
+            and info.get("quant_algo", "").upper() == "FP8_BLOCK_SCALES"
+        ):
+            if info.get("group_size") != 128:
+                raise ValueError(f"Unsupported MTP FP8 block size for {name}: {info}")
+            blocks[name] = 128
+    return blocks
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -152,6 +174,17 @@ def _make_draft_vllm_config(
     # inject packed and ignored modules to the quantization config of draft model
     if draft_quant_config is not None:
         configure_quant_config(draft_quant_config, Qwen4ExpMTP)
+        quantized_layers = getattr(draft_quant_config, "quantized_layers", None)
+        if quantized_layers:
+            # Checkpoint MTP layers start at zero, while decoder prefixes use
+            # target-layer offsets (e.g. mtp.layers.48). Keep mixed-precision
+            # assignments aligned with those prefixes, just like exclusions.
+            draft_quant_config.quantized_layers = dict(
+                zip(
+                    _remap_ignored_layers(list(quantized_layers), mtp_start_layer_idx),
+                    quantized_layers.values(),
+                )
+            )
         ignored_layers = getattr(draft_quant_config, "ignored_layers", None)
         if ignored_layers:
             setattr(  # noqa: B010
@@ -165,6 +198,14 @@ def _make_draft_vllm_config(
                 draft_quant_config,
                 "exclude_modules",
                 _remap_ignored_layers(exclude_modules, mtp_start_layer_idx),
+            )
+        fp8_experts = _sm70_mtp_fp8_blocks(draft_quant_config)
+        if fp8_experts:
+            # Width 640 / TP4 = 160 crosses 128-wide scale blocks. Reconstruct
+            # these draft weights once at load time, then use ordinary FP16
+            # expert sharding and kernels, as for the BF16 Ark checkpoint.
+            draft_quant_config.exclude_modules = list(
+                dict.fromkeys([*draft_quant_config.exclude_modules, *fp8_experts])
             )
 
     draft_vllm_config = replace(
@@ -209,6 +250,20 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             vllm_config,
             self.mtp_start_layer_idx,
         )
+        self.fp8_mtp_expert_blocks = {
+            f"model.layers.{int(name.split('.')[2]) - self.mtp_start_layer_idx}"
+            ".mlp.experts": block_size
+            for name, block_size in _sm70_mtp_fp8_blocks(
+                draft_vllm_config.quant_config
+            ).items()
+        }
+        if self.fp8_mtp_expert_blocks:
+            if model_config.dtype != torch.float16:
+                raise ValueError("SM70 block-FP8 MTP experts require dtype=float16")
+            logger.info_once(
+                "Loading Qwen4Exp MTP block-FP8 experts as resident FP16 on SM70; "
+                "checkpoint scales are applied once before TP sharding."
+            )
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
             # embedding, fc_hidden (shared across HC branches) projects the
@@ -493,7 +548,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             skip_substrs=["hyper_connection_mixer.block_inject_weight"],
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        loaded_weights = loader.load_weights(remap_weight_names())
+        loaded_weights = loader.load_weights(
+            dequantize_mtp_fp8_experts(
+                remap_weight_names(), self.model.fp8_mtp_expert_blocks
+            )
+        )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)
         return loaded_weights
 
