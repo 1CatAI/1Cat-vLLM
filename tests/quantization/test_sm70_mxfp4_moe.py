@@ -157,14 +157,14 @@ def test_mxfp4_sm70_platform_gate_is_exact(monkeypatch):
     monkeypatch.setattr(
         sm70_tm.current_platform,
         "is_device_capability",
-        lambda capability: capability == (7, 0),
+        lambda capability, device_id=0: capability == (7, 0),
     )
     assert sm70_tm.is_exact_sm70_cuda_platform()
 
     monkeypatch.setattr(
         sm70_tm.current_platform,
         "is_device_capability",
-        lambda capability: False,
+        lambda capability, device_id=0: False,
     )
     assert not sm70_tm.is_exact_sm70_cuda_platform()
 
