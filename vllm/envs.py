@@ -247,6 +247,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_FUSED_QKV_PACK: bool = False
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
+    VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
     VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH: bool = False
@@ -2257,6 +2258,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
+    ),
+    # Experimental fixed 8192/16-warp reduction for the FP16 no-residual and
+    # FP16-residual Gemma norms not covered by the existing FP32-residual path.
+    # Prevents per-rank/startup autotune from changing reduction order. Keep
+    # disabled until fixed-prefix, natural-output and full-round gates pass.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
     # DFlash2 proposal and target sampling distributions both have compact

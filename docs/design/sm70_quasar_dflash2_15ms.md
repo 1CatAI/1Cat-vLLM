@@ -122,10 +122,43 @@ every historical quality issue has the same cause.
 
 Both reductions differ from a rounded FP64 oracle (46 and 51 elements in
 this captured tensor). Selecting the more common configuration alone is not
-a precision argument. The next controlled experiment uses the existing
-`TORCHINDUCTOR_DETERMINISTIC=1` mechanism with fresh caches on every rank.
-Numerical, natural-output and complete-round checks are required before
-any default changes. No hot-path behavior changes in this diagnostic commit.
+a precision argument. An environment-only attempt with
+`TORCHINDUCTOR_DETERMINISTIC=1` did not reach the current AOT compile path:
+the generated kernel metadata still says `deterministic=False`. Its 2.517%
+A/A TV therefore does not evaluate the actual deterministic mechanism. It is
+recorded as a failed route hit, not a rejected numerical implementation.
+
+### Opt-in fixed Gemma reduction
+
+`VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS=1` selects a fixed 8192-element, 16-warp
+reduction for contiguous FP16 `[M, 5120]` inputs and FP16 weights, with either
+no residual or an FP16 residual. The latter retains FP32 residual output.
+The established FP32-residual fused path and unsupported shapes keep their
+existing dispatch. The new flag defaults to zero.
+
+The initial fixed-kernel A/A (`audit-fixed-norm-1r2` versus
+`audit-fixed-norm-2`) has 144 records per arm: zero differing intermediates,
+bitwise-equal logits and zero full/sampling TV. Comparing that candidate to
+`audit-a2` exposed another arithmetic detail at MBPP3 step 8: three values
+in layer 0 post-attention norm differ, eventually producing maximum sampling
+TV 0.003018199. Top-p support and top-1 stay unchanged, which is insufficient
+for acceptance. Its masked square and residual materialization boundary had
+been removed, changing FMA contraction even with the same tile and warp count.
+
+The corrected kernel preserves those boundaries. With the same checkpoint
+weights and captured inputs, both norms and the residual now exactly match
+`audit-a2` for all 36 case/step combinations (two full prefills plus all 17
+verification steps per tape). The final corrected model comparison and
+natural-output/performance gates are pending; no serving default is promoted.
+The first AOT attempt also exposed an unresolved imported `tldevice` alias in
+generated code. Using `tl.rsqrt` fixes code generation, and the test now runs
+the actual Inductor backend rather than only Dynamo's eager backend.
+
+Current focused norm/state tests: **28 pass on V100**, including graph replay,
+irregular prefill versus q1/q8 row invariance, residual storage/precision and
+FP64-reference checks. Recorded operator replay, source hashes and A/A results
+are under `results/fixed-norm-*.json`; the actual model runs use isolated
+compiler caches and the frozen native libraries.
 
 Focused tests: seven pass on V100, including accepted-slot indexing, invalid
 padding, owned snapshot storage, CUDA graph replay with changing selectors,
