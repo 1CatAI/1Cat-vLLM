@@ -12,12 +12,20 @@ unroll specialization passes exhaustive encoding, graph/state, FP64-reference
 and sanitizer gates; live attention shadow compares 665321472 elements with
 zero bit differences. It is restricted to TP2 q8/D256/FP32-partial/P1024.
 
-The first independent-startup candidate measures 35.921/32.706 ms against
-44.986/35.075 ms control. Output trajectories differ between startups, including
-between controls, so this is not a quality promotion or a 25 ms result.
-Keep the feature off while resolving the comparison and remaining cost.
+Three independent startups now each contain five attention-only graph-switch
+pairs per fixture, with fixed prefill and projection choices within a startup.
+Complete-round medians improve from 44.872/35.051 to 35.823/32.694 ms, and all
+fifteen pairs per fixture retain identical tokens, acceptance counts and EOS.
+Cross-startup control variation remains unresolved; the first unmatched
+comparison is retained as provisional evidence. The approximately 25 ms target
+and broader quality/context gates are still pending. Keep PR566 Draft and the
+production flag off while reducing the remaining cost.
 Capping inactive partition CTAs was numerically exact but had no speed gain;
 do not repeat that rejected path without new evidence.
+QPN2 TP2 can match TurboMind's operator bits by matching effective-scale
+rounding and the observed K64 split/reduction schedule. A full extra code copy
+exceeds the memory budget; shared-code, tiled and vector-reader screens remain
+slower and are rejected for model use. The TP2 worklog records the comparisons.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

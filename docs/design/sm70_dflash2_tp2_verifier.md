@@ -96,8 +96,10 @@ The private u8 implementation is pinned by SHA256
 `696545418c6dae261f0bc6a3a530b34464d040de8e404a3069cfd8c2a7762ad3`.
 The integrated native build is separately pinned by SHA256
 `f916e9e370eeb8d865b4de9d8b64f6e66d8831c0b4458dbe3087141dbadc1d19`;
-its own GPU and runtime gates must pass before substituting it for the
-isolated implementation.
+it passes 14 native tests and supplies the fast partition function in the
+paired model comparison below. Its retained build-source snapshot precedes
+the final changed-line formatting pass; the manifest hashes the actual
+as-built source and library.
 
 The first contemporaneous control reproduces round cost at 44.986/35.075 ms.
 Its release1k trajectory has 349 tokens rather than the original startup's
@@ -109,17 +111,98 @@ release1k/MBPP28 outputs of 283/297 tokens. Its corresponding control produces
 349/270 tokens. The trajectories and acceptance counts differ, so the
 approximately 20.15%/6.75% latency reductions are provisional performance
 observations, not accepted quality-preserving gains. A within-startup graph
-comparison is used next to keep prefill and projection choices fixed.
-The 25 ms target and final promotion remain outstanding.
+comparison now keeps prefill and projection choices fixed and isolates the
+attention change.
 
 The integrated native build passes 14 tests, including exhaustive byte
 decoding, 262144-token graph replay, FP64 reference, unsupported-shape fallback
-and stale-library rejection. The initial QPN2 TP2 projection screen uses
-sixteen real matrices from four adjacent layers. Its best working-set median
-is 0.685 ms versus 0.930 ms for TurboMind, but several reference-error metrics
-grow. This arithmetic candidate is rejected for model use. Source inspection
-identifies early FP16 rounding of the global scale as a separate precision
-candidate; it requires fresh operator and model gates.
+and stale-library rejection.
+
+### Three-startup paired attention result
+
+After warmup, each of three independent services alternates five A/B pairs
+per fixture. Between quiescent requests, a diagnostic CUDA driver API helper
+changes only the executable graph function for the sixteen scalar partition
+nodes on each rank. Node arguments, grid, reducer, buffers, prefill, model
+weights and that startup's TurboMind choices stay fixed. The candidate
+function comes from the pinned integrated native build. Switching and route
+verification happen outside request timing; no profiler or per-round tensor
+dump is active. This harness is not a service API change.
+
+| Startup | release1k control / candidate, ms | MBPP28 control / candidate, ms |
+| --- | ---: | ---: |
+| 3 | 44.808 / 35.823 | 35.051 / 32.694 |
+| 4 | 44.897 / 35.797 | 34.953 / 32.678 |
+| 5 | 44.872 / 35.930 | 35.318 / 32.861 |
+| Median of startup medians | **44.872 / 35.823** | **35.051 / 32.694** |
+
+Each cell is the median of five request-average complete-round costs.
+All fifteen pairs per fixture have identical token IDs, acceptance counters
+and natural EOS. Cross-startup controls still differ; this experiment isolates
+the attention optimization without claiming to fix the existing variation.
+
+Pooled endpoint stream intervals have one interval per round, checked against
+the round count. These host-observed intervals include delivery jitter:
+
+| Fixture / mode | Round p50 / p90 / p99, ms | Median TTFT, ms | Median pure decode, tokens/s |
+| --- | ---: | ---: | ---: |
+| release1k control | 44.772 / 45.159 / 47.196 | 575.877 | 67.947 |
+| release1k candidate | 35.789 / 36.063 / 38.027 | 576.364 | 85.219 |
+| MBPP28 control | 35.133 / 36.452 / 37.276 | 148.971 | 128.277 |
+| MBPP28 candidate | 32.728 / 33.232 / 33.915 | 149.931 | 137.237 |
+
+Acceptance is reported separately from emitted tokens:
+
+| Fixture | Startup | Accepted drafts / round, both modes | Emitted tokens / round, both modes |
+| --- | ---: | ---: | ---: |
+| release1k | 3 | 2.455446 | 3.455446 |
+| release1k | 4 | 2.063291 | 3.063291 |
+| release1k | 5 | 2.010638 | 3.010638 |
+| MBPP28 | 3, 4 | 3.500000 | 4.500000 |
+| MBPP28 | 5 | 3.569231 | 4.569231 |
+
+These paired results admit the attention component for continued experiments.
+The approximately 25 ms target, full context sweep and broader quality suite
+remain outstanding. The production flag stays off and the PR stays Draft.
+Raw reports are `attention-three-start-pair-summary.json`,
+`attention-three-start-secondary-metrics.json`, and
+`tp2-attention-within-start-{3,4,5}-switch.json` in the campaign results.
+
+### Projection screening and rejected paths
+
+Sixteen real matrices from four adjacent target layers cover all five TP2
+physical projection shapes. Inputs are fixed synthetic M8 operands, so these
+are operator screens, not live hidden-state or complete-model evidence.
+The first QPN2 screen is faster (0.685 versus 0.930 ms per working set) but
+increases several FP64-reference error metrics and is rejected for model use.
+
+TurboMind first combines each group scale with the global scale in FP32 and
+rounds that effective scale to FP16. Matching this order, the actual selected
+split-K count, and its K64 chunk boundaries produces bitwise-identical outputs
+on all sixteen tested matrices, with identical FP64-reference errors. Observed
+split counts vary across startup tuning, including 14 and 15; the experiment
+reads the selected kernel rather than assuming a fixed count. This is not yet
+proof that tuning explains the model's cross-startup variation.
+
+The exact prepacked variant measures 0.724 versus 0.891 ms, but duplicates
+roughly 5.67 GiB of codes per rank plus scales across the full target. It is
+not admitted under the frozen memory/context contract. Reusing the TurboMind
+code and effective-scale storage avoids that duplication but is slower:
+
+| Same-working-set comparison | TurboMind, ms | Candidate, ms | Decision |
+| --- | ---: | ---: | --- |
+| Shared codes, cached loads | 0.891 | 0.940 | Reject |
+| Shared codes, streaming loads | 0.896 | 0.921 | Reject |
+| Two / four adjacent N tiles | 0.896 | 1.081 / 1.614 | Reject |
+| Vector code load plus lane exchange | 0.887 | 0.907 | Reject |
+
+All these exact variants match the sixteen outputs bit for bit. No slower
+variant advances to model testing. The shared layout reader references PR561;
+that memory campaign is separate from this attention PR. Expanding the
+attention PV unroll from eight to sixteen retains the operator output and
+partial-state bits through length 262144 and changes its sixteen-layer median
+from 3.888 to 3.652 ms. This small additional gain is not yet a complete-round
+result and is not enabled in the published specialization.
 
 ## Reproduction and retained negative results
 
