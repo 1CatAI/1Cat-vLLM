@@ -289,13 +289,33 @@ Numerical parity and acceptance remain mandatory candidate promotion gates.
 At 2026-09-08 01:24:11 UTC, main merged PR #560 as
 `e5d63c51f0fcc1ddf75d229e3df06bf52df206f5`. It routes DFlash2 E4M3 q8 to FP32
 attention intermediates and changes the scalar/q1 precision path. The frozen
-campaign results above predate that change. Preserve the old overlay until
-the current numerical attribution is closed, then merge main, use matching
-precision-revision-4 Flash-V100 binaries and establish a new baseline before
-final performance acceptance. An independent build from the exact merge tree
-has completed under `flash-v4-source` / `flash-v4-build`; it is not yet the active
-runtime. The separate FP8-target model gate for #560 does not validate QUASAR.
+campaign results above predate that change. The cost branch integrates that
+main as `631780fb4229e3cc4f384571135f6fd86996ce3f`, with the old overlay and
+libraries retained for the separate numerical investigation. An independent
+build from the exact merge tree is active under `flash-v4-source` /
+`flash-v4-build`. Its import reports precision revision 4; 138 attention-policy
+tests pass on CPU, with one GPU test skipped. Establish a new unprofiled
+baseline before interpreting complete-round gains. The separate FP8-target
+model gate for #560 does not validate QUASAR.
 The revision-4 Flash-V100 library SHA256 is
 `a751fed902279b0de23537c4aad2dc4fee360146d7fce7ef0c4f255a77f48b02`;
 the matching paged-KV utility SHA256 is
 `571fe2a96b70d76737375eaed9fb8ad1cac3bc7eefadf139ea3d2437e0cfdb7d`.
+
+### QPN2 cost measurement
+
+`benchmarks/kernels/benchmark_sm70_qpn2_working_set.py` exports the prepared
+runtime codes, scales and actual dispatch parameters from four consecutive
+TP4 layers. Its benchmark replays all sixteen projections in model order,
+covering the five production shapes. Activations are explicitly frozen
+synthetic FP16 inputs; weights must come from the real loaded model. Both
+arms are checked for finite, bitwise-equal outputs after the first graph
+replay and after all alternating timing trials. Source-library and snapshot
+hashes accompany the result. This is a working-set measurement, never a
+complete-round result or a replacement for the candidate's full model gates.
+
+The task-local trace parser now discovers the captured steady rounds and
+kernel counts. A regression against the retained September 6 trace exactly
+reproduces the recorded phase and complete-round timings. The queued new
+trace uses the FP32-attention integration and GPU4--7, after a separate
+uninstrumented baseline. Its result is pending GPU availability.
