@@ -142,10 +142,11 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
-  const int tile = blockIdx.x;
+  const int tile = TurboMindLayout ? blockIdx.y : blockIdx.x;
   const int quadpair = (lane >> 2) & 3;
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int row_base = blockIdx.y * kQpn2RowsPerCta * RowTiles;
+  const int row_base =
+      (TurboMindLayout ? blockIdx.x : blockIdx.y) * kQpn2RowsPerCta * RowTiles;
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
@@ -253,10 +254,12 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
   const int projection = warp_in_block / SplitK;
   const int warp = warp_in_block - projection * SplitK;
   const int hidden_tiles = hidden >> 5;
-  const int tile = blockIdx.x + projection * hidden_tiles;
+  const int output_tile = TurboMindLayout ? blockIdx.y : blockIdx.x;
+  const int tile = output_tile + projection * hidden_tiles;
   const int quadpair = (lane >> 2) & 3;
   const int local_row = (lane & 3) + ((lane & 16) ? 4 : 0);
-  const int row_base = blockIdx.y * kQpn2RowsPerCta * RowTiles;
+  const int row_base =
+      (TurboMindLayout ? blockIdx.x : blockIdx.y) * kQpn2RowsPerCta * RowTiles;
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
@@ -354,7 +357,7 @@ __global__ void nvfp4_qpn2_gated_sm70_kernel(
       const half up_half = __float2half(up);
       const float gate_float = __half2float(gate_half);
       const half silu = __float2half(gate_float / (1.0f + expf(-gate_float)));
-      output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
+      output[static_cast<size_t>(output_row) * hidden + output_tile * 32 +
              output_col] = __hmul(silu, up_half);
     }
   }
@@ -365,7 +368,11 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
                  half* output, int n, int k, int m, float global_scale,
                  cudaStream_t stream) {
   constexpr int kRowsPerCta = kQpn2RowsPerCta * RowTiles;
-  const dim3 grid(n / 32, (m + kRowsPerCta - 1) / kRowsPerCta);
+  const int row_blocks = (m + kRowsPerCta - 1) / kRowsPerCta;
+  // Schedule adjacent row blocks against the same TurboMind weight tile.
+  // Reusing it before traversing N improves cache locality without repacking.
+  const dim3 grid =
+      TurboMindLayout ? dim3(row_blocks, n / 32) : dim3(n / 32, row_blocks);
   nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles, TurboMindLayout>
       <<<grid, (32 * SplitK), 0, stream>>>(codes, scales, input, output, n, k,
                                            m, global_scale);
@@ -376,7 +383,9 @@ void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
                        const half* input, half* output, int hidden, int k,
                        int m, float global_scale, cudaStream_t stream) {
   constexpr int kRowsPerCta = kQpn2RowsPerCta * RowTiles;
-  const dim3 grid(hidden / 32, (m + kRowsPerCta - 1) / kRowsPerCta);
+  const int row_blocks = (m + kRowsPerCta - 1) / kRowsPerCta;
+  const dim3 grid = TurboMindLayout ? dim3(row_blocks, hidden / 32)
+                                    : dim3(hidden / 32, row_blocks);
   nvfp4_qpn2_gated_sm70_kernel<SplitK, NAcc, RowTiles, TurboMindLayout>
       <<<grid, (64 * SplitK), 0, stream>>>(codes, scales, input, output, hidden,
                                            k, m, global_scale);
@@ -525,7 +534,8 @@ void nvfp4_qpn2_gemm_sm70_impl(torch::Tensor out, torch::Tensor input,
   launch_qpn2<SPLIT, NACC, ROWS, TurboMindLayout>(         \
       code_ptr, scale_ptr, input_ptr, output_ptr, n, k, m, \
       static_cast<float>(global_scale), stream)
-  const bool native_two_tile = qpn2_m16_native_enabled(m);
+  // Separate 8-row CTAs pair better with the shared layout's tile ordering.
+  const bool native_two_tile = !TurboMindLayout && qpn2_m16_native_enabled(m);
   if (native_two_tile && split_k == 8 && accumulator_chains == 1) {
     VLLM_LAUNCH_QPN2(2, 8, 1);
   } else if (native_two_tile && split_k == 8) {
@@ -579,7 +589,7 @@ void nvfp4_qpn2_gated_sm70_impl(torch::Tensor out, torch::Tensor input,
   launch_qpn2_gated<SPLIT, NACC, ROWS, TurboMindLayout>(        \
       code_ptr, scale_ptr, input_ptr, output_ptr, hidden, k, m, \
       static_cast<float>(global_scale), stream)
-  const bool native_two_tile = qpn2_m16_native_enabled(m);
+  const bool native_two_tile = !TurboMindLayout && qpn2_m16_native_enabled(m);
   if (native_two_tile && split_k == 8 && accumulator_chains == 1) {
     VLLM_LAUNCH_QPN2_GATED(2, 8, 1);
   } else if (native_two_tile && split_k == 8) {

@@ -59,10 +59,19 @@ dispatch. All 280 real TP4-shard operator cases match output bits, including
 gated output, padding and CUDA Graph replay with changed inputs. The removed
 target codes total approximately 2.836 GiB per rank for QUASAR 27B.
 
-Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in: M8 is close to the original
-layout, but some M16 operators and gated M32 regress by about 9–15%. Do not
-claim model throughput from these operator measurements. The design note
-records build and harness failures so they are not repeated.
+Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in. Shared row-first scheduling
+and 8-row CTAs reduce the rank-0 weighted M16 ratio from 1.0624 to 1.0138 and
+M32 from 1.0738 to 0.9968; M8 remains 1.0434 in the revised ABBA benchmark.
+The focused 21 cases pass bitwise; expanded validation is pending. These
+isolated projection ratios do not establish model throughput. Reject the
+slower vector-load/shuffle and global unroll 1/2 experiments.
+
+Production validation must retain automatic KV at utilization 0.8, TP4,
+256K context, E4M3 KV, chunk 4096, maxseq 4 and the existing DFlash2 q7 graph,
+FP32-logit and sampling settings. The fixed 2 GiB/8K/E5M2 diagnostic is excluded
+from production conclusions. The corrected control loaded 11.08 GiB/rank but
+was externally terminated during compilation; full production A/B remains
+pending. The design note records the failed paths and remaining acceptance.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

@@ -26,23 +26,44 @@ from benchmark_sm70_quasar_nvfp4_oracle import (
 )
 
 
-def _latency(call, repeats):
-    for _ in range(5):
-        call()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        call()
-    samples = []
-    for _ in range(3):
+def _paired_latency(control, shared, m):
+    # Multiple nodes amortize Python replay overhead for these short kernels.
+    nodes = 16 if m <= 32 else 1
+    graphs = []
+    for call in (control, shared):
+        for _ in range(5):
+            call()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(nodes):
+                call()
+        graphs.append(graph)
+
+    def measure(graph):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for _ in range(repeats):
+        for _ in range(10):
             graph.replay()
         end.record()
         end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000 / repeats)
-    return statistics.median(samples)
+        return start.elapsed_time(end) * 1000 / (10 * nodes)
+
+    # ABBA pairs expose drift and balance which layout runs first.
+    samples = []
+    for _ in range(8):
+        samples.append([measure(graphs[i]) for i in (0, 1, 1, 0)])
+    before = statistics.median(s[0] for s in samples)
+    after = statistics.median(s[3] for s in samples)
+    candidate = statistics.median((s[1] + s[2]) / 2 for s in samples)
+    return dict(
+        control_before_us=before,
+        shared_us=candidate,
+        control_after_us=after,
+        ratio=candidate / ((before + after) / 2),
+        abba_samples_us=samples,
+        graph_nodes=nodes,
+    )
 
 
 def _equal_bits(actual, expected):
@@ -152,17 +173,7 @@ def _check_projection(projection, rank, rows):
                 "graph_bits_equal": True,
             }
             if rank == 0:
-                repeats = 100 if m <= 32 else 10
-                # Bracket the candidate with controls to expose clock drift.
-                before = _latency(control, repeats)
-                candidate = _latency(shared, repeats)
-                after = _latency(control, repeats)
-                case.update(
-                    control_before_us=before,
-                    shared_us=candidate,
-                    control_after_us=after,
-                    ratio=candidate / ((before + after) / 2),
-                )
+                case.update(_paired_latency(control, shared, m))
             result["cases"].append(case)
     return result
 
