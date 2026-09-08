@@ -404,8 +404,10 @@ the consumer uses 40 registers with no stack or spills.
 
 `benchmarks/kernels/build_sm70_qpn2_publish_candidate.py` generates the private
 candidate from production source anchors and records source/DSO hashes. It does
-not replace a serving operator. `--build` builds the SM70 library with the same
-arithmetic flags as the production source. The generated CUDA source SHA256 is
+not replace a serving operator. `--build` now keeps default CUDA math;
+`--use-fast-math` explicitly reproduces historical experiments and is an
+arithmetic change for gated SiLU. All extra CUDA flags are recorded in the
+manifest. The generated CUDA source SHA256 is
 `7360d578080c96350970b9ceb42fa5e470627949c28219013d1daa0861acc42a`.
 Use a communicator built from the same header and set
 `VLLM_SM70_CUSTOM_AR_LIBRARY` to that sidecar; do not mix opaque communicator
@@ -557,6 +559,33 @@ FP32-residual contracts and three magnitude ranges. The subsequent model
 experiment is based on the cleared publication combination, with the direct
 attention-output switch disabled. See `results/qpn2-input-packed-real.json`
 and `results/packed-gemma-gate.json`.
+
+The first complete-model packed-input pair fails admission: release1k changes
+from 272 to 210 tokens and 1.989 to 1.800 accepted drafts/round; MBPP28 changes
+from 634 to 754 tokens and 3.877 to 3.303 accepted drafts/round. Its apparent
+16.823/16.443 ms timing is not a promoted gain. A diagnostic shadow then uses
+the actual input and weight of every selected operator: per rank, 383 fresh
+comparisons cover 128 norms, 127 residuals and 128 column projections. Norms,
+residuals and ungated projections all match. Gated projections in later layers
+show a few differing bytes, often one FP16 ULP, which the first-four-layer
+synthetic-input screen missed. Retained evidence is
+`results/packed-input-operator-shadow-summary.json` and each rank's raw report.
+
+The experimental packed-input DSO used `--use_fast_math`. Disassembly of its
+gated kernel has no FFMA correction instructions; the archived production
+gated kernel and the default-math rebuild each contain 22. The current CMake
+QPN2 path obtains Torch's common CUDA flags without adding fast math. A
+same-input GEMM/activation shadow and default-math model rerun are underway;
+the input-layout candidate remains held until those gates pass. The builder's
+former implicit fast-math default has therefore been removed and its math mode
+made explicit. Historical SHA256s and measured results are not relabeled as
+default-math results. Publication's serving path used only its nongated
+producer and already passed its complete 140-record comparison.
+
+The bounded direct-output probe has eight four-rank records: GDN layer 2,
+full-attention layer 3, target hidden and native logits all match, with zero TV.
+This does not clear the earlier 140-record drift; the direct-output switch
+remains disabled. See `results/v4-direct-tiny-comparison.json`.
 
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context

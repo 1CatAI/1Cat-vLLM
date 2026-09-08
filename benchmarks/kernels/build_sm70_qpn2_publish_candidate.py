@@ -21,7 +21,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--build", action="store_true")
+    parser.add_argument(
+        "--use-fast-math",
+        action="store_true",
+        help="Reproduce historical experiments; changes gated SiLU math",
+    )
     args = parser.parse_args()
+    cuda_flags = [
+        "-O3",
+        "-lineinfo",
+        "-gencode=arch=compute_70,code=sm_70",
+        "-DVLLM_NVFP4_QPN2_STANDALONE",
+        "-DVLLM_NVFP4_QPN2_BENCHMARK_CANDIDATE",
+        "-Xptxas=-v",
+    ]
+    if args.use_fast_math:
+        cuda_flags.append("--use_fast_math")
     A = args.output_dir.resolve()
     D = A / "sources"
     D.mkdir(parents=True, exist_ok=True)
@@ -200,6 +215,8 @@ TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
         json.dumps(
             dict(
                 sources=manifest,
+                extra_cuda_cflags=cuda_flags,
+                math_mode="fast" if args.use_fast_math else "default",
                 input_sources={
                     name: hashlib.sha256((W / name).read_bytes()).hexdigest()
                     for name in (
@@ -223,15 +240,7 @@ TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
             name="qpn2_publish_candidate",
             sources=[str(p)],
             build_directory=str(build_dir),
-            extra_cuda_cflags=[
-                "-O3",
-                "--use_fast_math",
-                "-lineinfo",
-                "-gencode=arch=compute_70,code=sm_70",
-                "-DVLLM_NVFP4_QPN2_STANDALONE",
-                "-DVLLM_NVFP4_QPN2_BENCHMARK_CANDIDATE",
-                "-Xptxas=-v",
-            ],
+            extra_cuda_cflags=cuda_flags,
             is_python_module=False,
             verbose=True,
         )
