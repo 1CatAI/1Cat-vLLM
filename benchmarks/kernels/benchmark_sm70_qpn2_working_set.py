@@ -93,6 +93,13 @@ def main() -> None:
         )
         item["codes"] = item["codes"].cuda()
         item["scales"] = item["scales"].cuda()
+        item["candidate_scales"] = item["scales"]
+        if args.candidate_library and hasattr(
+            torch.ops._qpn2_candidate, "prepare_scales"
+        ):
+            item["candidate_scales"] = torch.ops._qpn2_candidate.prepare_scales(
+                item["scales"], item["global_scale"]
+            )
         item["input"] = torch.randn(8, item["k"], device="cuda", dtype=torch.float16)
         width = item["n"] // 2 if item["gated"] else item["n"]
         item["outputs"] = [
@@ -127,7 +134,7 @@ def main() -> None:
                 item["outputs"][arm],
                 item["input"],
                 item["codes"],
-                item["scales"],
+                item["candidate_scales"] if arm else item["scales"],
                 item["global_scale"],
                 item["split_k"],
                 item["nacc"],
@@ -187,6 +194,12 @@ def main() -> None:
             for x in items
             for k in ("codes", "scales")
         ),
+        "candidate_weight_working_set_bytes": sum(
+            x[k].numel() * x[k].element_size()
+            for x in items
+            for k in ("codes", "candidate_scales")
+        ),
+        "candidate_scale_dtype": str(items[0]["candidate_scales"].dtype),
         "candidate_library_sha256": hashlib.sha256(
             args.candidate_library.read_bytes()
         ).hexdigest()
