@@ -87,6 +87,18 @@ endpoint result. Keep it separate. Earlier other-cohort parity differences
 are not resolved by the latest archived-cohort match. Concurrency and
 long-context admission remain outstanding; PR561 stays Draft.
 
+Evening quality follow-up at source2d683cc135: the two completed candidate
+final answers pass original assertions and EvalPlus base/plus tests (2/2
+each). Two attempts to run a current 32-task plus four-concurrent A/B are
+interrupted before candidate execution. Latest parent receives SIGINT;
+child receives SIGTERM during cleanup, without a logged OOM/CUDA failure.
+The controls themselves return270 versus634 tokens on MBPP28 (first
+difference at zero-based token8), with six identical repeats within each
+process. Different-output medians233.57/253.62 tok/s do not prove an
+optimization speed delta. Preserve this restart-variation evidence and
+the interrupted1957/2018 cohorts. No new32-task/concurrency pass is claimed;
+resume with an uninterrupted GPU reservation and verify control stability.
+
 ## DFlash2 shared NVFP4 codes, 2026-09-08
 
 The [shared QPN2/TurboMind weight path](sm70_dflash2_shared_nvfp4.md) removes

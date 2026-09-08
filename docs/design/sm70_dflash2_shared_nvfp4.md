@@ -411,3 +411,42 @@ The PR remains Draft. Raw artifacts include `memory-stacks/`,
 `memory-recovery-summary.json`, `memory-recovery-candidate-server-1/`, its
 per-rank inventory, and the retained interruption logs. The service has
 exited and released its GPU locks.
+
+### Speed and scored-quality follow-up, 2026-09-08 evening
+
+At source `2d683cc1355fddfb7742c32c21ab0a2210a3f045`, the two completed
+candidate answers above pass both the original MBPP assertions and EvalPlus
+base/plus tests: 2/2 in each. Only final content is scored; reasoning snippets
+cannot rescue an empty final. EvalPlus dataset hash is
+`ee43ecabebf20deef4bb776a405ac5b1`. This is a two-task check, not broad admission.
+
+A new same-source paired run keeps both shared-code paths enabled and uses
+the same compact-scale sidecar in both arms. Control restores the three
+LM-head preparation functions from `0afb9a47ee` and disables compact scales;
+candidate uses the current head preparation and compact scales. Production
+arguments remain unchanged. Each arm schedules one warmup plus five speed
+requests, 32 natural-EOS MBPP tasks with a 16384-token cap, and four concurrent
+requests. Concurrent per-request global engine counters are excluded.
+
+Both attempts are interrupted before reaching the candidate. The 19:57
+attempt completes six speed requests and two quality requests; the 20:18
+attempt completes six speed requests and three quality requests. The latter
+records parent SIGINT, followed by child SIGTERM during cleanup. Neither log
+reports an OOM or CUDA computation failure; the signal sender is unknown.
+These are incomplete runs, not successful 32-task or concurrency checks.
+
+The controls themselves expose unresolved restart variation: MBPP28 returns
+270 tokens in the first process and 634 in the second, first differing at
+zero-based token 8. Each process repeats its own sequence identically six
+times. Their measured decode medians, 233.57 and 253.62 tokens/s, cannot be
+used as a memory-optimization speed comparison because the outputs differ
+and no new candidate arm completes. The core and attention binary hashes
+still match the recorded versions. This observation does not establish
+semantic degradation or attribute the difference to compact scales.
+
+Keep the interrupted artifacts and `quality-validation-followup-summary.json`.
+Owned GPU services and the waiting scorer have exited. Resume the paired
+check only with an uninterrupted GPU reservation; investigate control
+restart reproducibility before claiming exact model parity. PR561 remains
+Draft, and broad quality, concurrency and actual 256K-input admission remain
+outstanding.
