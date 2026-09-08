@@ -1105,3 +1105,14 @@ patches the interface's actual module and preserves other shapes/eager calls.
 See [the complete resource audit](sm70_quasar_dflash2_resource_audit_20260909.md)
 for endpoint statistics, critical-rank closure, launch resources, the unchanged
 sampling quality guard and trace provenance limits. No new default is enabled.
+
+The corrected attention module binding now has actual graph proof: 640 partial
+launches over forty rank-rounds use a 3 × 80 grid, 256 threads, 234 registers
+and 30464-byte shared memory. Grouped-attention service is 0.909762 ms versus
+0.951279 ms in the preceding diagnostic trace; no whole-round gain follows
+from that comparison. The profiled release output remains canonical. A
+separate unprofiled pair is queued. The owned trace client was recovered from
+a job-name mismatch without reloading the model, and the final library
+manifest uses process ancestry to include Nsight's separate child group.
+The obsolete waiting client was then stopped; the wrapper exit 143 remains
+recorded rather than relabelled successful.

@@ -126,8 +126,15 @@ keep the raw measurements and isolated operator gates.
 `benchmarks/kernels/sm70_grouped_attention_candidate_route.py` now resolves the
 actual native object through the interface. It installs only when explicitly
 called by an experiment and delegates non-q8/eager calls to the original.
-The corrected private route has a separate trace queued and unprofiled pair
-prepared. It is not promoted.
+The corrected route is now proven in ten steady rounds across four ranks:
+640 grouped partial kernels use 240 CTAs and 256 threads. Their measured
+launch footprint is 234 registers/thread and 30464-byte shared memory per CTA.
+Thus more CTAs do not by themselves establish better achieved occupancy;
+register pressure remains a constraint. Grouped attention service changes
+from 0.951279 to 0.909762 ms in the two diagnostic traces. This is not an
+unprofiled full-round improvement. The canonical release token IDs and
+acceptance remain unchanged in the profiled request. A separate five-warmup
+unprofiled pair is queued; fixed-prefix admission of this actual route is open.
 
 Raw evidence: `profile/v4-sparse-dense-order-nodes/tp4.{nsys-rep,sqlite}`,
 `results/v4-sparse-dense-order-nodes-trace.json`,
@@ -135,8 +142,16 @@ Raw evidence: `profile/v4-sparse-dense-order-nodes/tp4.{nsys-rep,sqlite}`,
 `results/attention-headsplit-binding-identity.json`. The trace capture and export
 completed, but the wrapper then failed its runtime-map ownership-name assertion.
 Therefore this trace lacks its own final map manifest; separate unprofiled
-four-worker DSO manifests are retained. The next trace job fixes the ownership
-name. Do not describe the earlier wrapper job as wholly successful.
+four-worker DSO manifests are retained. The corrected-route trace has a separate four-worker/360-library manifest.
+Its original client waited on a mismatched ownership-name suffix, so a
+corrected client completed the capture against the existing owned service.
+Map collection was expanded to verified descendants because Nsight gives
+the application a separate process group. After saving the manifest, the
+obsolete waiting client was stopped and the wrapper cleaned its service,
+exiting 143. The client/capture completed; the wrapper did not exit cleanly.
+See `results/attention-bound-profile-harness-recovery.json`,
+`results/attention-bound-route-hit.json` and
+`results/nsys-v4-attention-bound-nodes-runtime-libraries.json`.
 
 Final combination fixed-prefix quality, three independent startup pairs,
 acceptance non-inferiority and model long-context gates remain open. No
