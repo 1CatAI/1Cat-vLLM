@@ -702,6 +702,21 @@ def _is_dflash2_spec_config(vllm_config: object) -> bool:
     return uses_dflash_selector_engine(vllm_config)
 
 
+def _sm70_current_device_is_volta() -> bool:
+    """Whether this worker builds its layers on a Volta device.
+
+    The other SM70 gates in this file ask device 0, which reads the same card
+    from every rank on a mixed node: all devices stay visible to every worker
+    and only ``set_device`` differs. The full-forward wrapper decides what the
+    compiler gets to see, so it has to ask the accelerator that is current.
+    """
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability(
+        (7, 0), device_id=torch.accelerator.current_device_index()
+    )
+
+
 def _sm70_qwen_gdn_full_forward_enabled(
     layer_name: LayerNameType,
     *,
@@ -2498,11 +2513,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
             and not block_003_deep_mtp
         )
+        # The automatic arm is Volta-only. The wrapper runs the whole layer
+        # through one opaque custom op, so Inductor never sees the input and
+        # output projections around the recurrent core and the gated RMSNorm
+        # falls back to its native chain. On Turing that costs about fifteen
+        # extra elementwise launches per GDN layer and step. The recurrent
+        # core keeps its own boundary either way, and an explicit
+        # VLLM_SM70_QWEN_GDN_FULL_FORWARD=1 still forces the wrapper anywhere.
         self.maybe_sm70_qwen_gdn_full_forward = (
             not self.disable_sm70_qwen_gdn_full_forward
             and (
                 self.force_sm70_qwen_gdn_full_forward
-                or self.auto_sm70_qwen_gdn_full_forward
+                or (
+                    self.auto_sm70_qwen_gdn_full_forward
+                    and _sm70_current_device_is_volta()
+                )
             )
         )
         if self.maybe_sm70_qwen_gdn_full_forward:
