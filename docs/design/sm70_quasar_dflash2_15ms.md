@@ -1007,6 +1007,77 @@ output gate passes, but medians 0.454779/0.456745 ms and mixed-sign differences
 show no gain. Reject the screen; it does not prove the preference survives
 graph instantiation (`results/qpn2-context-cache-real.json`).
 
+The generated FP32-residual Gemma kernel exchanges blocked layouts solely for
+its residual store. Scalar and vector inline stores eliminate that exchange:
+static PTX barriers fall from ten to two and dynamic shared scratch from
+8192 to 32 bytes, while the fifteen FMA contractions remain. All 128 varied-
+scale normalized/residual outputs match. Nevertheless, the 128-call working
+set regresses from 0.526305 to 0.981023 ms with scalar stores and from
+0.525332 to 0.607007 ms with vector stores. Both are rejected. An initial
+inline-assembly pointer/type compilation failure is retained separately;
+these timings come from the corrected kernels (`results/gemma-direct-residual-
+{v2,vector}.json`).
+
+The completed cap64 fixed-prefix tapes are retained in lossless archives to
+make space for the next paired audit. Every file was hashed, then read back
+and verified through decompression before removing its raw duplicate: 144
+files per arm, approximately 16.19 GB reduced to 2.42 GB per archive.
+`archives/v4-qpn2-cap64-audit-control.tar.zst` has SHA256
+`4bcd3f5f764e3914b2f0245fa76059802220a00287f964c9ef01741d4c6dcab3`;
+the candidate archive has SHA256
+`cda7db98115c2fb5f6a4f8a4c46fdc6f3926cce04808350298e1dcd69dd0409a`.
+Their adjacent manifests retain per-file checksums and original sizes.
+
+### Sparse rerank selection screen
+
+The FP32 rerank currently scatters 64 candidates into a 62080-token local
+vocabulary before calling dense top-k. The private compact gather reproduces
+[PyTorch v2.10.0 multiblock collection](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cuda/TensorTopK.cu):
+keys above the cutoff are collected in vocabulary order, followed by cutoff
+ties in that order. The unchanged native PyTorch key/value sorter then
+preserves its final tie permutation. Implicit -Inf background entries and
+canonical NaN radix keys are handled explicitly. No float dot, rounding,
+probability, sampling, or acceptance arithmetic is changed.
+
+`benchmarks/kernels/benchmark_sm70_sparse_dense_topk.py` covers seven/eight
+rows, top-k 16/20/21 and nine value families, including ties, signed zeros,
+NaN/Inf and fewer finite values than k. All 54 cases match values and IDs
+bytewise at the actual 62080-token width; native memcheck reports zero
+errors. The seven-pair graph screen reduces this primitive from approximately
+0.073213 to 0.010491 ms. The earlier 62464-width synthetic screen is labelled as
+such. Its initially incorrect model eligibility guard did not hit the route
+and provides no model evidence.
+
+`benchmarks/kernels/build_sm70_native_sort_candidate.py` reproduces the
+private wrapper against the frozen PyTorch 2.10.0 native sorter and records
+Torch/header/source/DSO provenance. Its rebuilt DSO SHA256 is
+`1ada9a86172d9a524cb2828b32fbbd35a917130abf8a1740b50ac3be4a30c2fc`;
+all 54 value/ID cases pass again (`results/sparse-dense-order-versioned-gate.json`).
+Neither utility installs a serving route.
+
+The first effective four-rank shadow checks 120 actual target calls plus
+eight draft warmups bytewise. Draft replay diagnostic copies subsequently
+contain out-of-range IDs and invalid data, so those failed diagnostic runs
+are excluded rather than attributed to the operator. Reading the model's
+persistent candidate buffers after actual replay avoids the invalid diagnostic
+copies. The completed v6 check compares 128 actual eager calls and 64 actual
+draft replay inputs across all four ranks, with identical FP32 values and IDs
+for both independently recomputed selectors. This does not prove which graph
+allocation behavior invalidated the earlier extra buffers. The uninstrumented
+complete-round pair is now running; see `results/sparse-dense-order-62080-gate.json`,
+`results/sparse-dense-order-shadow-v2.json`,
+`results/sparse-dense-order-shadow-v6.json`, and the excluded shadow v3--v5 logs.
+
+A separate filtered top-k port uses the installed FlashInfer source matching
+[official revision 064d9aa](https://github.com/flashinfer-ai/flashinfer/blob/064d9aa268fe8d2f4d7c9f3c5ca83ecb02fb2c9c/include/flashinfer/topk.cuh).
+Shrinking its index buffers from 128 to 64 KiB allows SM70 compilation; its
+15760-byte static shared scratch also fits. A negative-NaN mismatch is fixed
+by canonicalizing half NaN radix keys. All twenty checked cases then match
+the frozen PyTorch selection after restoring collection order. The isolated
+screen measures 0.041341/0.040759 ms, too little gain to justify adding this
+native path. It remains disabled (`results/flashinfer-filtered-sm70-nan-gate.json`).
+The separate GPU 5 checks are numerical only and have no timing claims.
+
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
 validation remain open. No new serving default or merge is claimed.
