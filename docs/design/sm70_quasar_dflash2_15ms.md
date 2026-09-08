@@ -885,17 +885,21 @@ for gated-S8 / GEMM-S8 / GEMM-S16) before and after the carveout preference;
 these are resource estimates, not measured achieved occupancy. This path is
 closed (`results/qpn2-chain-packed-{default,carveout100}.json`).
 
-The synchronized head-regrouping model pair preserves both canonical token
-hashes, natural EOS and acceptance counts across all five measured requests
-per fixture. Complete-round medians change from 17.064797 to 16.912649 ms
-for release1k and 16.479594 to 16.451247 ms for MBPP28. This is one startup
-per arm and a small incremental gain; the subsequent 144-record full-prefix comparison is byte-equal for all
-captured intermediates, states and logits, with zero TV, changed top-p
-support rows or top-1 changes. See
+The earlier head-regrouping model pair preserves both canonical token hashes,
+natural EOS and acceptance counts across all five measured requests per
+fixture. Its raw medians are 17.064797/16.912649 ms for release1k and
+16.479594/16.451247 ms for MBPP28. **Withdraw attribution of these differences
+to head regrouping:** the later node trace and CPU module-identity probe
+show that the hook patched a different Python extension module from the one
+used by the model. Both names resolve to the same frozen DSO, but their
+module objects and function bindings differ. The subsequent 144-record
+comparison remains a valid equality observation of the executed paths,
+not evidence that the regrouped model route was active. See
 `results/v4-attention-headsplit-sync-ab.json` and
-`results/v4-attention-headsplit-sync-audit-comparison.json`. Final repeated-
-startup acceptance, broader counterexamples and full-model long-context
-validation remain separate gates.
+`results/v4-attention-headsplit-sync-audit-comparison.json` and
+`results/attention-headsplit-binding-identity.json`. The isolated candidate
+operator gates remain separate evidence. Corrected route, repeated-startup
+acceptance and full-model long-context validation remain open.
 
 An adjacent-K16 weight/scale packing experiment retains the current q8
 accumulation chains and uses vector loads for pairs of groups. Sixteen
@@ -1063,8 +1067,8 @@ persistent candidate buffers after actual replay avoids the invalid diagnostic
 copies. The completed v6 check compares 128 actual eager calls and 64 actual
 draft replay inputs across all four ranks, with identical FP32 values and IDs
 for both independently recomputed selectors. This does not prove which graph
-allocation behavior invalidated the earlier extra buffers. The uninstrumented
-complete-round pair is now running; see `results/sparse-dense-order-62080-gate.json`,
+allocation behavior invalidated the earlier extra buffers. The first uninstrumented
+complete-round pair and a separate five-warmup pair are complete; see `results/sparse-dense-order-62080-gate.json`,
 `results/sparse-dense-order-shadow-v2.json`,
 `results/sparse-dense-order-shadow-v6.json`, and the excluded shadow v3--v5 logs.
 
@@ -1081,3 +1085,23 @@ The separate GPU 5 checks are numerical only and have no timing claims.
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
 validation remain open. No new serving default or merge is claimed.
+
+### Whole-round resource audit and route correction, 2026-09-09
+
+The five-warmup sparse-selector pair measures 17.017221/16.761147 ms for
+release1k and 16.624768/16.373416 ms for MBPP28. All five measured token IDs,
+EOS and acceptance counts match in both fixtures. MBPP28 retains a
+16.938744-ms outlier. The earlier one-warmup release regression is retained,
+not replaced or trimmed. The full fixed-prefix pair now passes: 144 records
+per arm, all captured intermediates/state/native logits byte-equal, TV zero,
+no support or top-1 changes (`results/v4-sparse-dense-order-audit-comparison.json`).
+
+The new trace confirms the compact collector in both actual target and draft
+execution. QPN2 remains 7.342 ms of service. Draft attention has only eight
+CTAs on an eighty-SM GPU, with 97920 bytes of shared memory per CTA. The
+head-regrouping hook was attached to the wrong native Python module; withdraw
+its previous model speed attribution. The new explicit benchmark installer
+patches the interface's actual module and preserves other shapes/eager calls.
+See [the complete resource audit](sm70_quasar_dflash2_resource_audit_20260909.md)
+for endpoint statistics, critical-rank closure, launch resources, the unchanged
+sampling quality guard and trace provenance limits. No new default is enabled.
