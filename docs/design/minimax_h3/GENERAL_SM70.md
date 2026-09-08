@@ -77,8 +77,9 @@ Unaccepted drift is not a new oracle; thresholds must not be relaxed to pass.
   `git archive` of that SHA. Generated extension aliases are confined to the
   artifact bootstrap, preserving package ABI names without copying stale H3
   binaries from another task.
-- `prepared-linear-v2.log`: 28 GPU tests passed (shared GEMM, scaling, LoRA,
-  activation, column-major plans). Prepared LoRA equals normal execution
+- `prepared-linear-v2.log`: 28 checks passed in the leased GPU batch (24 GPU
+  checks and four CPU layout checks: shared GEMM, scaling, LoRA, activation,
+  column-major plans). Prepared LoRA equals normal execution
   bitwise for original FP16 and W8A16, scales 0/0.75/-0.5, including explicit
   unrotated inputs beside rotated base operands.
 - `candidate-tp2.log` and `candidate-tp4.log`: the complete distributed block
@@ -134,3 +135,15 @@ the unqualified reduce-scatter communication saving. The distributed oracle
 is tightened from a tolerance to bitwise equality; complete-model revalidation
 is still required. Tensor-parallel GEMM, local normalization/residual ownership
 and adapter support remain active. No >80 result or human acceptance exists.
+
+`candidate-720p-exact-reduction` validates code `9623a9adb2`: complete video
+and audio latents are **bitwise equal** to the frozen mainline baseline, all
+124 pre-encoding frames match (SSIM 1.0), and all audio numerical gates pass.
+See `exact-reduction-quality.json`. This was a single no-warmup quality request
+(66.954238 s denoise); it is not a qualified performance comparison.
+
+The tightened bitwise block oracle also passes on both TP2 ranks
+(`exact-reduction-tp2-v3.log`) and all TP4 ranks (`exact-reduction-tp4.log`).
+These results establish the sampled four-step route's numerical preservation,
+not all adapters/partitions or human audiovisual acceptance. Draft PR #571
+contains the implementation and remains Draft.
