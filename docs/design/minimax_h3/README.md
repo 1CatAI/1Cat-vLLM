@@ -153,6 +153,12 @@ the sharded route changes FP32 reduction order from the default and its human
 quality review remains pending. Omit the flag to restore the default.
 These are short development measurements, not the 243-frame acceptance run.
 
+The generalized four-step/full-canvas check exposed substantial latent drift
+from reduce-scatter's FP32 addition order. Residual sharding now performs the
+same full all-reduce as the replicated path before selecting each rank's rows.
+This preserves the reference sum order and does not claim a communication-volume
+reduction. The old reduce-scatter speed figures above are not qualified outputs.
+
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not
 replace the five-axis human quality review. Useful TFLOPS use actual local

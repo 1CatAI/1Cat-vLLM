@@ -106,3 +106,31 @@ Unaccepted drift is not a new oracle; thresholds must not be relaxed to pass.
   fresh owned kernels, FA backend, no residual sharding, four-step v1.2 adapter,
   no FP16 weight cache, full warmup then one captured quality/timing request.
   This is a baseline acquisition, not the formal three-run acceptance.
+
+### Complete four-step quality localization
+
+The baseline completed on GPUs 0-3: one full warmup, then 66.206537 s denoise,
+47.303750 TFLOP/s/card, four calls and 3,131,817,518,663,680 useful FLOPs/rank.
+The first request took 83.139160 s denoise including fresh-cache startup; it is
+excluded. Complete-request memory peaked at 18.162186 GiB allocated/card.
+The baseline captured all latents and unencoded RGB/PCM; capture overhead is
+outside denoise but included in VAE/end-to-end wall time.
+
+`candidate-720p-residual` took 62.624739 s / 50.009271 TFLOP/s/card after one
+warmup. **Rejected:** video/audio latent relative L2 is 0.2957225/0.0565235,
+video PSNR 28.312 dB and SSIM 0.878025. Finite media and a 5.41% time reduction
+do not satisfy the accepted quality gate. This is not a qualified speedup.
+
+`candidate-720p-prepared-only` disables residual sharding while retaining every
+new prepared/dense execution change. Complete video/audio latents match the
+baseline bitwise; pre-encoding RGB matches exactly (SSIM 1.0), and all audio
+gates pass. Its single cold request is a quality control, not a speed baseline.
+This isolates the full-sampling regression to the residual route rather than
+the newly generalized prepared matrix/LoRA path.
+
+The residual implementation now uses the same full FP32 all-reduce as the
+replicated path, then selects local residual rows. This intentionally gives up
+the unqualified reduce-scatter communication saving. The distributed oracle
+is tightened from a tolerance to bitwise equality; complete-model revalidation
+is still required. Tensor-parallel GEMM, local normalization/residual ownership
+and adapter support remain active. No >80 result or human acceptance exists.

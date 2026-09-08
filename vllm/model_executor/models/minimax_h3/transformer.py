@@ -832,8 +832,9 @@ class MiniMaxH3DiTBlock(nn.Module):
         if self.residual_group is not None:
             if self.residual_group.world_size not in (2, 4):
                 raise ValueError("H3 residual sequence parallelism requires TP2 or TP4")
-            # These projections return unreduced FP32 partial sums. Reduce-scatter
-            # keeps that precision and assigns each rank its residual rows.
+            # Keep the replicated path's FP32 sum order before selecting local
+            # residual rows. NCCL reduce-scatter uses a different reduction
+            # order and fails the full four-step latent quality gate.
             self.attn.out_proj.reduce_results = False
             self.mlp.fc2.reduce_results = False
         self.adaln_proj = MiniMaxH3AdalnProj(
@@ -920,7 +921,9 @@ class MiniMaxH3DiTBlock(nn.Module):
             input_is_rotated=input_is_rotated,
         )
         if group is not None:
-            h = group.reduce_scatter(h, dim=0)
+            h = group.all_reduce(h).narrow(
+                0, group.rank_in_group * residual.shape[0], residual.shape[0]
+            )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -939,7 +942,9 @@ class MiniMaxH3DiTBlock(nn.Module):
             h = group.all_gather(h, dim=0)
         h = self.mlp(h, input_is_rotated=input_is_rotated)
         if group is not None:
-            h = group.reduce_scatter(h, dim=0)
+            h = group.all_reduce(h).narrow(
+                0, group.rank_in_group * residual.shape[0], residual.shape[0]
+            )
         return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 

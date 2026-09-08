@@ -228,7 +228,7 @@ def _check_replicated_blocks(group, valid, backend, *, quantized=False, adapted=
     assert actual.dtype == torch.float32
     assert torch.isfinite(actual).all()
     assert actual.abs().max() > torch.finfo(torch.float16).max
-    torch.testing.assert_close(actual, expected, rtol=2e-3, atol=3e-4)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     # Modifying padding must not change any valid attention output.
     if valid < total:
         changed = x.clone()
