@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from benchmarks.compare_sm70_dflash2_natural_audit import compare_natural
 from benchmarks.compare_sm70_dflash2_state_audit import compare, tensor_difference
 from benchmarks.sm70_dflash2_state_audit import gather_state, selected_ssm_slots
 
@@ -89,6 +90,67 @@ def test_audit_comparator_rejects_nonfinite_logits(captures):
     torch.save(data, path)
     with pytest.raises(ValueError, match="nonfinite"):
         compare(left, right)
+
+
+@pytest.fixture
+def natural_captures(captures):
+    for directory in captures:
+        for path in directory.glob("*-rank*-step*.pt"):
+            row = torch.load(path, weights_only=True)
+            row.update(
+                control="natural_sampling",
+                aux_hidden_states=[torch.ones(1, 2)],
+                num_sampled=torch.tensor([1]),
+                num_rejected=torch.tensor([7 if row["step"] else 0]),
+                sampled_token_ids=torch.tensor([[3, -1]]),
+            )
+            torch.save(row, path)
+            torch.save(
+                {
+                    **{k: row[k] for k in ("case", "rank", "step")},
+                    "draft_tokens": torch.tensor([[4, 5, 6]]),
+                    "projected_context": torch.ones(1, 2),
+                },
+                directory / f"proposal-test-tp{row['rank']}-forward{row['step']}.pt",
+            )
+    return captures
+
+
+def test_natural_audit_locates_proposal_before_next_target(natural_captures):
+    left, right = natural_captures
+    assert compare_natural(left, right)["cases"][0]["all_observed_tensors_equal"]
+    path = right / "proposal-test-tp2-forward0.pt"
+    row = torch.load(path, weights_only=True)
+    row["draft_tokens"][0, 0] += 1
+    torch.save(row, path)
+    path = right / "test-rank2-step1.pt"
+    row = torch.load(path, weights_only=True)
+    row["input_ids"][0] += 1
+    torch.save(row, path)
+    result = compare_natural(left, right)["cases"][0]
+    assert not result["all_observed_tensors_equal"]
+    first = result["first_observed_difference"]
+    assert (first["step"], first["phase"]) == (0, "proposal")
+    assert first["differences"][0]["name"] == "draft_tokens"
+
+
+@pytest.mark.parametrize(
+    "missing", ["test-rank3-step1.pt", "proposal-test-tp3-forward1.pt"]
+)
+def test_natural_audit_rejects_incomplete_equal_arms(natural_captures, missing):
+    for directory in natural_captures:
+        (directory / missing).unlink()
+    with pytest.raises(ValueError, match="four TP ranks|missing proposal"):
+        compare_natural(*natural_captures)
+
+
+def test_natural_audit_ignores_unwritten_output_padding(natural_captures):
+    left, right = natural_captures
+    path = right / "test-rank0-step1.pt"
+    row = torch.load(path, weights_only=True)
+    row["sampled_token_ids"][0, 1] = 100
+    torch.save(row, path)
+    assert compare_natural(left, right)["cases"][0]["all_observed_tensors_equal"]
 
 
 def test_state_audit_reads_accepted_slot_and_preserves_invalid_selectors():

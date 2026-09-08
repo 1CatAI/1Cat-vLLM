@@ -80,8 +80,11 @@ Artifacts for this campaign are retained under
 `baseline-manifest.json` records the source overlay, native-library SHA256s
 and loaded libraries on all four workers. The base vLLM DSO is an archived
 compatible build, not a full rebuild of main. Flash-V100 and FlashQLA were
-rebuilt from the frozen tree with CUDA 12.8/GCC 12. GPU clocks remain dynamic;
-the owned GPU lease covers devices 4--7, with independent telemetry.
+rebuilt from the frozen tree with CUDA 12.8/GCC 12. GPU clocks remain dynamic.
+The initial campaign uses devices 4--7 with independent telemetry. Following
+the September 8 host reboot, devices 4--7 host another service; new diagnostic
+pairs use a fixed lease on devices 0--3. Results from the two GPU groups are
+kept separate, and final speed pairs require a fresh baseline on the same group.
 
 Fresh uninstrumented baseline, one independent startup and five measured
 requests per fixture after warmup:
@@ -224,3 +227,58 @@ non-monotonic state IDs including zero, empty padded requests, strided state
 pools and untouched retired slots. Those original runs supplied captured FP32
 gates and contiguous QKV; they do not validate the previously incorrect runtime
 bridge. All evidence remains independent of performance and natural acceptance.
+
+The first uninstrumented packed startup measures 18.278 ms / 17.762 ms on
+release1k / MBPP28 (five requests after warmup). It is **not promoted**:
+relative to `fixed-speed-1`, first output flips occur at positions 123 / 8,
+and accepted drafts/round change from 1.917 / 3.934 to 1.989 / 3.500.
+The three-code subset still scores base 3/3 and plus 1/3, and nine structured
+seed/fixture pairs pass, but these cannot clear the changed acceptance gate.
+The original unpinned baseline also selected different first-layer reduction
+blocks across ranks: 2048 on ranks 0/1/3 and 8192 on rank 2. The retained
+compiler configurations are in `results/natural-baseline-norm-configs.json`.
+
+The diagnostic supports `force_tokens=false` cases. These keep
+the actual sampler outputs and record target auxiliary hidden states, incoming
+draft logits, proposal candidates/scores and sampled/rejected counts. Requests
+are bounded probes with synchronization and full-vocabulary dumps; neither
+their latency nor their forced length cap is a performance/text-health result.
+The first natural-mode startup failed because its proposal wrapper did not
+preserve the `input_batch` keyword used by warmup; the signature is corrected.
+The next failed before model loading because another task occupied GPU4--7.
+Neither failed run contains a usable natural-sampling comparison. Per-launch
+GPU availability is now rechecked in addition to the existing advisory locks.
+
+The first successful natural control on GPU0--3 preserves the previous
+uninstrumented fixed-norm output prefixes: all 32 MBPP28 and 144 release1k
+tokens match. This bounds the observed diagnostic perturbation; it is not a
+complete-output, acceptance noninferiority or performance result. The natural
+comparator checks complete four-rank target/proposal coverage before finding
+the first observed difference. Eleven CPU tests pass (one CUDA graph test
+skipped), including missing-proposal rejection, proposal-before-target ordering
+and exclusion of unwritten sampled-output padding.
+
+The completed natural pair has 232 target records per arm (nine MBPP28 and
+49 release1k forwards, each on four ranks). Its first observed difference is
+already at the prefill target boundary, before the first packed q8 verifier:
+layer 0/1 GDN observations remain equal, while all five auxiliary hidden-state
+tensors and final logits differ. The first sampled row has zero post-top-k/p
+TV in both cases, despite nonzero full-vocabulary TV. Later token/acceptance
+changes therefore cannot be dismissed based on that first sampled row.
+The investigation has moved to a bounded eight-token probe with layer 2/3
+observations, including the first full-attention layer. Q/K reduction autotune
+choices are being checked; no Q/K normalization cause is established yet.
+
+At 2026-09-08 01:24:11 UTC, main merged PR #560 as
+`e5d63c51f0fcc1ddf75d229e3df06bf52df206f5`. It routes DFlash2 E4M3 q8 to FP32
+attention intermediates and changes the scalar/q1 precision path. The frozen
+campaign results above predate that change. Preserve the old overlay until
+the current numerical attribution is closed, then merge main, use matching
+precision-revision-4 Flash-V100 binaries and establish a new baseline before
+final performance acceptance. An independent build from the exact merge tree
+has completed under `flash-v4-source` / `flash-v4-build`; it is not yet the active
+runtime. The separate FP8-target model gate for #560 does not validate QUASAR.
+The revision-4 Flash-V100 library SHA256 is
+`a751fed902279b0de23537c4aad2dc4fee360146d7fce7ef0c4f255a77f48b02`;
+the matching paged-KV utility SHA256 is
+`571fe2a96b70d76737375eaed9fb8ad1cac3bc7eefadf139ea3d2437e0cfdb7d`.

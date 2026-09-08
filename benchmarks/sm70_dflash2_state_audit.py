@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in fixed-prefix diagnostic; its forced acceptance is never a speed result.
+"""Opt-in state/proposal diagnostic, never a performance measurement.
 
 Set VLLM_SM70_DFLASH2_AUDIT_ROOT and use StateAuditExtension as the worker
 extension. The root's active-case.json contains name, prompt_ids and token_ids
 (the complete forced tape). Remove that file for ordinary requests. Each worker
 records prefill and verifier inputs, state selection, outputs and native logits.
+Set force_tokens=false to observe real sampling instead of forcing token_ids.
+Natural mode also records auxiliary states, proposal scores and acceptance;
+its extra snapshots still require a separate diagnostic-perturbation check.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ def install() -> None:
     from vllm.model_executor.models import qwen3_next as qn
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
     from vllm.v1.worker.gpu.sample.output import SamplerOutput
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
     root = Path(os.environ["VLLM_SM70_DFLASH2_AUDIT_ROOT"])
     mode = os.environ.get("VLLM_SM70_DFLASH2_AUDIT_MODE", "control")
@@ -59,6 +63,7 @@ def install() -> None:
     buffers: dict[str, torch.Tensor] = {}
     markers: dict[str, torch.Tensor] = {}
     epoch: torch.Tensor | None = None
+    runner = None
 
     def caller_layer() -> int | None:
         if epoch is None:
@@ -94,7 +99,8 @@ def install() -> None:
 
     @functools.wraps(initialize)
     def initialize_kv_cache(self, *args, **kwargs):
-        nonlocal epoch
+        nonlocal epoch, runner
+        runner = self
         result = initialize(self, *args, **kwargs)
         epoch = torch.full((1,), -1, device=self.device, dtype=torch.int64)
         for name, module in self.model.named_modules():
@@ -243,17 +249,23 @@ def install() -> None:
     def active(self, batch):
         if not hasattr(self, "_state_audit_requests"):
             self._state_audit_requests = {}
+        if not batch.req_ids:
+            return None
         request_id = batch.req_ids[0]
         if request_id not in self._state_audit_requests:
             path = root / "active-case.json"
             entry = None
             if path.exists():
+                if batch.num_reqs != 1:
+                    raise ValueError("State audit requires exactly one request")
                 case = json.loads(path.read_text())
                 entry = {
                     "case": case,
                     "tape": torch.tensor(
                         case["token_ids"], device=self.device, dtype=torch.int64
-                    ),
+                    )
+                    if case.get("force_tokens", True)
+                    else None,
                     "step": 0,
                 }
             self._state_audit_requests[request_id] = entry
@@ -267,11 +279,7 @@ def install() -> None:
         if epoch is not None:
             epoch.add_(1)
         entry = active(self, batch)
-        if entry is not None:
-            if batch.num_reqs != 1:
-                raise ValueError(
-                    "Fixed-prefix state audit requires exactly one request"
-                )
+        if entry is not None and entry["tape"] is not None:
             batch.input_ids[: batch.num_tokens].copy_(
                 entry["tape"][batch.positions[: batch.num_tokens]]
             )
@@ -340,10 +348,33 @@ def install() -> None:
                 for name in ("seeds", "temperature", "top_k", "top_p", "min_p")
             },
         }
+        natural_output = None
+        if entry["tape"] is None:
+            # Observe the actual proposal/rejection path without replacing its
+            # token IDs or acceptance decisions. Still diagnostic-only: CPU
+            # snapshots synchronize execution and cannot measure performance.
+            result["control"] = "natural_sampling"
+            frame = sys._getframe(1)
+            aux = frame.f_locals.get("aux_hidden_states")
+            if aux is None:
+                raise RuntimeError("Natural audit requires target auxiliary states")
+            result["aux_hidden_states"] = [cpu(t) for t in aux]
+            if batch.num_draft_tokens:
+                result["draft_logits"] = cpu(
+                    self.speculator.draft_logits.index_select(
+                        0, batch.idx_mapping.to(torch.int64)
+                    )
+                )
+            natural_output = sample(self, hidden, batch, grammar)
+            result["sampled_token_ids"] = cpu(natural_output[0].sampled_token_ids)
+            result["num_sampled"] = cpu(natural_output[1])
+            result["num_rejected"] = cpu(natural_output[2])
         torch.save(
             result, directory / f"{entry['case']['name']}-rank{rank}-step{step}.pt"
         )
         entry["step"] += 1
+        if natural_output is not None:
+            return natural_output
         next_ids = entry["tape"][positions + 1].view(1, -1).to(torch.int32)
         count = torch.full(
             (1,), next_ids.shape[1], device=self.device, dtype=torch.int32
@@ -356,6 +387,65 @@ def install() -> None:
         )
 
     GPUModelRunner.sample = sample_fixed_prefix
+    propose = DFlash2Speculator.propose
+
+    @functools.wraps(propose)
+    def propose_observed(self, input_batch, *args, **kwargs):
+        batch = input_batch
+        out = propose(self, batch, *args, **kwargs)
+        if runner is None or not batch.req_ids:
+            return out
+        entry = active(runner, batch)
+        if entry is None or entry["tape"] is not None:
+            return out
+        step = entry["step"] - 1
+        if step < 0:
+            return out
+        rank = torch.distributed.get_rank()
+        result = {
+            "rank": rank,
+            "step": step,
+            "case": entry["case"]["name"],
+            "draft_tokens": out.detach().cpu().clone(),
+            "idx_mapping": batch.idx_mapping.detach().cpu().clone(),
+        }
+        for name in ("_cached_candidate_ids", "_cached_candidate_scores"):
+            tensor = getattr(self, name)
+            if tensor is not None:
+                result[name] = (
+                    tensor.index_select(0, batch.idx_mapping.to(torch.int64))
+                    .detach()
+                    .cpu()
+                    .clone()
+                )
+        # Reuse the existing proposal shadow buffers when explicitly enabled.
+        # They are refreshed by the captured draft graph, including replays.
+        for name in (
+            "_debug_backbone_hidden_states",
+            "_debug_candidate_ids",
+            "_debug_unary_logits",
+            "_debug_lattice_scores",
+        ):
+            tensor = getattr(self, name, None)
+            if tensor is not None:
+                result[name] = tensor[: batch.num_reqs].detach().cpu().clone()
+        result["projected_context"] = (
+            self.hidden_states[: batch.num_tokens].detach().cpu().clone()
+        )
+        for name in ("sample_pos", "temperature", "seeds"):
+            result[name] = (
+                getattr(self, name)[: batch.num_reqs * self.draft_block]
+                .detach()
+                .cpu()
+                .clone()
+            )
+        torch.save(
+            result,
+            directory / f"proposal-{entry['case']['name']}-tp{rank}-forward{step}.pt",
+        )
+        return out
+
+    DFlash2Speculator.propose = propose_observed
 
 
 class StateAuditExtension:
