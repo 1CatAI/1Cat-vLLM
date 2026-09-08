@@ -48,6 +48,21 @@ __device__ __forceinline__ __half fp8_e5m2_to_half(uint8_t raw) {
   return __ushort_as_half(static_cast<unsigned short>(raw) << 8);
 }
 
+// E4M3 normals map exactly into the IEEE float exponent and mantissa fields.
+// Keep the original NaN payload and signed zero, including E4M3 subnormals.
+__device__ __forceinline__ float fp8_e4m3fn_to_float_bits(uint8_t raw) {
+  const uint32_t magnitude = raw & 0x7fu;
+  const uint32_t sign = static_cast<uint32_t>(raw & 0x80u) << 24;
+  uint32_t bits = (magnitude << 20) + 0x3c000000u;
+  if (magnitude < 8) {
+    bits = __float_as_uint(static_cast<float>(magnitude) * 0.001953125f);
+  }
+  if (magnitude == 0x7f) {
+    return quiet_nan_f();
+  }
+  return __uint_as_float(bits | sign);
+}
+
 __device__ __forceinline__ __half2 fp8_e5m2_pair_to_half2(uint16_t raw_pair) {
   const uint32_t half2_bits = (static_cast<uint32_t>(raw_pair & 0x00ffu) << 8) |
                               (static_cast<uint32_t>(raw_pair & 0xff00u) << 16);
@@ -69,7 +84,7 @@ __device__ __forceinline__ float fp8_e5m2_to_float(uint8_t raw) {
   return __half2float(fp8_e5m2_to_half(raw));
 }
 
-template <int KV_DTYPE>
+template <int KV_DTYPE, bool E4M3_BITS = false>
 __device__ __forceinline__ float load_kv_cache_float_unscaled(
     const void* __restrict__ cache, const int64_t index) {
   if constexpr (KV_DTYPE == KV_CACHE_DTYPE_FP16) {
@@ -78,6 +93,9 @@ __device__ __forceinline__ float load_kv_cache_float_unscaled(
   } else {
     const uint8_t* cache_u8 = reinterpret_cast<const uint8_t*>(cache);
     const uint8_t raw = cache_u8[index];
+    if constexpr (KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3 && E4M3_BITS) {
+      return fp8_e4m3fn_to_float_bits(raw);
+    }
     const float value = KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3
                             ? fp8_e4m3fn_to_float(raw)
                             : fp8_e5m2_to_float(raw);

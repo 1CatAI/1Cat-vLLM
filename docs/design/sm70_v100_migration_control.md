@@ -2,6 +2,23 @@
 
 Date: 2026-05-30
 
+## DFlash2 TP2 verification cost, 2026-09-08
+
+[The TP2 worklog](sm70_dflash2_tp2_verifier.md) freezes main at
+`e5d63c51f0fcc1ddf75d229e3df06bf52df206f5` and records initial complete-round
+costs of 44.973/35.119 ms on release1k/MBPP28. Scalar E4M3 attention accounts
+for about 12.84 ms in the release1k trace. An opt-in exact bit-decoder/PV
+unroll specialization passes exhaustive encoding, graph/state, FP64-reference
+and sanitizer gates; live attention shadow compares 665321472 elements with
+zero bit differences. It is restricted to TP2 q8/D256/FP32-partial/P1024.
+
+The first independent-startup candidate measures 35.921/32.706 ms against
+44.986/35.075 ms control. Output trajectories differ between startups, including
+between controls, so this is not a quality promotion or a 25 ms result.
+Keep the feature off while resolving the comparison and remaining cost.
+Capping inactive partition CTAs was numerically exact but had no speed gain;
+do not repeat that rejected path without new evidence.
+
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 
 [The precision-default change](sm70_dflash2_fp32_defaults.md) is based on

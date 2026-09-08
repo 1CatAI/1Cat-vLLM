@@ -1012,6 +1012,23 @@ def flash_attn_decode_paged(
         seq_lens,
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
     )
+    if (
+        os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST", "0") == "1"
+        and e4m3_fp32
+        and q.dtype == torch.float16
+        and tuple(q.shape) == (8, 12, 256)
+        and k_cache.shape[2:] == (2, 256)
+        and plan.partition_size == 1024
+        and window_size_left == window_size_right == -1
+        and anchor_lens is None
+    ):
+        version = getattr(
+            flash_attn_v100_cuda, "tp2_e4m3_scalar_fast_version", None
+        )
+        if not callable(version) or int(version()) < 1:
+            raise RuntimeError(
+                "Rebuild Flash-V100 for TP2 E4M3 scalar fast revision 1"
+            )
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
