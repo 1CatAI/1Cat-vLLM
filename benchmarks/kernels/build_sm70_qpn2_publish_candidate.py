@@ -22,6 +22,11 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--build", action="store_true")
     parser.add_argument(
+        "--packed-input",
+        action="store_true",
+        help="Read private [K/16, 8, 16] input in the q8 publisher only",
+    )
+    parser.add_argument(
         "--use-fast-math",
         action="store_true",
         help="Reproduce historical experiments; changes gated SiLU math",
@@ -58,6 +63,17 @@ def main():
     producer = source[start:end].replace(
         "nvfp4_qpn2_sm70_kernel", "nvfp4_qpn2_publish_sm70_kernel"
     )
+    if args.packed_input:
+        old = """const half* input_row = input + static_cast<size_t>(row) * k;
+        input01 = *reinterpret_cast<const uint4*>(input_row + group * 16);
+        input23 = *reinterpret_cast<const uint4*>(input_row + group * 16 + 8);"""
+        assert producer.count(old) == 1
+        producer = producer.replace(
+            old,
+            """const half* input_row = input + static_cast<size_t>(group) * 128 + row * 16;
+        input01 = *reinterpret_cast<const uint4*>(input_row);
+        input23 = *reinterpret_cast<const uint4*>(input_row + 8);""",
+        )
     old = "int m, float global_scale) {"
     assert producer.count(old) == 1
     producer = producer.replace(
@@ -201,6 +217,12 @@ TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
         "qpn2_consume_published<4><<<80, 128, 0, stream>>>(peers, nullptr,",
         "qpn2_consume_published<4><<<80, 128, 0, stream>>>(peers.ptrs[rank], nullptr,",
     )
+    if args.packed_input:
+        source = source.replace("_qpn2_candidate", "_qpn2_packed_row")
+        source = source.replace("nvfp4_qpn2_", "packedrow_nvfp4_qpn2_")
+        source = source.replace("qpn2_publish", "qpn2_packedrow_publish")
+        source = source.replace("qpn2_consume", "qpn2_packedrow_consume")
+        source = source.replace("qpn2_peer_pointers", "qpn2_packedrow_peer_pointers")
     shutil.copy2(
         W / "csrc/sm70_turbomind/ops/LICENSE.v100-skinny", D / "LICENSE.v100-skinny"
     )
@@ -217,6 +239,9 @@ TORCH_LIBRARY_FRAGMENT(_qpn2_candidate, ops) {
                 sources=manifest,
                 extra_cuda_cflags=cuda_flags,
                 math_mode="fast" if args.use_fast_math else "default",
+                publisher_input_layout="[K/16, 8, 16]"
+                if args.packed_input
+                else "[8, K]",
                 input_sources={
                     name: hashlib.sha256((W / name).read_bytes()).hexdigest()
                     for name in (

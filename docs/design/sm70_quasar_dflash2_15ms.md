@@ -596,8 +596,21 @@ control: 272 tokens / 91 rounds / 181 accepted drafts and
 634 tokens / 130 rounds / 504 accepted drafts. The isolated saving is
 0.076743/0.134038 ms, not a sub-15-ms result or a repeated-startup admission.
 See `results/packed-input-strict-shadow-summary.json` and
-`results/v4-packed-input-strict-ab.json`. The complete fixed-prefix pair is
-still pending; the direct-attention switch stays disabled in both arms.
+`results/v4-packed-input-strict-ab.json`. The direct-attention switch stays
+disabled in both arms.
+
+The longer fixed-prefix pair does not clear admission. After interpreting the
+544 packed norm snapshots in their logical layout, all captured layer-0/1
+states and layer outputs match. However, all 144 target-boundary records and
+native logits differ, with maximum sampling TV 0.0441784 and three changed
+top-p support rows. The first difference already occurs at the prefill target
+boundary, before the q8-only layout is active. This experiment cannot attribute
+that difference to packing or supersede the separate prefill/compiler
+repeatability investigation. Keep the layout candidate held. See
+`results/v4-packed-input-strict-audit-canonical-comparison.json` and
+`results/packed-input-quality-hold.json`. The first candidate startup was
+terminated by another task before producing a result; its identical recovery
+run supplies the candidate captures. The interrupted run is not a gate result.
 
 An exhaustive activation check covers all 63,488 finite FP16 gate values,
 with the up input fixed at one. Default CUDA math exactly matches native
@@ -610,6 +623,64 @@ other compilers or the performance of a complete gated projection. The
 helper remains a private candidate until actual projection and model gates
 pass. See `results/silu-math-contract-gate.json` and
 `results/silu-corrected-contract-gate.json`.
+
+The corrected activation subsequently matches every projection in the real
+four-layer working set, including three changed input magnitudes, but does
+not improve timing: 0.367063/0.367616 ms. It is rejected for speed and is not
+advanced to a model combination (`results/qpn2-packed-silu-exact-real.json`).
+
+### Packed MLP boundary and graph scheduling screens
+
+The next layout candidate lets gate/up write its FP16 output directly as
+`[hidden/16, 8, 16]`, then lets the down-projection publisher read that layout.
+Both arms use the preceding packed normalized input and existing publication
+protocol. No extra transpose, SiLU change or accumulation change is introduced.
+Four ranks pass five changing-input cycles with delayed-rank replays, canaries,
+all eight reductions and an ordinary ninth push. All seven timing pairs favor
+the candidate in the four-layer working set. See
+`results/qpn2-packed-mlp-chain-real.json`.
+
+One unprofiled startup per arm, warmup plus five requests per fixture, gives
+release1k 16.849092/16.802114 ms and MBPP28 16.566333/16.280088 ms. Every output
+hash and acceptance count matches the control. These are isolated screen
+results, not a completed repeated-startup gate. They inherit the preceding
+packed-input quality hold. See `results/v4-packed-mlp-ab.json`.
+
+The private packed-input and gated-output DSOs are reproducible with
+`benchmarks/kernels/build_sm70_qpn2_packed_input_candidate.py`, using
+`--pack-gated-output` for the latter. The builder retains the production
+arithmetic, restricts these entry points to M=8, records source/DSO SHA256s,
+and uses ordinary CUDA math. The existing publication builder accepts
+`--packed-input` for its publisher only; its standalone control GEMMs retain
+ordinary inputs. `benchmarks/kernels/benchmark_sm70_qpn2_packed_mlp.py` accepts
+all four DSO paths explicitly and checks the coupled gate/down boundary.
+These tools do not install a serving route or enable a default.
+
+The source-rebuilt versions pass the four-rank coupled gate with five changed
+input cycles, skewed rank launches and intact canaries. Each rank also rejects
+twelve non-q8 operator calls before kernel launch. Rebuilt DSO SHA256s are
+`6f718757d5918ae413e3f6977605a451649dfc31e3b3e2c709f53b59a14e77ec`
+(packed input),
+`d9a3990222b7a2d98243ab8707b582fdbe3de22a759096a0015dec131c2389ba`
+(packed gated output) and
+`5adec45ecceecbd0c8c7f7f37eac2d0f507e0c3ed09d2867eb817dac5b64e8fd`
+(packed publisher). This rebuild check has no timing claim. See
+`results/qpn2-packed-mlp-versioned-gate.json`. Without `--packed-input`, the
+publication builder still generates the previously recorded source SHA256
+`7360d578080c96350970b9ceb42fa5e470627949c28219013d1daa0861acc42a`.
+
+CUDA 12.8 conditional IF/ELSE graphs were exercised on the rear V100 with ten
+changing-condition replays. NVIDIA documents the conditional-body node
+restrictions in its [CUDA 12.8 runtime interface](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-runtime-api/structcudaConditionalNodeParams.html).
+This capability differs from PDL and was checked on SM70 directly. A follow-up
+prototype retains the original NumPy boundary decision via pinned transfers
+and a graph host callback. All 24 changing-input decisions match, but its tiny
+round-trip screen is slower: 0.091187/0.173937 ms. It is not integrated into
+the model (`results/host-conditional-graph-gate.json`). An independent draft
+tail experiment composes existing KV-store, metadata and query graphs in
+their original order. PyTorch rejected the first nested-replay capture before
+measurement. The follow-up retains the original graph handles and composes
+them with native child-graph APIs; its complete-round screen is pending.
 
 The bounded direct-output probe has eight four-rank records: GDN layer 2,
 full-attention layer 3, target hidden and native logits all match, with zero TV.
