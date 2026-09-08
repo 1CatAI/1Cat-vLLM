@@ -680,12 +680,111 @@ the model (`results/host-conditional-graph-gate.json`). An independent draft
 tail experiment composes existing KV-store, metadata and query graphs in
 their original order. PyTorch rejected the first nested-replay capture before
 measurement. The follow-up retains the original graph handles and composes
-them with native child-graph APIs; its complete-round screen is pending.
+them with native child-graph APIs. Sixteen changing-input primitive replays
+match. Its unprofiled complete-round pair is 16.986402/16.991194 ms for
+release1k and 16.540575/16.560563 ms for MBPP28. All five requests per fixture
+retain the canonical output hashes and acceptance counts, but neither
+fixture improves. Reject this scheduling candidate for speed; see
+`results/v4-draft-tail-native-v2-ab.json`.
 
 The bounded direct-output probe has eight four-rank records: GDN layer 2,
 full-attention layer 3, target hidden and native logits all match, with zero TV.
 This does not clear the earlier 140-record drift; the direct-output switch
 remains disabled. See `results/v4-direct-tiny-comparison.json`.
+
+### Publication node trace and bounded follow-up screens
+
+The next node-level trace uses the publication combination with packed GDN,
+combined split and fixed Gemma RMSNorm. Direct attention output and the held
+packed-input experiment remain disabled. The raw SQLite SHA256 is
+`13a16f21fba7a0fd46e41bccb741694f3d395048101f6e3e3edacf31305e8b37`.
+Ten complete steady rounds, four ranks, give the following CUDA service
+attribution in `results/v4-publish-nodes-trace.json`:
+
+| Work | Mean service ms / rank / round | Calls / rank / round |
+|---|---:|---:|
+| Target QPN2 gate/up and SiLU | 2.968 | 64 |
+| Target QPN2 published row projections | 2.887 | 128 |
+| Target QPN2 other projections | 1.562 | 64 |
+| Draft dense GEMMs and reductions | 1.832 | See phase attribution |
+| GDN recurrent update | 0.954 | 48 |
+| Target grouped attention | 0.952 | 32 |
+| Target normalization and residual | 0.837 | See phase attribution |
+| Gather/scatter/copy across phases | 0.351 | 63 |
+
+This confirms projection work as the largest remaining target. The trace
+also records 128 published-packet consumers with 0.656 ms of service and
+12 ordinary push collectives with 1.717 ms. Those durations include waiting
+for other ranks; they are not independently removable work. Node tracing
+perturbs scheduling: the diagnostic critical interval is 22.175 ms, whereas
+the previous whole-graph trace gave 18.465 ms and the unprofiled paired
+endpoint measurements were lower. Neither trace is a new performance
+baseline. The profiler-stop/export request is excluded from speed evidence.
+
+A private two-stream experiment starts the existing packet consumer before
+the producer and joins it before the next dependent projection. All four
+ranks finish capturing both graphs, and the control graph replays. The
+candidate hangs in its first replay and reaches the bounded timeout. No
+numerical or timing result exists for it. The cause is not yet localized;
+do not label it a measured overlap benefit or a proven occupancy failure.
+See `logs/qpn2-publish-overlap-diagnostic.log`.
+
+A NUMA scheduling pair binds the control to both CPU nodes and the candidate
+to the rear GPUs' local CPU node. The isolated medians are
+17.059970/17.033062 ms and 16.582857/16.485381 ms. Both arms agree with each
+other but share a changed trajectory relative to the earlier canonical
+baseline: release1k 283 tokens / 94 rounds / 189 accepted drafts, and MBPP28
+270 / 60 / 210. Common mapped dynamic libraries have identical hashes.
+Do not compare that shortened MBPP28 request with the earlier 634-token
+performance or attribute the common trajectory change to local CPU binding.
+This is another unresolved baseline-repeatability observation, not an
+admitted scheduling change (`results/v4-numa-ab.json`).
+
+An independent FP64 arithmetic screen decodes the actual rank-0 QPN2
+weights into the unchanged FP16 operands and evaluates all five matrix
+shapes, four consecutive layers and three activation magnitudes. Every
+single-accumulator-chain configuration expands at least one registered
+reference error and is rejected. Some row-projection configurations retain
+the checked max, p99 and relative-L2 bounds with small working-set gains,
+but have no model/acceptance evidence and remain disabled. See
+`results/qpn2-calibration-fp64.json`; these are not full-round gains.
+
+The earlier fixed-q8 specialization crossed a register-use boundary and was
+slower. A new build retains its accumulation order and ordinary CUDA math
+while capping registers at 64. Its four-layer working-set pair is
+0.405852/0.392275 ms, with all seven paired differences positive. An actual
+MBPP28 q8 step checks all 128 affected target column projections on each of
+four ranks: every output byte matches the existing operator. This is a
+bounded operator check, not full-prefix admission. The model sidecar source
+SHA256 is
+`a3b480efe2f671cf05ef39bd775f18c0f4cfc6b67bcf92fc96aec57960b06514`
+and its DSO SHA256 is
+`a62fa06fecb0f67a9011e011f2112f8006e691018e95c218c0bc092818303a4d`.
+See `results/qpn2-fixed-q8-cap64-real.json` and
+`results/qpn2-cap64-shadow-summary.json`. Its unprofiled complete-round
+pair improves release1k from 17.051370 to 16.888148 ms and MBPP28 from
+16.652563 to 16.456873 ms. Each arm has one independent startup and five
+measured requests after warmup. All ten candidate requests retain the
+canonical token hashes, natural EOS and acceptance counts. The subsequent
+144-record fixed-prefix pair also matches: all captured layer-0/1 outputs,
+conv/recurrent states, target hidden states and native logits are byte-equal;
+sampling TV, changed support rows and top-1 changes are all zero. This is not
+final repeated-startup admission or a sub-15-ms result. See
+`results/v4-qpn2-cap64-ab.json` and
+`results/v4-qpn2-cap64-audit-comparison.json`. The source is reproducible
+with `benchmarks/kernels/build_sm70_qpn2_q8_candidate.py`; the working-set
+benchmark accepts its private namespace through `--candidate-namespace`.
+The source-rebuilt DSO has SHA256
+`6a7e3e3f06f1f7cd2cadec4d4205381b0e6b73f8904ea65782306a54afd2c9ee`.
+It reproduces the recorded source hash, matches the sixteen-projection
+working-set outputs and rejects twelve non-q8 calls before launching a
+kernel (`results/qpn2-cap64-versioned-gate.json`). This rebuild has no
+additional performance claim.
+
+An independent L2-prefetch candidate avoids keeping future decoded weights
+in registers. It preserves all checked output bits, but the four-layer
+working set slows from 0.378491 to 0.433336 ms, with every paired trial
+slower. Reject it; see `results/qpn2-l2-prefetch-real.json`.
 
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context

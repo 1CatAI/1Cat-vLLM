@@ -70,6 +70,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshots", type=Path)
     parser.add_argument("--candidate-library", type=Path)
+    parser.add_argument("--candidate-namespace", default="_qpn2_candidate")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--trials", type=int, default=7)
@@ -80,6 +81,7 @@ def main() -> None:
         raise ValueError("SM70 is required")
     if args.candidate_library:
         torch.ops.load_library(str(args.candidate_library))
+    candidate_ops = getattr(torch.ops, args.candidate_namespace)
     torch.manual_seed(20260908)
     items, provenance = [], []
     for path in sorted(args.snapshots.glob("*.pt")):
@@ -94,10 +96,8 @@ def main() -> None:
         item["codes"] = item["codes"].cuda()
         item["scales"] = item["scales"].cuda()
         item["candidate_scales"] = item["scales"]
-        if args.candidate_library and hasattr(
-            torch.ops._qpn2_candidate, "prepare_scales"
-        ):
-            item["candidate_scales"] = torch.ops._qpn2_candidate.prepare_scales(
+        if args.candidate_library and hasattr(candidate_ops, "prepare_scales"):
+            item["candidate_scales"] = candidate_ops.prepare_scales(
                 item["scales"], item["global_scale"]
             )
         item["input"] = torch.randn(8, item["k"], device="cuda", dtype=torch.float16)
@@ -119,11 +119,7 @@ def main() -> None:
     def run(arm: int) -> None:
         for item in items:
             if arm and args.candidate_library:
-                op = (
-                    torch.ops._qpn2_candidate.gated
-                    if item["gated"]
-                    else torch.ops._qpn2_candidate.gemm
-                )
+                op = candidate_ops.gated if item["gated"] else candidate_ops.gemm
             else:
                 op = (
                     ops.nvfp4_qpn2_gated_sm70_out
@@ -200,6 +196,9 @@ def main() -> None:
             for k in ("codes", "candidate_scales")
         ),
         "candidate_scale_dtype": str(items[0]["candidate_scales"].dtype),
+        "candidate_namespace": args.candidate_namespace
+        if args.candidate_library
+        else None,
         "candidate_library_sha256": hashlib.sha256(
             args.candidate_library.read_bytes()
         ).hexdigest()
