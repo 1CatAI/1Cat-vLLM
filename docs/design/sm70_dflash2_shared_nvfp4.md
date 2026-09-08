@@ -105,19 +105,20 @@ changed-input CUDA Graph replay. Timing captures 16 nodes per graph for
 small M and takes eight ABBA rounds, retaining all raw samples.
 Weighted by the model's projection counts, counting fused gate/up once:
 
-| M | Initial shared/dual ratio | Final shared/dual ratio |
+| M | Repeated-projection shared/dual | Working-set shared/dual |
 | --- | --- | --- |
-| 8 | 1.0137 | 1.0013 |
-| 16 | 1.0624 | 0.9869 |
-| 32 | 1.0738 | 0.9591 |
+| 8 | 1.0013 | 1.0259 |
+| 16 | 0.9869 | 0.9915 |
+| 32 | 0.9591 | 0.9019 |
 
 Each ratio uses that run's control. Absolute times across the two timing
-methods or unlocked-clock runs are not comparable. These projection sums
-show recovery in this repeated-operator workload; they do not establish
-production throughput. Repeated access favors cache-resident weights. An
-additional working-set check cycles six distinct real projection tensors
-in the model's 3-GDN/1-attention layer pattern, exceeding L2 capacity; that
-measurement and the complete production A/B remain pending.
+methods or unlocked-clock runs are not comparable. The working-set check
+cycles six distinct real projection tensors in the model's 3-GDN/1-attention
+pattern, exceeding L2 capacity, with 256 calls per graph. It preserves the
+M16/M32 gain, while M8 retains a 2.59% cost. Without selective caching,
+the working-set M8 ratio was 1.0639, so caching remains beneficial here.
+These are isolated projections with independent inputs, without attention
+or communication, and do not establish production throughput.
 
 Rejected experiments retain their evidence: adjacent-column vector loads
 plus a lane shuffle pass bitwise but regress speed, including the variant
@@ -146,11 +147,45 @@ verification-round time 19.046 ms and TTFT 114.93 ms. Actual concurrency is
 one; maxseq4 is capacity. A separate MBPP0 request completes with 2105
 tokens and natural EOS. This is a focused check, not full quality admission.
 
-The shared production server logs 8.20 GiB model loading on all four ranks,
-then is externally terminated after compilation. Candidate KV capacity,
-NVML, output parity and endpoint speed remain unmeasured. The loading log
-is a runtime measurement distinct from the exact 2.835693 GiB code-storage
-calculation; do not report a full-service memory or throughput improvement.
+The shared production retry completes after the user authorizes using idle
+GPUs 0–3. The former reservation scheduler has no running or queued jobs
+when it is gracefully released; active work is not preempted.
+
+| Recorded allocation | Dual layout | Shared layout |
+| --- | --- | --- |
+| Model loading, GiB/rank | 11.08 | 8.20 |
+| Automatic KV budget, GiB/rank | 12.68 | 15.76 |
+| Logical KV tokens | 1,190,275 | 1,479,578 |
+| Graph capture increment, GiB/rank | 0.33 | 0.26 |
+| Idle worker NVML, MiB/rank | 26,114 | 26,030 |
+
+Both idle snapshots have zero running/waiting requests and zero KV usage.
+Automatic sizing turns the released memory into 289,303 additional logical
+KV tokens, a 24.31% increase. NVML usage stays near 25.5 GiB/rank. Loading,
+available KV budget and capture increments come from different profiling
+stages; do not sum them as an exact allocation ledger or attribute every
+budget difference to the exact 2.835693 GiB removed code storage.
+
+**Output parity fails; production speed is not accepted.** The same MBPP28
+prompt (135 input tokens), seed and sampling produce 260 control tokens and
+754 shared tokens, each stable within its own warmup/three-repeat cohort.
+The first difference is token 16 (one-based). MBPP0 produces 2105 versus 1093
+tokens; both finish naturally with nonempty final answers. These differences
+do not establish semantic degradation, but fail the deterministic gate.
+
+Shared median pure decode is 221.40 tokens/s, round time 19.435 ms and
+TTFT 112.37 ms. The different output sequences and acceptance lengths prevent
+a matched-output throughput claim. Input text, launch script, seeds and the
+six recorded native binary hashes are unchanged between arms. The existing
+336 operator checks use same-build source controls. A further oracle against
+the actual installed `_C` preparation/dispatch completes 36 projection/M
+combinations: all six projections differ at M16/M32, while M1/M8/135/1024
+match, including the gated cases reached. This exposes a native-version
+validation gap that the same-build comparison could not detect. A direct
+TurboMind comparison at M9/16/32 is queued to distinguish route selection
+from arithmetic. Do not attribute the token mismatch to shared code storage
+without localizing it. Retain the default-off switch and Draft PR until the
+native comparison and model parity are resolved.
 
 An earlier fixed 2 GiB KV/8K/E5M2 diagnostic is excluded from production
 conclusions. The first corrected control attempt exposes an old Flash-V100

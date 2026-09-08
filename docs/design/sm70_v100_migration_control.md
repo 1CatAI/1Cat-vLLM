@@ -63,8 +63,9 @@ Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in. Shared row-first scheduling,
 8-row CTAs and selective caching for K=1536/N=5120 output weights yield
 weighted M8/M16/M32 ratios of 1.0013/0.9869/0.9591 in the repeated-operator
 ABBA benchmark. All 336 final cases on 24 real shards pass bitwise,
-including partial rows. A working-set check is pending; these isolated
-projection ratios do not establish model throughput. Reject the slower
+including partial rows. A six-tensor working set yields ratios
+1.0259/0.9915/0.9019; M8 retains a cost and these isolated projection ratios
+do not establish model throughput. Reject the slower
 vector-load/shuffle and global unroll 1/2/8 experiments.
 
 Production validation must retain automatic KV at utilization 0.8, TP4,
@@ -73,10 +74,18 @@ FP32-logit and sampling settings. The fixed 2 GiB/8K/E5M2 diagnostic is excluded
 from production conclusions. With matching revision-four Flash-V100, the
 production control completes: 11.08 GiB loading/rank, 12.68 GiB KV budget,
 1,190,275 KV tokens and 277.52 tokens/s median single-request pure decode.
-Shared loading is 8.20 GiB/rank, but that service is externally terminated
-after compilation. Candidate KV/endpoint/output results and full production
-A/B remain pending. The design note records the failed paths and remaining
-acceptance; do not repeat the old-extension or fixed-KV harness failures.
+The shared production retry completes: loading 8.20 GiB/rank, KV 15.76 GiB,
+1,479,578 logical tokens (+24.31%) and idle NVML 26,030 MiB/rank versus 26,114.
+However, MBPP28 differs at token 16 and completes 754 versus 260 tokens; MBPP0
+completes 1093 versus 2105. Both arms finish naturally, but deterministic parity
+fails. Shared 221.40 tok/s cannot establish a matched-output speed comparison.
+Inputs, launch arguments and recorded binaries match. Comparing the actual
+installed `_C` operators exposes M16/M32 differences on all six projections;
+M1/M8/135/1024 match. The 336 earlier checks used same-build source controls.
+Next compare installed dispatch directly with TurboMind at M9/16/32 to
+localize route selection before another model run.
+Keep the feature default-off and PR Draft; do not repeat the old-extension,
+fixed-KV harness failures or passed 336 checks as a substitute for localization.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 
