@@ -148,8 +148,11 @@ been removed, changing FMA contraction even with the same tile and warp count.
 The corrected kernel preserves those boundaries. With the same checkpoint
 weights and captured inputs, both norms and the residual now exactly match
 `audit-a2` for all 36 case/step combinations (two full prefills plus all 17
-verification steps per tape). The final corrected model comparison and
-natural-output/performance gates are pending; no serving default is promoted.
+verification steps per tape). The final corrected model comparison,
+`audit-a2` versus `audit-fixed-norm-3`, also passes: all 144 records have
+bitwise-equal intermediates and native logits, zero full/sampling TV and no
+support or top-1 changes (`results/a2-versus-fixed-norm-3.json`).
+No serving default is promoted.
 The first AOT attempt also exposed an unresolved imported `tldevice` alias in
 generated code. Using `tl.rsqrt` fixes code generation, and the test now runs
 the actual Inductor backend rather than only Dynamo's eager backend.
@@ -173,3 +176,51 @@ Hardware NCU counters are currently unavailable: the driver sets
 `RmProfilingAdminOnly=1`, and the available root helper only manages GPU
 clocks. This does not block state, numerical, CUDA-event or Nsight Systems
 work, but no counter-based bottleneck claim is made without those counters.
+
+### Natural-output gate and packed verifier integration
+
+The first uninstrumented fixed-norm startup has median complete-round costs
+19.035 ms (release1k) and 18.719 ms (MBPP28), with five measured requests after
+warmup. Its three long-code cases score base 3/3 and plus 1/3, matching the
+initial baseline; JSON and all nine seed/structured-fixture pairs pass,
+including the existing parallel-tool premature-EOS fixture. Token sequences
+change versus the original unpinned startup: first flips are output positions
+187 (release1k) and 8 (MBPP28), zero-based. Accepted drafts/round are 1.917 and
+3.934, respectively. These are observations, not an acceptance noninferiority
+pass; the small score set cannot clear the changed-output gate.
+
+The initial packed on/off model run (`audit-packed-1`) is excluded as packed
+parity evidence: it did not log an actual route hit and produced no additional
+packed-verifier kernel specialization. Inspection finds two integration bugs:
+the Qwen3.5 projection and in-place convolution retain a wider QKVZBA row
+stride, rejected by the contiguous-only gate; and the packed bridge retains
+the old FP16 beta default while the standard speculative path uses FP32 beta.
+
+The candidate reads contiguous-feature, row-strided QKV directly using its
+actual row stride, and explicitly materializes FP32 beta. The existing
+default-off verifier flag still controls dispatch. Sixteen GPU parity cases
+cover the old FP16-beta component contract and the actual runtime bridge with
+FP32 beta, wider projection rows, q4/q8, B1/B2 and FP16/FP32 states. Projection
+storage remains unchanged. The diagnostic now records per-forward kernel
+route markers; the comparator can require a packed hit on every observed
+layer/rank/verification step. Eight state-audit tests pass, including rejection
+of an equal-output comparison with no candidate hit. The complete model
+comparison (`audit-fixed-norm-3` versus `audit-packed-2`) now passes with
+required per-forward packed hits: all 144 records, intermediate tensors,
+states and logits are bitwise equal, with zero TV/support/top-1 changes.
+See `results/packed-stride-ab.json` and the pinned source overlay in
+`results/audit-packed-2-source.json`.
+
+Twenty additional real-state cases exercise the new 4128-element QKV row
+stride; all outputs, states, padding and projection storage match exactly.
+Task-local NVIDIA Compute Sanitizer 2025.1.0 (CUDA package 12.8.93-1) memcheck
+reports zero errors on these cases; racecheck reports zero errors or warnings.
+This is an operator memory gate, not
+a long-context or acceptance noninferiority gate.
+
+Real-state component replay also covers 480 combinations of two layers, two
+tapes, four ranks, three verifier steps, all eight accepted-slot selectors,
+non-monotonic state IDs including zero, empty padded requests, strided state
+pools and untouched retired slots. Those original runs supplied captured FP32
+gates and contiguous QKV; they do not validate the previously incorrect runtime
+bridge. All evidence remains independent of performance and natural acceptance.

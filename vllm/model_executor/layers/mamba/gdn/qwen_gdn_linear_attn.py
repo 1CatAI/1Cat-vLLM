@@ -5181,7 +5181,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # The supported verifier contract keeps recurrent state in FP32;
             # an explicit FP16 cache override is also supported.
             and ssm_state.dtype in (torch.float16, torch.float32)
-            and mixed_qkv.is_contiguous()
+            # Qwen3.5's fused projection and in-place convolution retain the
+            # wider QKVZBA row stride. The packed consumer can read it directly.
+            and mixed_qkv.stride(1) == 1
+            and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
             and a.is_contiguous()
             and b.is_contiguous()
             and core_attn_out.is_contiguous()
@@ -5202,7 +5205,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        g, beta = fused_gdn_gating(
+            self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
+        )
         fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             A_log=self.A_log,
             a=a,

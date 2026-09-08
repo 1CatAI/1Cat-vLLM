@@ -57,6 +57,19 @@ def test_audit_comparator_requires_all_ranks(captures):
         compare(left, right)
 
 
+def test_audit_comparator_requires_actual_candidate_route(captures):
+    left, right = captures
+    with pytest.raises(ValueError, match="missing packed route hit"):
+        compare(left, right, right_verifier_route="packed")
+    for path in right.glob("*-step1.pt"):
+        data = torch.load(path, weights_only=True)
+        data["verifier_routes"] = ["route/verify/layer0/packed"]
+        torch.save(data, path)
+    assert compare(left, right, right_verifier_route="packed")["summary"][
+        "all_logits_bitwise_equal"
+    ]
+
+
 def test_audit_comparator_rejects_missing_layer_observations(captures):
     left, right = captures
     for directory in captures:

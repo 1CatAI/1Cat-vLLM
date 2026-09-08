@@ -61,7 +61,9 @@ def sampling_difference(left: torch.Tensor, right: torch.Tensor) -> dict:
     }
 
 
-def compare(left_dir: Path, right_dir: Path) -> dict:
+def compare(
+    left_dir: Path, right_dir: Path, *, right_verifier_route: str | None = None
+) -> dict:
     left_files = {p.name: p for p in left_dir.glob("*-rank*-step*.pt")}
     right_files = {p.name: p for p in right_dir.glob("*-rank*-step*.pt")}
     if not left_files or left_files.keys() != right_files.keys():
@@ -81,6 +83,13 @@ def compare(left_dir: Path, right_dir: Path) -> dict:
             if left[key] != right[key]:
                 raise ValueError(f"{name}: {key} differs")
         identity = {key: left[key] for key in ("case", "rank", "step", "phase")}
+        if right_verifier_route is not None and right["phase"] == "verify":
+            expected = {
+                f"route/verify/layer{layer}/{right_verifier_route}"
+                for layer in right["expected_layers"]
+            }
+            if set(right.get("verifier_routes", ())) != expected:
+                raise ValueError(f"{name}: missing {right_verifier_route} route hit")
         if left.get("expected_layers") != right.get("expected_layers"):
             raise ValueError(f"{name}: requested layers differ")
         if not left.get("expected_layers") or "capture_epoch" not in left:
@@ -179,9 +188,12 @@ def main() -> None:
     parser.add_argument("left", type=Path)
     parser.add_argument("right", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--right-verifier-route", choices=("split", "packed"))
     args = parser.parse_args()
     torch.set_num_threads(4)
-    result = compare(args.left, args.right)
+    result = compare(
+        args.left, args.right, right_verifier_route=args.right_verifier_route
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["summary"], indent=2))
 

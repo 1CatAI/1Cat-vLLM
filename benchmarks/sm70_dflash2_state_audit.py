@@ -147,6 +147,7 @@ def install() -> None:
         if layer is None or indices is None or selectors is None:
             return recurrent(*args, **kwargs)
         key = f"verify/layer{layer}/recurrent"
+        record(f"route/verify/layer{layer}/split", epoch)
         for label in ("q", "k", "v", "g", "beta", "cu_seqlens"):
             record(f"{key}/{label}", kwargs.get(label))
         record(f"{key}/slot_table", indices)
@@ -160,6 +161,54 @@ def install() -> None:
         return out
 
     gd.fused_recurrent_gated_delta_rule = recurrent_wrapper
+    packed = gd.fused_sigmoid_gating_delta_rule_update_mixed_qkv_out
+
+    @functools.wraps(packed)
+    def packed_wrapper(*args, **kwargs):
+        layer = caller_layer()
+        if layer is None or kwargs.get("precomputed_g") is None:
+            return packed(*args, **kwargs)
+        # Keep the same raw metadata coverage as the split verifier. The
+        # packed operator receives only the live slice of these parent args.
+        frame = sys._getframe(1)
+        for _ in range(8):
+            if frame.f_code.co_name == "_forward_dflash2_packed_gdn_verify":
+                indices = frame.f_locals["spec_state_indices_tensor"]
+                selectors = frame.f_locals["spec_state_slot_selectors"]
+                break
+            frame = frame.f_back
+            if frame is None:
+                raise RuntimeError("Missing packed-verifier metadata provenance")
+        else:
+            raise RuntimeError("Missing packed-verifier caller")
+        key = f"verify/layer{layer}/recurrent"
+        record(f"route/verify/layer{layer}/packed", epoch)
+        mixed = kwargs["mixed_qkv"]
+        tokens = mixed.shape[0]
+        q_heads, v_heads = kwargs["num_q_heads"], kwargs["num_v_heads"]
+        dk, dv = kwargs["head_k_dim"], kwargs["head_v_dim"]
+        q, k, v = mixed.split([q_heads * dk, q_heads * dk, v_heads * dv], dim=1)
+        for label, tensor in (
+            ("q", q.reshape(1, tokens, q_heads, dk)),
+            ("k", k.reshape(1, tokens, q_heads, dk)),
+            ("v", v.reshape(1, tokens, v_heads, dv)),
+            ("g", kwargs["precomputed_g"].reshape(1, tokens, v_heads)),
+            ("beta", kwargs["precomputed_beta"].reshape(1, tokens, v_heads)),
+            ("cu_seqlens", kwargs["cu_seqlens"]),
+            ("slot_table", indices),
+            ("selectors", selectors),
+        ):
+            record(f"{key}/{label}", tensor)
+        state = kwargs["initial_state"]
+        record_slots(
+            f"{key}/input_state", state, selected_ssm_slots(indices, selectors)
+        )
+        out = packed(*args, **kwargs)
+        record(f"{key}/output", out[0].transpose(0, 1))
+        record_slots(f"{key}/output_states", state, indices)
+        return out
+
+    gd.fused_sigmoid_gating_delta_rule_update_mixed_qkv_out = packed_wrapper
     for function_name, phase in (
         ("causal_conv1d_fn", "prefill"),
         ("causal_conv1d_update", "verify"),
@@ -273,6 +322,9 @@ def install() -> None:
             "hidden": cpu(hs),
             "native_logits": cpu(native) if rank == 0 else None,
             "states": tensors,
+            "verifier_routes": sorted(
+                key.split(":")[0] for key in fresh if key.startswith("route/")
+            ),
             "tensors": layer_tensors,
             "cuda_rng": torch.cuda.get_rng_state(self.device),
             "cpu_rng": torch.get_rng_state(),
