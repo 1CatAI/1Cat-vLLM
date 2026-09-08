@@ -946,6 +946,67 @@ All 45 output/workspace/guard comparisons pass for this rebuilt DSO
 (`results/attention-headsplit-versioned-correctness.json`). It installs no
 serving route; its operator gate is not an additional model speed claim.
 
+Rotating physical warp assignments to logical K partitions across N tiles
+preserves the matrix arithmetic but is slower in all seven steady ABBA
+pairs: 0.374835/0.375613 ms. Reject that schedule
+(`results/qpn2-staggered-k64-steady.json`).
+
+A private fused producer/consumer instead uses cooperative kernel launch and
+checks the complete 160-CTA grid against the device's admission capacity.
+[NVIDIA documents cooperative launch in CUDA Graphs](https://developer.nvidia.com/blog/cuda-11-features-revealed/).
+It keeps the original K accumulation, FP16 projection rounding, FP32 rank
+reduction, packet cleanup and eighty epoch counters. Five changing-input
+cycles across four ranks, delayed-rank cases and the ordinary ninth-push
+transition pass bytewise output and canary checks. However, the complete
+four-layer collective screen regresses from 0.445501 to 0.500654 ms in all
+seven pairs. A second version replaces the grid-wide barrier with per-epoch
+last-arrival counters. It also preserves outputs and resets its counters,
+but remains slower in every pair (approximately 0.4445/0.4980 ms). Both are
+rejected for speed; these bounded results do not diagnose all causes of the
+separate split-stream hang. See `results/qpn2-cooperative64-real.json` and
+`results/qpn2-cooperative-counts64-real.json`. No fused consumer is enabled.
+
+The minimal node trace of the bounded split-stream probe records the first
+candidate producer starting approximately 77.07 ms after its consumer,
+only near the latter's timeout. CUPTI's driver-selected shared-memory size
+is 64 KiB for the first S8 producer and 0 KiB for its consumer; S16
+producers use 32 KiB. See `results/qpn2-overlap-first-collective-trace.json`.
+[NVIDIA describes possible synchronization when cache preferences change](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-driver-api/group__CUDA__EXEC.html).
+An intervention sets a matching 25% shared-memory preference on the bounded
+probe's two producer kernels and consumer. The previously failing complete
+four-layer graph then finishes: all four ranks match all outputs/canaries,
+with no packet timeouts in its eight collectives. This supports the cache-
+configuration explanation. It is a one-cycle diagnostic with modified
+polling, not a production liveness guarantee or a speed result
+(`results/qpn2-compatible-carveout-probe.json`). A separate bounded early consumer leaves epoch updates to a main-stream
+completion kernel after joining the producer and early consumer. Five changing-
+input cycles match all four-rank outputs and canaries, both with normal overlap
+and with early polling forced to finish before the producer (all packets then
+use completion). The three-arm medians are 0.457175 ms for original serial,
+0.458035 ms for aligned serial and 0.508580 ms for bounded overlap. Every
+overlap pair is slower. Reject this route; no liveness assumption is added to
+serving (`results/qpn2-bounded-overlap-{forced,real}.json`).
+
+An exact FP16 operand-lookup candidate precomputes the original decode for
+every scale/code-pair combination and retains the original S16 column/S8
+gated splits. The first S8-only host gate correctly rejects the frozen
+column shapes before measurement. After correcting that dispatch, all
+sixteen projection outputs match, but the steady four-layer screen slows
+from 0.377795 to 0.787712 ms in every pair. Reject the lookup path
+(`results/qpn2-lookup64v2-steady.json`); changing decode representation
+alone does not imply lower cost.
+
+A warp-specialized QPN2 double buffer adds eight loader warps for sixteen
+compute warps, retaining both original accumulation chains inside each compute
+warp. All sixteen real-weight outputs match, but the sustained seven-pair
+working set regresses from 0.374917 to 0.480748 ms, slower in every pair.
+Reject it (`results/qpn2-staged40-steady.json`). A capture-time equal-cache
+preference screen uses identical serial publication kernels in both arms and
+restores the prior context preference after capture. Its five-cycle four-rank
+output gate passes, but medians 0.454779/0.456745 ms and mixed-sign differences
+show no gain. Reject the screen; it does not prove the preference survives
+graph instantiation (`results/qpn2-context-cache-real.json`).
+
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
 validation remain open. No new serving default or merge is claimed.
