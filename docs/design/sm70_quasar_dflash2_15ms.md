@@ -575,12 +575,41 @@ The experimental packed-input DSO used `--use_fast_math`. Disassembly of its
 gated kernel has no FFMA correction instructions; the archived production
 gated kernel and the default-math rebuild each contain 22. The current CMake
 QPN2 path obtains Torch's common CUDA flags without adding fast math. A
-same-input GEMM/activation shadow and default-math model rerun are underway;
-the input-layout candidate remains held until those gates pass. The builder's
-former implicit fast-math default has therefore been removed and its math mode
-made explicit. Historical SHA256s and measured results are not relabeled as
-default-math results. Publication's serving path used only its nongated
-producer and already passed its complete 140-record comparison.
+same-input layer-22 shadow separates raw gate/up GEMM from activation: both
+raw GEMMs are bitwise equal on all four ranks, and the control fused activation
+matches native `silu_and_mul`. Only the experimental activation differs. The
+builder's former implicit fast-math default has therefore been removed and
+its math mode made explicit. Historical SHA256s and measured results are not
+relabeled as default-math results. Publication's serving path used only its
+nongated producer and already passed its complete 140-record comparison.
+
+The default-math packed-input rebuild has source SHA256
+`13618190405372caed28f15391c4783c884ffca02a10af25a210da28668e216a`
+and DSO SHA256
+`257af8ceb4230428f874ac7429387ffff1697925cdb92bf1227477d5a1eed564`.
+All 383 fresh actual-input comparisons on each of four ranks now match
+bitwise, including all 128 column projections. One unprofiled startup per
+arm gives release1k 17.011715/16.934972 ms and MBPP28
+16.549580/16.415542 ms, each the median of five measured requests after
+warmup. All output hashes, natural EOS and acceptance counts match the
+control: 272 tokens / 91 rounds / 181 accepted drafts and
+634 tokens / 130 rounds / 504 accepted drafts. The isolated saving is
+0.076743/0.134038 ms, not a sub-15-ms result or a repeated-startup admission.
+See `results/packed-input-strict-shadow-summary.json` and
+`results/v4-packed-input-strict-ab.json`. The complete fixed-prefix pair is
+still pending; the direct-attention switch stays disabled in both arms.
+
+An exhaustive activation check covers all 63,488 finite FP16 gate values,
+with the up input fixed at one. Default CUDA math exactly matches native
+SiLU. Explicit fast division/exponential differs at precisely two inputs:
+`-2.724609375` and `-4.921875`. A separate experimental helper retains native
+math for those inputs and every nonfinite input. It matches native output
+bits for all 65,536 FP16 bit patterns, including signed zeros and NaN payloads.
+This is a bounded SM70/CUDA-12.8 activation contract check, not a claim about
+other compilers or the performance of a complete gated projection. The
+helper remains a private candidate until actual projection and model gates
+pass. See `results/silu-math-contract-gate.json` and
+`results/silu-corrected-contract-gate.json`.
 
 The bounded direct-output probe has eight four-rank records: GDN layer 2,
 full-attention layer 3, target hidden and native logits all match, with zero TV.
