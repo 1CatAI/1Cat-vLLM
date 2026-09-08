@@ -1,5 +1,11 @@
 # Experimental E4M3 grouped attention with FP32 partial state
 
+**2026-09-08 policy update:** [DFlash2 FP32 defaults](sm70_dflash2_fp32_defaults.md)
+supersede the default-routing and KV-alias decisions recorded below. E4M3
+DFlash2 verification now uses repaired FP32 state; revision 4 adds the
+1728/3456 page layouts. Earlier measurements and failed model gates retain
+their original artifact attribution.
+
 ## Scope and admission
 
 **Current mainline audit decision (2026-09-07): enabled for compatible

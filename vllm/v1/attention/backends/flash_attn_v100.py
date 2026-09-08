@@ -4455,9 +4455,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
             logger.warning_once(
-                "E4M3 grouped FP32 requires Flash-V100 precision revision 3; "
-                "using the existing attention fallback. Rebuild the extension "
-                "and restart workers to enable the repaired route.",
+                "E4M3 grouped FP32 requires Flash-V100 precision revision 4; "
+                "the E4M3 scalar fallback also requires this revision for "
+                "FP32 partial storage. Rebuild the extension and restart workers.",
                 scope="process",
             )
         self.dflash2_grouped_verify_max_query_tokens = (
@@ -5413,20 +5413,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and value_cache.dtype == torch.uint8
             and key_cache.stride(-1) == 1
             and value_cache.stride(-1) == 1
-            and (
-                self.kv_cache_dtype == "fp8_e5m2"
-                or (
-                    self.kv_cache_dtype == "fp8_e4m3"
-                    and num_query_tokens == 8
-                    and key_cache.stride(0) % 16 == 0
-                    and key_cache.stride(1) % 16 == 0
-                    and value_cache.stride(0) % 16 == 0
-                    and value_cache.stride(1) % 16 == 0
-                    and getattr(
-                        self.flash_attn_grouped_verify_paged, "supports_e4m3", False
-                    )
-                )
-            )
+            # This legacy verifier stores normalized partials in FP16.
+            # E4M3 must reach the repaired FP32 path below, including when
+            # the old native entry advertises E4M3 byte-format support.
+            and self.kv_cache_dtype == "fp8_e5m2"
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == num_reqs
@@ -5612,12 +5602,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 v_scale=float(layer._v_scale_float),
             )
             logger.info_once(
-                "FLASH_ATTN_V100 experimental E4M3 grouped FP32 route "
-                "selected (rows=%d, page=%d, explicit row lengths).",
+                "FLASH_ATTN_V100 E4M3 grouped FP32 route selected "
+                "(rows=%d, page=%d, FP32 numerator/max/sum, explicit row lengths).",
                 query.shape[0],
                 key_cache.shape[1],
                 scope="process",
             )
+            _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "grouped_fp32")
             _record_route("prefill_smallq_e4m3_grouped_fp32")
             return
         window_size = self._flash_v100_window_size(causal=True)
@@ -6816,6 +6807,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 self.kv_cache_dtype in ("fp8", "fp8_e4m3")
                 and key_cache.dtype == torch.uint8
                 and value_cache.dtype == torch.uint8
+                # The E4M3 XQA wave route retains half partials. A DFlash2
+                # target q1 must honor the same FP32 state policy as q8.
+                and not getattr(attn_metadata, "is_dflash_selector_target", False)
             )
         )
 

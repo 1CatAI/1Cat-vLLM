@@ -142,7 +142,7 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     requested_dtype: str,
     resolved_dtype: str,
 ) -> str:
-    """Preserve the historical 1Cat V100 meaning of the ``fp8`` alias."""
+    """Use E4M3 storage for the SM70 Flash-V100 ``fp8`` alias."""
     if (
         requested_dtype != "fp8"
         or resolved_dtype != "fp8"
@@ -157,12 +157,11 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     if capability is None or (capability.major, capability.minor) != (7, 0):
         return resolved_dtype
     logger.warning_once(
-        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e5m2 "
-        "for compatibility with the optimized 1Cat V100 KV-cache path. "
-        "Use explicit fp8_e4m3 to request E4M3 KV storage. Model weight "
+        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
+        "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
         "quantization is configured independently."
     )
-    return "fp8_e5m2"
+    return "fp8_e4m3"
 
 
 # object is used to allow for special typing forms

@@ -114,7 +114,9 @@ The adaptation is divided into independently testable surfaces:
    workspace before two Tensor Core GEMMs. The older direct scalar kernel is
    retained only as a reference/test path and is not accepted for B1 decode.
    Use the explicit `fp8_e4m3` cache dtype because the historical generic SM70
-   `fp8` alias resolves to E5M2 for other model families.
+   `fp8` alias historically resolved to E5M2 for other model families. The
+   [E4M3 default update](sm70_dflash2_fp32_defaults.md) changes that alias;
+   explicit `fp8_e4m3` keeps this recipe independent of that version boundary.
 9. Keep all GLM mHC4/H4096 execution on native SM70 kernels. Small-M fused
    decode follows the DeepSeek-V4 FP32 staging design, but its final Sinkhorn,
    residual mix, and RMSNorm stage is a dedicated single-CTA CUDA kernel for

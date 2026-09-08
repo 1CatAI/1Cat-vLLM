@@ -85,6 +85,8 @@ _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # Preserve candidate and dense logits in FP32 through sampling.
+    "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
     # This is the target projection's memory-neutral FP8 layout, not the
     # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
     # original layout whenever the exact operator contract is unavailable.

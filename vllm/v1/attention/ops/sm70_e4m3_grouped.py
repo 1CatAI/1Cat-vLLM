@@ -43,7 +43,7 @@ def grouped_e4m3_fp32_allowed(
         and out.device == query.device
         and out.is_contiguous()
         and k.ndim == 4
-        and k.shape[1] in (800, 848, 1616, 1648, 3296)
+        and k.shape[1] in (800, 848, 1616, 1648, 1728, 3296, 3456)
         and k.shape[2:] == (1, 256)
         and v.shape == k.shape
         and k.dtype == torch.uint8

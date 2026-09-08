@@ -18,7 +18,7 @@ def _native():
 
 
 @pytest.mark.parametrize("has_entry", [False, True])
-@pytest.mark.parametrize("version", [None, 0, 1, 2, 3, 4])
+@pytest.mark.parametrize("version", [None, 0, 1, 2, 3, 4, 5])
 def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, version):
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     native = SimpleNamespace()
@@ -28,7 +28,7 @@ def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, versi
         native.grouped_e4m3_fp32_precision_version = lambda: version
     monkeypatch.setattr(interface, "flash_attn_v100_cuda", native)
     assert interface.flash_attn_grouped_e4m3_fp32_available() is (
-        has_entry and version is not None and version >= 3
+        has_entry and version is not None and version >= 4
     )
 
 
@@ -40,6 +40,13 @@ def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, versi
         (8, 1616, 65536),
         (5, 1648, 131072),
         (5, 3296, 262144),
+        # DFlash2 q8 uses the same repaired arithmetic at each context boundary.
+        (8, 3296, 8192),
+        (8, 3296, 65536),
+        (8, 3296, 131072),
+        (8, 3296, 262144),
+        (8, 1728, 131072),
+        (8, 3456, 262144),
     ],
 )
 def test_fp32_grouped_row_lengths_graph(rows, page, length):

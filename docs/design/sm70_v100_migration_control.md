@@ -2,6 +2,19 @@
 
 Date: 2026-05-30
 
+## DFlash2 E4M3 FP32 default policy, 2026-09-08
+
+[The precision-default change](sm70_dflash2_fp32_defaults.md) is based on
+`56f534e672657a6c7599afd6c0dcb2e2c211b2e3`. It removes E4M3 admission to the
+legacy FP16-partial verifier, admits DFlash2 pages 1728/3456 to repaired FP32
+attention, resolves the SM70 `fp8` alias to E4M3, and enables FP32 logits in
+the existing Qwen3.8 DFlash2 default configuration. Explicit E5M2 remains
+available. No MTP enablement is part of this change.
+
+The legacy half-partial microbenchmark is retained for the speed/precision
+comparison; its higher speed is not a reason to restore it to E4M3 serving.
+Only measured model results may establish acceptance or throughput effects.
+
 ## v37 prefill integration: model-parity hold, 2026-09-07
 
 Draft [PR548](https://github.com/1CatAI/1Cat-vLLM/pull/548) integrates the

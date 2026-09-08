@@ -124,11 +124,12 @@ def _allocate_decode_workspace(
     num_heads: int,
     head_dim: int,
     max_num_partitions: int,
+    partial_dtype: torch.dtype = torch.float16,
 ) -> _DecodeWorkspace:
     return _DecodeWorkspace(
         tmp_out=torch.empty(
             (batch_capacity, num_heads, max_num_partitions, head_dim),
-            dtype=torch.float16,
+            dtype=partial_dtype,
             device=q.device,
         ),
         max_logits=torch.empty(
@@ -313,6 +314,7 @@ def _get_decode_workspace_for_plan(
     head_dim: int,
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
+    partial_dtype: torch.dtype = torch.float16,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
@@ -323,6 +325,7 @@ def _get_decode_workspace_for_plan(
         num_heads,
         head_dim,
         plan.partition_size,
+        partial_dtype,
     )
 
     workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
@@ -338,6 +341,7 @@ def _get_decode_workspace_for_plan(
             max_num_partitions=_round_decode_partition_capacity(
                 plan.workspace_num_partitions
             ),
+            partial_dtype=partial_dtype,
         )
         if _can_cache_workspace(q):
             _decode_workspace_cache[key] = workspace
@@ -967,6 +971,11 @@ def flash_attn_decode_paged(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
+    e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
+        raise RuntimeError(
+            "Rebuild Flash-V100 for E4M3 FP32 scalar decode (precision revision 4)"
+        )
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
@@ -1011,6 +1020,7 @@ def flash_attn_decode_paged(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
+            partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
         )
     )
 
@@ -1078,7 +1088,7 @@ def flash_attn_grouped_e4m3_fp32_available() -> bool:
     return (
         hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
         and callable(version)
-        and int(version()) >= 3
+        and int(version()) >= 4
     )
 
 
@@ -1094,7 +1104,7 @@ def flash_attn_grouped_e4m3_fp32_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Experimental E4M3 q2..8/GQA6/D256 attention over one KV sequence.
+    """E4M3 q2..8/GQA6/D256 attention over one KV sequence.
 
     Row lengths are authoritative GPU metadata, not inferred from padded Q.
     Zero lengths produce zero outputs. All positive lengths must fit the
@@ -1103,10 +1113,11 @@ def flash_attn_grouped_e4m3_fp32_paged(
     Tensor Core operands and final output remain FP16. KV must encode E4M3.
     Precision revision 3 retains FP32 numerators and separate max/sum until
     the final normalization, as well as compensated QK/P and tile-local PV.
+    Revision 4 adds DFlash2 1728/3456 pages and FP32 scalar fallback workspace.
     """
     if not flash_attn_grouped_e4m3_fp32_available():
         raise RuntimeError(
-            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 3"
+            "Rebuild Flash-V100 for E4M3 grouped FP32 precision revision 4"
         )
     workspace = _get_grouped_verify_workspace(q, partial_dtype=torch.float32)
     return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(

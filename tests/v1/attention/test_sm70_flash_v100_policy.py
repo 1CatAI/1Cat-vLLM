@@ -301,7 +301,7 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN == 49152
 
 
-def test_sm70_flash_v100_fp8_alias_resolves_to_e5m2(monkeypatch):
+def test_sm70_flash_v100_fp8_alias_resolves_to_e4m3(monkeypatch):
     import vllm.engine.arg_utils as arg_utils
     import vllm.envs as envs
 
@@ -318,6 +318,10 @@ def test_sm70_flash_v100_fp8_alias_resolves_to_e5m2(monkeypatch):
 
     assert (
         arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("fp8", "fp8")
+        == "fp8_e4m3"
+    )
+    assert (
+        arg_utils._resolve_sm70_flash_v100_kv_cache_dtype_alias("fp8_e5m2", "fp8_e5m2")
         == "fp8_e5m2"
     )
     assert (
@@ -1810,15 +1814,14 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
             num_query_tokens=query_len,
         )
         grouped_verify.supports_e4m3 = True  # type: ignore[attr-defined]
-        if query_len == 16:
-            assert not impl._dflash2_grouped_verify_allowed(
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata,
-                num_query_tokens=query_len,
-            )
-            return
+        assert not impl._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=query_len,
+        )
+        return
     result = impl._flash_v100_small_query_prefill_as_decode(
         layer,
         query,
@@ -1839,6 +1842,84 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
     assert captured["one_pass"] is True
     assert torch.all(output == 1)
+
+
+@pytest.mark.parametrize("page", [1648, 1728, 3296, 3456])
+@pytest.mark.parametrize("native_available", [False, True])
+def test_dflash2_e4m3_cannot_bypass_fp32_with_legacy_verifier(page, native_available):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=0.0625,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e4m3",
+    )
+    impl.use_dflash2_grouped_verify = True
+    impl.use_smallq_decode_xqa = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    calls = []
+
+    def legacy(*args, **kwargs):
+        pytest.fail("E4M3 DFlash2 selected FP16 partial state")
+
+    legacy.supports_e4m3 = True  # type: ignore[attr-defined]
+
+    def precise(q, k, v, table, lengths, **kwargs):
+        calls.append(("fp32", table, lengths))
+        assert kwargs["k_scale"] == 0.5
+        assert kwargs["v_scale"] == 1.25
+        kwargs["out"].fill_(3)
+
+    def scalar(q, k, v, table, lengths, **kwargs):
+        calls.append(("scalar", table, lengths))
+        kwargs["out"].fill_(2)
+
+    impl.flash_attn_grouped_verify_paged = legacy
+    impl.flash_attn_grouped_e4m3_fp32_paged = precise if native_available else None
+    impl._call_flash_attn_decode_paged = scalar
+    q = torch.zeros((8, 6, 256), dtype=torch.float16)
+    kv = torch.zeros((2, page, 1, 256), dtype=torch.uint8)
+    out = torch.empty_like(q)
+    table = torch.tensor([[1, 0]], dtype=torch.int32)
+    row_table = table.repeat(8, 1)
+    # Padding must retain zero visibility rather than shift the causal boundary.
+    lengths = torch.tensor(
+        [2049, 2050, 2051, 2052, 2053, 2054, 0, 0], dtype=torch.int32
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=8,
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=262144,
+        block_table=table,
+        seq_lens=torch.tensor([2054], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+        smallq_decode_block_table=row_table,
+        smallq_decode_seq_lens=lengths,
+        smallq_query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
+    )
+    result = impl._flash_v100_small_query_prefill_as_decode(
+        SimpleNamespace(_k_scale_float=0.5, _v_scale_float=1.25),
+        q,
+        kv,
+        kv,
+        metadata,
+        out,
+        metadata.query_start_loc,
+        metadata.seq_lens,
+    )
+    assert result is out
+    assert len(calls) == 1
+    assert calls[0][0] == ("fp32" if native_available else "scalar")
+    assert (
+        calls[0][1].data_ptr() == (table if native_available else row_table).data_ptr()
+    )
+    assert calls[0][2].data_ptr() == lengths.data_ptr()
+    assert bool((out == (3 if native_available else 2)).all())
 
 
 def test_flash_v100_batched_grouped_workspace_preserves_single_request_layout():
@@ -2154,7 +2235,8 @@ def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch)
     assert torch.all(output == 1)
 
 
-def test_flash_v100_decode_uses_xqa_for_e4m3_g6_d256(monkeypatch):
+@pytest.mark.parametrize("dflash_target", [False, True])
+def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(monkeypatch, dflash_target):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
@@ -2181,13 +2263,16 @@ def test_flash_v100_decode_uses_xqa_for_e4m3_g6_d256(monkeypatch):
         )
         kwargs["out"].fill_(1)
 
-    def fail_scalar(*args, **kwargs):
-        raise AssertionError("E4M3 G6/D256 decode should select XQA")
+    def hit_scalar(*args, **kwargs):
+        assert dflash_target
+        calls.append(("scalar", None, kwargs.get("kv_cache_dtype")))
+        kwargs["out"].fill_(1)
 
     impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
-    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = hit_scalar  # type: ignore[method-assign]
     attn_metadata = SimpleNamespace(
         num_actual_tokens=1,
+        is_dflash_selector_target=dflash_target,
         block_table=torch.tensor([[0]], dtype=torch.int32),
         seq_lens=torch.tensor([1025], dtype=torch.int32),
         flash_v100_decode_max_seq_len_hint=1025,
@@ -2210,7 +2295,9 @@ def test_flash_v100_decode_uses_xqa_for_e4m3_g6_d256(monkeypatch):
     )
 
     assert result is output
-    assert calls == [("xqa", 64, "fp8_e4m3")]
+    assert calls == [
+        ("scalar", None, "fp8_e4m3") if dflash_target else ("xqa", 64, "fp8_e4m3")
+    ]
     assert torch.all(output == 1)
 
 
@@ -3198,7 +3285,11 @@ def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode)
     assert calls[0][1]["v_scale"] == 1.25
     if mode == "selected":
         assert calls[0][0][3] is metadata.block_table
-        assert routes == ["prefill_smallq_e4m3_grouped_fp32"]
+        assert routes == [
+            "fp8_kv_decode",
+            "fp8_kv_decode_grouped_fp32",
+            "prefill_smallq_e4m3_grouped_fp32",
+        ]
         assert bool((out == 3).all())
     else:
         assert calls[0][0][3] is table

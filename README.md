@@ -47,6 +47,13 @@ Demo: [4× V100 running Qwen3.8-27B-NVFP4-DFlash2](https://www.bilibili.com/vide
 
 # 📊 Performance First
 
+SM70 Flash-V100 now resolves `--kv-cache-dtype fp8` to E4M3. DFlash2 E4M3
+verification uses repaired FP32 attention state, and the Qwen3.8 DFlash2
+configuration enables FP32 logits by default. Rebuild Flash-V100 for precision
+revision 4; see [the precision contract and validation](docs/design/sm70_dflash2_fp32_defaults.md).
+Historical E5M2/FP16-partial performance results below keep their original
+configuration and are not speed claims for these precision defaults.
+
 ## Long-Context Attention: 17.92 → 47.1 → ≈60.8 TFLOP/s
 
 | Stage | Evidence | Useful causal Attention compute | Notes |
