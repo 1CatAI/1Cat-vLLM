@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
     VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = False
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
@@ -1909,6 +1910,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in until same-contract GPU correctness and performance gates pass.
     "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "0"))
+    ),
+    "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "0"))
     ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.

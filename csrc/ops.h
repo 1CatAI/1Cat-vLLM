@@ -244,6 +244,14 @@ std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                                    torch::Tensor weight_scale);
 
 torch::Tensor nvfp4_qpn2_prepare_scales_sm70(torch::Tensor weight_scale);
+void nvfp4_qpn2_restore_tm_scales_sm70_out(torch::Tensor out,
+                                           torch::Tensor scales,
+                                           double global_scale);
+void nvfp4_qpn2_compact_tm_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor weight,
+                                         torch::Tensor scales,
+                                         double global_scale, int64_t k_ld,
+                                         int64_t q_ld, bool gated_silu);
 
 void nvfp4_qpn2_tm_dispatch_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor tm_weight,

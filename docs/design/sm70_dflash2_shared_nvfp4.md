@@ -30,9 +30,24 @@ The common reader implements this address change for ordinary/gated QPN2
 and the prefill dequantizer. Arithmetic, accumulation and activation order
 are preserved.
 
-Scales remain separate because TurboMind merges the global scale into FP16
+By default, scales remain separate because TurboMind merges the global scale into FP16
 while QPN2 retains E4M3 plus a separate global scale. Recovering the original
 E4M3 data from rounded FP16 would change the numerical contract.
+
+With `VLLM_SM70_NVFP4_QPN2_SHARED_SCALES=1`, compatible shared-code layers
+instead retain only the original packed E4M3 scales. TurboMind fallback
+restores the loader's FP32 multiplication followed by FP16 round-to-nearest
+into a temporary scale tensor. Serial fallback calls reuse allocator blocks;
+the largest supported layer requires 5.3125 MiB. QPN2 small-M decode and
+bounded dense prefill keep their existing scale reader and arithmetic.
+
+This second opt-in requires the rebuilt compact-scale operator and the
+DFlash2 TP4 q7 contract without DBO. All configured CUDA graph capture sizes
+must be at most 32; otherwise persistent TurboMind scales are retained.
+Larger graphs would retain temporary scales for every captured projection,
+negating the intended saving. Direct prepared-layer calls and TurboMind
+warmup also restore scales before consuming them. The switch defaults to
+zero while model admission remains outstanding.
 
 The new opaque C++ dispatcher keeps dynamic M selection outside Dynamo:
 
@@ -293,3 +308,106 @@ CUDA_VISIBLE_DEVICES=0 VLLM_SM70_NVFP4_QPN2_M16_NATIVE=1 \
 The matching `_C_stable_libtorch.abi3.so` must accompany the core library.
 The JSON records library hashes, the source base and diff hash, shard
 shapes, bitwise comparisons, and both control timings.
+
+## Residual allocation follow-up: LM head and compact scales
+
+A metadata-only TP4 census confirms that model loading still consumes
+8.203933716 GiB/rank after code sharing. It includes two additional
+606.25 MiB/rank FP16 LM-head matrices. One belongs to the target's packed
+layout. Allocation-history frames identify the other as the draft's
+placeholder LM-head packing: the draft later shares the target head, but
+the native FP16 weight cache retains that old packed tensor. Python model
+parameter enumeration alone misses this native cache ownership.
+
+FP32 dense logits and FP32 candidate rerank both consume the original FP16
+parameter. Preparation now omits the packed FP16 matrix and FP16-only
+rerank scratch when those are the selected consumers. QPN8 candidate
+screening retains its codes and scales, and an explicitly requested Tensor
+Core top1 route still prepares its required FP16 layout. Avoiding unused
+packing also prevents the draft placeholder's native-cache retention.
+There is no change to LM-head arithmetic or candidate selection.
+
+The expected tensor-storage reductions across TP4 are 4.736328 GiB for
+the two FP16 head matrices, plus the unused rerank scratch, and 2.835693 GiB
+for persistent TurboMind scales. The remaining head QPN8 copy is about
+1.184545 GiB across TP4; retained QPN2 scales are 1.417847 GiB. Keep these
+tensor counts separate from measured loading and automatic KV capacity.
+
+Focused validation on the same CUDA 12.8/Torch 2.10 runtime:
+
+- 43 CPU checks pass across LM-head preparation, QPN2 loading/dispatch and
+  TurboMind warmup. Coverage includes explicit packed top1, scale-buffer
+  aliasing, native capability and capture-size gates.
+- Six real LM-head shard cases preserve QPN8 codes/scales, candidate IDs,
+  FP32 logits and changed-input graph replay bits. Candidate/control timing
+  ratios range from 0.9969 to 1.0010; this is operator evidence.
+- Compact scales pass all 224 ordinary/gated cases across 24 real TP4
+  shards, including restored FP16 scale bits and changed-input graph replay.
+  Tested M is 8/16/32/33/135/512/1023/1024. With the model's projection
+  counts and fused gate/up counted once, compact/persistent time ratios are:
+
+| M | Compact / persistent scales |
+| --- | --- |
+| 8 | 1.0008 |
+| 16 | 1.0004 |
+| 32 | 1.0002 |
+| 33 | 1.1394 |
+| 135 | 1.0587 |
+| 512 | 1.0307 |
+| 1023 | 1.0163 |
+| 1024 | 0.9996 |
+
+The fallback cost is explicit: reconstructing scales adds 2.87–3.43 ms
+across the isolated projection calls for M33–1023. This is neither TTFT
+nor model latency. Main decode arithmetic and measured operator time are
+preserved. `--compact-scales` on the benchmark above compares this path
+against shared codes with persistent TurboMind scales.
+
+The first restoration experiment confused QPN lane order with TurboMind's
+logical column order. The actual converter confirms TurboMind scales are
+stored as `[K/16,N]`; using the inverse QPN lane map fixes the failed scale
+comparison. Retain the failed mapping evidence. Two LM-head harness setup
+failures (an unpinned import path and missing outer inference mode) are
+separate from numerical validation. The corrected build and targeted
+pre-commit checks pass.
+
+The full production follow-up control reaches the same 8.20 GiB/rank load,
+then receives termination during compilation. It has no endpoint result;
+keep this interrupted cohort separate from completed measurements.
+
+The candidate retry completes at 18:59 CST under the unchanged production
+contract, with shared codes and compact scales enabled. The census agrees
+on all four ranks: both 606.25 MiB FP16 head allocations and the persistent
+TurboMind scales are absent; QPN8 head codes/scales remain. Census operations
+do not change allocated GPU bytes.
+
+| Latest production allocation | Prior shared codes | Compact scales and head cleanup |
+| --- | --- | --- |
+| Model loading, GiB/rank | 8.203934 | 6.286138 |
+| Model loading across TP4, GiB | 32.815735 | 25.144552 |
+| Automatic KV budget, GiB/rank | 15.76 | 17.70 |
+| Logical KV tokens | 1,479,578 | 1,661,426 |
+| Graph capture increment, GiB/rank | 0.26 | 0.26 |
+| Idle worker NVML, MiB/rank | 26,030 | 26,036 |
+
+Measured loading decreases by 7.671183 GiB across TP4. Automatic KV capacity
+increases by 12.29%; total residency stays near the production budget.
+Do not equate the phase allocation delta exactly to the sum of removed
+tensor bytes: allocator granularity and discarded scratch also contribute.
+
+The MBPP28 warmup and three measured requests return the same 754-token
+sequence as the archived `production-server-1` shared-code cohort. MBPP0
+also matches all 1093 tokens. Both finish naturally with nonempty answers.
+Median pure decode is 225.66 tokens/s, round time 19.068 ms, and TTFT
+107.95 ms; the archived same-output cohort recorded 221.40 tokens/s,
+19.435 ms and 112.37 ms. No slowdown appears in this focused comparison,
+but the controls are not contemporaneous and clocks are unlocked; do not
+claim the approximately 2% difference as a speedup.
+
+This focused parity result does not resolve the distinct token differences
+in the earlier 17:55/17:57 cohorts, nor admit concurrency or long context.
+The PR remains Draft. Raw artifacts include `memory-stacks/`,
+`head-memory-oracle.json`, `compact-scale-oracle.json`,
+`memory-recovery-summary.json`, `memory-recovery-candidate-server-1/`, its
+per-rank inventory, and the retained interruption logs. The service has
+exited and released its GPU locks.

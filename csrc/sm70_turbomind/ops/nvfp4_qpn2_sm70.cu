@@ -106,6 +106,25 @@ __device__ __forceinline__ half2 fp8e4m3_to_half2(uint8_t value) {
   return __halves2half2(converted, converted);
 }
 
+// QPN2 stores [N/32, K/16, lane], while TurboMind V/Pack1 stores
+// [K/16, N] in logical column order. Preserve FP32 multiply then FP16 RNE.
+__global__ void nvfp4_qpn2_restore_tm_scales_kernel(half* output,
+                                                    const uint8_t* scales,
+                                                    float global_scale, int n,
+                                                    int groups) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= n * groups) {
+    return;
+  }
+  const int group = index / n;
+  const int column = index % n;
+  const int col = column % 32;
+  const int lane = ((col & 24) >> 1) | (col & 3) | ((col & 4) << 2);
+  const int source = ((column / 32) * groups + group) * 32 + lane;
+  const half raw = __low2half(fp8e4m3_to_half2(scales[source]));
+  output[index] = __float2half_rn(__fmul_rn(__half2float(raw), global_scale));
+}
+
 __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
                                                half2 output[4]) {
   constexpr unsigned kSign = 0x80008000u;
@@ -635,6 +654,40 @@ void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
 }
 
 #ifndef VLLM_NVFP4_QPN2_STANDALONE
+void nvfp4_qpn2_restore_tm_scales_sm70_out(torch::Tensor out,
+                                           torch::Tensor scales,
+                                           double global_scale) {
+  TORCH_CHECK(out.is_cuda() && scales.is_cuda() &&
+                  out.device() == scales.device() && out.is_contiguous() &&
+                  scales.is_contiguous(),
+              "QPN2 scale restore requires contiguous tensors on one GPU");
+  TORCH_CHECK(
+      out.dim() == 2 && out.scalar_type() == torch::kFloat16 &&
+          scales.scalar_type() == torch::kUInt8 &&
+          out.numel() == scales.numel() && out.size(1) % 32 == 0,
+      "QPN2 scale restore expects FP16 [K/16,N] and packed uint8 scales");
+  const at::cuda::OptionalCUDAGuard guard(device_of(out));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  nvfp4_qpn2_restore_tm_scales_kernel<<<(out.numel() + 255) / 256, 256, 0,
+                                        stream>>>(
+      reinterpret_cast<half*>(out.data_ptr()), scales.data_ptr<uint8_t>(),
+      static_cast<float>(global_scale), out.size(1), out.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void nvfp4_qpn2_compact_tm_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor weight,
+                                         torch::Tensor scales,
+                                         double global_scale, int64_t k_ld,
+                                         int64_t q_ld, bool gated_silu) {
+  // Only the fallback needs these scales. Serial calls reuse the allocator's
+  // temporary block; model admission excludes fallback-sized CUDA graphs.
+  auto expanded = torch::empty({input.size(1) / 16, weight.size(1) * 8},
+                               input.options().dtype(torch::kFloat16));
+  nvfp4_qpn2_restore_tm_scales_sm70_out(expanded, scales, global_scale);
+  nvfp4_gemm_sm70_out(out, input, weight, expanded, 16, k_ld, q_ld, gated_silu);
+}
+
 template <bool TurboMindLayout>
 void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor codes, torch::Tensor scales,
@@ -655,6 +708,23 @@ void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
     return;
   }
 
+  if constexpr (TurboMindLayout) {
+    if (tm_scales.scalar_type() == torch::kUInt8) {
+      if (!gated_silu) {
+        nvfp4_qpn2_compact_tm_gemm_sm70_out(out, input, tm_weight, tm_scales,
+                                            global_scale, tm_k_ld, tm_q_ld,
+                                            false);
+      } else {
+        auto gate_up =
+            torch::empty({input.size(0), out.size(1) * 2}, input.options());
+        nvfp4_qpn2_compact_tm_gemm_sm70_out(gate_up, input, tm_weight,
+                                            tm_scales, global_scale, tm_k_ld,
+                                            tm_q_ld, false);
+        silu_and_mul(out, gate_up);
+      }
+      return;
+    }
+  }
   if (!gated_silu) {
     nvfp4_gemm_sm70_out(out, input, tm_weight, tm_scales, tm_group_size,
                         tm_k_ld, tm_q_ld, false);

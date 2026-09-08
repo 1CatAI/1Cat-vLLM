@@ -70,7 +70,7 @@ def _equal_bits(actual, expected):
     return torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-def _check_projection(projection, rank, rows):
+def _check_projection(projection, rank, rows, compact_scales=False):
     packed = projection.packed.cuda()
     raw_scales = projection.scales.cuda()
     logical_n = packed.shape[0]
@@ -88,6 +88,13 @@ def _check_projection(projection, rank, rows):
     codes, scales = torch.ops._qpn2_shared_control.prepare(padded, padded_scales)
     shared_scales = torch.ops._C.nvfp4_qpn2_prepare_scales_sm70(raw_scales)
     assert torch.equal(shared_scales, scales), "Scale-only preparation differs"
+    if compact_scales:
+        restored = torch.empty_like(tm_scales)
+        torch.ops._C.nvfp4_qpn2_restore_tm_scales_sm70_out(
+            restored, shared_scales, global_scale
+        )
+        assert _equal_bits(restored, tm_scales), "Restored TurboMind scales differ"
+        del restored
 
     # Inspect real CUDA converter output independently of either GEMM reader.
     lane = torch.arange(32, device="cuda")
@@ -110,6 +117,8 @@ def _check_projection(projection, rank, rows):
         "code_bits_equal": True,
         "scale_bits_equal": True,
         "removed_code_bytes": codes.numel(),
+        "compact_scales": compact_scales,
+        "removed_scale_bytes": tm_scales.numel() * 2 if compact_scales else 0,
         "cases": [],
     }
     for m in rows:
@@ -119,6 +128,23 @@ def _check_projection(projection, rank, rows):
             new = torch.empty_like(old)
 
             def control(old=old, x=x, gated=gated):
+                if compact_scales:
+                    torch.ops._C.nvfp4_qpn2_tm_dispatch_sm70_out(
+                        old,
+                        x,
+                        tm_weight,
+                        shared_scales,
+                        global_scale,
+                        split_k,
+                        nacc,
+                        tm_scales,
+                        16,
+                        int(meta[0]),
+                        int(meta[1]),
+                        gated,
+                        1024,
+                    )
+                    return
                 torch.ops._qpn2_shared_control.dispatch(
                     old,
                     x,
@@ -145,7 +171,7 @@ def _check_projection(projection, rank, rows):
                     global_scale,
                     split_k,
                     nacc,
-                    tm_scales,
+                    shared_scales if compact_scales else tm_scales,
                     16,
                     int(meta[0]),
                     int(meta[1]),
@@ -186,6 +212,11 @@ def main():
     parser.add_argument("--json-out", type=Path, required=True)
     parser.add_argument("--ranks", type=int, nargs="+", default=[0, 1, 2, 3])
     parser.add_argument(
+        "--compact-scales",
+        action="store_true",
+        help="Compare temporary TurboMind scales with persistent shared-code scales.",
+    )
+    parser.add_argument(
         "--rows",
         type=int,
         nargs="+",
@@ -221,7 +252,9 @@ def main():
     try:
         for rank in args.ranks:
             for projection in _load_projections(args.model, rank, 4):
-                result = _check_projection(projection, rank, args.rows)
+                result = _check_projection(
+                    projection, rank, args.rows, args.compact_scales
+                )
                 report["results"].append(result)
                 print(json.dumps(result), flush=True)
                 torch.cuda.empty_cache()

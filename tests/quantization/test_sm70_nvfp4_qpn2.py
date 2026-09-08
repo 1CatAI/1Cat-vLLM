@@ -245,10 +245,16 @@ def _make_small_layer() -> torch.nn.Module:
 
 
 @pytest.mark.parametrize(
-    "shared_requested,shared_available", [(False, True), (True, False), (True, True)]
+    "shared_requested,shared_available,compact",
+    [
+        (False, True, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
 )
 def test_nvfp4_qpn2_prepare_and_dispatch_contract(
-    monkeypatch, shared_requested, shared_available
+    monkeypatch, shared_requested, shared_available, compact
 ):
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "1")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", str(int(shared_requested)))
@@ -257,6 +263,7 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
     envs.disable_envs_cache()
     layer = _make_small_layer()
     calls = []
+    monkeypatch.setattr(nvfp4_scheme, "_compact_qpn2_scales_enabled", lambda: compact)
 
     monkeypatch.setattr(nvfp4_scheme.sm70_tm, "use_turbomind", lambda enabled: True)
     scheme = CompressedTensorsW4A4Fp4()
@@ -344,6 +351,11 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
         assert layer.sm70_nvfp4_qpn2_global_scale == 0.5
         assert layer.sm70_nvfp4_qpn2_prefill_enabled
         assert layer.sm70_nvfp4_qpn2_shared_weight == shared
+        state = getattr(layer, sm70_tm.STATE_ATTR)
+        assert state.use_scale_code == compact
+        if compact:
+            assert state.scales is layer.sm70_nvfp4_qpn2_scales
+            assert state.global_scale == layer.sm70_nvfp4_qpn2_global_scale
         assert hasattr(layer, "sm70_nvfp4_qpn2_codes") != shared
         assert layer.weight.numel() == 0
         assert layer.weight_scale.numel() == 0
@@ -373,3 +385,19 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(
             assert combined_calls[-1][-1] == 0
     finally:
         envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "capture_sizes,expected", [([], True), ([1, 8, 32], True), ([8, 64], False)]
+)
+def test_compact_scales_exclude_fallback_sized_graphs(
+    monkeypatch, capture_sizes, expected
+):
+    monkeypatch.setattr(envs, "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", True)
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out", lambda: None, raising=False
+    )
+    config = _runtime_config()
+    config.compilation_config = SimpleNamespace(cudagraph_capture_sizes=capture_sizes)
+    monkeypatch.setattr(nvfp4_scheme, "get_current_vllm_config", lambda: config)
+    assert nvfp4_scheme._compact_qpn2_scales_enabled() == expected

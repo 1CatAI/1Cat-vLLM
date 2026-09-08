@@ -1338,6 +1338,31 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_prepare_scales_sm70"):
         )
 
 
+def nvfp4_qpn2_compact_tm_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    k_ld: int,
+    q_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    """Restore temporary TurboMind scales from the retained QPN2 scale codes."""
+    _op("nvfp4_qpn2_compact_tm_gemm_sm70_out")(
+        out, input, weight, scales, global_scale, k_ld, q_ld, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_compact_tm_gemm_sm70_out"):
+
+    @register_fake("_C::nvfp4_qpn2_compact_tm_gemm_sm70_out")
+    def _nvfp4_qpn2_compact_tm_gemm_sm70_out_fake(
+        out, input, weight, scales, global_scale, k_ld, q_ld, gated_silu
+    ) -> None:
+        return None
+
+
 def nvfp4_qpn2_tm_dispatch_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,

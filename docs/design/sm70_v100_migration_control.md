@@ -51,6 +51,42 @@ It contributes no accepted whole-round improvement. Changed draft GEMM
 arithmetic is also excluded: better local FP64 error still changes proposal
 distributions. Historical failed numerical, memory-budget, route-coverage,
 sanitizer-timeout and slower-kernel results remain recorded in the worklog.
+## DFlash2 residual weight memory recovery, 2026-09-08
+
+Follow-up in the [shared NVFP4 report](sm70_dflash2_shared_nvfp4.md) removes
+unused FP16 LM-head packing when FP32 logits consume the original parameter.
+Allocation stacks identify the extra 606.25 MiB/rank matrix as draft-head
+packing retained in the native cache after target-head sharing; avoiding
+the unused preparation removes that allocation too. QPN8 screening remains
+enabled, and explicit packed Tensor Core top1 retains its layout.
+
+`VLLM_SM70_NVFP4_QPN2_SHARED_SCALES=1` optionally retains only QPN2 E4M3
+scales and restores temporary FP16 scales for TurboMind fallback. It requires
+the shared-code path, rebuilt native operators, DFlash2 TP4 q7 without DBO,
+and capture sizes <=32 so graphs do not retain each fallback's temporary
+scales. The largest temporary is 5.3125 MiB. The switch defaults off.
+
+43 CPU checks, 224 real-shard scale/output checks and six LM-head cases pass,
+including changed-input graph replay. Decode scale-cost ratios are within
+0.1% of one; head ratios are 0.9969–1.0010. M135 fallback projections cost
+5.87% more, adding 3.13 ms across the isolated projection sequence; this is
+not TTFT. Preserve the rejected initial lane-map and harness setup evidence.
+
+Production candidate completes at 18:59 CST: loading 6.286138 GiB/rank,
+25.144552 GiB/TP4, down 7.671183 GiB from shared codes alone. Both unused
+head matrices and persistent TM scales are absent on all four ranks. KV is
+still automatic E4M3 at utilization0.8, maxlen256K/chunk4096/maxseq4/q7;
+budget17.70 GiB/rank, 1,661,426 logical tokens, idleNVML26,036 MiB/rank.
+MBPP28 repeats match all754 tokens of the archived shared-code cohort;
+MBPP0 matches all1093. Median decode225.66 tok/s, round19.068 ms,
+TTFT107.95 ms. Historical same-output values were221.40/19.435/112.37;
+no observed focused slowdown, but no contemporaneous speedup claim.
+
+The current paired control was terminated during compilation and has no
+endpoint result. Keep it separate. Earlier other-cohort parity differences
+are not resolved by the latest archived-cohort match. Concurrency and
+long-context admission remain outstanding; PR561 stays Draft.
+
 ## DFlash2 shared NVFP4 codes, 2026-09-08
 
 The [shared QPN2/TurboMind weight path](sm70_dflash2_shared_nvfp4.md) removes

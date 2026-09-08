@@ -28,6 +28,17 @@ void silu_and_mul(torch::Tensor& out, torch::Tensor& input) {
 
 TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def("nvfp4_qpn2_prepare_scales_sm70(Tensor weight_scale) -> Tensor");
+  ops.def(
+      "nvfp4_qpn2_restore_tm_scales_sm70_out(Tensor(a!) out, "
+      "Tensor scales, float global_scale) -> ()");
+  ops.impl("nvfp4_qpn2_restore_tm_scales_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_restore_tm_scales_sm70_out);
+  ops.def(
+      "nvfp4_qpn2_compact_tm_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, float global_scale, int k_ld, "
+      "int q_ld, bool gated_silu) -> ()");
+  ops.impl("nvfp4_qpn2_compact_tm_gemm_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_compact_tm_gemm_sm70_out);
   ops.impl("nvfp4_qpn2_prepare_scales_sm70", torch::kCUDA,
            &nvfp4_qpn2_prepare_scales_sm70);
   ops.def(
