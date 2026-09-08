@@ -89,6 +89,21 @@ def _target_tensors(row: dict) -> dict[str, torch.Tensor]:
     return result
 
 
+def _proposal_tensors(row: dict) -> dict[str, torch.Tensor]:
+    values = {
+        k: v
+        for k, v in row.items()
+        if isinstance(v, torch.Tensor) and k != "idx_mapping"
+    }
+    if "idx_mapping" in row and row.get("sampling_layout") != "request_gathered_v1":
+        # Early captures retained complete arrays indexed by request slot.
+        indices = row["idx_mapping"].to(torch.int64)
+        for name in ("temperature", "seeds"):
+            if name in values:
+                values[name] = values[name].index_select(0, indices)
+    return values
+
+
 def compare_natural(left_dir: Path, right_dir: Path) -> dict:
     left, right = _load(left_dir), _load(right_dir)
     cases = {k[0] for k in left}
@@ -98,6 +113,7 @@ def compare_natural(left_dir: Path, right_dir: Path) -> dict:
     for case in sorted(cases):
         lengths = [len({k[1] for k in arm if k[0] == case}) for arm in (left, right)]
         first = None
+        mappings = []
         for step in range(min(lengths)):
             for phase_index, phase in enumerate(("target", "proposal")):
                 differences = []
@@ -106,11 +122,15 @@ def compare_natural(left_dir: Path, right_dir: Path) -> dict:
                     values = [
                         _target_tensors(row)
                         if phase == "target"
-                        else {
-                            k: v for k, v in row.items() if isinstance(v, torch.Tensor)
-                        }
+                        else _proposal_tensors(row)
                         for row in rows
                     ]
+                    if phase == "proposal" and "idx_mapping" in rows[0]:
+                        slots = [row["idx_mapping"].tolist() for row in rows]
+                        if slots[0] != slots[1]:
+                            mappings.append(
+                                {"step": step, "rank": rank, "slots": slots}
+                            )
                     if values[0].keys() != values[1].keys():
                         raise ValueError(
                             f"{case}/{step}/{rank}: tensor coverage differs"
@@ -143,8 +163,8 @@ def compare_natural(left_dir: Path, right_dir: Path) -> dict:
                 "case": case,
                 "steps_per_arm": lengths,
                 "first_observed_difference": first,
-                "all_observed_tensors_equal": first is None
-                and lengths[0] == lengths[1],
+                "different_request_slot_mappings": mappings,
+                "all_logical_tensors_equal": first is None and lengths[0] == lengths[1],
             }
         )
     return result

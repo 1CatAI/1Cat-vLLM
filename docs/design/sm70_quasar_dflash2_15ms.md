@@ -85,6 +85,9 @@ The initial campaign uses devices 4--7 with independent telemetry. Following
 the September 8 host reboot, devices 4--7 host another service; new diagnostic
 pairs use a fixed lease on devices 0--3. Results from the two GPU groups are
 kept separate, and final speed pairs require a fresh baseline on the same group.
+The user subsequently reserved devices 0--3 for other work: all subsequent
+campaign GPU execution is restricted to devices 4--7. The temporary 0--3 lease
+and telemetry are released; those diagnostics remain historical evidence only.
 
 Fresh uninstrumented baseline, one independent startup and five measured
 requests per fixture after warmup:
@@ -268,6 +271,20 @@ changes therefore cannot be dismissed based on that first sampled row.
 The investigation has moved to a bounded eight-token probe with layer 2/3
 observations, including the first full-attention layer. Q/K reduction autotune
 choices are being checked; no Q/K normalization cause is established yet.
+
+The extended eight-token pair has 24 target records per arm. Its logical
+target, auxiliary, proposal and acceptance tensors match exactly after aligning
+physical request slots. The early proposal observer incorrectly sliced the
+per-request seed/temperature arrays as if they were packed per draft row;
+it now gathers by request slot. The comparator also aligns those older retained
+captures and reports physical slot mappings separately. Twelve CPU tests pass
+(one CUDA graph test skipped). The passing short pair does not clear the
+earlier prefill drift or the complete acceptance gate.
+
+From the user's subsequent scope clarification, this branch concentrates on
+DFlash2 complete-round cost. Independent quality-root-cause investigation is
+left for the other agents, with retained artifacts in `results/quality-handoff.md`.
+Numerical parity and acceptance remain mandatory candidate promotion gates.
 
 At 2026-09-08 01:24:11 UTC, main merged PR #560 as
 `e5d63c51f0fcc1ddf75d229e3df06bf52df206f5`. It routes DFlash2 E4M3 q8 to FP32

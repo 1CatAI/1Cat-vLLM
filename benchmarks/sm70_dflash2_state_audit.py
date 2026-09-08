@@ -45,6 +45,10 @@ def selected_ssm_slots(indices: torch.Tensor, selectors: torch.Tensor) -> torch.
     return torch.where(valid, slots, -1).reshape(-1)
 
 
+def cpu_request_slots(values: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    return values.index_select(0, indices.to(torch.int64)).detach().cpu().clone()
+
+
 def install() -> None:
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gd
     from vllm.model_executor.models import qwen3_next as qn
@@ -432,13 +436,14 @@ def install() -> None:
         result["projected_context"] = (
             self.hidden_states[: batch.num_tokens].detach().cpu().clone()
         )
-        for name in ("sample_pos", "temperature", "seeds"):
-            result[name] = (
-                getattr(self, name)[: batch.num_reqs * self.draft_block]
-                .detach()
-                .cpu()
-                .clone()
-            )
+        result["sample_pos"] = (
+            self.sample_pos[: batch.num_reqs * self.draft_block].detach().cpu().clone()
+        )
+        # Positions are packed per draft row, but seeds/temperature are indexed
+        # by request slot. Prefix slicing those arrays reads inactive warmup rows.
+        result["sampling_layout"] = "request_gathered_v1"
+        for name in ("temperature", "seeds"):
+            result[name] = cpu_request_slots(getattr(self, name), batch.idx_mapping)
         torch.save(
             result,
             directory / f"proposal-{entry['case']['name']}-tp{rank}-forward{step}.pt",

@@ -6,7 +6,11 @@ import torch
 
 from benchmarks.compare_sm70_dflash2_natural_audit import compare_natural
 from benchmarks.compare_sm70_dflash2_state_audit import compare, tensor_difference
-from benchmarks.sm70_dflash2_state_audit import gather_state, selected_ssm_slots
+from benchmarks.sm70_dflash2_state_audit import (
+    cpu_request_slots,
+    gather_state,
+    selected_ssm_slots,
+)
 
 
 @pytest.fixture
@@ -118,7 +122,7 @@ def natural_captures(captures):
 
 def test_natural_audit_locates_proposal_before_next_target(natural_captures):
     left, right = natural_captures
-    assert compare_natural(left, right)["cases"][0]["all_observed_tensors_equal"]
+    assert compare_natural(left, right)["cases"][0]["all_logical_tensors_equal"]
     path = right / "proposal-test-tp2-forward0.pt"
     row = torch.load(path, weights_only=True)
     row["draft_tokens"][0, 0] += 1
@@ -128,7 +132,7 @@ def test_natural_audit_locates_proposal_before_next_target(natural_captures):
     row["input_ids"][0] += 1
     torch.save(row, path)
     result = compare_natural(left, right)["cases"][0]
-    assert not result["all_observed_tensors_equal"]
+    assert not result["all_logical_tensors_equal"]
     first = result["first_observed_difference"]
     assert (first["step"], first["phase"]) == (0, "proposal")
     assert first["differences"][0]["name"] == "draft_tokens"
@@ -150,7 +154,24 @@ def test_natural_audit_ignores_unwritten_output_padding(natural_captures):
     row = torch.load(path, weights_only=True)
     row["sampled_token_ids"][0, 1] = 100
     torch.save(row, path)
-    assert compare_natural(left, right)["cases"][0]["all_observed_tensors_equal"]
+    assert compare_natural(left, right)["cases"][0]["all_logical_tensors_equal"]
+
+
+def test_natural_audit_aligns_request_slots(natural_captures):
+    for index, directory in enumerate(natural_captures):
+        for path in directory.glob("proposal-*.pt"):
+            row = torch.load(path, weights_only=True)
+            row["idx_mapping"] = torch.tensor([index + 1])
+            row["seeds"] = torch.tensor([999, 888, 777, 666])
+            row["seeds"][index + 1] = 0
+            torch.save(row, path)
+    result = compare_natural(*natural_captures)["cases"][0]
+    assert result["all_logical_tensors_equal"]
+    assert result["different_request_slot_mappings"]
+    values = torch.tensor([999, 0, 777])
+    actual = cpu_request_slots(values, torch.tensor([1]))
+    values[1] = 100
+    assert actual.tolist() == [0]
 
 
 def test_state_audit_reads_accepted_slot_and_preserves_invalid_selectors():
