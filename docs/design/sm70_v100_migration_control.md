@@ -44,14 +44,24 @@ GDN live diagnostics fail coverage because of padded metadata, then pooled
 state-pointer attribution; zero differences without per-layer coverage do
 not admit the packed route. The corrected shadow now covers 48 layers per
 rank, with zero bit differences across 2305032192 output and 295044120576
-state elements. Graph switching and whole-round benefit remain pending.
+state elements. The corrected graph comparison below establishes a
+whole-round benefit on the paired short-context fixtures.
 The TP2 worklog retains both diagnostic failures and the
 profile wrapper's shutdown exit 137 separately from usable captured data.
 The packed GDN route also rejected the model's QKV view because its row
 shares storage with Z/b/a. The opt-in entry and native wrapper now retain
 that row stride directly; four TP2/TP4 actual-entry tests pass, including
-input padding and complete state preservation. Full-round validation is
-still pending. Additional QPN2 unroll/lifetime screens remain slower.
+input padding and complete state preservation. Three independent startups
+now each run five GDN A/B pairs per fixture, with attention and exact MLP
+held fixed. Complete-round medians improve from 36.362439/33.312182 to
+34.528673/31.508836 ms, with identical paired tokens, acceptance and EOS.
+All 48 GDN regions per rank hit the strided route. This establishes a
+1.833766/1.803346 ms GDN benefit; 25 ms and wider admission remain pending.
+Additional QPN2 unroll/lifetime, block-interleaving, pitch-padding and L2
+prefetch screens preserve operator bits but remain slower. Do not repeat
+them without changed evidence. Existing TP2 communication/Gemma fusion also
+loses performance and changes 1 to 4 normalized FP16 elements per nonzero
+test case versus the actual DFlash2 Triton norm; retain the existing route.
 A private LM-head probe confirms that default reduced vocabulary width
 changes split-K and FP32 logits; retaining the complete-head cuBLASLt plan
 restores bitwise selected logits. This is a reranking building block, with

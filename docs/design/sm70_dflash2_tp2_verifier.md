@@ -306,9 +306,48 @@ and 4128, untouched input padding, every acceptance selector, changing graphs,
 all state-pool bits and retired rows. A second gate performs 24 graph-arm
 switches with padded metadata, the 8256-element QKV row stride and strided
 state pools; every output and pool bit matches. CUDA 12.8 memcheck reports
-zero errors and racecheck reports zero hazards for that gate. Live route and
-full-round validation remain pending; the failed first paired startup supplies
-no speed evidence.
+zero errors and racecheck reports zero hazards for that gate. The failed first
+paired startup supplies no speed evidence; the corrected route and three
+subsequent paired startups are reported below.
+
+### Three-startup paired packed GDN result
+
+The corrected route captures all 48 GDN regions on each rank. The actual q8
+QKV view has shape `[8,5120]` and row stride 8256. Three independent startups
+each run five alternating A/B pairs per fixture, holding exact attention u8,
+selective MLP, prefill, graph buffers and each startup's projection choices
+fixed. Only the packed GDN region changes between quiescent requests. Markers
+and the inactive arm are disabled before replay; no profiler or tensor dump
+runs during these measurements.
+
+| Startup | release1k control / candidate, ms | MBPP28 control / candidate, ms |
+| --- | ---: | ---: |
+| 2 | 36.487586 / 34.678536 | 33.492413 / 31.710558 |
+| 3 | 36.305965 / 34.508011 | 33.299356 / 31.508836 |
+| 4 | 36.362439 / 34.528673 | 33.312182 / 31.477274 |
+| Median of startup medians | **36.362439 / 34.528673** | **33.312182 / 31.508836** |
+
+Each entry is the median of five request-average complete-round costs. All
+15 measured pairs per fixture, and each startup's warmup pair, retain token
+IDs, acceptance counters and natural EOS. GDN adds a paired whole-round
+benefit of 1.833766/1.803346 ms. The startup controls still vary; this isolates
+the GDN change and does not resolve the pre-existing repeatability issue.
+
+| Fixture / mode | Host round p50 / p90 / p99, ms | Median TTFT, ms | Median pure decode, tokens/s |
+| --- | ---: | ---: | ---: |
+| release1k control | 36.334 / 36.578 / 38.608 | 575.826 | 82.220 |
+| release1k candidate | 34.526 / 34.778 / 36.907 | 575.153 | 86.480 |
+| MBPP28 control | 33.313 / 33.883 / 34.619 | 147.617 | 144.241 |
+| MBPP28 candidate | 31.526 / 32.105 / 32.897 | 147.968 | 152.346 |
+
+Host intervals include endpoint delivery jitter and are checked against the
+round count. Accepted drafts and emitted tokens are reported separately in
+`gdn-three-start-pair-summary.json` and
+`tp2-gdn-within-start-{2,3,4}-switch.json`. Both modes share each startup's
+acceptance exactly; MBPP28 accepted drafts per round are 3.845070, 3.569231
+and 4.306122, with emitted tokens per round 4.845070, 4.569231 and 5.306122.
+The candidate remains above 25 ms on both fixtures. Wider quality/context
+gates remain outstanding, so these results do not enable a production default.
 
 ### Updated target and draft attribution
 
@@ -357,6 +396,33 @@ unroll four. Shortening live input/dequant fragments reduces registers from
 52 to 48 without local memory, but measures 0.806400 ms against 0.705792 ms.
 All sixteen real matrix outputs and FP64-reference errors remain identical.
 Improved occupancy potential alone is not a measured speedup.
+
+Changing only weight block placement also loses performance. K-major block
+interleaving measures 0.807424 ms and 128-byte N-tile pitch padding 0.728832 ms,
+against 0.708608 ms for the existing matched layout. Bounded L2 prefetch eight
+groups ahead measures 0.794112 ms against 0.711680 ms. All sixteen tested
+matrix outputs and FP64-reference errors remain identical, and padding is
+untouched. Reject all three before model testing. These are latency
+hypotheses tested by timing; unavailable NCU counters do not establish a
+specific stall or cache-bank cause. Reports are
+`tp2-qpn2-memory-layout-screen.json` and `tp2-qpn2-prefetch8-screen.json`.
+
+### Existing communication fusion screening
+
+The existing TP2 all-reduce/Gemma RMSNorm fusion is compared with the actual
+DFlash2 Triton normalization, using real layer-0 norm weights, FP16 `[8,5120]`
+rank inputs and FP32 residuals. Five fixed operand amplitudes run on both
+ranks through graphs. Residual bits match, but nonzero cases differ in 1 to 4
+normalized FP16 elements. Some FP64 relative-L2 errors also increase slightly;
+this is not accepted as a new tolerance.
+
+The fusion is slower on both ranks: 0.021990/0.022349 ms per graph versus
+0.018048/0.018278 ms for the existing collective plus DFlash2 norm. These are
+operator timings, not whole-round gains. Reject this fusion for the current
+TP2 route. The native CUB reduction and current Triton variance reduction do
+not share an established arithmetic order. Do not attribute historical text
+quality changes to this disabled candidate. Evidence is
+`tp2-fused-comm-norm-rank{0,1}.json`.
 
 ### LM-head width and accumulation order
 
