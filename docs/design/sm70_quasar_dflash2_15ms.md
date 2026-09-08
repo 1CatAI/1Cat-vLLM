@@ -316,6 +316,80 @@ complete-round result or a replacement for the candidate's full model gates.
 
 The task-local trace parser now discovers the captured steady rounds and
 kernel counts. A regression against the retained September 6 trace exactly
-reproduces the recorded phase and complete-round timings. The queued new
-trace uses the FP32-attention integration and GPU4--7, after a separate
-uninstrumented baseline. Its result is pending GPU availability.
+reproduces the recorded phase and complete-round timings.
+
+### FP32-attention baseline and confirmed layout saving, September 8
+
+The user authorized stopping the service on GPU4--7. That service is stopped;
+the campaign holds the rear-four lease and does not allocate GPU0--3.
+The following independent startups use main `e5d63c51f0`, the pinned revision-4
+attention DSOs above, fixed Gemma reduction, and no profiler or tensor dumps.
+Each fixture has one warmup and five measured requests. These are initial
+screens, not the required three paired startups or final promotion evidence.
+
+| Fixture | Packed off | Packed on | Packed + combined split |
+| --- | ---: | ---: | ---: |
+| release1k complete round | 19.336 ms | 18.506 ms | 17.366 ms |
+| MBPP28 complete round | 18.923 ms | 18.024 ms | 16.953 ms |
+
+Every output hash matches within and across these three arms. release1k emits
+272 tokens in 91 rounds (1.989 accepted drafts/round; 2.989 emitted/round).
+MBPP28 emits 634 tokens in 130 rounds (3.877 accepted drafts/round; 4.877
+emitted/round). Both stop naturally. The combined-split startup has median
+TTFT 354.2/115.7 ms and pure decode throughput 171.5/287.2 tokens/s.
+See `results/v4-layout-initial-ab.json` and
+`results/v4-combined-initial-ab.json`. Loaded DSO inventories for the packed
+and combined startups were hashed after measured requests. The first baseline
+retains the pinned library manifest but predates that extra process-map capture.
+
+The opt-in `VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT=1` reuses the existing
+bitwise split kernel for the all-NVFP4 QKVZBA allocation. The old split flag
+only covered checkpoints with a separate b/a projection. In the real combined
+layout, each of 48 GDN layers instead launched three index creations and three
+separate tail copies. The new path copies z/b/a in one launch before convolution
+mutates QKV. It is limited to SM70 DFlash2 TP4/hidden5120, FP16 q8 and
+QKV/z/ba widths 2560/1536/12; other shapes retain their existing route. The
+new flag defaults to zero and is not automatically enabled by DFlash2 setup.
+Nine GPU tests pass, including the real 4120-column view with row stride 4128,
+aliased input arguments, compiled and ordinary CUDA graph replay, changed input
+values, preserved tails after QKV mutation, and untouched padding.
+
+The fresh packed trace is `profile/v4-packed-tp4.nsys-rep` and its SQLite;
+`results/v4-packed-trace.json` retains the analysis. Ten steady rounds on all
+four ranks show QPN2 service 7.033 ms, target communication 1.652 ms, target
+copies 1.339 ms and normalization 0.831 ms. Draft service is 3.774 ms, including
+1.831 ms of dense GEMMs. The 96 tiny b/a index-select kernels each launch one
+eight-thread block. These measurements motivate the combined split above.
+Profiler critical-rank round time is 21.618 ms; it is diagnostic, not an
+endpoint performance result. The profiler stop/export request is also excluded.
+
+Four QPN2 candidates were screened on rank-0 runtime weights from four
+consecutive layers (214,087,680 bytes), all five production shapes, seven
+alternating A/B trials and 50 graph replays per trial. All remain bitwise exact;
+none is faster, so none is integrated into serving:
+
+| Candidate | Control/candidate median working-set ms | Decision |
+| --- | ---: | --- |
+| Static K specialization | 0.389 / 0.405 | Reject; every paired trial slower |
+| Precombined FP16 scales | 0.379 / 0.417 | Reject; scale traffic grows |
+| 16-column CTA remapping | 0.406 / 0.429 | Reject; every paired trial slower |
+| One-group codes/scale prefetch | 0.390 / 0.408 | Reject; every paired trial slower |
+
+These are synthetic activations with real runtime weights, not full-layer or
+model-quality results. The precombined-scale working set is 237,875,200 bytes;
+the benchmark now records candidate scale dtype and footprint. The unchanged
+source-library control also matches the archived production QPN2 outputs.
+Source and DSO SHA256s accompany each `results/qpn2-*-real.json` result.
+
+The existing small-message push route also passed its native gate after a
+task-local build of the current main communicator: all four ranks, 13 message
+sizes, 32 changing-input cycles for each of random/zero/special patterns,
+mixed graph order, interleaved sum2, delayed ranks and canaries. For 128 q8
+collectives, 80 versus 40 blocks measures 0.884 versus 0.882 ms in the same
+communicator lifetime. This gain is too small to justify a full model candidate;
+it is not promoted. See `results/custom-ar-v4-mixed-size-gate.json` and
+`results/q8-push-grid-race.json`. No normalization arithmetic was changed.
+
+The complete-round target below 15 ms, full distribution/state comparison for
+the final combination, repeated-startup acceptance gates, and long-context
+validation remain open. No new serving default or merge is claimed.

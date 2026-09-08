@@ -2443,6 +2443,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+            and self.tp_size == 4
+            and self.hidden_size == 5120
+        )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
             and current_platform.is_device_capability(70)

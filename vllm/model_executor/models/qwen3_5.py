@@ -477,9 +477,29 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             ba_start = z_start + z_size
             a_start = ba_start + ba_size
             mixed_qkv = mixed_qkvzba[..., :qkv_size]
-            z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
-            b = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, ba_start, ba_size)
-            a = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, a_start, ba_size)
+            if (
+                self.enable_sm70_dflash2_fused_gdn_combined_split
+                and num_tokens == 8
+                and mixed_qkvzba.dtype == torch.float16
+                and (qkv_size, z_size, ba_size) == (2560, 1536, 12)
+            ):
+                # The NVFP4 projection has one padded QKVZBA allocation.
+                # Copy its three tails together before convolution mutates QKV.
+                z, b, a = _sm70_materialize_qwen35_gdn_splits(
+                    mixed_qkvzba,
+                    mixed_qkvzba[:, ba_start : a_start + ba_size],
+                    qkv_size,
+                    z_size,
+                    ba_size,
+                )
+                logger.info_once(
+                    "SM70 DFlash2 combined QKVZBA q8 split route hit.",
+                    scope="local",
+                )
+            else:
+                z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
+                b = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, ba_start, ba_size)
+                a = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, a_start, ba_size)
 
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
