@@ -59,19 +59,24 @@ dispatch. All 280 real TP4-shard operator cases match output bits, including
 gated output, padding and CUDA Graph replay with changed inputs. The removed
 target codes total approximately 2.836 GiB per rank for QUASAR 27B.
 
-Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in. Shared row-first scheduling
-and 8-row CTAs reduce the rank-0 weighted M16 ratio from 1.0624 to 1.0138 and
-M32 from 1.0738 to 0.9968; M8 remains 1.0434 in the revised ABBA benchmark.
-The focused 21 cases pass bitwise; expanded validation is pending. These
-isolated projection ratios do not establish model throughput. Reject the
-slower vector-load/shuffle and global unroll 1/2 experiments.
+Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in. Shared row-first scheduling,
+8-row CTAs and selective caching for K=1536/N=5120 output weights yield
+weighted M8/M16/M32 ratios of 1.0013/0.9869/0.9591 in the repeated-operator
+ABBA benchmark. All 336 final cases on 24 real shards pass bitwise,
+including partial rows. A working-set check is pending; these isolated
+projection ratios do not establish model throughput. Reject the slower
+vector-load/shuffle and global unroll 1/2/8 experiments.
 
 Production validation must retain automatic KV at utilization 0.8, TP4,
 256K context, E4M3 KV, chunk 4096, maxseq 4 and the existing DFlash2 q7 graph,
 FP32-logit and sampling settings. The fixed 2 GiB/8K/E5M2 diagnostic is excluded
-from production conclusions. The corrected control loaded 11.08 GiB/rank but
-was externally terminated during compilation; full production A/B remains
-pending. The design note records the failed paths and remaining acceptance.
+from production conclusions. With matching revision-four Flash-V100, the
+production control completes: 11.08 GiB loading/rank, 12.68 GiB KV budget,
+1,190,275 KV tokens and 277.52 tokens/s median single-request pure decode.
+Shared loading is 8.20 GiB/rank, but that service is externally terminated
+after compilation. Candidate KV/endpoint/output results and full production
+A/B remain pending. The design note records the failed paths and remaining
+acceptance; do not repeat the old-extension or fixed-KV harness failures.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

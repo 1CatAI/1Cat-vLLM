@@ -130,7 +130,8 @@ __device__ __forceinline__ void dequant_e2m1x8(unsigned packed, half2 scale,
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false>
+template <int SplitK, int NAcc, int RowTiles = 1, bool TurboMindLayout = false,
+          bool CacheCodes = false>
 __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
                                        const uint8_t* __restrict__ group_scales,
                                        const half* __restrict__ input,
@@ -150,8 +151,8 @@ __global__ void nvfp4_qpn2_sm70_kernel(const uint8_t* __restrict__ codes,
   const int groups_k16 = k >> 4;
   const int groups_per_warp = groups_k16 / SplitK;
   const int group_begin = warp * groups_per_warp;
-  const Nvfp4Qpn2CodeReader<TurboMindLayout> reader(codes, tile, groups_k16,
-                                                    lane);
+  const Nvfp4Qpn2CodeReader<TurboMindLayout, CacheCodes> reader(
+      codes, tile, groups_k16, lane);
   const uint8_t* scale_ptr =
       group_scales + static_cast<size_t>(tile) * groups_k16 * 32 + lane;
   const half2 global_scale2 = __float2half2_rn(global_scale * 16384.0f);
@@ -373,6 +374,16 @@ void launch_qpn2(const uint8_t* codes, const uint8_t* scales, const half* input,
   // Reusing it before traversing N improves cache locality without repacking.
   const dim3 grid =
       TurboMindLayout ? dim3(row_blocks, n / 32) : dim3(n / 32, row_blocks);
+  if constexpr (TurboMindLayout) {
+    // Cache the TP4 GDN/attention output weights (3.75 MiB). The larger
+    // QKV and MLP projections retain streaming loads; caching regresses them.
+    if (k == 1536 && n == 5120) {
+      nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles, true, true>
+          <<<grid, (32 * SplitK), 0, stream>>>(codes, scales, input, output, n,
+                                               k, m, global_scale);
+      return;
+    }
+  }
   nvfp4_qpn2_sm70_kernel<SplitK, NAcc, RowTiles, TurboMindLayout>
       <<<grid, (32 * SplitK), 0, stream>>>(codes, scales, input, output, n, k,
                                            m, global_scale);

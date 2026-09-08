@@ -83,8 +83,7 @@ A bounded experiment replaced the shared reader's two streaming loads with
 read-only cached loads. All 28 rank-0 cases remained bitwise equal. Although
 the K=1536 output projections improved, QKV and MLP regressed (gated M8
 ratio 1.131, MLP down M16 ratio 1.167). The global replacement was rejected;
-the implementation retains streaming loads. Selective cache policies are
-outside this change.
+the final recovery caches only the K=1536/N=5120 output projections.
 
 ### Scheduling recovery
 
@@ -95,30 +94,38 @@ layout still honors `VLLM_SM70_NVFP4_QPN2_M16_NATIVE`. Split-K, accumulator
 chains and each row's arithmetic order are unchanged. No additional weight
 or temporary tensor is allocated.
 
-The focused rank-0 check passes all 21 ordinary/gated M=8/16/32 cases in
-eager execution and changed-input CUDA Graph replay. Timing now captures
-16 nodes per graph and takes eight ABBA rounds, retaining all raw samples.
+Read-only cached loads are selected only for the 3.75 MiB GDN/attention
+output weights at K=1536/N=5120. Larger QKV and MLP weights retain streaming
+loads. This changes cache policy without allocating a tensor or changing
+the accumulation order.
+
+The final candidate passes all 336 ordinary/gated cases on 24 real TP4
+shards at M=1/8/9/15/16/17/18/24/31/32/33/1024, in eager execution and
+changed-input CUDA Graph replay. Timing captures 16 nodes per graph for
+small M and takes eight ABBA rounds, retaining all raw samples.
 Weighted by the model's projection counts, counting fused gate/up once:
 
-| M | Initial shared/dual ratio | Reordered shared/dual ratio |
+| M | Initial shared/dual ratio | Final shared/dual ratio |
 | --- | --- | --- |
-| 8 | 1.0137 | 1.0434 |
-| 16 | 1.0624 | 1.0138 |
-| 32 | 1.0738 | 0.9968 |
+| 8 | 1.0137 | 1.0013 |
+| 16 | 1.0624 | 0.9869 |
+| 32 | 1.0738 | 0.9591 |
 
 Each ratio uses that run's control. Absolute times across the two timing
 methods or unlocked-clock runs are not comparable. These projection sums
-show M16/M32 recovery, with a remaining M8 regression; they do not establish
-production throughput. Expanded partial-row/four-shard validation and the
-production service comparison remain pending.
+show recovery in this repeated-operator workload; they do not establish
+production throughput. Repeated access favors cache-resident weights. An
+additional working-set check cycles six distinct real projection tensors
+in the model's 3-GDN/1-attention layer pattern, exceeding L2 capacity; that
+measurement and the complete production A/B remain pending.
 
 Rejected experiments retain their evidence: adjacent-column vector loads
 plus a lane shuffle pass bitwise but regress speed, including the variant
 using two row tiles at M17–32. Shared unroll factors one and two also regress
 the weighted costs. Unroll eight brings gated M32 close to the control but
-worsens gated M8, so it is not applied globally. A bounded combination of
-selective output-projection caching and gated-M32 unrolling is still an
-experimental candidate, outside the implementation above. Hardware counter
+worsens gated M8, so it is not applied. Combining it with selective output
+caching does not establish an advantage over caching alone; retain unroll
+four. Hardware counter
 profiling failed with `ERR_NVGPUCTRPERM`; no counter-based claim is made.
 
 ### Production service contract
@@ -130,12 +137,28 @@ context pipeline/KV graph and CUDA Graph enabled. Preserve production
 sampling and xhigh thinking. Compare weight loading, KV capacity and NVML
 usage separately, and report pure decode separately from TTFT.
 
-An earlier diagnostic used a fixed 2 GiB KV pool and 8K/E5M2 settings.
-It does not represent the production contract and is excluded from
-production memory/performance conclusions. The corrected server confirms
-E4M3/256K/automatic KV arguments and 11.08 GiB model loading on all four
-control ranks, but was externally terminated during compilation. There is
-no completed production A/B result yet.
+The corrected production control completes with 11.08 GiB model loading
+per rank, a 12.68 GiB KV budget, 1,190,275 logical KV tokens, 0.33 GiB graph
+capture increment and 26,114 MiB NVML worker usage per rank. The existing
+MBPP28 speed item returns the same 260 tokens with natural EOS in warmup
+and three measured requests. Median pure decode is 277.52 tokens/s,
+verification-round time 19.046 ms and TTFT 114.93 ms. Actual concurrency is
+one; maxseq4 is capacity. A separate MBPP0 request completes with 2105
+tokens and natural EOS. This is a focused check, not full quality admission.
+
+The shared production server logs 8.20 GiB model loading on all four ranks,
+then is externally terminated after compilation. Candidate KV capacity,
+NVML, output parity and endpoint speed remain unmeasured. The loading log
+is a runtime measurement distinct from the exact 2.835693 GiB code-storage
+calculation; do not report a full-service memory or throughput improvement.
+
+An earlier fixed 2 GiB KV/8K/E5M2 diagnostic is excluded from production
+conclusions. The first corrected control attempt exposes an old Flash-V100
+extension without E4M3 precision revision four. Both production arms now
+use a frozen copy of the production revision-four DSO, SHA256
+`a751fed902279b0de23537c4aad2dc4fee360146d7fce7ef0c4f255a77f48b02`.
+The failed and externally interrupted logs remain separate from the
+completed control. Preserve the production runtime arguments when retrying.
 
 The first sidecar build omitted `ENABLE_SM70_TURBOMIND`, hiding declarations
 in `ops.h`; defining it fixes the build. The initial benchmark omitted the
