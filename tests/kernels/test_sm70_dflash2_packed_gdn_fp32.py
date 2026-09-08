@@ -14,19 +14,22 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 
 
 @pytest.mark.parametrize("tp_size", [2, 4])
-def test_packed_entry_preserves_fp32_beta_and_strided_state(tp_size: int):
+@pytest.mark.parametrize("strided_qkv", [False, True])
+def test_packed_entry_preserves_fp32_beta_and_strided_state(
+    tp_size: int, strided_qkv: bool
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("The packed DFlash2 verifier requires SM70")
     torch.manual_seed(20260911)
     q_heads, v_heads, dim, tokens = 16 // tp_size, 48 // tp_size, 128, 8
-    mixed = (
-        torch.randn(
-            (tokens, (2 * q_heads + v_heads) * dim),
-            device="cuda",
-            dtype=torch.float16,
-        )
-        * 0.1
+    width = (2 * q_heads + v_heads) * dim
+    projection_width = (2 * q_heads + 2 * v_heads) * dim + 2 * v_heads
+    row_stride = (projection_width + 31) // 32 * 32 if strided_qkv else width
+    mixed_storage = torch.full(
+        (tokens, row_stride), -3.0, device="cuda", dtype=torch.float16
     )
+    mixed = mixed_storage[:, :width]
+    mixed.copy_(torch.randn_like(mixed) * 0.1)
     a = torch.randn((tokens, v_heads), device="cuda", dtype=torch.float16)
     b = torch.randn_like(a)
     a_log = torch.randn(v_heads, device="cuda", dtype=torch.float32)
@@ -52,6 +55,26 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(tp_size: int):
         tp_size=tp_size,
         head_k_dim=dim,
         head_v_dim=dim,
+        enable_sm70_dflash2_fused_gdn_verify=True,
+    )
+    metadata = SimpleNamespace(
+        spec_sequence_masks=torch.ones(1, device="cuda", dtype=torch.bool),
+        num_spec_decodes=1,
+        num_prefills=0,
+        num_decodes=0,
+        ddtree_parent_ids=None,
+        spec_query_start_loc=cu,
+        spec_state_indices_tensor=indices,
+        spec_state_slot_selectors=accepted,
+    )
+    assert QwenGatedDeltaNetAttention._can_use_dflash2_packed_gdn_verify(
+        layer,
+        mixed_qkv=mixed,
+        a=a,
+        b=b,
+        core_attn_out=actual,
+        ssm_state=candidate_state,
+        attn_metadata=metadata,
     )
 
     def control():
@@ -117,3 +140,4 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(tp_size: int):
                 candidate_storage.index_select(0, retired),
                 initial.index_select(0, retired),
             )
+            assert torch.all(mixed_storage[:, width:] == -3.0)

@@ -652,7 +652,9 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     """
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
-    if not mixed_qkv.is_contiguous():
+    # Qwen's QKV view shares rows with Z/b/a; convolution preserves that
+    # row stride. The native mixed-QKV loader already accepts QKV_STRIDE.
+    if mixed_qkv.stride(1) != 1:
         mixed_qkv = mixed_qkv.contiguous()
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for mixed_qkv_out.")
@@ -672,11 +674,12 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     q_size = H * K
     k_size = H * K
     v_size = HV * V
-    qkv_stride = q_size + k_size + v_size
-    if mixed_qkv.shape[1] != qkv_stride:
+    qkv_width = q_size + k_size + v_size
+    if mixed_qkv.shape[1] != qkv_width:
         raise ValueError(
-            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_stride}."
+            f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_width}."
         )
+    qkv_stride = mixed_qkv.stride(0)
     if out.shape != (T, 1, HV, V):
         raise ValueError(f"out must have shape {(T, 1, HV, V)}, got {out.shape}.")
     if scale is None:

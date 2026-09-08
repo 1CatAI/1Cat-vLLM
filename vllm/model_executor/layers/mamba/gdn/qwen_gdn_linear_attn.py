@@ -5181,7 +5181,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # The supported verifier contract keeps recurrent state in FP32;
             # an explicit FP16 cache override is also supported.
             and ssm_state.dtype in (torch.float16, torch.float32)
-            and mixed_qkv.is_contiguous()
+            and mixed_qkv.ndim == 2
+            and mixed_qkv.stride(1) == 1
             and a.is_contiguous()
             and b.is_contiguous()
             and core_attn_out.is_contiguous()

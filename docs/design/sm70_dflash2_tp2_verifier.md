@@ -263,11 +263,11 @@ versus 0.507 ms for direct packed recurrence. Common convolution and gating
 are outside this operator timing. The feature remains disabled pending live
 state and full-round validation; this finding is not attributed as the cause
 of historical text-quality changes while the packed feature was disabled.
-The actual-entry GPU regression passes for both TP2 and TP4 head geometry,
+The initial actual-entry GPU regression passes for both TP2 and TP4 head geometry,
 with FP32 state, gaps between pool slots, all eight selectors, two changing
 replays per selector and untouched retired rows. Reproduce with
 `.venv/bin/python -m pytest --confcutdir=tests/kernels tests/kernels/test_sm70_dflash2_packed_gdn_fp32.py -q`
-(two tests passed).
+(two initial tests passed; the extended stride suite below contains four).
 
 The first live packed-recurrence shadow has no positive coverage and is not
 a pass: it assumes state indices `[1,8]`, while the real q8 graph passes a
@@ -289,6 +289,26 @@ and state continue to drive generation. Both natural-stop fixtures complete;
 these shadow timings are excluded from performance evidence. The fail-closed
 client now requires 48 named, positive-coverage layers per rank.
 Evidence: `tp2-gdn-shadow-3-admission.json` and the per-rank shadow reports.
+
+The first paired GDN service is blocked before its first request because no
+marked packed regions are captured. Source inspection identifies a layout
+gate: the Qwen3.5 QKV view shares its row with Z/b/a and the convolution writes
+in place, while the packed verifier requires a contiguous QKV matrix. The
+native mixed-QKV kernel already accepts a row stride, but its Python wrapper
+copies the input and then passes the logical width as that stride.
+
+The opt-in packed entry now accepts contiguous features with a separate row
+stride. Its operator wrapper passes the actual stride, retaining the old
+copy fallback for non-unit feature strides. Arithmetic, beta/state precision
+and state selectors are unchanged. The extended actual-entry suite passes
+four TP2/TP4 contiguous/strided cases, including physical QKV row widths 8256
+and 4128, untouched input padding, every acceptance selector, changing graphs,
+all state-pool bits and retired rows. A second gate performs 24 graph-arm
+switches with padded metadata, the 8256-element QKV row stride and strided
+state pools; every output and pool bit matches. CUDA 12.8 memcheck reports
+zero errors and racecheck reports zero hazards for that gate. Live route and
+full-round validation remain pending; the failed first paired startup supplies
+no speed evidence.
 
 ### Updated target and draft attribution
 
@@ -330,6 +350,36 @@ output bit but increases the working set from 0.708352 to 0.790528 ms. Reject
 it before model work. These are new measured negative results, not evidence
 of a changed numerical tolerance. Raw reports are `tp2-mlp-trace.json`,
 `tp2-qpn2-register-screen.json` and `tp2-qpn2-effective-scale-screen.json`.
+
+Further scheduling screens are also rejected. Compiler unroll one/two/eight
+measures 0.886784/0.803584/0.732672 ms against 0.711168 ms for the existing
+unroll four. Shortening live input/dequant fragments reduces registers from
+52 to 48 without local memory, but measures 0.806400 ms against 0.705792 ms.
+All sixteen real matrix outputs and FP64-reference errors remain identical.
+Improved occupancy potential alone is not a measured speedup.
+
+### LM-head width and accumulation order
+
+The trace spends approximately 4.133 ms across the target and draft dense
+FP32 heads. A bounded probe keeps real TP2 target-head weights and input
+rows fixed, then selects 256 vocabulary rows for recomputation. Default
+`torch.mm` changes its effective split-K grid from two to sixteen. On M8/M7,
+2001/1739 FP32 output elements change, with maximum differences of
+6.4820051e-7/6.1839819e-7. The cuBLASLt log requests split 19 for the narrower
+matrix; its resulting kernel grid uses sixteen partitions. Do not treat
+default narrowed GEMM as bit-exact candidate reranking.
+
+A private probe uses the official cuBLASLt algorithm-selection interface to
+retain the complete-head algorithm: ID 21, tile ID 5, stage ID 14, split two,
+output-type reduction (scheme 4). It uses the observed Torch workspace limit
+of 8519680 bytes. M7 and M8 each pass N64/N256/N1024 with three changing input
+amplitudes, with zero FP32 bit differences from the selected complete-head
+outputs. The N1024 graph is about 0.032 ms; this excludes candidate selection
+and weight gathering and is not a complete-head or model speed result.
+Candidate coverage, both actual head inputs, memory safety and full-round
+admission remain outstanding. No narrowed LM-head route is enabled.
+See `head-cublaslt-probe.json`, `head-lt-plan-probe.json` and the
+[CUDA 12.8 cuBLASLt reference](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html).
 
 ## Reproduction and retained negative results
 

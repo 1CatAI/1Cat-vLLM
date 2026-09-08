@@ -47,6 +47,15 @@ rank, with zero bit differences across 2305032192 output and 295044120576
 state elements. Graph switching and whole-round benefit remain pending.
 The TP2 worklog retains both diagnostic failures and the
 profile wrapper's shutdown exit 137 separately from usable captured data.
+The packed GDN route also rejected the model's QKV view because its row
+shares storage with Z/b/a. The opt-in entry and native wrapper now retain
+that row stride directly; four TP2/TP4 actual-entry tests pass, including
+input padding and complete state preservation. Full-round validation is
+still pending. Additional QPN2 unroll/lifetime screens remain slower.
+A private LM-head probe confirms that default reduced vocabulary width
+changes split-K and FP32 logits; retaining the complete-head cuBLASLt plan
+restores bitwise selected logits. This is a reranking building block, with
+candidate coverage and model admission outstanding, not a speed claim.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 
