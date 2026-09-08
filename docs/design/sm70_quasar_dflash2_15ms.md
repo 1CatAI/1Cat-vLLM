@@ -1111,8 +1111,26 @@ launches over forty rank-rounds use a 3 × 80 grid, 256 threads, 234 registers
 and 30464-byte shared memory. Grouped-attention service is 0.909762 ms versus
 0.951279 ms in the preceding diagnostic trace; no whole-round gain follows
 from that comparison. The profiled release output remains canonical. A
-separate unprofiled pair is queued. The owned trace client was recovered from
+separate unprofiled pair subsequently completes as recorded below.
+The owned trace client was recovered from
 a job-name mismatch without reloading the model, and the final library
 manifest uses process ancestry to include Nsight's separate child group.
 The obsolete waiting client was then stopped; the wrapper exit 143 remains
 recorded rather than relabelled successful.
+
+### Actual attention admission and chunked-publication screen
+
+The actual grouped-attention pair measures release1k 16.797233/16.637915 ms
+and MBPP28 16.416132/16.248439 ms after five warmups, with five measured
+requests per arm. All measured natural tokens and acceptance remain canonical.
+The actual-route four-rank fixed-prefix pair now passes: 144 records per arm,
+zero captured intermediate differences, byte-equal logits, TV zero and no
+support or top-1 changes. This closes the inactive-route evidence gap, not the
+final multi-seed, repeated-startup or long-context gate.
+
+The new two-chunk QPN2 publication implementation passes nine changing-input
+four-rank cycles, including rank skew and allocation canaries. Its real-weight
+working-set median regresses from 0.456499 ms to 0.511037 ms serialized and
+0.557527 ms overlapped. Keep it disabled and do not extend to four chunks.
+See the [resource audit](sm70_quasar_dflash2_resource_audit_20260909.md) for
+the independent channel protocol, source/DSO provenance and evidence limits.

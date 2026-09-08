@@ -1,7 +1,8 @@
 # QUASAR + DFlash2 complete-round resource audit, 2026-09-09
 
-The 15-ms goal is not met. The current unprofiled sparse-selector screen is
-16.761 ms for release1k and 16.373 ms for MBPP28. Both use rear GPUs 4–7,
+The 15-ms goal is not met. The latest unprofiled screen with the actual grouped
+attention route is 16.638 ms for release1k and 16.248 ms for MBPP28. Both use
+rear GPUs 4–7,
 TP4/B1/q8, E4M3 target KV, FP32 logits/state, the frozen model and natural
 EOS. One startup pair with five warmups and five measured requests per fixture
 does not complete the final performance or quality gates.
@@ -133,8 +134,8 @@ Thus more CTAs do not by themselves establish better achieved occupancy;
 register pressure remains a constraint. Grouped attention service changes
 from 0.951279 to 0.909762 ms in the two diagnostic traces. This is not an
 unprofiled full-round improvement. The canonical release token IDs and
-acceptance remain unchanged in the profiled request. A separate five-warmup
-unprofiled pair is queued; fixed-prefix admission of this actual route is open.
+acceptance remain unchanged in the profiled request. The separate five-warmup
+unprofiled pair and four-rank fixed-prefix comparison are now complete.
 
 Raw evidence: `profile/v4-sparse-dense-order-nodes/tp4.{nsys-rep,sqlite}`,
 `results/v4-sparse-dense-order-nodes-trace.json`,
@@ -153,6 +154,53 @@ See `results/attention-bound-profile-harness-recovery.json`,
 `results/attention-bound-route-hit.json` and
 `results/nsys-v4-attention-bound-nodes-runtime-libraries.json`.
 
-Final combination fixed-prefix quality, three independent startup pairs,
-acceptance non-inferiority and model long-context gates remain open. No
+Three independent startup pairs, acceptance non-inferiority and model
+long-context gates remain open. No
 15-ms result, default promotion, merge or 256K performance claim follows.
+
+## Actual attention quality and unprofiled follow-up
+
+The completed pair keeps five warmups and five measured requests per fixture.
+Request-average complete-round medians change 16.797233 -> 16.637915 ms for
+release1k and 16.416132 -> 16.248439 ms for MBPP28. Every measured token hash,
+natural EOS, accepted-draft count and emitted-token count remains canonical.
+This is one startup pair, not the final three-pair gate. The input reports and
+their hashes are in `results/v4-attention-bound-warm5-ab.json`.
+
+Both actual-route fixed-prefix jobs exit zero and collect 144 records each.
+The comparison finds no captured intermediate differences, all native logits
+byte-equal, TV zero, and no support or top-1 changes. The recorded conv/SSM
+states and metadata cover layers 0/1, not every layer's operator internals.
+Both arms retain mapped-library manifests; candidate capture logs prove the
+actual module binding. See `results/v4-attention-bound-audit-comparison.json`.
+Completed raw tapes are retired only after lossless archive reconstruction
+verifies each of the 144 per-file SHA256 values.
+
+## Two-chunk QPN2 publication screen: rejected
+
+The new private builder partitions the 5120 output columns into two 2560-column
+chunks, preserving each output's original dot product and rank reduction.
+Each chunk has separate two-epoch storage. Its consumer waits on the local
+producer's completion event; the main stream joins both consumers before
+dependent work. This does not reuse the rejected pre-producer polling scheme.
+
+Four ranks, sixteen real consecutive-layer projection weights, nine changing
+synthetic-input cycles, rank start delays and mixed ordinary-push calls pass
+bytewise output comparisons with intact allocation canaries. Seven alternating
+working-set measurements give 0.456499 ms for frozen publication, 0.511037 ms
+for serial chunks and 0.557527 ms for overlapped chunks. All paired differences
+are regressions. Therefore neither candidate gets a model run or a four-chunk
+extension; there is no end-to-end speed claim and no default change.
+
+`benchmarks/kernels/build_sm70_qpn2_chunked_candidate.py` and
+`benchmarks/kernels/benchmark_sm70_qpn2_chunked.py` reproduce the screen.
+The native DSO SHA256 is
+`745a2bf88bef7c5bd5284f1f45ebc36575f2cb1a320a5a3a04e6db817e224688`.
+The original publisher and communicator remain independently frozen and are
+hashed in `results/qpn2-two-chunks-real.json`. Kernel-level race and memory
+sanitizer admission is not claimed for this rejected route.
+
+NCU 2022.4.1 exists at `/usr/bin/ncu`, but the driver reports
+`RmProfilingAdminOnly: 1` and this task's noninteractive sudo attempt requires
+a password. Other campaigns' counters do not establish access for this task;
+its occupancy and memory-throughput counter gap remains explicit.
