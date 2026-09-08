@@ -204,3 +204,46 @@ NCU 2022.4.1 exists at `/usr/bin/ncu`, but the driver reports
 `RmProfilingAdminOnly: 1` and this task's noninteractive sudo attempt requires
 a password. Other campaigns' counters do not establish access for this task;
 its occupancy and memory-throughput counter gap remains explicit.
+
+## Context computation behind the target probe: model screen
+
+The explicit benchmark installer defers eligible q8 context preparation until
+after the target's 21-candidate probe is copied to preallocated pinned memory.
+It records a copy event, submits the original context graph on the original
+stream, waits only for the copy, and calls the unchanged CPU cutoff predicate.
+Full-vocabulary/structured-output paths flush any pending preparation before
+the caller updates request state or proposes drafts. KV stores retain their
+acceptance-dependent ordering. There is no additional CUDA compute stream.
+
+The CPU dependency/fallback gate passes 256 predicate inputs, including ties,
+and checks missing-guard fallback, unsupported probe layout, prefill and error
+cleanup. The actual natural-sampling shadow then checks at least 1280 calls
+on each rank: probe bytes, cutoff decisions, staged hidden states and projected
+context K/V match. All release/MBPP measured output hashes and acceptance
+counts remain canonical. Shadow executes additional reference work and is
+not performance evidence. See `results/context-probe-cpu-dispatch.json` and
+`results/context-probe-actual-shadow.json`.
+
+The first uninstrumented five-warmup pair measures release1k
+17.038700 -> 16.554804 ms and MBPP28 16.767940 -> 16.217768 ms. Its control is
+slower than the preceding actual-attention pair; do not attribute that entire
+difference to the pipeline. A reversed candidate/control pair is queued to
+check startup-order and environment effects. The candidate remains experimental;
+this does not clear distribution/state, final performance or long-context gates.
+
+## Draft cuBLAS layout screen: numerical rejection of broad changes
+
+All 400 retained four-rank raw projection controls reproduce bytewise with the
+original layout. A column-major weight view changes 300/400 outputs and expands
+FP64 reference error in 298 cases. Padding queries to sixteen rows changes
+200/400 outputs and expands reference error in 102 cases. Combining both changes
+has 300 differences and 298 expanded-error cases. The aggregate working-set
+medians 1.458115/1.283830/1.409249/1.355162 ms do not admit these broad routes.
+
+Only `o_proj` with column-major weights and `down_proj` with padded row-major
+weights retain byte parity in their respective 100-case subsets. A separate
+screen times these shapes with the required input copy included, leaving QKV
+and gate/up on the original path. No model route is installed for any layout
+candidate. `benchmarks/kernels/benchmark_sm70_draft_f16_layout.py` reproduces the
+full numerical screen; `results/draft-f16-layout-real.json` retains every case,
+FP64 metric, original snapshot hash and aggregate timing.
