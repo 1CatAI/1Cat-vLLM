@@ -467,6 +467,57 @@ about 0.200 ms across twenty real-weight projections but is not bitwise equal.
 Its independent FP64-reference errors do not worsen in that primitive screen;
 model-distribution and acceptance gates are still required, so it is not enabled.
 
+The subsequent forced-tape publication pair (`v4-publish-audit-control` /
+`v4-publish-audit-speed`) has 140 records per arm across all four ranks and
+two 128-token tapes. Requested layer 0/1 intermediates and conv/SSM state,
+target boundary/auxiliary tensors, and native logits are bitwise equal.
+Sampling TV is zero with no changed top-p support or top-1 rows. This gate
+retains the complete prefill records; it is not natural acceptance evidence.
+See `results/v4-publish-audit-comparison.json` and its separate manifest.
+
+The lower-overhead whole-graph trace in `profile/v4-publish-graph/tp4.sqlite`
+does not collect individual graph nodes. Ten steady rounds have diagnostic
+critical-rank mean interval 18.465 ms, GPU union 17.214 ms and uncovered time
+1.252 ms. Target graph mean duration is 12.308 ms. Its host launch skew is
+0.685 ms, but GPU start skew is only 0.005 ms because launches are queued.
+The main draft graph has host/GPU start skew 0.292/0.297 ms and mean duration
+3.862 ms. Do not treat the earlier target-node arrival skew as an established
+unprofiled saving. The request containing profiler stop/export is excluded
+from endpoint performance claims. Analysis:
+`results/v4-publish-graph-trace.json` and
+`results/v4-publish-graph-arrival-audit.json`.
+
+Additional independent screens remain unpromoted:
+
+| Candidate | Control/candidate working-set ms | Result |
+| --- | ---: | --- |
+| Local published-packet consumer + Gemma | 0.508 / 0.515 | Exact; slower in every pair |
+| Global QPN2 partials, four warps per CTA | 0.389 / 0.539 | Exact; added traffic/launches do not pay back |
+| Fixed-q8 input/output bounds | 0.380 / 0.477 | Exact; compiled register use rises to 70--72 |
+| Fixed-q8 bounds, unroll two | 0.393 / 0.408 | Exact; 64 registers, still slower |
+| K-group-major weight codes/scales | 0.379 / 0.392 | Exact; same footprint, still slower |
+
+The local consumer preserves the existing packet protocol and Gemma reduction
+topology and returns the materialized reduced tensor. Its successful gate
+covers changing inputs, graph order, delayed ranks and canaries. It follows
+two retained harness failures: incorrect packed inline-assembly return
+constraints and an unregistered warmup-only ordinary collective buffer.
+Neither failed run is counted as correctness or speed evidence.
+
+An independent-stream context experiment gives each arm an identical context
+capture stream, private graph pool and cuBLAS workspace. Only replay placement
+differs. Context scratch reads wait for target output; accepted-slot KV writes
+stay on the main stream and wait for context completion. The unprofiled model
+pair is slower: release1k 17.088/17.547 ms and MBPP28 16.659/17.130 ms. All
+output hashes and acceptance lengths match. See
+`results/v4-context-overlap-ab.json`; the experiment remains disabled and no
+further quality promotion work is justified by this negative speed result.
+
+Rear-four telemetry during decode reports 1530-MHz SM clocks, 877-MHz memory,
+roughly 171--183 W draw under the unchanged 300-W limit, and no active clock
+event reason in the checked samples. Clock headroom is not credited as a
+remaining optimization.
+
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
 validation remain open. No new serving default or merge is claimed.
