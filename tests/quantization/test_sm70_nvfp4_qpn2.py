@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.nn.parameter import Parameter
 
@@ -243,8 +244,14 @@ def _make_small_layer() -> torch.nn.Module:
     return layer
 
 
-def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
+@pytest.mark.parametrize(
+    "shared_requested,shared_available", [(False, True), (True, False), (True, True)]
+)
+def test_nvfp4_qpn2_prepare_and_dispatch_contract(
+    monkeypatch, shared_requested, shared_available
+):
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2", "1")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", str(int(shared_requested)))
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL", "1")
     monkeypatch.setenv("VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M", "9")
     envs.disable_envs_cache()
@@ -261,15 +268,28 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
     monkeypatch.setattr(nvfp4_scheme, "_is_qpn2_layer", lambda layer: True)
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_ops", lambda: [])
     monkeypatch.setattr(nvfp4_scheme, "_missing_qpn2_prefill_ops", lambda: [])
+    monkeypatch.setattr(
+        nvfp4_scheme,
+        "_missing_qpn2_shared_ops",
+        lambda: [] if shared_available else ["nvfp4_qpn2_tm_dispatch_sm70_out"],
+    )
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, False), (8, 2))
     monkeypatch.setitem(nvfp4_scheme._SM70_NVFP4_QPN2_CONFIGS, (64, 64, True), (8, 2))
+    shared = shared_requested and shared_available
+
+    def fake_prepare_codes(weight, scales):
+        assert not shared, "Shared preparation must not allocate QPN2 codes"
+        return torch.empty_like(weight), torch.empty(scales.shape, dtype=torch.uint8)
+
+    def fake_prepare_scales(scales):
+        assert shared
+        return torch.empty(scales.shape, dtype=torch.uint8)
+
     monkeypatch.setattr(
-        nvfp4_scheme.sm70_ops,
-        "nvfp4_qpn2_prepare_sm70",
-        lambda weight, scales: (
-            torch.empty_like(weight),
-            torch.empty(scales.shape, dtype=torch.uint8),
-        ),
+        nvfp4_scheme.sm70_ops, "nvfp4_qpn2_prepare_sm70", fake_prepare_codes
+    )
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_ops, "nvfp4_qpn2_prepare_scales_sm70", fake_prepare_scales
     )
 
     def fake_prepare(prepared_layer, *, interleave_gated_silu=False):
@@ -306,12 +326,25 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         fake_combined_dispatch,
     )
 
+    def fake_shared_dispatch(*args):
+        assert shared
+        assert args[2] is getattr(layer, sm70_tm.STATE_ATTR).weight
+        fake_combined_dispatch(*args)
+
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_ops,
+        "nvfp4_qpn2_tm_dispatch_sm70_out",
+        fake_shared_dispatch,
+    )
+
     try:
         scheme.process_weights_after_loading(layer)
         assert layer.sm70_nvfp4_qpn2
         assert layer.sm70_nvfp4_qpn2_gated_silu
         assert layer.sm70_nvfp4_qpn2_global_scale == 0.5
         assert layer.sm70_nvfp4_qpn2_prefill_enabled
+        assert layer.sm70_nvfp4_qpn2_shared_weight == shared
+        assert hasattr(layer, "sm70_nvfp4_qpn2_codes") != shared
         assert layer.weight.numel() == 0
         assert layer.weight_scale.numel() == 0
 
@@ -334,5 +367,9 @@ def test_nvfp4_qpn2_prepare_and_dispatch_contract(monkeypatch):
         assert torch.equal(large_fused, torch.full_like(large_fused, 5))
         assert combined_calls[2][-2:] == (False, 9)
         assert combined_calls[3][-2:] == (True, 9)
+        if shared:
+            layer.sm70_nvfp4_qpn2_prefill_enabled = False
+            scheme.apply_weights(layer, x)
+            assert combined_calls[-1][-1] == 0
     finally:
         envs.disable_envs_cache()

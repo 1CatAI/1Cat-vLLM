@@ -358,6 +358,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor[]");
   ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
 
+  ops.def("nvfp4_qpn2_prepare_scales_sm70(Tensor weight_scale) -> Tensor");
+  ops.impl("nvfp4_qpn2_prepare_scales_sm70", torch::kCUDA,
+           &nvfp4_qpn2_prepare_scales_sm70);
+  ops.def(
+      "nvfp4_qpn2_tm_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains, Tensor tm_scales, int tm_group_size, "
+      "int tm_k_ld, int tm_q_ld, bool gated_silu, int min_prefill_m) -> ()");
+  ops.impl("nvfp4_qpn2_tm_dispatch_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_tm_dispatch_sm70_out);
+
   ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "

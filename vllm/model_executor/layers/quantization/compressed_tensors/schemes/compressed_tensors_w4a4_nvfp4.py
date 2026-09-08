@@ -182,6 +182,17 @@ def _missing_qpn2_ops() -> list[str]:
     ]
 
 
+def _missing_qpn2_shared_ops() -> list[str]:
+    return [
+        name
+        for name in (
+            "nvfp4_qpn2_prepare_scales_sm70",
+            "nvfp4_qpn2_tm_dispatch_sm70_out",
+        )
+        if not hasattr(torch.ops._C, name)
+    ]
+
+
 def _missing_qpn2_prefill_ops() -> list[str]:
     return [
         name
@@ -380,16 +391,34 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     )
                     use_qpn2 = False
             if use_qpn2:
-                qpn2_weight, qpn2_weight_scale, qpn2_output_size = (
-                    _pad_qpn2_output_rows(layer.weight.data, layer.weight_scale.data)
-                )
-                qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
-                    qpn2_weight, qpn2_weight_scale
-                )
+                qpn2_shared = envs.VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT
+                if qpn2_shared and (missing_shared_ops := _missing_qpn2_shared_ops()):
+                    logger.warning_once(
+                        "SM70 NVFP4 shared QPN2 weights are unavailable; "
+                        "retaining separate layouts. Missing ops: %s.",
+                        str(missing_shared_ops),
+                    )
+                    qpn2_shared = False
+                if qpn2_shared:
+                    qpn2_output_size = (layer.weight.shape[0] + 31) // 32 * 32
+                    qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_scales_sm70(
+                        layer.weight_scale.data
+                    )
+                else:
+                    qpn2_weight, qpn2_weight_scale, qpn2_output_size = (
+                        _pad_qpn2_output_rows(
+                            layer.weight.data, layer.weight_scale.data
+                        )
+                    )
+                    qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
+                        qpn2_weight, qpn2_weight_scale
+                    )
                 qpn2_global_scale = float(layer.weight_global_scale.item())
                 qpn2_prefill_enabled = False
                 if _sm70_nvfp4_qpn2_prefill_enabled():
-                    missing_prefill_ops = _missing_qpn2_prefill_ops()
+                    missing_prefill_ops = (
+                        [] if qpn2_shared else _missing_qpn2_prefill_ops()
+                    )
                     if missing_prefill_ops:
                         logger.warning_once(
                             "The requested SM70 NVFP4 QPN2-packed prefill "
@@ -411,13 +440,15 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 k = layer.input_size_per_partition
                 n = qpn2_output_size
                 split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[(k, n, False)]
-                layer.register_buffer(
-                    "sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False
-                )
+                if not qpn2_shared:
+                    layer.register_buffer(
+                        "sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False
+                    )
                 layer.register_buffer(
                     "sm70_nvfp4_qpn2_scales", qpn2_scales, persistent=False
                 )
                 layer.sm70_nvfp4_qpn2 = True
+                layer.sm70_nvfp4_qpn2_shared_weight = qpn2_shared
                 layer.sm70_nvfp4_qpn2_global_scale = qpn2_global_scale
                 layer.sm70_nvfp4_qpn2_output_size = qpn2_output_size
                 layer.sm70_nvfp4_qpn2_split_k = split_k
@@ -428,6 +459,11 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     "SM70 NVFP4 QPN2 M<=32 route enabled for a compatible "
                     "TP4 projection contract."
                 )
+                if qpn2_shared:
+                    logger.info_once(
+                        "SM70 NVFP4 QPN2 shares TurboMind 4-bit weights; "
+                        "only QPN2 E4M3 scales are stored separately."
+                    )
                 if qpn2_prefill_enabled:
                     logger.info_once(
                         "SM70 NVFP4 opaque QPN2 decode plus QPN2-packed "
@@ -517,7 +553,28 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             split_k, nacc = _SM70_NVFP4_QPN2_CONFIGS[
                 (x_2d.shape[1], kernel_output_size * 2, True)
             ]
-        if getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
+        if getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
+            min_prefill_m = (
+                envs.VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M
+                if layer.sm70_nvfp4_qpn2_prefill_enabled
+                else 0
+            )
+            sm70_ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+                out_2d,
+                x_2d,
+                state.weight,
+                layer.sm70_nvfp4_qpn2_scales,
+                float(layer.sm70_nvfp4_qpn2_global_scale),
+                split_k,
+                nacc,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+                gated_silu,
+                min_prefill_m,
+            )
+        elif getattr(layer, "sm70_nvfp4_qpn2_prefill_enabled", False):
             sm70_ops.nvfp4_qpn2_prefill_dispatch_sm70_out(
                 out_2d,
                 x_2d,

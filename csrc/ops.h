@@ -243,6 +243,14 @@ void fp8_gemm_sm70_prescaled_m1_out(torch::Tensor out, torch::Tensor _in_feats,
 std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                                    torch::Tensor weight_scale);
 
+torch::Tensor nvfp4_qpn2_prepare_scales_sm70(torch::Tensor weight_scale);
+
+void nvfp4_qpn2_tm_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor tm_weight,
+    torch::Tensor scales, double global_scale, int64_t split_k,
+    int64_t accumulator_chains, torch::Tensor tm_scales, int64_t tm_group_size,
+    int64_t tm_k_ld, int64_t tm_q_ld, bool gated_silu, int64_t min_prefill_m);
+
 void nvfp4_qpn2_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                               torch::Tensor codes, torch::Tensor scales,
                               double global_scale, int64_t split_k,
