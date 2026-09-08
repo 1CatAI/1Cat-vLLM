@@ -181,11 +181,65 @@ six recorded native binary hashes are unchanged between arms. The existing
 the actual installed `_C` preparation/dispatch completes 36 projection/M
 combinations: all six projections differ at M16/M32, while M1/M8/135/1024
 match, including the gated cases reached. This exposes a native-version
-validation gap that the same-build comparison could not detect. A direct
-TurboMind comparison at M9/16/32 is queued to distinguish route selection
-from arithmetic. Do not attribute the token mismatch to shared code storage
-without localizing it. Retain the default-off switch and Draft PR until the
-native comparison and model parity are resolved.
+validation gap that the same-build comparison could not detect. All 18 direct
+comparisons at M9/16/32 match the installed dispatch to TurboMind bitwise,
+while differing from current-source shared QPN2. Current Python's M<=32 log
+does not prove that an older native binary selects QPN2 for those rows.
+
+### Latest production allocation and source-aligned comparison
+
+The 17:55/17:57 CST pair keeps the production contract above and loads both
+legacy and shared QPN2 implementations from the same source-built sidecar.
+Its optional `VLLM_QPN2_SHARED_ALIGN_NATIVE_CONTROL` build definition
+overrides the legacy CUDA registrations only in this benchmark overlay.
+Load the existing core DSO first, then the sidecar in every worker; loading
+the sidecar alone leaves the old control dispatch active. Dispatch-table
+inspection before and after importing `vllm._C` confirms that the owned
+registration remains selected. A complete native rebuild naturally contains
+both implementations and does not need this overlay.
+
+| Latest recorded allocation | Dual layout | Shared layout |
+| --- | --- | --- |
+| Model loading, GiB/rank | 11.08 | 8.20 |
+| Automatic KV budget, GiB/rank | 12.68 | 15.76 |
+| Logical KV tokens | 1,190,275 | 1,479,578 |
+| Graph capture increment, GiB/rank | 0.26 | 0.26 |
+| Idle worker NVML, MiB/rank | 26,040 | 26,030 |
+
+All four workers agree on the recorded per-rank values. Both snapshots show
+zero running/waiting requests and zero KV usage. Idle worker usage is
+25.430 versus 25.420 GiB/rank; under automatic sizing, saved weight memory
+increases KV capacity rather than substantially decreasing total residency.
+The 8.20 GiB loading measurement includes the target, draft and runtime
+weight layouts; it is not the target checkpoint size divided by four.
+The phase measurements are not a complete live tensor/allocator ledger.
+
+Aligning native dispatch does **not** resolve model parity. MBPP28 returns
+998 versus 297 tokens, with its first difference at token 155 (one-based).
+Both arms repeat their own sequence across warmup and three measured
+requests. MBPP0 returns 887 versus 760 tokens and first differs at token 287.
+All outputs finish naturally with nonempty final answers. Thus the verified
+old-binary route mismatch is not a complete explanation of the model result.
+Keep the earlier mixed-native cohort separate; neither cohort passes the
+deterministic gate.
+
+For reproducibility, median pure decode in this latest pair is 222.82 versus
+236.75 tokens/s; round time is 19.286 versus 19.234 ms and TTFT is 120.01
+versus 121.19 ms. Different emitted sequences and acceptance behavior prevent
+a matched-output speed claim. The next localization must compare actual
+activations at the first-divergence prefix, preserving production KV,
+context and sampling. Do not repeat unchanged full-model timing or adjust
+those settings to conceal the discrepancy. Retain the default-off switch
+and Draft PR pending model parity and broader acceptance.
+
+The retained task artifacts, whose directory is recorded in the local handoff,
+include
+`source-aligned-summary.json`, `source-aligned-server-{0,1}/`,
+`core-binary-oracle.json` and `core-tm-oracle.json`. The source-aligned DSO
+SHA256 is `45a0dd65ec0c8d99adbe26bd1267479cbb64ba17013b2b026a5a6e34100306d9`.
+It was built from source `608718f7a9` plus the optional sidecar registration
+patch, recorded by diff hash in both manifests. Both services exit after
+recording results and release their GPU locks.
 
 An earlier fixed 2 GiB KV/8K/E5M2 diagnostic is excluded from production
 conclusions. The first corrected control attempt exposes an old Flash-V100

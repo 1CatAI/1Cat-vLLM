@@ -50,3 +50,18 @@ TORCH_LIBRARY_FRAGMENT(_qpn2_shared_control, ops) {
       "int tm_q_ld, bool gated_silu, int min_prefill_m) -> ()");
   ops.impl("dispatch", torch::kCUDA, &nvfp4_qpn2_prefill_dispatch_sm70_out);
 }
+
+// Full-model overlays must update both layouts from the declared source.
+// Older core DSOs can dispatch M9..32 to TurboMind even when current Python
+// reports QPN2 M<=32. Load the core DSO before this optional implementation
+// overlay, and use the same overlay in both model arms.
+#ifdef VLLM_QPN2_SHARED_ALIGN_NATIVE_CONTROL
+TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+  ops.impl("nvfp4_qpn2_prepare_sm70", &nvfp4_qpn2_prepare_sm70);
+  ops.impl("nvfp4_qpn2_gemm_sm70_out", &nvfp4_qpn2_gemm_sm70_out);
+  ops.impl("nvfp4_qpn2_gated_sm70_out", &nvfp4_qpn2_gated_sm70_out);
+  ops.impl("nvfp4_qpn2_dispatch_sm70_out", &nvfp4_qpn2_dispatch_sm70_out);
+  ops.impl("nvfp4_qpn2_prefill_dispatch_sm70_out",
+           &nvfp4_qpn2_prefill_dispatch_sm70_out);
+}
+#endif

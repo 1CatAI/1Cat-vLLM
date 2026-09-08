@@ -82,8 +82,21 @@ fails. Shared 221.40 tok/s cannot establish a matched-output speed comparison.
 Inputs, launch arguments and recorded binaries match. Comparing the actual
 installed `_C` operators exposes M16/M32 differences on all six projections;
 M1/M8/135/1024 match. The 336 earlier checks used same-build source controls.
-Next compare installed dispatch directly with TurboMind at M9/16/32 to
-localize route selection before another model run.
+All 18 installed-dispatch comparisons at M9/16/32 equal TurboMind bitwise.
+The optional sidecar overlay now permits both model arms to use legacy/shared
+QPN2 from the same declared source, instead of trusting a Python route log.
+The 17:55/17:57 CST source-aligned pair reproduces the loading and KV capacity
+values above, with 26,040 versus 26,030 MiB idle worker usage and 0.26 GiB
+graph capture increments in both arms. Both have zero active requests/KV use.
+However, parity still fails: MBPP28 first differs at token 155, returning
+998 versus 297 tokens; MBPP0 differs at token 287, returning 887 versus 760.
+Within-arm speed repeats are stable and all outputs finish naturally. The
+native version gap does not fully explain model parity. Raw medians of
+222.82 versus 236.75 tok/s and 19.286 versus 19.234 ms/round are different
+output workloads, not an accepted model speedup. Preserve this cohort in
+`source-aligned-summary.json` separately from the older mixed-native pair.
+Next compare actual activations at the first-divergence prefix; do not repeat
+unchanged endpoint timing or change production KV/context/sampling settings.
 Keep the feature default-off and PR Draft; do not repeat the old-extension,
 fixed-KV harness failures or passed 336 checks as a substitute for localization.
 
