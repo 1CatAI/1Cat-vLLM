@@ -5202,7 +5202,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        # Match the ordinary speculative verifier's FP32 beta materialization.
+        # The gating helper otherwise defaults to the FP16 dtype of b.
+        g, beta = fused_gdn_gating(
+            self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
+        )
         fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             A_log=self.A_log,
             a=a,

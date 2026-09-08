@@ -26,6 +26,14 @@ QPN2 TP2 can match TurboMind's operator bits by matching effective-scale
 rounding and the observed K64 split/reduction schedule. A full extra code copy
 exceeds the memory budget; shared-code, tiled and vector-reader screens remain
 slower and are rejected for model use. The TP2 worklog records the comparisons.
+Selective MLP packing fits the frozen context after unused TP2 FP16 head
+packing is disabled; its two-rank live shadow has zero differences across
+22353903616 output elements. Complete-round MLP performance is still pending.
+The packed GDN entry also now requests FP32 beta, matching the ordinary
+speculative path. The previous implicit FP16 beta changes output and state
+bits in a fixed TP2 reproduction. Actual-entry TP2/TP4 tests pass with strided
+state and all acceptance selectors; packed GDN remains opt-in pending live
+and full-round gates.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

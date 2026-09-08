@@ -204,6 +204,54 @@ partial-state bits through length 262144 and changes its sixteen-layer median
 from 3.888 to 3.652 ms. This small additional gain is not yet a complete-round
 result and is not enabled in the published specialization.
 
+### Selective MLP and packed GDN follow-up
+
+Only the 128 MLP projections per rank can retain a fast duplicate layout
+without duplicating the full target. Their codes and scales cost 4.482422 GiB
+per rank. Explicitly disabling the unused TP4-only QPN8 rerank request avoids
+FP16 head packing on TP2; both actual target/draft heads still use the original
+FP16 parameters and FP32 dense logits. The shadow startup loads 16.82 GiB/rank,
+retains 7.09 GiB of KV and reports capacity for 332993 tokens, above the frozen
+262144 maximum context. This is capacity evidence, not long-context latency.
+
+The sixteen-MLP working set across both real TP2 shards improves from 1.203
+to 0.963 ms. Four changing-input graph cases per matrix match bitwise.
+Memcheck and racecheck pass for every supported split count 1 through 16 plus
+32. A complete live shadow covers all 128 MLP projections on each rank:
+248068 calls, 22353903616 output elements, zero bit differences and zero
+nonfinite outputs. The TurboMind output drives generation. Both fixtures
+finish naturally and repeat within that startup; diagnostic timings are
+excluded. A complete-round paired performance result is still pending.
+
+The first MLP graph-switch startup stops before its first request because the
+diagnostic queries edges of an unrelated graph and receives invalid argument.
+The helper now skips unmarked graphs and uses the edge-data-aware driver API,
+rejecting non-default dependencies inside a marked region. A bounded gate
+covers empty, one-node and two-node unmarked graphs plus twelve real-matrix
+switches. The failed startup is retained and contributes no speed evidence.
+
+The packed GDN audit also finds a concrete precision mismatch in its existing
+entry: the ordinary speculative path explicitly materializes beta in FP32,
+while the packed entry relied on the helper's FP16-input default. On a fixed
+TP2 q8 case, the old entry differs from the ordinary FP32-beta path in 5623
+output elements and 3142001 state elements, with maximum absolute differences
+of 3.8146973e-6 and 1.9565225e-5. The earlier shared-FP16-beta tests therefore
+do not admit the actual packed entry.
+
+The entry now explicitly requests FP32 beta. With the same FP32 gating,
+the packed subchain matches output and every pool-state bit through all eight
+acceptance selectors and changing-input graph replays. Sixteen distinct layer
+states measure 0.712 ms for QKV materialization, recurrence and output copy,
+versus 0.507 ms for direct packed recurrence. Common convolution and gating
+are outside this operator timing. The feature remains disabled pending live
+state and full-round validation; this finding is not attributed as the cause
+of historical text-quality changes while the packed feature was disabled.
+The actual-entry GPU regression passes for both TP2 and TP4 head geometry,
+with FP32 state, gaps between pool slots, all eight selectors, two changing
+replays per selector and untouched retired rows. Reproduce with
+`.venv/bin/python -m pytest --confcutdir=tests/kernels tests/kernels/test_sm70_dflash2_packed_gdn_fp32.py -q`
+(two tests passed).
+
 ## Reproduction and retained negative results
 
 Build Flash-V100 from this branch with the same CUDA/Torch/compiler flags and
