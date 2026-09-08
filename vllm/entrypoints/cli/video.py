@@ -45,9 +45,12 @@ class VideoSubcommand(CLISubcommand):
                 "--int8-weight-layout", choices=["row", "column"], default="column"
             )
             mode.add_argument(
+                "--fp16-weight-layout", choices=["row", "column"], default="row"
+            )
+            mode.add_argument(
                 "--residual-sequence-parallel",
                 action="store_true",
-                help=("Experimental FP32 residual sharding for TP4 FL2VA INT8"),
+                help="Experimental FP32 residual sharding for TP2/TP4; TP1 is a no-op",
             )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             mode.add_argument(
@@ -109,6 +112,7 @@ class VideoSubcommand(CLISubcommand):
             fp16_cache_layers=tuple(args.fp16_cache_layer),
             lora_path=args.lora_path,
             int8_weight_layout=args.int8_weight_layout,
+            fp16_weight_layout=args.fp16_weight_layout,
             residual_sequence_parallel=args.residual_sequence_parallel,
             video_encoder=args.video_encoder,
         )

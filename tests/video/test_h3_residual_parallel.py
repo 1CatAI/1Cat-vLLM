@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TP4 residual tests: launch the GPU cases with torchrun --nproc-per-node=4."""
+"""Residual tests: launch the GPU cases with torchrun --nproc-per-node=2 or 4."""
 
 import argparse
 import os
@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.model_executor.models.minimax_h3.config import H3Config, H3InputError
+from vllm.model_executor.models.minimax_h3.config import H3Config
 from vllm.model_executor.models.minimax_h3.transformer import MiniMaxH3DiTBlock
 
 
@@ -35,14 +35,13 @@ def test_residual_parallel_accepts_native_sm70_backends(backend):
         {"lora_path": "adapter.safetensors"},
     ],
 )
-def test_residual_parallel_rejects_unvalidated_deployments(change):
+def test_residual_parallel_accepts_compatible_deployments(change):
     config = H3Config(
         transformer_path="int8.safetensors",
         attention_backend="FLASHINFER_SM70",
         residual_sequence_parallel=True,
     )
-    with pytest.raises(H3InputError, match="residual sequence parallelism"):
-        replace(config, **change)
+    assert replace(config, **change).residual_sequence_parallel
 
 
 @pytest.mark.parametrize("mode", ["generate", "serve"])
@@ -89,8 +88,9 @@ def test_residual_parallel_rejects_invalid_rows_before_collectives(
 
 @pytest.fixture
 def tp4_group():
-    if os.environ.get("WORLD_SIZE") != "4":
-        pytest.skip("requires torchrun --nproc-per-node=4 on a leased GPU group")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size not in (2, 4):
+        pytest.skip("requires torchrun with TP2/TP4 on a leased GPU group")
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
@@ -104,10 +104,10 @@ def tp4_group():
     torch.accelerator.set_device_index(local_rank)
     torch.set_num_threads(2)
     with set_current_vllm_config(
-        VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=4))
+        VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world_size))
     ):
-        init_distributed_environment(4, rank, "env://", local_rank, "nccl")
-        initialize_model_parallel(4)
+        init_distributed_environment(world_size, rank, "env://", local_rank, "nccl")
+        initialize_model_parallel(world_size)
         try:
             yield get_tp_group()
         finally:
@@ -121,10 +121,20 @@ def test_gpu_residual_parallel_matches_replicated_blocks(tp4_group):
     for valid in (32, 33, 131):
         for backend in ("FLASH_ATTN_V100", "FLASHINFER_SM70"):
             _check_replicated_blocks(tp4_group, valid, backend)
+    for quantized in (False, True):
+        for backend in ("FLASH_ATTN_V100", "FLASHINFER_SM70"):
+            _check_replicated_blocks(
+                tp4_group, 131, backend, quantized=quantized, adapted=True
+            )
 
 
-def _check_replicated_blocks(group, valid, backend):
+def _check_replicated_blocks(group, valid, backend, *, quantized=False, adapted=False):
     from vllm.model_executor.models.minimax_h3.attention import attention_backend
+    from vllm.model_executor.models.minimax_h3.lora import TurboLinearMethod, lora_scale
+    from vllm.model_executor.models.minimax_h3.quantization import (
+        DiffusionInt8ConvRotConfig,
+        Int8ConvRotLinearMethod,
+    )
     from vllm.model_executor.models.minimax_h3.transformer import (
         MiniMaxH3DiTArchConfig,
     )
@@ -137,11 +147,19 @@ def _check_replicated_blocks(group, valid, backend):
         adaln_out_features=18 * 512,
     )
     token = attention_backend.set(backend)
+    quant = None
+    if quantized:
+        quant = DiffusionInt8ConvRotConfig(
+            layer_configs={
+                f"blocks.0.{name}": {"format": "int8_tensorwise", "convrot": True}
+                for name in ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
+            }
+        )
     try:
-        baseline = MiniMaxH3DiTBlock(arch, None, prefix="blocks.0").cuda().eval()
+        baseline = MiniMaxH3DiTBlock(arch, quant, prefix="blocks.0").cuda().eval()
         candidate = (
             MiniMaxH3DiTBlock(
-                arch, None, prefix="blocks.0", residual_sequence_parallel=True
+                arch, quant, prefix="blocks.0", residual_sequence_parallel=True
             )
             .cuda()
             .eval()
@@ -151,13 +169,41 @@ def _check_replicated_blocks(group, valid, backend):
     # Rank-dependent projection weights exercise real TP partial sums.
     torch.manual_seed(1234 + group.rank_in_group)
     for name, parameter in baseline.named_parameters():
-        if "norm" in name:
+        if parameter.dtype == torch.int8:
+            parameter.random_(-7, 8)
+        elif name.endswith("weight_scale"):
+            parameter.fill_(0.005)
+        elif "norm" in name:
             parameter.fill_(1)
         else:
             parameter.normal_(0, 0.03)
+    if adapted:
+        for block in (baseline, candidate):
+            for layer in block.modules():
+                method = getattr(layer, "quant_method", None)
+                if not getattr(method, "supports_prepared_fp16", False):
+                    continue
+                n, k = layer.weight.shape
+                layer.register_buffer(
+                    "h3_lora_a_0",
+                    torch.randn(8, k, dtype=torch.float16, device="cuda") * 0.01,
+                )
+                layer.register_buffer(
+                    "h3_lora_b_0",
+                    torch.randn(n, 8, dtype=torch.float16, device="cuda") * 0.01,
+                )
+                layer._sm70_f16_forbidden = True
+                layer.quant_method = TurboLinearMethod(method, [(0, 0, n)], 1.0)
     candidate.load_state_dict(baseline.state_dict())
+    for block in (baseline, candidate):
+        for layer in block.modules():
+            method = getattr(layer, "quant_method", None)
+            if isinstance(method, TurboLinearMethod):
+                method = method.base
+            if isinstance(method, Int8ConvRotLinearMethod):
+                method.process_weights_after_loading(layer)
     torch.manual_seed(42)
-    total = (valid + 3) // 4 * 4
+    total = (valid + group.world_size - 1) // group.world_size * group.world_size
     x = torch.randn(total, 512, device="cuda", dtype=torch.float32)
     x[::5, 0] = 70000  # Residuals must not pass through an FP16 collective.
     kwargs = dict(
@@ -168,12 +214,16 @@ def _check_replicated_blocks(group, valid, backend):
         max_seqlen=valid,
         packed_total=total,
     )
-    rows = total // 4
+    rows = total // group.world_size
     actual = x.narrow(0, group.rank_in_group * rows, rows).clone()
     expected = x.clone()
-    for _ in range(2):
-        expected = baseline(expected, **kwargs)
-        actual = candidate(actual, **kwargs)
+    scale_token = lora_scale.set(0.75 if adapted else 0.0)
+    try:
+        for _ in range(2):
+            expected = baseline(expected, **kwargs)
+            actual = candidate(actual, **kwargs)
+    finally:
+        lora_scale.reset(scale_token)
     actual = group.all_gather(actual, dim=0)
     assert actual.dtype == torch.float32
     assert torch.isfinite(actual).all()

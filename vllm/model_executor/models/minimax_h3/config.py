@@ -42,6 +42,7 @@ class H3Config:
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
     int8_weight_layout: str = "column"
+    fp16_weight_layout: Literal["row", "column"] = "row"
     residual_sequence_parallel: bool = False
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
@@ -52,6 +53,8 @@ class H3Config:
             raise H3InputError("partition must be fl2va or ref2va")
         if self.int8_weight_layout not in ("row", "column"):
             raise H3InputError("H3 INT8 weight layout must be row or column")
+        if self.fp16_weight_layout not in ("row", "column"):
+            raise H3InputError("H3 FP16 weight layout must be row or column")
         if self.tensor_parallel_size not in (1, 2, 4):
             raise H3InputError("native H3 supports TP1, TP2, or TP4")
         if self.attention_backend not in (
@@ -60,18 +63,6 @@ class H3Config:
             "TORCH_SDPA",
         ):
             raise H3InputError(f"unsupported H3 attention: {self.attention_backend}")
-        if self.residual_sequence_parallel and (
-            self.tensor_parallel_size != 4
-            or self.attention_backend not in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
-            or self.partition != "fl2va"
-            or not self.transformer_path
-            or self.lora_path is not None
-        ):
-            raise H3InputError(
-                "experimental residual sequence parallelism requires TP4, "
-                "FLASH_ATTN_V100 or FLASHINFER_SM70 and an FL2VA INT8 "
-                "ConvRot checkpoint without an adapter"
-            )
         if (
             not math.isfinite(self.fp16_weight_cache_gib)
             or self.fp16_weight_cache_gib < 0

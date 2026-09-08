@@ -520,6 +520,7 @@ class MiniMaxH3Pipeline(nn.Module):
         for layer in self.transformer.modules():
             method = getattr(layer, "quant_method", None)
             if method is not None:
+                layer.h3_fp16_weight_layout = config.fp16_weight_layout
                 method.process_weights_after_loading(layer)
         self.transformer.post_load_weights()
         self.turbo_spec = None

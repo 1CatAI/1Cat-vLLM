@@ -123,16 +123,27 @@ For INT8 MLPs, the native path combines FP32 SiLU/product evaluation and
 power-of-two FP16 input preparation in one kernel. The following projection
 restores the scale in FP32 before the normal TP reduction. This removes the
 large FP32 activation intermediate without lowering arithmetic precision or
-adding a persistent cache. CPU, unquantized and FP32-input paths keep their
-existing implementation.
+adding a persistent cache. Prepared inputs now also support original floating
+weights and active LoRA. LoRA restores the first A projection's row scale before
+preparing B, retaining both rounding boundaries and pre-reduction delta addition.
+The shared FP16 GEMM and preparation operators live outside the H3 model package.
+Original floating projections can opt into `--fp16-weight-layout column`; the
+default remains `row`. Layout preparation preserves logical weight coordinates
+and storage size. Full-workflow qualification is tracked in [GENERAL_SM70.md](GENERAL_SM70.md).
 
 For the measured TP4 FL2VA INT8 development workload, optionally add
 `--residual-sequence-parallel` to `video generate` or `video serve`. This keeps
 FP32 residual rows sharded across ranks and gathers normalized FP16 inputs at
 the existing precision boundary. Both native SM70 attention backends support
-this option; it rejects BF16, Ref2VA, adapters and non-TP4 configurations. It defaults to
-false. Normalized FP16 rows are now rotated locally before all-gather, avoiding
+this option. It now accepts original weights, Ref2VA and matching adapters on
+TP2/TP4; TP1 uses ordinary execution. It defaults to false. Runtime guards still
+require one request, FP32 residuals, aligned metadata and no Ulysses hooks.
+For projections that can consume only a rotated input, normalized FP16 rows
+are rotated locally before all-gather, avoiding
 four copies of the same ConvRot work while preserving gathered bits and GEMMs.
+An active adapter also needs the unrotated input, so the ordinary gather is
+retained there until a validated combined preparation removes that dependency.
+The following measurements predate the generalized route and do not qualify it:
 The native FlashAttention 39-frame/20-update run measures 58.190385 s
 and 6.195001125 GiB peak denoise allocation/card, versus 62.804019 s and
 6.566735744 GiB without the flag, with zero persistent cache in both cases.
