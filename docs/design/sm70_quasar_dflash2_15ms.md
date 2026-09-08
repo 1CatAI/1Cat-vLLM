@@ -903,9 +903,12 @@ projection outputs match the original operator; the four-layer working set
 changes from 0.379699 to 0.374784 ms with all seven paired differences
 positive. Because the candidate includes fixed-q8/cap64 as well, a direct cap64 pair is inconclusive: the arm medians are
 0.393216/0.400855 ms while six of seven paired differences favor the
-candidate. The samples have substantial time variation. A sustained-warmup
-ABBA screen with clock telemetry will resolve this before any model trial;
-clock drift is not yet established as the cause. This is not an additional
+candidate. The samples have substantial time variation. The sustained-warmup ABBA screen resolves the paired direction: all seven
+trials favor the candidate, with medians 0.376730/0.375122 ms. Each post-trial
+sample reports 1530/877-MHz SM/memory clocks. The approximately 0.0016-ms
+four-layer benefit is too small to justify another model route now; no model
+promotion follows. This does not establish what caused the earlier time
+variation (`results/qpn2-pair-load64-steady.json`). This is not an additional
 admitted gain over cap64 (`results/qpn2-pair-load64-real.json` and
 `results/qpn2-pair-load64-vs-cap64.json`).
 
@@ -923,9 +926,25 @@ serial and overlapping graph schedules on all four ranks. All 5120 packets
 per rank arrive, epochs are uniform, and projected/reduced output bytes
 match. The maximum observed candidate poll interval is 76757 device cycles.
 Because the probe changes the polling kernel, this does not clear the
-original multi-projection hang or measure a speedup. The next probe restores
-the consecutive projections and ordinary-push transition to localize the
-missing condition (`results/qpn2-publish-overlap-probe.json`).
+original multi-projection hang or measure a speedup. Restoring the consecutive projections and ordinary-push transition exposes
+all 5120 first-collective packets timing out on every rank. Once that
+perturbed poll exits, all seven later collectives receive their packets.
+The expected nonfinite-output assertion rejects the run; it is diagnostic
+evidence, not quality admission. It narrows the missing condition to the
+first collective in the larger graph, without proving a scheduling or
+memory-ordering root cause. See `results/qpn2-publish-overlap-probe.json`,
+`logs/qpn2-publish-overlap-multi-probe.log` and the per-rank saved probes.
+
+`benchmarks/kernels/build_sm70_grouped_attention_candidate.py` reproduces
+the private attention scheduling experiment from the repaired source. It
+supports the original one-group layout and the three-group candidate,
+preserves the native validation/math contract, copies the required headers
+and license, and records source/header/library hashes. The three-group
+source rebuild has DSO SHA256
+`e40120cb4788a7b1443fd48cd2e348df95c6782997d9040efd7aa778031acfeb`.
+All 45 output/workspace/guard comparisons pass for this rebuilt DSO
+(`results/attention-headsplit-versioned-correctness.json`). It installs no
+serving route; its operator gate is not an additional model speed claim.
 
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
