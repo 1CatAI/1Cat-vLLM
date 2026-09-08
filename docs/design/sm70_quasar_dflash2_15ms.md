@@ -470,7 +470,7 @@ model-distribution and acceptance gates are still required, so it is not enabled
 The subsequent forced-tape publication pair (`v4-publish-audit-control` /
 `v4-publish-audit-speed`) has 140 records per arm across all four ranks and
 two 128-token tapes. Requested layer 0/1 intermediates and conv/SSM state,
-target boundary/auxiliary tensors, and native logits are bitwise equal.
+target boundary tensors, and native logits are bitwise equal.
 Sampling TV is zero with no changed top-p support or top-1 rows. This gate
 retains the complete prefill records; it is not natural acceptance evidence.
 See `results/v4-publish-audit-comparison.json` and its separate manifest.
@@ -517,6 +517,46 @@ Rear-four telemetry during decode reports 1530-MHz SM clocks, 877-MHz memory,
 roughly 171--183 W draw under the unchanged 300-W limit, and no active clock
 event reason in the checked samples. Clock headroom is not credited as a
 remaining optimization.
+
+### Direct attention output: speed candidate held at the numerical gate
+
+`VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT` defaults to zero. It is armed only
+for SM70, DFlash2, TP4, FP16 dense Qwen3.5 with hidden size 5120. The decoder
+can consume the projection tensor already returned by attention. The new GDN
+opaque entry returns that allocation while retaining the full-forward operation
+order and explicit conv/SSM mutation arguments. It does not enable the existing
+long-prefill collective/norm switch. Other models keep the existing path.
+
+The initial artifact prototype failed during compilation because the existing
+GDN full-forward boundary required an output buffer even though the decoder
+could accept a direct return. The new return-valued opaque entry resolves that
+interface issue. Its schema marks both caches mutated and its return unaliased;
+the fake implementation passes shape/dtype checks at 1, 8, 135 and 4097 rows.
+Scoped Python lint, format and bytecode checks pass.
+
+One unprofiled artifact A/B startup per arm, five measured requests per fixture,
+gives 17.091/16.824 ms on release1k and 16.561/16.402 ms on MBPP28. All output
+hashes, natural EOS and acceptance lengths match. The source-integrated version
+also reaches this range, but **this candidate is not numerically cleared**.
+Its 140-record fixed-prefix comparison has identical captured layer 0/1
+intermediates and conv/SSM state, while all target-boundary hidden records and
+native logits differ. Maximum sampling TV is 0.0104069 with no changed top-p
+support or top-1 rows. These observations do not yet distinguish later-layer
+arithmetic/compiler effects from diagnostic perturbation. See
+`results/v4-direct-source-audit-comparison.json` and
+`results/direct-output-quality-hold.json`. A bounded eight-token probe captures
+GDN layer 2 and the first full-attention layer 3. Until the difference is
+localized and resolved, exclude this candidate from promoted combinations.
+
+The QPN2 input-layout screen is separate: arranging the same FP16 q8 input as
+`[K/16, 8, 16]` gives 0.387/0.357 ms across the real four-layer weight working
+set, bitwise equal in every projection. That screen excludes packing time and
+does not establish model speed. Gemma producers that write this layout directly
+pass 45 changing-input graph cases across no-residual, FP16-residual and
+FP32-residual contracts and three magnitude ranges. The subsequent model
+experiment is based on the cleared publication combination, with the direct
+attention-output switch disabled. See `results/qpn2-input-packed-real.json`
+and `results/packed-gemma-gate.json`.
 
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context

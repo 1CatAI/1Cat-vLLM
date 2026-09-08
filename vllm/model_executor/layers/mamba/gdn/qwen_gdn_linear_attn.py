@@ -3865,8 +3865,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ):
                 conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                     layer_name,
-                    output,
+                    hidden_states if output is None else output,
                 )
+                if output is None:
+                    return torch.ops.vllm.qwen_gdn_full_forward_direct(
+                        hidden_states,
+                        conv_state_cache,
+                        ssm_state_cache,
+                        layer_name,
+                    )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
                     output,
@@ -3880,7 +3887,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _full_forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ):
         return self._forward_method(hidden_states, output)
 
@@ -7157,6 +7164,34 @@ def qwen_gdn_full_forward_fake(
     """Fake implementation for torch.compile."""
 
 
+def qwen_gdn_full_forward_direct(
+    hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Keep the full-forward order while returning its projection allocation."""
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    # Match the original opaque op's explicit recurrent-state dependencies.
+    # Its eager body accesses these same caches through the layer object.
+    _ = conv_state_cache, ssm_state_cache
+    output = layer._full_forward(hidden_states, None)
+    if output is None:
+        raise RuntimeError("Direct GDN full-forward did not return a projection")
+    _log_runtime_route_once("SM70 Qwen GDN direct full-forward output route hit.")
+    return output
+
+
+def qwen_gdn_full_forward_direct_fake(
+    hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 def qwen_gdn_output_projection(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -7460,6 +7495,14 @@ direct_register_custom_op(
     op_func=qwen_gdn_full_forward,
     mutates_args=["output", "conv_state_cache", "ssm_state_cache"],
     fake_impl=qwen_gdn_full_forward_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_full_forward_direct",
+    op_func=qwen_gdn_full_forward_direct,
+    mutates_args=["conv_state_cache", "ssm_state_cache"],
+    fake_impl=qwen_gdn_full_forward_direct_fake,
 )
 
 

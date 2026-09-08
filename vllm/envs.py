@@ -244,6 +244,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT: bool = False
+    VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT: bool = False
     VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_FUSED_QKV_PACK: bool = False
@@ -2239,6 +2240,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
     "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT", "0"))
+    ),
+    # Return the existing projection tensor across the GDN opaque boundary.
+    # This does not enable collective/norm fusion or change state arithmetic.
+    "VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT", "0"))
     ),
     # Build Flash-V100 small-query verifier rows directly in their persistent
     # graph buffers. This replaces four repeat_interleave scans per KV group.

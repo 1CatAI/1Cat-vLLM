@@ -44,6 +44,7 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
+    _is_dflash2_spec_config,
     _qwen_gdn_run_recurrent_core,
     _resolve_qwen_gdn_kv_cache_args,
     _sm70_compile_graph_slice_dim,
@@ -66,6 +67,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -549,6 +551,15 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        self.sm70_dflash2_direct_attention_output = bool(
+            envs.VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and model_config.dtype == torch.float16
+            and config.hidden_size == 5120
+            and config.model_type == "qwen3_5_text"
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(
