@@ -786,6 +786,147 @@ in registers. It preserves all checked output bits, but the four-layer
 working set slows from 0.378491 to 0.433336 ms, with every paired trial
 slower. Reject it; see `results/qpn2-l2-prefetch-real.json`.
 
+### Follow-up draft and attention candidates
+
+A different GDN output-copy experiment preserves the original opaque GDN
+operator and its explicit state/output mutations. Its row-projection consumer
+writes directly into the existing output buffer. All 48 GDN layers hit on
+each rank, and both fixtures preserve canonical tokens, natural EOS and
+acceptance counts. However, release1k changes from 16.962519 to 17.066488 ms
+and MBPP28 from 16.517022 to 16.913165 ms. Reject this candidate for complete-
+round speed, without extending its quality tests
+(`results/v4-gdn-sink-ab.json`). This does not clear or reuse the earlier
+direct-attention-return candidate.
+
+The draft's live B1 query is eight rows. Its five query attention layers use
+fused QKV projections with TP4 shape N=1536, K=5120, rather than a standalone
+N=1024 query projection. The first private loader correctly stopped when
+only fifteen of twenty expected projections matched its module selection;
+it produced no model measurement. The corrected twenty-projection screen
+includes all three Q/K/V shards, unchanged FP16 weights, and the existing
+separate BF16-emulation/activation boundaries. Its raw FP16 HMMA implementation
+uses two FP32 accumulator chains. With four K partitions, the working-set
+pair is 1.458278/1.151078 ms, with non-increased FP64 reference error across
+three synthetic activation magnitudes. The earlier q-only projection screen
+is not a complete runtime draft-path measurement.
+
+Actual model inputs reveal why that synthetic gate is insufficient. The
+control-fed shadow captures five q8 query steps, twenty projections per step,
+on all four ranks. Among 400 comparisons with independent FP64 products,
+the four-partition candidate expands a reference metric three times: one
+gate/up maximum error and two QKV relative-L2 errors. It remains disabled
+despite improved aggregate errors. Re-evaluating exactly those saved inputs
+with eight or sixteen K partitions gives no expanded max, p99 or relative-L2
+metric in all 400 comparisons. The uniform eight-partition candidate then reaches a complete-model A/B,
+but it is not admitted: release1k changes from 16.890287 to 16.549846 ms
+while emitted tokens / rounds / accepted drafts change from 272 / 91 / 181
+to 270 / 91 / 179. The accepted-draft count falls and the token hash changes.
+MBPP28 changes from 16.458697 to 16.117234 ms, but its control trajectory
+is 457 / 96 / 361 instead of the canonical 634 / 130 / 504, which the
+candidate happens to reproduce. Do not treat this as a matched-output
+speedup or use its lower cost as the numerically cleared best result. See
+`results/v4-draft-q8-split8-ab.json`; distribution/acceptance gates stay open.
+See `results/draft-f16-q8-fused-real.json`,
+`results/draft-q8-actual-reference.json` and
+`results/draft-q8-actual-calibration.json`.
+
+An attention scheduling candidate divides six query heads into three groups
+of two, preserving each head's QK/PV arithmetic, probability compensation,
+K partitioning and FP32 numerator/max/sum storage. Forty-five changing-row-
+length graph states match output, the entire partial/max/sum workspace and
+canaries byte-for-byte, including a 262144-token case. A sixteen-layer screen
+with cache-eviction work between layers saves approximately 0.067 ms; this
+is not a complete-round result. Native memcheck reports zero errors.
+Racecheck reports shared-memory access warnings: isolated baseline-only and
+candidate-only probes each reproduce two warning sites. The unsynchronized
+candidate stays held. Adding an explicit warp barrier before lane 0 updates the online-softmax
+row state clears both isolated warning sites. Both the original CTA layout
+plus the barrier and the regrouped layout plus the barrier pass all 45
+output/partial/max/sum/guard comparisons, including zero rows and the
+262144-token operator case. Isolated racecheck reports zero hazards, errors
+and warnings for both variants. Neither this bounded check nor the original
+warnings establish a text-quality root cause. See `results/attention-headsplit-gate.json`,
+`results/attention-headsplit-memcheck.json`, and the corresponding isolated
+`logs/attention-race-{baseline,candidate}.log` files.
+
+The source fix in `flash_decode_paged.cu` orders each warp's shared-state
+reads before lane 0 overwrites the row maximum. NVIDIA documents
+[`__syncwarp` memory ordering](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html);
+a shuffle's synchronization does not provide that shared-memory ordering.
+The source SHA256 is
+`4e8a2ea7fe5315f30cdc66e4c60a90a9460b28e4ec723a6549892d03a2d5d9bd`.
+The standalone original-layout DSO is
+`21520f8d573bd7b8ec74943cac15385671c3f226bde9640d92b34ff3825ed472`;
+the regrouped-layout DSO is
+`690300fffc5f265642d8effbebfe89992fcaaed5a5a1764464ed4615eb8bc6ab`.
+See `results/attention-baseline-sync-gate.json`,
+`results/attention-headsplit-sync-gate.json`, and
+`logs/attention-{baseline,headsplit}-sync-racecheck.log`. Both variants also pass native memcheck over thirty short changing-row
+states and isolated synccheck, each with zero errors. The complete native FA rebuild has SHA256
+`bc8410cf09e87e6ca31679886fbe85e0a37bd010d7d6a317208e8b2a56ce9e01`.
+It passes 89 targeted grouped E4M3-FP32, E4M3 and legacy grouped-verifier
+tests, including the added short q8 multi-tile racecheck fixture. The first
+test launcher failed before importing the extension because Torch had not
+yet loaded `libc10`; the corrected entry explicitly imports Torch first.
+See `results/flash-sync-build.json` and `logs/flash-sync-native-tests-v2.log`.
+
+A QPN2 experiment assigns the two original FP32 accumulation chains to
+separate warps, preserving the final pairwise sum and K-partition order.
+All sixteen real-weight projection outputs match, but the four-layer
+working set slows from 0.387072 to 0.442921 ms; every paired trial is slower
+(`results/qpn2-chain-warps32-real.json`). Chain-specific code packing also
+passes the sixteen-output numerical screen on physical GPU 5. That screen
+ran with another task on GPUs 4/7 and only one timing iteration; its timing
+is excluded from performance evidence. Two isolated seven-pair screens reject the packed version as well:
+default carveout changes 0.406610 to 0.471409 ms, and 100% shared-memory
+preference changes 0.381563 to 0.514908 ms. All outputs remain byte-equal.
+CUDA's occupancy API gives the same theoretical block limits (2 / 4 / 2
+for gated-S8 / GEMM-S8 / GEMM-S16) before and after the carveout preference;
+these are resource estimates, not measured achieved occupancy. This path is
+closed (`results/qpn2-chain-packed-{default,carveout100}.json`).
+
+The synchronized head-regrouping model pair preserves both canonical token
+hashes, natural EOS and acceptance counts across all five measured requests
+per fixture. Complete-round medians change from 17.064797 to 16.912649 ms
+for release1k and 16.479594 to 16.451247 ms for MBPP28. This is one startup
+per arm and a small incremental gain; the subsequent 144-record full-prefix comparison is byte-equal for all
+captured intermediates, states and logits, with zero TV, changed top-p
+support rows or top-1 changes. See
+`results/v4-attention-headsplit-sync-ab.json` and
+`results/v4-attention-headsplit-sync-audit-comparison.json`. Final repeated-
+startup acceptance, broader counterexamples and full-model long-context
+validation remain separate gates.
+
+An adjacent-K16 weight/scale packing experiment retains the current q8
+accumulation chains and uses vector loads for pairs of groups. Sixteen
+projection outputs match the original operator; the four-layer working set
+changes from 0.379699 to 0.374784 ms with all seven paired differences
+positive. Because the candidate includes fixed-q8/cap64 as well, a direct cap64 pair is inconclusive: the arm medians are
+0.393216/0.400855 ms while six of seven paired differences favor the
+candidate. The samples have substantial time variation. A sustained-warmup
+ABBA screen with clock telemetry will resolve this before any model trial;
+clock drift is not yet established as the cause. This is not an additional
+admitted gain over cap64 (`results/qpn2-pair-load64-real.json` and
+`results/qpn2-pair-load64-vs-cap64.json`).
+
+Decoding half a K16 group's weights immediately before its corresponding
+MMA pair retains all sixteen projection outputs but is slower in every
+paired trial; reject it (`results/qpn2-late-decode64-vs-cap64.json`). A
+fixed-q8 publication producer increases compiled register use to 72 before
+capping. Its 64-register build preserves the serial protocol and all checked
+four-rank outputs/canaries, but gives only 0.453878/0.452792 ms across the
+four-layer collective screen with mixed-sign differences. No robust speed
+claim or model promotion follows (`results/qpn2-publish-fixed64-real.json`).
+
+A bounded device-polling probe completes one K4352 row projection under both
+serial and overlapping graph schedules on all four ranks. All 5120 packets
+per rank arrive, epochs are uniform, and projected/reduced output bytes
+match. The maximum observed candidate poll interval is 76757 device cycles.
+Because the probe changes the polling kernel, this does not clear the
+original multi-projection hang or measure a speedup. The next probe restores
+the consecutive projections and ordinary-push transition to localize the
+missing condition (`results/qpn2-publish-overlap-probe.json`).
+
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
 validation remain open. No new serving default or merge is claimed.
