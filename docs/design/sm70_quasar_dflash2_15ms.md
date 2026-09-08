@@ -390,6 +390,83 @@ communicator lifetime. This gain is too small to justify a full model candidate;
 it is not promoted. See `results/custom-ar-v4-mixed-size-gate.json` and
 `results/q8-push-grid-race.json`. No normalization arithmetic was changed.
 
+### QPN2 publication and communication arrival audit
+
+The private publication candidate moves the established 16-byte packet writes
+into the unchanged QPN2 arithmetic epilogue. Producer CTAs never poll or wait.
+A separate consumer preserves rank-ordered FP32 addition, FP16 materialization,
+sentinel escaping/cleanup and both epochs of the existing push pool. The normal
+projection output remains materialized. This differs from producer-poll fusion;
+the first implementation spilled its dynamically indexed peer-pointer array
+and was slower. Passing the local pointer directly eliminates those spills.
+The exact q8 row-projection kernels use 48 registers with no stack or spills;
+the consumer uses 40 registers with no stack or spills.
+
+`benchmarks/kernels/build_sm70_qpn2_publish_candidate.py` generates the private
+candidate from production source anchors and records source/DSO hashes. It does
+not replace a serving operator. `--build` builds the SM70 library with the same
+arithmetic flags as the production source. The generated CUDA source SHA256 is
+`7360d578080c96350970b9ceb42fa5e470627949c28219013d1daa0861acc42a`.
+Use a communicator built from the same header and set
+`VLLM_SM70_CUSTOM_AR_LIBRARY` to that sidecar; do not mix opaque communicator
+objects between libraries. The measured sidecar SHA256 is
+`e32f156f606c47dc5863a7785065f1fef9ff3668788d9c44e5f85c2264e8a7d1`.
+
+`benchmarks/kernels/benchmark_sm70_qpn2_publish.py` exercises sixteen real
+prepared projections on each of four ranks, with eight dependent all-reduces
+and an extra ordinary push call. Five changing-input cycles, alternating graph
+order, delayed ranks and output canaries pass byte-for-byte checks on projected
+and reduced tensors. The working-set screen measures 0.491/0.465 ms for
+control/candidate; it is not a complete model round. A focused memcheck and
+racecheck pass with zero errors using Gloo process coordination. The first
+NCCL-coordinated sanitizer run exited on CUDA API 209 during NCCL's kernel
+capability probing; it was not counted as a pass. Racecheck is a shared-memory
+check, not proof of all inter-GPU global-memory ordering.
+
+The model-screen DSO SHA256 is
+`3e5afdbdb176cf4ed7460e125f48f0bb1f36e85fae7107d33f48deb157919a37`.
+The reusable builder produces identical CUDA source; its independently rebuilt
+DSO `007298ccc086ac3181a29b9d745f32c76809a9d2b90158af474b2b94f3efc457`
+also passes the four-rank five-cycle correctness gate. Original sanitizer
+evidence is tied to the model-screen DSO, not relabeled as a rebuilt-DSO run.
+
+The task-local model integration preserves one opaque row-projection boundary
+in both arms, reuses the same compiler/autotuner cache, and enables publication
+only during q8 CUDA capture. All 128 target row projections hit on every rank;
+draft projections retain their existing path. One independent startup per arm,
+one warmup and five measured requests per fixture, without instrumentation:
+
+| Fixture | Matching publication control | Publication enabled | Saved |
+| --- | ---: | ---: | ---: |
+| release1k complete round | 17.232 ms | 17.073 ms | 0.159 ms |
+| MBPP28 complete round | 16.785 ms | 16.660 ms | 0.126 ms |
+
+All output hashes, natural EOS and both acceptance-length definitions match the
+earlier arms above. The matching control includes the new row-op boundary and
+rebuilt communicator: do not attribute its difference from the earlier
+17.366/16.953 ms result to publication. See
+`results/v4-publish-initial-ab.json`, per-startup source manifests and mapped
+library inventories. The model integration remains task-local and disabled
+by default; full state/distribution and repeated-startup gates remain open.
+
+Ordinal-matched communication in the four-rank packed trace shows that its
+first target push has mean kernel duration 0.388 ms, rank arrival skew 0.684 ms,
+and last-arrival-to-last-finish time 0.010 ms. The first draft push similarly
+measures 0.236/0.473/0.009 ms. Much of these particular kernel durations is rank
+waiting. Graph-node profiling can itself inflate arrival skew; these numbers
+do not establish unprofiled host overhead. The CPU sparse-target probe span
+includes waiting for queued target GPU work and must not be added again as
+independent CPU cost. See `results/v4-collective-arrival-audit.json`.
+
+Further exact QPN2 screens (shared-partial bank swizzle, cache policy and a
+33-percent shared-memory carveout hint) show either noise-level savings or
+regressions and remain unpromoted. A vectorized peer-read/Gemma prototype is
+exact but slower (eight joins: 0.100/0.264 ms); a local-push consumer design
+requires its own evidence. The existing draft TurboMind FP16 GEMM screen saves
+about 0.200 ms across twenty real-weight projections but is not bitwise equal.
+Its independent FP64-reference errors do not worsen in that primitive screen;
+model-distribution and acceptance gates are still required, so it is not enabled.
+
 The complete-round target below 15 ms, full distribution/state comparison for
 the final combination, repeated-startup acceptance gates, and long-context
 validation remain open. No new serving default or merge is claimed.
