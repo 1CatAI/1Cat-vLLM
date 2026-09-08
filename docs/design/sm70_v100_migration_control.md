@@ -28,12 +28,25 @@ exceeds the memory budget; shared-code, tiled and vector-reader screens remain
 slower and are rejected for model use. The TP2 worklog records the comparisons.
 Selective MLP packing fits the frozen context after unused TP2 FP16 head
 packing is disabled; its two-rank live shadow has zero differences across
-22353903616 output elements. Complete-round MLP performance is still pending.
+22353903616 output elements. One five-pair startup measures an additional
+35.903/32.768 to 35.414/32.294 ms improvement, with identical paired tokens
+and acceptance. The approximately 0.5 ms whole-round gain is much smaller
+than the projection microbenchmark; three-startup admission remains pending.
 The packed GDN entry also now requests FP32 beta, matching the ordinary
 speculative path. The previous implicit FP16 beta changes output and state
 bits in a fixed TP2 reproduction. Actual-entry TP2/TP4 tests pass with strided
 state and all acceptance selectors; packed GDN remains opt-in pending live
 and full-round gates.
+The updated trace still attributes about 14.786 ms to target projections
+and 6.832 ms to draft work. Register caps 48/40 and precomputed effective
+scales preserve operator bits but lose performance and are rejected. Initial
+GDN live diagnostics fail coverage because of padded metadata, then pooled
+state-pointer attribution; zero differences without per-layer coverage do
+not admit the packed route. The corrected shadow now covers 48 layers per
+rank, with zero bit differences across 2305032192 output and 295044120576
+state elements. Graph switching and whole-round benefit remain pending.
+The TP2 worklog retains both diagnostic failures and the
+profile wrapper's shutdown exit 137 separately from usable captured data.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

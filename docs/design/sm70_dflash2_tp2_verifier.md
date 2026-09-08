@@ -195,6 +195,7 @@ code and effective-scale storage avoids that duplication but is slower:
 | Shared codes, streaming loads | 0.896 | 0.921 | Reject |
 | Two / four adjacent N tiles | 0.896 | 1.081 / 1.614 | Reject |
 | Vector code load plus lane exchange | 0.887 | 0.907 | Reject |
+| Effective-scale-only repack, shared codes | 0.883 | 0.978 | Reject |
 
 All these exact variants match the sixteen outputs bit for bit. No slower
 variant advances to model testing. The shared layout reader references PR561;
@@ -221,7 +222,23 @@ Memcheck and racecheck pass for every supported split count 1 through 16 plus
 248068 calls, 22353903616 output elements, zero bit differences and zero
 nonfinite outputs. The TurboMind output drives generation. Both fixtures
 finish naturally and repeat within that startup; diagnostic timings are
-excluded. A complete-round paired performance result is still pending.
+excluded.
+
+One subsequent startup performs five unprofiled A/B pairs per fixture,
+switching only marked MLP graph regions between quiescent requests. Both arms
+retain the same prefill, attention u8, allocations, selected TurboMind splits
+and sampling. Every pair has identical tokens, acceptance and natural EOS:
+
+| Fixture | Control / candidate complete round, ms | Accepted drafts / round | Emitted tokens / round |
+| --- | ---: | ---: | ---: |
+| release1k | 35.903174 / 35.413639 | 2.063291 | 3.063291 |
+| MBPP28 | 32.767878 / 32.293540 | 3.500000 | 4.500000 |
+
+The complete-round benefit is only 0.490/0.474 ms. Do not extrapolate the
+approximately 20% projection microbenchmark into a multi-millisecond model
+gain. This is one startup, not the final three-startup performance gate.
+Raw evidence is `mlp-first-paired-summary.json` and
+`tp2-mlp-within-start-2-switch.json`.
 
 The first MLP graph-switch startup stops before its first request because the
 diagnostic queries edges of an unrelated graph and receives invalid argument.
@@ -251,6 +268,68 @@ with FP32 state, gaps between pool slots, all eight selectors, two changing
 replays per selector and untouched retired rows. Reproduce with
 `.venv/bin/python -m pytest --confcutdir=tests/kernels tests/kernels/test_sm70_dflash2_packed_gdn_fp32.py -q`
 (two tests passed).
+
+The first live packed-recurrence shadow has no positive coverage and is not
+a pass: it assumes state indices `[1,8]`, while the real q8 graph passes a
+padded `[8,8]` index buffer and `[8]` selector buffer. The active sequence count
+comes from the two-element cumulative-length tensor. Its metadata report is
+also written before capture and therefore misses later dispatches. A second
+diagnostic correctly slices the active row and observes zero output/state
+differences, but its per-layer gate fails: indexing counters by state-pool base
+collapses 48 GDN layers into eight shared pool addresses. These diagnostic
+failures remain retained; positive coverage must be attributed to actual
+layer identity before model admission.
+
+The third shadow attributes calls by the active GDN layer prefix and pool
+pointer, and resets its GPU counters after graph capture. The final admission
+snapshot covers all 48 layers on each rank: 93792 calls, 2305032192 output
+elements and 295044120576 state elements, with zero output/state bit
+differences, nonfinite values or unsupported active calls. Original output
+and state continue to drive generation. Both natural-stop fixtures complete;
+these shadow timings are excluded from performance evidence. The fail-closed
+client now requires 48 named, positive-coverage layers per rank.
+Evidence: `tp2-gdn-shadow-3-admission.json` and the per-rank shadow reports.
+
+### Updated target and draft attribution
+
+An actual candidate service with selective MLP and exact u8 attention captures
+twelve complete rounds; attribution uses the ten interior rounds, on both
+ranks. Both warmup and measured requests finish naturally with 242 tokens,
+79 rounds and 163 accepted drafts. The profiler wrapper subsequently exits
+137 during shutdown. The completed Nsight capture and exported SQLite are
+retained, but the job is not recorded as a clean success. No performance
+acceptance claim uses this instrumented service.
+
+The same critical-rank wall window closes as follows:
+
+| Diagnostic wall component | Mean, ms |
+| --- | ---: |
+| Complete round interval | 39.235763 |
+| GPU interval union inside that window | 36.186996 |
+| Uncovered wall interval | 3.048767 |
+
+Launch-correlated GPU service identifies the next priorities. These service
+sums use both ranks and are separate from the wall-clock closure:
+
+| GPU work | Mean service per rank and round, ms |
+| --- | ---: |
+| Target graph, total | 26.222108 |
+| Target QPN2 MLP projections | 8.903925 |
+| Remaining target TurboMind projections | 5.881736 |
+| Target exact scalar attention | 3.845147 |
+| GDN recurrent core | 1.577858 |
+| Draft proposal, total | 6.831827 |
+| Target head and sampling | 2.270963 |
+
+The QPN2 MLP kernel uses 52 registers/thread with no local-memory allocation
+in the native resource dump. Register-cap screens preserve all sixteen real
+matrix outputs and their FP64-reference errors, but are slower: matched
+0.716544 ms, cap 48 at 0.739584 ms and cap 40 at 0.888576 ms. Both are rejected.
+Moving effective-scale conversion to preparation also preserves every tested
+output bit but increases the working set from 0.708352 to 0.790528 ms. Reject
+it before model work. These are new measured negative results, not evidence
+of a changed numerical tolerance. Raw reports are `tp2-mlp-trace.json`,
+`tp2-qpn2-register-screen.json` and `tp2-qpn2-effective-scale-screen.json`.
 
 ## Reproduction and retained negative results
 
