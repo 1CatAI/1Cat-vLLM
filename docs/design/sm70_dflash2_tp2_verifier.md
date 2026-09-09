@@ -488,7 +488,12 @@ original recurrent arithmetic and stage count. Eight actual-entry GPU tests
 pass, including the original TP4 BV8 fallback with the new flag requested.
 The first test revision incorrectly expected TP4 BV16; every output/state
 check passed, and only that launch assertion failed. The corrected fixture
-and failed evidence are retained. The integrated model A/B remains pending.
+and failed evidence are retained. A subsequent source-integrated model A/B
+verifies the constructor flag on all 48 GDN layers per rank and toggles the
+source guard. All five pairs and warmup per fixture retain token IDs,
+acceptance and natural EOS. Release1k improves from 34.433621 to 34.063787 ms
+and MBPP28 from 31.428823 to 31.008482 ms. This confirms the source integration;
+it is a separate startup from the preceding three-start cohort.
 
 A separate collective launch-geometry screen keeps the original peer protocol,
 rank reduction order and DFlash2 normalization. All tested q7/q8 outputs,
@@ -523,7 +528,7 @@ Original outputs drive generation. The observed KV budget is 8870215885 and
 memory utilization 0.8 unchanged. The paired speed comparison retains the
 same allocation in both arms and switches those 192 projections against
 TurboMind; it does not compare separate startups or allocate both complete
-layout choices. Complete-round gain remains pending. The source kernels and
+layout choices. The source kernels and
 layouts remain private experiments. Evidence is
 `tp2-balanced-shadow-1-admission.json` and the two rank memory reports.
 The first paired startup stops before generation because the diagnostic
@@ -533,9 +538,57 @@ checks 192 unique prepared weight pointers and layer prefixes, and leaves
 all prefill pieces on the control path. The corrected startup runs five
 pairs per fixture with exact tokens, acceptance and natural EOS. Complete
 rounds improve from 35.178025 to 33.911462 ms on release1k and 32.107532 to
-30.847108 ms on MBPP28. Both arms retain packed BV16 and attention u8; the
-control uses TurboMind for all target projections. This is one startup and
-does not establish a paired comparison with the previous MLP-only layout.
+30.847108 ms on MBPP28 in the first corrected startup. Three independent
+startups now pass all fifteen measured pairs and warmup per fixture. The
+median of startup medians is 35.163780 to 33.911462 ms for release1k and
+32.052971 to 30.844085 ms for MBPP28. Candidate round p50/p90/p99 are
+33.878/34.173/36.521 and 30.791/31.315/31.913 ms, respectively. Median warm
+TTFT is 578.279/147.689 ms and pure decode is 89.938/147.626 tokens/s.
+Both arms retain packed BV16 and attention u8; the control uses TurboMind
+for all target projections. This does not establish a paired comparison
+with the previous MLP-only layout. Raw per-start acceptance and emitted
+counts remain separate in `balanced-three-start-pair-summary.json`.
+
+A subsequent private layout experiment stores one persistent code buffer,
+761200640 bytes of extra QPN2 scales and a 44564736-byte shared conversion
+workspace per rank. Integer word permutation reconstructs the original
+TurboMind prefill layout without changing weights or arithmetic. Live
+same-call shadow covers all 256 target projections on each rank: 495818
+calls and 35330540544 output elements total, with zero bit differences or
+nonfinite values. Original outputs drive generation. The observed KV
+budgets are 11804131533/11808325837 bytes, with the same maximum context
+and memory utilization. This is quality and memory evidence, not speed.
+The first paired startup stops before generation: the V2 full-graph manager
+calls its forward function with runtime mode NONE while capturing, so a
+FULL-runtime-mode guard misses the route. The revised private harness uses
+the existing SM70 decode-graph capture context and retains unique coverage
+and split-K checks for all 256 projections. The corrected startup passes all
+five paired requests and warmup per fixture: release1k improves from
+35.275544 to 33.318339 ms and MBPP28 from 32.274264 to 30.331608 ms.
+Candidate warm TTFT is 591.741/166.197 ms. Both arms materialize original
+prefill weights into the fixed workspace, so this new prefill cost must
+remain visible in TTFT rather than being attributed to decode. Three
+independent startups now pass all fifteen measured pairs and warmup per
+fixture. The median of startup medians is 35.281057 to 33.318339 ms for
+release1k and 32.180410 to 30.175731 ms for MBPP28. Candidate round
+p50/p90/p99 are 33.267/33.602/35.439 and 30.195/30.677/31.347 ms;
+warm TTFT is 592.478/165.612 ms and pure decode is 90.140/150.135 tokens/s.
+Per-start accepted and emitted counts remain separate in
+`single-layout-3-start-pair-summary.json`. A trace of the new projection
+combination is pending. This does not establish the 25 ms target.
+
+The first two conversion sanitizer jobs incorrectly retain a GDN-only
+kernel filter. Their zero-error summaries do not establish conversion-kernel
+memory or race coverage. Failed admission records and logs remain intact;
+the replacement gates explicitly select the conversion/materialization
+kernels and retain CUDA API error checking. Both corrected memcheck and
+racecheck gates pass twelve real rank/projection cases, conversion in both
+directions, original TurboMind M8/M129 consumers, changing graph inputs,
+changing layout flags and scratch canaries. The retained native library
+SHAs are `7e24b7f014df0060af6ba2e7eb8df88d1839d0cd483e96f1a0990a4954b09657`
+for static conversion and
+`41c8ad3998f7c826355b5333c17568fa4a617b899b56185debac5c58b7b6f640`
+for conversion with dynamic prefill materialization.
 
 An E2M1 register-permutation decoder is also exact on the sixteen-matrix
 screen but slower: 0.763648 versus 0.712960 ms. A separate scale-folding probe
@@ -568,6 +621,36 @@ A separate eight-value PV staging kernel also preserves all forty-four
 output/partial/statistic comparisons, but increases the page1648 working
 set from 3.858176 to 4.857088 ms and page3296 from 3.941120 to 4.908800 ms.
 It is rejected before model use.
+
+An E4M3 decoder probe constructs an exact FP16 bit pattern, converts it to
+FP32 and multiplies by 256. It retains signed zeros, reserved-NaN handling,
+all original QK/PV arithmetic and FP32 partial/reduction storage. All 256
+encodings and forty-four output/partial/statistic cases through 262144
+tokens match, with the same FP64-reference errors. The sixteen-layer
+working-set median is 3.429376 versus u8's 3.859712 ms on page1648, and
+3.465472 versus 3.942912 ms on page3296. The winning-library-only memcheck
+and racecheck pass; the earlier two-library memcheck reports the previously
+observed `cuKernelGetFunction` invalid-handle error and remains excluded.
+Twenty-four alternating graph replacements across six changing sequence
+lengths retain output and valid partial/statistic bits. Live model shadow
+now covers all sixteen logical attention layers on both ranks: 27040 calls
+and 664535040 output elements, with zero bit differences or nonfinite values.
+The first coverage check incorrectly equates unique KV base pointers with
+logical layers and fails after completing generation. Sixteen layers share
+eight KV memory pools, with distinct page-table pointers for the paired
+layers. The revised diagnostic attributes each call to the backend layer
+name and requires positive coverage for every layer. Original u8 outputs
+drive generation. Complete-round performance is still pending. This probe changes the
+decoder instructions, not the stored E4M3 KV precision. Its library SHA is
+`6dc516f8d629f15b578b0c287257fefa70cf4dc58a50878988642b38129b0cd7`.
+
+Another probe shares KV load/decode between two adjacent query heads in one
+CTA while retaining each original scalar head's arithmetic. All forty-four
+output/partial/statistic comparisons and FP64-reference errors match, but
+the working set regresses from 3.430144 to 4.232704 ms on page1648 and
+3.469312 to 4.279040 ms on page3296. It is rejected before sanitizer or
+model follow-up. These timings establish a regression, not a measured
+hardware-counter explanation of its cause.
 
 ### LM-head width and accumulation order
 
