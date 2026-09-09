@@ -18,12 +18,12 @@ from typing import cast
 
 from vllm.model_executor.models.minimax_h3.config import H3Config, H3Request
 
-from .gpu import acquire_gpu_group
+from .gpu import acquire_gpu_group, worker_device_mask
 from .gpu import select_gpu_group as select_gpu_group
 
 
 def _worker(rank, config, gpu_ids, endpoint, connection):
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    os.environ["CUDA_VISIBLE_DEVICES"] = worker_device_mask(gpu_ids)
     from datetime import timedelta
 
     import torch

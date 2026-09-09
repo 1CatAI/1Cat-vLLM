@@ -149,8 +149,13 @@ matrix dimensions and valid attention tokens, exclude padding/rotation/dequant,
 and divide by the maximum complete denoise duration across all four ranks.
 NVML utilization and standalone operator speed are diagnostic evidence only.
 
-The native engine reserves a whole available GPU group (0–3 first, then 4–7)
-with the shared 1Cat V100 per-card and group locks. The lease remains held until
+The native engine reserves a whole available GPU group with the shared 1Cat
+V100 per-card and group locks. An explicit `CUDA_VISIBLE_DEVICES` selection
+(NVML indices or GPU UUIDs) bounds the candidate groups; a busy selected group
+never falls back to unselected devices. UUIDs are recommended for launchers.
+Without a selection, devices with at least 30 GiB capacity form ordered groups,
+so a small display card does not shift the four-V100 grouping. Workers receive
+the leased devices as UUIDs to avoid CUDA/NVML ordinal-order differences. The lease remains held until
 its workers exit. A group reserved by another cooperating task is unavailable
 even while that task is between CUDA processes. If both groups are occupied or
 reserved, startup fails before model loading.
