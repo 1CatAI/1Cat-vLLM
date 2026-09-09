@@ -34,10 +34,43 @@ The reference sampler is Tongyi-MAI/Z-Image commit
 Image editing is deliberately outside this capability. The model registry must
 not advertise image editing, unsupported output sizes or unverified GPU quality.
 
-## Acceptance status
+## Acceptance — 2026-09-09
 
-CPU protocol and cancellation tests are included. V100 generation quality,
-fixed-seed progress on/off parity and Studio frontend acceptance are pending.
-This document does not establish model or workflow availability. Record source
-and model hashes, explicit GPU scope, dimensions, sampler recipe, output hashes,
-quality review, elapsed time and UI run IDs before promoting this integration.
+53 CPU media tests pass, covering protocol compatibility, real step counting,
+queued/running cancellation, restart idempotency, FP16 outlier handling, corrupt
+saved records and disk failure without a stalled queue. Pre-commit and CI pass.
+
+Actual Studio frontend runs on V100 SXM2 32 GB / PyTorch 2.10 / CUDA 12.8 produced:
+
+- Z-Image Turbo and Base: 1024 × 1024 PNG, seed 42, respectively 8 and 50 updates.
+- H3 Turbo 4: text, first/last-frame and image-reference videos, each 1344 × 768,
+  107 frames at 24 fps (4.458333 s), with synchronous 32 kHz stereo audio.
+- The image run uses one explicitly selected V100; H3 uses four. Display GPU is
+  excluded. ABI-matching SM70 extensions from `b6d91d61ff` are reused; this PR
+  changes no CUDA/C++ source and makes no power-policy changes.
+
+Z-Image Base now retains FP32 attention/modulation/residual range after measured
+FP16 overflow in layer 25 Q/K/V and later AdaLN scaling. It fits one 32 GB V100,
+but its 50-update original recipe takes roughly ten minutes in this setup.
+Turbo is the default for interactive creation. Images were visually checked;
+video playback/download and keyframe/reference consistency were checked in UI.
+
+Progress parity with fixed inputs/recipes/seeds:
+
+| Output | Enabled/disabled reporting |
+| --- | --- |
+| Z-Image Turbo PNG | Byte-identical (`a08ca43be383426e…`) |
+| Z-Image Base PNG | Byte-identical (`1d9db6d2e332c65a…`) |
+| Warm H3 keyframe MP4 | Byte-identical (`fb9dc41853af7778…`), including raw audio |
+
+First-run H3 audio has a maximum 5.44e-7 sample difference from warm runs, also
+present with reporting enabled in both runs; enabled/disabled warm outputs
+match exactly. Video frames match in all three cases. These are correctness
+checks, not a throughput benchmark or exhaustive validation of every allowed
+output dimension/duration.
+
+Weights and component code came from the checksum-verified ModelScope catalog:
+`Tongyi-MAI/Z-Image-Turbo`, `Tongyi-MAI/Z-Image`, `MiniMax/MiniMax-H3`,
+`Comfy-Org/MiniMax-H3`, and `lightx2v/Minimax-h3-Turbo`. The original model revision
+and complete manifest hashes are retained in deployment acceptance records.
+No Hub fallback is used by the native image path. Image editing remains disabled.
