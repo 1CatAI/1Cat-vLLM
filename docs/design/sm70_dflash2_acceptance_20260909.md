@@ -6,6 +6,34 @@ PR/main integration only if the gates pass. Quantization-independent
 optimizations must be available to other weight formats. The original sub-15-ms
 performance objective is not claimed achieved by this campaign.
 
+## Current capacity contract: 256K
+
+The user subsequently required 256K context without the evaluation's artificial
+16K generation cutoff. The server already used `--max-model-len 262144`; the
+cutoff came from the client request's `max_tokens=16384`. The old seed-one job
+was stopped deliberately and its partial records retained. Its exit code 143
+is an authorized protocol transition, not a numerical failure.
+
+The new `acceptance-256k` campaign retains the same prompts, seeds, weights,
+sampling and four GPUs. Before natural generation, the client uses the server's
+`/tokenize` renderer, verifies `max_model_len=262144`, and explicitly sets
+`max_tokens=262144-prompt_tokens`. The input is never truncated and EOS remains
+natural. A 135-token prompt therefore has a 262009-token output budget. The
+actual response's prompt count must match the tokenizer result. There is no
+separate 16K/32K generation cap. Reaching the model's total context limit is
+still reported as a length stop, never presented as natural completion.
+
+All three paired dataset launches are restarted with this policy; previous
+truncated cases run first. FP8, public-route and whole-stack controls use the
+same remaining-capacity policy. Speed requests also use the full remaining
+capacity while retaining the canonical natural-EOS fixtures. One-token prefix
+warmups and bounded teacher-forced operator diagnostics remain explicitly
+excluded from natural-generation quality and performance results.
+
+The corpus, capacity-policy checks, launch-time source archives and new results
+are separate from `acceptance-16ms`. The results below describe the historical
+16K-cap campaign and do not certify the new 256K-capacity campaign.
+
 ## Frozen evaluation
 
 The running reference checkout remains detached at
