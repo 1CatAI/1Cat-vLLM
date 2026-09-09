@@ -41,8 +41,7 @@ def source_provenance():
         *package.joinpath("video").glob("*.py"),
         *package.joinpath("model_executor/models/minimax_h3").glob("*.py"),
         package / "model_executor/layers/linear.py",
-        package / "model_executor/layers/sm70_diffusion.py",
-        package / "model_executor/layers/sm70_sparse_attention.py",
+        *package.joinpath("model_executor/layers").glob("sm70_*.py"),
     ]
     for path in sorted(paths):
         if path.is_file():
