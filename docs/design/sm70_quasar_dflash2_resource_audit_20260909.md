@@ -364,8 +364,93 @@ BV2 retains the original K reduction shape and one-warp schedule while exposing
 
 The explicit `sm70_gdn_value_tile_candidate_route.py` installer is limited to
 captured TP4/B1/q8 with twelve value heads and FP32 state. Other shapes/dtypes
-retain the original schedule. A live same-input/state shadow across every GDN
-layer is queued; no full-model quality or speed admission is inferred from the
-local screen. Evidence is `results/tp4-gdn-bv-screen.json` and
+retain the original schedule. The live same-input/state shadow now passes all 48 GDN
+layers on every rank, with at least 2230 calls per layer. Output/state bits,
+finite-value checks and active-slot validity all match. Original outputs drive
+shadow generation, and both natural trajectories remain canonical. This is
+diagnostic evidence, not a timing result. Evidence is `results/tp4-gdn-bv-screen.json` and
 `results/tp4-gdn-bv2-{memcheck,racecheck}.json`. Reusing FP32 Q/K normalization
 across value tiles is a separate unadmitted screen and is not combined yet.
+
+The first separate-startup unprofiled GDN pair retains five warmups and five
+measurements per fixture. Release1k changes 17.085427 -> 16.333210 ms and MBPP28
+16.551539 -> 15.969318 ms, with identical canonical token hashes, natural EOS,
+accepted-draft counts and emitted-token counts. Its control is slower than the
+prior context pair; the entire gap cannot yet be credited to BV2. The reversed
+pair measures control/candidate 16.585019/16.552420 ms for release1k and
+16.326226/16.324162 ms for MBPP28. All trajectories remain canonical, but
+these 0.032598/0.002064-ms differences do not establish a stable whole-round
+gain. Six CPU mocked checks also confirm q8 dispatch, other dtype,
+TP size, query width, eager and head-count fallbacks, and restored scope.
+See `results/gdn-value-tile-live-shadow-admission.json`,
+`results/gdn-value-tile-first-pair.json`, and
+`results/gdn-value-tile-cpu-dispatch.json`.
+
+Actual CUDA graph node tracing independently confirms the candidate route:
+all recurrent launches use grid `(1,64,12)`, one warp and 55 registers, versus
+the frozen `(1,16,12)` and 80 registers. The forty steady rank-rounds each
+contain all 48 recurrent calls. Their mean summed service falls from
+0.955449 to 0.682117 ms between the retained context and BV2 traces; QPN2
+service remains about 7.35 ms. These are profiled observations, not endpoint
+speed evidence or measured occupancy. The BV2 trace retains host/rank-wait
+outliers: critical-round p50 is 17.876601 ms and mean 18.513127 ms, with
+2.048493 ms mean uncovered GPU time. See
+`results/v4-gdn-value-tile-nodes-{trace,resource-trace}.json` and the four-worker
+runtime-map manifest. Separate-startup variability still needs isolation
+before the route is promoted.
+
+## Q/K reuse exposes a recursive FP32 rounding boundary
+
+The first private normalization-reuse screen leaves the immediate FP16 output
+unchanged but changes 62767 FP32 state elements on its first candidate case.
+Timing is skipped. A diagnostic tap is first checked against the frozen
+recurrence: both its output and complete state pool remain byte-equal.
+On the exact failing input, the standalone and in-recurrence normalized Q/K
+also match bytewise. Thus this candidate's first state difference is downstream
+of Q/K normalization, not in those normalized operands.
+
+PTX identifies a changed contraction boundary in the local four-element
+`h dot k` reduction. The frozen kernel first rounds the product at local K1,
+then contracts K0, K2 and K3 through FMA. Loading materialized normalized K
+allows the compiler to choose K0 as the initially rounded product. The
+subsequent warp reduction has the same shape, but these programs need not
+produce identical FP32 state. The output's FP16 rounding initially conceals it.
+
+The corrected private candidate makes the K1 product's rounding explicit with
+`mul.rn.f32` and retains the remaining reduction. All 48 checked cases across
+BV8, BV2 and corrected reuse now have zero output and complete-state bit
+differences. Sixteen-state working-set medians are 0.379136/0.303040/0.291456 ms;
+the extra gain over BV2 is only 0.011584 ms and is not a model gain. Further
+kernel safety, real-model shadow and whole-round validation remain open.
+This diagnosis concerns the new reuse experiment; it does not resolve the
+previous unrelated 4.33% repeat-start distribution discrepancy.
+
+Evidence: `results/tp4-gdn-precomputed-qk-screen.json`,
+`results/gdn-norm-tap-failure-comparison.json`,
+`results/gdn-norm-tap-failure-operands.pt`, and
+`results/tp4-gdn-precomputed-qk-fmafix-screen.json`. The corrected derived-source
+SHA256 is `ce200148aa03ab9da6692d69e07f5d48f8e58b1f08763aaa88972ab3b0e7acee`.
+The artifact root retains original/corrected Triton source, TTGIR and PTX.
+
+## Cooperative MLP publication: native gates pass
+
+A new private candidate executes gate/up and the dependent down projection
+inside a 160-CTA cooperative kernel, with one grid barrier between them. It
+retains the original dot-product chains, FP16 SiLU boundaries and packet
+publisher. The original consumer remains separate and starts after the local
+producer finishes; this does not revive the rejected pre-producer polling
+scheme. The launcher checks that all 160 CTAs can be resident before launch.
+Compilation reports 64 registers, 32768-byte shared storage and no local stack
+or spills; runtime confirms two resident CTAs per SM. Four ranks, four real
+consecutive-layer weight sets, nine changing-input cycles, skewed ranks and an
+additional ordinary push all preserve gate, down and reduced output bits and
+buffer canaries. Seven paired working-set trials measure 0.457871 -> 0.451072
+ms, about 1.5% locally; both arms drift during the trials, so raw samples are
+retained. Four-rank memcheck and racecheck exit zero, with zero reported errors
+or hazards. A private model shadow is queued to verify all 64 actual MLPs;
+there is no model-speed or final-quality admission yet.
+
+Reports are `results/qpn2-coop-mlp-{real,memcheck,racecheck}.json` with sanitizer
+logs and manifests alongside them. The private library SHA256 is
+`22a91bd9f9e8aa0cc1324b0482c0fc4d6fc695ef7b553935801a935e47194c31`;
+`candidates/qpn2-coop-mlp/cooperative-manifest.json` retains the source and flags.
