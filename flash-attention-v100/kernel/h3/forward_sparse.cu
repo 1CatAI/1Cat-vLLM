@@ -13,6 +13,7 @@
 #include <cutlass/gemm/kernel/default_gemm.h>
 
 #include "default_fmha.h"
+#include "vsa_layout.h"
 
 namespace {
 using Half = cutlass::half_t;
@@ -143,6 +144,8 @@ torch::Tensor sparse_forward_prevalidated(torch::Tensor q, torch::Tensor k,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("_h3_tile_qkv_prevalidated", &h3_vsa_layout::tile);
+  m.def("_h3_gate_untile_prevalidated", &h3_vsa_layout::finish);
   m.def("forward", &sparse_forward, pybind11::arg("q"), pybind11::arg("k"),
         pybind11::arg("v"), pybind11::arg("block_map"),
         pybind11::arg("block_sizes"), pybind11::arg("scale"));

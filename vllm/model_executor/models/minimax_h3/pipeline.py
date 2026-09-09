@@ -90,6 +90,7 @@ from .time_request import (
 )
 from .transformer import MiniMaxH3DiTBlock, MiniMaxH3DiTModel
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vsa import h3_vsa_workspace
 from .weight_cache import FP16WeightCache
 from .weights import iter_checkpoint_weights, resolve_model_root
 
@@ -1652,7 +1653,11 @@ class MiniMaxH3Pipeline(nn.Module):
                 "heads": transformer.blocks[0].attn.num_heads,
                 "head_size": transformer.blocks[0].attn.head_dim,
             }
-        with counter, self._resident_dit_layers_on_device(enabled=True):
+        with (
+            counter,
+            h3_vsa_workspace(),
+            self._resident_dit_layers_on_device(enabled=True),
+        ):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()

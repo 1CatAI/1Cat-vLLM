@@ -10,12 +10,63 @@ caches retain indices only; pooled activations, scores and gates are per-call.
 
 import functools
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 
 from vllm.model_executor.layers.sm70_sparse_attention import (
     _h3_block_sparse_attention as block_sparse_attention,
 )
+from vllm.model_executor.layers.sm70_sparse_attention import (
+    sparse_extension,
+)
+
+_layout_buffers: ContextVar[dict[tuple[torch.device, int], torch.Tensor] | None] = (
+    ContextVar("h3_vsa_layout_buffers", default=None)
+)
+
+
+@contextmanager
+def h3_vsa_workspace():
+    """Own intermediate buffers for one denoise request, including failures."""
+    buffers: dict[tuple[torch.device, int], torch.Tensor] = {}
+    token = _layout_buffers.set(buffers)
+    try:
+        yield
+    finally:
+        buffers.clear()
+        _layout_buffers.reset(token)
+
+
+def _layout_scratch(q: torch.Tensor, rows: int) -> torch.Tensor:
+    shape = (3, q.shape[0], rows, q.shape[2], q.shape[3])
+    buffers = _layout_buffers.get()
+    if buffers is None:
+        return torch.empty(shape, device=q.device, dtype=q.dtype)
+    key = (q.device, torch.cuda.current_stream(q.device).cuda_stream)
+    scratch = buffers.get(key)
+    if scratch is None or scratch.shape != shape or scratch.dtype != q.dtype:
+        scratch = torch.empty(shape, device=q.device, dtype=q.dtype)
+        buffers[key] = scratch
+    return scratch
+
+
+def _layout_ops(*operands: torch.Tensor):
+    # Preserve the generic path for strided or unaligned views and old wheels.
+    # In particular, a fused inference primitive must not hide autograd inputs.
+    if any(
+        not x.is_cuda or not x.is_contiguous() or x.requires_grad or x.data_ptr() % 16
+        for x in operands
+    ):
+        return None
+    ops = sparse_extension()
+    if not all(
+        hasattr(ops, name)
+        for name in ("_h3_tile_qkv_prevalidated", "_h3_gate_untile_prevalidated")
+    ):
+        return None
+    return ops
 
 
 @functools.lru_cache(maxsize=32)
@@ -141,6 +192,17 @@ def _pool_h3_tiles(x: torch.Tensor, sizes: torch.Tensor) -> torch.Tensor:
     return pooled.permute(0, 2, 1, 3)
 
 
+@functools.lru_cache(maxsize=32)
+def _get_h3_fused_indices(prefix_segments, video_shape, device):
+    """Cache only indices derived from already validated H3 geometry."""
+    partition, sizes, non_pad, untile, _, _ = _get_h3_tile_metadata(
+        prefix_segments, video_shape, device
+    )
+    source = torch.full((sizes.numel() * 64,), -1, device=device, dtype=torch.int32)
+    source[non_pad] = partition.to(torch.int32)
+    return source, untile.to(torch.int32)
+
+
 def _build_h3_block_map(
     scores: torch.Tensor,
     num_prefix_blocks: int,
@@ -207,28 +269,46 @@ def h3_vsa_attention(
     )
     blocks = sizes.numel()
     shape = (q.shape[0], blocks * 64, q.shape[2], q.shape[3])
-    tiled = []
-    for operand in (q, k, v):
-        target = torch.zeros(shape, device=q.device, dtype=q.dtype)
-        target[:, non_pad] = operand[:, partition]
-        tiled.append(target)
-    q_tiled, k_tiled, v_tiled = tiled
+    layout = _layout_ops(q, k, v, gate_compress)
+    if layout is None:
+        tiled = []
+        for operand in (q, k, v):
+            target = torch.zeros(shape, device=q.device, dtype=q.dtype)
+            target[:, non_pad] = operand[:, partition]
+            tiled.append(target)
+        q_tiled, k_tiled, v_tiled = tiled
+    else:
+        source, fused_untile = _get_h3_fused_indices(
+            tuple(prefix_segments), tuple(video_shape), q.device
+        )
+        scratch = _layout_scratch(q, blocks * 64)
+        q_tiled, k_tiled, v_tiled = layout._h3_tile_qkv_prevalidated(
+            q, k, v, source, scratch
+        ).unbind(0)
     q_pool, k_pool = (_pool_h3_tiles(x, sizes) for x in (q_tiled, k_tiled))
     scores = torch.matmul(q_pool, k_pool.transpose(-2, -1)) * scale
     block_map = _build_h3_block_map(scores, prefix_blocks, video_blocks, topk)
     output = block_sparse_attention(
         q_tiled, k_tiled, v_tiled, block_map, sizes, scale=scale
     )
-    gate_tiled = torch.zeros_like(q_tiled)
-    gate_tiled[:, non_pad] = gate_compress[:, partition]
     v_pool = _pool_h3_tiles(v_tiled, sizes)
     compressed = torch.matmul(torch.softmax(scores, dim=-1), v_pool)
     compressed = compressed.permute(0, 2, 1, 3).to(output.dtype)
-    output = (
-        output.view(q.shape[0], blocks, 64, q.shape[2], q.shape[3])
-        + compressed.unsqueeze(2)
-        * gate_tiled.view(q.shape[0], blocks, 64, q.shape[2], q.shape[3])
-    ).view_as(output)
+    if layout is None:
+        gate_tiled = torch.zeros_like(q_tiled)
+        gate_tiled[:, non_pad] = gate_compress[:, partition]
+        output = (
+            output.view(q.shape[0], blocks, 64, q.shape[2], q.shape[3])
+            + compressed.unsqueeze(2)
+            * gate_tiled.view(q.shape[0], blocks, 64, q.shape[2], q.shape[3])
+        ).view_as(output)
+        output = output[:, untile].contiguous()
+    else:
+        # Match the existing separate FP16 multiply and add rounding exactly.
+        # The returned tensor is fresh; only intermediate QKV storage is reused.
+        output = layout._h3_gate_untile_prevalidated(
+            output, compressed.contiguous(), gate_compress, fused_untile
+        )
     # Keep dynamic counts on the device until complete denoise accounting.
     # Padding and unselected blocks never contribute useful model FLOPs.
     pair_sizes = sizes.to(torch.int64)[:, None] * sizes.to(torch.int64)[None, :]
@@ -242,4 +322,4 @@ def h3_vsa_attention(
         "heads": q.shape[2],
         "head_size": q.shape[3],
     }
-    return output[:, untile].contiguous(), work
+    return output, work
