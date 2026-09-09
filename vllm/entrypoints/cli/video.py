@@ -40,14 +40,23 @@ class VideoSubcommand(CLISubcommand):
                 default="FLASH_ATTN_V100",
             )
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
+            mode.add_argument(
+                "--disable-host-weight-pinning",
+                dest="host_weight_pin_memory",
+                action="store_false",
+                help="Keep weight masters pageable when pinned copies exceed host RAM",
+            )
             mode.add_argument("--fp16-cache-layer", action="append", default=[])
             mode.add_argument(
                 "--int8-weight-layout", choices=["row", "column"], default="column"
             )
             mode.add_argument(
+                "--fp16-weight-layout", choices=["row", "column"], default="row"
+            )
+            mode.add_argument(
                 "--residual-sequence-parallel",
                 action="store_true",
-                help=("Experimental FP32 residual sharding for TP4 FL2VA INT8"),
+                help="Experimental FP32 residual sharding for TP2/TP4; TP1 is a no-op",
             )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             mode.add_argument(
@@ -109,8 +118,10 @@ class VideoSubcommand(CLISubcommand):
             fp16_cache_layers=tuple(args.fp16_cache_layer),
             lora_path=args.lora_path,
             int8_weight_layout=args.int8_weight_layout,
+            fp16_weight_layout=args.fp16_weight_layout,
             residual_sequence_parallel=args.residual_sequence_parallel,
             video_encoder=args.video_encoder,
+            host_weight_pin_memory=args.host_weight_pin_memory,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

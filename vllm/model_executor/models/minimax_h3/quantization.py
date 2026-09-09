@@ -37,6 +37,12 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
+from vllm.model_executor.layers.sm70_diffusion import (
+    fp16_gemm_input as fp16_gemm_input,
+)
+from vllm.model_executor.layers.sm70_diffusion import (
+    fp16_linear_prepared,
+)
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -63,45 +69,48 @@ logger = init_logger(__name__)
 _FORMAT = "int8_tensorwise"
 
 
-def fp16_gemm_input(x):
-    """Scale wide-range activations by exact powers of two before FP16 GEMM.
+class FP16LinearMethod(UnquantizedLinearMethod):
+    """Dense Tensor Core operands with explicit preparation and output precision."""
 
-    Leave headroom for the 256-channel rotation's worst-case amplification.
-    Row scaling is restored in FP32 after the projection.
-    """
-    flat = x.reshape(-1, x.shape[-1]).contiguous()
-    if flat.dtype == torch.float16:
-        return flat, None
-    if flat.dtype != torch.float32:
-        raise ValueError("H3 GEMM activations must be FP16 or FP32")
-    if flat.is_cuda:
-        from .cuda_ops import w8a16_extension
-
-        return w8a16_extension().prepare_fp16(flat)
-    maximum = flat.abs().amax(-1, keepdim=True)
-    _, exponent = torch.frexp(maximum)
-    scale = torch.ldexp(torch.ones_like(maximum), (exponent - 11).clamp_min(0))
-    return (flat / scale).half(), scale
-
-
-class FP32OutputLinearMethod(UnquantizedLinearMethod):
-    """Keep wide-range projection outputs in FP32 with FP16 Tensor Core inputs."""
+    output_fp32 = False
+    supports_prepared_fp16 = True
+    supports_rotated_input = False
 
     def process_weights_after_loading(self, layer):
-        layer.weight.data = layer.weight.data.contiguous()
+        if getattr(layer, "h3_fp16_weight_layout", "row") == "column":
+            layer.weight.data = layer.weight.data.t().contiguous().t()
+        else:
+            layer.weight.data = layer.weight.data.contiguous()
 
     def apply(self, layer, x, bias=None):
         if x.is_cuda:
-            from .cuda_ops import w8a16_extension
-
             values, scale = fp16_gemm_input(x)
-            output = w8a16_extension().gemm(values, layer.weight, True)
-            if scale is not None:
-                output = output * scale
+            output = self.apply_prepared(layer, values, scale)
             output = output.reshape(*x.shape[:-1], layer.weight.shape[0])
         else:
             output = torch.nn.functional.linear(x.float(), layer.weight.float())
-        return output if bias is None else output + bias.float()
+            if not self.output_fp32:
+                output = output.to(x.dtype)
+        return output if bias is None else output + bias.to(output.dtype)
+
+    def apply_prepared(
+        self, layer, values, scale, *, input_is_rotated=False, original_input=None
+    ):
+        if input_is_rotated:
+            raise ValueError("Dense weights require unrotated activations")
+        return fp16_linear_prepared(
+            values, layer.weight, scale, output_fp32=self.output_fp32
+        )
+
+
+class FP32OutputLinearMethod(FP16LinearMethod):
+    """Keep wide-range projection outputs in FP32 with FP16 Tensor Core inputs."""
+
+    output_fp32 = True
+
+
+def supports_prepared_fp16(layer):
+    return bool(getattr(layer.quant_method, "supports_prepared_fp16", False))
 
 
 def preserve_fp32_output(layer):
@@ -396,10 +405,20 @@ class Int8ConvRotLinearMethod(LinearMethodBase):
             output = torch.nn.functional.linear(x, weight, bias)
         return output.reshape(*original_shape[:-1], layer.weight.shape[0])
 
-    def apply_prepared(self, layer, values, scale, *, input_is_rotated=False):
+    supports_prepared_fp16 = True
+
+    @property
+    def supports_rotated_input(self):
+        return self.layer_config.convrot and self.layer_config.convrot_groupsize == 256
+
+    def apply_prepared(
+        self, layer, values, scale, *, input_is_rotated=False, original_input=None
+    ):
         """Project FP16 rows with an explicit scale restored before TP reduction."""
         from .cuda_ops import fp16_gemm, w8a16_extension
 
+        if input_is_rotated and not self.supports_rotated_input:
+            raise ValueError("Pre-rotated input requires matching ConvRot weights")
         ops = w8a16_extension()
         x = values.reshape(-1, values.shape[-1])
         if self.layer_config.convrot and not input_is_rotated:
@@ -423,9 +442,8 @@ def rotate_local_fp16(layer, values):
     if (
         values.is_cuda
         and values.dtype == torch.float16
-        and isinstance(method, Int8ConvRotLinearMethod)
-        and method.layer_config.convrot
-        and method.layer_config.convrot_groupsize == 256
+        and getattr(method, "supports_rotated_input", False)
+        and not getattr(method, "requires_original_input", False)
         and layer.bias is None
         and not layer.gather_output
     ):
@@ -436,7 +454,12 @@ def rotate_local_fp16(layer, values):
 
 
 class _H3RotatedColumnInput(ColumnParallelLinear):
-    def forward(self, input_, *, input_is_rotated=False):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if type(self.quant_method) is UnquantizedLinearMethod:
+            self.quant_method = FP16LinearMethod()
+
+    def forward(self, input_, *, input_is_rotated=False, original_input=None):
         if not input_is_rotated:
             return super().forward(input_)
         method = self.quant_method
@@ -445,16 +468,20 @@ class _H3RotatedColumnInput(ColumnParallelLinear):
             or input_.dtype != torch.float16
             or self.bias is not None
             or self.gather_output
-            or not isinstance(method, Int8ConvRotLinearMethod)
-            or not method.layer_config.convrot
-            or method.layer_config.convrot_groupsize != 256
+            or not getattr(method, "supports_rotated_input", False)
         ):
             raise ValueError(
                 "Pre-rotated H3 columns require bias-free INT8 FP16 inputs"
             )
         # The module still receives every gathered row: ordinary forward hooks
         # and useful-FLOP accounting retain the original full projection shape.
-        output = method.apply_prepared(self, input_, None, input_is_rotated=True)
+        output = method.apply_prepared(
+            self,
+            input_,
+            None,
+            input_is_rotated=True,
+            original_input=original_input,
+        )
         return (output, None) if self.return_bias else output
 
 
@@ -475,10 +502,10 @@ class H3RowParallelLinear(RowParallelLinear):
         if (
             not self.input_is_parallel
             or self.bias is not None
-            or not isinstance(self.quant_method, Int8ConvRotLinearMethod)
+            or not supports_prepared_fp16(self)
         ):
             raise ValueError(
-                "Prepared H3 rows require a bias-free INT8 local projection"
+                "Prepared H3 rows require a bias-free local FP16-capable projection"
             )
         output = self.quant_method.apply_prepared(self, input_, input_scale)
         if self.reduce_results and self.tp_size > 1:

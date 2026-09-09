@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.model_executor.layers import sm70_diffusion
 from vllm.model_executor.models.minimax_h3 import cuda_ops
 from vllm.model_executor.models.minimax_h3.quantization import (
     DiffusionInt8ConvRotConfig,
@@ -73,7 +74,9 @@ def test_real_tp4_projection_uses_exact_zero_workspace_plan(n, k, fp32):
 @cuda
 def test_missing_plan_falls_back_without_changing_math(monkeypatch):
     monkeypatch.setattr(
-        cuda_ops, "_column_major_plan", lambda *args: SimpleNamespace(supported=False)
+        sm70_diffusion,
+        "_column_major_plan",
+        lambda *args: SimpleNamespace(supported=False),
     )
     x = torch.randn(17, 256, dtype=torch.float16, device="cuda")
     w = torch.randn(65, 256, dtype=torch.float16, device="cuda")

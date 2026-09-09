@@ -435,7 +435,8 @@ def test_encoder_uses_functional_all_reduce_return():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_staging_preserves_aliased_weights_across_repeated_transfers():
+@pytest.mark.parametrize("pin_memory", [True, False])
+def test_staging_preserves_aliased_weights_across_repeated_transfers(pin_memory):
     from torch import nn
 
     from vllm.model_executor.models.minimax_h3.residency import PinnedModuleStager
@@ -445,7 +446,7 @@ def test_staging_preserves_aliased_weights_across_repeated_transfers():
     module.weight = nn.Parameter(backing)
     module.register_buffer("view", backing[3:7, 1:5])
     expected = module.view.clone()
-    stager = PinnedModuleStager(module, torch.device("cuda"))
+    stager = PinnedModuleStager(module, torch.device("cuda"), pin_memory=pin_memory)
     for _ in range(2):
         stager.load()
         assert module.weight.is_cuda and module.view.is_cuda
@@ -455,7 +456,8 @@ def test_staging_preserves_aliased_weights_across_repeated_transfers():
         )
         torch.testing.assert_close(module.view.cpu(), expected)
         stager.offload()
-        assert module.weight.is_pinned() and module.view.is_pinned()
+        assert module.weight.is_pinned() is pin_memory
+        assert module.view.is_pinned() is pin_memory
         torch.testing.assert_close(module.view, expected)
 
 

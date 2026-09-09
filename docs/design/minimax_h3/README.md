@@ -58,6 +58,15 @@ its downloaded model directory. Frozen revisions and port licenses are recorded
 in the model package's `UPSTREAM.md`. FFmpeg and FFprobe must be on `PATH` for
 reference-video/audio processing.
 
+For hosts that cannot hold every component's pinned CPU copy, use
+`--disable-host-weight-pinning` (Python: `host_weight_pin_memory=False`). This
+keeps pageable immutable masters for the DiT, text encoder and both VAEs.
+It preserves weights, layouts and computation, while allowing the OS to page
+inactive components; transfers and request startup can be slower. The original
+TP4 deployment holds about 157 GiB of CPU masters before loader temporaries and
+allocator caches, so all-pinned startup exhausted the tested 188 GiB host.
+See [GENERAL_SM70.md](GENERAL_SM70.md) for the complete floating-weight control.
+
 Use `--image first.png --keyframe-indices 0`, `--image last.png
 --keyframe-indices -1`, or two `--image` arguments with `--keyframe-indices 0 -1`
 for FL2VA. A Ref2VA instance uses `--partition ref2va` and the matching transformer
@@ -98,13 +107,13 @@ The measured 39-frame/20-update cache list and native cuBLASLt configuration
 are documented in [FLASHINFER_TO50.md](FLASHINFER_TO50.md), including exact
 commands, output comparison and the still-incomplete 50-second target.
 
-For the experimental FlashInfer TP4 INT8 FL2VA route, add
-`--residual-sequence-parallel` to shard FP32 residual rows and reduce TP
-communication. It defaults off and changes floating-point reduction order.
-The unchanged 39-frame/20-update denoise measures 66.863312 seconds; automatic
-checks pass, while five-axis human quality review and the 50-second target
-remain open. See [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md) for output
-differences, GPU tests, current hardware counters and rollback.
+The earlier experimental FlashInfer residual route changed reduction order;
+its historical results and unaccepted differences are recorded in
+[FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md). Current residual sharding uses
+the ordinary full FP32 all-reduce before selecting local residual rows. It
+preserves the complete four-step control bitwise, and does not claim the old
+reduce-scatter communication saving. It remains explicitly enabled with
+`--residual-sequence-parallel` and requires wider quality/performance validation.
 
 The subsequent probability-tile layout change reduces this same optional
 route to 65.804661 seconds and preserves its video/audio outputs bitwise.
@@ -123,16 +132,27 @@ For INT8 MLPs, the native path combines FP32 SiLU/product evaluation and
 power-of-two FP16 input preparation in one kernel. The following projection
 restores the scale in FP32 before the normal TP reduction. This removes the
 large FP32 activation intermediate without lowering arithmetic precision or
-adding a persistent cache. CPU, unquantized and FP32-input paths keep their
-existing implementation.
+adding a persistent cache. Prepared inputs now also support original floating
+weights and active LoRA. LoRA restores the first A projection's row scale before
+preparing B, retaining both rounding boundaries and pre-reduction delta addition.
+The shared FP16 GEMM and preparation operators live outside the H3 model package.
+Original floating projections can opt into `--fp16-weight-layout column`; the
+default remains `row`. Layout preparation preserves logical weight coordinates
+and storage size. Full-workflow qualification is tracked in [GENERAL_SM70.md](GENERAL_SM70.md).
 
 For the measured TP4 FL2VA INT8 development workload, optionally add
 `--residual-sequence-parallel` to `video generate` or `video serve`. This keeps
 FP32 residual rows sharded across ranks and gathers normalized FP16 inputs at
 the existing precision boundary. Both native SM70 attention backends support
-this option; it rejects BF16, Ref2VA, adapters and non-TP4 configurations. It defaults to
-false. Normalized FP16 rows are now rotated locally before all-gather, avoiding
+this option. It now accepts original weights, Ref2VA and matching adapters on
+TP2/TP4; TP1 uses ordinary execution. It defaults to false. Runtime guards still
+require one request, FP32 residuals, aligned metadata and no Ulysses hooks.
+For projections that can consume only a rotated input, normalized FP16 rows
+are rotated locally before all-gather, avoiding
 four copies of the same ConvRot work while preserving gathered bits and GEMMs.
+An active adapter also needs the unrotated input, so the ordinary gather is
+retained there until a validated combined preparation removes that dependency.
+The following measurements predate the generalized route and do not qualify it:
 The native FlashAttention 39-frame/20-update run measures 58.190385 s
 and 6.195001125 GiB peak denoise allocation/card, versus 62.804019 s and
 6.566735744 GiB without the flag, with zero persistent cache in both cases.
@@ -141,6 +161,12 @@ run bitwise, so that run's checked decode is reused. Automatic checks pass;
 the sharded route changes FP32 reduction order from the default and its human
 quality review remains pending. Omit the flag to restore the default.
 These are short development measurements, not the 243-frame acceptance run.
+
+The generalized four-step/full-canvas check exposed substantial latent drift
+from reduce-scatter's FP32 addition order. Residual sharding now performs the
+same full all-reduce as the replicated path before selecting each rank's rows.
+This preserves the reference sum order and does not claim a communication-volume
+reduction. The old reduce-scatter speed figures above are not qualified outputs.
 
 Outputs include `video.mp4`, original decoded `audio.wav`, `run.json`, sampled
 `nvml.jsonl`, `quality.json` and frame screenshots. Automatic checks do not
