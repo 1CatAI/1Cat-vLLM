@@ -649,10 +649,11 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     ``precomputed_g`` and ``precomputed_beta`` retain the split verifier's
     exact gating materialization while still removing the packed-QKV rearrange.
     Omitting both computes gating inside the recurrent kernel.
+    Row-strided QKV views with contiguous features are consumed without a copy.
     """
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
-    if not mixed_qkv.is_contiguous():
+    if mixed_qkv.stride(1) != 1:
         mixed_qkv = mixed_qkv.contiguous()
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for mixed_qkv_out.")
@@ -677,6 +678,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         raise ValueError(
             f"mixed_qkv width {mixed_qkv.shape[1]} != expected {qkv_stride}."
         )
+    qkv_stride = mixed_qkv.stride(0)
     if out.shape != (T, 1, HV, V):
         raise ValueError(f"out must have shape {(T, 1, HV, V)}, got {out.shape}.")
     if scale is None:

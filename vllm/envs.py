@@ -243,10 +243,13 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT: bool = False
+    VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT: bool = False
     VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_FUSED_QKV_PACK: bool = False
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
+    VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS: bool = False
     VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC: bool = False
     VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH: bool = False
@@ -2234,6 +2237,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
     ),
+    # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT", "0"))
+    ),
+    # Return the existing projection tensor across the GDN opaque boundary.
+    # This does not enable collective/norm fusion or change state arithmetic.
+    "VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_DIRECT_ATTENTION_OUTPUT", "0"))
+    ),
     # Build Flash-V100 small-query verifier rows directly in their persistent
     # graph buffers. This replaces four repeat_interleave scans per KV group.
     # The matched TP4 trace is token/acceptance exact and cuts the synchronized
@@ -2257,6 +2269,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
+    ),
+    # Experimental fixed 8192/16-warp reduction for the FP16 no-residual and
+    # FP16-residual Gemma norms not covered by the existing FP32-residual path.
+    # Prevents per-rank/startup autotune from changing reduction order. Keep
+    # disabled until fixed-prefix, natural-output and full-round gates pass.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
     # DFlash2 proposal and target sampling distributions both have compact
