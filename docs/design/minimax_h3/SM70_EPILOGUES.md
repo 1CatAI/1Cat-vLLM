@@ -44,7 +44,30 @@ V100 SXM2 32GB. All GPU tests use an owned native lease. Evidence root:
 - `epilogue-binaries.json` retains the first tested binary. The strengthened
   alias check is in `epilogue-binaries-v3.json`; validation is recorded separately.
 
-Complete four-step latent/RGB/PCM comparison and one full warmup plus three
-unprofiled requests remain required before this change can be promoted.
-Independent official reference and full audiovisual review remain required
-even if frozen-mainline preservation passes.
+The final alias guard passed on GPU0 (`epilogue-alias-v3-gpu0.log`). An earlier
+GPU4 attempt was refused by an existing lease before starting the test.
+
+## Complete four-step control and measurements
+
+Source `7ea8908d83827dd8d82c34ba6a60b2beaa8057d6`, TP4, LightX2V four-step v1.2,
+W8A16, FA, exact residual sharding, no persistent FP16 weight cache, and the
+original 1280x736/124-frame internal canvas for the five-second sample:
+
+- `epilogue-quality.json`: final video/audio latents and all pre-encoding RGB
+  frames match frozen mainline bitwise; video SSIM 1, spectral cosine 1 and RMS
+  ratio 1. This is numerical preservation, not independent official acceptance.
+- `epilogue-720p-three-runs/performance.json`: one full warmup (64.373997 seconds
+  denoise) followed by three complete requests without profiler or captures.
+  Denoise times are 62.245159 / 62.183194 / 62.162648 seconds; CV 0.056387%.
+  Every rank reports median **49.905491–49.905510 useful TFLOP/s**. The declared
+  >80 gate fails and remains incomplete.
+- Complete request times are 84.363265 / 91.992465 / 88.620830 seconds. Peak
+  allocation remains 19,501,498,880 bytes per card. Exact source/kernel hashes,
+  per-step records and NVML samples are retained beside each run.
+- The 62.183194-second median is 5.64% below the audited original FA baseline
+  (65.898529 seconds). This measures the **combined** prepared/residual/epilogue
+  changes, not an isolated attribution to this CUDA epilogue. A separate matched
+  profile is necessary for attribution.
+
+Independent official reference, full audiovisual review, other adapters and
+the complete shape/TP matrix remain required. No AUTO selection is qualified.
