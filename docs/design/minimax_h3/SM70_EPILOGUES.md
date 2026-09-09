@@ -86,5 +86,25 @@ match frozen mainline bitwise (`q128-profile-quality.json`). A matching pair of
 full-denoise profiles is retained in `epilogue-profile-breakdown/` and
 `q128-epilogue-profile-breakdown/`; profiler timings are not acceptance results.
 The public kernel/CLI implementation additionally passes 69 GPU tail, storage,
-cross-attention-length and graph checks. Complete native API quality and three
-unprofiled measurements of this explicit option are still pending.
+cross-attention-length and graph checks; 53 strengthened comparisons also
+require exact equality between query geometries and reject invalid query tiles.
+
+The native option at source `6b39f1c23ca6834e9beead89b4cdf57548101e97` passes
+the complete latent/RGB/PCM comparison (`query-tile-quality.json`): both final
+latents and all 124 frames match frozen mainline bitwise; SSIM 1 and all audio
+gates pass. The same explicit configuration completed one full warmup plus
+three unprofiled requests (`query-tile-720p-three-runs/performance.json`):
+
+| Configuration | Median denoise seconds | Useful TFLOP/s/card | Denoise CV |
+| --- | ---: | ---: | ---: |
+| Audited original FA baseline | 65.898529 | 47.091839–47.091855 | 0.055668% |
+| Prepared/residual/epilogue, query tile 64 | 62.183194 | 49.905491–49.905510 | 0.056387% |
+| Same path, explicit query tile 128 | 59.748563 | 51.939038–51.939057 | 0.003793% |
+
+The last three denoise times are 59.743807 / 59.748563 / 59.748666 seconds.
+Complete request times are 81.805001 / 82.780855 / 84.272880 seconds and peak
+allocation remains 19,501,498,880 bytes/card. The 128-query setting reduces
+median denoise by 3.92% relative to the same prepared 64-query configuration,
+and the combined change reduces it by 9.33% relative to the original baseline.
+These measurements cover one five-second workflow only. **The >80 gate still
+fails; official reference, human review and the wider matrix remain pending.**
