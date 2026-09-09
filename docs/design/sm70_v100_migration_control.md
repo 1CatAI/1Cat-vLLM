@@ -66,6 +66,18 @@ A private LM-head probe confirms that default reduced vocabulary width
 changes split-K and FP32 logits; retaining the complete-head cuBLASLt plan
 restores bitwise selected logits. This is a reranking building block, with
 candidate coverage and model admission outstanding, not a speed claim.
+The clean packed-route trace still attributes 14.788 ms to target projections
+and 3.849 ms to attention. A smaller GDN V tile (BV2) passes the actual q8
+state/graph and sanitizer gates, then a two-rank live shadow with zero output
+and state differences; its full-round comparison against BV16 is pending.
+Adding 80 projections to the MLP layout fails the frozen 262144 context
+memory budget before generation. A replacement layout packs 64 MLP down and
+128 non-MLP projections instead, retaining gate/up on TurboMind. All 192
+layers per rank pass live bitwise comparison, and measured KV budget is
+about 8.26 GiB per rank. Complete-round gain is not yet established.
+E2M1 decoder changes and external logical-split CTAs are slower than the
+matched QPN2 kernel and remain rejected; retain the diagnostic scale-constant
+error separately from the corrected but slower implementation.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

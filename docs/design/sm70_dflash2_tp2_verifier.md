@@ -424,6 +424,96 @@ not share an established arithmetic order. Do not attribute historical text
 quality changes to this disabled candidate. Evidence is
 `tp2-fused-comm-norm-rank{0,1}.json`.
 
+### Packed-route trace and next projection scope, 2026-09-09
+
+A fresh service uses the actual packed GDN route with exact MLP and attention
+u8. Both warmup and measured release1k requests finish naturally with 280
+tokens, 96 rounds and 184 accepted drafts. Capture, SQLite export and owned
+service shutdown complete with exit zero. Ten interior rounds on both ranks
+give a critical-rank interval of 37.306504 ms, GPU union of 35.103202 ms and
+uncovered interval of 2.203302 ms. These remain instrumented diagnostics.
+
+| GPU work | Mean service per rank and round, ms |
+| --- | ---: |
+| Target graph | 25.422060 |
+| Target QPN2 MLP | 8.906423 |
+| Remaining target TurboMind projections | 5.881097 |
+| Target scalar attention | 3.848959 |
+| Draft proposal | 6.699200 |
+| Target head and sampling | 2.270655 |
+| All-phase gather/scatter/copy | 1.012917 |
+
+The packed GDN kernel launches 192 CTAs of 32 threads, with 128 registers per
+thread and zero static shared memory. Its mean invocation is 32.665 us. A
+separate q8 V-tile screen retains one warp and the original K dimension.
+BV16/8/4/2/32 all preserve output and every state bit through eight acceptance
+selectors and two changing replays, including strided QKV/state and retired
+rows. Sixteen distinct layer-state working sets measure respectively
+0.525824/0.455936/0.398592/0.392832/0.793984 ms. BV2 passes memcheck, racecheck
+and 24 graph-arm switches with padded metadata. Its subsequent live shadow
+covers all 48 GDN layers on each rank: 81120 calls compare 1993605120 output
+and 255181455360 state elements with zero bit differences, nonfinite values
+or unsupported active calls. The ordinary recurrence supplies the outputs
+and states used for generation; diagnostic latency is excluded. Complete
+rounds against packed BV16 remain pending. Independent multi-request GDN
+measurements do not admit this route. Raw evidence is `tp2-packed-trace.json`,
+`tp2-gdn-bv-screen.json`, `gdn-bv2-graph-switch-gate.json` and
+`tp2-gdn-bv2-shadow-1-admission.json`.
+
+A separate collective launch-geometry screen keeps the original peer protocol,
+rank reduction order and DFlash2 normalization. All tested q7/q8 outputs,
+residuals, signed-zero/cancellation inputs and changing graph replays match.
+The best q8 median improves by only about 0.33 us per invocation; no model
+gain or production setting is established. The first diagnostic stops before
+its first replay because the retained graph was not explicitly instantiated;
+the corrected run passes and the failed run remains excluded.
+
+Granular real-weight projection timing identifies a smaller next layout
+scope: all 64 target output projections and the 16 attention QKV projections.
+Together they require 896532480 additional bytes per rank, compared with the
+existing MLP layout's 4812963840 bytes. Their real-shard operator gates pass
+four changing-input graph cases and canaries; memcheck and racecheck cover
+both TP2 shards and all split counts 1 through 16 plus 32. Its first live
+shadow startup fails before generation: available KV is 5.14 GiB, below the
+5.58 GiB needed for the unchanged 262144 maximum length. Both ranks prepare
+208 projections, but there is no live quality or speed result. The static
+layout estimate alone did not establish the full runtime memory budget.
+
+The next private candidate instead retains 64 MLP down projections and all
+128 non-MLP projections; gate/up stays on TurboMind. This uses 3642163200
+layout bytes per rank, less than the previous MLP-only candidate. GDN input
+weights/scales retain zero-filled padding from 8240 to 8256 columns, and the
+producer output stride is unchanged. Eight real non-MLP shard cases pass
+changing-input graphs, full output bits, canaries, memcheck and racecheck
+across all supported splits; the MLP down gates are retained. The live shadow
+now covers all 192 projections on both ranks: 376904 calls compare
+18317493248 output elements with zero bit differences or nonfinite values.
+Original outputs drive generation. The observed KV budget is 8870215885 and
+8874410189 bytes, about 8.26 GiB per rank, with maximum length 262144 and
+memory utilization 0.8 unchanged. The paired speed comparison retains the
+same allocation in both arms and switches those 192 projections against
+TurboMind; it does not compare separate startups or allocate both complete
+layout choices. Complete-round gain remains pending. The source kernels and
+layouts remain private experiments. Evidence is
+`tp2-balanced-shadow-1-admission.json` and the two rank memory reports.
+
+An E2M1 register-permutation decoder is also exact on the sixteen-matrix
+screen but slower: 0.763648 versus 0.712960 ms. A separate scale-folding probe
+initially misreads the half constant `0x5c00` as 64 instead of 256; it changes
+1139840 output elements and is rejected before any model use. That diagnostic
+failure is retained independently of its corrected probe. Neither decoder
+experiment changes repository kernels or production behavior. The corrected
+256-factor probe restores all sixteen matrix outputs and FP64-reference
+errors, but is slower: 0.774144 versus 0.705024 ms, and is also rejected.
+
+A separate scheduling probe maps each existing logical split to its own
+32-thread CTA, then reduces explicit FP32 partials in the original order.
+All sixteen real-matrix outputs and FP64-reference errors match, and scratch
+canaries remain intact. The working-set median is 0.886016 ms versus
+0.711936 ms for the matched QPN2 kernel, so the extra launch/workspace path
+is rejected before model use. The result does not establish an instruction
+stall diagnosis; hardware performance counters remain unavailable.
+
 ### LM-head width and accumulation order
 
 The trace spends approximately 4.133 ms across the target and draft dense
