@@ -1452,7 +1452,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         if spec_sequence_masks is None:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m,
+                    decode_threshold=1,
+                    # A singleton prefill must initialize speculative GDN state,
+                    # rather than consume a recycled recurrent-state slot.
+                    treat_short_extends_as_decodes=not (
+                        self.use_spec_decode and m.is_prefilling is not None
+                    ),
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
