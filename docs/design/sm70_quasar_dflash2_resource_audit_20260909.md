@@ -1,7 +1,7 @@
 # QUASAR + DFlash2 complete-round resource audit, 2026-09-09
 
-The 15-ms goal is not met. The latest unprofiled screen with the actual grouped
-attention route is 16.638 ms for release1k and 16.248 ms for MBPP28. Both use
+The 15-ms goal is not met. The latest same-startup unprofiled GDN BV2 isolation
+measures 16.280 ms for release1k and 15.873 ms for MBPP28. Both use
 rear GPUs 4–7,
 TP4/B1/q8, E4M3 target KV, FP32 logits/state, the frozen model and natural
 EOS. One startup pair with five warmups and five measured requests per fixture
@@ -516,3 +516,53 @@ and the independent
 Their prepacked quadpair-on-N layout and independent accumulator mechanism
 are already represented in this campaign; their weight/KV contracts and
 published timings are not imported as this model's performance evidence.
+
+## Direct native m8 draft QK/PV: no whole-round admission
+
+The next native FlashInfer-fragment screen uses Volta's
+`mma.sync.aligned.m8n8k4` for the eight actual query rows. It preserves the
+original K4 accumulation order, K176 schedule, FP32 softmax and FP16
+probability boundary. A separate QK oracle compares original WMMA and native
+FP32 scores before softmax in 45 cases. Extending the same mechanism to PV
+adds 45 comparisons with nonzero FP32 initial accumulators. All 90 FP32
+comparisons are byte-equal; independent FP64 references are also retained.
+Twenty complete attention cases cover the actual 1648-token pages and changing
+graph inputs, with matching frozen FP16 outputs and intact canaries. Candidate
+FP32 LSE matches the parent fragment implementation, not an independent
+original-native LSE oracle.
+
+The QK-only implementation reports 180 registers and the combined QK/PV
+implementation 138, both with 73088-byte shared memory and zero spills.
+At 512/1024/4096 keys, frozen/combined medians are respectively
+0.043653/0.042240, 0.074793/0.074117 and 0.322703/0.360151 ms.
+The small short-context difference and longer-context regression do not
+justify a serving route. No sanitizer or model admission follows. These
+results do not establish the memory/issue bottleneck without counters.
+
+Evidence is `results/draft-{qk,qkpv}-m8-gate.json`. Generated source SHA256s
+are `b98ee65791dcafe46e0ccb7529feff7a555b9d5ab02798bb70fc2dd54a8bb6f0`
+and `1f6d113deb1144838de6f49aefa4328f9f5a45aeacdcde3793d9a94689d575a8`;
+their native DSO SHA256s are
+`a15460c1078136d84bd9630055fce7095b45b65f7c0b09ca08dea9e9d178d084`
+and `be9844d71c36b1ed6e9309fd8faf8388e07fa4ebea32a5d23c3169d9a9c86f9c`.
+Operand mapping follows NVIDIA's
+[PTX m8n8k4 fragment documentation](https://docs.nvidia.com/cuda/archive/11.0/parallel-thread-execution/index.html).
+
+## Positive QPN2 scale decoding: no stable gain
+
+A separate screen checks every actual scale byte in the four-rank,
+four-consecutive-layer working set before removing a redundant sign-bit
+construction. All scale bytes are below 128, and exhaustive bit mapping of
+those 128 codes matches the original. The two FP16 multiplies, HMMA chains,
+SiLU and rank reduction remain unchanged. Nine changing-input cycles, skewed
+ranks, dependent gate/down projections, mixed epochs and canaries all pass
+bytewise comparison.
+
+Seven paired working-set trials nevertheless measure 0.458691/0.459366 ms
+for control/candidate, with mixed signs in the paired differences. Keep this
+specialization off and do not advance it to a model test without new evidence.
+The result is `results/qpn2-positive-scales-real.json`. Column/row source
+SHA256s are `ef64e021cd88403acd2dfa676653fa293244aa280330338760e91c8b344198ee`
+and `ab2adf4c76298186eed97c684c461ed792c8d5c46c945f4be4e225ba465fe5d6`;
+DSO SHA256s are `ed02ddf8baac4d537caaf328d181ff9dca6fedaac15a7453410a37beb58aef9d`
+and `be15316b1f8471063803a3f87d4a5aee1c63f9955c5a57c17bb1c7dab019b968`.
