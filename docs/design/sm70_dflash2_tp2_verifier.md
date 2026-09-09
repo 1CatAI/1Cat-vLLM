@@ -574,8 +574,42 @@ release1k and 32.180410 to 30.175731 ms for MBPP28. Candidate round
 p50/p90/p99 are 33.267/33.602/35.439 and 30.195/30.677/31.347 ms;
 warm TTFT is 592.478/165.612 ms and pure decode is 90.140/150.135 tokens/s.
 Per-start accepted and emitted counts remain separate in
-`single-layout-3-start-pair-summary.json`. A trace of the new projection
-combination is pending. This does not establish the 25 ms target.
+`single-layout-3-start-pair-summary.json`. This does not establish the 25 ms
+target.
+
+The full-target QPN2 trace now covers ten interior rounds on both ranks,
+with 256 projection calls per rank per round. Profiled critical-rank wall
+is 35.615096 ms, GPU union 33.243090 ms and uncovered time 2.372007 ms.
+Target service is 23.626618 ms, draft 6.628412 ms, target head/sampling
+2.268724 ms and context/output 0.609346 ms. Projection shapes account for:
+
+| Projection | N / K / original split | Calls per round | GPU service, ms |
+| --- | --- | ---: | ---: |
+| MLP gate/up | 17408 / 5120 / 7 | 64 | 6.091905 |
+| MLP down | 5120 / 8704 / 8 | 64 | 2.790530 |
+| GDN input | 8256 / 5120 / 9 | 48 | 2.008633 |
+| Attention/GDN output | 5120 / 3072 / 9 | 64 | 1.278775 |
+| Attention QKV | 7168 / 5120 / 5 | 16 | 0.655133 |
+
+MLP gate/up and down account for approximately 69% of QPN2 service. Draft
+dense projections, including its head, cost 5.398522 ms. These are priorities
+for further work, not estimates of additive end-to-end savings. Hardware
+counters remain unavailable. The first profile attempt fails before
+generation because the launcher overrides the requested worker extension.
+The corrected capture and request complete with 280 output tokens, 96 rounds
+and 184 accepted drafts, matching warmup. Its bounded process cleanup exits
+137; the trace is not described as a clean exit-zero benchmark. The retained
+report, exported SQLite and interval/route checks admit only diagnostic use.
+Evidence is `tp2-single-layout-trace-admission.json`,
+`tp2-single-layout-trace.json` and `tp2-single-layout-projection-shapes.json`.
+
+The reproducible private-kernel generator is now checked in as
+`benchmarks/kernels/build_sm70_tp2_matched_qpn2.py`. It preserves the tested
+CUDA source byte for byte (SHA256
+`139ff11214d1fb49062efe1e6d9dc824588e5f2f14439435154d30b43915fc62`),
+including the original K64 partition boundaries, effective FP16 scale
+rounding, single accumulator chain and ordered partial sum. It generates
+an isolated library; it does not install a library or enable a serving route.
 
 The first two conversion sanitizer jobs incorrectly retain a GDN-only
 kernel filter. Their zero-error summaries do not establish conversion-kernel
@@ -640,8 +674,8 @@ logical layers and fails after completing generation. Sixteen layers share
 eight KV memory pools, with distinct page-table pointers for the paired
 layers. The revised diagnostic attributes each call to the backend layer
 name and requires positive coverage for every layer. Original u8 outputs
-drive generation. Complete-round performance is still pending. This probe changes the
-decoder instructions, not the stored E4M3 KV precision. Its library SHA is
+drive generation. This probe changes the decoder instructions, not the stored
+E4M3 KV precision. Its library SHA is
 `6dc516f8d629f15b578b0c287257fefa70cf4dc58a50878988642b38129b0cd7`.
 
 Another probe shares KV load/decode between two adjacent query heads in one
@@ -651,6 +685,28 @@ the working set regresses from 3.430144 to 4.232704 ms on page1648 and
 3.469312 to 4.279040 ms on page3296. It is rejected before sanitizer or
 model follow-up. These timings establish a regression, not a measured
 hardware-counter explanation of its cause.
+
+The exact FP16-bridge decoder now passes three independent startups with
+five alternating pairs after warmup per fixture. Both arms retain balanced
+192-projection QPN2, BV16 GDN and original u8 prefill. The median of startup
+complete-round medians is 33.895185 to 33.373525 ms on release1k and
+30.741620 to 30.641039 ms on MBPP28. All fifteen pairs and warmups match token
+IDs, acceptance counters and natural EOS. Candidate round p50/p90/p99 are
+33.289/33.683/35.361 and 30.564/31.070/32.148 ms; TTFT is 576.749/148.847 ms
+and pure decode 103.063/146.342 tokens/s. Per-start trajectories and accepted
+versus emitted counts are retained in `half-bridge-3-start-pair-summary.json`.
+This is not a paired comparison with the single-layout campaign.
+
+A K16-major activation-layout candidate also preserves all sixteen real
+matrix outputs, FP64-reference errors and three changing graph replays.
+The continuous four-layer working set regresses from matched QPN2's
+0.712448 to 0.722688 ms, even before input packing is charged. The tested
+candidate is rejected before producer or model integration. Its initial
+build omits operator registration and fails before GPU comparison; the
+corrected build and failure are retained separately. A separate experiment
+changes only the executable grid of the unchanged scalar attention kernel.
+It preserves outputs and valid partial/statistic bits but saves only about
+0.06–0.07 ms across sixteen KV layers. It is not advanced to a model route.
 
 ### LM-head width and accumulation order
 
