@@ -76,6 +76,7 @@ class DenoiseWorkCounter:
 
         self.flops = 0
         self.redundant_flops = 0
+        self.cache_decision_flops = 0
         self.calls = 0
         self.sparse_blocks = 0
         self.sparse_pairs = 0
@@ -120,6 +121,9 @@ class DenoiseWorkCounter:
                         effective = min(rows, audio_outputs)
                     n, k = layer.weight.shape
                     count = 2 * effective * n * k
+                    if getattr(model, "_h3_cache_decision", False):
+                        self.cache_decision_flops += count
+                        return
                     self.flops += count
                     self.by_layer[name] = self.by_layer.get(name, 0) + count
                     method = layer.quant_method
@@ -200,6 +204,8 @@ class DenoiseWorkCounter:
         pairs_before = self.sparse_pairs
         compression_before = self.sparse_compression_flops
         avoided_before = self.attention_avoided_flops
+        cache_decision_before = self.cache_decision_flops
+        blocks_before = dict(self.blocks)
         start.record()
         started = time.perf_counter()
         yield
@@ -212,13 +218,24 @@ class DenoiseWorkCounter:
                 "redundant_flops": self.redundant_flops - before[3],
                 "dit_calls": self.calls - before[1],
                 "executed_blocks": sum(self.blocks.values()) - before[2],
+                "executed_block_names": sorted(
+                    name
+                    for name, count in self.blocks.items()
+                    if count != blocks_before.get(name, 0)
+                ),
                 "sparse_blocks": self.sparse_blocks - sparse_before,
                 "sparse_token_pairs": self.sparse_pairs - pairs_before,
                 "sparse_compression_flops": self.sparse_compression_flops
                 - compression_before,
                 "attention_avoided_flops": self.attention_avoided_flops
                 - avoided_before,
-                "cache_hits": 0,
+                "cache_hits": int(
+                    sum(self.blocks.values()) - before[2] < self.blocks_per_call
+                ),
+                "cache_skipped_blocks": self.blocks_per_call
+                - (sum(self.blocks.values()) - before[2]),
+                "cache_decision_flops": self.cache_decision_flops
+                - cache_decision_before,
             }
         )
         self._step_events.append((start, end))
@@ -359,14 +376,19 @@ def _validate_sparse_work(rank, calls):
         dense_token_pairs=0,
     )
     for name, layer in layers.items():
+        executed_calls = (
+            rank["denoise_executed_blocks"][name.split(".attn.")[0]]
+            if workload["cache_algorithm"] is not None
+            else calls
+        )
         if any(type(layer[key]) is not int or layer[key] <= 0 for key in sums):
             raise ValueError("sparse work must use positive integer counts")
         if (
             layer["head_size"] != config["head_size"]
             or layer["heads"] != config["heads"]
-            or layer["selected_blocks"] != calls * per_layer_blocks
-            or layer["dense_token_pairs"] != calls * per_layer_dense_pairs
-            or layer["compression_flops"] != calls * per_layer_compression
+            or layer["selected_blocks"] != executed_calls * per_layer_blocks
+            or layer["dense_token_pairs"] != executed_calls * per_layer_dense_pairs
+            or layer["compression_flops"] != executed_calls * per_layer_compression
             or not layer["selected_blocks"]
             <= layer["selected_token_pairs"]
             <= min(layer["dense_token_pairs"], layer["selected_blocks"] * 64**2)
@@ -380,21 +402,17 @@ def _validate_sparse_work(rank, calls):
             sums[key] += layer[key]
     steps = rank["denoise_steps"]
     for step in steps:
+        executed = step["executed_blocks"] - 2
         if (
-            step["sparse_blocks"] != per_layer_blocks * config["gated_blocks"]
+            step["sparse_blocks"] != per_layer_blocks * executed
             or type(step["sparse_token_pairs"]) is not int
-            or not 0
-            < step["sparse_token_pairs"]
-            <= per_layer_dense_pairs * config["gated_blocks"]
-            or step["sparse_compression_flops"]
-            != per_layer_compression * config["gated_blocks"]
+            or not 0 <= step["sparse_token_pairs"] <= per_layer_dense_pairs * executed
+            or step["sparse_token_pairs"] < step["sparse_blocks"]
+            or step["sparse_compression_flops"] != per_layer_compression * executed
             or step["attention_avoided_flops"]
             != 4
             * config["head_size"]
-            * (
-                per_layer_dense_pairs * config["gated_blocks"]
-                - step["sparse_token_pairs"]
-            )
+            * (per_layer_dense_pairs * executed - step["sparse_token_pairs"])
         ):
             raise ValueError("sparse step counters disagree with executed geometry")
     if any(
@@ -411,13 +429,15 @@ def _validate_sparse_work(rank, calls):
 def _validate_workload(rank):
     workload = rank["denoise_workload"]
     sparse = workload["attention_algorithm"] == "vsa"
-    expected_version = "sparse_tp_v1" if sparse else "dense_tp_lora_v2"
+    cached = workload["cache_algorithm"] is not None
+    expected_version = (
+        "cached_tp_v1" if cached else ("sparse_tp_v1" if sparse else "dense_tp_lora_v2")
+    )
     if workload.get("work_accounting") != expected_version:
         raise ValueError("legacy work counts may include replicated LoRA projections")
-    if (
-        workload["attention_algorithm"] not in ("dense", "vsa")
-        or workload["cache_algorithm"] is not None
-    ):
+    if workload["attention_algorithm"] not in ("dense", "vsa") or workload[
+        "cache_algorithm"
+    ] not in (None, "tea_cache", "cache_dit"):
         raise ValueError(
             "sparse/cache workflows require their own measured work accounting"
         )
@@ -442,8 +462,8 @@ def _validate_workload(rank):
     for step in steps:
         if (
             step["dit_calls"] != 1
-            or step["executed_blocks"] != blocks
-            or step["cache_hits"] != 0
+            or (not cached and step["executed_blocks"] != blocks)
+            or (not cached and step["cache_hits"] != 0)
             or (not sparse and step["sparse_blocks"] != 0)
         ):
             raise ValueError("dense step work does not match the workflow")
@@ -458,16 +478,66 @@ def _validate_workload(rank):
         sum(step["useful_flops"] for step in steps) != rank["useful_denoise_flops"]
         or sum(rank["denoise_flops_by_layer"].values()) != rank["useful_denoise_flops"]
         or len(rank["denoise_executed_blocks"]) != blocks
-        or any(value != calls for value in rank["denoise_executed_blocks"].values())
+        or any(
+            not 1 <= value <= calls if cached else value != calls
+            for value in rank["denoise_executed_blocks"].values()
+        )
         or sum(step["redundant_flops"] for step in steps)
         != rank["redundant_denoise_flops"]
         or sum(rank["redundant_flops_by_layer"].values())
         != rank["redundant_denoise_flops"]
     ):
         raise ValueError("step, layer and complete-denoise work counts disagree")
+    if cached:
+        _validate_cached_work(rank, calls)
     if sparse:
         _validate_sparse_work(rank, calls)
     return workload
+
+
+def _validate_cached_work(rank, calls):
+    from collections import Counter
+
+    workload = rank["denoise_workload"]
+    algorithm, config = workload["cache_algorithm"], workload["cache_config"]
+    blocks = workload["blocks_per_call"]
+    main = {f"blocks.{i}" for i in range(blocks - 2)}
+    refiners = {"token_refiner.blocks.0", "token_refiner.blocks.1"}
+    observed: Counter[str] = Counter()
+    for index, step in enumerate(rank["denoise_steps"]):
+        names = step["executed_block_names"]
+        if (
+            len(names) != len(set(names))
+            or not refiners <= set(names) <= main | refiners
+        ):
+            raise ValueError("cached step has invalid executed block identities")
+        skipped = blocks - len(names)
+        if (
+            step["executed_blocks"] != len(names)
+            or step["cache_skipped_blocks"] != skipped
+            or step["cache_hits"] != int(skipped > 0)
+            or type(step["cache_decision_flops"]) is not int
+            or step["cache_decision_flops"] < 0
+        ):
+            raise ValueError("cache hit and actual block execution disagree")
+        if index == 0 and skipped:
+            raise ValueError("first step must populate the request's cache")
+        if skipped:
+            expected = refiners
+            if algorithm == "cache_dit":
+                first, last = config["Fn_compute_blocks"], config["Bn_compute_blocks"]
+                expected = (
+                    expected
+                    | {f"blocks.{i}" for i in range(first)}
+                    | {f"blocks.{i}" for i in range(blocks - 2 - last, blocks - 2)}
+                )
+            if set(names) != expected:
+                raise ValueError(
+                    "cached block pattern differs from its official policy"
+                )
+        observed.update(names)
+    if dict(observed) != rank["denoise_executed_blocks"]:
+        raise ValueError("cached step and layer execution records disagree")
 
 
 def evaluate_performance(runs, *, warmup):

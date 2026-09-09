@@ -39,6 +39,8 @@ class H3Config:
     tensor_parallel_size: int = 4
     attention_backend: str = "FLASH_ATTN_V100"
     vsa_topk: int = 64
+    cache_backend: str = "none"
+    cache_config: dict[str, Any] = field(default_factory=dict)
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
@@ -49,6 +51,11 @@ class H3Config:
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
+        from .request_cache import validate_cache_config
+
+        validate_cache_config(self.cache_backend, self.cache_config)
+        if self.cache_backend == "tea_cache" and self.partition != "fl2va":
+            raise H3InputError("official TeaCache is calibrated for FL2VA only")
         if not isinstance(self.host_weight_pin_memory, bool):
             raise H3InputError("host weight pinning must be a boolean")
         if self.video_encoder not in ("libx264", "h264_nvenc"):
@@ -117,8 +124,8 @@ class H3SamplingParams:
             raise H3InputError("H3 needs at least two sigma positions")
         if self.num_outputs_per_prompt != 1:
             raise H3InputError("native H3 generates one video per request")
-        if self.quality not in (None, "lossless"):
-            raise H3InputError("native H3 does not enable approximate step caches")
+        if self.quality not in (None, "lossless", "high"):
+            raise H3InputError("H3 quality must be lossless or high")
         for key in ("flow_shift", "audio_flow_shift"):
             value = self.extra_args.get(key)
             if value is not None and (

@@ -280,3 +280,82 @@ def test_memory_gate_and_variability_are_reported_separately():
     assert not report["memory_passed"]
     assert report["denoise_cv"] > 0.05
     assert not report["performance_passed"]
+
+
+def cached_measurements(algorithm="tea_cache"):
+    from collections import Counter
+
+    warmup, runs = measurements(calls=4, api_steps=5)
+    refiners = ["token_refiner.blocks.0", "token_refiner.blocks.1"]
+    all_blocks = refiners + [f"blocks.{i}" for i in range(50)]
+    reused = refiners if algorithm == "tea_cache" else refiners + ["blocks.0"]
+    for run in (warmup, *runs):
+        for rank in run["ranks"]:
+            rank["denoise_workload"].update(
+                work_accounting="cached_tp_v1",
+                cache_algorithm=algorithm,
+                cache_config={"rel_l1_thresh": 0.17}
+                if algorithm == "tea_cache"
+                else {
+                    "Fn_compute_blocks": 1,
+                    "Bn_compute_blocks": 0,
+                },
+            )
+            observed: Counter[str] = Counter()
+            for index, step in enumerate(rank["denoise_steps"]):
+                names = all_blocks if index in (0, 3) else reused
+                observed.update(names)
+                step.update(
+                    executed_blocks=len(names),
+                    executed_block_names=list(names),
+                    cache_hits=int(len(names) < 52),
+                    cache_skipped_blocks=52 - len(names),
+                    cache_decision_flops=123456789,
+                    useful_flops=len(names) * 10**12,
+                )
+            rank["denoise_executed_blocks"] = dict(observed)
+            rank["denoise_flops_by_layer"] = {
+                name + ".matrix": value * 10**12 for name, value in observed.items()
+            }
+            rank["useful_denoise_flops"] = sum(rank["denoise_flops_by_layer"].values())
+    return warmup, runs
+
+
+@pytest.mark.parametrize("algorithm", ["tea_cache", "cache_dit"])
+def test_cache_counts_only_executed_blocks(algorithm):
+    warmup, runs = cached_measurements(algorithm)
+    result = evaluate_performance(runs, warmup=warmup)
+    actual = runs[0]["ranks"][0]["useful_denoise_flops"]
+    assert result["rank_median_tflops"] == [actual / 60 / 1e12] * 4
+    assert actual < 4 * 52 * 10**12
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "first_hit",
+        "invented_hit",
+        "wrong_middle",
+        "duplicate",
+        "layer_total",
+        "overhead",
+    ],
+)
+def test_cache_validator_rejects_wrong_reuse_and_counts(invalid):
+    warmup, runs = cached_measurements()
+    rank = runs[0]["ranks"][0]
+    step = rank["denoise_steps"][1]
+    if invalid == "first_hit":
+        rank["denoise_steps"][0]["cache_hits"] = 1
+    elif invalid == "invented_hit":
+        step["cache_hits"] = 0
+    elif invalid == "wrong_middle":
+        step["executed_block_names"][-1] = "blocks.0"
+    elif invalid == "duplicate":
+        step["executed_block_names"][-1] = step["executed_block_names"][0]
+    elif invalid == "layer_total":
+        rank["denoise_executed_blocks"]["blocks.0"] += 1
+    elif invalid == "overhead":
+        step["cache_decision_flops"] = -1
+    with pytest.raises(ValueError):
+        evaluate_performance(runs, warmup=warmup)

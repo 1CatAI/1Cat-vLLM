@@ -24,6 +24,8 @@ from vllm.video.metrics import evaluate_performance
 
 
 def source_provenance():
+    import importlib.metadata
+
     import torch
 
     import vllm
@@ -36,7 +38,23 @@ def source_provenance():
         "vllm": vllm.__version__,
         "package_path": str(package),
         "sources_sha256": {},
+        "dependencies": {},
     }
+    for name in ("cache-dit", "huggingface-hub", "diffusers", "transformers"):
+        try:
+            distribution = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        record: dict = {"version": distribution.version}
+        if name == "cache-dit":
+            record["sources_sha256"] = {
+                str(path): hashlib.sha256(
+                    Path(str(distribution.locate_file(path))).read_bytes()
+                ).hexdigest()
+                for path in distribution.files or ()
+                if str(path).startswith("cache_dit/") and str(path).endswith(".py")
+            }
+        provenance["dependencies"][name] = record
     paths = [
         *package.joinpath("video").glob("*.py"),
         *package.joinpath("model_executor/models/minimax_h3").glob("*.py"),
