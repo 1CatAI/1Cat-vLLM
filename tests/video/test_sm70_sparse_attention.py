@@ -99,3 +99,33 @@ def test_sparse_all_blocks_matches_existing_64_key_arithmetic():
         scale=128**-0.5,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_h3_owned_sparse_route_preserves_output_without_host_scalar_reads():
+    from vllm.model_executor.layers.sm70_sparse_attention import (
+        _h3_block_sparse_attention,
+        sparse_extension,
+    )
+
+    assert hasattr(sparse_extension(), "_forward_prevalidated")
+    torch.manual_seed(814)
+    q, k, v = [
+        torch.randn(1, 192, 2, 128, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    ]
+    sizes = torch.tensor([17, 64, 3], device="cuda", dtype=torch.int32)
+    mask = torch.ones(1, 2, 3, 3, device="cuda", dtype=torch.bool)
+    mask[:, :, 1:, 1] = False
+    expected = block_sparse_attention(q, k, v, mask, sizes, scale=128**-0.5)
+    _h3_block_sparse_attention(q, k, v, mask, sizes, scale=128**-0.5)
+    torch.accelerator.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as prof:
+        actual = _h3_block_sparse_attention(q, k, v, mask, sizes, scale=128**-0.5)
+    assert not any(
+        event.key == "aten::_local_scalar_dense" for event in prof.key_averages()
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(RuntimeError, match="block map"):
+        _h3_block_sparse_attention(q, k, v, mask[:, :, :2], sizes, scale=128**-0.5)

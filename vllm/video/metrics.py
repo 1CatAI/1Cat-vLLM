@@ -78,6 +78,8 @@ class DenoiseWorkCounter:
         self.blocks: dict[str, int] = {}
         self.steps: list[dict] = []
         self._step_events = []
+        self._pending_sparse: list[tuple[int | None, str, int, dict]] = []
+        self._active_step: int | None = None
         self.by_layer: dict[str, int] = {}
         self.redundant_by_layer: dict[str, int] = {}
         self.handles = []
@@ -139,38 +141,11 @@ class DenoiseWorkCounter:
                     used = metadata.extra.get("valid_kv_length", q.shape[1])
                     if layer.backend == "FASTVIDEO_VSA":
                         work = metadata.extra["sparse_work"]
-                        count = 4 * work["selected_token_pairs"] * q.shape[3]
-                        compression = work["compression_flops"]
-                        self.sparse_blocks += work["selected_blocks"]
-                        self.sparse_pairs += work["selected_token_pairs"]
-                        self.sparse_compression_flops += compression
-                        avoided = (
-                            4
-                            * (work["dense_token_pairs"] - work["selected_token_pairs"])
-                            * q.shape[3]
+                        # Dynamic counts remain on the GPU while layers enqueue.
+                        self._pending_sparse.append(
+                            (self._active_step, name, q.shape[3], dict(work))
                         )
-                        self.attention_avoided_flops += avoided
-                        record = self.sparse_by_layer.setdefault(
-                            name,
-                            {
-                                "head_size": q.shape[3],
-                                "heads": q.shape[2],
-                                "selected_blocks": 0,
-                                "selected_token_pairs": 0,
-                                "compression_flops": 0,
-                                "dense_token_pairs": 0,
-                            },
-                        )
-                        for key in (
-                            "selected_blocks",
-                            "selected_token_pairs",
-                            "compression_flops",
-                            "dense_token_pairs",
-                        ):
-                            record[key] += work[key]
-                        key = name + ".compression"
-                        self.by_layer[key] = self.by_layer.get(key, 0) + compression
-                        self.flops += compression
+                        return
                     else:
                         count = 4 * q.shape[0] * q.shape[2] * used * used * q.shape[3]
                     self.flops += count
@@ -193,9 +168,15 @@ class DenoiseWorkCounter:
         pairs_before = self.sparse_pairs
         compression_before = self.sparse_compression_flops
         avoided_before = self.attention_avoided_flops
+        if self._active_step is not None:
+            raise RuntimeError("denoise counter steps cannot be nested")
+        self._active_step = len(self.steps)
         start.record()
         started = time.perf_counter()
-        yield
+        try:
+            yield
+        finally:
+            self._active_step = None
         end.record()
         self.steps.append(
             {
@@ -216,8 +197,67 @@ class DenoiseWorkCounter:
         )
         self._step_events.append((start, end))
 
+    def finish_sparse(self):
+        """Resolve all dynamic counters once, inside complete-denoise timing."""
+        if not self._pending_sparse:
+            return
+        import torch
+
+        tensors = []
+        for _, _, _, work in self._pending_sparse:
+            for key in ("selected_token_pairs", "selected_blocks"):
+                value = work[key]
+                if isinstance(value, torch.Tensor):
+                    if value.ndim != 0 or value.dtype != torch.int64:
+                        raise ValueError("sparse work counters must be int64 scalars")
+                    tensors.append(value)
+        values = iter(torch.stack(tensors).cpu().tolist() if tensors else [])
+        pending, self._pending_sparse = self._pending_sparse, []
+        for step_index, name, head_size, work in pending:
+            for key in ("selected_token_pairs", "selected_blocks"):
+                if isinstance(work[key], torch.Tensor):
+                    work[key] = next(values)
+            pairs, blocks = work["selected_token_pairs"], work["selected_blocks"]
+            compression = work["compression_flops"]
+            count = 4 * pairs * head_size
+            avoided = 4 * (work["dense_token_pairs"] - pairs) * head_size
+            self.flops += count + compression
+            self.sparse_pairs += pairs
+            self.sparse_blocks += blocks
+            self.sparse_compression_flops += compression
+            self.attention_avoided_flops += avoided
+            self.by_layer[name] = self.by_layer.get(name, 0) + count
+            key = name + ".compression"
+            self.by_layer[key] = self.by_layer.get(key, 0) + compression
+            record = self.sparse_by_layer.setdefault(
+                name,
+                dict(
+                    head_size=head_size,
+                    heads=work["heads"],
+                    selected_blocks=0,
+                    selected_token_pairs=0,
+                    compression_flops=0,
+                    dense_token_pairs=0,
+                ),
+            )
+            for key in (
+                "selected_blocks",
+                "selected_token_pairs",
+                "compression_flops",
+                "dense_token_pairs",
+            ):
+                record[key] += work[key]
+            if step_index is not None:
+                step = self.steps[step_index]
+                step["useful_flops"] += count + compression
+                step["sparse_blocks"] += blocks
+                step["sparse_token_pairs"] += pairs
+                step["sparse_compression_flops"] += compression
+                step["attention_avoided_flops"] += avoided
+
     def finish_steps(self):
         """Read events only after the caller's complete-denoise synchronization."""
+        self.finish_sparse()
         for record, (start, end) in zip(self.steps, self._step_events):
             record["gpu_seconds"] = start.elapsed_time(end) / 1000
         return self.steps
@@ -225,12 +265,17 @@ class DenoiseWorkCounter:
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, exc_type, *_):
+        try:
+            if exc_type is None:
+                self.finish_sparse()
+        finally:
+            self.close()
 
     def close(self):
         for handle in self.handles:
             handle.remove()
+        self._pending_sparse.clear()
 
 
 class NVMLMonitor:

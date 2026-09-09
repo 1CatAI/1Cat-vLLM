@@ -13,7 +13,9 @@ import math
 
 import torch
 
-from vllm.model_executor.layers.sm70_sparse_attention import block_sparse_attention
+from vllm.model_executor.layers.sm70_sparse_attention import (
+    _h3_block_sparse_attention as block_sparse_attention,
+)
 
 
 @functools.lru_cache(maxsize=32)
@@ -227,13 +229,13 @@ def h3_vsa_attention(
         + compressed.unsqueeze(2)
         * gate_tiled.view(q.shape[0], blocks, 64, q.shape[2], q.shape[3])
     ).view_as(output)
-    # Host scalars are deliberately recorded after sparse execution. No padded
-    # Tensor Core work or unselected block contributes to useful model FLOPs.
+    # Keep dynamic counts on the device until complete denoise accounting.
+    # Padding and unselected blocks never contribute useful model FLOPs.
     pair_sizes = sizes.to(torch.int64)[:, None] * sizes.to(torch.int64)[None, :]
     work = {
         "dense_token_pairs": q.shape[0] * q.shape[2] * q.shape[1] ** 2,
-        "selected_token_pairs": int((block_map * pair_sizes).sum().item()),
-        "selected_blocks": int(block_map.sum().item()),
+        "selected_token_pairs": (block_map * pair_sizes).sum(),
+        "selected_blocks": block_map.sum(),
         "compression_flops": 4 * q.shape[0] * q.shape[2] * blocks**2 * q.shape[3],
         "prefix_blocks": prefix_blocks,
         "video_blocks": video_blocks,

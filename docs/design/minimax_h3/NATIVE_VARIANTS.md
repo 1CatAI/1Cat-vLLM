@@ -1,5 +1,10 @@
 # Native H3 variant integration
 
+Current VSA development and its explicitly agreed 31.3-second stage are
+tracked in [VSA_QUALITY_SPEED.md](VSA_QUALITY_SPEED.md). Independent official
+GPU-kernel validation and >80 throughput remain future objectives; the
+existing full FP32-control quality failure has not been reclassified.
+
 This branch extends the prepared execution and workflow accounting stack
 (#571 / #578) with the pinned official FastH3 VSA algorithm. Performance above
 80 useful TFLOP/s/card, independent official full-sampling quality and human

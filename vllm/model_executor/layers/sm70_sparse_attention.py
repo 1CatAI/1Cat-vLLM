@@ -41,3 +41,14 @@ def block_sparse_attention(q, k, v, block_map, block_sizes, *, scale):
     logical order. Unused output rows remain zero. No dense fallback exists.
     """
     return sparse_extension().forward(q, k, v, block_map, block_sizes, scale)
+
+
+def _h3_block_sparse_attention(q, k, v, block_map, block_sizes, *, scale):
+    """Private route for H3-owned sizes and a nonempty mask built by H3.
+
+    Arbitrary external maps must use block_sparse_attention and its value
+    checks. Older wheels retain that checked entrypoint until rebuilt.
+    """
+    ops = sparse_extension()
+    forward = getattr(ops, "_forward_prevalidated", ops.forward)
+    return forward(q, k, v, block_map, block_sizes, scale)

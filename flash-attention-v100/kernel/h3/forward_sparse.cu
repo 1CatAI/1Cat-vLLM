@@ -48,9 +48,10 @@ __global__ __launch_bounds__(128, 1) void sparse_attention(
 }
 }  // namespace
 
-torch::Tensor sparse_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                             torch::Tensor block_map, torch::Tensor block_sizes,
-                             double scale) {
+torch::Tensor sparse_forward_impl(torch::Tensor q, torch::Tensor k,
+                                  torch::Tensor v, torch::Tensor block_map,
+                                  torch::Tensor block_sizes, double scale,
+                                  bool validate_values) {
   TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.size(0) > 0 && q.size(1) > 0 &&
                   q.size(1) % 64 == 0 && q.size(2) > 0 && q.size(3) == 128,
@@ -86,12 +87,14 @@ torch::Tensor sparse_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "SM70 sparse attention requires SM70");
-  TORCH_CHECK(
-      block_sizes.min().item<int>() > 0 && block_sizes.max().item<int>() <= 64,
-      "SM70 sparse attention block sizes must be in [1,64]");
-  TORCH_CHECK(
-      block_map.any(-1).all().item<bool>(),
-      "SM70 sparse attention requires a selected key for every query block");
+  if (validate_values) {
+    TORCH_CHECK(block_sizes.min().item<int>() > 0 &&
+                    block_sizes.max().item<int>() <= 64,
+                "SM70 sparse attention block sizes must be in [1,64]");
+    TORCH_CHECK(
+        block_map.any(-1).all().item<bool>(),
+        "SM70 sparse attention requires a selected key for every query block");
+  }
   // Aligned strides alone do not guarantee an aligned contiguous storage view.
   if (reinterpret_cast<uintptr_t>(q.data_ptr()) % 16) q = q.clone();
   if (reinterpret_cast<uintptr_t>(k.data_ptr()) % 16) k = k.clone();
@@ -121,8 +124,30 @@ torch::Tensor sparse_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   return output;
 }
 
+torch::Tensor sparse_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                             torch::Tensor block_map, torch::Tensor block_sizes,
+                             double scale) {
+  return sparse_forward_impl(q, k, v, block_map, block_sizes, scale, true);
+}
+
+// Private H3 route: the owner constructs immutable sizes from validated host
+// geometry and creates a nonempty mask by construction. Keep all device,
+// shape, dtype, alignment and indexing checks; only value reductions are
+// omitted.
+torch::Tensor sparse_forward_prevalidated(torch::Tensor q, torch::Tensor k,
+                                          torch::Tensor v,
+                                          torch::Tensor block_map,
+                                          torch::Tensor block_sizes,
+                                          double scale) {
+  return sparse_forward_impl(q, k, v, block_map, block_sizes, scale, false);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &sparse_forward, pybind11::arg("q"), pybind11::arg("k"),
         pybind11::arg("v"), pybind11::arg("block_map"),
         pybind11::arg("block_sizes"), pybind11::arg("scale"));
+  m.def("_forward_prevalidated", &sparse_forward_prevalidated,
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("block_map"), pybind11::arg("block_sizes"),
+        pybind11::arg("scale"));
 }

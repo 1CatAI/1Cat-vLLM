@@ -1678,6 +1678,7 @@ class MiniMaxH3Pipeline(nn.Module):
                     step_profiler=counter.step,
                 )
             torch.accelerator.synchronize()
+            counter.finish_sparse()
             dist.barrier()
             torch.accelerator.synchronize()
             self.stage_durations["denoise"] = time.perf_counter() - started
