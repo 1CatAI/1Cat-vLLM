@@ -616,8 +616,29 @@ the two frozen projection libraries, generated norm module and real-weight
 root explicitly; its `sm70_qpn2_graph_{nodes,layout}.py` helpers install no
 serving default. The first versioned four-rank rerun passes 72 cases per rank.
 The final helper revision adds the cuBLAS fallback check and uses the standard
-accelerator synchronization API. Evidence is retained in
+accelerator synchronization API. Its four-rank rerun passes another 72 cases
+per rank, including the untouched cuBLAS graph. The matching private helper's
+memcheck/racecheck reruns both exit zero with zero errors/hazards and no invalid
+API queries. A second model attempt finds the 128-pair full graph plus temporary
+compiler/piecewise graphs, so its broad count assertion fails before serving.
+The installer is then scoped directly to the model manager's owned
+`FULL / num_tokens=8 / num_reqs=1 / uniform_token_count=8` descriptor.
+
+The third attempt completes the same-startup five-warmup/five-measurement pair.
+All four ranks match 128 norm/projection pairs on that exact descriptor. The
+between-request sentinel check confirms all candidate producers were written
+and control requests leave their packed buffers untouched. Both fixtures keep
+canonical tokens, acceptance and natural EOS. Release1k medians are
+16.348511/16.328542 ms and MBPP28 16.001308/15.983139 ms. The paired MBPP savings
+include two regressions; approximately 0.02 ms is not a substantial or admitted
+full-round gain. Keep this candidate off. The original fixed-prefix quality
+hold is not cleared by these natural trajectories alone.
+
+Evidence is retained in
 `results/qpn2-layout-graph-*`, the corresponding queue records, and
-`candidates/qpn2-layout-model-v1`. Model fixed-prefix, acceptance and complete
-round admission remain open; this does not resolve the old repeat-start TV
-discrepancy by itself.
+`candidates/qpn2-layout-model-v{1,2}`. The full pair and raw samples are in
+`results/qpn2-layout-within-start-summary.json` and
+`results/v4-qpn2-layout-within-start-3-switch.json`, with their own four-worker
+runtime-library manifest. Final fixed-prefix, acceptance and complete-round
+admission remain open; this does not resolve the old repeat-start TV discrepancy
+by itself.
