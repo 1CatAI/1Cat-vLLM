@@ -566,3 +566,58 @@ SHA256s are `ef64e021cd88403acd2dfa676653fa293244aa280330338760e91c8b344198ee`
 and `ab2adf4c76298186eed97c684c461ed792c8d5c46c945f4be4e225ba465fe5d6`;
 DSO SHA256s are `ed02ddf8baac4d537caaf328d181ff9dca6fedaac15a7453410a37beb58aef9d`
 and `be15316b1f8471063803a3f87d4a5aee1c63f9955c5a57c17bb1c7dab019b968`.
+
+## QPN2 layout substitution within the original graph
+
+The preceding packed-input quality hold first diverges during prefill, before
+its q8 layout is active. A new diagnostic therefore retains the original
+Python/FX path and changes only executable q8 CUDA graph nodes after capture.
+Dependency ancestry and buffer addresses pair a norm with its QPN2 consumer.
+The replacement norm keeps its original row-major output and FP32 residual,
+and additionally writes private `[320,8,16]` storage. Only the paired projection
+receives the packed pointer. Original raw graph nodes and edges remain intact;
+the caller synchronizes and switches executable parameters between requests.
+This uses CUDA's documented
+[kernel-node parameter update interface](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html),
+not a change to the compilation boundary or prefill implementation.
+
+Four ranks each pass 216 real-weight projection cases across three residual
+contracts, three magnitudes and changing inputs. Eighty-one control/candidate/
+control replays per rank preserve output/residual bits, logical packed values,
+allocation canaries and the raw graph fingerprint. M1/M7 norm-plus-QPN2 graphs
+remain unmodified. M9/M32 checks cover norms only: the independently frozen raw
+QPN2 entry correctly rejects M greater than eight. The first script mistakenly
+used that entry for larger rows and is not recorded as a complete gate pass.
+The eight-column/norm working set has only a small local difference: rank 0
+medians are 0.294416/0.291616 ms. It excludes row projections, communication and
+the model round; no end-to-end saving is inferred.
+
+An initial graph reader mishandles the zero-edge single-node case. A later
+parameter-count probe intentionally reaches an invalid API index, producing
+4912 memcheck API errors despite passing data comparisons. Neither is a clean
+admission. Reading the known kernel signatures removes that probe; the next
+memcheck and racecheck each exit zero, with zero errors/hazards. Reports retain
+these separate attempts rather than filtering the earlier errors.
+
+The first model startup then stops during draft graph capture: the reader
+assumes pointer-array arguments for an unrelated cuBLAS kernel using the packed
+launch-parameter convention. No endpoint timing or model quality result is
+produced. The reader is narrowed to registered kernels before accessing their
+arguments; a separate unmodified-cuBLAS graph check is added. A subsequent
+model attempt remains necessary. The scoped installer also checks the target
+norm weights/epsilon and verifies packed producers were written on candidate
+requests and left untouched on control requests. These checks occur between
+requests, not inside the timed round.
+
+The explicit builder `build_sm70_qpn2_dual_norm.py` reproduces generated source
+SHA256 `346e063dfaf185650c279394588eac2663e12b886e179a7a6a71a899a6b9f096`
+from the pinned norm expressions. `benchmark_sm70_qpn2_graph_layout.py` accepts
+the two frozen projection libraries, generated norm module and real-weight
+root explicitly; its `sm70_qpn2_graph_{nodes,layout}.py` helpers install no
+serving default. The first versioned four-rank rerun passes 72 cases per rank.
+The final helper revision adds the cuBLAS fallback check and uses the standard
+accelerator synchronization API. Evidence is retained in
+`results/qpn2-layout-graph-*`, the corresponding queue records, and
+`candidates/qpn2-layout-model-v1`. Model fixed-prefix, acceptance and complete
+round admission remain open; this does not resolve the old repeat-start TV
+discrepancy by itself.
