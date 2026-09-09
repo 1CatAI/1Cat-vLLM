@@ -118,3 +118,23 @@ passes 30 GPU tests covering layout, sparse math and geometry; its eight layout
 checks also pass memcheck with zero errors. Complete native output preservation
 and formal timing remain pending. Engineering quality and the 31.3-second stage
 remain incomplete; VSA is not promoted into default or AUTO selection.
+
+## Stage timing evaluation
+
+After separate full native benchmarks for VSA and Dense, run:
+
+```bash
+python -m vllm.video.vsa_acceptance --vsa VSA_BENCHMARK_DIR \
+  --dense DENSE_BENCHMARK_DIR --output stage-performance.json
+```
+
+The tool reuses strict same-session warmup, three-request and rank/step/layer
+accounting validation. It additionally requires the primary dimensions, TP4,
+top-k 64, official FastH3 four-step sigma positions and matched request, GPU,
+host-weight, VAE, communication and export settings. Only backend, query tile,
+top-k and adapter path may differ between the two algorithm controls. It checks
+the slowest rank's median denoise <=31.3 seconds, CV <=5%, and a strictly lower
+complete-request median than Dense. The future 80-TF criterion is explicitly
+reported separately. Passing this timing tool does not establish weight
+identity, numerical/human quality, other-shape coverage or official hardware
+validation.
