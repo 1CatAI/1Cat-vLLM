@@ -115,9 +115,11 @@ The corrected comparison includes work counting on both sides: median 41.969666
 ms baseline versus 37.358593 ms fused over seven paired operator measurements.
 This is an operator result, not complete-denoise acceptance. The installed source
 passes 30 GPU tests covering layout, sparse math and geometry; its eight layout
-checks also pass memcheck with zero errors. Complete native output preservation
-and formal timing remain pending. Engineering quality and the 31.3-second stage
-remain incomplete; VSA is not promoted into default or AUTO selection.
+checks also pass memcheck and synccheck with zero errors. The complete primary
+capture preserves final video/audio latents, all 124 pre-encoding RGB frames and
+PCM bitwise; every rank/layer/step work count is identical. Its captured denoise
+is 32.989041 seconds, which is diagnostic only. Independent FP32 engineering
+quality remains incomplete; VSA is not promoted into default or AUTO selection.
 
 ## Stage timing evaluation
 
@@ -138,3 +140,122 @@ complete-request median than Dense. The future 80-TF criterion is explicitly
 reported separately. Passing this timing tool does not establish weight
 identity, numerical/human quality, other-shape coverage or official hardware
 validation.
+
+## Matched formal timing: speed gate passes, joint stage incomplete
+
+Source `450f9b9bc6458e31ff83150f33b79df31a89732d` with the retained
+`native-layout-binaries.json` completed one full warmup and three consecutive
+unprofiled, uncaptured single requests per backend. Both controls use the same
+original H3 weights, request, TP4 GPUs, pageable shared VAE masters, prepared
+FP16 columns, 4 GiB native peer-row communication budget and libx264 export.
+Each uses its corresponding official FastH3 Data-Free adapter. VSA uses top-k
+64 and query tile 64; Dense FA uses query tile 128.
+
+| Measurement | VSA, existing FP16 sparse math | Dense FA |
+| --- | ---: | ---: |
+| Denoise run 1 (s), slowest rank | 30.948464 | 52.886819 |
+| Denoise run 2 (s), slowest rank | 30.999521 | 52.873835 |
+| Denoise run 3 (s), slowest rank | 30.990756 | 52.858062 |
+| Median denoise (s) | 30.990756 | 52.873835 |
+| Denoise CV | 0.071956% | 0.022239% |
+| Median complete request (s) | 68.157817 | 87.426512 |
+| Peak allocation bound incl. raw IPC (GiB/card) | 20.843828 | 19.554280 |
+| Effective model TFLOP/s/card, lowest rank median | 54.611483 | 57.553944 |
+
+Per-step medians of the maximum rank GPU time are 7.730810, 7.748937,
+7.747062 and 7.753540 seconds for VSA, versus 13.183612, 13.219172,
+13.240814 and 13.227989 seconds for Dense. These event timings do not replace
+the complete-denoise wall-clock criterion, which includes counter completion.
+Avoided sparse work is not included in useful throughput.
+
+`native-layout-stage-performance.json` passes all three timing checks. The
+underlying sparse arithmetic still fails the independent FP32 reference:
+video/audio latent relative L2 is 0.390670/0.088636. This timing pass cannot be
+combined with the quality pass of a different, slower kernel. No configuration
+has yet passed the joint stage. `vsa-layout-formal-telemetry.json` and its Dense
+counterpart retain per-device clocks, power, memory and utilization samples;
+these span the complete campaign and are not denoise-only utilization figures.
+
+## Exact FP32 sparse CUDA candidate
+
+The compensated-PV experiment with exact FP32 QK/global softmax still fails
+full sampling (video/audio latent errors 0.367458/0.074789), despite a fivefold
+local improvement. Admission now requires real-input FP32 parity before another
+full sample; a small local relative error is not sufficient evidence.
+
+Sequential FP32 FFMA QK and PV match cuBLAS FP32 on seven real query subsets.
+A directly indexed CUDA implementation avoids gathered K/V copies, compacts
+selected blocks in ascending order, preserves prefix-dense/video-sparse queries
+and uses a global FP32 softmax. Its 64-by-64 output-tile variant matches all
+609 blocks of the actual primary operator bitwise, including five boundary,
+extreme-score and poisoned-padding cases. Six small cases pass memcheck and
+synccheck with zero errors.
+
+The complete dynamic-selection seed-42 sample also matches the frozen reference
+video/audio latents and all decoded RGB frames bitwise. PSNR is infinite,
+SSIM is 1, audio spectral cosine is 0.999999999999945 and RMS ratio is
+0.999999998643185. This is a numerical pass only: human review remains pending.
+Captured denoise is approximately 109.6 seconds, so this kernel fails speed.
+
+The 64-by-64 operator takes approximately 407 ms. Nsight Systems attributes
+158.81 ms to QK, 215.65 ms to PV and 32.37 ms to global softmax. Shared-memory
+padding (411 ms) and a 4-by-4 register tile (437 ms) preserve bitwise output but
+are slower and rejected. A CUTLASS SIMT candidate preserves the five boundary
+cases and full primary operator bitwise at approximately 233 ms. Six small
+cases pass memcheck and synccheck with zero errors. Nsight Systems attributes
+75.76 ms to QK, 116.46 ms to PV and 32.46 ms to global softmax. Its complete
+seed-42 sample preserves initial video/audio noise, text tensors, every step
+and final latents bitwise. All 124 RGB frames are identical; audio spectral
+cosine is 0.999999999999945 and RMS ratio is 0.999999998643185. Captured denoise
+is 74.545147 seconds and complete request is 225.097778 seconds; the latter
+includes cold staging and capture and is not a matched formal measurement.
+The primary numerical gate passes, but speed and human review do not. No
+precision candidate changes the runtime backend or sampling algorithm.
+
+Remaining acceptance work: one configuration satisfying both quality and speed,
+seeds 43/44, 243-frame and 15-second boundaries, TP1/TP2 compatibility, representative
+Dense/LightX2V/Ref2VA output regressions, and human audiovisual review. Official
+original-hardware comparison remains explicitly deferred.
+
+## Reproducing the precision diagnostic
+
+The acceptance-only source is `benchmarks/kernels/h3_vsa_fp32.cu`. It has no
+runtime backend registration. Build it separately with CUTLASS 4.4.2, CUDA
+12.8.93, Torch 2.10.0+cu128, Python 3.12.13 and SM70:
+
+```bash
+CUDA_HOME=/path/to/cuda-12.8 TORCH_CUDA_ARCH_LIST=7.0 MAX_JOBS=2 \
+  .venv/bin/python benchmarks/kernels/benchmark_h3_vsa_fp32.py \
+  --build-directory /path/to/diagnostic-build \
+  --cutlass-root /path/to/cutlass-4.4.2 --output /path/to/build.json
+```
+
+After acquiring a GPU lease, run the regression checks against that exact
+binary. For sanitizer checks, put `compute-sanitizer --tool memcheck
+--error-exitcode 86` or `--tool synccheck --error-exitcode 86` before Python:
+
+```bash
+H3_VSA_FP32_DIAGNOSTIC=/path/to/diagnostic-build/h3_vsa_cutlass_fp32.so \
+  .venv/bin/python -m pytest -q tests/video/test_h3_vsa_fp32_diagnostic.py
+```
+
+The same benchmark accepts `--binary`, `--capture attention-input-rank-0.pt`
+and `--output`. It compares the complete captured operator with independent
+FP32 math before measuring it. Reports retain binary/source hashes and mark
+operator measurements ineligible for complete-denoise acceptance. Supplying
+an existing binary does not assert that it was built from the current source.
+The diagnostic binary must never be substituted into a formal runtime timing
+record without recording the actual operator override.
+
+The versioned diagnostic currently passes 20 leased-GPU regression checks,
+including six mathematical/boundary cases and fourteen public input rejection
+cases. The complete captured primary operator also matches FP32 bitwise. All
+20 checks pass memcheck and synccheck with zero errors. Its build source hash is
+`f21ae1df63032be02853c2968dacdc001511bb5729942c8b006e316a0771d8fc`.
+The full quality capture used the arithmetic-identical artifact build
+`cafdc331dfbc2218e6e982a6ce8b4d8c4cd562ad45e4106ca5968de4fb911349`;
+the separately built versioned extension is
+`ef4a9b8ebee7091b71951692d46313a1b59c322f1970d1925759a285c1d8cb96`.
+The source body is unchanged apart from inlining includes, using the base
+CUTLASS header directly, formatting and comments. These binary identities
+must remain distinct in retained measurement records.
