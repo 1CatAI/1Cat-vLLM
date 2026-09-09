@@ -811,6 +811,73 @@ unsupported row counts are rejected. Compiler register use drops from 52 to
 It is rejected before model work. Register count alone is not a performance
 result; evidence is `qpn2-static-m8-decision.json`.
 
+### Strict draft GEMM: better local reference error does not preserve proposals
+
+Actual TP2 draft operands now cover both ranks, twenty projections and five
+query steps per rank. The original row-weight GEMM reproduces all 200 retained
+outputs. Column-weight GEMM with reduced-precision reduction disabled changes
+all 200 outputs, but expands none of the independent FP64 maximum, p99 or
+relative-L2 errors. Its twenty-projection working set falls from 2.910515 to
+2.362880 ms. This local result does not admit a model optimization.
+
+A diagnostic captures both projections in the same q8 query graph, selects
+the propagated arm with a device flag, and replays control/candidate/control
+at each real prefix. The last control replay supplies serving outputs and
+query KV. Across 24 prefixes per fixture on both ranks, every retained
+projection input/output, FP32 head and selector buffer repeats bytewise in
+the two control replays. Query tokens, positions, slot mappings and RNG states
+are unchanged. Natural requests before, during and after the audit retain
+their token IDs, acceptance counters and EOS. This isolates the candidate
+from diagnostic perturbation within this startup; it does not resolve the
+earlier cross-startup variation.
+
+The candidate fails distribution admission despite no top-1 or sampled draft
+token changes in the 336 observed rows:
+
+| Observation | Result |
+| --- | ---: |
+| Maximum full draft-vocabulary TV | 5.021620% |
+| Changed top-20 sets | 26 / 336 |
+| Changed diagnostic k20/p0.95 support sets | 18 / 336 |
+| Maximum actual selector-proposal TV | 47.719886% |
+| Changed actual proposal support sets | 26 / 336 |
+
+The actual draft selector uses sixteen candidates and proposal top-p 1.0;
+the k20/p0.95 row is a separate diagnostic. At release1k prefix step 19,
+proposal row 6, token 40718 enters the selector support and receives
+47.719886% probability after the selector's edge scores. The first differing
+operator is `model.layers.64.self_attn.qkv_proj`, with identical input on both
+ranks. Subsequent layer inputs change as the difference propagates. A smaller
+local FP64 error and an unchanged sampled token do not establish unchanged
+sampling or acceptance. This candidate is rejected before unprofiled model
+timing and remains disabled.
+
+Evidence: `tp2-draft-f16-layout-screen.json`,
+`tp2-draft-column-shadow-1-diagnostic.json`, and
+`draft-column-tp2-decision.json`. The frozen diagnostic harness and five CPU
+checks include candidate-ID permutation invariance and a known TV of 0.5.
+
+### Trace of the current native combination
+
+A new release1k trace uses source `bb333ee528f0d9e4bbe64d65b6a708a0617ea427`
+and the frozen native revision 2 combination, with the draft arithmetic
+candidate disabled. Ten interior rounds cover all 256 QPN2 projections,
+48 BV2 GDN kernels and sixteen native attention partitions per rank/round.
+Warmup and captured natural requests match at 280 output tokens. Nsight
+exits zero; cleanup signals and source/library provenance remain recorded.
+The different startup trajectory does not replace the paired unprofiled
+31.884546/29.279787-ms result above.
+
+The profiled critical-rank round is 33.955203 ms, with 32.153534 ms of GPU
+activity and 1.801669 ms not covered by GPU activity. Rank-mean service is
+12.820451 ms for QPN2, 3.422064 ms for scalar target attention, 1.055777 ms
+for recurrent GDN and 1.930007 ms for communication. Draft service is
+6.615042 ms; the two full FP32 head GEMMs together take 4.140522 ms and are
+already included in the target sampling/draft phases. Context computation
+now falls inside the sampling phase, so phase labels must not be read as
+independent speedups. These numbers are attribution, not performance
+acceptance. See `tp2-combined-native-trace.json` and its admission report.
+
 ### LM-head width and accumulation order
 
 The trace spends approximately 4.133 ms across the target and draft dense
