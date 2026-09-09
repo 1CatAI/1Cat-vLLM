@@ -138,6 +138,8 @@ class ZImagePipeline:
         report("encoding")
         started = time.perf_counter()
         embeddings = self.encode(request.prompt, recipe["guidance_scale"] > 0)
+        if not all(torch.isfinite(value).all() for value in embeddings):
+            raise RuntimeError("Z-Image text encoder produced non-finite conditioning")
         self.stage_seconds["encoding"] = time.perf_counter() - started
         generator = torch.Generator(self.device).manual_seed(request.seed)
         latents = torch.randn(
@@ -199,6 +201,8 @@ class ZImagePipeline:
                 )[0]
                 report("denoising", completed=index + 1, total=len(times))
         self.stage_seconds["denoising"] = time.perf_counter() - started
+        if not torch.isfinite(latents).all():
+            raise RuntimeError("Z-Image denoiser produced non-finite latents")
         report("decoding")
         started = time.perf_counter()
         self.vae.to(self.device)

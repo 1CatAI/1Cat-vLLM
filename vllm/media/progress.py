@@ -13,6 +13,27 @@ _callback: ContextVar[ProgressCallback | None] = ContextVar(
 )
 
 
+def report_loading(completed, total, component, *, rank=0, world_size=1):
+    """Startup progress travels via the existing owned process log."""
+    import json
+
+    print(
+        "ONECAT_MEDIA_PROGRESS "
+        + json.dumps(
+            {
+                "stage": "loading_weights",
+                "completed": completed,
+                "total": total,
+                "component": component,
+                "unit": "components",
+                "rank": rank,
+                "world_size": world_size,
+            }
+        ),
+        flush=True,
+    )
+
+
 @contextmanager
 def reporting(callback: ProgressCallback | None) -> Iterator[None]:
     token = _callback.set(callback)

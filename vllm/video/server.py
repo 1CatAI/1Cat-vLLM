@@ -94,7 +94,9 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
                         state["engine"].generate,
                         request,
                         directory,
-                        on_progress=on_progress,
+                        on_progress=on_progress
+                        if metadata.get("progress_reporting", True)
+                        else None,
                     )
                     outputs.append(
                         {
@@ -210,6 +212,10 @@ def create_app(config: H3Config, output_dir: str | Path, *, engine_factory=None)
                     "updated_at": time.time(),
                     "stage_progress": None,
                     "denoise_progress": None,
+                    "progress_reporting": request.headers.get(
+                        "X-1Cat-Progress", "true"
+                    ).lower()
+                    != "false",
                     "created_at": int(time.time()),
                     "partition": config.partition,
                     "size": f"{generation.sampling.width}x{generation.sampling.height}",

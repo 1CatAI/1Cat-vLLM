@@ -136,3 +136,37 @@ def test_queued_device_work_is_not_reported_as_a_completed_step():
         ready.set()
         assert arrived.wait(1)
     assert [e["stage"] for e in observed] == ["denoising", "decoding"]
+
+
+def test_progress_can_be_disabled_without_changing_the_model_request(tmp_path):
+    captured = []
+
+    class Engine:
+        _closed = False
+
+        def generate(self, request, output, *, on_progress):
+            captured.append((request, on_progress))
+            output.mkdir(parents=True)
+            (output / "video.mp4").write_bytes(b"video")
+            return {"ranks": []}
+
+        def close(self):
+            self._closed = True
+
+    app = create_app(H3Config(), tmp_path, engine_factory=lambda _: Engine())
+    with TestClient(app) as client:
+        for enabled in (True, False):
+            response = client.post(
+                "/v1/videos",
+                json={"prompt": "A cat", "seed": 42},
+                headers={"X-1Cat-Progress": str(enabled).lower()},
+            )
+            identity = response.json()["id"]
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if client.get(f"/v1/videos/{identity}").json()["status"] == "completed":
+                    break
+                time.sleep(0.01)
+        assert captured[0][0] == captured[1][0]
+        assert callable(captured[0][1])
+        assert captured[1][1] is None
