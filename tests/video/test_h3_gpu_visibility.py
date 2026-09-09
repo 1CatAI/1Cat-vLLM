@@ -80,3 +80,42 @@ def test_selected_lock_is_respected_even_when_other_gpus_are_idle(
         gpu.acquire_gpu_group(4)
     with gpu.acquire_gpu_group(4) as lease:
         assert lease.gpu_ids == (1, 2, 3, 4)
+
+
+def test_nvml_platform_resolves_worker_uuid_order(monkeypatch):
+    from vllm.platforms import cuda
+
+    fake = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetHandleByUUID=lambda u: {"GPU-selected-a": 6, "GPU-selected-b": 2}[
+            u
+        ],
+        nvmlDeviceGetIndex=lambda handle: handle,
+    )
+    monkeypatch.setattr(cuda, "pynvml", fake)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-selected-a,GPU-selected-b")
+    assert cuda.NvmlCudaPlatform.device_id_to_physical_device_id(0) == 6
+    assert cuda.NvmlCudaPlatform.device_id_to_physical_device_id(1) == 2
+    with pytest.raises(IndexError):
+        cuda.NvmlCudaPlatform.device_id_to_physical_device_id(2)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-unknown")
+    with pytest.raises(KeyError):
+        cuda.NvmlCudaPlatform.device_id_to_physical_device_id(0)
+
+
+@pytest.mark.parametrize(
+    "mask,device,expected", [("6,2", 0, 6), ("6,2", 1, 2), ("", 1, 1)]
+)
+def test_nvml_platform_preserves_integer_and_empty_masks(
+    monkeypatch, mask, device, expected
+):
+    from vllm.platforms import cuda
+
+    monkeypatch.setattr(
+        cuda,
+        "pynvml",
+        SimpleNamespace(nvmlInit=lambda: None, nvmlShutdown=lambda: None),
+    )
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+    assert cuda.NvmlCudaPlatform.device_id_to_physical_device_id(device) == expected

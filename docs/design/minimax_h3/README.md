@@ -155,7 +155,10 @@ V100 per-card and group locks. An explicit `CUDA_VISIBLE_DEVICES` selection
 never falls back to unselected devices. UUIDs are recommended for launchers.
 Without a selection, devices with at least 30 GiB capacity form ordered groups,
 so a small display card does not shift the four-V100 grouping. Workers receive
-the leased devices as UUIDs to avoid CUDA/NVML ordinal-order differences. The lease remains held until
+the leased devices as UUIDs to avoid CUDA/NVML ordinal-order differences.
+The NVML platform resolves these UUIDs for physical-device queries before
+pipeline imports, so capability checks use the same selected boards.
+The lease remains held until
 its workers exit. A group reserved by another cooperating task is unavailable
 even while that task is between CUDA processes. If both groups are occupied or
 reserved, startup fails before model loading.
