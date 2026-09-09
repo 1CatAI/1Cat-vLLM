@@ -2,6 +2,12 @@
 
 ## Current campaign direction
 
+The latest user instruction narrows current delivery to already working H3
+dense workflows using retained FA. Further slower Attention prototypes and
+new workflow expansion are paused. No experimental replacement is installed.
+See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the current report. Historical
+experiments and the unfinished full campaign remain below for reference.
+
 New Attention development and exhaustive workflow acceptance concentrate on
 FlashAttention-V100 at the user's request. The already validated FlashInfer
 implementation remains available, but new FI optimization and exhaustive FI

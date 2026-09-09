@@ -1,8 +1,14 @@
 # FlashAttention development focus
 
-Further Attention development and exhaustive workflow qualification concentrate
-on FlashAttention-V100 at the user's request. Validated FlashInfer remains
-available; new FI optimization and full FI acceptance are paused.
+Current delivery uses the retained FlashAttention-V100 implementation on
+already working H3 dense workflows. At the user's latest request, further
+investigation of slower Attention prototypes and new workflow expansion are
+paused. Validated FlashInfer remains available, with further FI optimization
+and exhaustive FI acceptance paused. The unfinished matrix and unchanged
+quality/performance gates remain recorded as incomplete.
+
+See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the retained configuration,
+measured workflow coverage and delivery limits.
 
 With native TP4 peer rows, shared pageable VAE weights and a complete request
 warmup plus three unprofiled requests, FA records a minimum-card median
@@ -78,3 +84,21 @@ slowdown limit. No full-model run or production promotion follows.
 
 Evidence: `attention-fa-warp16-staging-q96`, `attention-fa-register-k128`,
 `attention-fa-register-k128-vprefetch`, and `fa-vprefetch-after-register.json`.
+
+The artifact-only D128 tiled-GEMM port also closes without promotion. Padding
+only PV's reduction width to 32 fixes its nonaligned-key vector read; the
+original failing boundary then passes Compute Sanitizer with zero errors.
+Eleven boundary/stress cases and the actual input pass the independent FP32
+operator gate. Actual-input relative L2 is 0.000231 against that oracle and
+0.000335 against FA; output is not bitwise equal to FA. Its paired median is
+212.961273 ms versus retained FA's 149.299194 ms, so no complete sampling
+quality run is justified.
+
+A bounded Nsight Systems attribution records 209.361943 ms operator wall
+time: QK plus tile softmax 142.181160 ms, PV plus probability rescaling
+61.613049 ms, and GPU idle/host gaps 0.582682 ms. API durations overlap GPU
+execution and cannot be added to those kernel durations. Packing or CPU
+scheduling does not explain this regression. A row-maximum epilogue follow-up
+completed its CPU build but was stopped at the user's scope change before
+any GPU numerical check or timing. Neither artifact replaces production FA.
+Evidence: `attention-fa-tiled-gemm-d128` and `attention-fa-tiled-gemm-rowmax`.
