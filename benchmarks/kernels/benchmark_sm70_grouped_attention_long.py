@@ -105,11 +105,25 @@ def main():
     parser.add_argument("--sanitizer", action="store_true")
     parser.add_argument("--profile-one", action="store_true")
     parser.add_argument("--performance-page", type=int, default=1648)
+    parser.add_argument(
+        "--performance-contexts",
+        type=int,
+        nargs="+",
+        default=[1024, 32768, 65536, 131072],
+    )
+    parser.add_argument(
+        "--extended-boundary",
+        type=int,
+        choices=(262144, 262152),
+        help="Additional operator-only 256K boundary; does not enable serving",
+    )
     args = parser.parse_args()
     if not args.candidate and not args.profile_one:
         parser.error("At least one --candidate is required for a comparison")
     if args.performance_page <= 0:
         parser.error("--performance-page must be positive")
+    if any(n < 8 or n > 262152 for n in args.performance_contexts):
+        parser.error("Performance contexts must be between 8 and 262152 tokens")
     assert not args.output.exists(), args.output
     assert torch.cuda.get_device_capability() == (7, 0)
     torch.manual_seed(20260909)
@@ -156,6 +170,11 @@ def main():
         ]
     if args.sanitizer:
         cases = [(8, 1648, 1649, 0), (8, 1648, 3297, 8), (8, 3296, 6593, 0)]
+    if args.extended_boundary is not None:
+        cases += [
+            (8, 3296, args.extended_boundary, 0),
+            (8, 1648, args.extended_boundary, 8),
+        ]
     for rows, page, length, padding in cases:
         case = make_case(rows, page, length, len(operators), padding)
         graphs = []
@@ -206,7 +225,7 @@ def main():
     save()
 
     if not args.correctness_only:
-        for length in (1024, 32768, 65536, 131072):
+        for length in args.performance_contexts:
             # Sixteen distinct KV allocations represent the target's real
             # layer working set and prevent single-layer hot-cache claims.
             cases = [

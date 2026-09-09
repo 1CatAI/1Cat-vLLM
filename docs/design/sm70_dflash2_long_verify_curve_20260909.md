@@ -11,7 +11,8 @@ comparisons use a frozen source and native-library manifest, physical GPUs
 `dedf8df68adfb1afeaf7b7480c0a0243108177b4`, CUDA 12.8, Torch 2.10.0+cu128,
 E4M3 target KV, FP32 logits/state and the existing compensated attention.
 Original FlashQLA GDN prefill and the verified FA2 sidecar stay enabled.
-Capacity remains 262144; measured inputs stop at 131072 tokens.
+Capacity remains 262144. The frozen first campaign stops at 131072 input
+tokens; the subsequent target revision below explicitly adds the 256K tier.
 
 The user revised the objective on September 10: continuously reduce absolute
 complete-round cost and the incremental cost of longer contexts. Prefill
@@ -20,6 +21,28 @@ condition. Every long-context absolute round cost must improve, 1K must not
 regress, and context increments must not increase. Report both additional
 milliseconds and milliseconds per 1024 additional context tokens. Never
 improve a ratio by slowing the shorter point, prefill or acceptance.
+
+The subsequent September 10 target revision sets explicit complete-round
+latency goals:
+
+| Context tier | Complete-round target |
+| --- | ---: |
+| 32K | <= 17 ms |
+| 64K | <= 18 ms |
+| 128K | < 20 ms |
+| 256K | < 22 ms |
+
+1K must not regress and the <15 ms short-context goal remains. Output quality,
+compensation and acceptance requirements are unchanged. The 256K target
+supersedes the previous instruction to stop all measurements at 128K; it does
+not qualify any untested kernel range. Keep the current 132096-token serving
+gate until the longer operator and model checks pass. Existing frozen reports
+remain immutable. Within 262144 service capacity, a boundary-window performance
+probe constructs a separate 261888-token prompt and reserves 256 output tokens;
+report that exact input length and the actual sampled context range. Do not
+truncate an existing prompt, label this as a full 262144-token cold prefill, or
+silently raise model capacity. Operator checks separately include 262144 and
+the speculative q8 boundary headroom.
 
 ## Implementation order
 
@@ -196,6 +219,74 @@ reports their explanations; it rejects changed live history, invalid selectors,
 padding-to-live changes and inconsistent or aliased slot mappings. It must not
 use repeated-run TV as a numerical tolerance. EOS IDs come from the frozen
 generation configuration, not another tokenizer's constants.
+
+## Repeated integrated results and the expanded target
+
+Three independent paired startups complete 144 requests (72 per arm). Each
+startup includes one cold warmup and five measured requests per context/arm,
+with reversed arm order in the second startup. All paired token sequences,
+finish reasons and acceptance records match. The unprofiled request-median
+results are:
+
+| Context | Paired control, ms | Candidate, ms | Candidate pure decode, tokens/s | Accepted drafts/round | Emitted tokens/round |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1K | 16.210 | 16.130 | 292.76 | 3.778 | 4.741 |
+| 32K | 25.553 | 18.371 | 210.32 | 2.894 | 3.879 |
+| 64K | 34.701 | 20.418 | 237.20 | 3.863 | 4.863 |
+| 128K | 52.826 | 24.451 | 176.76 | 3.339 | 4.339 |
+
+The candidate passes absolute-cost and incremental-cost checks against both
+the original frozen curve and the new paired controls. The 32K-to-64K increment
+is 2.047 ms, or 0.06397 ms per additional 1024 tokens; 64K-to-128K adds 4.033 ms,
+or 0.06302 ms per 1024. These results have not reached the new 17/18/20 ms
+targets. The complete natural-output campaign remains a separate admission.
+
+The diagnostic retry completes all six fixed tapes: 1K, 32K, 64K, 128K, MBPP28
+and MBPP3. Each arm has 96 all-rank target snapshots. All native logits,
+full/sampled distributions, support sets, top-1 and EOS probabilities are
+exact in control/candidate and repeated-control comparisons. The 1768/1752
+raw state differences are fully explained by the validated storage layout;
+no live-state or other unexplained differences remain. Diagnostic GPU memory
+utilization 0.6 provides 451076 KV token slots, exceeding the unchanged
+262144 service capacity. These dumps do not contribute performance samples.
+
+The integrated 128K trace now attributes 8.615 ms to target attention and
+7.387 ms to the three QPN2 projection categories, averaged across ranks. Draft
+proposal GPU service is 3.919 ms. The same fixed rank 0 has a 26.419 ms round
+interval and 24.423 ms GPU union. Across critical ranks, actual profiled round
+p50/p90/p99 are 26.524/26.631/26.754 ms. Those are individual **profiled**
+intervals and must not replace the unprofiled request-average distribution.
+
+The first expanded operator screen passes 45 byte-exact output/full-FP32-
+workspace/canary cases, including 262152-token physical-page and stride
+boundaries. At 261888 tokens the sixteen-layer attention working set takes
+70.344 ms for the frozen control and 16.335 ms for the selected one-stage
+candidate. This is not a 256K model result. The restored serving control's
+single cold/warm screen gives 2265.5 cold-prefill tokens/s and a 95.694 ms
+warmed complete round; the bounded experimental graph is deliberately not
+selected beyond its current admitted domain. Repeated 256K model acceptance
+still needs a separately validated extended serving route.
+
+A new private feasibility builder separates compensated QK production from
+two disjoint PV column partitions. It retains 80 logical context partitions,
+K16 compensation, N32 online updates and probability residual products. The
+QK producer uses 80 registers and 48384 shared-memory bytes; the PV consumer
+uses 102 registers and a 25248-byte shared layout, without spills. These are
+compiler resource observations, not achieved occupancy. Extra score storage,
+kernel boundaries and repeated softmax work may erase the benefit, so byte
+checks and complete-working-set timing decide whether to continue. Prototype
+score scratch is capture-owned; no serving route is installed by this builder.
+Its first screen preserves output and complete partial/max/sum bytes in all
+65 cases, including the expanded boundary (130 checks across the one-stage
+and staged candidates). It is slower: 32K/64K/128K/261888-token attention costs
+3.162/5.849/11.194/21.714 ms versus 2.401/4.417/8.451/16.341 ms for the paired
+one-stage candidate. The staged source SHA is
+`d8493061867f9d044ce7a70e2298306816d0f283aaa84984c69031b668aee825`; DSO SHA is
+`02b2a3080c99ad1c837e98fda1222eeb25fefca71ca97e23b939122f60b32f2d`.
+It is rejected for serving. A bounded operator trace separates producer and
+consumer costs before any follow-up; extra parallelism alone is not a gain.
+The selected one-stage DSO separately passes extended-boundary memcheck,
+racecheck and synccheck with zero errors.
 
 Prior rejected experiments remain recorded in the context-cost and long-verify
 worklogs. Historical E5M2 and FP16-partial Pack-GQA timings are design references,
