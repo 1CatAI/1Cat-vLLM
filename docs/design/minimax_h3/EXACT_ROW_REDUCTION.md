@@ -1,7 +1,8 @@
 # Explicit SM70 local-row reduction
 
 The shared `SM70ExactRowReductionPlan` interface is experimental and has no
-automatic dispatch or H3 runtime selection yet. The ordinary residual path
+automatic dispatch. H3 exposes an explicit runtime selection; its final
+integration is still undergoing GPU and full-request validation. The ordinary residual path
 continues to use FP32 all-reduce followed by a local-row slice. No configuration
 has passed the campaign's >80 useful TFLOP/s/card and complete quality gates.
 
@@ -32,8 +33,9 @@ CPU group, and peer handles close before owners free their allocations.
 The plan rejects another stream/device, autograd inputs, incompatible layouts,
 CUDA Graph execution and epoch exhaustion. It does not silently change a
 backend or precision. Callers retain their ordinary collective when a plan
-is unsuitable. Only the shared operator is provided in this change; a model
-must explicitly own its lifecycle before integrating it into requests.
+is unsuitable. H3 owns one plan per pipeline, reuses it for identical shapes and closes it
+collectively on shape changes or worker shutdown. Other models must likewise
+own the plan lifecycle explicitly.
 
 ## Validation and measured limits
 
@@ -83,9 +85,8 @@ records 58.310740 seconds denoise and 99.562953 seconds total. Its contract,
 source/binary manifests, `review-native-quality.json` and
 `review-native-summary.json` are retained separately from prototype evidence.
 
-This validates the final shared operator in one H3 request, but does not add
-native model routing or establish full-request warmup-plus-three performance.
-API integration, formal repeated requests, TP/shape breadth and official/human
+This validates the final shared operator in one H3 request, but does not establish full-request warmup-plus-three performance.
+Final native integration validation, formal repeated requests, TP/shape breadth and official/human
 quality gates remain incomplete. No AUTO promotion is made.
 
 Reproduce the operator control with an owned native GPU lease and
@@ -93,3 +94,30 @@ Reproduce the operator control with an owned native GPU lease and
 benchmarks/kernels/benchmark_sm70_exact_row_reduce.py --output <new-directory>
 --full-shape`. The optional `--extension` pins an already-built library; the
 report records its SHA256 plus benchmark, CUDA and shared Python source hashes.
+
+## Native API selection and memory records
+
+Start `vllm video serve` or `vllm video generate` with
+`--residual-sequence-parallel --residual-reduction peer
+--residual-reduction-memory-gib 4` to select the explicit candidate. The default
+remains `native`; HTTP clients continue to use the existing video API. Selection
+does not depend on floating versus W8A16 weights, adapters or task labels.
+
+TP1 retains its ordinary path. TP2 uses the original all-reduce and local slice.
+TP4 creates a shared plan only when its complete calibration/storage requirement
+fits the explicit budget; larger shapes use the ordinary collective. A plan
+remains valid only for its original communicator and shape. Setup happens on
+the first actual projection; its time is included in complete denoise and is
+also reported separately in `residual_communication.setup_seconds`. Repeated
+requests of the same shape reuse calibration without reading model state.
+
+Each result records peer/native call counts and the fallback reason. The
+`torch_peak_allocated_bytes` and `raw_ipc_peak_bytes` fields remain separate;
+`peak_allocated_bytes` is their conservative sum and is marked as an upper
+bound when raw IPC storage is present. The performance validator therefore
+includes external communication allocations in its memory gate. CUDA driver
+and library overhead still require the retained NVML measurements.
+
+CPU request ownership, budget fallback, config, API and existing residual
+regressions pass. GPU generation through the final native selection and formal
+measurements remain required; preceding forward overrides do not satisfy them.

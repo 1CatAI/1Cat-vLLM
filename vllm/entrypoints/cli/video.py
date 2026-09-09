@@ -72,6 +72,18 @@ class VideoSubcommand(CLISubcommand):
                 action="store_true",
                 help="Experimental FP32 residual sharding for TP2/TP4; TP1 is a no-op",
             )
+            mode.add_argument(
+                "--residual-reduction",
+                choices=("native", "peer"),
+                default="native",
+                help="Explicit TP4 SM70 row reduction; requires residual sharding",
+            )
+            mode.add_argument(
+                "--residual-reduction-memory-gib",
+                type=float,
+                default=4.0,
+                help="Communication setup and buffer budget; larger shapes use native",
+            )
             mode.add_argument("--output-dir", type=Path, default=Path("h3-output"))
             mode.add_argument(
                 "--video-encoder",
@@ -135,6 +147,8 @@ class VideoSubcommand(CLISubcommand):
             int8_weight_layout=args.int8_weight_layout,
             fp16_weight_layout=args.fp16_weight_layout,
             residual_sequence_parallel=args.residual_sequence_parallel,
+            residual_reduction=args.residual_reduction,
+            residual_reduction_memory_gib=args.residual_reduction_memory_gib,
             video_encoder=args.video_encoder,
             host_weight_pin_memory=args.host_weight_pin_memory,
             share_host_vae_weights=args.share_host_vae_weights,

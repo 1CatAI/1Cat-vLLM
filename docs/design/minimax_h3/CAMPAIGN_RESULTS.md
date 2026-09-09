@@ -57,5 +57,5 @@ The explicit [shared row-reduction interface](EXACT_ROW_REDUCTION.md) has
 separate operator and prototype full-media controls. Its 2.49348% paired
 denoise improvement is a development measurement, not a new formal campaign
 result. The final shared interface also passes a complete native media control via
-an explicit forward override. Native H3 runtime integration remains pending,
-and the ordinary reduction stays selected.
+an explicit forward override. Native H3 selection is now explicit and still requires its final GPU
+validation; the ordinary reduction remains the default.
