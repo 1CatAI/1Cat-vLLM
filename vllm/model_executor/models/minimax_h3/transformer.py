@@ -54,6 +54,8 @@ if TYPE_CHECKING:
         QuantizationConfig,
     )
 
+    from .collectives import H3ResidualReduction
+
 
 logger = init_logger(__name__)
 
@@ -860,6 +862,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.mlp",
         )
+        self.residual_reducer: H3ResidualReduction | None = None
         self.residual_group = (
             get_tp_group()
             if residual_sequence_parallel and get_tensor_model_parallel_world_size() > 1
@@ -959,9 +962,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             vsa_prefix_segments=vsa_prefix_segments,
         )
         if group is not None:
-            h = group.all_reduce(h).narrow(
-                0, group.rank_in_group * residual.shape[0], residual.shape[0]
-            )
+            if self.residual_reducer is not None:
+                h = self.residual_reducer.reduce(h)
+            else:
+                h = group.all_reduce(h).narrow(
+                    0, group.rank_in_group * residual.shape[0], residual.shape[0]
+                )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -980,9 +986,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             h = group.all_gather(h, dim=0)
         h = self.mlp(h, input_is_rotated=input_is_rotated)
         if group is not None:
-            h = group.all_reduce(h).narrow(
-                0, group.rank_in_group * residual.shape[0], residual.shape[0]
-            )
+            if self.residual_reducer is not None:
+                h = self.residual_reducer.reduce(h)
+            else:
+                h = group.all_reduce(h).narrow(
+                    0, group.rank_in_group * residual.shape[0], residual.shape[0]
+                )
         return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 

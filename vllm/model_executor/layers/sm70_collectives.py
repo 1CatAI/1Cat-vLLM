@@ -73,6 +73,11 @@ class SM70ExactRowReductionPlan:
     synchronization semantics.
     """
 
+    @staticmethod
+    def required_memory_bytes(shape):
+        """Conservative explicit budget for setup scratch and persistent buffers."""
+        return _layout(shape)[3]
+
     def __init__(self, group, shape, *, memory_budget_bytes):
         error = None
         try:
