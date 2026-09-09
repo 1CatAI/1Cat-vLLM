@@ -68,6 +68,9 @@ class ZImagePipeline:
             .eval()
             .to(self.device)
         )
+        from .precision import preserve_projection_range
+
+        preserve_projection_range(self.transformer)
         loading(1, "text_encoder")
         self.text_encoder = AutoModel.from_pretrained(
             str(root / "text_encoder"),

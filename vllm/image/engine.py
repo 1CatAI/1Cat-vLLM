@@ -58,7 +58,7 @@ class ImageEngine:
                 "model": self.config.checkpoint,
                 "recipe_version": RECIPE_VERSION,
                 "recipe": RECIPES[self.config.checkpoint],
-                "precision": "fp16-vae-fp32",
+                "precision": "fp16-fp32-projection-output-and-vae",
                 "stage_seconds": self.pipeline.stage_seconds,
                 "end_to_end_seconds": time.perf_counter() - started,
             }

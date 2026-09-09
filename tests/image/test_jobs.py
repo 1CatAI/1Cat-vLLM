@@ -85,6 +85,13 @@ def test_async_counts_cancel_queue_keep_running_result_and_restart(tmp_path):
     ) as client:
         assert client.get(f"/v1/images/jobs/{identity}").json()["status"] == "completed"
         assert client.get(f"/v1/images/jobs/{identity}/content").status_code == 200
+        replay = client.post(
+            "/v1/images/jobs",
+            json={"prompt": "A cat"},
+            headers={"Idempotency-Key": "same-key"},
+        )
+        assert replay.json()["id"] == identity
+        assert len(engine.requests) == 1
 
 
 def test_invalid_model_and_dimensions_do_not_allocate_a_task(tmp_path):
