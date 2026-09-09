@@ -5,6 +5,7 @@
 import argparse
 import os
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 from torch import nn
@@ -13,6 +14,7 @@ from torch import nn
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layer-offload", action="store_true")
+    parser.add_argument("--peer-reduction", action="store_true")
     parser.add_argument(
         "--backend",
         choices=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
@@ -22,10 +24,12 @@ def main():
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
+        get_tp_group,
         init_distributed_environment,
         initialize_model_parallel,
     )
     from vllm.model_executor.models.minimax_h3.attention import attention_backend
+    from vllm.model_executor.models.minimax_h3.collectives import H3ResidualReduction
     from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
     from vllm.model_executor.models.minimax_h3.request_cache import (
         CACHE_DIT_DEFAULTS,
@@ -36,7 +40,10 @@ def main():
         LayerwiseModuleStager,
         PinnedModuleStager,
     )
-    from vllm.model_executor.models.minimax_h3.transformer import MiniMaxH3DiTModel
+    from vllm.model_executor.models.minimax_h3.transformer import (
+        MiniMaxH3DiTBlock,
+        MiniMaxH3DiTModel,
+    )
     from vllm.video.metrics import DenoiseWorkCounter
 
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -50,6 +57,7 @@ def main():
             world, rank, "env://", int(os.environ["LOCAL_RANK"]), "nccl"
         )
         initialize_model_parallel(world)
+        residual_owner = None
         try:
             with torch.inference_mode():
                 backend_token = attention_backend.set(args.backend)
@@ -110,6 +118,13 @@ def main():
                     audio_ref_cond_timestep=0.1,
                 )
                 expected = model(**kwargs)
+                if args.peer_reduction:
+                    residual_owner = H3ResidualReduction(
+                        get_tp_group(), memory_budget_bytes=512 * 2**20
+                    )
+                    for module in model.modules():
+                        if isinstance(module, MiniMaxH3DiTBlock):
+                            module.residual_reducer = residual_owner
                 residency = None
                 if args.layer_offload:
                     snapshot = PinnedModuleStager(
@@ -157,6 +172,8 @@ def main():
                 for plan in plans:
                     repeated = []
                     for request in range(2):
+                        if residual_owner is not None:
+                            residual_owner.begin_request()
                         with (
                             residency.on_device() if residency else nullcontext(),
                             DenoiseWorkCounter(
@@ -192,16 +209,32 @@ def main():
                         assert sum(s["useful_flops"] for s in steps) == sum(
                             counter.by_layer.values()
                         )
+                        if residual_owner is not None:
+                            communication = residual_owner.snapshot()
+                            if world == 4:
+                                assert communication["peer_calls"] > 0
+                                assert communication["native_calls"] == 0
+                            else:
+                                assert communication["peer_calls"] == 0
+                            calls: list[Any] = [None] * world
+                            with torch.inference_mode(False):
+                                torch.distributed.all_gather_object(
+                                    calls, communication, group=get_tp_group().cpu_group
+                                )
+                            assert len({c["peer_calls"] for c in calls}) == 1
+                            assert len({c["native_calls"] for c in calls}) == 1
                         repeated.append(counts)
                     assert repeated[0] == repeated[1]
                     print(
                         f"rank={rank} tp={world} layer={args.layer_offload} "
-                        f"backend={args.backend} "
+                        f"backend={args.backend} peer={args.peer_reduction} "
                         f"{plan.backend} "
                         f"{plan.options} counts={repeated[0]} PASS",
                         flush=True,
                     )
         finally:
+            if residual_owner is not None:
+                residual_owner.close()
             cleanup_dist_env_and_memory()
 
 
