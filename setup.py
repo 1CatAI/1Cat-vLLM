@@ -896,6 +896,9 @@ class precompiled_wheel_utils:
                 sm70_sampler_ext_regex = re.compile(
                     r"vllm/_sm70_sampler_C(?:\.[^/]+)?\.so$"
                 )
+                h3_ext_regex = re.compile(
+                    r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
+                )
                 file_members = []
                 for member in wheel.filelist:
                     if member.filename in exact_members:
@@ -916,6 +919,7 @@ class precompiled_wheel_utils:
                         or flash_attn_v100_ext_regex.match(member.filename)
                         or flash_qla_sm70_ext_regex.match(member.filename)
                         or sm70_sampler_ext_regex.match(member.filename)
+                        or h3_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
@@ -1243,6 +1247,9 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_contains(7, 0):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
+        ext_modules.append(CMakeExtension(name="vllm._h3_w8a16_C"))
+        ext_modules.append(CMakeExtension(name="vllm._h3_flashinfer_C"))
+        ext_modules.append(CMakeExtension(name="vllm._h3_flashattn_C"))
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
@@ -1404,7 +1411,18 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
-        "video": [],  # Kept for backwards compatibility
+        "video": [
+            "diffusers==0.40.0",
+            "av>=14",
+            "imageio>=2.37.2",
+            "imageio-ffmpeg>=0.6",
+            "soundfile>=0.13",
+            "scipy",
+            "einops",
+            "omegaconf",
+            "accelerate>=1.12",
+            "nvidia-ml-py",
+        ],
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:

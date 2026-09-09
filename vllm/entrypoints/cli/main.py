@@ -21,6 +21,7 @@ def main():
     import vllm.entrypoints.cli.openai
     import vllm.entrypoints.cli.run_batch
     import vllm.entrypoints.cli.serve
+    import vllm.entrypoints.cli.video
     from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -31,6 +32,7 @@ def main():
         vllm.entrypoints.cli.benchmark.main,
         vllm.entrypoints.cli.collect_env,
         vllm.entrypoints.cli.run_batch,
+        vllm.entrypoints.cli.video,
     ]
 
     cli_env_setup()
