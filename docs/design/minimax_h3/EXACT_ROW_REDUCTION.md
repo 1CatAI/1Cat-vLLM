@@ -74,11 +74,19 @@ V100 SXM2 32GB cards. Evidence root:
   743,180,800 persistent raw IPC bytes/card. Their sum is 20,475,735,040 bytes;
   driver/library overhead is additional. Do not report only the PyTorch number.
 
-The prototype full-model evidence precedes the packaged plan's dynamic
-calibration and setup guards. It is not substituted for full-model validation
-of this final interface. Native integration, finalized-interface media controls,
-formal repeated requests, TP/shape breadth and official/human quality gates
-remain incomplete. No AUTO promotion is made.
+The committed shared interface at `6d2a44b8d0` now also passes a complete
+native H3 control using an explicit forward override. Dynamic calibration uses
+the current native group and the actual shape, with no saved arithmetic-code
+map. Final video/audio latents, all 124 RGB frames and PCM match the frozen
+FA query-128 control bitwise; SSIM and RMS ratio are 1. The captured request
+records 58.310740 seconds denoise and 99.562953 seconds total. Its contract,
+source/binary manifests, `review-native-quality.json` and
+`review-native-summary.json` are retained separately from prototype evidence.
+
+This validates the final shared operator in one H3 request, but does not add
+native model routing or establish full-request warmup-plus-three performance.
+API integration, formal repeated requests, TP/shape breadth and official/human
+quality gates remain incomplete. No AUTO promotion is made.
 
 Reproduce the operator control with an owned native GPU lease and
 `torchrun --standalone --nproc_per_node=4
