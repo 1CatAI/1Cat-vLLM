@@ -157,7 +157,8 @@ Without a selection, devices with at least 30 GiB capacity form ordered groups,
 so a small display card does not shift the four-V100 grouping. Workers receive
 the leased devices as UUIDs to avoid CUDA/NVML ordinal-order differences.
 The NVML platform resolves these UUIDs for physical-device queries before
-pipeline imports, so capability checks use the same selected boards.
+pipeline imports, so capability checks use the same selected boards. Custom
+all-reduce topology checks use this mapping as well.
 The lease remains held until
 its workers exit. A group reserved by another cooperating task is unavailable
 even while that task is between CUDA processes. If both groups are occupied or

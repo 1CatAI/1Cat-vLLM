@@ -119,3 +119,42 @@ def test_nvml_platform_preserves_integer_and_empty_masks(
     )
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
     assert cuda.NvmlCudaPlatform.device_id_to_physical_device_id(device) == expected
+
+
+@pytest.mark.parametrize("mask", ["GPU-a,GPU-b,GPU-c,GPU-d", "6,2,4,1"])
+def test_custom_allreduce_queries_the_selected_physical_boards(monkeypatch, mask):
+    from vllm.distributed.device_communicators import custom_all_reduce as ar
+
+    physical = [6, 2, 4, 1]
+    observed = []
+
+    def gather(values, tensor, group):
+        assert tensor.item() == 2
+        for value, index in zip(values, physical):
+            value.fill_(index)
+
+    def connected(indices):
+        observed.extend(indices)
+        return False  # Stop after the topology check, before CUDA allocation.
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+    monkeypatch.setattr(ar, "custom_ar", True)
+    monkeypatch.setattr(ar, "in_the_same_node_as", lambda *a, **kw: [True] * 4)
+    monkeypatch.setattr(ar.dist, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(ar.dist, "get_rank", lambda **kw: 1)
+    monkeypatch.setattr(ar.dist, "get_world_size", lambda **kw: 4)
+    monkeypatch.setattr(ar.dist, "all_gather", gather)
+    monkeypatch.setattr(
+        ar,
+        "current_platform",
+        SimpleNamespace(
+            get_device_capability=lambda: SimpleNamespace(major=7, minor=0),
+            is_cuda=lambda: True,
+            is_cuda_alike=lambda: True,
+            device_id_to_physical_device_id=lambda index: physical[index],
+            is_fully_connected=connected,
+        ),
+    )
+    communicator = ar.CustomAllreduce(group=object(), device="cuda:1")
+    assert communicator.disabled
+    assert observed == physical
