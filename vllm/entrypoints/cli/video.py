@@ -36,9 +36,15 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument("--tensor-parallel-size", "-tp", type=int, default=4)
             mode.add_argument(
                 "--attention-backend",
-                choices=("FLASH_ATTN_V100", "FLASHINFER_SM70", "TORCH_SDPA"),
+                choices=(
+                    "FLASH_ATTN_V100",
+                    "FLASHINFER_SM70",
+                    "TORCH_SDPA",
+                    "FASTVIDEO_VSA",
+                ),
                 default="FLASH_ATTN_V100",
             )
+            mode.add_argument("--fastvideo-vsa-topk", type=int, default=64)
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument(
                 "--disable-host-weight-pinning",
@@ -114,6 +120,7 @@ class VideoSubcommand(CLISubcommand):
             transformer_path=args.transformer_path,
             tensor_parallel_size=args.tensor_parallel_size,
             attention_backend=args.attention_backend,
+            vsa_topk=args.fastvideo_vsa_topk,
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
             lora_path=args.lora_path,

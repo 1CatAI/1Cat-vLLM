@@ -1246,6 +1246,7 @@ if _is_cuda():
         ext_modules.append(CMakeExtension(name="vllm._h3_w8a16_C"))
         ext_modules.append(CMakeExtension(name="vllm._h3_flashinfer_C"))
         ext_modules.append(CMakeExtension(name="vllm._h3_flashattn_C"))
+        ext_modules.append(CMakeExtension(name="vllm._sm70_sparse_attention_C"))
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))

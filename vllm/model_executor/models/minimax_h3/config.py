@@ -38,6 +38,7 @@ class H3Config:
     transformer_path: str | None = None
     tensor_parallel_size: int = 4
     attention_backend: str = "FLASH_ATTN_V100"
+    vsa_topk: int = 64
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
@@ -64,8 +65,17 @@ class H3Config:
             "FLASH_ATTN_V100",
             "FLASHINFER_SM70",
             "TORCH_SDPA",
+            "FASTVIDEO_VSA",
         ):
             raise H3InputError(f"unsupported H3 attention: {self.attention_backend}")
+        if (
+            isinstance(self.vsa_topk, bool)
+            or not isinstance(self.vsa_topk, int)
+            or self.vsa_topk <= 0
+        ):
+            raise H3InputError("VSA topk must be a positive integer")
+        if self.attention_backend == "FASTVIDEO_VSA" and not self.lora_path:
+            raise H3InputError("H3 VSA requires an explicit FastH3 VSA artifact")
         if (
             not math.isfinite(self.fp16_weight_cache_gib)
             or self.fp16_weight_cache_gib < 0

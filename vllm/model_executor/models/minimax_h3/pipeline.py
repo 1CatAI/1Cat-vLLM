@@ -502,6 +502,8 @@ class MiniMaxH3Pipeline(nn.Module):
             weights = restore_dense_adaln_weights(weights, path / "transformer")
         fusion = None
         if isinstance(adapter_spec, FastH3Spec):
+            if adapter_spec.requires_vsa:
+                self.transformer.enable_vsa_gates(config.vsa_topk)
             fusion = FastH3Fusion(
                 select_adapter_file(config.lora_path),
                 partition=config.partition,
@@ -1529,7 +1531,11 @@ class MiniMaxH3Pipeline(nn.Module):
             audio_outputs=int(branch.audio_update_mask.sum()),
         )
         self.denoise_workload = {
-            "work_accounting": "dense_tp_lora_v2",
+            "work_accounting": (
+                "sparse_tp_v1"
+                if self.config.attention_backend == "FASTVIDEO_VSA"
+                else "dense_tp_lora_v2"
+            ),
             "partition": self.partition,
             "task": task,
             "adapter": (
@@ -1539,7 +1545,9 @@ class MiniMaxH3Pipeline(nn.Module):
             "audio_sigmas": list(inputs["sigmas_audio"]),
             "used_length": branch.used_len,
             "blocks_per_call": counter.blocks_per_call,
-            "attention_algorithm": "dense",
+            "attention_algorithm": (
+                "vsa" if self.config.attention_backend == "FASTVIDEO_VSA" else "dense"
+            ),
             "cache_algorithm": None,
             "actual_backends": sorted(
                 {
@@ -1549,6 +1557,18 @@ class MiniMaxH3Pipeline(nn.Module):
                 }
             ),
         }
+        if self.config.attention_backend == "FASTVIDEO_VSA":
+            layout = branch.static_kwargs["video_token_layout"]
+            self.denoise_workload["sparse_config"] = {
+                "topk": self.config.vsa_topk,
+                "prefix_segments": list(
+                    branch.static_kwargs["packed_seq_params"]["vsa_prefix_segments"]
+                ),
+                "video_shape": list(layout.video_spans[-1].latent_grid),
+                "gated_blocks": len(transformer.blocks),
+                "heads": transformer.blocks[0].attn.num_heads,
+                "head_size": transformer.blocks[0].attn.head_dim,
+            }
         with counter, self._resident_dit_layers_on_device(enabled=True):
             torch.accelerator.synchronize()
             dist.barrier()
@@ -1585,6 +1605,7 @@ class MiniMaxH3Pipeline(nn.Module):
             self.redundant_flops_by_layer = counter.redundant_by_layer
             self.denoise_steps = counter.finish_steps()
             self.denoise_executed_blocks = dict(counter.blocks)
+            self.denoise_sparse_work_by_layer = counter.sparse_by_layer
 
         return self._unpack_denoised_rows(
             branch,
