@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -57,6 +58,7 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
             initialize_model_parallel(config.tensor_parallel_size)
             started = time.perf_counter()
             pipeline = MiniMaxH3Pipeline(config, shared_weights_dir=shared_weights_dir)
+            kernel_provenance = None
             connection.send(
                 {
                     "ready": True,
@@ -71,12 +73,22 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
                 request, output_dir = command
                 torch.accelerator.reset_peak_memory_stats()
                 video, audio = pipeline(request)
+                if kernel_provenance is None:
+                    from .metrics import loaded_kernel_provenance
+
+                    kernel_provenance = loaded_kernel_provenance()
                 result = {
                     "rank": rank,
                     "stage_seconds": pipeline.stage_durations,
                     "dit_calls": pipeline.actual_dit_calls,
                     "useful_denoise_flops": pipeline.useful_denoise_flops,
                     "denoise_flops_by_layer": pipeline.denoise_flops_by_layer,
+                    "redundant_denoise_flops": pipeline.redundant_denoise_flops,
+                    "redundant_flops_by_layer": pipeline.redundant_flops_by_layer,
+                    "denoise_workload": pipeline.denoise_workload,
+                    "denoise_steps": pipeline.denoise_steps,
+                    "denoise_executed_blocks": pipeline.denoise_executed_blocks,
+                    "kernel_provenance": kernel_provenance,
                     "peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
                 }
                 if rank == 0:
@@ -129,6 +141,8 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
 class H3Engine:
     def __init__(self, config: H3Config):
         self.config = config
+        self.session_id = str(uuid.uuid4())
+        self.request_index = 0
         self._gpu_lease = None
         self._shared_weights = None
         self._lock = threading.Lock()
@@ -212,6 +226,8 @@ class H3Engine:
                 self.close()
                 raise
             result = {
+                "engine_session_id": self.session_id,
+                "request_index": self.request_index,
                 "config": asdict(self.config),
                 "request": asdict(request),
                 "gpus": self.gpu_ids,
@@ -222,6 +238,7 @@ class H3Engine:
             (output_dir / "run.json").write_text(
                 json.dumps(result, indent=2, ensure_ascii=False)
             )
+            self.request_index += 1
             return result
 
     def close(self):
