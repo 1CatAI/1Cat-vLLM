@@ -10,11 +10,38 @@ from benchmarks.sm70_dflash2_state_audit import (
     cpu_request_slots,
     gather_state,
     selected_ssm_slots,
+    target_auxiliary_states,
 )
 from benchmarks.sm70_dflash2_state_layout import (
     check_slot_mapping,
     explain_state_difference,
 )
+
+
+def test_natural_audit_observes_auxiliary_states_through_sampling_wrapper():
+    class Runner:
+        def run(self, input_batch, aux_hidden_states):
+            return self.wrapper(input_batch)
+
+        def wrapper(self, batch):
+            # A wrapper may contain unrelated state; only a matching batch
+            # from the same runner is a valid source for the observation.
+            input_batch = object()
+            aux_hidden_states = [torch.tensor([-1.0])]
+            assert input_batch is not batch and aux_hidden_states
+            return target_auxiliary_states(self, batch)
+
+    expected = [torch.tensor([1.0])]
+    assert Runner().run(object(), expected) is expected
+
+
+def test_natural_audit_rejects_unrelated_auxiliary_states():
+    class Runner:
+        def run(self, input_batch, aux_hidden_states):
+            return target_auxiliary_states(object(), input_batch)
+
+    with pytest.raises(RuntimeError, match="matching target auxiliary states"):
+        Runner().run(object(), [torch.tensor([1.0])])
 
 
 @pytest.fixture
