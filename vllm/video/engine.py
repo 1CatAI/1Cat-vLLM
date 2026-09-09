@@ -8,9 +8,11 @@ import contextlib
 import multiprocessing as mp
 import os
 import socket
+import tempfile
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -23,7 +25,7 @@ from .gpu import acquire_gpu_group, worker_device_mask
 from .gpu import select_gpu_group as select_gpu_group
 
 
-def _worker(rank, config, gpu_ids, endpoint, connection):
+def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = worker_device_mask(gpu_ids)
     from datetime import timedelta
 
@@ -44,6 +46,7 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
     current = VllmConfig(
         parallel_config=ParallelConfig(tensor_parallel_size=config.tensor_parallel_size)
     )
+    pipeline = None
     try:
         with set_current_vllm_config(current):
             init_distributed_environment(
@@ -56,7 +59,8 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
             )
             initialize_model_parallel(config.tensor_parallel_size)
             started = time.perf_counter()
-            pipeline = MiniMaxH3Pipeline(config)
+            pipeline = MiniMaxH3Pipeline(config, shared_weights_dir=shared_weights_dir)
+            kernel_provenance = None
             connection.send(
                 {
                     "ready": True,
@@ -80,13 +84,30 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
                     reporting(observer),
                 ):
                     video, audio = pipeline(request)
+                if kernel_provenance is None:
+                    from .metrics import loaded_kernel_provenance
+
+                    kernel_provenance = loaded_kernel_provenance()
+                communication = pipeline.residual_reduction_stats()
+                torch_peak = torch.accelerator.max_memory_allocated()
+                raw_peak = communication["raw_ipc_peak_bytes"]
                 result = {
                     "rank": rank,
+                    "residual_communication": communication,
+                    "torch_peak_allocated_bytes": torch_peak,
+                    "raw_ipc_peak_bytes": raw_peak,
+                    "peak_allocation_is_upper_bound": bool(raw_peak),
                     "stage_seconds": pipeline.stage_durations,
                     "dit_calls": pipeline.actual_dit_calls,
                     "useful_denoise_flops": pipeline.useful_denoise_flops,
                     "denoise_flops_by_layer": pipeline.denoise_flops_by_layer,
-                    "peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
+                    "redundant_denoise_flops": pipeline.redundant_denoise_flops,
+                    "redundant_flops_by_layer": pipeline.redundant_flops_by_layer,
+                    "denoise_workload": pipeline.denoise_workload,
+                    "denoise_steps": pipeline.denoise_steps,
+                    "denoise_executed_blocks": pipeline.denoise_executed_blocks,
+                    "kernel_provenance": kernel_provenance,
+                    "peak_allocated_bytes": torch_peak + raw_peak,
                 }
                 if rank == 0:
                     from .media import export_video
@@ -133,14 +154,21 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
     except BaseException:
         connection.send({"error": traceback.format_exc(), "rank": rank})
     finally:
-        cleanup_dist_env_and_memory()
-        connection.close()
+        try:
+            if pipeline is not None:
+                pipeline.close()
+        finally:
+            cleanup_dist_env_and_memory()
+            connection.close()
 
 
 class H3Engine:
     def __init__(self, config: H3Config):
         self.config = config
+        self.session_id = str(uuid.uuid4())
+        self.request_index = 0
         self._gpu_lease = None
+        self._shared_weights = None
         self._lock = threading.Lock()
         self._closed = False
         self.workers = []
@@ -150,15 +178,20 @@ class H3Engine:
         try:
             self._gpu_lease = acquire_gpu_group(config.tensor_parallel_size)
             self.gpu_ids = self._gpu_lease.gpu_ids
+            if config.share_host_vae_weights and config.tensor_parallel_size > 1:
+                self._shared_weights = tempfile.TemporaryDirectory(
+                    prefix="vllm-h3-vae-", dir="/dev/shm"
+                )
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
             endpoint = f"tcp://127.0.0.1:{port}"
             for rank in range(config.tensor_parallel_size):
                 parent, child = context.Pipe()
-                worker = context.Process(
-                    target=_worker, args=(rank, config, self.gpu_ids, endpoint, child)
-                )
+                args: tuple = (rank, config, self.gpu_ids, endpoint, child)
+                if self._shared_weights is not None:
+                    args = (*args, self._shared_weights.name)
+                worker = context.Process(target=_worker, args=args)
                 worker.start()
                 child.close()
                 self.workers.append(worker)
@@ -229,6 +262,8 @@ class H3Engine:
                 self.close()
                 raise
             result = {
+                "engine_session_id": self.session_id,
+                "request_index": self.request_index,
                 "config": asdict(self.config),
                 "request": asdict(request),
                 "gpus": self.gpu_ids,
@@ -239,6 +274,7 @@ class H3Engine:
             (output_dir / "run.json").write_text(
                 json.dumps(result, indent=2, ensure_ascii=False)
             )
+            self.request_index += 1
             return result
 
     def close(self):
@@ -258,6 +294,9 @@ class H3Engine:
                 worker.join()
         for connection in self.connections:
             connection.close()
+        if self._shared_weights is not None:
+            self._shared_weights.cleanup()
+            self._shared_weights = None
         if self._gpu_lease is not None:
             self._gpu_lease.close()
             self._gpu_lease = None

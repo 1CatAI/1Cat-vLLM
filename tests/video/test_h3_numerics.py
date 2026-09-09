@@ -178,7 +178,7 @@ def test_attention_padding_excludes_poisoned_suffix(used, padded):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [127, 128, 129, 12323])
+@pytest.mark.parametrize("length", [127, 128, 129, 191, 192, 193, 12323])
 def test_flashinfer_online_softmax_across_tiles_and_batches(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
@@ -197,7 +197,9 @@ def test_flashinfer_online_softmax_across_tiles_and_batches(length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize(
+    "length", [31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 385]
+)
 def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
@@ -218,7 +220,7 @@ def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [129, 257])
+@pytest.mark.parametrize("length", [129, 193, 257, 385])
 def test_flashinfer_query_groups_have_independent_softmax_state(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
@@ -435,7 +437,8 @@ def test_encoder_uses_functional_all_reduce_return():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_staging_preserves_aliased_weights_across_repeated_transfers():
+@pytest.mark.parametrize("pin_memory", [True, False])
+def test_staging_preserves_aliased_weights_across_repeated_transfers(pin_memory):
     from torch import nn
 
     from vllm.model_executor.models.minimax_h3.residency import PinnedModuleStager
@@ -445,7 +448,7 @@ def test_staging_preserves_aliased_weights_across_repeated_transfers():
     module.weight = nn.Parameter(backing)
     module.register_buffer("view", backing[3:7, 1:5])
     expected = module.view.clone()
-    stager = PinnedModuleStager(module, torch.device("cuda"))
+    stager = PinnedModuleStager(module, torch.device("cuda"), pin_memory=pin_memory)
     for _ in range(2):
         stager.load()
         assert module.weight.is_cuda and module.view.is_cuda
@@ -455,7 +458,8 @@ def test_staging_preserves_aliased_weights_across_repeated_transfers():
         )
         torch.testing.assert_close(module.view.cpu(), expected)
         stager.offload()
-        assert module.weight.is_pinned() and module.view.is_pinned()
+        assert module.weight.is_pinned() is pin_memory
+        assert module.view.is_pinned() is pin_memory
         torch.testing.assert_close(module.view, expected)
 
 

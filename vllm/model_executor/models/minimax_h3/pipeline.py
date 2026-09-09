@@ -29,7 +29,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import get_cpu_memory
 from vllm.video.metrics import DenoiseWorkCounter
 
-from .attention import attention_backend
+from .attention import Attention, attention_backend
 from .comfy_checkpoint import inspect_comfy_checkpoint, resolve_comfy_checkpoint_path
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
@@ -84,14 +84,14 @@ from .reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
-from .residency import MMapHostWeights, PinnedModuleStager
+from .residency import LayerwiseModuleStager, MMapHostWeights, PinnedModuleStager
 from .sigma_schedule import DMD2SigmaSchedule
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_align_frame_count,
     minimax_h3_time_shift_sigmas,
 )
-from .transformer import MiniMaxH3DiTModel
+from .transformer import MiniMaxH3DiTBlock, MiniMaxH3DiTModel
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 from .weight_cache import FP16WeightCache
 from .weights import iter_checkpoint_weights, resolve_model_root
@@ -426,8 +426,16 @@ def _broadcast_tensor(
 
 
 class MiniMaxH3Pipeline(nn.Module):
-    def __init__(self, config: H3Config):
+    def __init__(self, config: H3Config, *, shared_weights_dir: str | None = None):
         super().__init__()
+        if (
+            config.share_host_vae_weights
+            and config.tensor_parallel_size > 1
+            and shared_weights_dir is None
+        ):
+            raise H3InputError(
+                "shared host VAE weights require an engine-owned directory"
+            )
         self.config = config
         self.partition = config.partition
         from vllm.media.progress import report_loading
@@ -533,6 +541,20 @@ class MiniMaxH3Pipeline(nn.Module):
             PinnedModuleStager.map_cpu_weights(
                 self.transformer, self._host_backing, preserve_parameters=False
             )
+        for module in self.transformer.modules():
+            if isinstance(module, Attention):
+                module.query_tile = config.attention_query_tile
+        self._residual_reduction = None
+        if config.residual_reduction == "peer":
+            from .collectives import H3ResidualReduction
+
+            self._residual_reduction = H3ResidualReduction(
+                get_tp_group(),
+                memory_budget_bytes=int(config.residual_reduction_memory_gib * 2**30),
+            )
+            for module in self.transformer.modules():
+                if isinstance(module, MiniMaxH3DiTBlock):
+                    module.residual_reducer = self._residual_reduction
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")
@@ -556,6 +578,7 @@ class MiniMaxH3Pipeline(nn.Module):
         for layer in self.transformer.modules():
             method = getattr(layer, "quant_method", None)
             if method is not None:
+                layer.h3_fp16_weight_layout = config.fp16_weight_layout
                 method.process_weights_after_loading(layer)
                 if self._host_backing is not None:
                     PinnedModuleStager.map_cpu_weights(layer, self._host_backing)
@@ -570,7 +593,10 @@ class MiniMaxH3Pipeline(nn.Module):
                 self.transformer, config.lora_path, self.partition
             )
         self._dit_stager = PinnedModuleStager(
-            self.transformer, self.device, host_backing=self._host_backing
+            self.transformer,
+            self.device,
+            host_backing=self._host_backing,
+            pin_memory=config.host_weight_pin_memory,
         )
         self._weight_cache = FP16WeightCache(
             self.transformer,
@@ -599,13 +625,37 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
         self._encoder_stager = PinnedModuleStager(
-            self.text_encoder, self.device, host_backing=self._host_backing
+            self.text_encoder,
+            self.device,
+            pin_memory=config.host_weight_pin_memory,
+            host_backing=self._host_backing,
         )
+        self._dit_layer_stager: LayerwiseModuleStager | None = None
+        self._encoder_layer_stager: LayerwiseModuleStager | None = None
+        if config.weight_offload == "layer":
+            self._dit_layer_stager = LayerwiseModuleStager(
+                self._dit_stager,
+                (*self.transformer.token_refiner.blocks, *self.transformer.blocks),
+                # Cache decision probes may consume these outside block.forward.
+                resident_modules=(
+                    self.transformer.blocks[0].norm1,
+                    self.transformer.blocks[0].adaln_proj,
+                ),
+            )
+            self._encoder_layer_stager = LayerwiseModuleStager(
+                self._encoder_stager,
+                (
+                    *self.text_encoder.vision.blocks,
+                    *self.text_encoder.text_model.layers,
+                ),
+            )
         loading(2, "video_vae")
         self.video_vae = MiniMaxH3VideoVAE(
             str(shared / "video_vae"),
             device=self.device,
             load_device=torch.device("cpu"),
+            pin_memory=config.host_weight_pin_memory,
+            shared_weights_dir=shared_weights_dir,
         )
         self.video_vae.set_parallel_size(config.tensor_parallel_size)
         loading(3, "audio_vae")
@@ -613,6 +663,8 @@ class MiniMaxH3Pipeline(nn.Module):
             str(shared / "audio_vae"),
             device=self.device,
             load_device=torch.device("cpu"),
+            pin_memory=config.host_weight_pin_memory,
+            shared_weights_dir=shared_weights_dir,
         )
         self.stage_durations = {}
         self.actual_dit_calls = 0
@@ -642,6 +694,20 @@ class MiniMaxH3Pipeline(nn.Module):
 
     @contextmanager
     def _component_on_device(self, component):
+        if (
+            component is self.text_encoder
+            and getattr(self, "_encoder_layer_stager", None) is not None
+        ):
+            plan = self._encoder_layer_stager
+            try:
+                with plan.on_device():
+                    yield
+            finally:
+                self.stage_durations["encoder_layer_weight_staging"] = plan.load_seconds
+                self.stage_durations["encoder_layer_weight_offload"] = (
+                    plan.offload_seconds
+                )
+            return
         stager = self._encoder_stager if component is self.text_encoder else None
         if stager is not None:
             stager.load()
@@ -658,6 +724,18 @@ class MiniMaxH3Pipeline(nn.Module):
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled=True):
         started = time.perf_counter()
+        if getattr(self, "_dit_layer_stager", None) is not None:
+            plan = self._dit_layer_stager
+            try:
+                with plan.on_device():
+                    self.stage_durations["dit_staging_and_weight_cache"] = (
+                        time.perf_counter() - started
+                    )
+                    yield
+            finally:
+                self.stage_durations["dit_layer_weight_staging"] = plan.load_seconds
+                self.stage_durations["dit_layer_weight_offload"] = plan.offload_seconds
+            return
         self._dit_stager.load()
         try:
             self._weight_cache.prepare()
@@ -673,11 +751,25 @@ class MiniMaxH3Pipeline(nn.Module):
     def progress_bar(self, *, total):
         return tqdm(total=total, desc="H3 denoise", disable=self._dit_rank != 0)
 
+    def residual_reduction_stats(self):
+        reducer = getattr(self, "_residual_reduction", None)
+        if reducer is None:
+            return {"configured_backend": "native", "raw_ipc_peak_bytes": 0}
+        return reducer.snapshot()
+
+    def close(self):
+        reducer = getattr(self, "_residual_reduction", None)
+        if reducer is not None:
+            reducer.close()
+
     @torch.inference_mode()
     def forward(self, request: H3Request):
         from vllm.media.progress import report
 
         self.stage_durations = {}
+        reducer = getattr(self, "_residual_reduction", None)
+        if reducer is not None:
+            reducer.begin_request()
         self.actual_dit_calls = 0
         report("encoding")
         started = time.perf_counter()
@@ -1578,7 +1670,28 @@ class MiniMaxH3Pipeline(nn.Module):
         from vllm.media.progress import report
 
         report("staging_model")
-        with self._resident_dit_layers_on_device(enabled=True):
+        self.denoise_workload = {
+            "work_accounting": "dense_tp_lora_v2",
+            "partition": self.partition,
+            "task": task,
+            "adapter": (
+                type(self.turbo_spec).__name__ if self.turbo_spec is not None else None
+            ),
+            "video_sigmas": list(inputs["sigmas_video"]),
+            "audio_sigmas": list(inputs["sigmas_audio"]),
+            "used_length": branch.used_len,
+            "blocks_per_call": counter.blocks_per_call,
+            "attention_algorithm": "dense",
+            "cache_algorithm": None,
+            "actual_backends": sorted(
+                {
+                    module.backend
+                    for module in transformer.modules()
+                    if isinstance(module, Attention)
+                }
+            ),
+        }
+        with counter, self._resident_dit_layers_on_device(enabled=True):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()
@@ -1608,6 +1721,7 @@ class MiniMaxH3Pipeline(nn.Module):
                         MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
                     ),
                     on_step=on_step,
+                    step_profiler=counter.step,
                 )
             torch.accelerator.synchronize()
             dist.barrier()
@@ -1616,7 +1730,10 @@ class MiniMaxH3Pipeline(nn.Module):
             self.useful_denoise_flops = counter.flops
             self.actual_dit_calls = counter.calls
             self.denoise_flops_by_layer = counter.by_layer
-            counter.close()
+            self.redundant_denoise_flops = counter.redundant_flops
+            self.redundant_flops_by_layer = counter.redundant_by_layer
+            self.denoise_steps = counter.finish_steps()
+            self.denoise_executed_blocks = dict(counter.blocks)
 
         return self._unpack_denoised_rows(
             branch,

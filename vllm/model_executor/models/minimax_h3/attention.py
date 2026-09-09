@@ -81,6 +81,7 @@ class Attention(nn.Module):
         self.backend = attention_backend.get()
         self.scale = softmax_scale
         self.head_size = head_size
+        self.query_tile = 64
 
     @property
     def attn_backend(self):
@@ -104,17 +105,16 @@ class Attention(nn.Module):
         if not 0 < used <= q.shape[1] or k.shape != v.shape:
             raise ValueError("invalid packed H3 attention lengths")
         q_valid, k_valid, v_valid = (x[:, :used].contiguous() for x in (q, k, v))
-        if self.backend == "FLASH_ATTN_V100":
-            from .cuda_ops import flashattn_extension
+        if self.backend in ("FLASH_ATTN_V100", "FLASHINFER_SM70"):
+            from vllm.model_executor.layers.sm70_attention import noncausal_attention
 
-            attended = flashattn_extension().forward(
-                q_valid, k_valid, v_valid, self.scale
-            )
-        elif self.backend == "FLASHINFER_SM70":
-            from .cuda_ops import flashinfer_extension
-
-            attended = flashinfer_extension().forward(
-                q_valid, k_valid, v_valid, self.scale
+            attended = noncausal_attention(
+                q_valid,
+                k_valid,
+                v_valid,
+                scale=self.scale,
+                backend=self.backend,
+                query_tile=self.query_tile,
             )
         elif self.backend == "TORCH_SDPA":
             attended = chunked_attention_reference(

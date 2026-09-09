@@ -142,6 +142,7 @@ def test_source_wheel_reuse_keeps_h3_native_operators(
         f"_h3_{kind}_C.cpython-312-x86_64-linux-gnu.so"
         for kind in ("w8a16", "flashinfer", "flashattn")
     ]
+    names.append("_sm70_exact_reduce_C.cpython-312-x86_64-linux-gnu.so")
     with zipfile.ZipFile(wheel, "w") as archive:
         for name in names:
             archive.writestr("vllm/" + name, b"native-test-bytes")

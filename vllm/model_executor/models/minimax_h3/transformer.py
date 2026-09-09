@@ -43,15 +43,17 @@ from .quantization import (
     H3MergedColumnParallelLinear,
     H3QKVParallelLinear,
     H3RowParallelLinear,
-    Int8ConvRotLinearMethod,
     preserve_fp32_output,
     rotate_local_fp16,
+    supports_prepared_fp16,
 )
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
     )
+
+    from .collectives import H3ResidualReduction
 
 
 logger = init_logger(__name__)
@@ -647,7 +649,7 @@ class MiniMaxH3MLP(nn.Module):
             hidden.is_cuda
             and hidden.dtype == torch.float16
             and 0 < hidden.shape[-1] <= 32768
-            and isinstance(self.fc2.quant_method, Int8ConvRotLinearMethod)
+            and supports_prepared_fp16(self.fc2)
         ):
             from .activation import silu_prepare_fp16
 
@@ -824,12 +826,18 @@ class MiniMaxH3DiTBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.residual_group = get_tp_group() if residual_sequence_parallel else None
+        self.residual_reducer: H3ResidualReduction | None = None
+        self.residual_group = (
+            get_tp_group()
+            if residual_sequence_parallel and get_tensor_model_parallel_world_size() > 1
+            else None
+        )
         if self.residual_group is not None:
-            if self.residual_group.world_size != 4:
-                raise ValueError("H3 residual sequence parallelism requires TP4")
-            # These projections return unreduced FP32 partial sums. Reduce-scatter
-            # keeps that precision and assigns each rank its residual rows.
+            if self.residual_group.world_size not in (2, 4):
+                raise ValueError("H3 residual sequence parallelism requires TP2 or TP4")
+            # Keep the replicated path's FP32 sum order before selecting local
+            # residual rows. NCCL reduce-scatter uses a different reduction
+            # order and fails the full four-step latent quality gate.
             self.attn.out_proj.reduce_results = False
             self.mlp.fc2.reduce_results = False
         self.adaln_proj = MiniMaxH3AdalnProj(
@@ -916,7 +924,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             input_is_rotated=input_is_rotated,
         )
         if group is not None:
-            h = group.reduce_scatter(h, dim=0)
+            if self.residual_reducer is not None:
+                h = self.residual_reducer.reduce(h)
+            else:
+                h = group.all_reduce(h).narrow(
+                    0, group.rank_in_group * residual.shape[0], residual.shape[0]
+                )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -935,7 +948,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             h = group.all_gather(h, dim=0)
         h = self.mlp(h, input_is_rotated=input_is_rotated)
         if group is not None:
-            h = group.reduce_scatter(h, dim=0)
+            if self.residual_reducer is not None:
+                h = self.residual_reducer.reduce(h)
+            else:
+                h = group.all_reduce(h).narrow(
+                    0, group.rank_in_group * residual.shape[0], residual.shape[0]
+                )
         return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
@@ -1087,15 +1105,9 @@ class MiniMaxH3DiTModel(nn.Module):
         self._qkv_checkpoint_is_runtime_layout = bool(
             getattr(quant_config, "is_checkpoint_int8_convrot_serialized", False)
         )
-        self.residual_sequence_parallel = residual_sequence_parallel
-        if residual_sequence_parallel and (
-            get_tensor_model_parallel_world_size() != 4
-            or not self._qkv_checkpoint_is_runtime_layout
-        ):
-            raise ValueError(
-                "H3 residual sequence parallelism requires TP4 "
-                "and serialized INT8 ConvRot"
-            )
+        self.residual_sequence_parallel = (
+            residual_sequence_parallel and get_tensor_model_parallel_world_size() > 1
+        )
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -1322,6 +1334,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
+            if param.dtype == _COMPUTE_DTYPE and not torch.isfinite(param).all():
+                raise ValueError(
+                    f"H3 weight {name} cannot be represented as finite FP16; "
+                    "checkpoint conversion must not silently overflow"
+                )
             loaded.add(name)
         return loaded
 
