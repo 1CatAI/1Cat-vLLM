@@ -70,5 +70,23 @@ Evidence root: `/data/minimax-h3/sm70-general-20260909/`.
 Full native FlashGen and FastH3 Dense five-second GPU generation completed on
 the preceding combined source `5195f31b8d`, with original weights and native
 pageable host masters. Basic media checks pass; those cold captured requests
-are not speed or independent quality acceptance. Full VSA generation is next.
+are not speed or independent quality acceptance.
+
+Full native VSA generation on source `61c57e36ae` also completed with the
+official data-free adapter (SHA256
+`42dc502a2078f166c396a1fa75f29728d1844363652d345d5ef3e2b444ed6470`).
+This TP4 cold captured request used the same 1280x736, five-second, seed-42
+prompt. Complete denoising took 37.387443 seconds; the slowest rank per step
+took 12.211990, 8.383499, 8.374612 and 8.412264 seconds. Peak allocated memory
+was 20,987,568,640 bytes/card. All four ranks passed the native sparse-work
+validator, and basic video/audio checks passed. Results and raw captures are
+in `/home/ymzx/h3-sm70-artifacts-20260909/runs/fasth3-vsa-720p-native/`;
+`fasth3-vsa-native-summary.json` records the compact audit.
+
+Actual useful throughput was 45.2679–45.2773 TFLOP/s/card. Approximately
+1.484e15 skipped attention FLOPs/card are reported separately, not credited
+to throughput. This single cold request is not the warmup-plus-three-run
+performance gate. Independent official full-sampling comparison and human
+review remain pending; a sampled frame contains several ducks despite the
+prompt specifying one, so basic media checks do not establish prompt fidelity.
 No complete workflow is yet qualified for AUTO or the >80 target.
