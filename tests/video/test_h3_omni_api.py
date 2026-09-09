@@ -23,7 +23,7 @@ class RecordingEngine:
         self.requests = []
         self._closed = False
 
-    def generate(self, request, output):
+    def generate(self, request, output, *, on_progress=None):
         for paths in request.media.values():
             assert all(Path(path).is_file() for path in paths)
         self.requests.append(request)
