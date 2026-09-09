@@ -8,6 +8,7 @@ import contextlib
 import multiprocessing as mp
 import os
 import socket
+import tempfile
 import threading
 import time
 import traceback
@@ -23,7 +24,7 @@ from .gpu import acquire_gpu_group
 from .gpu import select_gpu_group as select_gpu_group
 
 
-def _worker(rank, config, gpu_ids, endpoint, connection):
+def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
     from datetime import timedelta
 
@@ -56,7 +57,7 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
             )
             initialize_model_parallel(config.tensor_parallel_size)
             started = time.perf_counter()
-            pipeline = MiniMaxH3Pipeline(config)
+            pipeline = MiniMaxH3Pipeline(config, shared_weights_dir=shared_weights_dir)
             kernel_provenance = None
             connection.send(
                 {
@@ -146,6 +147,7 @@ class H3Engine:
         self.session_id = str(uuid.uuid4())
         self.request_index = 0
         self._gpu_lease = None
+        self._shared_weights = None
         self._lock = threading.Lock()
         self._closed = False
         self.workers = []
@@ -155,15 +157,20 @@ class H3Engine:
         try:
             self._gpu_lease = acquire_gpu_group(config.tensor_parallel_size)
             self.gpu_ids = self._gpu_lease.gpu_ids
+            if config.share_host_vae_weights and config.tensor_parallel_size > 1:
+                self._shared_weights = tempfile.TemporaryDirectory(
+                    prefix="vllm-h3-vae-", dir="/dev/shm"
+                )
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = sock.getsockname()[1]
             endpoint = f"tcp://127.0.0.1:{port}"
             for rank in range(config.tensor_parallel_size):
                 parent, child = context.Pipe()
-                worker = context.Process(
-                    target=_worker, args=(rank, config, self.gpu_ids, endpoint, child)
-                )
+                args: tuple = (rank, config, self.gpu_ids, endpoint, child)
+                if self._shared_weights is not None:
+                    args = (*args, self._shared_weights.name)
+                worker = context.Process(target=_worker, args=args)
                 worker.start()
                 child.close()
                 self.workers.append(worker)
@@ -254,6 +261,9 @@ class H3Engine:
                 worker.join()
         for connection in self.connections:
             connection.close()
+        if self._shared_weights is not None:
+            self._shared_weights.cleanup()
+            self._shared_weights = None
         if self._gpu_lease is not None:
             self._gpu_lease.close()
             self._gpu_lease = None
