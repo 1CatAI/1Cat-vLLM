@@ -58,7 +58,11 @@ class ImageEngine:
                 "model": self.config.checkpoint,
                 "recipe_version": RECIPE_VERSION,
                 "recipe": RECIPES[self.config.checkpoint],
-                "precision": "fp16-fp32-projection-output-and-vae",
+                "precision": (
+                    "fp16-weights-fp32-attention-residual-and-vae"
+                    if self.config.checkpoint == "z-image"
+                    else "fp16-fp32-projection-output-and-vae"
+                ),
                 "stage_seconds": self.pipeline.stage_seconds,
                 "end_to_end_seconds": time.perf_counter() - started,
             }

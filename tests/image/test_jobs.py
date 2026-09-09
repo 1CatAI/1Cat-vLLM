@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -123,6 +124,47 @@ def test_sync_compatibility_and_size_alias(tmp_path):
         assert response.status_code == 200
         assert response.json()["data"][0]["b64_json"].startswith("iVBOR")
         assert engine.requests[0].width == 512
+
+
+def test_bad_saved_record_does_not_block_other_image_jobs(tmp_path):
+    broken = tmp_path / ("image_" + "a" * 32) / "job.json"
+    broken.parent.mkdir()
+    broken.write_text('{"unfinished":')
+    engine = RecordingEngine(ImageConfig(str(tmp_path)))
+    engine.release.set()
+    with TestClient(
+        create_app(engine.config, tmp_path, engine_factory=lambda _: engine)
+    ) as client:
+        assert client.get("/health").status_code == 200
+        identity = client.post("/v1/images/jobs", json={"prompt": "cat"}).json()["id"]
+        assert wait(client, identity)["status"] == "completed"
+        assert broken.read_text() == '{"unfinished":'
+
+
+def test_terminal_disk_failure_releases_waiter_and_does_not_kill_queue(
+    tmp_path, monkeypatch
+):
+    engine = RecordingEngine(ImageConfig(str(tmp_path)))
+    with TestClient(
+        create_app(engine.config, tmp_path, engine_factory=lambda _: engine)
+    ) as client:
+        identity = client.post("/v1/images/jobs", json={"prompt": "cat"}).json()["id"]
+        assert engine.entered.wait(5)
+        replace = Path.replace
+
+        def full(path, target):
+            if path.name == "job.json.tmp":
+                raise OSError("No space left on device")
+            return replace(path, target)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "replace", full)
+            engine.release.set()
+            failed = wait(client, identity)
+            assert failed["status"] == "failed"
+            assert failed["error"]["code"] == "persistence_failed"
+        following = client.post("/v1/images/jobs", json={"prompt": "dog"}).json()["id"]
+        assert wait(client, following)["status"] == "completed"
 
 
 @pytest.mark.parametrize(

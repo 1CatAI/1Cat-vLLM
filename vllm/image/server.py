@@ -5,6 +5,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -18,6 +19,8 @@ from fastapi.responses import FileResponse
 from vllm.media.progress import update_metadata
 
 from .config import RECIPE_VERSION, ImageConfig, ImageRequest
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(config: ImageConfig, output_dir: str | Path, *, engine_factory=None):
@@ -66,7 +69,6 @@ def create_app(config: ImageConfig, output_dir: str | Path, *, engine_factory=No
             def apply(event, record=record):
                 if record["status"] == "in_progress":
                     update_metadata(record, event, time.time())
-                    save(record)
 
             def callback(event, loop=loop, apply=apply):
                 loop.call_soon_threadsafe(apply, event)
@@ -98,16 +100,40 @@ def create_app(config: ImageConfig, output_dir: str | Path, *, engine_factory=No
                     },
                 )
             finally:
-                save(record)
-                done[identity].set()
-                queue.task_done()
+                try:
+                    save(record)
+                except OSError:
+                    logger.exception("Could not persist image job %s", identity)
+                    update_metadata(record, {"stage": "failed"}, time.time())
+                    record.update(
+                        status="failed",
+                        error={
+                            "code": "persistence_failed",
+                            "message": "Could not save image job state; "
+                            "check free disk space and permissions",
+                        },
+                    )
+                finally:
+                    done[identity].set()
+                    queue.task_done()
 
     @asynccontextmanager
     async def lifespan(app):
         root.mkdir(parents=True, exist_ok=True)
         # A process restart cannot replay a submitted request without consent.
         for path in root.glob("image_*/job.json"):
-            record = json.loads(path.read_text())
+            try:
+                record = json.loads(path.read_text())
+                if (
+                    not isinstance(record, dict)
+                    or record.get("id") != path.parent.name
+                    or record.get("status")
+                    not in {"queued", "in_progress", "completed", "failed", "cancelled"}
+                ):
+                    raise ValueError("Invalid saved image job")
+            except (OSError, ValueError, TypeError):
+                logger.warning("Skipping unreadable image job: %s", path)
+                continue
             if record["status"] in {"queued", "in_progress"}:
                 update_metadata(record, {"stage": "failed"}, time.time())
                 record.update(

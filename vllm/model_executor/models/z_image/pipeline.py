@@ -70,7 +70,9 @@ class ZImagePipeline:
         )
         from .precision import preserve_projection_range
 
-        preserve_projection_range(self.transformer)
+        preserve_projection_range(
+            self.transformer, attention_fp32=config.checkpoint == "z-image"
+        )
         loading(1, "text_encoder")
         self.text_encoder = AutoModel.from_pretrained(
             str(root / "text_encoder"),
