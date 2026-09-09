@@ -505,6 +505,9 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         finally:
             attention_backend.reset(token)
+        for module in self.transformer.modules():
+            if isinstance(module, Attention):
+                module.query_tile = config.attention_query_tile
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")

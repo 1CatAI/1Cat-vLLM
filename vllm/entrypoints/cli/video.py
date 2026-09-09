@@ -47,6 +47,9 @@ class VideoSubcommand(CLISubcommand):
             mode.add_argument("--fastvideo-vsa-topk", type=int, default=64)
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument(
+                "--attention-query-tile", type=int, choices=(64, 128), default=64
+            )
+            mode.add_argument(
                 "--weight-offload",
                 choices=("component", "layer"),
                 default="component",
@@ -132,6 +135,7 @@ class VideoSubcommand(CLISubcommand):
             tensor_parallel_size=args.tensor_parallel_size,
             attention_backend=args.attention_backend,
             vsa_topk=args.fastvideo_vsa_topk,
+            attention_query_tile=args.attention_query_tile,
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
             lora_path=args.lora_path,
