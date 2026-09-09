@@ -162,3 +162,28 @@ across the different host-memory policies.
 The interface remains explicit. The >80 target, official/human quality, wider
 workflow and shape/TP matrix are still incomplete. Initial setup, skipped work,
 raw IPC storage and slower end-to-end outcomes are retained in the records.
+
+## Native backend and workload breadth
+
+The same native API path with register-probability FI also passes a complete
+latent/RGB/PCM bitwise control against its frozen FI baseline. Full-request
+warmup plus three unprofiled measurements record denoise
+60.986616 / 60.889535 / 60.969633 seconds, median
+50.898828-50.898847 useful TFLOP/s/card and CV 0.069457%. Complete requests take
+89.859034 / 89.086770 / 89.525699 seconds. The allocation upper bound including
+raw IPC is 20,475,227,136 bytes/card. FA and FI peer runs share the pageable
+host/shared VAE policy. Both fail the >80 gate. Evidence:
+`peer-api-fi-720p-three-runs/performance.json`,
+`peer-api-fi-native-quality.json` and `peer-api-fi-formal-telemetry.json`.
+
+Additional complete native controls preserve video/audio latents, all 124 RGB
+frames and PCM bitwise with original floating Light4 weights and W8A16 Ref4
+mixed image/video/audio conditioning. Original Light4 records 59.323955 seconds
+denoise and 22,022,771,200 bytes/card allocation upper bound. Ref4 records
+181.260984 seconds and 21,572,765,184 bytes/card; its longer reference sequence
+uses an explicit 8 GiB reduction budget and 1,491,864,064 raw IPC bytes/card.
+Both record 400 peer calls with zero native fallbacks. These are captured cold
+quality controls, not formal repeated performance measurements. Evidence:
+`peer-api-breadth-summary.json` and both corresponding `*-quality.json` files.
+Independent official quality, human review and the full task/weight/shape
+matrix remain incomplete.
