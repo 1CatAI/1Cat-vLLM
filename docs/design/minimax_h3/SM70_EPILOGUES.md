@@ -4,6 +4,11 @@ This development branch is stacked on the common prepared execution (#571)
 and workflow accounting (#578) branches. No configuration has passed the
 campaign's >80 useful TFLOP/s/card and complete official quality gates.
 
+The separate [FI register-probability update](FLASHINFER_REGISTER_PROBABILITY.md)
+now also has full native media preservation and a formal warmup-plus-three
+result of 49.795 useful TFLOP/s/card. It remains below the FA query-128 result
+and the campaign target. Both use the same shared projection interface.
+
 ## Measured problem and implementation
 
 The matching four-step FA denoise profile spends 6.890 seconds in miscellaneous
@@ -238,9 +243,39 @@ These are captured cold quality controls, not warmed three-run performance.
 Together with the existing v1.2 four-step and v1.0_768p eight-step controls,
 all six official FL2V Turbo artifacts now have a complete W8A16 T2VA numerical
 preservation result. Original-weight and keyframe combinations remain separate
-pending coverage; Ref2V four-step is also still awaiting its full control.
+pending coverage. The subsequent Ref2V four-step control is recorded below.
 No independent official quality or human acceptance is inferred.
 
 Evidence: `remaining-turbo-pairs.json`, `remaining-turbo-summary.json`,
 `light4-v{10,11,01}-720p-quality.json`, `light8-v10-non768-720p-quality.json`
 and the corresponding captured runs under the campaign's artifact root.
+
+## Four-step mixed references and complete adapter inventory
+
+Source `c69cfc7024460e314e79a0bba37a3b736340bc6e` completes the official
+Ref2V four-step v0.1 adapter with a W8A16 Ref2VA base, one image, one
+2.5-second video and one standalone audio reference. The video starts at zero;
+seed 42, five sigma points, video/audio shifts 12/3 and alpha 8 are retained.
+The candidate uses the same general FA query-128 path as the other adapters.
+
+`ref4-mixed-quality.json` passes all declared numerical gates against frozen
+native `4f19ef7`: final video/audio latents, all 124 RGB frames and PCM match
+bitwise, PSNR is infinite, SSIM is 1 and RMS ratio is 1. Spectral cosine is
+0.9999999999999695. Both native generations complete. The candidate's strict
+actual-work checks pass; its complete denoise is 184.563686 seconds, request
+269.210367 seconds, and peak allocation 19,613,711,360 bytes/card. Corrected
+useful throughput is 52.585556-52.585562 TFLOP/s/card.
+
+The frozen control takes 214.108869 seconds denoise and 321.250580 seconds
+request with the same peak allocation. These are captured cold requests with
+different host VAE sharing policies; they are not formal speed acceptance.
+The old control script did not embed Git metadata. The separate
+`baseline-source-audit.json` verifies all 2,483 tracked `vllm` files in the
+frozen archive against `4f19ef7`, without changing the historical contract.
+
+All eight official LightX2V artifacts now have complete native numerical
+preservation evidence: six FL2V adapters on T2VA and both Ref2V adapters with
+mixed references. This is not the full task/weight/reference cross-product,
+independent official quality, human review or >80 acceptance. Exact paths,
+source identities and timing scope are retained in `ref4-mixed-pair.json`,
+`ref4-mixed-summary.json` and the campaign result index.

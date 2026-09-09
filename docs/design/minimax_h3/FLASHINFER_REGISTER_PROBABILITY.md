@@ -92,6 +92,27 @@ and 107.358301 / 100.664110 seconds request (control/candidate). These captures
 include different first-use setup costs and are not a formal speed comparison.
 Use the matched warmed denoise control above for the isolated 7.179% result.
 
-Formal repeated request measurements, independent official references and
-human review remain separate gates. The campaign remains incomplete. No
-precision gate or sampler setting is relaxed.
+## Formal repeated requests
+
+Source `c69cfc7024460e314e79a0bba37a3b736340bc6e` completes one full native
+warmup and three requests without profiler or captures, with the same
+media-checked configuration and immutable binary. The warmup takes 63.412712
+seconds denoise and 98.849412 seconds request.
+
+| Measurement | Denoise seconds | Complete request seconds |
+| --- | ---: | ---: |
+| 1 | 62.321408 | 91.585107 |
+| 2 | 62.339754 | 91.385871 |
+| 3 | 62.257260 | 95.401157 |
+
+Minimum-to-maximum rank median throughput is **49.794813-49.794831 useful
+TFLOP/s/card**, using the slowest rank's complete denoise time. Denoise CV is
+0.056762%; peak allocation remains 19,501,498,880 bytes/card. The full contract,
+per-rank stages/steps, loaded binary hashes, source hashes and NVML samples are
+retained in `fi-register-720p-three-runs/`.
+
+**The >80 performance gate fails.** The earlier FA query-128 configuration's
+51.939 TFLOP/s/card remains the campaign's best formal result. The complete
+native FI numerical control passes, but independent official references and
+human review remain pending. No AUTO selection, precision relaxation or
+campaign completion is claimed.
