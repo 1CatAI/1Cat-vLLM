@@ -237,6 +237,7 @@ def main():
     parser.add_argument("--base-manifest", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--build", action="store_true")
+    parser.add_argument("--shared-carveout", type=int, choices=(100,))
     args = parser.parse_args()
     base = json.loads(args.base_manifest.read_text())
     assert base["head_groups"] == 1 and base.get("splits", 80) == 80
@@ -248,7 +249,48 @@ def main():
     sources = directory / "sources"
     shutil.copytree(source_dir, sources)
     path = sources / "kernel/grouped-attention.cu"
-    path.write_text(staged_source(source_file.read_text()))
+    source = staged_source(source_file.read_text())
+    if args.shared_carveout is not None:
+        launch = "    producer<<<tiles, 256, 0, stream>>>("
+        source = replace_once(
+            source,
+            launch,
+            "    C10_CUDA_CHECK(cudaFuncSetAttribute(producer,\n"
+            "        cudaFuncAttributePreferredSharedMemoryCarveout, 100));\n"
+            "    C10_CUDA_CHECK(cudaFuncSetAttribute(consumer,\n"
+            "        cudaFuncAttributePreferredSharedMemoryCarveout, 100));\n" + launch,
+        )
+        source = replace_once(
+            source,
+            "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {",
+            r"""
+pybind11::dict staged_resource_report() {
+  auto describe = [](auto kernel, int threads, int dynamic_bytes) {
+    cudaFuncAttributes attrs;
+    C10_CUDA_CHECK(cudaFuncGetAttributes(&attrs, kernel));
+    int blocks = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, kernel, threads, dynamic_bytes));
+    pybind11::dict result;
+    result["registers"] = attrs.numRegs;
+    result["static_shared_bytes"] = attrs.sharedSizeBytes;
+    result["dynamic_shared_bytes"] = dynamic_bytes;
+    result["preferred_shared_carveout"] = attrs.preferredShmemCarveout;
+    result["resource_limited_blocks_per_sm"] = blocks;
+    return result;
+  };
+  pybind11::dict result;
+  result["qk"] = describe(grouped_staged_qk_kernel<3296, true>, 256, 0);
+  result["pv"] = describe(grouped_staged_pv_kernel<8, false, 3296,
+      false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
+      false, float, true, true, true>, 256, sizeof(StagedPVSmem));
+  return result;
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("resource_report", &staged_resource_report);
+""",
+        )
+    path.write_text(source)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     module_name = "sm70_staged_attention_" + digest[:12]
     manifest = {
@@ -259,6 +301,7 @@ def main():
         "staged_qk": True,
         "pv_column_partitions": 2,
         "capture_owned_score_scratch": True,
+        "shared_carveout": args.shared_carveout,
         "source_files": {
             str(p.relative_to(sources)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(sources.rglob("*"))

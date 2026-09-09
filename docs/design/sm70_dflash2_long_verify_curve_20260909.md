@@ -291,3 +291,190 @@ racecheck and synccheck with zero errors.
 Prior rejected experiments remain recorded in the context-cost and long-verify
 worklogs. Historical E5M2 and FP16-partial Pack-GQA timings are design references,
 not quality/performance evidence for this E4M3 FP32 path.
+
+## Expanded-domain model checks and terminal scheduling
+
+A private process-only extension raises the experimental graph bound to 262152
+before capture. The public source remains bounded at 132096, and service
+capacity remains 262144. The original selected DSO completes one startup with
+one cold warmup and five measured requests per arm at 261888 input tokens plus
+256 output tokens. Median complete cost is 95.419 ms for the control and
+38.602 ms for the candidate. All token IDs, acceptance and finish reasons
+match. Accepted drafts/round are 4.02 and emitted tokens/round are 5.12.
+This is a capacity-bound performance probe, whose responses reach the output
+limit; it is not a natural-EOS quality case or three-startup acceptance.
+
+The 256K fixed-prefix control/candidate/control diagnostic also has exact
+logits, TV, support and EOS probabilities. Its 272 raw differences per
+comparison are explained storage differences, with zero unexplained changes.
+The separate natural-output campaign retains exact paired 10107-token
+HumanEval and 75828-token LiveCodeBench responses, both ending naturally.
+All twelve structured pairs (JSON, schema, one tool, parallel tools; seeds
+0/1/2) have exact tokens/acceptance, valid structure and natural termination.
+The other sixteen code pairs are separate resumable jobs. The first of those
+also completes an exact 51562-token LiveCodeBench pair with natural EOS; it
+does not complete the rest of the campaign.
+
+The expanded 256K middle-window trace attributes 16.517 ms of rank-average
+GPU service to target attention and about 7.387 ms to QPN2 projections.
+Its profiled critical interval p50/p90/p99 is 33.834/34.201/34.822 ms.
+Attention agrees with the actual-page independent working set; these data do
+not establish an extra allocation/TLB bottleneck.
+
+A second trace observes actual B1 scheduling through the end of the request.
+At computed position 262139, after 252 emitted tokens, the final four steps
+have one scheduled token and zero proposals. They leave the FULL q8 graph and
+run eager target forward. The scalar E4M3 FP32 partition attention kernel has
+grid `(1,6,256)`, 256 threads, 40 registers and 12880 static shared bytes;
+its sixteen target-layer calls cost 59.377 ms per captured q1 step/rank.
+The draft phase still runs. This explains a substantial terminal penalty and
+identifies a separate optimization scope. Full request accounting must retain
+those steps even though the speculative-round counter does not count them.
+Adjacent profiled scheduling intervals overlap GPU work; their service sums
+must not be presented as a closed wall-clock decomposition.
+
+## PV reuse and quality localization
+
+The PV-reuse builder interchanges independent M fragments so a raw V fragment
+and its residual-scaled copy are loaded/formed once per N16 panel. Each output
+accumulator still consumes main0, residual0, main16 and residual16 before its
+N32 online update. Source SHA is
+`c70e6046c374d18f1c51ad126622e03ecfc34a46a656de225ae2376d384968c0`; DSO SHA is
+`30c468456c6e5bfb8d97819a3cad1d6e598db20d0ca18e9ca2d681b12ef32961`.
+It uses 112 registers without spills and the same 73728 shared-memory bytes.
+All 130 paired operator checks pass, as do its own extended memcheck,
+racecheck and synccheck. The actual-page sixteen-layer costs are:
+
+| Input tokens | Prior selected attention, ms | PV reuse attention, ms |
+| --- | ---: | ---: |
+| 1024 | 0.580 | 0.552 |
+| 32768 | 2.401 | 2.244 |
+| 65536 | 4.428 | 4.111 |
+| 131072 | 8.471 | 7.841 |
+| 261888 | 16.384 | 15.150 |
+
+Its first standalone model startup is **not admissible**. The 1K responses
+match retained controls, but longer free generations differ, including
+acceptance and a 64K finish reason. The 32K/64K/128K request medians of
+18.280/19.993/23.727 ms therefore cannot establish a paired speedup; 256K is
+39.875 ms and does not improve the previous screen. The experiment also uses
+a fresh compiler-cache namespace and the expanded graph domain. Fifteen
+shared native-library hashes still match the frozen run. Do not attribute
+the trajectory difference to the new operator without an exact-input check.
+
+The next 32K/128K fixed-prefix A/B/A captures have exact native logits and
+zero TV, support changes and unexplained state differences. Comparing their
+control against the earlier startup's matching fixed tapes is also exact.
+These checks do not replace the failed free-generation gate. A diagnostic
+native shadow and natural proposal/state captures are used to locate the
+first difference; the new candidate remains disabled for promotion.
+
+Paired QK products are another independent scheduling experiment: produce
+two separate zero-initialized K16 products, then consume their compensation
+updates in the original order. All 130 operator checks pass. The 128K working
+set is 7.769 ms versus the paired PV-reuse parent's 7.818 ms; at 261888 it is
+15.001 versus 15.095 ms. This small local benefit has no model admission.
+Its source SHA is
+`0f1d3703382b94ccacee3958eb9f89e0b4f13cdb25ca48269ef7e31006fa731f`; DSO SHA is
+`14377f48ce548858c8d2af830e892cb68abe3abe1da29ee2d60713698117a30a`.
+
+The staged QK/PV follow-up with preferred shared carveout 100 does not help:
+128K is 11.208 ms versus 11.193 ms without the preference and 8.446 ms for
+the earlier one-stage selection. The resource occupancy API permits two PV
+blocks/SM with either preference; this is a resource bound, not achieved
+occupancy. The producer/PV trace costs 3.580/8.232 ms, motivating reuse and
+consumer scheduling work instead of claiming that extra parallelism suffices.
+
+An independent warp-pipeline prototype uses eight producer and sixteen
+consumer warps, two score/V panels and named ready/free barriers. Its initial
+binary (source `416d076ee5962e1587b3c0c9854eb8a1837ba808bc1bcf82a804645216b143cf`)
+fails the expanded byte-equality check despite zero reported synccheck errors.
+It also spills under the 768-thread register limit. It has no performance or
+serving acceptance. A serialized variant isolates overlap from other causes;
+both preserve failed artifacts. The serialized variant still produces NaNs
+on independent random inputs, so disabling overlap alone does not fix the
+prototype. Constant-input, first-tile checks follow before any timing claim.
+Named-barrier synchronization follows the
+[PTX producer/consumer memory-ordering contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar),
+including explicit participating-thread counts and unaligned instructions
+for divergent producer/consumer warps.
+
+The structured-client diagnostic also found a prompt-counting defect:
+canonical JSON serialization reordered tool/schema keys before rendering,
+whereas generation preserved their insertion order. Actual prompts differ
+in token count (339 versus 338 for one tool and 452 versus 454 for parallel
+tools). The private client now uses the chat renderer with generation's wire
+order, retaining the original counts as evidence and requiring equality to
+the generated request's reported prompt count. Sampling, prompts, natural
+EOS and total context capacity are unchanged.
+
+The natural-state diagnostic also needs to find auxiliary target states
+through the context-probe sampling wrapper. Its earlier immediate-caller
+lookup fails there before a scored observation. The revised lookup requires
+both the same model-runner object and the same input-batch object, rejecting
+unrelated frames. The affected CPU suite passes 19 tests with one GPU skip;
+this change observes existing tensors and does not alter inference arithmetic.
+
+An isolated q1 builder reproduces the traced scalar E4M3/FP32 partition and
+1024-token merge using the frozen serving source. The extracted reference and
+PV-unroll4 candidate pass all 24 output/full-workspace/canary checks against
+the frozen production DSO, including stride padding, zero-length replay and
+262144 visible tokens. The sixteen-layer 261888-token workset is
+60.565/60.574/60.580 ms for production/extracted/unroll4 respectively; the hint
+has no useful performance benefit. Source/DSO hashes are:
+
+| Scalar q1 variant | Source SHA256 | DSO SHA256 |
+| --- | --- | --- |
+| Extracted reference | `903401903455e91fda49685b170b7bd932b1975d291f0c022b7a951ad99d0501` | `c521b0f96fa17bd8f474e5104ed2b35d1c82074d73af2e447172c90a05b0d584` |
+| PV unroll4 | `e81f28ba2bf8215e7a6e037c2f599697e84cef582d1be0148c71f6f2c082a6f5` | `e9336ac7bd888bd3a9b43559423c4661de74b8a5d46d6ee1c7591afc845c06cc` |
+
+Explicit four-value prefetch applies the original FP32 FMAs in token order
+and passes all 24 checks, but regresses the sixteen-layer 261888-token workset
+from 60.564 to 63.124 ms. It is rejected without a model trial. Its source/DSO
+SHA256 are `9723b252d9c54ebd96d1aa99c4ea3544c8cf66696e58e5fafa218d161e0619a8` /
+`e822ade9e58e14510be2c40818327c4a608e4978d9970e5871d7fc3b231bf69d`.
+A separate six-head scalar prototype shares each decoded K/V value across
+independent per-head FP32 chains, retaining the original 1024-token partitions
+and merge. It requires its own full-workspace checks and performance screen.
+The scalar builder installs no serving route and does not change q8 arithmetic.
+
+## September 10 online-softmax correction and natural diagnostics
+
+The first warp-pipeline failure is localized to code extraction: the builder
+copied the TWO_PASS statistics-only row loop instead of the online softmax
+branch. It never wrote P, the compensated probability residual, or row rescale
+before PV read them. A constant-input first-tile probe confirms an incorrect
+P/residual with correct V and max/sum, including with overlap disabled. The
+builder now anchors the online branch and requires all three publications and
+its warp memory barrier. Corrected source
+`15b44fd2fefe692000d18a112cb3f278802c6e5bc7448a62c6a885dc02014385` has DSO SHA256
+`2fdf18b3d0d71d84a9797a046554fe56e15a70182151b15206cbe06080b73717`.
+This correction is not a quality or speed pass; the original failed artifacts
+remain retained. The current 768-thread prototype still has register spills.
+
+The no-forced-token 32K control/candidate/control audit has 30 observed steps
+and all four ranks. After checking consistent physical-slot renaming and
+source-defined unused convolution storage, all captured target/proposal
+logical tensors agree. Each comparison retains 2352 raw storage differences.
+The natural comparator now supports the same explicit convolution-width
+explanation as the fixed-prefix comparator; tests reject changed live values
+and inconsistent mappings. The focused suite passes 22 tests with one GPU skip.
+
+This audit cannot explain away the PV candidate's free-generation failure.
+Its 128-token output differs from the retained uninstrumented selected result
+at token 97 (zero based), while the failed PV result first differs at token 59.
+In addition, graph-captured persistent shadow counters contain non-count
+values after control replays. They are invalid evidence. A revised diagnostic
+allocates persistent counters and reference workspaces before graph capture,
+matching initial workspace contents before each native comparison. A separate
+uninstrumented same-startup route A/B is required to distinguish candidate
+behavior from startup/layout or diagnostic effects. No claim of a model-wide
+PV equality pass is made from these observations.
+
+The original selected combination has completed 17 of 30 frozen natural-EOS
+pairs at this checkpoint. This includes all 12 JSON/schema/tool/parallel-tool
+pairs over seeds 0/1/2 and five seed-0 code pairs. Completed long-code outputs
+include 75828, 51562, 83004 and 24318 tokens with exact output IDs, acceptance
+and finish reason. These are paired non-regression observations, not new
+benchmark scores. Remaining natural code pairs continue at complete-pair
+boundaries alongside the optimization queue.

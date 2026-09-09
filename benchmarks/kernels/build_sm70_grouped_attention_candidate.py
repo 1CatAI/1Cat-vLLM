@@ -148,6 +148,143 @@ def prefetch_keys(source: str, key_load_warps: int) -> str:
     return source[:start] + partial + source[end:]
 
 
+def reuse_pv_values(source: str) -> str:
+    """Interchange independent M tiles to reuse raw/scaled V fragments.
+
+    Each accumulator still receives main0, residual0, main16, residual16 in that
+    order, followed by one N32 online-state update. The six-head/16-warp layout
+    assigns the same D tile to a warp for all three M tiles.
+    """
+    start = source.index("__launch_bounds__(kGroupedVerifyThreads, 1) void ")
+    end = source.index(
+        "void flash_attention_grouped_verify_e5m2_combine_kernel(", start
+    )
+    partial = source[start:end]
+    begin = partial.index(
+        "#pragma unroll\n    for (int fragment_idx = 0; "
+        "fragment_idx < kGroupedVerifyOutputTilesPerWarp;"
+    )
+    finish = partial.index("    __syncthreads();\n  }", begin)
+    replacement = r"""    static_assert(COMPENSATE_P && kGroupedVerifyWarps == 16,
+                  "PV reuse is isolated to six-head compensated E4M3");
+    volta::fragment<volta::accumulator, 16, 16, 16, float>
+        tile_fragments[kGroupedVerifyOutputTilesPerWarp];
+#pragma unroll
+    for (int i = 0; i < kGroupedVerifyOutputTilesPerWarp; ++i)
+      volta::fill_fragment(tile_fragments[i], 0.0f);
+    const int d_tile = warp_id;
+#pragma unroll
+    for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
+      volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
+          value_fragment;
+      volta::load_matrix_sync(
+          value_fragment,
+          shared_values + k_offset * kGroupedVerifyKVStride + d_tile * 16,
+          kGroupedVerifyKVStride);
+      auto residual_value_fragment = value_fragment;
+#pragma unroll
+      for (int i = 0; i < value_fragment.num_elements / 2; ++i) {
+        union {
+          uint32_t bits;
+          __half2 pair;
+        } packed_value;
+        packed_value.bits = value_fragment.x[i];
+        packed_value.pair =
+            __hmul2(packed_value.pair, __float2half2_rn(1.0f / 2048.0f));
+        residual_value_fragment.x[i] = packed_value.bits;
+      }
+#pragma unroll
+      for (int fragment_idx = 0;
+           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+        const int m_tile = fragment_idx;
+        if ((active_m_tiles & (1 << m_tile)) == 0) continue;
+        volta::fragment<volta::matrix_a, 16, 16, 16, half, volta::row_major>
+            probability_fragment;
+        volta::load_matrix_sync(
+            probability_fragment,
+            shared_probs + m_tile * 16 * kGroupedVerifyProbStride + k_offset,
+            kGroupedVerifyProbStride);
+        volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
+                        value_fragment, tile_fragments[fragment_idx]);
+        volta::load_matrix_sync(
+            probability_fragment,
+            shared_prob_residual + m_tile * 16 * kResidualStride + k_offset,
+            kResidualStride);
+        volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
+                        residual_value_fragment, tile_fragments[fragment_idx]);
+      }
+    }
+#pragma unroll
+    for (int fragment_idx = 0;
+         fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+      const int m_tile = fragment_idx;
+      if ((active_m_tiles & (1 << m_tile)) == 0) continue;
+      grouped_verify_add_output_tile(output_fragments[fragment_idx],
+                                     tile_fragments[fragment_idx],
+                                     smem.row_scale, m_tile * 16);
+    }
+"""
+    partial = partial[:begin] + replacement + partial[finish:]
+    return source[:start] + partial + source[end:]
+
+
+def pair_qk_products(source: str) -> str:
+    """Produce two independent K16 products before their ordered corrections.
+
+    The dot products retain their own zero-initialized accumulators. Correction
+    consumes the first product and then the second, in the original K16 order.
+    This isolates instruction scheduling from a change in reduction arithmetic.
+    """
+    start = source.index("__device__ __forceinline__ void grouped_verify_qk(")
+    end = source.index(
+        "__device__ __forceinline__ void grouped_verify_scale_output_fragment(",
+        start,
+    )
+    qk = source[start:end]
+    qk = replace_once(
+        qk,
+        "k_offset < kGroupedVerifyHeadDim; k_offset += 16)",
+        "k_offset < kGroupedVerifyHeadDim; k_offset += (COMPENSATE ? 32 : 16))",
+    )
+    product = (
+        "      volta::mma_sync(tile_fragment, q_fragment, k_fragment, tile_fragment);"
+    )
+    qk = replace_once(
+        qk,
+        product,
+        product
+        + r"""
+      volta::fragment<volta::accumulator, 16, 16, 16, float> next_tile_fragment;
+      volta::fill_fragment(next_tile_fragment, 0.0f);
+      volta::load_matrix_sync(
+          q_fragment,
+          shared_q + m_tile * 16 * kGroupedVerifyQStride + k_offset + 16,
+          kGroupedVerifyQStride);
+      volta::load_matrix_sync(
+          k_fragment,
+          shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset + 16,
+          kGroupedVerifyKVStride);
+      volta::mma_sync(next_tile_fragment, q_fragment, k_fragment,
+                      next_tile_fragment);
+""",
+    )
+    correction = r"""#pragma unroll
+      for (int i = 0; i < score_fragment.num_elements; ++i) {
+        const float y = __fsub_rn(tile_fragment.x[i], correction[i]);
+        const float sum = __fadd_rn(score_fragment.x[i], y);
+        correction[i] = __fsub_rn(__fsub_rn(sum, score_fragment.x[i]), y);
+        score_fragment.x[i] = sum;
+      }"""
+    qk = replace_once(
+        qk,
+        correction,
+        correction
+        + "\n"
+        + correction.replace("tile_fragment.x", "next_tile_fragment.x"),
+    )
+    return source[:start] + qk + source[end:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -158,6 +295,8 @@ def main() -> None:
     parser.add_argument("--prefetch-v", action="store_true")
     parser.add_argument("--prefetch-k", action="store_true")
     parser.add_argument("--prefetch-k-warps", type=int, choices=(4, 8), default=8)
+    parser.add_argument("--reuse-pv-values", action="store_true")
+    parser.add_argument("--qk-paired-products", action="store_true")
     parser.add_argument("--splits", type=int, choices=(80, 160, 320), default=80)
     parser.add_argument("--grouped-only", action="store_true")
     parser.add_argument("--build", action="store_true")
@@ -166,6 +305,13 @@ def main() -> None:
         parser.error("--prefetch-v currently requires --head-groups 1")
     if args.prefetch_k and not (args.prefetch_v and args.grouped_only):
         parser.error("--prefetch-k requires --prefetch-v and --grouped-only")
+    if args.reuse_pv_values and not (
+        args.head_groups == 1
+        and args.prefetch_v
+        and args.grouped_only
+        and not args.prefetch_k
+    ):
+        parser.error("--reuse-pv-values needs six heads, V prefetch and grouped-only")
     root = Path(__file__).resolve().parents[2] / "flash-attention-v100"
     original = root / "kernel/flash_decode_paged.cu"
     source = original.read_text()
@@ -252,6 +398,14 @@ def main() -> None:
         source = prefetch_values(source)
     if args.prefetch_k:
         source = prefetch_keys(source, args.prefetch_k_warps)
+    if args.reuse_pv_values:
+        source = reuse_pv_values(source)
+    if args.qk_paired_products:
+        if not args.grouped_only or args.head_groups != 1 or args.qk_unroll != 1:
+            parser.error(
+                "QK paired products require grouped-only, six heads and unroll1"
+            )
+        source = pair_qk_products(source)
     barrier = """        __syncwarp();
         if (lane_id == 0) {
           if (tile_sum > 0.0f) {"""
@@ -360,6 +514,8 @@ def main() -> None:
         "prefetch_v": args.prefetch_v,
         "prefetch_k": args.prefetch_k,
         "prefetch_k_warps": args.prefetch_k_warps if args.prefetch_k else None,
+        "reuse_pv_values": args.reuse_pv_values,
+        "qk_paired_products": args.qk_paired_products,
         "splits": args.splits,
         "grouped_only": args.grouped_only,
         "extra_cuda_cflags": flags,
