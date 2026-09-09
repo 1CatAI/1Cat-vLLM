@@ -423,8 +423,16 @@ def _broadcast_tensor(
 
 
 class MiniMaxH3Pipeline(nn.Module):
-    def __init__(self, config: H3Config):
+    def __init__(self, config: H3Config, *, shared_weights_dir: str | None = None):
         super().__init__()
+        if (
+            config.share_host_vae_weights
+            and config.tensor_parallel_size > 1
+            and shared_weights_dir is None
+        ):
+            raise H3InputError(
+                "shared host VAE weights require an engine-owned directory"
+            )
         self.config = config
         self.partition = config.partition
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
@@ -566,6 +574,7 @@ class MiniMaxH3Pipeline(nn.Module):
             device=self.device,
             load_device=torch.device("cpu"),
             pin_memory=config.host_weight_pin_memory,
+            shared_weights_dir=shared_weights_dir,
         )
         self.video_vae.set_parallel_size(config.tensor_parallel_size)
         self.audio_vae = MiniMaxH3AudioVAE(
@@ -573,6 +582,7 @@ class MiniMaxH3Pipeline(nn.Module):
             device=self.device,
             load_device=torch.device("cpu"),
             pin_memory=config.host_weight_pin_memory,
+            shared_weights_dir=shared_weights_dir,
         )
         self.stage_durations = {}
         self.actual_dit_calls = 0
