@@ -13,6 +13,11 @@ from torch import nn
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--layer-offload", action="store_true")
+    parser.add_argument(
+        "--backend",
+        choices=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
+        default="FLASH_ATTN_V100",
+    )
     args = parser.parse_args()
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -20,6 +25,7 @@ def main():
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.model_executor.models.minimax_h3.attention import attention_backend
     from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
     from vllm.model_executor.models.minimax_h3.request_cache import (
         CACHE_DIT_DEFAULTS,
@@ -46,23 +52,27 @@ def main():
         initialize_model_parallel(world)
         try:
             with torch.inference_mode():
-                model = (
-                    MiniMaxH3DiTModel(
-                        dict(
-                            num_layers=4,
-                            hidden_size=512,
-                            num_attention_heads=4,
-                            ffn_hidden_size=1024,
-                            text_dim=32,
-                            adaln_curve_grid=2,
-                            adaln_out_features=18 * 512,
-                            final_adaln_out_features=2 * 512,
-                        ),
-                        residual_sequence_parallel=True,
+                backend_token = attention_backend.set(args.backend)
+                try:
+                    model = (
+                        MiniMaxH3DiTModel(
+                            dict(
+                                num_layers=4,
+                                hidden_size=512,
+                                num_attention_heads=4,
+                                ffn_hidden_size=1024,
+                                text_dim=32,
+                                adaln_curve_grid=2,
+                                adaln_out_features=18 * 512,
+                                final_adaln_out_features=2 * 512,
+                            ),
+                            residual_sequence_parallel=True,
+                        )
+                        .cuda()
+                        .eval()
                     )
-                    .cuda()
-                    .eval()
-                )
+                finally:
+                    attention_backend.reset(backend_token)
                 torch.manual_seed(190)
                 for name, value in model.named_parameters():
                     value.fill_(1) if "norm" in name else value.normal_(0, 0.01)
@@ -186,6 +196,7 @@ def main():
                     assert repeated[0] == repeated[1]
                     print(
                         f"rank={rank} tp={world} layer={args.layer_offload} "
+                        f"backend={args.backend} "
                         f"{plan.backend} "
                         f"{plan.options} counts={repeated[0]} PASS",
                         flush=True,

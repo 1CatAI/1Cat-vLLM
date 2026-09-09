@@ -183,3 +183,14 @@ returns to its CPU master after each request. Cache state is removed on exit.
 Evidence is `cache-layer-tp{1,2,4}-gpu.log` and `cache-layer-checks.json` in the
 campaign root. These are operator/request-lifecycle integration checks; they
 do not extend the recorded full-model quality or performance acceptance.
+
+The same distributed fixture also accepts `--backend FLASHINFER_SM70`.
+With the register-probability FI build inherited from kernel source `f8b85c681a`,
+TP1/TP2/TP4 again pass all five policies, two consecutive requests and actual
+layer staging. Backend selection is recorded in each result line. Counts agree
+across ranks and outputs meet the unchanged resident-control gate. Evidence:
+`cache-register-gpu.json`, `cache-register-tp{1,2,4}-gpu.log`, and the immutable
+`shared-register-variants-binaries.json` manifest. This verifies cache/layer
+integration on both explicit dense backends; it does not qualify cached model
+quality or >80 throughput. The associated CPU integration passes 103 checks,
+with seven explicitly device-masked GPU skips.
