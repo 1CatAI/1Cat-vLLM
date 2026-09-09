@@ -141,7 +141,10 @@ def main() -> None:
     parser.add_argument("--trace-dir", type=Path)
     parser.add_argument("--reset-prefix-cache-before-length", action="store_true")
     parser.add_argument("--require-native-prefill", action="store_true")
+    parser.add_argument("--require-original-gdn-prefill", action="store_true")
     args = parser.parse_args()
+    if args.require_original_gdn_prefill and not args.require_native_prefill:
+        parser.error("--require-original-gdn-prefill needs --require-native-prefill")
     assert not args.output.exists(), args.output
     corpus_bytes = args.corpus.read_bytes()
     corpus = json.loads(corpus_bytes)
@@ -161,6 +164,7 @@ def main() -> None:
         "profiler": args.trace_dir is not None,
         "reset_prefix_cache_before_length": args.reset_prefix_cache_before_length,
         "require_native_prefill": args.require_native_prefill,
+        "require_original_gdn_prefill": args.require_original_gdn_prefill,
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": 0},
         "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
         "cases": [],
@@ -182,6 +186,8 @@ def main() -> None:
             rows = json.load(response)["results"]
         assert sorted(row["rank"] for row in rows) == list(range(4)), rows
         assert all(row["native_prefill_available"] for row in rows), rows
+        if args.require_original_gdn_prefill:
+            assert all(row["gdn_prefill"]["original_tilelang"] for row in rows), rows
         return sorted(rows, key=lambda row: row["rank"])
 
     if args.require_native_prefill:

@@ -63,9 +63,9 @@ on the benchmark modules. The first GPU observations below exposed a missing
 native prefill dependency and do not qualify the intended fast route.
 
 Artifacts, private launch wrappers, checkpoints and task-local compiler caches
-are under `/home/ymzx/.cache/1cat-dflash2-context-cost-20260909`. The retained
-frozen candidate and rear-four-GPU queue are under
-`/data/minimax-h3/task-cache/v100-quasar-dflash2-15ms-20260908`.
+are retained in the task artifact archive, with absolute locations in the
+private handoff manifest. Generated libraries and private cache paths are not
+part of this source change.
 The dataset campaign is checkpointed, preserving completed same-startup pairs
 and retaining any interrupted partial case separately. Its queued continuation
 remains held during the prefill route investigation.
@@ -152,3 +152,117 @@ The repaired run retains FP32 arithmetic and does not disable compensation to
 recover speed. Raw results and route snapshots are in
 `results/context-cost-fa2-repaired.json`, with the compact comparison in
 `results/prefill-repair-summary.json` under the audit artifact root.
+
+## Historical prefill regression and precision gate
+
+The requested historical numbers are real: PR #548's matched release run
+records 128000 / 39.778778 = 3218 tokens/s and 256000 / 107.000216 = 2393
+tokens/s. It uses an FP8 target without DFlash, chunk8192 and E4M3 KV.
+PR #445 is the closer QUASAR NVFP4 + DFlash2 reference: 63482 input tokens
+at 3596.5 tokens/s in the release wheel; same-host source observations at
+63488 input tokens are 3611.8 and 3607.2 tokens/s. It uses chunk4096,
+max_num_seqs4 and E5M2 KV. The repaired E4M3 run above is not declared to have
+recovered historical prefill performance.
+
+The launch also explicitly sets `FLASH_QLA_SM70_USE_ORIGINAL_TILELANG=0`,
+overriding the default original FlashQLA prefill route. This has a recorded
+precedent in PR #477's migration worklog, where restoring the original
+TileLang route recovered prefill throughput. A bounded late-128K trace
+confirms the current native VLK GDN costs 210.862 ms per 3296-token chunk
+(48 calls). The actual launch is 96 CTAs, 64 threads/CTA and 79 registers
+per thread; an earlier commentary incorrectly inferred 48 CTAs from another
+block-group configuration. The trace, not that inference, is authoritative.
+
+The same trace measures 665.067 ms of attention including its softmax
+reduction, about 472.304 ms of remaining dense GEMM/reduction work,
+114.835 ms of communication, and 35.103 ms of normalization/residual work
+per rank/chunk. These are instrumented GPU service categories, not additive
+end-to-end performance predictions. Critical-rank interval is 1562.795 ms,
+GPU event union 1549.213 ms and uncovered time 13.582 ms. The four-rank
+observations cover four real 3296-token prefills starting at positions
+115360, 118656, 121952 and 125248; the middle two chunks are analyzed.
+
+A native-versus-original GDN screen confirms 4.819 versus 0.832 ms at the
+real TP4 Q4/Hv12/D128/T3296 shape. However, an independent FP64 recurrent
+reference finds larger original-TileLang errors: at T65 with weak decay,
+output relative L2 is 0.04661% versus native 0.02074%, and state relative L2
+is 0.03610% versus native 0.0001018%. The T129 strong-decay case has the same
+direction. The initial strict non-worsening reference gate therefore rejected
+this arithmetic candidate. The user subsequently accepted output error growth
+below one order of magnitude and explicitly requested measuring the historical
+GDN fast route first. Output error is about 2x in this operator screen; state
+error has a much larger ratio against the very small native FP32 error, so
+state and model-quality conclusions remain separate from speed restoration.
+
+The next candidate changes the number of value columns assigned to each
+thread subgroup in the existing FP32 recurrence. It preserves the 16-lane
+reductions, recurrence order, FP16 output boundary and FP32 state. The private
+screen requires native output and state to be bitwise equal before timing a
+candidate; no arithmetic downgrade is enabled. Raw artifacts are
+`results/flashqla-original-operator.json` and `results/fp32-gdn-cols.json`.
+
+The completed 64K q8 trace separately identifies target grouped attention as
+the largest decode term: 18.798 ms of GPU service per rank/round, of which
+18.471 ms is the compensated partial kernel. Its launch has 240 CTAs,
+256 threads, 234 registers/thread and 30464 bytes of shared memory. These
+static resources do not establish measured occupancy or memory bandwidth.
+The standalone 128K q8 trace is held while prefill recovery takes priority;
+the 256K jobs remain held at the user's direction.
+
+## Restored original-GDN prefill measurements
+
+The same serving source and FA2 sidecar were rerun with
+`VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL=1` and
+`FLASH_QLA_SM70_USE_ORIGINAL_TILELANG=1`, removing the task launch's forced
+serial-prefill override. The worker log confirms the original TileLang GDN
+route with direct output and non-indexed state; FA2 bridge hits are recorded
+on all four ranks. The native libraries, TP4/B1/q8, 4096 chunk budget,
+262144 total capacity, E4M3 KV, FP32 logits/state, weights and sampling remain
+fixed. No profiler or tensor dump is enabled.
+
+| Input tokens | Previous cold prefill, tokens/s | Restored cold prefill, tokens/s | Restored cold prefill, s | Throughput gain | Complete round, ms | Pure decode, tokens/s | Accepted drafts/round | Emitted tokens/round |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 3222 | 3595 | 0.285 | 11.6% | 16.214 | 291.24 | 3.7778 | 4.7407 |
+| 32768 | 3388 | 4070 | 8.051 | 20.1% | 26.068 | 148.21 | 2.8939 | 3.8788 |
+| 65536 | 3096 | 3651 | 17.949 | 17.9% | 34.633 | 139.84 | 3.8627 | 4.8627 |
+| 131072 | 2630 | 3015 | 43.476 | 14.6% | 53.133 | 81.34 | 3.3390 | 4.3390 |
+
+Each prefill value is a verified cold request with the computed-token counter
+equal to the full input length. Round/decode/acceptance values are medians of
+three repeats in one startup. This recovers the approximately 3600 tokens/s
+64K QUASAR result and 3000+ tokens/s at 128K. It is a speed diagnostic, not
+the plan's three-startup acceptance or a prediction for 256K.
+
+Within each length, all four requests have identical token IDs. Compared with
+the serial GDN baseline, 1K is identical; 32K/64K/128K first differ at output
+indices 199/126/21. The restored 64K request ends naturally after 248 tokens
+with a complete Python function, whereas the control reaches the 256-token
+cap inside its return expression. The other restored lengths hit the cap.
+There is no claim of general quality parity from these bounded requests.
+Accepted drafts/round at 32K/64K/128K change from 3.3729/4.0784/3.5536 to
+2.8939/3.8627/3.3390. Different sampled continuations are a confounder, but
+these observations do not establish acceptance-length non-inferiority.
+Long-context decode is therefore not reported as recovered by this prefill
+configuration change.
+
+The route snapshot now records both original-GDN flags and their resolved
+selection, plus indexed-state/direct-output settings. The optional
+`--require-original-gdn-prefill` guard, used with `--require-native-prefill`,
+rejects a forced serial GDN launch before long measurements. These are
+configuration checks; the actual original-GDN hit must still be confirmed in
+the worker log. This guard was added after the above run, not retroactively
+claimed as part of its launch.
+
+Retained reports are `results/context-cost-prefill-restored.json`,
+`results/prefill-restored-summary.json` and the per-rank runtime-library
+manifest. Job `zz3189-prefill-restored` completed successfully and its owned
+service was stopped. The explicit fast-route launch is retained for subsequent
+verification-cost work; queued 256K requests remain held.
+
+The precision-preserving alternatives are also retained: value-column
+scheduling passes 48/48 native output/state bitwise comparisons and lowers
+the T3296 exp-gate operator from 4.842 to 3.271 ms. A four-token input prefetch
+preserving recurrence order also passes 48/48 and reaches 2.696 ms. Increasing
+prefetch to eight passes 12/12 but regresses to 5.698 ms, so it is rejected
+without a model run. These are operator results, not end-to-end gains or
+enabled production paths.

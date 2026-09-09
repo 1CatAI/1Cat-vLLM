@@ -16,6 +16,7 @@ class PrefillRouteAuditExtension:
     def dflash2_prefill_route_snapshot(self):
         import torch
 
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
         from vllm.v1.attention.backends import flash_attn_v100 as backend
 
         required = (
@@ -52,5 +53,17 @@ class PrefillRouteAuditExtension:
                 and bool(libraries)
             ),
             "routes": dict(backend._route_counts),
+            "gdn_prefill": {
+                "original_tilelang": gdn._sm70_flashqla_original_prefill_enabled(),
+                "indexed_state": gdn._sm70_flashqla_indexed_prefill_enabled(),
+                "direct_output": gdn._sm70_flashqla_direct_output_enabled(),
+                "explicit_original_flag": os.getenv(
+                    "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL"
+                ),
+                "legacy_original_flag": os.getenv(
+                    "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG"
+                ),
+                "configuration_only_verify_actual_hit_in_worker_log": True,
+            },
             "graph_route_counts_are_capture_counts": True,
         }
