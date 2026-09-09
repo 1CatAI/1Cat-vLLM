@@ -137,6 +137,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         device: torch.device,
         load_device: torch.device | None = None,
         pin_memory: bool = True,
+        shared_weights_dir: str | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -158,6 +159,8 @@ class MiniMaxH3VideoVAE(nn.Module):
                 device,
                 pin_memory=pin_memory,
             )
+            if shared_weights_dir is not None:
+                self._stager.share_cpu_storage(Path(shared_weights_dir) / "video")
         self.model = self.remote.model
         self.use_tiling = True
         self.use_slicing = False
@@ -425,6 +428,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         device: torch.device,
         load_device: torch.device | None = None,
         pin_memory: bool = True,
+        shared_weights_dir: str | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -444,6 +448,8 @@ class MiniMaxH3AudioVAE(nn.Module):
                 device,
                 pin_memory=pin_memory,
             )
+            if shared_weights_dir is not None:
+                self._stager.share_cpu_storage(Path(shared_weights_dir) / "audio")
         self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])
 
