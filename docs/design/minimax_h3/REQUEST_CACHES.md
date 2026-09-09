@@ -194,3 +194,18 @@ across ranks and outputs meet the unchanged resident-control gate. Evidence:
 integration on both explicit dense backends; it does not qualify cached model
 quality or >80 throughput. The associated CPU integration passes 103 checks,
 with seven explicitly device-masked GPU skips.
+
+## Explicit peer reduction with cache and layer staging
+
+The fixture at `567c060fa8` adds `--peer-reduction`, using the native pipeline
+reduction owner rather than replacing a block forward. TP4 passes both
+`FLASH_ATTN_V100` and `FLASHINFER_SM70` with actual layer offload, five cache
+policies and two consecutive requests. Output and executed-block checks are
+unchanged; every rank records peer calls, no native fallbacks and matching
+communication counts. The owner is closed before distributed teardown.
+
+The native API dependency merge `f7dbba3721` passes 110 targeted CPU checks
+with one device-masked GPU skip. GPU evidence is `cache-peer-gpu.json` and
+`cache-peer-{fa,fi}.log` under the campaign root. These checks establish cache,
+staging and communication integration; full cached-model quality and primary
+performance qualification remain incomplete.
