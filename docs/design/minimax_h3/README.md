@@ -58,6 +58,15 @@ its downloaded model directory. Frozen revisions and port licenses are recorded
 in the model package's `UPSTREAM.md`. FFmpeg and FFprobe must be on `PATH` for
 reference-video/audio processing.
 
+For hosts that cannot hold every component's pinned CPU copy, use
+`--disable-host-weight-pinning` (Python: `host_weight_pin_memory=False`). This
+keeps pageable immutable masters for the DiT, text encoder and both VAEs.
+It preserves weights, layouts and computation, while allowing the OS to page
+inactive components; transfers and request startup can be slower. The original
+TP4 deployment holds about 157 GiB of CPU masters before loader temporaries and
+allocator caches, so all-pinned startup exhausted the tested 188 GiB host.
+See [GENERAL_SM70.md](GENERAL_SM70.md) for the complete floating-weight control.
+
 Use `--image first.png --keyframe-indices 0`, `--image last.png
 --keyframe-indices -1`, or two `--image` arguments with `--keyframe-indices 0 -1`
 for FL2VA. A Ref2VA instance uses `--partition ref2va` and the matching transformer
@@ -98,13 +107,13 @@ The measured 39-frame/20-update cache list and native cuBLASLt configuration
 are documented in [FLASHINFER_TO50.md](FLASHINFER_TO50.md), including exact
 commands, output comparison and the still-incomplete 50-second target.
 
-For the experimental FlashInfer TP4 INT8 FL2VA route, add
-`--residual-sequence-parallel` to shard FP32 residual rows and reduce TP
-communication. It defaults off and changes floating-point reduction order.
-The unchanged 39-frame/20-update denoise measures 66.863312 seconds; automatic
-checks pass, while five-axis human quality review and the 50-second target
-remain open. See [FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md) for output
-differences, GPU tests, current hardware counters and rollback.
+The earlier experimental FlashInfer residual route changed reduction order;
+its historical results and unaccepted differences are recorded in
+[FLASHINFER_RESIDUAL.md](FLASHINFER_RESIDUAL.md). Current residual sharding uses
+the ordinary full FP32 all-reduce before selecting local residual rows. It
+preserves the complete four-step control bitwise, and does not claim the old
+reduce-scatter communication saving. It remains explicitly enabled with
+`--residual-sequence-parallel` and requires wider quality/performance validation.
 
 The subsequent probability-tile layout change reduces this same optional
 route to 65.804661 seconds and preserves its video/audio outputs bitwise.

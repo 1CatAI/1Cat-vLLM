@@ -532,7 +532,9 @@ class MiniMaxH3Pipeline(nn.Module):
             self.turbo_spec = install_adapter(
                 self.transformer, config.lora_path, self.partition
             )
-        self._dit_stager = PinnedModuleStager(self.transformer, self.device)
+        self._dit_stager = PinnedModuleStager(
+            self.transformer, self.device, pin_memory=config.host_weight_pin_memory
+        )
         self._weight_cache = FP16WeightCache(
             self.transformer,
             budget_gib=config.fp16_weight_cache_gib,
@@ -554,17 +556,21 @@ class MiniMaxH3Pipeline(nn.Module):
             encoder_group=self.text_encoder_group,
         )
         self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
-        self._encoder_stager = PinnedModuleStager(self.text_encoder, self.device)
+        self._encoder_stager = PinnedModuleStager(
+            self.text_encoder, self.device, pin_memory=config.host_weight_pin_memory
+        )
         self.video_vae = MiniMaxH3VideoVAE(
             str(shared / "video_vae"),
             device=self.device,
             load_device=torch.device("cpu"),
+            pin_memory=config.host_weight_pin_memory,
         )
         self.video_vae.set_parallel_size(config.tensor_parallel_size)
         self.audio_vae = MiniMaxH3AudioVAE(
             str(shared / "audio_vae"),
             device=self.device,
             load_device=torch.device("cpu"),
+            pin_memory=config.host_weight_pin_memory,
         )
         self.stage_durations = {}
         self.actual_dit_calls = 0

@@ -45,7 +45,7 @@ Unaccepted drift is not a new oracle; thresholds must not be relaxed to pass.
 
 | Requirement | Implementation | Validation / evidence |
 | --- | --- | --- |
-| Common FP16 input/GEMM, dense column-major path | Shared operator and explicit dense layout | GPU operator checks pass; full original-weight generation pending |
+| Common FP16 input/GEMM, dense column-major path | Shared operator and explicit dense layout | GPU operator checks pass; original/W8A16 four-step complete controls match bitwise |
 | Prepared LoRA input and collective ordering | Implemented, including explicit original basis | GPU prepared/normal results bitwise equal; TP2/TP4 block comparisons pass |
 | General residual sequence sharding | TP2/TP4, original/INT8, matching adapters; TP1 no-op | Both backends and wide residual/padding block checks pass; full Ref2VA pending |
 | FA and FI kernel optimization | Existing narrower routes | Matched baselines pending |
@@ -56,7 +56,7 @@ Unaccepted drift is not a new oracle; thresholds must not be relaxed to pass.
 | Workflow-specific performance accounting | Fixed primary case only | Pending |
 | Non-H3 DiT operator reuse | Shared GEMM/input preparation | Two non-H3 GEMM shapes pass; Attention reuse pending |
 | >80 TFLOP/s/card, full quality, memory | Not achieved | No qualifying results |
-| Draft PRs, matrix report and playable samples | Pending | Pending |
+| Draft PRs, matrix report and playable samples | Common interface Draft PR #571 | First original/W8A16 four-step samples retained; full matrix pending |
 
 ## Development record
 
@@ -147,3 +147,42 @@ The tightened bitwise block oracle also passes on both TP2 ranks
 These results establish the sampled four-step route's numerical preservation,
 not all adapters/partitions or human audiovisual acceptance. Draft PR #571
 contains the implementation and remains Draft.
+
+### Original floating-weight control and host memory
+
+The first original checkpoint run was interrupted by a host restart and has no
+result. The retry (`baseline-720p-original-v2`) was stopped during startup after
+host usage reached 187 GiB with less than 1 GiB available and heavy swapping.
+No denoise performance was recorded. Original-weight CPU masters per rank are
+17,252,698,560 bytes DiT, 13,770,235,360 bytes encoder, 10,415,484,160 bytes video
+VAE and 605,306,340 bytes audio VAE, before loader/allocator overhead.
+
+Two complete controls therefore used identical **pageable** CPU masters for
+all four components, with otherwise unchanged sampling, original BF16 checkpoint
+converted through the existing FP16/FP32 runtime, LightX2V four-step v1.2 and FA:
+
+| Quality control | Denoise seconds | Useful TFLOP/s/card |
+| --- | ---: | ---: |
+| Frozen mainline, ordinary residuals and row layout | 69.044838 | 45.359844 |
+| General prepared path, column layout, exact residual sharding | 66.426983 | 47.147453 |
+
+These are single no-warmup quality requests; the timing difference is **not an
+accepted speedup**. Full video/audio latents match bitwise, all 124 decoded RGB
+frames match (SSIM 1.0), spectral cosine is effectively 1 and RMS ratio is 1.
+See `baseline-720p-original-pageable`, `candidate-720p-original-column` and
+`original-column-quality.json`. These prove preservation of frozen mainline for
+this original-weight workflow, not independent official or human acceptance.
+
+The corresponding native deployment option is `host_weight_pin_memory=False`
+or `--disable-host-weight-pinning`, applied to the DiT, encoder and both VAEs.
+It preserves values, aliases and layouts and changes host residency/transfers
+only. Automatic host/GPU memory budgeting remains further work. The recorded
+complete controls used an artifact-local stager option before the native flag
+was added; they must not be presented as full native-flag generation evidence.
+`host-memory-cpu-v1.log`: 43 config/VAE/workflow/API checks pass.
+`host-memory-gpu-v1.log`: two pinned/pageable alias-preserving repeated transfer
+checks pass. The full original-weight native-flag run is still pending.
+
+The separate workflow-metrics branch replaces fixed 49-call validation with
+actual sigma intervals and step/block counts. Its results and formal FA/FI
+comparisons will be recorded independently. No >80 configuration is qualified.

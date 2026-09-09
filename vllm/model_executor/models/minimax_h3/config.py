@@ -44,9 +44,12 @@ class H3Config:
     int8_weight_layout: str = "column"
     fp16_weight_layout: Literal["row", "column"] = "row"
     residual_sequence_parallel: bool = False
+    host_weight_pin_memory: bool = True
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.host_weight_pin_memory, bool):
+            raise H3InputError("host weight pinning must be a boolean")
         if self.video_encoder not in ("libx264", "h264_nvenc"):
             raise H3InputError("video encoder must be libx264 or h264_nvenc")
         if self.partition not in ("fl2va", "ref2va"):
