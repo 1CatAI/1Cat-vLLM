@@ -12,6 +12,7 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -22,8 +23,10 @@ from torch import nn
 from tqdm.auto import tqdm
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 
+from vllm import envs
 from vllm.distributed import get_tp_group, get_world_group
 from vllm.logger import init_logger
+from vllm.utils.mem_utils import get_cpu_memory
 from vllm.video.metrics import DenoiseWorkCounter
 
 from .attention import attention_backend
@@ -81,7 +84,7 @@ from .reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
-from .residency import PinnedModuleStager
+from .residency import MMapHostWeights, PinnedModuleStager
 from .sigma_schedule import DMD2SigmaSchedule
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
@@ -428,6 +431,22 @@ class MiniMaxH3Pipeline(nn.Module):
         self.config = config
         self.partition = config.partition
         self.device = torch.device("cuda", torch.accelerator.current_device_index())
+        use_mmap = config.host_memory_mode == "mmap" or (
+            config.host_memory_mode == "auto" and get_cpu_memory() < 128 * 1024**3
+        )
+        self._host_backing = (
+            MMapHostWeights(
+                config.host_memory_directory or Path(envs.VLLM_CACHE_ROOT) / "h3-host"
+            )
+            if use_mmap
+            else None
+        )
+        if self._host_backing is not None:
+            logger.info(
+                "H3 uses reclaimable disk-backed host weights at %s; "
+                "weights and compute precision are unchanged",
+                self._host_backing.directory,
+            )
         from .fasth3 import FastH3Fusion, FastH3Spec
         from .flashgen import FlashGenSpec, restore_dense_adaln_weights
         from .lora import inspect_deployment_adapter, select_adapter_file
@@ -497,6 +516,10 @@ class MiniMaxH3Pipeline(nn.Module):
             )
         finally:
             attention_backend.reset(token)
+        if self._host_backing is not None:
+            PinnedModuleStager.map_cpu_weights(
+                self.transformer, self._host_backing, preserve_parameters=False
+            )
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")
@@ -521,6 +544,8 @@ class MiniMaxH3Pipeline(nn.Module):
             method = getattr(layer, "quant_method", None)
             if method is not None:
                 method.process_weights_after_loading(layer)
+                if self._host_backing is not None:
+                    PinnedModuleStager.map_cpu_weights(layer, self._host_backing)
         self.transformer.post_load_weights()
         self.turbo_spec = None
         if fusion is not None:
@@ -531,7 +556,9 @@ class MiniMaxH3Pipeline(nn.Module):
             self.turbo_spec = install_adapter(
                 self.transformer, config.lora_path, self.partition
             )
-        self._dit_stager = PinnedModuleStager(self.transformer, self.device)
+        self._dit_stager = PinnedModuleStager(
+            self.transformer, self.device, host_backing=self._host_backing
+        )
         self._weight_cache = FP16WeightCache(
             self.transformer,
             budget_gib=config.fp16_weight_cache_gib,
@@ -552,8 +579,14 @@ class MiniMaxH3Pipeline(nn.Module):
             load_model=True,
             encoder_group=self.text_encoder_group,
         )
+        if self._host_backing is not None:
+            PinnedModuleStager.map_cpu_weights(
+                self.text_encoder, self._host_backing, preserve_parameters=False
+            )
         self.text_encoder.load_weights(iter_checkpoint_weights(shared / "text_encoder"))
-        self._encoder_stager = PinnedModuleStager(self.text_encoder, self.device)
+        self._encoder_stager = PinnedModuleStager(
+            self.text_encoder, self.device, host_backing=self._host_backing
+        )
         self.video_vae = MiniMaxH3VideoVAE(
             str(shared / "video_vae"),
             device=self.device,

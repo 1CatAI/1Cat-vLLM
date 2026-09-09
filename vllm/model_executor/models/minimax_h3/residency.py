@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import chain
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -29,6 +33,49 @@ def set_tensor_storage(target, value):
 
 
 logger = init_logger(__name__)
+
+
+class MMapHostWeights:
+    """Reclaimable CPU masters with disk space reserved before mapping.
+
+    Files are unlinked once mapped. The kernel keeps storage alive while tensors
+    reference it, and releases it even if a worker is killed. No model files are
+    modified and no stale offload files need to be recovered after a crash.
+    """
+
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory).expanduser().resolve()
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.prefix = f"h3-{os.getpid()}-{uuid.uuid4().hex}-"
+        self.bytes_reserved = 0
+
+    def snapshot(self, source: torch.Tensor, *, preserve: bool = True) -> torch.Tensor:
+        if source.device.type != "cpu" or source.dtype != torch.uint8:
+            raise ValueError("Host backing requires a CPU storage byte view")
+        if not source.numel():
+            return source.detach()
+        filename = source.untyped_storage().filename
+        if filename and str(filename).startswith(str(self.directory / self.prefix)):
+            return source.detach()
+        fd, filename = tempfile.mkstemp(prefix=self.prefix, dir=self.directory)
+        try:
+            # ftruncate alone can SIGBUS later if the disk fills during loading.
+            os.posix_fallocate(fd, 0, source.numel())
+            master = torch.from_file(
+                filename, shared=True, size=source.numel(), dtype=torch.uint8
+            )
+            if preserve:
+                master.copy_(source)
+            self.bytes_reserved += source.numel()
+            return master
+        except OSError as error:
+            raise RuntimeError(
+                "H3 host offload could not reserve disk storage at "
+                f"{self.directory}: {error}"
+            ) from error
+        finally:
+            os.close(fd)
+            Path(filename).unlink(missing_ok=True)
 
 
 class BoundedAllocatorCache:
@@ -125,6 +172,7 @@ class PinnedModuleStager:
         device: torch.device,
         *,
         pin_memory: bool = True,
+        host_backing: MMapHostWeights | None = None,
         copy_stream: Any | None = None,
         cache_retention: BoundedAllocatorCache | None = None,
     ) -> None:
@@ -139,7 +187,9 @@ class PinnedModuleStager:
         self._ready_event = torch.cuda.Event()
         self.cache_retention = cache_retention
         self.loaded = False
-        self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
+        self._groups = self._snapshot_groups(
+            modules, pin_memory=pin_memory, host_backing=host_backing
+        )
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
 
@@ -153,6 +203,8 @@ class PinnedModuleStager:
         modules: tuple[nn.Module, ...],
         *,
         pin_memory: bool,
+        host_backing: MMapHostWeights | None = None,
+        preserve_parameters: bool = True,
     ) -> list[_StorageGroup]:
         targets: list[torch.Tensor] = []
         seen_targets: set[int] = set()
@@ -204,7 +256,12 @@ class PinnedModuleStager:
                 if storage_view.device.type == "cpu"
                 else storage_view.to("cpu")
             )
-            if pin_memory and not master.is_pinned():
+            if host_backing is not None:
+                preserve = preserve_parameters or any(
+                    not isinstance(binding.target, nn.Parameter) for binding in bindings
+                )
+                master = host_backing.snapshot(master, preserve=preserve)
+            elif pin_memory and not master.is_pinned():
                 master = master.pin_memory()
             groups.append(_StorageGroup(master=master, bindings=bindings))
             # Release each pageable allocation as soon as its pinned master is
@@ -213,6 +270,22 @@ class PinnedModuleStager:
             for binding in bindings:
                 set_tensor_storage(binding.target, cls._view(master, binding))
         return groups
+
+    @classmethod
+    def map_cpu_weights(
+        cls,
+        module: nn.Module,
+        backing: MMapHostWeights,
+        *,
+        preserve_parameters: bool = True,
+    ) -> None:
+        """Bind CPU storage before streaming writes, avoiding a full anonymous copy."""
+        cls._snapshot_groups(
+            (module,),
+            pin_memory=False,
+            host_backing=backing,
+            preserve_parameters=preserve_parameters,
+        )
 
     @staticmethod
     def _view(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:

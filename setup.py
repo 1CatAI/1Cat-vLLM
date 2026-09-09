@@ -896,6 +896,9 @@ class precompiled_wheel_utils:
                 sm70_sampler_ext_regex = re.compile(
                     r"vllm/_sm70_sampler_C(?:\.[^/]+)?\.so$"
                 )
+                h3_ext_regex = re.compile(
+                    r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
+                )
                 file_members = []
                 for member in wheel.filelist:
                     if member.filename in exact_members:
@@ -916,6 +919,7 @@ class precompiled_wheel_utils:
                         or flash_attn_v100_ext_regex.match(member.filename)
                         or flash_qla_sm70_ext_regex.match(member.filename)
                         or sm70_sampler_ext_regex.match(member.filename)
+                        or h3_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
