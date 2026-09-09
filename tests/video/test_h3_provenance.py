@@ -34,3 +34,18 @@ def test_provenance_tracks_shared_operators_outside_model_directory(
     assert {k: v for k, v in before.items() if k != changed} == {
         k: v for k, v in after.items() if k != changed
     }
+
+
+def test_provenance_tracks_loaded_generic_sm70_binary(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from vllm.video.metrics import loaded_kernel_provenance
+
+    binary = tmp_path / "exact_reduce.so"
+    binary.write_bytes(b"generic collective binary")
+    monkeypatch.setitem(
+        sys.modules, "onecat_sm70_exact_reduce", SimpleNamespace(__file__=str(binary))
+    )
+    result = loaded_kernel_provenance()
+    assert result[str(binary)] == hashlib.sha256(binary.read_bytes()).hexdigest()

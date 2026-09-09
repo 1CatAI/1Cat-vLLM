@@ -106,3 +106,37 @@ def fp16_linear_prepared(values, weight, scale=None, *, output_fp32=False):
     if scale is not None:
         output = output * scale
     return output.reshape(*values.shape[:-1], weight.shape[0])
+
+
+def supports_fused_scaled_add(output):
+    """Old wheels and unsupported output layouts keep ordinary epilogues."""
+    return (
+        output.is_cuda
+        and output.dtype in (torch.float16, torch.float32)
+        and output.is_contiguous()
+        and torch.cuda.get_device_capability(output.device) == (7, 0)
+        and hasattr(sm70_extension(), "scaled_add_")
+    )
+
+
+def fp16_linear_add(x, weight, output, *, alpha, offset=0):
+    """Add a scaled FP16 projection into a contiguous output slice in place.
+
+    GEMM and row-scale restoration retain FP32 boundaries. FP16 output is
+    rounded after this contribution, so callers combining overlapping deltas
+    must retain an FP32 accumulation buffer until their last contribution.
+    """
+    if not output.is_contiguous():
+        raise ValueError("SM70 projection addition requires contiguous output")
+    values, scale = fp16_gemm_input(x)
+    delta = fp16_gemm(values, weight, output_fp32=True)
+    flat = output.view(-1, output.shape[-1])
+    if supports_fused_scaled_add(output):
+        sm70_extension().scaled_add_(flat, delta, scale, alpha, offset)
+    else:
+        if scale is not None:
+            delta = delta * scale
+        target = flat[:, offset : offset + weight.shape[0]]
+        result = target.float().add(delta, alpha=alpha).to(output.dtype)
+        target.copy_(result)
+    return output

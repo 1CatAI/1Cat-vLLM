@@ -21,7 +21,11 @@ from safetensors import safe_open
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
-from vllm.model_executor.layers.sm70_diffusion import fp16_linear_prepared
+from vllm.model_executor.layers.sm70_diffusion import (
+    fp16_linear_add,
+    fp16_linear_prepared,
+    supports_fused_scaled_add,
+)
 
 from .config import H3InputError
 from .fasth3 import FASTH3_FILENAME, FastH3Spec
@@ -273,6 +277,8 @@ class TurboLinearMethod(LinearMethodBase):
         self.base = base
         self.parts = parts
         self.alpha_over_rank = alpha_over_rank
+        spans = sorted((offset, offset + width) for _, offset, width in parts)
+        self.disjoint_parts = all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
 
     def create_weights(self, *args, **kwargs):
         raise RuntimeError("Turbo is installed after base checkpoint loading")
@@ -304,7 +310,9 @@ class TurboLinearMethod(LinearMethodBase):
             return output
         original = original_input if input_is_rotated else values
         dtype = output.dtype
-        output = output.float()
+        fused = self.disjoint_parts and supports_fused_scaled_add(output)
+        if not fused:
+            output = output.float()
         for index, offset, width in self.parts:
             a = getattr(layer, f"h3_lora_a_{index}")
             b = getattr(layer, f"h3_lora_b_{index}")
@@ -313,8 +321,11 @@ class TurboLinearMethod(LinearMethodBase):
             intermediate = fp16_linear_prepared(
                 original, a, input_scale, output_fp32=True
             )
-            delta = _linear_fp32(intermediate, b)
-            output[..., offset : offset + width].add_(delta, alpha=scale)
+            if fused:
+                fp16_linear_add(intermediate, b, output, alpha=scale, offset=offset)
+            else:
+                delta = _linear_fp32(intermediate, b)
+                output[..., offset : offset + width].add_(delta, alpha=scale)
         return output.to(dtype)
 
     def apply(self, layer, x, bias=None):
@@ -323,12 +334,18 @@ class TurboLinearMethod(LinearMethodBase):
         if scale == 0:
             return output
         dtype = output.dtype
-        output = output.float()
+        fused = self.disjoint_parts and supports_fused_scaled_add(output)
+        if not fused:
+            output = output.float()
         for index, offset, width in self.parts:
             a = getattr(layer, f"h3_lora_a_{index}")
             b = getattr(layer, f"h3_lora_b_{index}")
-            delta = _linear_fp32(_linear_fp32(x, a), b)
-            output[..., offset : offset + width].add_(delta, alpha=scale)
+            intermediate = _linear_fp32(x, a)
+            if fused:
+                fp16_linear_add(intermediate, b, output, alpha=scale, offset=offset)
+            else:
+                delta = _linear_fp32(intermediate, b)
+                output[..., offset : offset + width].add_(delta, alpha=scale)
         return output.to(dtype)
 
 

@@ -38,18 +38,39 @@ class H3Config:
     transformer_path: str | None = None
     tensor_parallel_size: int = 4
     attention_backend: str = "FLASH_ATTN_V100"
+    attention_query_tile: Literal[64, 128] = 64
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
     int8_weight_layout: str = "column"
     fp16_weight_layout: Literal["row", "column"] = "row"
     residual_sequence_parallel: bool = False
+    residual_reduction: Literal["native", "peer"] = "native"
+    residual_reduction_memory_gib: float = 4.0
     host_weight_pin_memory: bool = True
     share_host_vae_weights: bool = False
     weight_offload: Literal["component", "layer"] = "component"
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
+        if self.residual_reduction not in ("native", "peer"):
+            raise H3InputError("residual reduction must be native or peer")
+        if self.residual_reduction == "peer" and not self.residual_sequence_parallel:
+            raise H3InputError("peer reduction requires residual sequence parallelism")
+        if (
+            isinstance(self.residual_reduction_memory_gib, bool)
+            or not math.isfinite(self.residual_reduction_memory_gib)
+            or not math.isfinite(self.residual_reduction_memory_gib * 2**30)
+            or self.residual_reduction_memory_gib <= 0
+        ):
+            raise H3InputError("residual communication budget must be finite and > 0")
+        if self.attention_query_tile not in (64, 128):
+            raise H3InputError("Attention query tile must be 64 or 128")
+        if (
+            self.attention_query_tile != 64
+            and self.attention_backend != "FLASH_ATTN_V100"
+        ):
+            raise H3InputError("Explicit query tiling requires FLASH_ATTN_V100")
         if self.weight_offload not in ("component", "layer"):
             raise H3InputError("weight offload must be component or layer")
         if self.weight_offload == "layer" and self.fp16_cache_layers:
