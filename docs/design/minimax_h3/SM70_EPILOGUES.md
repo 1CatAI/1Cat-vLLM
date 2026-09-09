@@ -210,3 +210,37 @@ These first captured requests establish shape and memory compatibility only.
 They have no matched quality reference, full warmup or three post-warmup
 measurements. Both are below 80 and remain unqualified. The independent
 official reference and human review gates are also pending.
+
+## Remaining FL2V Turbo versions
+
+Source `be89a26d1c` completes four more matched frozen-mainline comparisons on
+TP4 at the same 1280x736/124-frame internal canvas for a five-second request.
+All use W8A16, seed 42, pageable host masters and no fixed FP16 weight cache.
+The candidate uses prepared execution, exact residual sharding, shared LoRA
+epilogues and query tile 128. The frozen `4f19ef7` control uses its ordinary
+query-64 path. Each artifact retains its official alpha and flow shift.
+
+| Official artifact | Intervals / sigma points | Video shift / alpha | Candidate denoise seconds | Request seconds |
+| --- | ---: | ---: | ---: | ---: |
+| FL2V four-step v1.0_768p | 4 / 5 | 6 / 128 | 61.263482 | 96.285706 |
+| FL2V four-step v1.1_768p | 4 / 5 | 6 / 128 | 61.018722 | 96.491105 |
+| FL2V four-step v0.1 | 4 / 5 | 12 / 8 | 61.000133 | 94.938178 |
+| FL2V eight-step v1.0 (non-768p) | 8 / 9 | 12 / 8 | 120.478234 | 156.924670 |
+
+For every pair, final video/audio latents, all 124 pre-encoding RGB frames and
+decoded PCM match bitwise. SSIM and RMS ratio are 1. Strict per-rank workload
+validators pass, including actual intervals, block counts and duplicate-work
+exclusion. Peak allocation is 19,501,498,880 bytes/card for the four-step cases
+and 19,502,023,168 bytes/card for eight-step. Single-request useful throughput
+is approximately 50.65–51.52 TFLOP/s/card, below 80.
+
+These are captured cold quality controls, not warmed three-run performance.
+Together with the existing v1.2 four-step and v1.0_768p eight-step controls,
+all six official FL2V Turbo artifacts now have a complete W8A16 T2VA numerical
+preservation result. Original-weight and keyframe combinations remain separate
+pending coverage; Ref2V four-step is also still awaiting its full control.
+No independent official quality or human acceptance is inferred.
+
+Evidence: `remaining-turbo-pairs.json`, `remaining-turbo-summary.json`,
+`light4-v{10,11,01}-720p-quality.json`, `light8-v10-non768-720p-quality.json`
+and the corresponding captured runs under the campaign's artifact root.
