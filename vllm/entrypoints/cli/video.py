@@ -44,6 +44,11 @@ class VideoSubcommand(CLISubcommand):
                 "--attention-query-tile", type=int, choices=(64, 128), default=64
             )
             mode.add_argument(
+                "--share-host-vae-weights",
+                action="store_true",
+                help="Share immutable pageable VAE masters across TP workers",
+            )
+            mode.add_argument(
                 "--disable-host-weight-pinning",
                 dest="host_weight_pin_memory",
                 action="store_false",
@@ -126,6 +131,7 @@ class VideoSubcommand(CLISubcommand):
             residual_sequence_parallel=args.residual_sequence_parallel,
             video_encoder=args.video_encoder,
             host_weight_pin_memory=args.host_weight_pin_memory,
+            share_host_vae_weights=args.share_host_vae_weights,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve

@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import chain
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -216,12 +220,108 @@ class PinnedModuleStager:
 
     @staticmethod
     def _view(backing: torch.Tensor, binding: _TensorBinding) -> torch.Tensor:
+        element_size = binding.dtype.itemsize
+        backing_offset = backing.storage_offset() * backing.element_size()
+        if backing_offset % element_size:
+            raise ValueError("shared weight storage must preserve dtype alignment")
         return torch.empty(0, dtype=binding.dtype, device=backing.device).set_(
             backing.untyped_storage(),
-            binding.storage_offset,
+            backing_offset // element_size + binding.storage_offset,
             binding.shape,
             binding.stride,
         )
+
+    def share_cpu_storage(self, directory: str | Path) -> None:
+        """Share a checked immutable replica across this engine's TP workers.
+
+        The engine owns the temporary directory and removes it after workers
+        stop. Private mappings prevent accidental CPU writes from affecting a
+        different rank. Only identical complete storage groups may be shared.
+        """
+        import torch.distributed as dist
+
+        if self.loaded or any(group.master.is_pinned() for group in self._groups):
+            raise ValueError("shared host storage requires unloaded pageable masters")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        directory = Path(directory)
+        if rank == 0:
+            self._write_shared_groups(directory)
+        if dist.is_initialized():
+            dist.barrier()
+        self._read_shared_groups(directory)
+
+    @staticmethod
+    def _group_description(group: _StorageGroup) -> dict:
+        return {
+            "bytes": group.master.numel(),
+            "bindings": [
+                {
+                    "dtype": str(binding.dtype),
+                    "shape": list(binding.shape),
+                    "stride": list(binding.stride),
+                    "storage_offset": binding.storage_offset,
+                }
+                for binding in group.bindings
+            ],
+        }
+
+    @staticmethod
+    def _storage_digest(master: torch.Tensor) -> str:
+        return hashlib.sha256(memoryview(master.numpy())).hexdigest()
+
+    def _write_shared_groups(self, directory: Path) -> None:
+        directory.mkdir(mode=0o700)
+        records, total = [], 0
+        for group in self._groups:
+            total = (total + 255) // 256 * 256
+            records.append({**self._group_description(group), "offset": total})
+            total += group.master.numel()
+        data_path = directory / "weights.bin"
+        fd = os.open(data_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            # Reserve tmpfs space before mapping so a later write cannot SIGBUS
+            # because unrelated processes consume the remaining free space.
+            if total:
+                os.posix_fallocate(fd, 0, total)
+        finally:
+            os.close(fd)
+        shared = torch.from_file(
+            str(data_path), shared=True, size=total, dtype=torch.uint8
+        )
+        for group, record in zip(self._groups, records):
+            target = shared.narrow(0, record["offset"], record["bytes"])
+            target.copy_(group.master)
+            record["sha256"] = self._storage_digest(target)
+        (directory / "metadata.json").write_text(
+            json.dumps({"version": 1, "bytes": total, "groups": records})
+        )
+
+    def _read_shared_groups(self, directory: Path) -> None:
+        metadata = json.loads((directory / "metadata.json").read_text())
+        records = metadata["groups"]
+        if metadata["version"] != 1 or len(records) != len(self._groups):
+            raise ValueError("shared component storage inventory differs across ranks")
+        # COW mappings share physical pages while keeping the file immutable.
+        shared = torch.from_file(
+            str(directory / "weights.bin"),
+            shared=False,
+            size=metadata["bytes"],
+            dtype=torch.uint8,
+        )
+        for group, record in zip(self._groups, records):
+            if any(
+                record[key] != value
+                for key, value in self._group_description(group).items()
+            ):
+                raise ValueError("shared component tensor layouts differ across ranks")
+            if self._storage_digest(group.master) != record["sha256"]:
+                raise ValueError("shared component weights differ across ranks")
+            target = shared.narrow(0, record["offset"], record["bytes"])
+            if self._storage_digest(target) != record["sha256"]:
+                raise ValueError("shared component snapshot failed its checksum")
+            group.master = target
+            for binding in group.bindings:
+                set_tensor_storage(binding.target, self._view(target, binding))
 
     def _bind(self, storages: list[torch.Tensor]) -> None:
         for storage, group in zip(storages, self._groups):

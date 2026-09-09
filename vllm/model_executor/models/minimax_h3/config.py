@@ -46,6 +46,7 @@ class H3Config:
     fp16_weight_layout: Literal["row", "column"] = "row"
     residual_sequence_parallel: bool = False
     host_weight_pin_memory: bool = True
+    share_host_vae_weights: bool = False
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
@@ -58,6 +59,14 @@ class H3Config:
             raise H3InputError("Explicit query tiling requires FLASH_ATTN_V100")
         if not isinstance(self.host_weight_pin_memory, bool):
             raise H3InputError("host weight pinning must be a boolean")
+        if not isinstance(self.share_host_vae_weights, bool):
+            raise H3InputError("shared host VAE weights must be a boolean")
+        if (
+            self.share_host_vae_weights
+            and self.tensor_parallel_size > 1
+            and self.host_weight_pin_memory
+        ):
+            raise H3InputError("shared host VAE weights require pageable host masters")
         if self.video_encoder not in ("libx264", "h264_nvenc"):
             raise H3InputError("video encoder must be libx264 or h264_nvenc")
         if self.partition not in ("fl2va", "ref2va"):
