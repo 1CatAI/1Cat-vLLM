@@ -485,7 +485,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
                 and mixed_qkvzba.dtype == torch.float16
                 and (qkv_size, z_size, ba_size) == (2560, 1536, 12)
             ):
-                # The NVFP4 projection has one padded QKVZBA allocation.
+                # Any combined projection may have a padded QKVZBA allocation.
                 # Copy its three tails together before convolution mutates QKV.
                 z, b, a = _sm70_materialize_qwen35_gdn_splits(
                     mixed_qkvzba,

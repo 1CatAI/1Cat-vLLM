@@ -642,3 +642,30 @@ Evidence is retained in
 runtime-library manifest. Final fixed-prefix, acceptance and complete-round
 admission remain open; this does not resolve the old repeat-start TV discrepancy
 by itself.
+
+## Draft WMMA output-tile grouping: exact reconstruction, no speed gain
+
+The real cuBLAS trace uses different split-K rounding contracts for draft
+projections. QKV uses three FP32 partials and a separate reduction; gate/up
+uses two serial partitions with an FP16 intermediate output. O/down write
+their FP16 output directly. A parallel FP16-partial gate/up reconstruction
+does not match this contract. A separate one-partition reduction also erases
+one negative-zero output in the actual O-projection corpus. Neither mismatch
+is waived by a numerical tolerance.
+
+Using the corresponding serial/direct/FP32-parallel contracts, both one-warp
+and four-output-warp CUTLASS prototypes pass all 400 real projection cases:
+four ranks, five layers, four projections and five input snapshots. Outputs
+match the captured frozen cuBLAS bytes, QKV partials match across warp grouping,
+and workspace/output canaries remain intact, including graph replay.
+
+Seven paired timings over the twenty distinct rank-zero consecutive-layer
+weights give medians of 1.450368 ms for frozen cuBLAS, 1.895968 ms for one warp
+and 1.505536 ms for four warps. The four-warp prototype remains slower than the
+frozen library, so it receives no serving route or end-to-end admission.
+Reference CUTLASS commit is `b2dd65dc864e09688245b316ac46c4a6cd07e15c`.
+Serial/parallel DSO hashes are
+`47dc2f9f1978777428247bbc1970eb497d25dcbd2335e261b8e85645497b9b8a` and
+`5c832dde87a11e51338b0851eff90cf43c76c156996cec4012c5c8371d1b7b33`.
+Retained evidence includes `results/draft-wmma-serial-oracle.json`, the failed
+first working-set gate and `results/draft-wmma-working-set-v2.json`.
