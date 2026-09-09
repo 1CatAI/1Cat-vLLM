@@ -71,6 +71,27 @@ packaging, and includes only one measurement per implementation. It is not
 the required full-request warmup-plus-three acceptance. Existing FA query-128
 remains faster in its separately recorded full-request measurements.
 
-Full native media preservation, formal repeated request measurements,
-independent official references and human review remain separate gates. The
-campaign remains incomplete. No precision gate or sampler setting is relaxed.
+## Complete native media control
+
+The formatted native build at `f8b85c681a402ad26aac13adc701687a342881d9`
+completes a separate pair of full TP4 W8A16 LightX2V four-step v1.2 requests.
+Both implementations use the same current Python source, shared pageable VAE
+host storage, zero persistent FP16 cache and the five-second request's
+1280x736/124-frame internal canvas. Only the immutable FI binary differs.
+
+`fi-register-native-quality.json` passes every numerical gate. Final video
+and audio latents, all 124 unencoded RGB frames and PCM match bitwise. Video
+PSNR is infinite and SSIM is 1; audio spectral cosine is
+0.9999999999999756 and RMS ratio is 1. Both requests pass native media and
+strict actual-work validation. Their peak allocation is unchanged at
+19,501,498,880 bytes/card. Commands, binary hashes and clean source provenance
+are in `fi-register-native-pair.json` and `fi-register-native-summary.json`.
+
+The single captured cold requests take 71.085578 / 63.649644 seconds denoise
+and 107.358301 / 100.664110 seconds request (control/candidate). These captures
+include different first-use setup costs and are not a formal speed comparison.
+Use the matched warmed denoise control above for the isolated 7.179% result.
+
+Formal repeated request measurements, independent official references and
+human review remain separate gates. The campaign remains incomplete. No
+precision gate or sampler setting is relaxed.
