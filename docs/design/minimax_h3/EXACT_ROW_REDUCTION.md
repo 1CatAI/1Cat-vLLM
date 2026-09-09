@@ -1,8 +1,9 @@
 # Explicit SM70 local-row reduction
 
 The shared `SM70ExactRowReductionPlan` interface is experimental and has no
-automatic dispatch. H3 exposes an explicit runtime selection; its final
-integration is still undergoing GPU and full-request validation. The ordinary residual path
+automatic dispatch. H3 exposes an explicit runtime selection; its native
+four-step integration passes media preservation and remains below the
+formal >80 throughput gate. The ordinary residual path
 continues to use FP32 all-reduce followed by a local-row slice. No configuration
 has passed the campaign's >80 useful TFLOP/s/card and complete quality gates.
 
@@ -119,5 +120,45 @@ includes external communication allocations in its memory gate. CUDA driver
 and library overhead still require the retained NVML measurements.
 
 CPU request ownership, budget fallback, config, API and existing residual
-regressions pass. GPU generation through the final native selection and formal
-measurements remain required; preceding forward overrides do not satisfy them.
+regressions pass. The final native selection now has the separate controls and measurements
+below. Wider workflow validation remains incomplete.
+
+## Final native four-step measurements
+
+At source `ca82c279bc`, the ordinary engine selects peer rows through H3Config,
+with no forward replacement. The separate captured native request preserves
+both final latents, all 124 RGB frames and PCM bitwise. All four ranks report
+400 peer calls, zero native fallbacks and about 0.374 seconds initial plan
+setup. `peer-api-native-quality.json` and `peer-api-native-summary.json` retain
+this control and its precise configuration.
+
+`peer-api-720p-three-runs/performance.json` records one complete request warmup
+and three unprofiled, uncaptured requests of that same configuration:
+
+| Measurement | Value |
+| --- | ---: |
+| Warmup denoise | 59.698783 s |
+| Measured denoise | 58.344130 / 58.293218 / 58.234342 s |
+| Median useful TFLOP/s/card | 53.235745–53.235764 |
+| Denoise coefficient of variation | 0.076959% |
+| Complete request | 91.071940 / 90.560870 / 91.905029 s |
+| Live allocation upper bound, including IPC | 20,475,227,136 bytes/card |
+| Memory gate | Pass |
+| >80 throughput gate | Fail |
+
+The companion `peer-api-formal-telemetry.json` retains 1,995 NVML samples at a
+0.25-second interval. Across startup, warmup and measurement, the maximum
+sampled device usage is 24,387,256,320 bytes, including allocator caches and
+runtime overhead. High-utilization samples have median power of about
+278–280 W/card. Telemetry is independent of the CUDA work counters.
+
+This formal request uses pageable host masters and shared VAE weights; the
+older FA query-128 formal control used pinned masters. The latter's shorter
+complete-request time must not be presented as a matched comparison of the
+communication kernels. The isolated 2.49348% denoise comparison above used
+matching host and compute settings. No overall request speedup is claimed
+across the different host-memory policies.
+
+The interface remains explicit. The >80 target, official/human quality, wider
+workflow and shape/TP matrix are still incomplete. Initial setup, skipped work,
+raw IPC storage and slower end-to-end outcomes are retained in the records.

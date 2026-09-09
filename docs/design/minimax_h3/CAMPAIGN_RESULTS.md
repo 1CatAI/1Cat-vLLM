@@ -22,6 +22,7 @@ All rows use TP4. Rows marked formal use a complete request warmup plus three un
 | FL2V Light4 v1.2_768p, first | W8A16 | FLASH_ATTN_V100 | 66.419 | 50.697 | passed | not measured |
 | FL2V Light4 v1.2_768p, last | W8A16 | FLASH_ATTN_V100 | 64.852 | 51.923 | passed | not measured |
 | FL2V Light4 v1.2_768p, first-last | W8A16 | FLASH_ATTN_V100 | 69.615 | 52.305 | passed | not measured |
+| FL2V Light4 v1.2_768p, native peer rows | W8A16 | FLASH_ATTN_V100 | 58.293 | 53.236 | passed | failed >80 |
 
 The VSA failure is against an explicitly labeled FP32 selected-key diagnostic, not the unmodified official GPU kernel. Generation alone does not establish numerical quality.
 
@@ -34,28 +35,7 @@ The VSA failure is against an explicitly labeled FP32 selected-key diagnostic, n
 
 Exact source/run paths and the evidence index are retained in `campaign-results.json` and `campaign-results.csv`.
 
-## Additional bounded experiments
-
-These artifact-only experiments did not change production defaults:
-
-- Increasing NCCL CTA counts from 8 to 16/32 changes FP32 reduction bits.
-  The preliminary bitwise gate rejected them before timing or a full-model
-  comparison; this is not a measured full-model quality failure.
-- Sequential FA warp-operand loading reduces one register count from 248 to
-  235 but leaves the proposed occupancy budget unmet. Build evidence was
-  sufficient to reject the hypothesis; no GPU benchmark was run.
-- K-only swizzling in the new FI kernel preserves operator bits but changes
-  the paired median by only 0.192%, within observed clock variation. No
-  complete-model run or production integration was justified.
-
-The artifact folders `nccl-cta-control`, `attention-single-warp-buffer` and
-`attention-fi-key-only-swizzle` retain hypotheses, source hashes and results.
-Do not repeat these experiments without a changed hypothesis. Communication
-work continues separately; it has no accepted model-level speedup yet.
-
-The explicit [shared row-reduction interface](EXACT_ROW_REDUCTION.md) has
-separate operator and prototype full-media controls. Its 2.49348% paired
-denoise improvement is a development measurement, not a new formal campaign
-result. The final shared interface also passes a complete native media control via
-an explicit forward override. Native H3 selection is now explicit and still requires its final GPU
-validation; the ordinary reduction remains the default.
+The [native row-reduction record](EXACT_ROW_REDUCTION.md) includes explicit
+API selection, native bitwise media preservation and the 53.236 TFLOP/s/card
+formal result. Its host-memory policy differs from the older query-128 run,
+so complete-request times do not isolate the communication change.
