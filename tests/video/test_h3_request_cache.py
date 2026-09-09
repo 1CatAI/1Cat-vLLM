@@ -31,6 +31,11 @@ from vllm.model_executor.models.minimax_h3.request_cache import (
         ("cache_dit", {"Fn_compute_blocks": 1.5}),
         ("cache_dit", {"max_warmup_steps": -1}),
         ("cache_dit", {"max_cached_steps": True}),
+        ("cache_dit", {"enable_taylorseer": 1}),
+        ("cache_dit", {"taylorseer_order": -1}),
+        ("cache_dit", {"taylorseer_order": True}),
+        ("cache_dit", {"scm_steps_mask_policy": "custom"}),
+        ("cache_dit", {"scm_steps_policy": "unknown"}),
     ],
 )
 def test_invalid_cache_configuration(backend, options):
@@ -54,6 +59,14 @@ def test_official_quality_and_partition_policy():
         "residual_diff_threshold": 0.04,
         "max_continuous_cached_steps": 1,
     }
+    advanced = H3Config(
+        cache_backend="cache_dit",
+        cache_config={"enable_taylorseer": True, "scm_steps_mask_policy": "fast"},
+    )
+    assert (
+        resolve_cache_plan(advanced, H3SamplingParams(quality="high"), calls=8).options
+        == high.options
+    )
     with pytest.raises(H3InputError, match="mutually exclusive"):
         resolve_cache_plan(
             H3Config(cache_backend="tea_cache"),
@@ -153,7 +166,21 @@ class Model(nn.Module):
 
 
 @pytest.mark.parametrize("hint,policy", [(None, "once"), (3, "once"), (3, "repeat")])
-def test_actual_cachedit_repeated_requests_and_teardown(hint, policy):
+@pytest.mark.parametrize(
+    "advanced",
+    [
+        {},
+        {"enable_taylorseer": True, "taylorseer_order": 2},
+        {"scm_steps_mask_policy": "medium"},
+        {"scm_steps_mask_policy": "medium", "scm_steps_policy": "static"},
+        {
+            "enable_taylorseer": True,
+            "scm_steps_mask_policy": "medium",
+            "scm_steps_policy": "static",
+        },
+    ],
+)
+def test_actual_cachedit_repeated_requests_and_teardown(hint, policy, advanced):
     model = Model().eval()
     options = {
         **CACHE_DIT_DEFAULTS,
@@ -162,6 +189,7 @@ def test_actual_cachedit_repeated_requests_and_teardown(hint, policy):
         "max_warmup_steps": 1,
         "residual_diff_threshold": 1,
         "max_continuous_cached_steps": 2,
+        **advanced,
     }
     if hint is not None:
         options.update(force_refresh_step_hint=hint, force_refresh_step_policy=policy)
@@ -178,12 +206,52 @@ def test_actual_cachedit_repeated_requests_and_teardown(hint, policy):
         assert list(model.blocks) == original
         assert not model._h3_cache_active
         assert not getattr(model, "_is_cached", False)
-        assert any(sum(step) < 6 for step in steps)
+        if advanced.get("scm_steps_mask_policy") and hint == 3 and policy == "repeat":
+            # Every third call refreshes before medium SCM reaches its first
+            # reuse slot. The official policy legitimately computes all blocks.
+            assert [sum(step) for step in steps] == [6] * 8
+        else:
+            assert any(sum(step) < 6 for step in steps)
         outputs.append(results)
         patterns.append(steps)
     assert patterns[0] == patterns[1]
     for a, b in zip(*outputs):
         torch.testing.assert_close(a, b, atol=0, rtol=0)
+    if advanced.get("scm_steps_policy") == "static" and hint is None:
+        # Official medium mask for eight actual calls: 11110101.
+        assert [sum(step) for step in patterns[0]] == [6, 6, 6, 6, 2, 6, 2, 6]
+
+
+@pytest.mark.parametrize("calls", [3, 4, 5, 6, 7, 8, 49])
+def test_scm_refresh_uses_official_mask_for_actual_calls(monkeypatch, calls):
+    import cache_dit
+
+    observed = []
+    refresh = cache_dit.refresh_context
+
+    def record(model, **kwargs):
+        observed.append(kwargs)
+        return refresh(model, **kwargs)
+
+    monkeypatch.setattr(cache_dit, "refresh_context", record)
+    config = H3Config(
+        cache_backend="cache_dit",
+        cache_config={"scm_steps_mask_policy": "fast"},
+    )
+    plan = resolve_cache_plan(config, H3SamplingParams(), calls=calls)
+    with request_cache(Model(), plan):
+        pass
+    assert len(observed) == 1
+    if calls >= 8 or calls in (4, 6):
+        actual = observed[0]["cache_config"]
+        assert actual.num_inference_steps == calls
+        assert actual.steps_computation_mask == cache_dit.steps_mask(
+            mask_policy="fast", total_steps=calls
+        )
+        assert actual.steps_computation_mask[-1] == 1
+    else:
+        # Match Omni's ordinary refresh for unsupported short SCM schedules.
+        assert observed[0] == {"num_inference_steps": calls, "verbose": False}
 
 
 def test_exception_and_reentrant_request_cleanup():

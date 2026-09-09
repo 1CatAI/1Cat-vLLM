@@ -15,13 +15,26 @@ Fn=1, Bn=0, warmup=4, residual threshold=0.24, maximum continuous reuse=3
 profile. Both configurations are also available through `--cache-backend`
 and JSON `--cache-config`. The exposed Cache-DiT options are Fn/Bn block
 counts, warmup steps, total cached-step limit, residual threshold and the
-continuous cached-step limit; TaylorSeer and SCM profiles are not exposed yet.
+continuous cached-step limit. Optional `enable_taylorseer` and
+`taylorseer_order` select the pinned package's official forecasting calibrator.
+`scm_steps_mask_policy` accepts `slow`, `medium`, `fast` or `ultra`;
+`scm_steps_policy` accepts `dynamic` or `static`. TaylorSeer is off and SCM is
+unset by default.
 
 Omitted request quality follows the selected deployment policy. Explicit
 `quality="lossless"` disables request caches. `quality="high"` selects the
 official conservative Cache-DiT profile: Fn=1, Bn=0, warmup=4, threshold=0.04,
 continuous reuse=1, without TaylorSeer or SCM. A TeaCache deployment rejects
 `high` because the two backends are mutually exclusive.
+
+SCM masks come from the pinned package and use actual sampling intervals,
+including four/eight calls for LightX2V's five/nine sigma points. As in Omni,
+unsupported short schedules (1/2/3/5/7 calls) use ordinary cache refresh without
+a predefined mask. Every request installs a fresh calibrator and refreshes
+the mask. Repeated force-refresh hints can intentionally prevent cache reuse:
+refreshing every third call resets the eight-call medium mask before it reaches
+its first reuse slot. This must not be reported as an implementation failure
+or credited as skipped work.
 
 The existing video API accepts `extra_params.force_refresh_step_hint` and
 `force_refresh_step_policy` (`once` or `repeat`) for an active Cache-DiT

@@ -105,6 +105,23 @@ def main():
                         4,
                     ),
                 ]
+                for scm_policy in ("dynamic", "static"):
+                    plans.append(
+                        CachePlan(
+                            "cache_dit",
+                            {
+                                **CACHE_DIT_DEFAULTS,
+                                "max_warmup_steps": 1,
+                                "residual_diff_threshold": 1,
+                                "max_continuous_cached_steps": 2,
+                                "enable_taylorseer": True,
+                                "taylorseer_order": 2,
+                                "scm_steps_mask_policy": "fast",
+                                "scm_steps_policy": scm_policy,
+                            },
+                            4,
+                        )
+                    )
                 for plan in plans:
                     repeated = []
                     for request in range(2):

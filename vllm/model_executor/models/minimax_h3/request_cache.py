@@ -25,13 +25,17 @@ TEA_COEFFICIENTS = (
     -4.232669906169421e00,
     2.173782527946167e-01,
 )
-CACHE_DIT_DEFAULTS = {
+CACHE_DIT_DEFAULTS: dict[str, Any] = {
     "Fn_compute_blocks": 1,
     "Bn_compute_blocks": 0,
     "max_warmup_steps": 4,
     "max_cached_steps": -1,
     "residual_diff_threshold": 0.24,
     "max_continuous_cached_steps": 3,
+    "enable_taylorseer": False,
+    "taylorseer_order": 1,
+    "scm_steps_mask_policy": None,
+    "scm_steps_policy": "dynamic",
 }
 
 
@@ -52,6 +56,18 @@ def validate_cache_config(backend: str, config: dict[str, Any]) -> dict[str, Any
         raise H3InputError(f"unsupported {backend} cache options: {sorted(unknown)}")
     result = {**defaults, **config}
     for key, value in result.items():
+        if key == "enable_taylorseer":
+            if not isinstance(value, bool):
+                raise H3InputError("enable_taylorseer must be boolean")
+            continue
+        if key == "scm_steps_mask_policy":
+            if value not in (None, "slow", "medium", "fast", "ultra"):
+                raise H3InputError("invalid predefined SCM mask policy")
+            continue
+        if key == "scm_steps_policy":
+            if value not in ("dynamic", "static"):
+                raise H3InputError("SCM steps policy must be dynamic or static")
+            continue
         if (
             isinstance(value, bool)
             or not isinstance(value, (int, float))
@@ -213,16 +229,43 @@ def request_cache(model, plan: CachePlan):
             adapter.pipe.__class__ = type(
                 "H3RequestCachePipe", (original_class,), {"_is_cached": False}
             )
+            options = dict(plan.options)
+            enable_taylorseer = options.pop("enable_taylorseer", False)
+            order = options.pop("taylorseer_order", 1)
+            mask_policy = options.pop("scm_steps_mask_policy", None)
+            steps_policy = options.pop("scm_steps_policy", "dynamic")
+            calibrator = (
+                cache_dit.TaylorSeerCalibratorConfig(taylorseer_order=order)
+                if enable_taylorseer
+                else None
+            )
             cache_dit.enable_cache(
                 adapter,
                 cache_config=cache_dit.DBCacheConfig(
-                    num_inference_steps=plan.calls, **plan.options
+                    num_inference_steps=plan.calls, **options
                 ),
-                calibrator_config=None,
+                calibrator_config=calibrator,
             )
-            cache_dit.refresh_context(
-                model, num_inference_steps=plan.calls, verbose=False
-            )
+            # Match Omni's request refresh, using actual sigma intervals.
+            # The pinned package has no predefined masks for 1/2/3/5/7 steps.
+            if mask_policy is not None and (plan.calls >= 8 or plan.calls in (4, 6)):
+                refresh = cache_dit.DBCacheConfig().reset(
+                    num_inference_steps=plan.calls,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=mask_policy, total_steps=plan.calls
+                    ),
+                    steps_computation_policy=steps_policy,
+                )
+                if options.get("force_refresh_step_hint") is not None:
+                    refresh.force_refresh_step_hint = options["force_refresh_step_hint"]
+                    refresh.force_refresh_step_policy = options[
+                        "force_refresh_step_policy"
+                    ]
+                cache_dit.refresh_context(model, cache_config=refresh, verbose=False)
+            else:
+                cache_dit.refresh_context(
+                    model, num_inference_steps=plan.calls, verbose=False
+                )
         yield
     finally:
         try:
