@@ -88,6 +88,8 @@ def install_common_routes(manifest: dict) -> None:
         for key in ("attention", "sort")
         if manifest.get(key) is not None
     }
+    if "sort" in libraries and torch.__version__.split("+")[0] != "2.10.0":
+        raise ValueError("Exact sparse tie ordering requires frozen PyTorch 2.10.0")
     if "sort" in libraries:
         from benchmarks.kernels.benchmark_sm70_sparse_dense_topk import select
 
