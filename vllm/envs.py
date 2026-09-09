@@ -244,7 +244,6 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_TP2_GDN_BV2: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
-    VLLM_SM70_DFLASH2_TP2_COMBINED_GDN_SPLIT: bool = False
     VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_FUSED_QKV_PACK: bool = False
@@ -2240,11 +2239,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
-    ),
-    # Opt in separately: the existing split-projection switch is enabled by
-    # DFlash2 defaults, but combined QUASAR TP2 still needs model admission.
-    "VLLM_SM70_DFLASH2_TP2_COMBINED_GDN_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_TP2_COMBINED_GDN_SPLIT", "0"))
     ),
     # Build Flash-V100 small-query verifier rows directly in their persistent
     # graph buffers. This replaces four repeat_interleave scans per KV group.

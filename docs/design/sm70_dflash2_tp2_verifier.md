@@ -2,9 +2,21 @@
 
 ## Scope and frozen baseline
 
-The TP2 campaign targets approximately 25 ms per complete B1/q8 DFlash2 round
-on two rear V100-SXM2-32GB GPUs. A round includes target, logits/sampling,
-state handling, context work and draft. TP4 optimization is a separate campaign.
+The user closed the optimization campaign on 2026-09-10 at the accepted
+31.884546/29.279787-ms release1k/MBPP28 endpoint. The earlier approximately
+25-ms target is no longer a merge requirement. These are complete B1/q8
+DFlash2 rounds on two rear V100-SXM2-32GB GPUs, including target,
+logits/sampling, state handling, context work and draft. TP4 is a separate
+campaign. No later local microbenchmark replaces these accepted measurements.
+
+The retained endpoint uses three independent paired startups, five measured
+pairs per fixture per startup, unchanged token IDs/acceptance/natural EOS,
+and a separate full-logits/hidden-state diagnostic. Source integration keeps
+the audited native attention, packed GDN repairs/BV2 and matched QPN2 builder.
+The unadmitted combined-projection copy experiment has been withdrawn from
+this PR's source. New optimization switches remain opt-in; the full measured
+combination also uses the retained QPN2/context worker harness described below.
+Merging these source components does not make that entire harness a default.
 
 Integration base: `e5d63c51f0fcc1ddf75d229e3df06bf52df206f5`.
 Use the QUASAR Qwen3.8-27B NVFP4 checkpoint at
@@ -163,8 +175,9 @@ Acceptance is reported separately from emitted tokens:
 | MBPP28 | 5 | 3.569231 | 4.569231 |
 
 These paired results admit the attention component for continued experiments.
-The approximately 25 ms target, full context sweep and broader quality suite
-remain outstanding. The production flag stays off and the PR stays Draft.
+At this earlier checkpoint, the approximately 25 ms target, full context
+sweep and broader quality suite remained outstanding. The production flag
+stayed off and the PR remained Draft.
 Raw reports are `attention-three-start-pair-summary.json`,
 `attention-three-start-secondary-metrics.json`, and
 `tp2-attention-within-start-{3,4,5}-switch.json` in the campaign results.
@@ -801,7 +814,8 @@ release1k/MBPP28. This does not retroactively resolve the older startup
 variation. Source is `ca0ea462c1877525fb231faf4f817d7929a3a64a`; runtime library
 and private harness hashes are frozen in `combined-native-three-start-manifest.json`.
 Raw evidence is `combined-native-3-start-pair-summary.json`. The approximately
-25 ms target remains unmet, so defaults remain off and the PR remains Draft.
+25 ms target was not met and was retired by the user at campaign close.
+The 31.884546/29.279787-ms endpoint is the accepted scope; defaults remain off.
 
 A q8-only QPN2 specialization removes unused row predicates and row offsets
 while preserving all dot-product arithmetic. All sixteen real projection
@@ -905,12 +919,12 @@ See `head-cublaslt-probe.json`, `head-lt-plan-probe.json` and the
 
 The native-combination trace still contains three tail gathers per GDN layer.
 QUASAR uses the combined projection branch, which did not call the existing
-one-copy z/b/a helper. A separate, default-off
-`VLLM_SM70_DFLASH2_TP2_COMBINED_GDN_SPLIT` switch now routes the verified TP2
-geometry through that helper. It also requires the existing SM70/DFlash2 split
-gate. Other TP sizes, feature dimensions and dtypes retain the old path.
-QKV remains a view for the convolution's in-place update; the helper reads
-the actual padded row stride and BA view offset. No arithmetic changes.
+one-copy z/b/a helper. Commit `5aa67252674db770eb8b0594963a517456249135`
+tested a separately gated TP2 integration. QKV remained a view for the
+convolution's in-place update; the helper read the actual padded row stride
+and BA offset, with no arithmetic changes. This integration was withdrawn
+from the final PR because it had not passed complete-round admission when
+the user closed optimization. Its source and evidence remain in history.
 
 The isolated copy screen passes all 65,536 FP16 bit encodings, changing graph
 replays, rows 1/7/8/9/32/128/4096, row strides 8240/8256/8320 and storage
@@ -919,9 +933,16 @@ working sets take 0.722739 ms per round of three gathers versus 0.100045 ms
 for the one-copy helper. This approximately 0.623-ms local saving is not a
 complete model-round result. The actual `forward_cuda` entry and existing
 split tests pass all twenty cases, including QKV convolution ownership and
-tail bits after changing graph replays. Live compiled-model and unprofiled
-performance admission are pending. Evidence: `tp2-combined-gdn-split-screen.json`
-and serial queue job 309; no new serving default is enabled.
+tail bits after changing graph replays. Seven forward cases also pass
+memcheck with zero errors. The live source audit covers 48 layers per rank
+and 1,462,855,680 FP16 elements with zero bit differences. Its repeated
+same-configuration full-model requests preserve hidden states, complete
+FP32 logits and valid acceptance records; this is not an original-versus-new
+model-performance result. The separate paired model harness fails before
+generation because its ctypes CUDA-graph edge type overwrites the QPN2
+reader's binding. Job 313 is excluded, and no later paired performance is
+claimed. Evidence: `tp2-combined-gdn-split-screen.json`,
+`tp2-combined-split-shadow-1-admission.json` and queue jobs 309--313.
 
 Two other bounded screens are closed before model work. The N16 QPN2 tile
 matches all sixteen retained real outputs and FP64-reference errors, including
