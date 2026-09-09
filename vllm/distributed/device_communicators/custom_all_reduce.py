@@ -194,7 +194,10 @@ class CustomAllreduce:
                 )
         cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
         if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
+            device_ids = [
+                current_platform.device_id_to_physical_device_id(index)
+                for index in range(len(cuda_visible_devices.split(",")))
+            ]
         else:
             device_ids = list(range(current_platform.device_count()))
 

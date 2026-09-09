@@ -12,15 +12,45 @@ LOCK_ROOT = Path("/tmp")
 def _available_gpu_groups(tp: int) -> list[tuple[int, ...]]:
     import pynvml as nvml
 
+    if tp < 1:
+        raise ValueError("H3 tensor parallel size must be positive")
     groups = []
     nvml.nvmlInit()
     try:
-        for start in (0, 4):
-            indices = tuple(range(start, start + tp))
-            if indices[-1] >= nvml.nvmlDeviceGetCount():
+        count = nvml.nvmlDeviceGetCount()
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is not None:
+            if not visible.strip() or visible.strip() == "-1":
+                return []
+            indices = []
+            for token in visible.split(","):
+                token = token.strip()
+                if token.startswith("GPU-"):
+                    index = nvml.nvmlDeviceGetIndex(
+                        nvml.nvmlDeviceGetHandleByUUID(token)
+                    )
+                elif token.isdecimal() and int(token) < count:
+                    index = int(token)
+                else:
+                    raise ValueError(
+                        "H3 GPU selection must contain NVML indices or GPU UUIDs"
+                    )
+                if index in indices:
+                    raise ValueError("H3 GPU selection contains a duplicate device")
+                indices.append(index)
+        else:
+            # A display GPU must not shift the four-card V100 group boundaries.
+            indices = []
+            for index in range(count):
+                handle = nvml.nvmlDeviceGetHandleByIndex(index)
+                if nvml.nvmlDeviceGetMemoryInfo(handle).total >= 30 * 1024**3:
+                    indices.append(index)
+        for start in range(0, len(indices), tp):
+            group = tuple(indices[start : start + tp])
+            if len(group) != tp:
                 continue
             available = True
-            for index in indices:
+            for index in group:
                 handle = nvml.nvmlDeviceGetHandleByIndex(index)
                 processes = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
                 # Ignore a small desktop CUDA allocation; never displace jobs.
@@ -29,8 +59,22 @@ def _available_gpu_groups(tp: int) -> list[tuple[int, ...]]:
                 if nvml.nvmlDeviceGetMemoryInfo(handle).free < 30 * 1024**3:
                     available = False
             if available:
-                groups.append(indices)
+                groups.append(group)
         return groups
+    finally:
+        nvml.nvmlShutdown()
+
+
+def worker_device_mask(gpu_ids: tuple[int, ...]) -> str:
+    """Use UUIDs when entering CUDA; NVML and CUDA ordinal order may differ."""
+    import pynvml as nvml
+
+    nvml.nvmlInit()
+    try:
+        uuids = [
+            nvml.nvmlDeviceGetUUID(nvml.nvmlDeviceGetHandleByIndex(i)) for i in gpu_ids
+        ]
+        return ",".join(u.decode() if isinstance(u, bytes) else u for u in uuids)
     finally:
         nvml.nvmlShutdown()
 
