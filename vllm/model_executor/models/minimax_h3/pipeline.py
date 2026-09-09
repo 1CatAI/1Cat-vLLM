@@ -732,7 +732,23 @@ class MiniMaxH3Pipeline(nn.Module):
 
         token = lora_scale.set(request.sampling.lora_scale)
         try:
-            video_latent, audio_latent = self.diffuse(**self._denoise_kwargs(context))
+            from .request_cache import resolve_cache_plan
+
+            cache_plan = resolve_cache_plan(
+                self.config,
+                request.sampling,
+                calls=len(
+                    minimax_h3_time_shift_sigmas(
+                        num_steps=context["num_steps"],
+                        shift_scale=context["video_shift"],
+                        base_schedule=context["base_schedule"],
+                    )
+                )
+                - 1,
+            )
+            video_latent, audio_latent = self.diffuse(
+                **self._denoise_kwargs(context), cache_plan=cache_plan
+            )
         finally:
             lora_scale.reset(token)
         torch.accelerator.synchronize()
@@ -1581,6 +1597,7 @@ class MiniMaxH3Pipeline(nn.Module):
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        cache_plan=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -1607,6 +1624,10 @@ class MiniMaxH3Pipeline(nn.Module):
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        from .request_cache import CachePlan, request_cache
+
+        if cache_plan is None:
+            cache_plan = CachePlan("none", {}, len(inputs["sigmas_video"]) - 1)
         counter = DenoiseWorkCounter(
             transformer,
             used_length=branch.used_len,
@@ -1631,7 +1652,9 @@ class MiniMaxH3Pipeline(nn.Module):
             "attention_algorithm": (
                 "vsa" if self.config.attention_backend == "FASTVIDEO_VSA" else "dense"
             ),
-            "cache_algorithm": None,
+            "cache_algorithm": (
+                None if cache_plan.backend == "none" else cache_plan.backend
+            ),
             "actual_backends": sorted(
                 {
                     module.backend
@@ -1640,6 +1663,9 @@ class MiniMaxH3Pipeline(nn.Module):
                 }
             ),
         }
+        if cache_plan.backend != "none":
+            self.denoise_workload["work_accounting"] = "cached_tp_v1"
+            self.denoise_workload["cache_config"] = dict(cache_plan.options)
         if self.config.attention_backend == "FASTVIDEO_VSA":
             layout = branch.static_kwargs["video_token_layout"]
             self.denoise_workload["sparse_config"] = {
@@ -1652,7 +1678,11 @@ class MiniMaxH3Pipeline(nn.Module):
                 "heads": transformer.blocks[0].attn.num_heads,
                 "head_size": transformer.blocks[0].attn.head_dim,
             }
-        with counter, self._resident_dit_layers_on_device(enabled=True):
+        with (
+            counter,
+            self._resident_dit_layers_on_device(enabled=True),
+            request_cache(transformer, cache_plan),
+        ):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()

@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Run directly with torchrun; full small H3 forward and TP cache agreement."""
+
+import argparse
+import os
+from contextlib import nullcontext
+from typing import Any
+
+import torch
+from torch import nn
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--layer-offload", action="store_true")
+    parser.add_argument("--peer-reduction", action="store_true")
+    parser.add_argument(
+        "--backend",
+        choices=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
+        default="FLASH_ATTN_V100",
+    )
+    args = parser.parse_args()
+    from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        cleanup_dist_env_and_memory,
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.models.minimax_h3.attention import attention_backend
+    from vllm.model_executor.models.minimax_h3.collectives import H3ResidualReduction
+    from vllm.model_executor.models.minimax_h3.pipeline import MiniMaxH3Pipeline
+    from vllm.model_executor.models.minimax_h3.request_cache import (
+        CACHE_DIT_DEFAULTS,
+        CachePlan,
+        request_cache,
+    )
+    from vllm.model_executor.models.minimax_h3.residency import (
+        LayerwiseModuleStager,
+        PinnedModuleStager,
+    )
+    from vllm.model_executor.models.minimax_h3.transformer import (
+        MiniMaxH3DiTBlock,
+        MiniMaxH3DiTModel,
+    )
+    from vllm.video.metrics import DenoiseWorkCounter
+
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    torch.set_num_threads(2)
+    torch.accelerator.set_device_index(int(os.environ["LOCAL_RANK"]))
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world))
+    ):
+        init_distributed_environment(
+            world, rank, "env://", int(os.environ["LOCAL_RANK"]), "nccl"
+        )
+        initialize_model_parallel(world)
+        residual_owner = None
+        try:
+            with torch.inference_mode():
+                backend_token = attention_backend.set(args.backend)
+                try:
+                    model = (
+                        MiniMaxH3DiTModel(
+                            dict(
+                                num_layers=4,
+                                hidden_size=512,
+                                num_attention_heads=4,
+                                ffn_hidden_size=1024,
+                                text_dim=32,
+                                adaln_curve_grid=2,
+                                adaln_out_features=18 * 512,
+                                final_adaln_out_features=2 * 512,
+                            ),
+                            residual_sequence_parallel=True,
+                        )
+                        .cuda()
+                        .eval()
+                    )
+                finally:
+                    attention_backend.reset(backend_token)
+                torch.manual_seed(190)
+                for name, value in model.named_parameters():
+                    value.fill_(1) if "norm" in name else value.normal_(0, 0.01)
+                for name, value in model.named_buffers():
+                    value.normal_(0, 0.01)
+                pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+                nn.Module.__init__(pipeline)
+                pipeline.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+                inputs = pipeline._build_denoise_inputs(
+                    task="t2va",
+                    text_embeddings=torch.randn(3, 32, device="cuda"),
+                    text_tags=torch.ones(3, dtype=torch.long, device="cuda"),
+                    seed=42,
+                    latent_t=3,
+                    latent_h=4,
+                    latent_w=8,
+                    audio_t=3,
+                    num_frames=22,
+                    num_steps=5,
+                    video_shift=12,
+                    audio_shift=3,
+                    base_schedule=None,
+                    visual_condition=None,
+                    visual_condition_shape=None,
+                    audio_condition=None,
+                    ref_audio_t=None,
+                )
+                branch = inputs["branch"]
+                kwargs = branch.forward_kwargs(
+                    video_rows=inputs["video_rows"],
+                    audio_rows=inputs["audio_rows"],
+                    t_video=0.9,
+                    t_audio=0.7,
+                    imgvid_cond_timestep=0.1,
+                    audio_ref_cond_timestep=0.1,
+                )
+                expected = model(**kwargs)
+                if args.peer_reduction:
+                    residual_owner = H3ResidualReduction(
+                        get_tp_group(), memory_budget_bytes=512 * 2**20
+                    )
+                    for module in model.modules():
+                        if isinstance(module, MiniMaxH3DiTBlock):
+                            module.residual_reducer = residual_owner
+                residency = None
+                if args.layer_offload:
+                    snapshot = PinnedModuleStager(
+                        model, pipeline.device, pin_memory=False
+                    )
+                    residency = LayerwiseModuleStager(
+                        snapshot,
+                        (*model.token_refiner.blocks, *model.blocks),
+                        resident_modules=(
+                            model.blocks[0].norm1,
+                            model.blocks[0].adaln_proj,
+                        ),
+                    )
+                plans = [
+                    CachePlan("tea_cache", {"rel_l1_thresh": 0}, 4),
+                    CachePlan("tea_cache", {"rel_l1_thresh": 0.5}, 4),
+                    CachePlan(
+                        "cache_dit",
+                        {
+                            **CACHE_DIT_DEFAULTS,
+                            "max_warmup_steps": 1,
+                            "residual_diff_threshold": 1,
+                            "max_continuous_cached_steps": 2,
+                        },
+                        4,
+                    ),
+                ]
+                for scm_policy in ("dynamic", "static"):
+                    plans.append(
+                        CachePlan(
+                            "cache_dit",
+                            {
+                                **CACHE_DIT_DEFAULTS,
+                                "max_warmup_steps": 1,
+                                "residual_diff_threshold": 1,
+                                "max_continuous_cached_steps": 2,
+                                "enable_taylorseer": True,
+                                "taylorseer_order": 2,
+                                "scm_steps_mask_policy": "fast",
+                                "scm_steps_policy": scm_policy,
+                            },
+                            4,
+                        )
+                    )
+                for plan in plans:
+                    repeated = []
+                    for request in range(2):
+                        if residual_owner is not None:
+                            residual_owner.begin_request()
+                        with (
+                            residency.on_device() if residency else nullcontext(),
+                            DenoiseWorkCounter(
+                                model,
+                                used_length=branch.used_len,
+                                video_outputs=int(branch.update_mask.sum()),
+                                audio_outputs=int(branch.audio_update_mask.sum()),
+                            ) as counter,
+                        ):
+                            with request_cache(model, plan):
+                                for step in range(4):
+                                    with counter.step(step):
+                                        actual = model(**kwargs)
+                                    for a, b in zip(actual, expected):
+                                        torch.testing.assert_close(
+                                            a, b, atol=1e-5, rtol=1e-5
+                                        )
+                            torch.accelerator.synchronize()
+                            steps = counter.finish_steps()
+                        assert not getattr(model, "_h3_cache_active", False)
+                        assert not hasattr(model, "_h3_tea_cache")
+                        if residency:
+                            assert residency.loaded_bytes > 0
+                            assert all(
+                                p.device.type == "cpu" for p in model.parameters()
+                            )
+                        assert counter.calls == 4
+                        counts = [s["executed_blocks"] for s in steps]
+                        if plan.options.get("rel_l1_thresh") == 0:
+                            assert counts == [6] * 4
+                        else:
+                            assert min(counts) < 6
+                        assert sum(s["useful_flops"] for s in steps) == sum(
+                            counter.by_layer.values()
+                        )
+                        if residual_owner is not None:
+                            communication = residual_owner.snapshot()
+                            if world == 4:
+                                assert communication["peer_calls"] > 0
+                                assert communication["native_calls"] == 0
+                            else:
+                                assert communication["peer_calls"] == 0
+                            calls: list[Any] = [None] * world
+                            with torch.inference_mode(False):
+                                torch.distributed.all_gather_object(
+                                    calls, communication, group=get_tp_group().cpu_group
+                                )
+                            assert len({c["peer_calls"] for c in calls}) == 1
+                            assert len({c["native_calls"] for c in calls}) == 1
+                        repeated.append(counts)
+                    assert repeated[0] == repeated[1]
+                    print(
+                        f"rank={rank} tp={world} layer={args.layer_offload} "
+                        f"backend={args.backend} peer={args.peer_reduction} "
+                        f"{plan.backend} "
+                        f"{plan.options} counts={repeated[0]} PASS",
+                        flush=True,
+                    )
+        finally:
+            if residual_owner is not None:
+                residual_owner.close()
+            cleanup_dist_env_and_memory()
+
+
+if __name__ == "__main__":
+    main()

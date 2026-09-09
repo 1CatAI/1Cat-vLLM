@@ -45,6 +45,12 @@ class VideoSubcommand(CLISubcommand):
                 default="FLASH_ATTN_V100",
             )
             mode.add_argument("--fastvideo-vsa-topk", type=int, default=64)
+            mode.add_argument(
+                "--cache-backend",
+                choices=("none", "tea_cache", "cache_dit"),
+                default="none",
+            )
+            mode.add_argument("--cache-config", type=json.loads, default={})
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument(
                 "--attention-query-tile", type=int, choices=(64, 128), default=64
@@ -98,6 +104,11 @@ class VideoSubcommand(CLISubcommand):
                 help="MP4 encoder; NVENC requires a capable IMAGEIO_FFMPEG_EXE",
             )
             if name == "generate":
+                mode.add_argument("--quality", choices=("lossless", "high"))
+                mode.add_argument("--force-refresh-step-hint", type=int)
+                mode.add_argument(
+                    "--force-refresh-step-policy", choices=("once", "repeat")
+                )
                 mode.add_argument("--prompt", default=DEFAULT_PROMPT)
                 mode.add_argument("--width", type=int, default=1344)
                 mode.add_argument("--height", type=int, default=768)
@@ -147,6 +158,8 @@ class VideoSubcommand(CLISubcommand):
             tensor_parallel_size=args.tensor_parallel_size,
             attention_backend=args.attention_backend,
             vsa_topk=args.fastvideo_vsa_topk,
+            cache_backend=args.cache_backend,
+            cache_config=args.cache_config,
             attention_query_tile=args.attention_query_tile,
             fp16_weight_cache_gib=args.fp16_weight_cache_gib,
             fp16_cache_layers=tuple(args.fp16_cache_layer),
@@ -167,7 +180,13 @@ class VideoSubcommand(CLISubcommand):
             serve(config, host=args.host, port=args.port, output_dir=args.output_dir)
             return
         extra = {}
-        for key in ("task", "flow_shift", "audio_flow_shift"):
+        for key in (
+            "task",
+            "flow_shift",
+            "audio_flow_shift",
+            "force_refresh_step_hint",
+            "force_refresh_step_policy",
+        ):
             if getattr(args, key) is not None:
                 extra[key] = getattr(args, key)
         if args.duration is not None:
@@ -186,6 +205,7 @@ class VideoSubcommand(CLISubcommand):
                 seed=args.seed,
                 num_inference_steps=args.num_inference_steps,
                 lora_scale=args.lora_scale,
+                quality=args.quality,
                 extra_args=extra,
             ),
             media={

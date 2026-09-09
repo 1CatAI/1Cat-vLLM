@@ -34,6 +34,14 @@ def validate_request(config: H3Config, request: H3Request) -> None:
             task,
             request.sampling,
         )
+    from .request_cache import resolve_cache_plan
+
+    # The worker resolves the actual sigma schedule (including checkpoint DMD2
+    # metadata). Reject incompatible quality/refresh requests before dispatch;
+    # the final hint bound is checked against actual intervals in the worker.
+    resolve_cache_plan(
+        config, request.sampling, calls=request.sampling.num_inference_steps
+    )
     references = {}
     for key in ("image", "video", "audio"):
         value = request.media.get(key)

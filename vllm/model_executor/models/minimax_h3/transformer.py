@@ -1666,19 +1666,41 @@ class MiniMaxH3DiTModel(nn.Module):
                 )
             rows = seq_len // residual_group.world_size
             hidden = hidden.narrow(0, residual_group.rank_in_group * rows, rows)
-        for block in self.blocks:
-            hidden = block(
-                hidden,
-                t_emb=t_emb,
-                combined_indices=block_combined,
-                rope_table=block_rope,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                packed_total=seq_len,
-                num_requests=num_requests,
-                video_layout=video_layout,
-                vsa_prefix_segments=vsa_prefix_segments,
-            )
+
+        def run_blocks(hidden):
+            for block in self.blocks:
+                hidden = block(
+                    hidden,
+                    t_emb=t_emb,
+                    combined_indices=block_combined,
+                    rope_table=block_rope,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    packed_total=seq_len,
+                    num_requests=num_requests,
+                    video_layout=video_layout,
+                    vsa_prefix_segments=vsa_prefix_segments,
+                )
+            return hidden
+
+        tea_cache = getattr(self, "_h3_tea_cache", None)
+        if tea_cache is None:
+            hidden = run_blocks(hidden)
+        else:
+            state_indices = block_combined
+            if residual_group is not None:
+                state_indices = state_indices.narrow(
+                    0, residual_group.rank_in_group * hidden.shape[0], hidden.shape[0]
+                )
+            self._h3_cache_decision = True
+            try:
+                shift, scale, *_ = self.blocks[0].adaln_proj(t_emb)
+                modulated = indexed_scale_shift_(
+                    self.blocks[0].norm1(hidden), shift, scale, state_indices
+                )
+            finally:
+                self._h3_cache_decision = False
+            hidden = tea_cache.execute(hidden, modulated, run_blocks, residual_group)
         if residual_group is not None:
             # Final heads and the existing padding boundary consume full FP32 rows.
             hidden = residual_group.all_gather(hidden, dim=0)

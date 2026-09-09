@@ -1410,6 +1410,8 @@ setup(
         ],  # Required for audio processing
         "video": [
             "diffusers==0.40.0",
+            "cache-dit==1.5.0",
+            "huggingface-hub>=1.30.0,<2",
             "av>=14",
             "imageio>=2.37.2",
             "imageio-ffmpeg>=0.6",

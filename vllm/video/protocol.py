@@ -74,7 +74,7 @@ class VideoRequest(BaseModel):
     num_inference_steps: int | None = None
     num_outputs_per_prompt: int = Field(default=1, ge=1, le=10)
     task: Literal["t2va", "fl2va", "ref2va"] | None = None
-    quality: Literal["lossless"] | None = None
+    quality: Literal["lossless", "high"] | None = None
     lora: RemoteLoRA | None = None
     lora_scale: float | None = Field(default=None, allow_inf_nan=False)
     flow_shift: float | None = None
@@ -131,7 +131,11 @@ class VideoRequest(BaseModel):
                 if key in extra and extra[key] != value:
                     raise H3InputError(f"conflicting {field} and extra_params.{key}")
                 extra[key] = value
-        allowed = set(aliases.values()) | {"short_edge"}
+        allowed = set(aliases.values()) | {
+            "short_edge",
+            "force_refresh_step_hint",
+            "force_refresh_step_policy",
+        }
         if unknown := extra.keys() - allowed:
             raise H3InputError(f"unsupported H3 extra_params: {sorted(unknown)}")
         if extra.get("short_edge", 768) != 768:
