@@ -38,5 +38,21 @@ Evidence: `/data/minimax-h3/sm70-general-20260909/`.
   adapter buffers, cross-component aliases and 65-row tails reproduce
   whole-resident results bitwise across three load/forward/offload cycles.
 
-Full TP1/TP2 H3 generation and peak-memory measurements remain pending. These
-operator tests do not establish full-model quality or performance acceptance.
+`layer-staging-cpu-v2.log` additionally passes 35 checks, including explicit
+resident consumers and both CLI modes, with three GPU cases deselected.
+
+Source `aea5a0fc35` completes a TP1 original-weight LightX2V four-step request
+on one V100, using column-major matrices and pageable host masters. The first
+capacity check uses the smallest legal temporal extent (22 frames) on a
+256x448 canvas; it is not a primary performance workload. The full request
+passes basic media validation and peaks at 15,473,571,328 allocated GPU bytes.
+Denoise takes 126.274887 seconds and the complete request 152.031041 seconds.
+Recorded DiT weight loading takes 123.212966 seconds including the initial
+3.769427-second resident setup outside denoise. This identifies pageable
+layer transfers as the dominant cost, not a useful fast configuration.
+
+The full contract, source/binary hashes, raw latents/RGB/PCM and stages are in
+`/home/ymzx/h3-sm70-artifacts-20260909/runs/layer-offload-tp1-original-minimal/`.
+Pinned-host full-output comparison, larger TP1 and full TP2 generation remain
+pending. Neither the operator tests nor this basic media check establishes
+independent official full-model quality or performance acceptance.
