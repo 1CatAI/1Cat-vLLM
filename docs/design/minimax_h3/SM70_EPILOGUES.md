@@ -170,3 +170,28 @@ with zero errors/hazards. Their paired operator gains are only 0.3–0.6%, so
 neither is retained or promoted to a full-request performance claim. Evidence:
 `attention-barrier-coalesce/`, `attention-barrier-coalesce-v2/` and the
 `barrier-v2-*.log` files under the campaign root.
+
+## Larger canvas and duration compatibility
+
+Source `9d2489fc4e2f32ea500ec13478bd68ef9000c1cc` completes two additional
+TP4 W8A16 LightX2V four-step requests with prepared execution, exact residual
+sharding, query tile 128 and shared pageable VAE masters. Both use seed 42,
+the original paper-boat prompt, five sigma points and flow shifts 6/3.
+
+| Requested shape | Actual frames | Denoise seconds | Request seconds | Peak GPU allocation bytes/card | Useful TFLOP/s/card |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1344x768, 243 frames | 243 | 203.431920 | 254.138019 | 24,341,115,904 | 52.603224–52.603229 |
+| 1344x768, 15 seconds | 362 | 401.026288 | 469.032456 | 28,777,495,040 | 53.561244–53.561247 |
+
+The 15-second request resolves to the model's 362-frame aligned output; it is
+not claimed to be an exactly 15.000-second encoded clip. Both complete native
+media validation and strict actual-work checks, and remove their owned shared
+weight directories after shutdown. Full captures, source/binary manifests,
+per-rank stages and NVML samples are retained under
+`/home/ymzx/h3-sm70-artifacts-20260909/runs/official-243-frame/` and
+`boundary-15-second/`; `large-canvas-summary.json` summarizes the evidence.
+
+These first captured requests establish shape and memory compatibility only.
+They have no matched quality reference, full warmup or three post-warmup
+measurements. Both are below 80 and remain unqualified. The independent
+official reference and human review gates are also pending.
