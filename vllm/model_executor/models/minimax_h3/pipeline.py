@@ -81,7 +81,7 @@ from .reference_video import (
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
 )
-from .residency import PinnedModuleStager
+from .residency import LayerwiseModuleStager, PinnedModuleStager
 from .sigma_schedule import DMD2SigmaSchedule
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
@@ -569,6 +569,25 @@ class MiniMaxH3Pipeline(nn.Module):
         self._encoder_stager = PinnedModuleStager(
             self.text_encoder, self.device, pin_memory=config.host_weight_pin_memory
         )
+        self._dit_layer_stager: LayerwiseModuleStager | None = None
+        self._encoder_layer_stager: LayerwiseModuleStager | None = None
+        if config.weight_offload == "layer":
+            self._dit_layer_stager = LayerwiseModuleStager(
+                self._dit_stager,
+                (*self.transformer.token_refiner.blocks, *self.transformer.blocks),
+                # Cache decision probes may consume these outside block.forward.
+                resident_modules=(
+                    self.transformer.blocks[0].norm1,
+                    self.transformer.blocks[0].adaln_proj,
+                ),
+            )
+            self._encoder_layer_stager = LayerwiseModuleStager(
+                self._encoder_stager,
+                (
+                    *self.text_encoder.vision.blocks,
+                    *self.text_encoder.text_model.layers,
+                ),
+            )
         self.video_vae = MiniMaxH3VideoVAE(
             str(shared / "video_vae"),
             device=self.device,
@@ -611,6 +630,20 @@ class MiniMaxH3Pipeline(nn.Module):
 
     @contextmanager
     def _component_on_device(self, component):
+        if (
+            component is self.text_encoder
+            and getattr(self, "_encoder_layer_stager", None) is not None
+        ):
+            plan = self._encoder_layer_stager
+            try:
+                with plan.on_device():
+                    yield
+            finally:
+                self.stage_durations["encoder_layer_weight_staging"] = plan.load_seconds
+                self.stage_durations["encoder_layer_weight_offload"] = (
+                    plan.offload_seconds
+                )
+            return
         stager = self._encoder_stager if component is self.text_encoder else None
         if stager is not None:
             stager.load()
@@ -627,6 +660,18 @@ class MiniMaxH3Pipeline(nn.Module):
     @contextmanager
     def _resident_dit_layers_on_device(self, *, enabled=True):
         started = time.perf_counter()
+        if getattr(self, "_dit_layer_stager", None) is not None:
+            plan = self._dit_layer_stager
+            try:
+                with plan.on_device():
+                    self.stage_durations["dit_staging_and_weight_cache"] = (
+                        time.perf_counter() - started
+                    )
+                    yield
+            finally:
+                self.stage_durations["dit_layer_weight_staging"] = plan.load_seconds
+                self.stage_durations["dit_layer_weight_offload"] = plan.offload_seconds
+            return
         self._dit_stager.load()
         try:
             self._weight_cache.prepare()

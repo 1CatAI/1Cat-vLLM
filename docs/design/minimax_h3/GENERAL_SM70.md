@@ -222,3 +222,34 @@ generation at 256x448, 107 internal frames and 49 intervals. TeaCache records
 within the declared gates. These are lifecycle checks, not full official
 quality or the primary performance matrix. Subsequent branch documents hold
 the detailed records; their APIs are not all present in this common-base PR.
+
+### Original projection conversion audit
+
+`float-matrix-conversion-audit.json` scans every original attention/MLP matrix
+that the native model executes in FP16, including the token refiners: 208
+matrices and 20,038,287,360 values per partition. Protected FP32 normalization,
+AdaLN and embedding parameters are outside this conversion. The audit retains
+each source tensor's SHA256, shape/dtype, conversion error and underflow count.
+Checkpoint revision is `42ed227ee7df40d41602854ae760620d6eb651fe`.
+
+| Partition | Aggregate relative L2 | Maximum matrix relative L2 | Nonzero values underflowed to zero | Overflow / non-finite input |
+| --- | ---: | ---: | ---: | ---: |
+| FL2VA | 9.000060e-10 | 4.256286e-9 | 4,055 | 0 / 0 |
+| Ref2VA | 9.004251e-10 | 4.208590e-9 | 4,058 | 0 / 0 |
+
+This explicitly records FP16 subnormal-range loss; conversion is not claimed
+to preserve every source bit. No value clipping is performed. The loading
+guard still rejects FP16 overflow. These weight-only measurements do not
+replace the final latent, video and audio quality gates.
+
+The official eight LightX2V files are now present and hash-verified against
+repository revision `2f015e66b37c585cea9dc4ae6f1850ea8788e742`. Native header
+inspection accepts all eight with the recipe's task families, four/eight
+intervals, five/nine sigma points, flow shifts and alpha values; see
+`official-variants/all-lightx2v-inventory.json`. Download/header validation is
+not full GPU generation or acceptance for the remaining adapter versions.
+
+The kernel branch's Ref2VA eight-step mixed image/video/audio control also
+passes frozen-native latent/RGB/PCM comparison bitwise, with 69,325 valid DiT
+tokens. Its single captured denoise is 366.799932 seconds; no formal three-run
+or independent official quality qualification is claimed.
