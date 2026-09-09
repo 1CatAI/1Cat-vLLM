@@ -1522,6 +1522,7 @@ class MiniMaxH3Pipeline(nn.Module):
             audio_outputs=int(branch.audio_update_mask.sum()),
         )
         self.denoise_workload = {
+            "work_accounting": "dense_tp_lora_v2",
             "partition": self.partition,
             "task": task,
             "adapter": (
@@ -1573,6 +1574,8 @@ class MiniMaxH3Pipeline(nn.Module):
             self.useful_denoise_flops = counter.flops
             self.actual_dit_calls = counter.calls
             self.denoise_flops_by_layer = counter.by_layer
+            self.redundant_denoise_flops = counter.redundant_flops
+            self.redundant_flops_by_layer = counter.redundant_by_layer
             self.denoise_steps = counter.finish_steps()
             self.denoise_executed_blocks = dict(counter.blocks)
 

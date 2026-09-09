@@ -61,6 +61,15 @@ Cache-DiT support. Padding, ConvRot, dequantization and repeated output rows rem
 excluded from useful FLOPs. Algorithmic work savings must be accounted separately
 when those variants are implemented.
 
+Column-parallel LoRA A projections have the same weights and input on every
+rank. `dense_tp_lora_v2` attributes those input rows once across the TP group,
+including uneven tails. Identical replicas are reported in
+`redundant_denoise_flops`, `redundant_flops_by_layer` and each step's
+`redundant_flops`; they never increase useful throughput. Row-parallel A consumes
+distinct input shards, so its resulting partial B products remain useful work.
+Legacy records without an accounting version are rejected until explicitly
+audited; the measurement source/time must remain unchanged in any such audit.
+
 ## Development evidence
 
 Integration base: `4f19ef7a20db60bb0685e599bd3f4dd156202eed` (`onecat/main`).
@@ -77,3 +86,36 @@ Artifacts: `/data/minimax-h3/sm70-general-20260909/`.
   acquired after the original-weight control released it.
 - Full model instrumentation validation and performance measurements are pending.
   No configuration has met the campaign's >80 TFLOP/s and full quality gates.
+
+### Complete four-step controls and first three-run baseline
+
+`metrics-720p-quality` validates runtime `82362a4312`, W8A16 + LightX2V4 v1.2,
+TP4 GPUs0-3, internal 1280x736/124 frames for the five-second 720p sample.
+All four ranks recorded four complete calls and 52 blocks/call. Full video/audio
+latents and decoded RGB/PCM match frozen mainline bitwise; SSIM is 1.0 and the
+audio numerical gates pass (`metrics-quality.json`). This is instrumentation
+regression evidence, not independent official or human quality acceptance.
+
+`fa-720p-three-runs` completes one full native warmup and three unprofiled
+requests with the same deployment/sampling on `82362a4312`. Denoise times are
+65.880184, 65.898529 and 65.965556 seconds; CV is 0.055668%. End-to-end times
+are 93.173206, 95.494415 and 88.343595 seconds. Peak allocation is
+19,501,498,880 bytes/card. Warmup alone also retained fresh encoder/denoise input
+tensors for later independent diagnostics; measured requests contain no captures.
+
+The original counter included identical column-A replicas. Its reported
+47.524847 TFLOP/s/card is superseded by the explicit header-shape audit in
+`fa-720p-three-runs/audited-counts/`. Original files, times and source fingerprints
+are retained. Rank0 useful work is 3,103,284,010,387,456 FLOPs after excluding
+28,533,508,276,224 replicated A FLOPs (0.9111% of the old numerator).
+Audited median throughput is **47.091839–47.091855 TFLOP/s/card**, depending on
+the uneven row tail. Performance remains below 80. The audit script checks all
+retained per-layer counts against immutable LightX2V A/B header shapes; it is
+not a new run of the revised runtime counter.
+
+`metrics-lora-count-cpu.log`: 49 CPU tests pass, including unique logical column
+adapter FLOPs across TP1/2/4 and one-row/97-row/34551-row tails. Two additional
+legacy/inconsistent-redundancy rejection cases pass in
+`metrics-legacy-rejection.log`. The revised counter will be exercised in the
+matching FlashInfer full measurements. Sparse/cache and complete official
+workflow/quality/performance coverage remain open.

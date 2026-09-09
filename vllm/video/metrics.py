@@ -30,6 +30,28 @@ def loaded_kernel_provenance():
     }
 
 
+def lora_work(layer, parts, rows, *, replicated_a):
+    """Separate identical column-A replicas from useful TP partial products.
+
+    Column-parallel A has identical weights and full input rows on every rank.
+    Attribute each row once, balanced by rank, including non-divisible tails.
+    Row-parallel A instead consumes distinct input shards; its B products are
+    distinct partial contributions and are not identical replicas.
+    """
+    a_elements = sum(
+        getattr(layer, f"h3_lora_a_{index}").numel() for index, _, _ in parts
+    )
+    b_elements = sum(
+        getattr(layer, f"h3_lora_b_{index}").numel() for index, _, _ in parts
+    )
+    executed = 2 * rows * (a_elements + b_elements)
+    redundant = 0
+    if replicated_a:
+        owner_rows = rows // layer.tp_size + (layer.tp_rank < rows % layer.tp_size)
+        redundant = 2 * (rows - owner_rows) * a_elements
+    return executed - redundant, redundant
+
+
 class DenoiseWorkCounter:
     """Count actual TP-local matrix shapes, excluding structural padding.
 
@@ -38,7 +60,7 @@ class DenoiseWorkCounter:
     """
 
     def __init__(self, model, *, used_length, video_outputs, audio_outputs):
-        from vllm.model_executor.layers.linear import LinearBase
+        from vllm.model_executor.layers.linear import ColumnParallelLinear, LinearBase
         from vllm.model_executor.models.minimax_h3.attention import Attention
         from vllm.model_executor.models.minimax_h3.lora import (
             TurboLinearMethod,
@@ -46,11 +68,13 @@ class DenoiseWorkCounter:
         )
 
         self.flops = 0
+        self.redundant_flops = 0
         self.calls = 0
         self.blocks: dict[str, int] = {}
         self.steps: list[dict] = []
         self._step_events = []
         self.by_layer: dict[str, int] = {}
+        self.redundant_by_layer: dict[str, int] = {}
         self.handles = []
 
         def completed_call(module, inputs, output):
@@ -88,18 +112,19 @@ class DenoiseWorkCounter:
                     self.by_layer[name] = self.by_layer.get(name, 0) + count
                     method = layer.quant_method
                     if isinstance(method, TurboLinearMethod) and lora_scale.get() != 0:
-                        work = sum(
-                            2
-                            * effective
-                            * (
-                                getattr(layer, f"h3_lora_a_{index}").numel()
-                                + getattr(layer, f"h3_lora_b_{index}").numel()
-                            )
-                            for index, _, _ in method.parts
+                        work, redundant = lora_work(
+                            layer,
+                            method.parts,
+                            effective,
+                            replicated_a=isinstance(layer, ColumnParallelLinear),
                         )
                         self.flops += work
                         key = name + ".lora"
                         self.by_layer[key] = self.by_layer.get(key, 0) + work
+                        self.redundant_flops += redundant
+                        self.redundant_by_layer[key] = (
+                            self.redundant_by_layer.get(key, 0) + redundant
+                        )
 
                 self.handles.append(module.register_forward_hook(linear_hook))
             elif isinstance(module, Attention):
@@ -123,7 +148,7 @@ class DenoiseWorkCounter:
         import torch
 
         start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        before = self.flops, self.calls, sum(self.blocks.values())
+        before = self.flops, self.calls, sum(self.blocks.values()), self.redundant_flops
         start.record()
         started = time.perf_counter()
         yield
@@ -133,6 +158,7 @@ class DenoiseWorkCounter:
                 "index": index,
                 "cpu_enqueue_seconds": time.perf_counter() - started,
                 "useful_flops": self.flops - before[0],
+                "redundant_flops": self.redundant_flops - before[3],
                 "dit_calls": self.calls - before[1],
                 "executed_blocks": sum(self.blocks.values()) - before[2],
                 # This counter currently instruments dense, uncached execution.
@@ -244,6 +270,8 @@ class NVMLMonitor:
 
 def _validate_dense_workload(rank):
     workload = rank["denoise_workload"]
+    if workload.get("work_accounting") != "dense_tp_lora_v2":
+        raise ValueError("legacy work counts may include replicated LoRA projections")
     if (
         workload["attention_algorithm"] != "dense"
         or workload["cache_algorithm"] is not None
@@ -279,6 +307,8 @@ def _validate_dense_workload(rank):
             raise ValueError("dense step work does not match the workflow")
         if type(step["useful_flops"]) is not int or step["useful_flops"] <= 0:
             raise ValueError("useful FLOPs must be positive integer counts")
+        if type(step["redundant_flops"]) is not int or step["redundant_flops"] < 0:
+            raise ValueError("redundant work must be a nonnegative integer count")
         for key in ("gpu_seconds", "cpu_enqueue_seconds"):
             if not math.isfinite(step[key]) or step[key] <= 0:
                 raise ValueError("invalid measured step duration")
@@ -287,6 +317,10 @@ def _validate_dense_workload(rank):
         or sum(rank["denoise_flops_by_layer"].values()) != rank["useful_denoise_flops"]
         or len(rank["denoise_executed_blocks"]) != blocks
         or any(value != calls for value in rank["denoise_executed_blocks"].values())
+        or sum(step["redundant_flops"] for step in steps)
+        != rank["redundant_denoise_flops"]
+        or sum(rank["redundant_flops_by_layer"].values())
+        != rank["redundant_denoise_flops"]
     ):
         raise ValueError("step, layer and complete-denoise work counts disagree")
     return workload

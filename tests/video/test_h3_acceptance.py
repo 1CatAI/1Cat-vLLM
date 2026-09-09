@@ -11,6 +11,7 @@ from vllm.video.metrics import evaluate_performance
 
 def measurements(calls=49, api_steps=50, tp=4):
     workload = {
+        "work_accounting": "dense_tp_lora_v2",
         "partition": "fl2va",
         "task": "t2va",
         "adapter": None,
@@ -38,6 +39,8 @@ def measurements(calls=49, api_steps=50, tp=4):
                 "dit_calls": calls,
                 "useful_denoise_flops": total,
                 "denoise_flops_by_layer": {"example": total},
+                "redundant_denoise_flops": 0,
+                "redundant_flops_by_layer": {},
                 "denoise_workload": deepcopy(workload),
                 "denoise_executed_blocks": {str(i): calls for i in range(52)},
                 "denoise_steps": [
@@ -46,6 +49,7 @@ def measurements(calls=49, api_steps=50, tp=4):
                         "dit_calls": 1,
                         "executed_blocks": 52,
                         "useful_flops": quot + (i < rem),
+                        "redundant_flops": 0,
                         "gpu_seconds": 1.0,
                         "cpu_enqueue_seconds": 0.1,
                         "sparse_blocks": 0,
@@ -117,6 +121,8 @@ def test_uses_actual_intervals_for_all_dense_schedules(calls, api_steps, tp):
         "warmup_incomplete",
         "missing_warmup",
         "nan_step_time",
+        "legacy_work",
+        "redundant_work",
     ],
 )
 def test_rejects_incomplete_or_incomparable_measurements(invalid):
@@ -162,6 +168,10 @@ def test_rejects_incomplete_or_incomparable_measurements(invalid):
         warmup["measurement"]["warmup"] = False
     elif invalid == "nan_step_time":
         rank["denoise_steps"][0]["gpu_seconds"] = float("nan")
+    elif invalid == "legacy_work":
+        rank["denoise_workload"].pop("work_accounting")
+    elif invalid == "redundant_work":
+        rank["redundant_denoise_flops"] = 1
     else:
         rank["dit_calls"] = 48
     with pytest.raises(ValueError):

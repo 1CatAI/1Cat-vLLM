@@ -1,10 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
-from vllm.video.metrics import DenoiseWorkCounter
+from vllm.video.metrics import DenoiseWorkCounter, lora_work
+
+
+@pytest.mark.parametrize("rows", [1, 97, 34551])
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_column_lora_a_is_counted_once_across_ranks_including_tails(rows, tp):
+    useful = redundant = 0
+    for rank in range(tp):
+        layer = SimpleNamespace(
+            tp_size=tp,
+            tp_rank=rank,
+            h3_lora_a_0=torch.empty(3, 7),
+            h3_lora_b_0=torch.empty(8 // tp, 3),
+        )
+        work, repeated = lora_work(layer, [(0, 0, 8 // tp)], rows, replicated_a=True)
+        useful += work
+        redundant += repeated
+    # The logical adapter is one 7->3->8 projection regardless of TP size.
+    assert useful == 2 * rows * (7 * 3 + 3 * 8)
+    assert redundant == 2 * rows * (7 * 3) * (tp - 1)
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_row_lora_partial_products_are_distinct_work(tp):
+    layer = SimpleNamespace(
+        tp_size=tp,
+        tp_rank=0,
+        h3_lora_a_0=torch.empty(3, 8 // tp),
+        h3_lora_b_0=torch.empty(11, 3),
+    )
+    work, redundant = lora_work(layer, [(0, 0, 11)], 13, replicated_a=False)
+    assert work == 2 * 13 * (3 * (8 // tp) + 11 * 3)
+    assert redundant == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a leased GPU")

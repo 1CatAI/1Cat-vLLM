@@ -82,6 +82,8 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
                     "dit_calls": pipeline.actual_dit_calls,
                     "useful_denoise_flops": pipeline.useful_denoise_flops,
                     "denoise_flops_by_layer": pipeline.denoise_flops_by_layer,
+                    "redundant_denoise_flops": pipeline.redundant_denoise_flops,
+                    "redundant_flops_by_layer": pipeline.redundant_flops_by_layer,
                     "denoise_workload": pipeline.denoise_workload,
                     "denoise_steps": pipeline.denoise_steps,
                     "denoise_executed_blocks": pipeline.denoise_executed_blocks,
