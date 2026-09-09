@@ -11,13 +11,17 @@ import torch
 FLAG = "VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST"
 
 
-def test_requested_fast_path_rejects_stale_library(monkeypatch):
+@pytest.mark.parametrize("native_version", [None, 1])
+def test_requested_fast_path_rejects_stale_library(monkeypatch, native_version):
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     monkeypatch.setenv(FLAG, "1")
+    stale = SimpleNamespace(grouped_e4m3_fp32_precision_version=lambda: 4)
+    if native_version is not None:
+        stale.tp2_e4m3_scalar_fast_version = lambda: native_version
     monkeypatch.setattr(
         interface,
         "flash_attn_v100_cuda",
-        SimpleNamespace(grouped_e4m3_fp32_precision_version=lambda: 4),
+        stale,
     )
     monkeypatch.setattr(
         interface, "flash_attn_grouped_e4m3_fp32_available", lambda: True
@@ -34,7 +38,7 @@ def test_requested_fast_path_rejects_stale_library(monkeypatch):
     kv = torch.empty((1, 3296, 2, 256), dtype=torch.uint8)
     table = torch.zeros((8, 1), dtype=torch.int32)
     seq = torch.zeros(8, dtype=torch.int32)
-    with pytest.raises(RuntimeError, match="TP2 E4M3 scalar fast revision 1"):
+    with pytest.raises(RuntimeError, match="TP2 E4M3 scalar fast revision 2"):
         interface.flash_attn_decode_paged(
             q, kv, kv, table, seq, kv_cache_dtype="fp8_e4m3"
         )
@@ -47,8 +51,8 @@ def native():
     interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
     extension = interface.flash_attn_v100_cuda
     version = getattr(extension, "tp2_e4m3_scalar_fast_version", lambda: 0)
-    if version() < 1:
-        pytest.skip("rebuild Flash-V100 with TP2 scalar fast revision 1")
+    if version() < 2:
+        pytest.skip("rebuild Flash-V100 with TP2 scalar fast revision 2")
     return extension
 
 

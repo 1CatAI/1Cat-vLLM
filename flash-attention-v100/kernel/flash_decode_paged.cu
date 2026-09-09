@@ -4415,7 +4415,7 @@ int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   return 4;
 }
 
-int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 1; }
+int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 2; }
 
 int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count() {
   // Includes capture-time launches; CUDA Graph replay does not call this host

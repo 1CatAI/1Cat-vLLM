@@ -48,19 +48,13 @@ __device__ __forceinline__ __half fp8_e5m2_to_half(uint8_t raw) {
   return __ushort_as_half(static_cast<unsigned short>(raw) << 8);
 }
 
-// E4M3 normals map exactly into the IEEE float exponent and mantissa fields.
-// Keep the original NaN payload and signed zero, including E4M3 subnormals.
+// Finite E4M3 values map exactly to FP16 bits followed by FP32 scaling.
+// Preserve the original NaN payload and signed zeros, including subnormals.
 __device__ __forceinline__ float fp8_e4m3fn_to_float_bits(uint8_t raw) {
-  const uint32_t magnitude = raw & 0x7fu;
-  const uint32_t sign = static_cast<uint32_t>(raw & 0x80u) << 24;
-  uint32_t bits = (magnitude << 20) + 0x3c000000u;
-  if (magnitude < 8) {
-    bits = __float_as_uint(static_cast<float>(magnitude) * 0.001953125f);
-  }
-  if (magnitude == 0x7f) {
-    return quiet_nan_f();
-  }
-  return __uint_as_float(bits | sign);
+  const uint16_t half_bits = ((static_cast<uint16_t>(raw) << 7) & 0x3f80u) |
+                             ((static_cast<uint16_t>(raw) << 8) & 0x8000u);
+  const float value = __half2float(__ushort_as_half(half_bits)) * 256.0f;
+  return (raw & 0x7fu) == 0x7fu ? quiet_nan_f() : value;
 }
 
 __device__ __forceinline__ __half2 fp8_e5m2_pair_to_half2(uint16_t raw_pair) {

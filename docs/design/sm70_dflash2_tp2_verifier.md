@@ -59,9 +59,10 @@ only for q shape `[8,12,256]`, E4M3 KV with two heads, FP32 partial storage,
 off by default. Unverified shapes use the original route. A requested matching
 route rejects a stale native library instead of silently reporting success.
 
-The specialization constructs normal E4M3 values directly in FP32 bit fields,
-retains the original signed zeros, subnormals and NaN payload, and unrolls the
-PV loop by eight. Each output still follows the original ascending-token FMA
+Revision 1 constructs normal E4M3 values directly in FP32 bit fields. Revision
+2 uses an exact FP16 bit expansion followed by FP32 multiplication by 256.
+Both retain the original signed zeros, subnormals and NaN payload and unroll
+the PV loop by eight. Each output follows the original ascending-token FMA
 chain. It retains partition boundaries, score reductions, FP32 intermediate
 storage, output rounding, KV scales and the original final reduction kernel.
 The native launch counter proves host dispatch, including capture-time calls;
@@ -708,6 +709,83 @@ changes only the executable grid of the unchanged scalar attention kernel.
 It preserves outputs and valid partial/statistic bits but saves only about
 0.06–0.07 ms across sixteen KV layers. It is not advanced to a model route.
 
+The context/probe scheduling experiment retains the original NumPy top-p
+cutoff guard. It copies the FP32 probe to a fixed pinned buffer, records an
+event, then launches the original context graph on its original stream.
+The CPU guard waits for the probe copy while context work continues. Missing
+or unsupported probes flush pending context before state updates. Live
+shadow compares hidden states, positions and every projected context K/V
+before versus after the target head: 966 context and probe checks per rank
+pass. Three independent startups retain all fifteen measured pairs and
+warmups per fixture. With balanced 192-projection QPN2 and BV16 fixed,
+complete rounds improve from 33.778139 to 33.251763 ms on release1k and
+30.696557 to 30.018241 ms on MBPP28. Candidate p50/p90/p99 are
+33.176/33.809/35.623 and 30.118/30.981/32.607 ms; TTFT is 579.024/148.915 ms
+and pure decode 92.123/149.354 tokens/s. Evidence is
+`context-probe-3-start-pair-summary.json`. Composition with the full 256
+projection layout, BV2 and the newer decoder requires a separate diagnostic
+and unprofiled campaign; these independent gains are not added together.
+
+The combined diagnostic fixes all 256 QPN2 projections and source-integrated
+BV2, then switches the exact decoder and context schedule together. Its first
+check incorrectly compares the entire sampled-token allocation. All target
+hidden states, full local-vocabulary logits, accepted lengths and final
+outputs match, but unused sampled-token tails differ. The original sparse
+sampler uses `new_empty` and writes only its valid prefix; downstream output
+uses `num_sampled`. The failed report is retained without admission.
+
+The corrected diagnostic records each raw differing column and confirms it
+is outside the valid prefix. It also fills invalid tails with distinct values
+in the two arms before downstream consumers run. All later hidden states,
+full local-vocabulary logits, valid sampled tokens, acceptance and natural EOS
+still match. The comparison covers 1162 complete-vocabulary rows, represented
+by 288547840 FP32 elements across the two rank shards. Each arm poisons
+476/139 tail elements per rank on release1k/MBPP28; context comparisons cover
+95/50 rounds per rank. This tests tail isolation on these requests and does
+not resolve the earlier cross-startup variation. Evidence is
+`tp2-combined-shadow-2-admission.json` and `combined-shadow-2-summary.json`.
+
+The first unprofiled combined startup passes all five pairs and warmup per
+fixture. With full QPN2/BV2 fixed, adding the private exact decoder and
+context overlap changes complete rounds from 33.184675 to 31.896585 ms on
+release1k and 30.082788 to 29.146665 ms on MBPP28. Candidate round p50/p90/p99
+are 31.863/32.362/34.516 and 29.078/29.677/30.255 ms. Warm TTFT is
+593.983/163.962 ms, and pure decode 108.022/153.820 tokens/s. This is one
+startup, not the three-startup gate or the approximately 25 ms goal. It is
+also not a performance claim for the newly rebuilt native revision 2.
+
+A separate MLP two-accumulator-chain screen preserves weights, scale rounding
+and logical K64 splits but changes accumulation order. Both TP2 ranks and
+three fixed input amplitudes produce twelve checks of the actual gate/up
+and down shapes. Eight checks expand independent FP64-reference error, with
+122–604 changed FP16 output elements per case. The arithmetic candidate is
+rejected before timing or model integration. See
+`qpn2-mlp-two-chain-decision.json`.
+
+Native revision 2 now contains the exact FP16-bridge decoder behind the same
+default-off TP2 flag. An explicitly requested matching route rejects revision
+1 and older libraries. The isolated build SHA256 is
+`9d0fe7186bfe82ccd0b58f0795b9f0b4a70eb7ecf8dc9caf345efb4055752cdf`.
+It passes 15 native tests, including both stale-library cases, exhaustive
+byte decoding, FP64 reference, changing graphs and unsupported shapes.
+Twenty-four replacements of the real kernel function preserve outputs and
+valid partial/statistic bits. Memcheck covers 1025, 3297 and 262144 tokens
+with zero errors. The 262144-token racecheck reaches the 240-second limit
+and is retained as a timeout, not a pass. A bounded racecheck at 1025/3297
+tokens completes with zero hazards. Each successful native invocation
+records positive fast-path host dispatch counts. The final source includes
+a whitespace-only changed-line formatting pass after the build snapshot.
+Whole-model admission of this rebuilt library remains separate from the
+private decoder's earlier paired performance evidence.
+
+A q8-only QPN2 specialization removes unused row predicates and row offsets
+while preserving all dot-product arithmetic. All sixteen real projection
+outputs, FP64-reference errors, changing replays and output canaries match;
+unsupported row counts are rejected. Compiler register use drops from 52 to
+48 per thread, but the working-set median worsens from 0.725504 to 0.776960 ms.
+It is rejected before model work. Register count alone is not a performance
+result; evidence is `qpn2-static-m8-decision.json`.
+
 ### LM-head width and accumulation order
 
 The trace spends approximately 4.133 ms across the target and draft dense
@@ -732,6 +810,19 @@ See `head-cublaslt-probe.json`, `head-lt-plan-probe.json` and the
 [CUDA 12.8 cuBLASLt reference](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html).
 
 ## Reproduction and retained negative results
+
+Generate the isolated TP2 projection candidate without installing it:
+
+```bash
+CUDA_VISIBLE_DEVICES="" TORCH_CUDA_ARCH_LIST=7.0 MAX_JOBS=2 \
+  .venv/bin/python benchmarks/kernels/build_sm70_tp2_matched_qpn2.py \
+  --output-dir /tmp/tp2-matched-qpn2 --build
+```
+
+The manifest records source and library hashes. The tested candidate uses
+the observed TurboMind split for each real TP2 q8 projection and one
+accumulator chain. Other shapes, split choices or new builds require their
+own numerical and model admission.
 
 Build Flash-V100 from this branch with the same CUDA/Torch/compiler flags and
 select that module before running the tests. Set `CUDA_VISIBLE_DEVICES` only
