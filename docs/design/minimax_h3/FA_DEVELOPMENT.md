@@ -52,8 +52,8 @@ No GEMM plan change is justified by this measurement.
 - Adding vector Q/K loads, V lane-exchange transpose and swizzled probability
   storage to that prototype spills 160 bytes per thread at the 128-register
   limit. The resource gate rejects it before GPU timing. A separate scoped
-  staging experiment checks whether shortening vector lifetime can avoid
-  that spill; it remains an unqualified development artifact.
+  staging experiment reduces the spill to 116 bytes with a 120-byte stack,
+  which still fails the resource gate. Neither staging variant is GPU timed.
 
 Exact code, binary hashes, clocks, numerical results and paired measurements
 are retained under `/data/minimax-h3/sm70-general-20260909/` in
