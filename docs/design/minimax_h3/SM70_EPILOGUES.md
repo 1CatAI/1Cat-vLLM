@@ -108,3 +108,31 @@ median denoise by 3.92% relative to the same prepared 64-query configuration,
 and the combined change reduces it by 9.33% relative to the original baseline.
 These measurements cover one five-second workflow only. **The >80 gate still
 fails; official reference, human review and the wider matrix remain pending.**
+
+## Eight-step numerical preservation
+
+The same explicit query-128/prepared/residual/epilogue configuration at
+`bd5e1898265eb1783fcc413de321125230fbe594` also completed a matched TP4
+LightX2V eight-step FL2V v1.0_768p comparison with frozen mainline `4f19ef7`.
+Both runs use W8A16, seed 42, the same five-second request, nine sigma points,
+flow shift 6 and audio flow shift 3. The official adapter SHA256 is
+`9b0efe3613b43a84e30febaa43af27432ea9d0711eac7bba904b2556b175f6d4`.
+
+`light8-720p-quality.json` passes every declared numerical gate: both final
+latents, all 124 RGB frames and decoded PCM match bitwise. This extends
+preservation evidence beyond the four-step adapter, using the same shared
+operators without an adapter-specific dispatch exception. It remains a frozen
+native control, not independent official-model acceptance.
+
+The captured cold requests took 141.160054 and 121.541891 seconds in denoise;
+complete request times were 174.840862 and 203.651622 seconds respectively.
+These single captured runs have different staging conditions and no full
+warmup, so they do not establish a formal performance result or an overall
+request speedup. Source hashes, binary manifests and commands are recorded
+in `light8-pair.json`. The eight-step >80 gate remains unmeasured.
+
+An additional 16-row warp experiment (`attention-warp16/hypothesis.json`)
+was rejected at compilation: CUTLASS Volta MMA requires a multiple of its
+interleaved tile shape. No GPU run or production change followed. Supporting
+that geometry requires new MMA and accumulator iterators, not another
+configuration-only benchmark of the rejected shape.
