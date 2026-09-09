@@ -1,10 +1,12 @@
 # DFlash2 acceptance and quantization-independent schedules, 2026-09-09
 
-The user requests acceptance of the current approximately 16.2/15.8-ms
-combination, dataset-level decode speed, acceptance and quality, followed by
-PR/main integration only if the gates pass. Quantization-independent
-optimizations must be available to other weight formats. The original sub-15-ms
-performance objective is not claimed achieved by this campaign.
+The current approximately 16.2/15.8-ms combination exposes independently
+selectable schedules and records dataset-level decode speed, acceptance and
+quality. Quantization-independent optimizations are available to other weight
+formats through the common entry point. The user has explicitly requested
+main integration of the current PR. Experimental routes remain disabled by
+default; source integration does not certify the pending runtime gates below.
+The original sub-15-ms performance objective is not claimed achieved.
 
 ## Current capacity contract: 256K
 
@@ -31,8 +33,58 @@ warmups and bounded teacher-forced operator diagnostics remain explicitly
 excluded from natural-generation quality and performance results.
 
 The corpus, capacity-policy checks, launch-time source archives and new results
-are separate from `acceptance-16ms`. The results below describe the historical
-16K-cap campaign and do not certify the new 256K-capacity campaign.
+are separate from `acceptance-16ms`. The historical 16K-cap results later in
+this document do not certify the new 256K-capacity campaign.
+
+## Current 256K-capacity observations and integration scope
+
+The first independent startup measures five requests after five warmups per
+fixture and arm, with no profiler or tensor dump:
+
+| Fixture | BV8 / BV2 complete-round median | BV2 pure decode median | Accepted drafts / emitted tokens per round |
+| --- | ---: | ---: | ---: |
+| release1k | 16.571456 / 16.339483 ms | 182.259 token/s | 1.989011 / 2.989011 |
+| MBPP28 | 16.144814 / 15.907431 ms | 306.098 token/s | 3.876923 / 4.876923 |
+
+These are medians of request-average complete-round costs. All tokens, natural
+EOS and acceptance match. This A/B isolates BV8/BV2 with the other performance
+candidates shared; it is not the full-stack all-off comparison.
+
+The first five completed long-output pairs also match token IDs, acceptance,
+finish reasons and semantic tool calls exactly. Every response stops naturally.
+Their candidate measurements are:
+
+| Case | Output tokens | Mean complete round | Pure decode |
+| --- | ---: | ---: | ---: |
+| HumanEval/10 | 21162 | 19.486480 ms | 186.554 token/s |
+| LiveCodeBench/21 | 76955 | 26.916502 ms | 122.378 token/s |
+| LiveCodeBench/64 | 34520 | 21.619425 ms | 148.984 token/s |
+| LiveCodeBench/93 | 70725 | 26.381223 ms | 132.853 token/s |
+| LiveCodeBench/131 | 52704 | 23.985040 ms | 131.885 token/s |
+
+Within LiveCodeBench/21, median client inter-chunk intervals rise from
+17.161768 ms over the first 1024 intervals to 37.595053 ms over the last 1024.
+The interval count matches the draft-round count, but these transport timings
+are not GPU instrumentation or a per-window token/s measurement. They establish
+a same-response latency trend without assigning its cost to an individual
+operator. Across the whole request, acceptance is identical between BV8 and
+BV2. Long-context target/draft attention needs a separate context sweep and
+trace before attributing the slowdown or selecting another optimization.
+
+Evidence: `results/v4-accept256-datasets-seed0-switch.json`,
+`acceptance-256k/v4-accept256-datasets-seed0-pairs.json` and the retained
+`acceptance-256k/long-generation-cost-progress-20260909.json` snapshot under
+the campaign artifact root recorded in the companion worklogs. Full natural
+generation scoring, independent startups, whole-stack comparisons, all-layer
+repeatability, the public installer, FP8 and long-prefix gates remain pending.
+Five matching long generations are not proof of universally unchanged quality
+or a 256K-context speed claim.
+
+Integration retains the audited source and opt-in manifests, the grouped
+attention synchronization repair and dependency #563's singleton-prefill fix.
+It does not change serving defaults, weights, sampling semantics or context
+capacity. No pending or rejected arithmetic candidate is promoted by this
+integration. The frozen evaluation checkout and native libraries remain intact.
 
 ## Frozen evaluation
 
@@ -153,4 +205,5 @@ The FP8 model snapshot has all 66 indexed shards present. Independent control
 and common-route candidate model jobs are queued, including the two speed
 fixtures and 20 real quality cases. Other-quantization performance/quality is
 not yet established. QPN2 compressed weight decoding remains NVFP4-specific.
-No new route is enabled by default and PR #556 remains a draft pending gates.
+No new route is enabled by default. The user has requested source integration
+of PR #556 while the remaining runtime gates continue on frozen artifacts.
