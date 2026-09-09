@@ -775,8 +775,33 @@ and is retained as a timeout, not a pass. A bounded racecheck at 1025/3297
 tokens completes with zero hazards. Each successful native invocation
 records positive fast-path host dispatch counts. The final source includes
 a whitespace-only changed-line formatting pass after the build snapshot.
-Whole-model admission of this rebuilt library remains separate from the
-private decoder's earlier paired performance evidence.
+Whole-model shadow of this rebuilt library now passes on both ranks, including
+full local-vocabulary logits, valid acceptance records and distinct invalid-tail
+sentinels. It is separate from the private decoder's earlier performance
+evidence.
+
+Three unprofiled native-combination startups now pass all fifteen measured
+pairs and warmups per fixture. Both arms keep the single-layout 256-projection
+QPN2 path and source-integrated BV2; the candidate adds the rebuilt exact
+decoder and context overlap. The median of startup request medians is:
+
+| Metric | release1k control / candidate | MBPP28 control / candidate |
+| --- | ---: | ---: |
+| Complete round, ms | 32.934885 / **31.884546** | 29.830193 / **29.279787** |
+| Round p50, ms | 32.913 / 31.876 | 29.912 / 29.229 |
+| Round p90, ms | 33.361 / 32.370 | 30.454 / 29.913 |
+| Round p99, ms | 35.142 / 34.244 | 32.367 / 31.149 |
+| Warm TTFT, ms | 591.649 / 591.596 | 165.546 / 164.810 |
+| Pure decode, tokens/s | 91.089 / 94.089 | 152.659 / 155.623 |
+| Accepted drafts per round, both arms | 2.010638 | 3.569231 |
+| Emitted tokens per round, both arms | 3.010638 | 4.569231 |
+
+All three startups produce 283/297 output tokens and 94/65 draft rounds on
+release1k/MBPP28. This does not retroactively resolve the older startup
+variation. Source is `ca0ea462c1877525fb231faf4f817d7929a3a64a`; runtime library
+and private harness hashes are frozen in `combined-native-three-start-manifest.json`.
+Raw evidence is `combined-native-3-start-pair-summary.json`. The approximately
+25 ms target remains unmet, so defaults remain off and the PR remains Draft.
 
 A q8-only QPN2 specialization removes unused row predicates and row offsets
 while preserving all dot-product arithmetic. All sixteen real projection
