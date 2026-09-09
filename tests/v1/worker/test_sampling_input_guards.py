@@ -100,3 +100,36 @@ def test_empty_tokenization_is_a_request_error():
     params = SamplingParams(bad_words=["\x00"])
     with pytest.raises(VLLMValidationError, match="bad_words"):
         params.update_from_tokenizer(Tokenizer())
+
+
+@pytest.mark.parametrize("parameter", ["stop_token_ids", "allowed_token_ids"])
+@pytest.mark.parametrize("token_id", [-1, 248320])
+def test_chat_request_is_rejected_at_engine_admission(parameter, token_id):
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    request = ChatCompletionRequest(
+        model="qwen38",
+        messages=[{"role": "user", "content": "hello"}],
+        min_tokens=2,
+        **{parameter: [token_id]},
+    )
+    params = request.to_sampling_params(max_tokens=8, default_sampling_params={})
+    processor = object.__new__(InputProcessor)
+    processor.model_config = SimpleNamespace(
+        max_logprobs=20, get_vocab_size=lambda: 248320, logits_processors=None
+    )
+    processor.speculative_config = None
+    processor.structured_outputs_config = None
+    processor.renderer = SimpleNamespace(tokenizer=None)
+    with pytest.raises(VLLMValidationError) as exc:
+        processor._validate_params(params, ("generate",))
+    assert exc.value.parameter == parameter
+
+
+def test_premerged_eos_is_validated_for_min_token_masking():
+    params = SamplingParams(min_tokens=2, ignore_eos=True)
+    params.update_from_generation_config({}, eos_token_id=128)
+    assert params.stop_token_ids == []
+    with pytest.raises(VLLMValidationError, match="stop_token_ids"):
+        verify(params)
