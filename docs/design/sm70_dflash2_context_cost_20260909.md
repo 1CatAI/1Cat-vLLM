@@ -2,8 +2,9 @@
 
 ## Scope and frozen contract
 
-Measure growth in complete verification-round cost at 64K, 128K and near the
-256K capacity boundary, with a same-prompt-template 1K anchor. This is a latency
+Measure growth in complete verification-round cost at 64K and 128K, with a
+same-prompt-template 1K anchor. The user stopped 256K measurements after observing
+abnormally slow prefill; queued 256K jobs remain held. This is a latency
 diagnostic, separate from the continuing natural-output quality campaign.
 No production kernel, arithmetic, weights or serving default changes here.
 
@@ -33,7 +34,7 @@ are never clipped, and all actual token counts are retained.
 
 ## Measurement and attribution
 
-`benchmarks/profile_sm70_dflash2_context_cost.py` records a cold/warmup request
+`benchmarks/profile_sm70_dflash2_context_cost.py` records an initial/warmup request
 and three unprofiled repeats per input length. It separates TTFT, engine decode,
 complete-round mean, emitted token throughput and draft acceptance, and retains
 per-chunk token counts/times. Client stream intervals are transport evidence,
@@ -58,13 +59,62 @@ not establish achieved occupancy or HBM throughput.
 
 CPU checks cover seven q8/prefill/tail/multiple-request combinations, four exact
 prompt lengths and rejection beyond 262144 total tokens. Scoped pre-commit runs
-on both benchmark modules. GPU measurements are pending; this document makes
-no 64K/128K/256K latency or quality claim before their artifacts exist.
+on the benchmark modules. The first GPU observations below exposed a missing
+native prefill dependency and do not qualify the intended fast route.
 
 Artifacts, private launch wrappers, checkpoints and task-local compiler caches
 are under `/home/ymzx/.cache/1cat-dflash2-context-cost-20260909`. The retained
 frozen candidate and rear-four-GPU queue are under
 `/data/minimax-h3/task-cache/v100-quasar-dflash2-15ms-20260908`.
-The ongoing dataset campaign is checkpointed before this focused sweep and
-resumed afterward, preserving completed same-startup pairs and retaining any
-interrupted partial case separately.
+The dataset campaign is checkpointed, preserving completed same-startup pairs
+and retaining any interrupted partial case separately. Its queued continuation
+remains held during the prefill route investigation.
+
+## Missing native prefill dependency
+
+The frozen service selected `FLASH_ATTN_V100`, but its `lib-v4` dependency set
+did not contain FA2 and its launch did not set `VLLM_SM70_FA2_D256_LIBRARY`.
+The startup log explicitly warned that
+`_vllm_fa2_C::sm70_d256_splitd_n32_dense_fwd` was absent and long prefill would
+use a slower fallback. The E4M3 bridge is resolved from that same missing
+library, so it was unavailable too. The later logs show direct paged E4M3
+prefix prefill, without the D256/v37 bridge route.
+
+The warning was missed before the long sweep. The partial unprofiled results
+are retained as fallback observations, not expected Flash-V100 scaling:
+
+| Input tokens | Complete round, ms | Pure decode, tokens/s | Accepted drafts/round | Emitted tokens/round | Initial TTFT, s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 16.419 | 254.61 | 3.2295 | 4.1967 | 1.650 |
+| 65536 | 34.972 | 142.97 | 4.0784 | 5.0196 | 81.468 |
+| 131072 | 53.575 | 80.67 | 3.3390 | 4.3390 | 221.823 |
+
+Round/decode values are medians of three repeats in one startup. All 12
+completed requests reached the 256-output-token diagnostic cap; none receives
+quality credit. Repeated token IDs and acceptance match within each length.
+The initial 128K request could reuse the previous 64K prefix, so its TTFT is
+not a cold-prefill measurement. Repeat TTFT also includes prefix-cache hits.
+No 256K request completed and no graph-node trace was collected in this run.
+
+PR #548 is already merged at `8d9c3518992059105d89939e8a46d75184505d8e`.
+Its CMake-built FA2 library, SHA256
+`ec00745c34b3d146b0200fb9454c1419322072b0ccf0d551d958cbe701e4e15b`,
+contains Split-D dense/paged, v37 and the E4M3 bridge. Its eight v37 source
+hashes match the frozen serving source. A private copy is frozen under this
+audit's `native/fa2-ec00745c` directory; every other native dependency stays
+fixed. This is a dependency-loading repair for the diagnostic service, not a
+new kernel or a quality promotion. PR #548 disclosed a remaining model token
+divergence; operator accuracy alone cannot close that model-quality gate.
+
+The corrected launch explicitly selects this sidecar. The client checks native
+availability and the loaded FA2 SHA on every rank before long requests, then
+requires actual exact-bridge route hits. Snapshots occur between requests.
+It resets the prefix cache before each new input length and requires the
+request's computed-prefill-token counter to equal the full input length;
+an HTTP reset response alone does not prove a cold request. Full API usage,
+engine prefill time and computed-token metrics are retained. The first focused
+repair run stops at 128K; 256K jobs must not resume automatically.
+
+Missing FA2 explains the prefill fallback. It does not by itself attribute
+the q8 decode slope: target verification has a separate grouped E4M3 FP32
+dispatch and still needs a same-route graph-node trace after this repair.

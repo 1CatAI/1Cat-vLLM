@@ -32,7 +32,12 @@ def metrics(base: str) -> dict:
         for family in families:
             for sample in family.samples:
                 if "spec_decode" in sample.name or sample.name.endswith(
-                    ("_time_seconds_sum", "_latency_seconds_sum")
+                    (
+                        "_time_seconds_sum",
+                        "_latency_seconds_sum",
+                        "request_prefill_kv_computed_tokens_sum",
+                        "prefix_cache_hits_total",
+                    )
                 ):
                     key = sample.name
                     if "position" in sample.labels:
@@ -102,11 +107,16 @@ def request(base: str, prompt: list[int], output_limit: int, seed: int) -> dict:
         "prompt_sha256": hashlib.sha256(json.dumps(prompt).encode()).hexdigest(),
         "output_limit": output_limit,
         "output_tokens": len(token_ids),
+        "usage": usage,
         "token_ids": token_ids,
         "text": "".join(text),
         "finish_reason": finish,
         "wall_s": wall,
         "ttft_s": chunks[0]["at_s"],
+        "engine_prefill_s": delta.get("vllm:request_prefill_time_seconds_sum"),
+        "prefill_computed_tokens": delta.get(
+            "vllm:request_prefill_kv_computed_tokens_sum"
+        ),
         "engine_decode_s": decode,
         "complete_round_ms": decode * 1000 / rounds if rounds else None,
         "pure_decode_tps": (len(token_ids) - 1) / decode if decode else None,
@@ -129,6 +139,8 @@ def main() -> None:
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace-dir", type=Path)
+    parser.add_argument("--reset-prefix-cache-before-length", action="store_true")
+    parser.add_argument("--require-native-prefill", action="store_true")
     args = parser.parse_args()
     assert not args.output.exists(), args.output
     corpus_bytes = args.corpus.read_bytes()
@@ -147,6 +159,8 @@ def main() -> None:
         "scope": "Bounded latency diagnostic, not natural-output quality scoring",
         "context_capacity": 262144,
         "profiler": args.trace_dir is not None,
+        "reset_prefix_cache_before_length": args.reset_prefix_cache_before_length,
+        "require_native_prefill": args.require_native_prefill,
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": 0},
         "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
         "cases": [],
@@ -156,8 +170,33 @@ def main() -> None:
     def save():
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
+    def route_snapshot():
+        req = urllib.request.Request(
+            args.base + "/collective_rpc",
+            data=json.dumps(
+                {"method": "dflash2_prefill_route_snapshot", "timeout": 60}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=90) as response:
+            rows = json.load(response)["results"]
+        assert sorted(row["rank"] for row in rows) == list(range(4)), rows
+        assert all(row["native_prefill_available"] for row in rows), rows
+        return sorted(rows, key=lambda row: row["rank"])
+
+    if args.require_native_prefill:
+        report["initial_routes"] = route_snapshot()
+        save()
+
     for length in args.lengths:
         prompt = build_prompt(corpus, length)
+        if args.reset_prefix_cache_before_length:
+            req = urllib.request.Request(
+                args.base + "/reset_prefix_cache", data=b"", method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=60) as response:
+                assert response.status == 200
+        routes_before = route_snapshot() if args.require_native_prefill else None
         for repeat in range(-1, args.repeats):
             if args.trace_dir and repeat == 0:
                 (args.trace_dir / "arm").touch()
@@ -165,12 +204,35 @@ def main() -> None:
             row.update(warmup=repeat < 0, repeat=repeat)
             report["cases"].append(row)
             save()
+            if args.reset_prefix_cache_before_length and repeat < 0:
+                # The HTTP reset response alone does not prove cache eviction.
+                assert row["prefill_computed_tokens"] == length, row
+            if args.require_native_prefill and repeat < 0:
+                row["routes_before"] = routes_before
+                row["routes_after"] = route_snapshot()
+                save()
+                if length >= 32768:
+                    for before, after in zip(routes_before, row["routes_after"]):
+                        hits = sum(
+                            count - before["routes"].get(name, 0)
+                            for name, count in after["routes"].items()
+                            if name.startswith("prefill_prefix_fp8_bridge_exact_")
+                        )
+                        assert hits > 0, (before, after)
             print(
                 json.dumps(
                     {
                         key: value
                         for key, value in row.items()
-                        if key not in ("text", "token_ids", "chunks", "metric_deltas")
+                        if key
+                        not in (
+                            "text",
+                            "token_ids",
+                            "chunks",
+                            "metric_deltas",
+                            "routes_before",
+                            "routes_after",
+                        )
                     }
                 ),
                 flush=True,
