@@ -39,9 +39,34 @@ higher denoising TFLOP/s.
 including nonzero offsets, transposed and strided views, mixed-dtype aliases,
 private writes, mismatched replicas, corrupt snapshots and owned cleanup.
 `shared-host-gpu.log`: exact storage roundtrips pass across three GPU
-load/offload cycles. Full TP4 generation, measured physical host-memory savings
-and final media comparison remain pending. Do not qualify this option for
-AUTO or claim an end-to-end speed improvement yet.
+load/offload cycles.
+
+Source `324f2463c78fb0f69d1546c817e67f3802e52342` additionally completes a full
+TP4 original-weight LightX2V four-step request: column-major FP16 weights,
+FP32 residual sharding, frozen FA binaries, 1280x736/124 internal frames,
+seed 42, five sigma points and no persistent FP16 weight cache. All final
+video/audio latents, 124 RGB frames and decoded PCM match the prior original
+column-weight control bitwise (`shared-host-quality.json`). PSNR is infinity,
+SSIM and audio RMS ratio are 1; all numerical preservation gates pass.
+
+The four workers' VAE mappings total 44,083,544,064 RSS bytes but only
+11,020,886,016 PSS bytes, with zero private mapped pages at startup. Each rank
+maps the same two files and accounts for one quarter of their physical pages.
+This verifies sharing of the approximately 11.02 GB replica and eliminates
+the three redundant replicas; mapping alignment adds small overhead to the
+raw tensor sizes above. The engine removes its owned directory after shutdown.
+
+The single captured cold request takes 66.365689 s in denoise and 126.846697 s
+overall, with 21,979,466,240 peak allocated GPU bytes/card. DiT staging still
+takes 8.44–26.53 s across ranks after startup paging. This is not a warmed
+speed comparison or proof that all host paging has been eliminated. Full
+independent official quality, human review and performance qualification
+remain pending; AUTO is not enabled.
+
+`shared-host-summary.json` records the physical mapping totals and stages.
+The complete contract, source/binary hashes, startup smaps snapshot and raw
+media are retained under
+`/home/ymzx/h3-sm70-artifacts-20260909/runs/shared-host-original-light4/`.
 
 Evidence root: `/data/minimax-h3/sm70-general-20260909/`. Runtime:
 Python 3.12.13, Torch 2.10.0+cu128, CUDA 12.8.93, V100 SXM2 32GB.
