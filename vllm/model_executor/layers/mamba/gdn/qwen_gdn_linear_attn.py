@@ -2433,6 +2433,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
+            self.enable_sm70_dflash2_fused_gdn_verify
+            and self.tp_size == 2
+            and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
+        )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_GDN_NORM
             and current_platform.is_device_capability(70)
@@ -5234,6 +5239,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quantize_state_each_step=False,
             match_recurrent_schedule=True,
             match_recurrent_numerics=True,
+            sm70_tp2_q8_bv2=getattr(
+                self, "enable_sm70_dflash2_tp2_gdn_bv2", False
+            ),
         )
         return out.transpose(0, 1)
 

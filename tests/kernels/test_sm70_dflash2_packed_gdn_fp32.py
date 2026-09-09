@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -15,12 +16,32 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 
 @pytest.mark.parametrize("tp_size", [2, 4])
 @pytest.mark.parametrize("strided_qkv", [False, True])
+@pytest.mark.parametrize("use_bv2", [False, True])
 def test_packed_entry_preserves_fp32_beta_and_strided_state(
-    tp_size: int, strided_qkv: bool
+    tp_size: int, strided_qkv: bool, use_bv2: bool, monkeypatch: pytest.MonkeyPatch
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("The packed DFlash2 verifier requires SM70")
     torch.manual_seed(20260911)
+    fused = importlib.import_module(
+        "vllm.model_executor.layers.fla.ops.fused_sigmoid_gating"
+    )
+    original_kernel = fused.fused_sigmoid_gating_delta_rule_update_kernel
+    launches = []
+
+    class RecordingKernel:
+        def __getitem__(self, grid):
+            launch = original_kernel[grid]
+
+            def record(*args, **kwargs):
+                launches.append((grid, kwargs["BV"], kwargs["num_warps"]))
+                return launch(*args, **kwargs)
+
+            return record
+
+    monkeypatch.setattr(
+        fused, "fused_sigmoid_gating_delta_rule_update_kernel", RecordingKernel()
+    )
     q_heads, v_heads, dim, tokens = 16 // tp_size, 48 // tp_size, 128, 8
     width = (2 * q_heads + v_heads) * dim
     projection_width = (2 * q_heads + 2 * v_heads) * dim + 2 * v_heads
@@ -56,6 +77,7 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
         head_k_dim=dim,
         head_v_dim=dim,
         enable_sm70_dflash2_fused_gdn_verify=True,
+        enable_sm70_dflash2_tp2_gdn_bv2=use_bv2,
     )
     metadata = SimpleNamespace(
         spec_sequence_masks=torch.ones(1, device="cuda", dtype=torch.bool),
@@ -141,3 +163,6 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
                 initial.index_select(0, retired),
             )
             assert torch.all(mixed_storage[:, width:] == -3.0)
+    expected_bv = (2 if use_bv2 else 16) if tp_size == 2 else 8
+    assert launches
+    assert set(launches) == {((1, dim // expected_bv, v_heads), expected_bv, 1)}

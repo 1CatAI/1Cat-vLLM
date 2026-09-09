@@ -454,11 +454,41 @@ and 24 graph-arm switches with padded metadata. Its subsequent live shadow
 covers all 48 GDN layers on each rank: 81120 calls compare 1993605120 output
 and 255181455360 state elements with zero bit differences, nonfinite values
 or unsupported active calls. The ordinary recurrence supplies the outputs
-and states used for generation; diagnostic latency is excluded. Complete
-rounds against packed BV16 remain pending. Independent multi-request GDN
-measurements do not admit this route. Raw evidence is `tp2-packed-trace.json`,
+and states used for generation; diagnostic latency is excluded. Independent
+multi-request GDN measurements do not admit this route. Raw evidence is
+`tp2-packed-trace.json`,
 `tp2-gdn-bv-screen.json`, `gdn-bv2-graph-switch-gate.json` and
 `tp2-gdn-bv2-shadow-1-admission.json`.
+
+Three independent startups then each run five BV16/BV2 graph-switch pairs
+per fixture, holding the exact MLP projection route, attention u8, prefill
+and graph allocations fixed. All fifteen measured pairs and the warmup
+pairs retain identical token IDs, acceptance counters and natural EOS.
+
+| Fixture | Startup | BV16 complete round, ms | BV2 complete round, ms |
+| --- | ---: | ---: | ---: |
+| release1k | 1 | 34.496555 | 34.132393 |
+| release1k | 2 | 34.429623 | 34.174315 |
+| release1k | 3 | 34.576248 | 34.201821 |
+| MBPP28 | 1 | 31.288474 | 30.914687 |
+| MBPP28 | 2 | 31.708845 | 31.277764 |
+| MBPP28 | 3 | 31.530112 | 31.126483 |
+
+The medians of startup medians improve by 0.322239/0.403629 ms to
+34.174315/31.126483 ms. Candidate host-observed round p50/p90/p99 are
+34.102/34.415/36.301 ms for release1k and 31.060/31.755/33.735 ms for MBPP28.
+Median TTFT is 575.230/148.479 ms and pure decode is 87.902/145.594 tokens/s.
+Acceptance and emitted counts are reported separately for each startup in
+`gdn-bv2-three-start-pair-summary.json`; cross-startup trajectories still
+vary. These are unprofiled paired results, not a 25 ms or broad quality gate.
+The source now exposes `VLLM_SM70_DFLASH2_TP2_GDN_BV2`, default off and
+dependent on the packed verifier flag. It admits only TP2 q8, H8/HV24,
+K/V128, FP16 input/output, FP32 state and precomputed gating, retaining the
+original recurrent arithmetic and stage count. Eight actual-entry GPU tests
+pass, including the original TP4 BV8 fallback with the new flag requested.
+The first test revision incorrectly expected TP4 BV16; every output/state
+check passed, and only that launch assertion failed. The corrected fixture
+and failed evidence are retained. The integrated model A/B remains pending.
 
 A separate collective launch-geometry screen keeps the original peer protocol,
 rank reduction order and DFlash2 normalization. All tested q7/q8 outputs,
@@ -496,6 +526,16 @@ TurboMind; it does not compare separate startups or allocate both complete
 layout choices. Complete-round gain remains pending. The source kernels and
 layouts remain private experiments. Evidence is
 `tp2-balanced-shadow-1-admission.json` and the two rank memory reports.
+The first paired startup stops before generation because the diagnostic
+counts both the 192-region full graph and prefill piecewise graphs. That
+failure is retained. The corrected tool selects exactly one full graph,
+checks 192 unique prepared weight pointers and layer prefixes, and leaves
+all prefill pieces on the control path. The corrected startup runs five
+pairs per fixture with exact tokens, acceptance and natural EOS. Complete
+rounds improve from 35.178025 to 33.911462 ms on release1k and 32.107532 to
+30.847108 ms on MBPP28. Both arms retain packed BV16 and attention u8; the
+control uses TurboMind for all target projections. This is one startup and
+does not establish a paired comparison with the previous MLP-only layout.
 
 An E2M1 register-permutation decoder is also exact on the sixteen-matrix
 screen but slower: 0.763648 versus 0.712960 ms. A separate scale-folding probe
@@ -513,6 +553,21 @@ canaries remain intact. The working-set median is 0.886016 ms versus
 0.711936 ms for the matched QPN2 kernel, so the extra launch/workspace path
 is rejected before model use. The result does not establish an instruction
 stall diagnosis; hardware performance counters remain unavailable.
+
+An attention address-reuse screen retains the original shared-memory size,
+QK/softmax, ascending PV FMA and FP32 partition/reducer. Forty-four cases
+across page sizes 1648/3296 preserve output and valid partial/statistic bits
+through 262144 tokens, with unchanged FP64-reference errors. It has no
+stable working-set gain: 3.921664 versus u8's 3.859456 ms on the actual
+1648-token page, and 3.902720 versus 3.944448 ms on page3296. It is not
+promoted. Reusing the existing grouped FP32 kernel separately for both TP2
+KV heads also fails the strict arithmetic gate: all nine tested cases change
+some FP16 outputs and some expand FP64 relative-L2 error. Timing and model
+admission are skipped. These results do not establish a text-quality cause.
+A separate eight-value PV staging kernel also preserves all forty-four
+output/partial/statistic comparisons, but increases the page1648 working
+set from 3.858176 to 4.857088 ms and page3296 from 3.941120 to 4.908800 ms.
+It is rejected before model use.
 
 ### LM-head width and accumulation order
 
