@@ -68,7 +68,10 @@ def test_dense_layout_keeps_logical_weights_and_wide_output(layout):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires SM70")
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("adapter_scale", [0.0, 0.75, -0.5])
-def test_gpu_prepared_adapter_preserves_wide_intermediates(quantized, adapter_scale):
+def test_gpu_prepared_adapter_preserves_wide_intermediates(
+    quantized, adapter_scale, monkeypatch
+):
+    import vllm.model_executor.models.minimax_h3.lora as adapter
     from vllm.model_executor.models.minimax_h3.cuda_ops import w8a16_extension
 
     torch.manual_seed(42)
@@ -93,7 +96,9 @@ def test_gpu_prepared_adapter_preserves_wide_intermediates(quantized, adapter_sc
     values, scale = fp16_gemm_input(x)
     token = lora_scale.set(adapter_scale)
     try:
-        expected = method.apply(layer, x)
+        with monkeypatch.context() as context:
+            context.setattr(adapter, "supports_fused_scaled_add", lambda _: False)
+            expected = method.apply(layer, x)
         actual = method.apply_prepared(layer, values, scale)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         assert actual.dtype == torch.float32 and torch.isfinite(actual).all()
