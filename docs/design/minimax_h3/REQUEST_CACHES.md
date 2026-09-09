@@ -132,3 +132,35 @@ evidence root. Raw outputs live under
 `teacache-native-lifecycle` and `cachedit-native-lifecycle` directories.
 Independent official quality, human review and >80 useful TFLOP/s/card
 acceptance remain incomplete; no automatic policy is qualified.
+
+## TaylorSeer and SCM validation
+
+Source `f5e4340d4a7d35432fbcd85380c4c11d4514865f` adds the official optional
+calibrator and predefined step masks without changing their defaults.
+`cache-scm-cpu-v2.log` has 42 passing policy/lifecycle checks. The first
+expanded run additionally passes 87 affected acceptance/service/API checks;
+its three failures were tests incorrectly demanding cache hits when a repeated
+refresh resets SCM before any reuse slot. The corrected tests assert the
+official all-compute pattern, with no production algorithm change for that
+fixture correction.
+
+`cache-scm-gpu-tp{1,2,4}.log` passes real small H3 forwards on each TP size.
+TaylorSeer order 2 with both dynamic and static fast SCM preserves repeated
+outputs and records 6/6/3/6 executed blocks for four actual sampling calls.
+The original forced-compute, TeaCache and Cache-DiT checks pass in the same
+leased runs. All commit hooks pass.
+
+Full original-weight TP4 cached/lossless/cached generation also completes with
+TaylorSeer order 1, fast dynamic SCM and shared pageable VAE masters. The
+256x448/107-frame/49-interval lifecycle records 23/0/23 hits on every rank;
+denoise takes 27.017239 / 45.870016 / 24.999759 seconds. Peak allocation is
+17,209,923,584 bytes/card for cached requests. Every request passes media and
+strict actual-work validation. The first and third requests have bitwise
+identical video/audio latents and all RGB frames; PCM relative L2 is
+1.734748e-6, spectral cosine 0.9999999999992253 and RMS ratio 0.999999975445.
+All declared repeatability gates pass (`cache-scm-repeat-quality.json`).
+
+`cache-scm-native-summary.json` retains stages and request records. These
+checks establish optional-policy execution and request isolation. They do not
+qualify approximate outputs against the independent official model, compare
+algorithm quality with lossless sampling or satisfy primary performance gates.
