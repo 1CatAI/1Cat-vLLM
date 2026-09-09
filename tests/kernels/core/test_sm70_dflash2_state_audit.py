@@ -11,6 +11,10 @@ from benchmarks.sm70_dflash2_state_audit import (
     gather_state,
     selected_ssm_slots,
 )
+from benchmarks.sm70_dflash2_state_layout import (
+    check_slot_mapping,
+    explain_state_difference,
+)
 
 
 @pytest.fixture
@@ -94,6 +98,88 @@ def test_audit_comparator_rejects_nonfinite_logits(captures):
     torch.save(data, path)
     with pytest.raises(ValueError, match="nonfinite"):
         compare(left, right)
+
+
+def test_audit_tracks_eos_changes_without_a_top1_flip(captures):
+    left, right = captures
+    eos = (0, 30)
+    assert (
+        compare(left, right, eos_token_ids=eos)["summary"][
+            "max_eos_probability_abs_difference"
+        ]
+        == 0
+    )
+    path = right / "test-rank0-step1.pt"
+    data = torch.load(path, weights_only=True)
+    data["native_logits"][0, 30] += 0.5
+    torch.save(data, path)
+    result = compare(left, right, eos_token_ids=eos)
+    assert result["summary"]["top1_changed_rows"] == 0
+    assert result["summary"]["max_eos_probability_abs_difference"] > 0
+    row = result["logits"][-1]
+    assert row["full_eos_probabilities_left"] != row["full_eos_probabilities_right"]
+    assert (
+        row["sampling_eos_probabilities_left"]
+        != row["sampling_eos_probabilities_right"]
+    )
+    with pytest.raises(ValueError, match="outside the captured vocabulary"):
+        compare(left, right, eos_token_ids=(32,))
+
+
+def test_state_layout_requires_bijective_slots_and_preserves_padding():
+    key = "verify/layer0/recurrent/slot_table:(1, 3)"
+    left = {key: torch.tensor([[52, 53, -1]])}
+    right = {key: torch.tensor([[154, 155, -1]])}
+    mapping: dict[int, int] = {}
+    reverse: dict[int, int] = {}
+    check_slot_mapping(left, right, mapping, reverse)
+    chosen = "verify/layer0/recurrent/input_state/indices:(1,)"
+    # An accepted selector reading the wrong logical slot cannot be explained
+    # as another physical renaming after the full table has been observed.
+    with pytest.raises(ValueError, match="Inconsistent or aliased"):
+        check_slot_mapping(
+            {chosen: torch.tensor([52])},
+            {chosen: torch.tensor([155])},
+            mapping,
+            reverse,
+        )
+    with pytest.raises(ValueError, match="Inconsistent or aliased"):
+        check_slot_mapping(left, {key: torch.tensor([[154, 154, -1]])}, {}, {})
+    with pytest.raises(ValueError, match="Padding slot"):
+        check_slot_mapping(left, {key: torch.tensor([[154, 155, 0]])}, {}, {})
+
+
+@pytest.mark.parametrize("phase", ["prefill", "verify"])
+def test_state_layout_compares_only_proven_conv_input_window(phase):
+    prefix = f"{phase}/layer0/conv"
+    key = prefix + "/input_state/values:(1, 2, 10)"
+    left = {
+        key: torch.zeros(1, 2, 10),
+        prefix + "/input_state/valid:(1,)": torch.tensor([True]),
+        prefix + "/has_initial_state:(1,)": torch.tensor([True]),
+        prefix + "/num_accepted_tokens:(1,)": torch.tensor([4]),
+    }
+    right = {k: v.clone() for k, v in left.items()}
+    # Prefill reads columns 0..2. With selector 4, verify reads columns 3..5.
+    right[key][..., 8] = 123
+    assert explain_state_difference(key, left, right, 4) == (
+        "unused_convolution_storage"
+    )
+    active_column = 1 if phase == "prefill" else 4
+    right[key][..., active_column] = 1
+    assert explain_state_difference(key, left, right, 4) is None
+    del right[prefix + "/input_state/valid:(1,)"]
+    with pytest.raises(ValueError, match="Missing or ambiguous"):
+        explain_state_difference(key, left, right, 4)
+
+
+def test_state_layout_keeps_all_verifier_output_bytes():
+    prefix = "verify/layer0/conv/output_state"
+    key = prefix + "/values:(1, 2, 10)"
+    left = {key: torch.zeros(1, 2, 10), prefix + "/valid:(1,)": torch.tensor([True])}
+    right = {k: v.clone() for k, v in left.items()}
+    right[key][..., 9] = 123
+    assert explain_state_difference(key, left, right, 4) is None
 
 
 @pytest.fixture

@@ -165,6 +165,38 @@ Workspaces are fixed per operator source SHA, capacity, device and CUDA stream.
 CPU tests cover the boundary, fallback, switching back, missing captures and
 refusal to read a device hint. Native graph-switch/model gates remain pending.
 
+The integrated serving source `239d71c7100b3bce5526268be2cafb4cff8ba8f2`
+uses candidate source SHA
+`8459d57c6b72993ba47f5c3fe3953bd8343c4174974a05f329984e1ef070f738` and DSO SHA
+`dac8262f3d023ce35f1618bbd6fe0f569993f1e9e1f2a60e8291880f76a97339`.
+The first unprofiled integrated startup gives 16.078/18.382/20.356/24.326 ms
+at 1K/32K/64K/128K, with pure decode 293.7/210.2/237.9/177.7 tokens/s.
+All 24 request token sequences, acceptance counts and finish reasons match
+the frozen control. This is still a single-startup screen. Three independent
+paired startups and the frozen seeds 0/1/2 natural-output campaign follow.
+The selected DSO also passes expanded memcheck, racecheck and synccheck
+coverage, including the actual 3296-token pages, with zero errors/warnings.
+
+The first fixed-prefix diagnostic completes its 1K control/candidate/control
+captures, then exhausts GPU memory during the 32K warmup. Snapshot buffers
+grow after the initial memory profile; this instrumented failure is not a
+performance result. The retry reserves additional diagnostic memory by using
+GPU memory utilization 0.6; capacity stays 262144 and uninstrumented performance
+runs keep 0.8. The partial captures and failed report remain in the archive.
+
+For the completed 1K captures, all full-vocabulary logits, distributions,
+top-p support, top-1 and EOS probabilities are exact in both A/B and A/A.
+There are 320 raw intermediate mismatches in each pair. Every mismatch is
+either a bijective physical-slot renaming or unused convolution storage:
+prefill writes only `kernel_width - 1` history columns; the verifier reads the
+window beginning at `num_accepted_tokens - 1`. With no initial prefill state,
+the old convolution allocation is not read. All verifier output storage is
+compared in full. The offline comparer retains raw differences and separately
+reports their explanations; it rejects changed live history, invalid selectors,
+padding-to-live changes and inconsistent or aliased slot mappings. It must not
+use repeated-run TV as a numerical tolerance. EOS IDs come from the frozen
+generation configuration, not another tokenizer's constants.
+
 Prior rejected experiments remain recorded in the context-cost and long-verify
 worklogs. Historical E5M2 and FP16-partial Pack-GQA timings are design references,
 not quality/performance evidence for this E4M3 FP32 path.
