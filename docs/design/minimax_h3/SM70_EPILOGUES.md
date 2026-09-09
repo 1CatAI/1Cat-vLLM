@@ -279,3 +279,33 @@ mixed references. This is not the full task/weight/reference cross-product,
 independent official quality, human review or >80 acceptance. Exact paths,
 source identities and timing scope are retained in `ref4-mixed-pair.json`,
 `ref4-mixed-summary.json` and the campaign result index.
+
+## First, last and both-frame controls
+
+Source `4ed70419e7f42c6e9f4625f7fa92cf8dea2126d8` also completes all three
+FL2VA keyframe modes using the official Light4 v1.2_768p adapter and W8A16,
+with one immutable engine per implementation. The candidate uses the same
+general FA query-128/prepared/exact-residual/epilogue path. First and last
+images are the retained frames 0 and 123 of the campaign sample, selected
+with indices `[0]`, `[-1]` and `[0,-1]` respectively.
+
+| Constraint | Frozen-control denoise seconds | Candidate denoise seconds | Candidate request seconds | Candidate useful TFLOP/s/card, minimum |
+| --- | ---: | ---: | ---: | ---: |
+| First frame | 77.275887 | 66.419303 | 106.123582 | 50.697486 |
+| Last frame | 71.537050 | 64.852263 | 102.142091 | 51.922501 |
+| First and last frames | 77.299085 | 69.615145 | 108.431893 | 52.304580 |
+
+Every pair passes complete numerical preservation: final video/audio latents,
+all 124 decoded frames and PCM match bitwise; SSIM and RMS ratio are 1.
+Peak allocation is unchanged within each pair: 19,512,957,952 bytes/card
+for a single image and 19,522,796,544 bytes/card for both images.
+
+These are captured requests with different first-use state, reference lengths
+and host VAE sharing policies. They establish full execution and native
+preservation, not a formal performance comparison or independent verification
+of reference fidelity. Original-weight/other-adapter keyframes and the full
+legal Ref2VA combination matrix remain pending.
+
+Evidence: `keyframe-pairs.json`, `keyframe-summary.json`, and
+`keyframe-{first,last,first-last}-quality.json`. The candidate contract retains
+shared-operator, model and video-source hashes plus clean Git provenance.
