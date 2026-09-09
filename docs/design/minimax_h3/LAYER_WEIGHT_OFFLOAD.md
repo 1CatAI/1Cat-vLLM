@@ -23,8 +23,11 @@ bounded. This mode does not support a fixed persistent FP16 weight-cache list.
 
 All transfers inside sampling remain in the full denoise denominator.
 `dit_layer_weight_staging` / `dit_layer_weight_offload` and the corresponding
-encoder fields report subsets of the enclosing denoise/encode wall times;
-they must not be summed again into request latency. This is a capacity option,
+encoder fields are host boundary measurements, not isolated GPU transfer
+durations. Loading includes host submission and any blocking copies; offload
+waits for pending H2D and compute before releasing storage, with no D2H copy.
+DiT loading also includes the initial resident setup outside denoise. These
+fields must not be summed again into request latency. This is a capacity option,
 not an automatic or >80-TFLOP/s configuration.
 
 ## Development validation
@@ -48,11 +51,19 @@ capacity check uses the smallest legal temporal extent (22 frames) on a
 passes basic media validation and peaks at 15,473,571,328 allocated GPU bytes.
 Denoise takes 126.274887 seconds and the complete request 152.031041 seconds.
 Recorded DiT weight loading takes 123.212966 seconds including the initial
-3.769427-second resident setup outside denoise. This identifies pageable
-layer transfers as the dominant cost, not a useful fast configuration.
+3.769427-second resident setup outside denoise. Pageable staging accounts for
+most host boundary time in this run.
 
 The full contract, source/binary hashes, raw latents/RGB/PCM and stages are in
 `/home/ymzx/h3-sm70-artifacts-20260909/runs/layer-offload-tp1-original-minimal/`.
-Pinned-host full-output comparison, larger TP1 and full TP2 generation remain
-pending. Neither the operator tests nor this basic media check establishes
-independent official full-model quality or performance acceptance.
+The matching pinned-host run completes denoise in 53.840319 seconds and the
+request in 67.370839 seconds, with the same GPU peak. Final video/audio latents,
+all 22 pre-encoding frames and decoded PCM match the pageable run bitwise;
+SSIM is 1 and audio RMS ratio is 1 (`layer-tp1-pinned-quality.json`). Recorded
+DiT load/offload boundaries take 35.957164/15.261954 seconds; the latter includes
+waiting for asynchronous copies and compute, not device-to-host weight traffic.
+Both are captured cold capacity checks, not formal warmed speed measurements.
+
+Larger TP1 and full TP2 generation remain pending. Neither these residency-mode
+comparisons nor the operator tests establish independent official full-model
+quality or performance acceptance.
