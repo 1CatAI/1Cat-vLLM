@@ -227,8 +227,11 @@ not performance evidence. See `results/context-probe-cpu-dispatch.json` and
 The first uninstrumented five-warmup pair measures release1k
 17.038700 -> 16.554804 ms and MBPP28 16.767940 -> 16.217768 ms. Its control is
 slower than the preceding actual-attention pair; do not attribute that entire
-difference to the pipeline. A reversed candidate/control pair is queued to
-check startup-order and environment effects. The candidate remains experimental;
+difference to the pipeline. The reversed candidate completed, but its control was interrupted by a host
+reboot and produced no endpoint result. It is not a paired comparison. A fresh
+post-reboot pair measures release1k 16.779740 -> 16.591267 ms and MBPP28
+16.466058 -> 16.106911 ms, with five warmups and five measured requests per
+fixture. Every measured token hash and acceptance count remains canonical. The candidate remains experimental;
 this does not clear distribution/state, final performance or long-context gates.
 
 ## Draft cuBLAS layout screen: numerical rejection of broad changes
@@ -241,9 +244,128 @@ has 300 differences and 298 expanded-error cases. The aggregate working-set
 medians 1.458115/1.283830/1.409249/1.355162 ms do not admit these broad routes.
 
 Only `o_proj` with column-major weights and `down_proj` with padded row-major
-weights retain byte parity in their respective 100-case subsets. A separate
-screen times these shapes with the required input copy included, leaving QKV
-and gate/up on the original path. No model route is installed for any layout
-candidate. `benchmarks/kernels/benchmark_sm70_draft_f16_layout.py` reproduces the
+weights retain byte parity in their respective 100-case subsets. The separate
+screen includes the required input copy and leaves QKV and gate/up unchanged.
+Its complete twenty-projection working set regresses from 1.451684 ms to
+1.485681 ms when combining the byte-equal subsets. Either subset alone also
+regresses. These exact-layout routes are rejected before model testing. `benchmarks/kernels/benchmark_sm70_draft_f16_layout.py` reproduces the
 full numerical screen; `results/draft-f16-layout-real.json` retains every case,
 FP64 metric, original snapshot hash and aggregate timing.
+
+## Post-reboot context trace and closure
+
+The machine rebooted at 2026-09-09 02:34:57 UTC. The old lease and unfinished
+reverse-control processes were gone. The user-authorized rear-GPU default
+service was stopped, and the task lease was restarted with explicit physical
+GPU order 4,5,6,7. Frozen candidate/control DSOs were rehashed. The interrupted
+job is retained as `zz240-v4-context-probe-warm5-reverse-control.interrupted.json`;
+`host-recovery-20260909.json` records ownership recovery.
+
+The new node trace exits cleanly and retains its own four-worker library
+manifest. Its ten steady rounds have critical-rank interval mean 19.553882 ms,
+p50 18.468254 ms, GPU union mean 17.426705 ms and uncovered mean 2.127177 ms.
+Two roughly 24-ms rounds remain in those aggregates: one has 7.417044 ms of
+uncovered time and the next has 22.366826 ms of GPU activity, including waits.
+Their cause is not assigned to a source change. The trace is diagnostic and
+cannot replace the separate unprofiled results above.
+
+GPU correlation identifies exactly one six-kernel context graph after the
+672-byte target probe on each of forty rank-rounds. Its mean service/envelope
+is 0.076562/0.082549 ms; mean overlap with the remaining host sampling span is
+0.080438 ms. That span includes the unchanged CPU guard and rejection launch
+handling, so it is not a pure predicate timer. The roughly 11-ms event wait
+includes queued target work, not just probe transfer. QPN2 still totals
+7.351498 ms per rank-round. No achieved-occupancy or HBM counter claim is made.
+
+Evidence: `results/v4-context-probe-nodes-trace.json`,
+`results/v4-context-probe-nodes-resource-trace.json`,
+`results/v4-context-probe-overlap-proof.json`, and
+`results/nsys-v4-context-probe-nodes-runtime-libraries.json`.
+
+## Strict draft column GEMM: arithmetic gate passes, model trajectory held
+
+The bounded follow-up disables reduced-precision FP16 GEMM reduction only
+while selecting each candidate kernel, then restores the process setting.
+The original layout still reproduces all 400 retained controls. Strict column
+weights change 300 outputs but expand none of the registered FP64 max, p99 or
+relative-L2 errors. Strict padded-row weights still expand three cases and
+are rejected. Twenty-projection medians are 1.469460 ms for the original and
+1.307750 ms for strict column weights. This is a local arithmetic screen.
+The switch follows the documented PyTorch 2.10 reduction control; its effect
+here is measured, not a diagnosis inferred solely from the documentation.
+
+The explicit `sm70_draft_column_candidate_route.py` installer selects only the
+twenty captured q8 query projections and retains original prefill/context
+calls. In the first natural model run, release1k changes 272 -> 248 emitted
+tokens, with first token difference at zero-based offset 123; MBPP28 changes
+634 -> 357, first differing at offset 194. Accepted drafts per round are
+1.989011 -> 2.024390 and 3.876923 -> 4.100000, respectively. These changed
+trajectories do not establish acceptance non-inferiority or preserved quality.
+The apparent 16.369764/15.902543-ms medians are not admitted performance gains.
+The arithmetic route remains closed pending causal distribution/acceptance
+and broader quality evidence. No score is used to excuse these differences.
+
+See `results/draft-f16-layout-strict-real.json`,
+`results/draft-f16-layout-gated-real.json`, and
+`results/draft-column-model-screen.json`. The operator benchmark restores the
+original reduction property in a `finally` block; no global serving default
+is changed. Official reference:
+[PyTorch 2.10 numerical accuracy](https://docs.pytorch.org/docs/2.10/notes/numerical_accuracy.html).
+
+## Native FlashInfer fragment draft prototype: rejected for speed
+
+A private B1/H8/q8/D128 FP16 paged prototype reuses the project's native
+FlashInfer Volta WMMA fragments with the frozen Flash-V100 K176 and online
+softmax schedule. It reduces the query tile to sixteen rows and uses one or
+four independent output-column partitions, retaining every output's QK, FP16
+probability and FP32 PV order. Each version passes 28 changing-length,
+permuted-page, tail, graph-replay and output-canary comparisons bytewise
+against frozen native attention. This screen uses 16-token pages; it is not
+an actual 1648-token model-page or long-context admission.
+
+The first variant has 128 registers and a four-byte spill. A second keeps PV
+accumulators in registers across K tiles and uses the actual one-resident-CTA
+launch bound. Its four-part kernel has 147 registers, 73088 bytes shared and
+zero spill stores/loads. It also passes all 28 comparisons, but still has no
+stable speed gain. At 4096 keys, baseline/one-part/four-part medians are
+0.382853/0.463544/0.420690 ms. Neither version is installed in a model, and no
+sanitizer or model-quality admission is claimed for these rejected routes.
+
+Retained source, flags and library hashes are in
+`candidates/draft-fi-q8-p{1,4}{,-register}/manifest.json`; direct gate reports
+are `results/draft-fi-q8-gate.json` and
+`results/draft-fi-q8-register-gate.json`. Register four-part DSO SHA256:
+`76766685df4a15c1ecc60f8dff6d890dd2578b58076d7b88b0070c2b8f9cdd6e`.
+This reuse does not claim that an unmodified upstream FlashInfer kernel was
+run. The native project route remains a valid porting base; GPU support-list
+membership is not used to reject further implementations.
+
+## QPN2 gate/up CTA redistribution: rejected
+
+Another bounded screen replaces each 136-CTA/512-thread fused gate/up with
+272 256-thread GEMM CTAs followed by the original native SiLU. Split-K eight,
+two accumulator chains, reduction order and FP16 activation boundaries remain
+unchanged. Four real consecutive-layer weights and nine changing-input cycles
+pass all 36 bytewise comparisons, but seven alternating working-set medians
+regress 0.159058 -> 0.171489 ms. No model run or default change follows.
+See `results/qpn2-unfused-gated-real.json`.
+
+## GDN value-tile candidate
+
+The current TP4 trace launches 192 one-warp GDN CTAs with 80 registers/thread,
+covering twelve value heads with BV=8. A separate exact-shape screen adapts the
+value-tiling mechanism to TP4; it does not transfer another TP size's timings.
+BV 8/4/2/1 each preserve all output and FP32 state bits for eight acceptance
+selectors and two changing graph replays per selector, including strided QKV,
+strided state pools, padding canaries and untouched retired slots.
+Sixteen distinct state working sets measure 0.381416/0.312884/0.305196/0.308504 ms.
+BV2 retains the original K reduction shape and one-warp schedule while exposing
+768 CTAs. Focused BV8/BV2 memcheck and racecheck both exit zero.
+
+The explicit `sm70_gdn_value_tile_candidate_route.py` installer is limited to
+captured TP4/B1/q8 with twelve value heads and FP32 state. Other shapes/dtypes
+retain the original schedule. A live same-input/state shadow across every GDN
+layer is queued; no full-model quality or speed admission is inferred from the
+local screen. Evidence is `results/tp4-gdn-bv-screen.json` and
+`results/tp4-gdn-bv2-{memcheck,racecheck}.json`. Reusing FP32 Q/K normalization
+across value tiles is a separate unadmitted screen and is not combined yet.

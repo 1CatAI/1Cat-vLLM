@@ -4,7 +4,8 @@
 
 Numerical checks replay all four ranks' real weights and inputs on GPU 4.
 The separate timing uses twenty consecutive-layer weights from rank zero.
-No altered layout or padded shape is admitted without bytewise output parity.
+Changed arithmetic requires numerical and model gates; this screen alone does
+not admit a serving route.
 """
 
 import argparse
@@ -30,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--strict-candidate-reduction", action="store_true")
     args = parser.parse_args()
     assert os.environ.get("CUDA_VISIBLE_DEVICES") == "4"
     assert torch.cuda.get_device_capability() == (7, 0)
@@ -39,7 +41,15 @@ def main():
     def run(item, mode):
         x = item["padded"] if mode >= 2 else item["x"]
         weight = item["column_weight"] if mode % 2 else item["weight"]
-        torch.mm(x, weight.T, out=item["outputs"][mode])
+        previous = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        try:
+            if args.strict_candidate_reduction and mode != 0:
+                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+                    False
+                )
+            torch.mm(x, weight.T, out=item["outputs"][mode])
+        finally:
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = previous
 
     for rank in range(4):
         root = args.root / f"rank{rank}"
@@ -155,6 +165,7 @@ def main():
         samples_ms=timings,
         medians_ms=[statistics.median(t) for t in timings],
         complete_round_performance=False,
+        strict_candidate_reduction=args.strict_candidate_reduction,
         torch_version=torch.__version__,
         allow_fp16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction,
     )
