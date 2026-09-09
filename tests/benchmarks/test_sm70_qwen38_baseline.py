@@ -117,6 +117,26 @@ def test_environment_is_explicit(bundle, tmp_path, monkeypatch):
         assert os.environ[name] == str(output / f"{component}.so")
 
 
+def test_default_route_does_not_inject_optimization_flags(
+    bundle, tmp_path, monkeypatch
+):
+    output, _, _ = bundle
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    os.environ["VLLM_SM70_QWEN38_FP16_GEMV"] = "0"
+    baseline.configure_environment(output, tmp_path / "cache", None, use_defaults=True)
+    assert set(name for name in os.environ if name.startswith("VLLM_")) == set(
+        baseline.LIBRARY_ENVS.values()
+    ) - {"FLASH_QLA_SM70_PREBUILT_EXTENSION_PATH"} | {"VLLM_CACHE_ROOT"}
+    args = baseline.engine_args("model", use_defaults=True)
+    assert (
+        not {"compilation_config", "kernel_config", "attention_backend", "quantization"}
+        & args.keys()
+    )
+    assert args["tensor_parallel_size"] == 4
+    assert args["mamba_ssm_cache_dtype"] == "auto"
+    assert args["kv_cache_dtype"] == "float16"
+
+
 @pytest.mark.parametrize("failure", [None, "health", "reference"])
 def test_driver_records_failure_and_releases_workers(
     bundle, tmp_path, monkeypatch, failure

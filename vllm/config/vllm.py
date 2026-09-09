@@ -252,6 +252,42 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     return tuple(range(start, start + parallel.local_world_size))
 
 
+def _apply_sm70_qwen38_nomtp_defaults(
+    cfg: "VllmConfig", *, is_sm70: bool
+) -> tuple[str, ...]:
+    """Complete the admitted NVFP4 baseline without global experimental defaults."""
+    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+        cfg.model_config, cfg.speculative_config, cfg.parallel_config
+    ):
+        return ()
+    parallel = cfg.parallel_config
+    if (
+        cfg.model_config.quantization != "modelopt_fp4"
+        or cfg.lora_config is not None
+        or parallel.enable_expert_parallel
+        or parallel.enable_dbo
+        or parallel.data_parallel_size != 1
+        or parallel.nnodes_within_dp != 1
+        or cfg.cache_config.cache_dtype not in ("auto", "float16")
+        or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
+    ):
+        return ()
+
+    defaults = {
+        "VLLM_SM70_QWEN38_FP16_GEMV": "1",
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": "1",
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16": "1",
+        "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
+        "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
+    }
+    applied = []
+    for name, value in defaults.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            applied.append(name)
+    return tuple(applied)
+
+
 def _any_participating_device_is_capability(
     cfg: "VllmConfig", capability: tuple[int, int]
 ) -> bool:
@@ -1926,6 +1962,23 @@ class VllmConfig:
                         "baseline. Set it explicitly to override.",
                         env_name,
                         env_value,
+                    )
+            if (
+                not sm70_compile_disabled_by_user
+                and not sm70_no_compile_decode_graph_requested
+                and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            ):
+                for env_name in _apply_sm70_qwen38_nomtp_defaults(
+                    self,
+                    is_sm70=all(
+                        current_platform.is_device_capability((7, 0), device_id=i)
+                        for i in _participating_cuda_device_ids(self)
+                    ),
+                ):
+                    logger.info_once(
+                        "Auto-setting %s=1 for the quality-qualified SM70 "
+                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
+                        env_name,
                     )
             if (
                 _is_sm70_qwen38_nomtp_dual_compile_contract(
