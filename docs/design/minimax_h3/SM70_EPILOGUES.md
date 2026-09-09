@@ -71,3 +71,20 @@ original 1280x736/124-frame internal canvas for the five-second sample:
 
 Independent official reference, full audiovisual review, other adapters and
 the complete shape/TP matrix remain required. No AUTO selection is qualified.
+
+## Explicit attention query geometry
+
+`attention_query_tile=128` / `--attention-query-tile 128` opts into a 128-query
+FlashAttention-V100 CTA. The default remains 64 and retains the previous call
+ABI. Both sizes use the same 32x64 warp arithmetic and key-tile selection.
+The option applies independently of model weights and adapters; other attention
+backends reject this explicit tiling option rather than ignoring it.
+
+The separate prototype retains exact outputs at nine boundary lengths and
+the actual 34,551-token Q/K/V capture. Full four-step video/audio latents also
+match frozen mainline bitwise (`q128-profile-quality.json`). A matching pair of
+full-denoise profiles is retained in `epilogue-profile-breakdown/` and
+`q128-epilogue-profile-breakdown/`; profiler timings are not acceptance results.
+The public kernel/CLI implementation additionally passes 69 GPU tail, storage,
+cross-attention-length and graph checks. Complete native API quality and three
+unprofiled measurements of this explicit option are still pending.

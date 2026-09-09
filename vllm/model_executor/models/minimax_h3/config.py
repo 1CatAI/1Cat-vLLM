@@ -38,6 +38,7 @@ class H3Config:
     transformer_path: str | None = None
     tensor_parallel_size: int = 4
     attention_backend: str = "FLASH_ATTN_V100"
+    attention_query_tile: Literal[64, 128] = 64
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
@@ -48,6 +49,13 @@ class H3Config:
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
+        if self.attention_query_tile not in (64, 128):
+            raise H3InputError("Attention query tile must be 64 or 128")
+        if (
+            self.attention_query_tile != 64
+            and self.attention_backend != "FLASH_ATTN_V100"
+        ):
+            raise H3InputError("Explicit query tiling requires FLASH_ATTN_V100")
         if not isinstance(self.host_weight_pin_memory, bool):
             raise H3InputError("host weight pinning must be a boolean")
         if self.video_encoder not in ("libx264", "h264_nvenc"):

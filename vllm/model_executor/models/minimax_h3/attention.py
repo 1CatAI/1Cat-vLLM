@@ -81,6 +81,7 @@ class Attention(nn.Module):
         self.backend = attention_backend.get()
         self.scale = softmax_scale
         self.head_size = head_size
+        self.query_tile = 64
 
     @property
     def attn_backend(self):
@@ -107,9 +108,14 @@ class Attention(nn.Module):
         if self.backend == "FLASH_ATTN_V100":
             from .cuda_ops import flashattn_extension
 
-            attended = flashattn_extension().forward(
-                q_valid, k_valid, v_valid, self.scale
-            )
+            if self.query_tile == 64:
+                attended = flashattn_extension().forward(
+                    q_valid, k_valid, v_valid, self.scale
+                )
+            else:
+                attended = flashattn_extension().forward(
+                    q_valid, k_valid, v_valid, self.scale, 0, self.query_tile
+                )
         elif self.backend == "FLASHINFER_SM70":
             from .cuda_ops import flashinfer_extension
 
