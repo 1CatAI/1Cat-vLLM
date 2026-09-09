@@ -35,6 +35,15 @@ model preparation are outside decode timing. The original baseline uses
 frozen copies of existing native libraries; it is not a rebuild of all main
 sources. Retained runtime manifests hash the actual mapped worker libraries.
 
+The complete-round campaign explicitly holds these four switches at zero:
+`VLLM_SM70_DFLASH2_QPN8_RERANK`,
+`VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW`,
+`VLLM_SM70_ENABLE_LM_HEAD_FASTPATH`, and `VLLM_SM70_LM_HEAD_TOP1_TC`.
+These overrides are part of the measured FP32-logits contract; an automatic
+reranking default is not interchangeable with the frozen endpoint. The
+final main integration also keeps PR556's combined-copy, direct-output and
+fixed-Gemma-norm experiments disabled for this TP2 validation.
+
 One startup, one warmup and five measured requests per fixture gave:
 
 | Metric | release1k | MBPP28 |
