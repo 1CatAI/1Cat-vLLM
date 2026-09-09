@@ -90,3 +90,26 @@ performance gate. Independent official full-sampling comparison and human
 review remain pending; a sampled frame contains several ducks despite the
 prompt specifying one, so basic media checks do not establish prompt fidelity.
 No complete workflow is yet qualified for AUTO or the >80 target.
+
+## Full sparse math control
+
+`vsa-fp32-control` runs two requests in one native engine: the sparse kernel,
+then the pinned official Omni frontend with independent selected-key FP32
+QK/softmax/PV. Initial video/audio rows and text inputs are bitwise equal; the
+native request's final latents also reproduce the first bringup bitwise. The
+official frontend alone matches the port bitwise in operator checks.
+
+Small local kernel differences amplify during full sampling. Against this
+FP32 math control, final video/audio latent relative L2 is 0.390670 / 0.088636,
+video PSNR is 24.2768 dB and SSIM is 0.769774. Audio spectral cosine is 0.992129
+and RMS ratio is 1.001159. The required latent and video gates fail; do not
+qualify this configuration or relax thresholds. Full results are retained in
+`vsa-fp32-control-quality.json` at the evidence root.
+
+This control substitutes the sparse math operation and keeps the native model;
+it is not an independent official full-model or official GPU-kernel reference.
+The unchanged FastVideo Triton source at `a943220c115228ade5d57b3bab9a6a87fd600a10`
+fails to compile FP16 inputs because probabilities are cast to BF16 while V is
+FP16. `official-triton-sm70-probe.json` retains that failure. Matching the
+official kernel's intended precision and locating full-sampling amplification
+remain required quality work.

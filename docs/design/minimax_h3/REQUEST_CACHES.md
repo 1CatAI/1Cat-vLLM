@@ -87,3 +87,35 @@ The first TP1 test setup omitted the small model's final AdaLN dimension;
 `cache-gpu-tp1.log` records that constructor rejection. The corrected test
 sets both main and final AdaLN dimensions. No production algorithm was changed
 in response to that fixture error.
+
+## Full native request lifecycle
+
+Source `d09e52dd302e2bed510cd036f1d338e5b8325c77` completed three sequential
+requests per backend in one engine: cached, explicit lossless, cached. Both use
+original FP16 execution weights, FP32 residuals, column-major weights, TP4 on
+GPUs 0–3, pageable host masters, 256x448 output and 49 sampling intervals.
+The requested four seconds resolves to 107 internal frames. These runs test
+full-model lifecycle compatibility; they are not the primary resolution or
+the required warmup-plus-three performance measurements.
+
+| Backend | Cache hits per request, on every rank | Denoise seconds | Peak allocation bytes/card |
+| --- | --- | --- | --- |
+| TeaCache, threshold 0.17 | 5 / 0 / 5 | 45.601157 / 45.854488 / 41.358189 | 17,144,250,368 |
+| Cache-DiT, official defaults | 34 / 0 / 34 | 16.450964 / 45.956182 / 15.157820 | 17,143,863,296 |
+
+All six requests pass basic media validity and strict executed-work checks.
+For each backend, the first and third requests produce bitwise identical
+video/audio latents and RGB frames (PSNR infinity, SSIM 1). Decoded PCM has
+small repeat-run differences: relative L2 1.684731e-6 for TeaCache and
+2.066048e-6 for Cache-DiT; spectral cosine exceeds 0.999999999998 and RMS
+ratio differs from 1 by less than 7e-9. All declared numerical repeatability
+gates pass. This comparison checks fresh-request reproducibility, not whether
+approximate cached outputs match lossless sampling or the official model.
+
+Evidence: `teacache-native-summary.json`, `cachedit-native-summary.json`,
+`teacache-repeat-quality.json` and `cachedit-repeat-quality.json` under the
+evidence root. Raw outputs live under
+`/home/ymzx/h3-sm70-artifacts-20260909/runs/` in the corresponding
+`teacache-native-lifecycle` and `cachedit-native-lifecycle` directories.
+Independent official quality, human review and >80 useful TFLOP/s/card
+acceptance remain incomplete; no automatic policy is qualified.
