@@ -399,6 +399,21 @@ outliers: critical-round p50 is 17.876601 ms and mean 18.513127 ms, with
 runtime-map manifest. Separate-startup variability still needs isolation
 before the route is promoted.
 
+The first same-startup diagnostic captures adjacent BV2/BV8 kernels on the
+same buffers, disabling one state mutation before the first replay. Dependency
+edges identify each pair; both node-enable states are read back after changes.
+Twenty-four changing-input/selector switches first pass complete-state, output,
+padding and retired-slot checks. The owned model client then switches only
+between requests, with five warmups per arm and five interleaved measurements.
+Release1k changes 16.493886 -> 16.279546 ms and MBPP28 16.088556 -> 15.872776 ms,
+with canonical token IDs, accepted drafts and natural EOS in every request.
+This isolates an approximately 0.21-ms whole-round gain while retaining startup,
+prefill, allocations and GEMM choices. One such startup is not final admission.
+See `results/gdn-value-tile-within-start-1-summary.json` and
+`results/gdn-pair-graph-gate.json`. The diagnostic uses CUDA's documented
+[individual-node enable behavior](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html#individual-node-enable);
+disabled nodes retain dependencies and behave as empty nodes.
+
 ## Q/K reuse exposes a recursive FP32 rounding boundary
 
 The first private normalization-reuse screen leaves the immediate FP16 output
@@ -447,10 +462,57 @@ additional ordinary push all preserve gate, down and reduced output bits and
 buffer canaries. Seven paired working-set trials measure 0.457871 -> 0.451072
 ms, about 1.5% locally; both arms drift during the trials, so raw samples are
 retained. Four-rank memcheck and racecheck exit zero, with zero reported errors
-or hazards. A private model shadow is queued to verify all 64 actual MLPs;
-there is no model-speed or final-quality admission yet.
+or hazards. The first private model shadow executes no candidate calls: its
+outer Python shape guard is specialized away during dynamic model compilation.
+Those results are explicitly excluded. Moving eligibility into the opaque
+runtime custom op and asserting all 64 captured prefixes fixes the route.
+All four ranks then pass at least 1338 live comparisons in each of 64 layers,
+with zero gate/final-output bit differences or nonfinite values. Original
+outputs drive generation; both natural fixtures stay canonical.
+
+The separate-startup five-warmup/five-measurement pair measures release1k
+16.445409 -> 16.453666 ms and MBPP28 16.129142 -> 15.966142 ms. All token IDs,
+acceptance counts and natural EOS match, but the gain is workload-dependent
+and only one pair is available. This is not a promoted combination or a
+sub-15-ms result. `results/coop-mlp-live-shadow-admission.json` and the
+`v4-coop-mlp-warm5-{control,candidate}-speed-*` reports retain the evidence.
 
 Reports are `results/qpn2-coop-mlp-{real,memcheck,racecheck}.json` with sanitizer
 logs and manifests alongside them. The private library SHA256 is
 `22a91bd9f9e8aa0cc1324b0482c0fc4d6fc695ef7b553935801a935e47194c31`;
 `candidates/qpn2-coop-mlp/cooperative-manifest.json` retains the source and flags.
+
+The versioned `build_sm70_qpn2_cooperative_mlp.py` accepts an explicit private
+output directory and reproduces the exact validated CUDA source SHA256
+`21f5a7448cb71ec3b847f21e41068b64f7eae44db0e5e2ec365b96a2fbd99b65`.
+Its companion benchmark keeps real consecutive-layer weights, changing inputs,
+rank skew and mixed-protocol epochs, and adds six rejected non-q8 row counts.
+Its four-rank rerun passes both changing-input cycles, all six rejected shapes
+on every rank and all output/canary comparisons; the generated source matches
+the previously built and sanitized DSO. The rerun is recorded in
+`results/qpn2-coop-mlp-versioned-gate.json`.
+The benchmark is an operator/communication gate, not a model quality score.
+
+## Independent draft query-row partitions: rejected
+
+A further native FlashInfer-fragment experiment partitions the eight query
+rows among four or eight CTAs per head, retaining K176, per-row reduction and
+FP16 probability boundaries. This differs from the earlier output-column
+partitions. Both versions match frozen FP16 output in 40 graph/canary cases at
+the actual 1648-token page size, including 1647/1648/1649 and 3295/3296/3297 key
+lengths. The candidates' FP32 LSE also matches each other; that check is not an
+independent FP32-score reference.
+Yet both regress: at 1024 keys, control/four/eight-part medians are
+0.074189/0.077496/0.080691 ms; at 4096 keys they are
+0.322202/0.369172/0.380150 ms. Increasing the grid from eight to 32/64 CTAs does
+not itself improve latency. No serving hook or model admission follows.
+`results/draft-fi-query-rows-gate.json` and the two candidate manifests retain
+the frozen native DSO hash, generated source, raw samples and compile resources.
+
+The upstream QPN2 source was rechecked at
+[`v100-skinny` 5b589c0](https://github.com/dnv2003/v100-skinny/blob/5b589c0dc81223e0ba65bcb3e755874723f8b515/kernels/skinny_kernels.cu)
+and the independent
+[`ninfer-v100` 8fd0e2e implementation](https://github.com/geoffwatts/ninfer-v100/blob/8fd0e2efdea77bab944991f2394309c07b8baffe/src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh).
+Their prepacked quadpair-on-N layout and independent accumulator mechanism
+are already represented in this campaign; their weight/KV contracts and
+published timings are not imported as this model's performance evidence.
