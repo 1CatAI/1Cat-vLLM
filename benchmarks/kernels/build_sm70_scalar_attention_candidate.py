@@ -213,6 +213,7 @@ def main() -> None:
     parser.add_argument("--pv-unroll", type=int, choices=(1, 2, 4, 8), default=1)
     parser.add_argument("--pv-prefetch", action="store_true")
     parser.add_argument("--share-kv-six-heads", action="store_true")
+    parser.add_argument("--e4m3-lut", action="store_true")
     parser.add_argument("--build", action="store_true")
     args = parser.parse_args()
     original = args.source.read_text()
@@ -266,6 +267,28 @@ def main() -> None:
             parser.error("Screen shared-head KV reuse independently")
         partition = partition[: partition.index("{")] + SHARED_HEADS_BODY
         host = replace_once(host, "<<<dim3(1, 6, 256),", "<<<dim3(1, 1, 256),")
+    if args.e4m3_lut:
+        if not args.share_kv_six_heads:
+            parser.error("The LUT probe currently requires six-head KV sharing")
+        partition = replace_once(
+            partition,
+            "  __shared__ __half q_shared[6][D];",
+            "  __shared__ float kv_lut[256];\n"
+            "  kv_lut[threadIdx.x] = flash_v100::fp8_e4m3fn_to_float(\n"
+            "      static_cast<uint8_t>(threadIdx.x));\n"
+            "  __shared__ __half q_shared[6][D];",
+        )
+        partition = replace_once(
+            partition,
+            "flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(\n"
+            "          k_cache, k_index + d)",
+            "kv_lut[static_cast<const uint8_t*>(k_cache)[k_index + d]]",
+        )
+        partition = replace_once(
+            partition,
+            "flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(v_cache, v_index)",
+            "kv_lut[static_cast<const uint8_t*>(v_cache)[v_index]]",
+        )
     source = original[:start] + partition + "\n" + reduce + "\n" + host
     directory = args.output_dir.resolve()
     if directory.exists():
@@ -303,6 +326,7 @@ def main() -> None:
         pv_unroll=args.pv_unroll,
         pv_prefetch=args.pv_prefetch,
         share_kv_six_heads=args.share_kv_six_heads,
+        e4m3_lut=args.e4m3_lut,
         max_context=262144,
         source_files={
             str(p.relative_to(sources)): hashlib.sha256(p.read_bytes()).hexdigest()

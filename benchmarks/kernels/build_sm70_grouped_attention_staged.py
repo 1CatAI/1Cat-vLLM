@@ -80,7 +80,8 @@ static_assert(sizeof(StagedPVSmem) <= 48 * 1024, "PV storage budget");
 """
 
 
-def staged_source(source: str) -> str:
+def staged_source(source: str, pv_columns: int = 2) -> str:
+    assert pv_columns in (1, 2)
     start = source.index(
         "template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE"
     )
@@ -175,7 +176,32 @@ def staged_source(source: str) -> str:
         "if (column_partition == 0 && tid < kGroupedVerifyRows)",
         1,
     )
-    source = source[:end] + PRODUCER + partial + source[end:]
+    producer = PRODUCER
+    if pv_columns == 1:
+        for old, new in (
+            ("kStagedPVThreads = 256", "kStagedPVThreads = 512"),
+            ("kStagedPVWarps = 8", "kStagedPVWarps = 16"),
+            ("kStagedPVHeadDim = 128", "kStagedPVHeadDim = 256"),
+            ("kStagedPVStride = 136", "kStagedPVStride = 264"),
+            ("kv[32 * 136]", "kv[32 * 264]"),
+            ("output[48 * 128]", "output[48 * 256]"),
+            ("<= 48 * 1024", "<= 64 * 1024"),
+        ):
+            producer = replace_once(producer, old, new)
+        partial = replace_once(
+            partial,
+            "__launch_bounds__(kStagedPVThreads, 2)",
+            "__launch_bounds__(kStagedPVThreads, 1)",
+        )
+    elif "PV reuse is isolated" in partial:
+        # Each D128 block has eight warps, one D tile per warp. The same
+        # three independent M accumulators can still share both V fragments.
+        partial = replace_once(
+            partial,
+            "COMPENSATE_P && kStagedPVWarps == 16",
+            "COMPENSATE_P && kStagedPVWarps == 8",
+        )
+    source = source[:end] + producer + partial + source[end:]
     # Keep the complete original host validation and fallback for untested
     # small/other shapes. Prototype scratch is capture-owned, not a cache.
     a = source.index(
@@ -229,6 +255,10 @@ def staged_source(source: str) -> str:
         + original
         + "  }\n"
     )
+    if pv_columns == 1:
+        replacement = replace_once(
+            replacement, "consumer<<<dim3(1, 80, 2)", "consumer<<<dim3(1, 80, 1)"
+        )
     return source[:a] + replacement + source[b:]
 
 
@@ -238,6 +268,7 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--shared-carveout", type=int, choices=(100,))
+    parser.add_argument("--pv-columns", type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
     base = json.loads(args.base_manifest.read_text())
     assert base["head_groups"] == 1 and base.get("splits", 80) == 80
@@ -249,7 +280,7 @@ def main():
     sources = directory / "sources"
     shutil.copytree(source_dir, sources)
     path = sources / "kernel/grouped-attention.cu"
-    source = staged_source(source_file.read_text())
+    source = staged_source(source_file.read_text(), args.pv_columns)
     if args.shared_carveout is not None:
         launch = "    producer<<<tiles, 256, 0, stream>>>("
         source = replace_once(
@@ -283,7 +314,7 @@ pybind11::dict staged_resource_report() {
   result["qk"] = describe(grouped_staged_qk_kernel<3296, true>, 256, 0);
   result["pv"] = describe(grouped_staged_pv_kernel<8, false, 3296,
       false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-      false, float, true, true, true>, 256, sizeof(StagedPVSmem));
+      false, float, true, true, true>, kStagedPVThreads, sizeof(StagedPVSmem));
   return result;
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -299,7 +330,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "source_sha256": digest,
         "module_name": module_name,
         "staged_qk": True,
-        "pv_column_partitions": 2,
+        "pv_column_partitions": args.pv_columns,
+        "reuse_pv_values": base.get("reuse_pv_values", False),
         "capture_owned_score_scratch": True,
         "shared_carveout": args.shared_carveout,
         "source_files": {

@@ -552,3 +552,108 @@ Native manifests for this stage:
 | four-producer QK/PV | `b005452e565468012b25a6f53c297ebc9a3482adde545ac041bfd170b264cde4` | `7dab6ff2d14e60a6f2c9803b9039bceeefc0dd879005f9333beef20d8ede8b99` |
 | six-producer QK/PV | `a79561fc9c1a8a0a06590455e8e3d64807efb70a6aed412a50abdf229a1c12f7` | `1e9da088a750af9892b8c50a12187c652e3061dbd645091152cba7ed01a8b74b` |
 | lossless decoded mirror probe | `eca466df3e1a64c945627e70447470250b83a1683cb6a2b32fd23724d06071e5` | `c31c0a3c136f453ea3f2b27f0fdd1275d3c29963ec3aa0ded889100651b0aeba` |
+
+## Three-startup q1 result and the next operator screens
+
+The six-head scalar q1 comparison has now completed three independent paired
+service starts, each with a cold request and five measured requests per length
+and arm. All 36 request pairs (72 requests) have identical output IDs,
+acceptance and finish reason. The summary checks distinct server PIDs, frozen
+source/library hashes, the prompt/sampling contract and 384 candidate calls on
+each rank in each startup. Both arms retain the previously selected q8 kernel.
+
+| Input | Control complete round | Shared-q1 complete round | Pure decode control/candidate |
+| --- | ---: | ---: | ---: |
+| 1K | 15.951 ms | 15.893 ms | 296.070 / 296.663 tokens/s |
+| 261888 | 38.563 ms | 36.436 ms | 132.268 / 139.854 tokens/s |
+
+Complete-round values are the median of the three startup medians; pure
+decode values summarize the measured requests. Terminal q1 time is included.
+Boundary accepted drafts/round and emitted tokens/round remain 4.02 and 5.12.
+The second startup's 1K candidate is 0.184 ms slower; it remains in the
+aggregate and makes no new scalar calls. The aggregate short-context median
+does not regress. The request-average p50/p90/p99 distributions are retained
+separately from actual GPU-step timings in
+`scalar-q1-three-startup-summary.json`.
+
+An independent actual-input boundary shadow also passes: 64 q1 comparisons
+per rank, 256 in total, have byte-identical output, full partial numerator and
+max/sum workspaces against the frozen production scalar operator. The paired
+requests retain identical output and acceptance. Shadow timing is diagnostic
+only. The original selected q8 natural-EOS campaign has completed 20/30 pairs,
+including a new exact 62396-token seed-1 LiveCodeBench-21 output.
+
+The next q1 candidate constructs a 256-entry FP32 shared-memory E4M3 lookup
+table using the original decoder. A completed initialization barrier precedes
+all reads. It reuses the same decoded values across six independent head
+chains, retaining the original dimension/token order, partition size, FP32
+state and merge. Thirty output/full-workspace byte checks pass. Its sixteen-layer
+261888-token operator workset is 15.965 ms, versus 33.326 ms for scalar sharing
+alone and 60.577 ms for the frozen production operator. This is an operator
+screen; its own sanitizer and full-service gates are required. It does not
+broaden the public worker probe's context eligibility or enable a default.
+
+Revisiting staged QK/PV with PV-value reuse still fails the performance screen.
+One D256 column uses 512 threads; two D128 columns use 256 threads each. Both
+retain all 80 logical partitions and N32 updates and pass 130 byte checks in
+total. Sixteen-layer 128K/261888 worksets are 9.276/17.899 ms for one column and
+10.537/20.420 ms for two, versus 7.814/15.088 ms for the one-stage PV parent.
+Neither staged variant advances to a model trial. The one-column diagnostic
+trace attributes 3.931 ms to QK, 6.762 ms to PV and 0.229 ms to merge per
+sixteen layers at 128K. These instrumented service sums cannot be used as
+unprofiled latency or assumed overlap savings. The PV kernel uses 108
+registers/thread and 49824 bytes of dynamic shared memory; these are static
+resources, not achieved occupancy.
+
+A separate explicit `profile` entrypoint records intra-CTA `clock64`
+boundaries around K loading, QK with V loading, online softmax, and ordered
+PV. It exists to distinguish phase dependencies before another scheduling
+rewrite. Timestamp deltas include probe overhead and waits and do not report
+hardware utilization. No serving route imports the probe.
+
+| Candidate | Source SHA256 | DSO SHA256 |
+| --- | --- | --- |
+| q1 shared E4M3 lookup | `82e3e0486f549125b94f5b38555e03e792fea51e349d3d5f972cf269871f632f` | `576b7dc765dd6850a6760a7b4dd248e803570d5c5d193ee3af83fc0d68d89a7a` |
+| staged PV reuse, one column | `9aed322a8a098e9bb51f7113a0774bab3ca66766051281c20f54bfd9443c3b20` | `f01d7ea03de216445a325a95e5213fdb9f18b0ae8ff1299acabfa3aac7ffafce` |
+| staged PV reuse, two columns | `fe00ab5a5e39e177f22bc3ecfda24d155bc8ae25ca78784c61f01d2150aa006f` | `16e5d1271f11e3201c5db9f61120cb6aea51c72d9b502007ddcfaec07f4ddfba` |
+| intra-CTA phase probe | `aac2d83f53b52e738e9b71903ddc4f077d4ecb00ab95bcd354860067226f5534` | `abdea58968713b5017bf2d6f5898735a9cb741016264fa79c5df458d3d147906` |
+
+The lookup candidate's own memcheck, racecheck and synccheck each complete six
+byte/canary checks with zero reported errors. Its first boundary shadow uses
+261888 input tokens and 256 output tokens: the two outputs and acceptance
+records agree, but this trajectory exercises no eligible scalar q1 calls.
+The client rejects the missing coverage. This is retained as a route miss,
+not a scalar quality pass. A separate 262136-input/eight-output boundary
+diagnostic is used to leave no full q8 window; its timing is excluded.
+
+A subsequent uninstrumented paired startup does exercise the lookup operator:
+384 calls per rank over six boundary requests. All twelve request pairs are
+exact. Complete-round medians at 1K are 16.028/15.929 ms for control/lookup,
+and at 261888 are 38.822/36.796 ms. Boundary pure decode is
+119.426/126.003 tokens/s, accepted drafts/round 3.563636 and emitted
+tokens/round 4.654545 in both arms. These acceptance values differ from the
+older three-startup scalar campaign, so its 36.436 ms result cannot rank the
+two scalar implementations. The unchanged control first differs from that
+older output at tokens 114/62 for 1K/261888. All fifteen checked shared native
+libraries retain their hashes. This startup repeatability issue is retained;
+it is not assigned to the lookup kernel, which is disabled in the control.
+An explicit same-startup control/shared/lookup comparison follows before
+claiming incremental lookup benefit.
+
+The clock probe completes sixteen-layer working sets at 128K and 261888 with
+byte-identical output and full FP32 workspaces. It records 65536/130944 N32
+tiles respectively. Aggregated CTA cycles at 261888 divide into 14.86% K load,
+34.19% QK with V load, 20.16% online softmax and 30.79% ordered PV. The 128K
+fractions closely agree. These include waits and timestamp overhead, and are
+not kernel wall-time fractions or achieved utilization. They motivate removing
+common-case branches and auditing the QK dependency chain. The original
+selected natural campaign is now 22/30 exact natural-EOS pairs; the new seed-1
+LiveCodeBench-64/93 outputs contain 94767/47005 tokens respectively.
+
+The explicit short boundary-generation shadow completes 48 actual scalar
+comparisons per rank (192 total), with byte-identical output, partial numerator
+and max/sum storage; both requests retain identical output and acceptance.
+The timestamp probe also passes its own memcheck, racecheck and synccheck,
+including full 262144 visibility, page crossing, graph replay and timestamp
+canaries. These checks validate the diagnostic; they do not remove its timing
+overhead or grant model admission to another operator.
