@@ -118,3 +118,37 @@ repair run stops at 128K; 256K jobs must not resume automatically.
 Missing FA2 explains the prefill fallback. It does not by itself attribute
 the q8 decode slope: target verification has a separate grouped E4M3 FP32
 dispatch and still needs a same-route graph-node trace after this repair.
+
+## Repaired native-prefill probe
+
+The explicit sidecar launch completed 16 requests through 128K using harness
+commit `77ae71b0060acee63881204c4668aae1fe5e3406`. All four ranks mapped the
+same FA2 SHA. Every cold request's computed-prefill-token count equals its
+full input length. The 32K/64K/128K requests recorded respectively 144/304/624
+v37 and exact E4M3 bridge calls per rank. Existing GPU attention/bridge tests
+passed 23 cases, with both 256K cases deselected. The first test launcher
+imported the unbuilt harness checkout and failed before GPU validation;
+the rerun used frozen serving imports with explicit pytest import isolation.
+
+| Input tokens | Cold prefill, s | Cold prefill, tokens/s | Complete round, ms | Pure decode, tokens/s | Accepted drafts/round | Emitted tokens/round |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.318 | 3222 | 16.429 | 287.43 | 3.7778 | 4.7407 |
+| 32768 | 9.670 | 3388 | 25.606 | 168.79 | 3.3729 | 4.3390 |
+| 65536 | 21.166 | 3096 | 34.730 | 143.97 | 4.0784 | 5.0196 |
+| 131072 | 49.842 | 2630 | 52.981 | 85.95 | 3.5536 | 4.5714 |
+
+Prefill is one verified cold request per length; round and decode are medians
+of three warmed repeats in one startup. These are diagnosis results, not
+the plan's three-startup performance acceptance. The 4096 chunk budget,
+1648-token page, NVFP4 target and FP32 recurrent state are unchanged. Historical
+FP8 target-only/chunk8192 results are a different contract.
+
+All four requests at each length have identical output-token IDs and acceptance
+within that startup. Compared with the missing-library fallback, the 64K
+256-token output matches, while 1K and 128K first diverge at zero-based output
+positions 114 and 21. None of these capped requests receives quality credit;
+there is no promotion or claim that the sampled distribution is unchanged.
+The repaired run retains FP32 arithmetic and does not disable compensation to
+recover speed. Raw results and route snapshots are in
+`results/context-cost-fa2-repaired.json`, with the compact comparison in
+`results/prefill-repair-summary.json` under the audit artifact root.
