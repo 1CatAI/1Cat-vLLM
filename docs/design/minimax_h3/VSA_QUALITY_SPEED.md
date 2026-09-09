@@ -1,12 +1,14 @@
 # VSA quality and 31.3-second stage
 
-The user resumed FastH3 VSA Data-Free development with original floating
-weights, TP4 and the official top-k 64/four-step algorithm. This stage requires
-independent FP32 full-sampling quality and human audiovisual review, plus a
-full warmup and three unprofiled requests with median denoise <=31.3 seconds
-and CV <=5%. Complete requests must beat a matched Dense control. Official
-GPU-kernel validation and >80 useful TFLOP/s/card remain separate unfinished
-objectives. No quality threshold is relaxed and no AUTO promotion is made.
+FastH3 VSA Data-Free on original floating weights and V100 TP4 has no
+configuration that passes the joint 31.3-second quality/speed stage. The native
+FP16 sparse path reaches a formal 30.990756-second median but fails independent
+FP32 quality. The acceptance-only exact FP32 path passes the primary numerical
+gates at a formal 60.353224-second median; human audiovisual review and the
+extended coverage matrix remain incomplete. Neither result authorizes AUTO
+promotion. Official GPU-kernel validation and >80 useful TFLOP/s/card remain
+separate unfinished objectives. No quality threshold or official sampling/
+selection rule is relaxed.
 
 ## Frozen baseline and diagnosis
 
@@ -288,9 +290,73 @@ and peak allocation bound including raw IPC is 24,884,304,896 bytes/card.
 These captured times are diagnostic; the original and batched captures are
 not a formal warm-session comparison.
 
-A separate one-warmup/three-request benchmark is pending. Its provenance must
-explicitly name `CUTLASS_SIMT_FP32_BATCHED_DIAGNOSTIC` and the binary/source
+The separate one-warmup/three-request benchmark completed. Its provenance
+explicitly names `CUTLASS_SIMT_FP32_BATCHED_DIAGNOSTIC` and the binary/source
 hashes: the native sampler, work counters and timers are unchanged, but the
 acceptance tool replaces the sparse operator. This remains an opt-in diagnostic
 with no runtime/default/AUTO registration. The joint 31.3-second quality/speed
 stage remains incomplete.
+
+## Exact FP32 formal result and remaining bottlenecks
+
+Source `3ae9087b28` and binary `8a019200...539f5cd6` completed a full warmup
+followed by three consecutive unprofiled, uncaptured requests in one engine.
+Every run records the actual diagnostic sparse operator override. The warmup
+(90.458786-second denoise) is excluded from the following measurements.
+
+| Measurement | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| Slowest-rank denoise (s) | 60.317440 | 60.355101 | 60.353224 |
+| Complete request (s) | 163.296343 | 140.666471 | 96.415224 |
+| Rank-0 text/media encoding (s) | 31.438246 | 25.516768 | 7.559961 |
+| Rank-0 DiT staging/weight preparation (s) | 51.678684 | 25.174796 | 9.212433 |
+| Rank-0 VAE (s) | 14.851771 | 14.801774 | 14.235778 |
+| Rank-0 packaging (s) | 1.838711 | 1.963504 | 1.896965 |
+
+The denoise median is **60.353224 seconds**, CV **0.028716%**, and the complete
+request median is **140.666471 seconds**. The stage evaluator passes CV but
+fails both <=31.3 seconds and beating the retained Dense complete-request
+median of 87.426512 seconds. The host preparation times are visibly unsettled
+in the first two measured requests; the full-request difference must not be
+attributed entirely to the sparse kernel. All three prescribed requests remain
+in the result, and the fastest request is not substituted for their median.
+The retained Dense and native VSA controls have matching configuration but were
+measured earlier; background host state was not controlled across campaigns.
+
+The four per-step maximum-rank GPU-time medians are 15.071570, 15.072747,
+15.091930 and 15.108280 seconds. The lowest-rank effective model throughput
+median is **28.042311 TFLOP/s/card**. Peak allocation including raw IPC is
+24,882,522,624 bytes/card (23.173655 GiB). Avoided work is reported separately,
+not added to useful throughput.
+
+NVML samples are retained for the complete campaign. Restricting to samples
+with GPU utilization >=90%, per-card median SM clocks are 1387, 1470, 1485 and
+1470 MHz; median powers are 256.597, 261.452, 246.914 and 257.504 W. This selection
+includes other GPU-active phases and must not be labeled denoise-only power or
+utilization. The complete series and ranges are in the telemetry artifact.
+
+A separate Nsight Systems trace of the fixed captured operator records 20 QK
+and 20 PV launches after batching, versus 84 each before. QK takes 73.09 ms, PV
+60.24 ms and global softmax 32.08 ms. Conversion, score masking, pointer/index
+preparation and output scattering account for about 7.76 ms. FP32 QK/PV and
+normalization still dominate this operator; this is not a complete-denoise
+category breakdown. Further layout-only changes cannot account for the large
+remaining speed gap. No new Dense FA prototype or FI route was introduced.
+
+The final operator, quality and timing records are respectively
+`cutlass-batched-versioned-capture.json`,
+`cutlass-batched-full-quality-metrics.json`,
+`vsa-fp32-batched-three-runs/`, and `fp32-batched-stage-performance.json` under
+the retained artifact root. `review-media.json` records playable candidate and
+reference MP4/WAV paths and hashes; both MP4 files pass complete FFmpeg decode.
+They are H.264/AAC, 1280x736 at 24 fps, 5.175 seconds after the frozen request's
+frame alignment. Assistant inspection of frames 0/61/123 notes several ducks
+in the background, also present in the identical FP32 reference. Object-count
+consistency and complete audiovisual quality require human review; the user
+has been asked to review the playable sample. No human pass is recorded.
+
+Seeds 43/44, 243 frames, the 15-second boundary, TP1/TP2 complete compatibility,
+and representative Dense/LightX2V/Ref2VA output regression remain **not
+completed**. The implementation, numerical primary evidence and formal speed
+failure are delivered in Draft #583; the requested combined acceptance remains
+**not completed**, with no default/AUTO promotion.
