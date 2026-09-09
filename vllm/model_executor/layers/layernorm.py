@@ -22,6 +22,100 @@ logger = init_logger(__name__)
 
 
 @triton.jit
+def _sm70_dflash2_fixed_gemma_rms_kernel(
+    x,
+    residual,
+    weight,
+    normalized_out,
+    residual_out,
+    HAS_RESIDUAL: tl.constexpr,
+    epsilon: tl.constexpr,
+):
+    # Pin both the reduction extent and warp count. Inductor's 2048/8192
+    # autotune changes FP32 reduction order, including between TP ranks.
+    row = tl.program_id(0)
+    cols = tl.arange(0, 8192)
+    mask = cols < 5120
+    values = tl.load(x + row * 5120 + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        values += tl.load(residual + row * 5120 + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        tl.store(residual_out + row * 5120 + cols, values, mask=mask)
+    # Preserve the masked square and residual materialization of the pinned
+    # Inductor reduction. Removing this boundary changes FMA contraction for
+    # sums of two FP16 inputs even with an identical reduction tile.
+    variance = tl.sum(tl.where(mask, values * values, 0.0), axis=0) / 5120.0
+    inverse_rms = tl.rsqrt(variance + epsilon)
+    if HAS_RESIDUAL:
+        values = tl.load(residual_out + row * 5120 + cols, mask=mask, other=0.0)
+    gemma_weight = tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
+    tl.store(
+        normalized_out + row * 5120 + cols,
+        values * inverse_rms * gemma_weight,
+        mask=mask,
+    )
+
+
+def _sm70_dflash2_fixed_gemma_rms_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    normalized_out = torch.empty_like(x)
+    residual_out = (
+        torch.empty_like(x, dtype=torch.float32) if residual is not None else None
+    )
+    _sm70_dflash2_fixed_gemma_rms_kernel[(x.shape[0],)](
+        x,
+        residual,
+        weight,
+        normalized_out,
+        residual_out,
+        HAS_RESIDUAL=residual is not None,
+        epsilon=variance_epsilon,
+        num_warps=16,
+        num_stages=1,
+        enable_fp_fusion=True,
+    )
+    if residual_out is None:
+        return normalized_out
+    return normalized_out, residual_out
+
+
+def _use_sm70_dflash2_fixed_gemma_rms(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+) -> bool:
+    return bool(
+        envs.VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS
+        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and _sm70_gemma_long_prefill_available()
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.ndim == 2
+        and x.shape[0] > 0
+        and x.shape[1] == 5120
+        and x.is_contiguous()
+        and weight.device == x.device
+        and weight.dtype == torch.float16
+        and weight.shape == (5120,)
+        and weight.is_contiguous()
+        and (
+            residual is None
+            or (
+                residual.dtype == torch.float16
+                and residual.device == x.device
+                and residual.shape == x.shape
+                and residual.is_contiguous()
+            )
+        )
+    )
+
+
+@triton.jit
 def _sm70_dflash2_gemma_fused_add_rms_kernel(
     x,
     residual,
@@ -429,6 +523,10 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
+        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+            return _sm70_dflash2_fixed_gemma_rms_norm(
+                x, residual, self.weight, self.variance_epsilon
+            )
         if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(
@@ -483,6 +581,10 @@ class GemmaRMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if _use_sm70_dflash2_fixed_gemma_rms(x, residual, self.weight):
+            return _sm70_dflash2_fixed_gemma_rms_norm(
+                x, residual, self.weight, self.variance_epsilon
+            )
         if _use_sm70_dflash2_gemma_fused_add_rms(x, residual, self.weight):
             assert residual is not None
             return _sm70_dflash2_gemma_fused_add_rms_norm(

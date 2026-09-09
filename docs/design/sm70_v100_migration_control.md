@@ -2,89 +2,37 @@
 
 Date: 2026-05-30
 
-## DFlash2 TP2 verification cost, 2026-09-08
+## DFlash2 TP2 accepted endpoint, 2026-09-10
 
-[The TP2 worklog](sm70_dflash2_tp2_verifier.md) freezes main at
-`e5d63c51f0fcc1ddf75d229e3df06bf52df206f5` and records initial complete-round
-costs of 44.973/35.119 ms on release1k/MBPP28. Scalar E4M3 attention accounts
-for about 12.84 ms in the release1k trace. An opt-in exact bit-decoder/PV
-unroll specialization passes exhaustive encoding, graph/state, FP64-reference
-and sanitizer gates; live attention shadow compares 665321472 elements with
-zero bit differences. It is restricted to TP2 q8/D256/FP32-partial/P1024.
+The user closed TP2 optimization at **31.884546/29.279787 ms** complete rounds
+for release1k/MBPP28, retiring the earlier approximately 25-ms goal. The
+[TP2 worklog](sm70_dflash2_tp2_verifier.md) retains the frozen contract,
+development history, rejected candidates and source/library provenance.
+TP4 remains a separate campaign.
 
-Three independent startups now each contain five attention-only graph-switch
-pairs per fixture, with fixed prefill and projection choices within a startup.
-Complete-round medians improve from 44.872/35.051 to 35.823/32.694 ms, and all
-fifteen pairs per fixture retain identical tokens, acceptance counts and EOS.
-Cross-startup control variation remains unresolved; the first unmatched
-comparison is retained as provisional evidence. The approximately 25 ms target
-and broader quality/context gates are still pending. Keep PR566 Draft and the
-production flag off while reducing the remaining cost.
-Capping inactive partition CTAs was numerically exact but had no speed gain;
-do not repeat that rejected path without new evidence.
-QPN2 TP2 can match TurboMind's operator bits by matching effective-scale
-rounding and the observed K64 split/reduction schedule. A full extra code copy
-exceeds the memory budget; shared-code, tiled and vector-reader screens remain
-slower and are rejected for model use. The TP2 worklog records the comparisons.
-Selective MLP packing fits the frozen context after unused TP2 FP16 head
-packing is disabled; its two-rank live shadow has zero differences across
-22353903616 output elements. One five-pair startup measures an additional
-35.903/32.768 to 35.414/32.294 ms improvement, with identical paired tokens
-and acceptance. The approximately 0.5 ms whole-round gain is much smaller
-than the projection microbenchmark; three-startup admission remains pending.
-The packed GDN entry also now requests FP32 beta, matching the ordinary
-speculative path. The previous implicit FP16 beta changes output and state
-bits in a fixed TP2 reproduction. Actual-entry TP2/TP4 tests pass with strided
-state and all acceptance selectors; packed GDN remains opt-in pending live
-and full-round gates.
-The updated trace still attributes about 14.786 ms to target projections
-and 6.832 ms to draft work. Register caps 48/40 and precomputed effective
-scales preserve operator bits but lose performance and are rejected. Initial
-GDN live diagnostics fail coverage because of padded metadata, then pooled
-state-pointer attribution; zero differences without per-layer coverage do
-not admit the packed route. The corrected shadow now covers 48 layers per
-rank, with zero bit differences across 2305032192 output and 295044120576
-state elements. The corrected graph comparison below establishes a
-whole-round benefit on the paired short-context fixtures.
-The TP2 worklog retains both diagnostic failures and the
-profile wrapper's shutdown exit 137 separately from usable captured data.
-The packed GDN route also rejected the model's QKV view because its row
-shares storage with Z/b/a. The opt-in entry and native wrapper now retain
-that row stride directly; four TP2/TP4 actual-entry tests pass, including
-input padding and complete state preservation. Three independent startups
-now each run five GDN A/B pairs per fixture, with attention and exact MLP
-held fixed. Complete-round medians improve from 36.362439/33.312182 to
-34.528673/31.508836 ms, with identical paired tokens, acceptance and EOS.
-All 48 GDN regions per rank hit the strided route. This establishes a
-1.833766/1.803346 ms GDN benefit; 25 ms and wider admission remain pending.
-Additional QPN2 unroll/lifetime, block-interleaving, pitch-padding and L2
-prefetch screens preserve operator bits but remain slower. Do not repeat
-them without changed evidence. Existing TP2 communication/Gemma fusion also
-loses performance and changes 1 to 4 normalized FP16 elements per nonzero
-test case versus the actual DFlash2 Triton norm; retain the existing route.
-A private LM-head probe confirms that default reduced vocabulary width
-changes split-K and FP32 logits; retaining the complete-head cuBLASLt plan
-restores bitwise selected logits. This is a reranking building block, with
-candidate coverage and model admission outstanding, not a speed claim.
-The clean packed-route trace still attributes 14.788 ms to target projections
-and 3.849 ms to attention. A smaller GDN V tile (BV2) passes the actual q8
-state/graph and sanitizer gates, then a two-rank live shadow with zero output
-and state differences. Three independent five-pair startups preserve tokens,
-acceptance and natural EOS and improve median complete rounds from
-34.496555/31.530112 to 34.174315/31.126483 ms. Its source flag
-`VLLM_SM70_DFLASH2_TP2_GDN_BV2` remains off, admits only the FP32-state TP2 q8
-contract, and passes eight integrated-entry GPU tests including TP4 fallback.
-Adding 80 projections to the MLP layout fails the frozen 262144 context
-memory budget before generation. A replacement layout packs 64 MLP down and
-128 non-MLP projections instead, retaining gate/up on TurboMind. All 192
-layers per rank pass live bitwise comparison, and measured KV budget is
-about 8.26 GiB per rank. A corrected full-graph-only comparison measures
-35.178025/32.107532 to 33.911462/30.847108 ms in one startup, with all five
-pairs per fixture exact; two additional startups remain required. The first
-diagnostic overcounts prefill piecewise graphs and stops before generation.
-E2M1 decoder changes and external logical-split CTAs are slower than the
-matched QPN2 kernel and remain rejected; retain the diagnostic scale-constant
-error separately from the corrected but slower implementation.
+Three independent unprofiled startups each run one warmup and five paired
+requests per fixture. All fifteen pairs preserve token IDs, acceptance and
+natural EOS. Accepted drafts per round are 2.010638/3.569231; emitted tokens
+per round are 3.010638/4.569231. A separate same-startup diagnostic preserves
+hidden states, full FP32 vocabulary logits and valid acceptance records.
+These short-context measurements are not 256K performance evidence.
+
+PR566 integrates the exact revision-2 scalar E4M3 decoder/PV schedule, the
+independently gated TP2 q8 BV2 GDN schedule and the matched QPN2 builder.
+Main already contains the FP32-beta and row-stride repairs from PR556;
+integration keeps those repairs and the TP4 fallback. The observed K64 split,
+effective FP16 scale rounding, FP32 state/logits and E4M3 KV are unchanged.
+The complete measured combination also uses the retained single-layout
+QPN2/context worker harness; merging the kernel components does not enable
+that whole combination by default. New TP2 switches remain opt-in.
+
+The later combined-projection copy experiment is withdrawn from this PR's
+source. Its local copy and live byte-oracle gates pass, but its model A/B
+harness fails before generation due to a ctypes graph-binding conflict.
+It contributes no accepted whole-round improvement. Changed draft GEMM
+arithmetic is also excluded: better local FP64 error still changes proposal
+distributions. Historical failed numerical, memory-budget, route-coverage,
+sanitizer-timeout and slower-kernel results remain recorded in the worklog.
 
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 

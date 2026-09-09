@@ -311,9 +311,14 @@ def _build(
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
     use_common_metadata: bool = False,
+    is_prefilling: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if is_prefilling is not None:
+        common = common.replace(
+            is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool, device=DEVICE)
+        )
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         num_decode_draft_tokens_cpu = torch.tensor(
@@ -409,6 +414,97 @@ def test_gdn_build_classification(
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+@pytest.mark.parametrize("use_full_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    (
+        "num_speculative_tokens",
+        "query_len",
+        "seq_len",
+        "is_prefilling",
+        "expected_prefills",
+        "expected_initial_state",
+    ),
+    [
+        pytest.param(7, 1, 1, True, 1, [False], id="fresh-singleton"),
+        pytest.param(7, 1, 17, True, 1, [True], id="cached-singleton-extension"),
+        pytest.param(7, 1, 17, False, 0, None, id="regular-decode"),
+        pytest.param(7, 2, 2, True, 1, [False], id="two-token-prefill"),
+        pytest.param(7, 17, 17, True, 1, [False], id="longer-prefill"),
+        pytest.param(7, 1, 1, None, 0, None, id="legacy-metadata"),
+        pytest.param(0, 1, 1, True, 0, None, id="non-speculative-unchanged"),
+    ],
+)
+def test_singleton_prefill_state_initialization(
+    local_gdn_model: str,
+    use_full_cuda_graph: bool,
+    num_speculative_tokens: int,
+    query_len: int,
+    seq_len: int,
+    is_prefilling: bool | None,
+    expected_prefills: int,
+    expected_initial_state: list[bool] | None,
+):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=num_speculative_tokens,
+        use_full_cuda_graph=use_full_cuda_graph,
+        max_cudagraph_capture_size=8,
+    )
+    meta = _build(
+        builder,
+        BatchSpec(seq_lens=[seq_len], query_lens=[query_len]),
+        num_decode_draft_tokens=[-1] if num_speculative_tokens else None,
+        is_prefilling=None if is_prefilling is None else [is_prefilling],
+    )
+
+    assert meta.num_spec_decodes == 0
+    assert meta.num_prefills == expected_prefills
+    assert meta.num_decodes == 1 - expected_prefills
+    assert meta.num_prefill_tokens == query_len * expected_prefills
+    if expected_initial_state is None:
+        assert meta.has_initial_state is None
+    else:
+        assert meta.has_initial_state is not None
+        assert meta.has_initial_state.tolist() == expected_initial_state
+
+
+@pytest.mark.parametrize("poison", [10.0, float("nan")], ids=["recycled", "nan"])
+def test_singleton_prefill_masks_recycled_conv_state(local_gdn_model: str, poison):
+    from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+        causal_conv1d_torch,
+    )
+
+    builder = _create_gdn_builder(local_gdn_model, num_speculative_tokens=7)
+    meta = _build(
+        builder,
+        BatchSpec(seq_lens=[1], query_lens=[1]),
+        num_decode_draft_tokens=[-1],
+        is_prefilling=[True],
+    )
+    assert meta.num_prefills == 1
+    assert meta.has_initial_state is not None
+    assert meta.non_spec_query_start_loc is not None
+    assert meta.non_spec_state_indices_tensor is not None
+    states = torch.full((1, 1, 3), poison, dtype=torch.float32, device=DEVICE)
+    output = causal_conv1d_torch(
+        x=torch.ones((1, 1), dtype=torch.float32, device=DEVICE),
+        weight=torch.ones((1, 4), dtype=torch.float32, device=DEVICE),
+        bias=None,
+        conv_states=states,
+        query_start_loc=meta.non_spec_query_start_loc,
+        cache_indices=torch.zeros_like(meta.non_spec_state_indices_tensor),
+        has_initial_state=meta.has_initial_state,
+        activation=None,
+    )
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+    torch.testing.assert_close(
+        states,
+        torch.tensor([[[0.0, 0.0, 1.0]]], device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize(

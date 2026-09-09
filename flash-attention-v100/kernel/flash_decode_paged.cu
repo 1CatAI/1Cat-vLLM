@@ -2412,6 +2412,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
           shared_prob_residual[row * kResidualStride + lane_id] =
               __float2half_rn((probability - rounded) * 2048.0f);
         }
+        // Finish every lane's shared-state reads before lane 0 overwrites the
+        // online maximum. Shuffle synchronization does not order memory.
+        __syncwarp();
         if (lane_id == 0) {
           if (tile_sum > 0.0f) {
             smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;

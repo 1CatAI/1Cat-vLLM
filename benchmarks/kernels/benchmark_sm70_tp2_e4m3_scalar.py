@@ -29,8 +29,8 @@ def main():
     from flash_attn_v100 import flash_attn_interface as interface
 
     native = interface.flash_attn_v100_cuda
-    if getattr(native, "tp2_e4m3_scalar_fast_version", lambda: 0)() < 1:
-        raise RuntimeError("rebuild Flash-V100 with TP2 scalar fast revision 1")
+    if getattr(native, "tp2_e4m3_scalar_fast_version", lambda: 0)() < 2:
+        raise RuntimeError("rebuild Flash-V100 with TP2 scalar fast revision 2")
     if args.layers < 1 or any(not 8 <= n <= 262144 for n in args.context_lengths):
         raise ValueError("positive layer count and context lengths 8..262144 required")
     torch.manual_seed(20260908)

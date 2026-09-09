@@ -40,6 +40,8 @@ def test_precision_capability_rejects_stale_binary(monkeypatch, has_entry, versi
         (8, 1616, 65536),
         (5, 1648, 131072),
         (5, 3296, 262144),
+        # Small multi-tile q8 case for the online-softmax warp-state racecheck.
+        (8, 3296, 512),
         # DFlash2 q8 uses the same repaired arithmetic at each context boundary.
         (8, 3296, 8192),
         (8, 3296, 65536),

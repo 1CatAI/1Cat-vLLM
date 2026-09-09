@@ -751,8 +751,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         )
 
         use_direct_attention_output = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM and torch.compiler.is_compiling()
-        )
+            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+            or getattr(self, "sm70_dflash2_direct_attention_output", False)
+        ) and torch.compiler.is_compiling()
         self_attention_output = (
             None if use_direct_attention_output else torch.empty_like(hidden_states)
         )
@@ -772,7 +773,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         if use_direct_attention_output:
             if projected_attention_output is None:
                 raise RuntimeError(
-                    "SM70 TP4 fused prefill requires a direct attention output"
+                    "SM70 TP4 direct attention route requires a projection tensor"
                 )
             hidden_states = projected_attention_output
         else:
