@@ -48,15 +48,15 @@ Unaccepted drift is not a new oracle; thresholds must not be relaxed to pass.
 | Common FP16 input/GEMM, dense column-major path | Shared operator and explicit dense layout | GPU operator checks pass; original/W8A16 four-step complete controls match bitwise |
 | Prepared LoRA input and collective ordering | Implemented, including explicit original basis | GPU prepared/normal results bitwise equal; TP2/TP4 block comparisons pass |
 | General residual sequence sharding | TP2/TP4, original/INT8, matching adapters; TP1 no-op | Both backends and wide residual/padding block checks pass; full Ref2VA pending |
-| FA and FI kernel optimization | Existing narrower routes | Matched baselines pending |
+| FA and FI kernel optimization | Explicit query-128 and shared epilogues in #581 | Audited FA 47.092, FI 43.990, candidate FA 51.939 TFLOP/s/card; >80 fails |
 | All dense task/weight/adapter combinations | Partial mainline support | Full matrix pending |
-| FastH3 VSA on SM70 | Pending | Pending |
-| TeaCache and Cache-DiT | Pending | Pending |
-| AUTO and native variant APIs | Pending | Pending |
-| Workflow-specific performance accounting | Fixed primary case only | Pending |
+| FastH3 VSA on SM70 | True block-sparse native API in #583 | Full generation completes; final FP32-math diagnostic fails latent/video gates |
+| TeaCache and Cache-DiT | Request-scoped official policies in #584 | TP1/2/4 small forwards and full native cached/lossless/cached lifecycle pass; official quality pending |
+| AUTO and native variant APIs | Variant APIs in #583/#584; AUTO pending | No configuration qualified for automatic selection |
+| Workflow-specific performance accounting | Actual intervals, blocks, sparse pairs and cache hits in #578/#583/#584 | Strict validators pass; skipped/padded/duplicate work excluded |
 | Non-H3 DiT operator reuse | Shared GEMM/input preparation | Two non-H3 GEMM shapes pass; Attention reuse pending |
 | >80 TFLOP/s/card, full quality, memory | Not achieved | No qualifying results |
-| Draft PRs, matrix report and playable samples | Common interface Draft PR #571 | First original/W8A16 four-step samples retained; full matrix pending |
+| Draft PRs, matrix report and playable samples | Draft PRs #571/#578/#581/#583/#584 | Original/W8A16 Light4, W8A16 Light8, FlashGen, FastH3 and cache samples retained; full matrix pending |
 
 ## Development record
 
@@ -186,3 +186,39 @@ checks pass. The full original-weight native-flag run is still pending.
 The separate workflow-metrics branch replaces fixed 49-call validation with
 actual sigma intervals and step/block counts. Its results and formal FA/FI
 comparisons will be recorded independently. No >80 configuration is qualified.
+
+### Current shared storage and campaign checkpoints
+
+The later native-flag run at `324f2463c78fb0f69d1546c817e67f3802e52342`
+also enables explicit shared VAE host storage. Full original-weight Light4
+latents, RGB and PCM match the original column-weight control bitwise.
+TP4 VAE mappings total 11.02 GB physical PSS instead of four physical replicas,
+and the engine cleans up its owned files. See [shared host weights](SHARED_HOST_WEIGHTS.md).
+This supersedes the pending native-flag status above; warmed request speed
+and automatic memory budgeting remain unqualified.
+
+The accounting branch corrects duplicate column-LoRA A projections. For the
+four-step W8A16 sample, useful rank-zero FLOPs are now
+3,103,284,010,387,456; the equal-work 80 TFLOP/s budget is approximately
+38.79 seconds. Earlier TFLOP/s values in this historical record use the old
+numerator and must not be mixed with corrected results.
+
+The kernel branch's full warmup plus three unprofiled query-128 requests take
+59.743807 / 59.748563 / 59.748666 seconds, median 51.939 TFLOP/s/card and
+CV 0.003793%. Light4 and Light8 complete native-control comparisons pass
+bitwise for video/audio latents, RGB and PCM. Neither establishes independent
+official-model or human quality acceptance. The >80 gate still fails.
+
+The variants branch completes native FlashGen, FastH3 Dense and true VSA
+generation. VSA's full FP32 selected-key attention control produces final
+video/audio latent L2 errors 0.390670/0.088636, PSNR 24.277 dB and SSIM
+0.769774: it is unqualified despite small local operator errors. Unmodified
+official FastVideo Triton cannot compile FP16 inputs on this V100 setup;
+an independent compatible official runtime remains required.
+
+Both request caches complete original-weight TP4 cached/lossless/cached
+generation at 256x448, 107 internal frames and 49 intervals. TeaCache records
+5/0/5 hits and Cache-DiT 34/0/34, with repeated latents/RGB bitwise and PCM
+within the declared gates. These are lifecycle checks, not full official
+quality or the primary performance matrix. Subsequent branch documents hold
+the detailed records; their APIs are not all present in this common-base PR.
