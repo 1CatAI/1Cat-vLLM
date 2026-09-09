@@ -198,8 +198,8 @@ The integration branch includes dependency PR #563 at
 for initial one-token requests in speculative GDN, preventing reads from a
 previous request's recycled state. Its 32 focused CPU metadata tests pass;
 GPU singleton/history-reuse diagnostics are queued on the fixed integration
-source. This dependency is not yet merged into main, and the unsafe original
-singleton case is not rerun on the unpatched frozen evaluation checkout.
+source. This PR carries the dependency into main; the unsafe original singleton
+case is not rerun on the unpatched frozen evaluation checkout.
 
 The FP8 model snapshot has all 66 indexed shards present. Independent control
 and common-route candidate model jobs are queued, including the two speed
