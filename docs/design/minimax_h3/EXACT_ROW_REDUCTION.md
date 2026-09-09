@@ -1,8 +1,9 @@
 # Explicit SM70 local-row reduction
 
 The shared `SM70ExactRowReductionPlan` interface is experimental and has no
-automatic dispatch. H3 exposes an explicit runtime selection; its final
-integration is still undergoing GPU and full-request validation. The ordinary residual path
+automatic dispatch. H3 exposes an explicit runtime selection; its native
+four-step integration passes media preservation and remains below the
+formal >80 throughput gate. The ordinary residual path
 continues to use FP32 all-reduce followed by a local-row slice. No configuration
 has passed the campaign's >80 useful TFLOP/s/card and complete quality gates.
 
@@ -119,5 +120,70 @@ includes external communication allocations in its memory gate. CUDA driver
 and library overhead still require the retained NVML measurements.
 
 CPU request ownership, budget fallback, config, API and existing residual
-regressions pass. GPU generation through the final native selection and formal
-measurements remain required; preceding forward overrides do not satisfy them.
+regressions pass. The final native selection now has the separate controls and measurements
+below. Wider workflow validation remains incomplete.
+
+## Final native four-step measurements
+
+At source `ca82c279bc`, the ordinary engine selects peer rows through H3Config,
+with no forward replacement. The separate captured native request preserves
+both final latents, all 124 RGB frames and PCM bitwise. All four ranks report
+400 peer calls, zero native fallbacks and about 0.374 seconds initial plan
+setup. `peer-api-native-quality.json` and `peer-api-native-summary.json` retain
+this control and its precise configuration.
+
+`peer-api-720p-three-runs/performance.json` records one complete request warmup
+and three unprofiled, uncaptured requests of that same configuration:
+
+| Measurement | Value |
+| --- | ---: |
+| Warmup denoise | 59.698783 s |
+| Measured denoise | 58.344130 / 58.293218 / 58.234342 s |
+| Median useful TFLOP/s/card | 53.235745–53.235764 |
+| Denoise coefficient of variation | 0.076959% |
+| Complete request | 91.071940 / 90.560870 / 91.905029 s |
+| Live allocation upper bound, including IPC | 20,475,227,136 bytes/card |
+| Memory gate | Pass |
+| >80 throughput gate | Fail |
+
+The companion `peer-api-formal-telemetry.json` retains 1,995 NVML samples at a
+0.25-second interval. Across startup, warmup and measurement, the maximum
+sampled device usage is 24,387,256,320 bytes, including allocator caches and
+runtime overhead. High-utilization samples have median power of about
+278–280 W/card. Telemetry is independent of the CUDA work counters.
+
+This formal request uses pageable host masters and shared VAE weights; the
+older FA query-128 formal control used pinned masters. The latter's shorter
+complete-request time must not be presented as a matched comparison of the
+communication kernels. The isolated 2.49348% denoise comparison above used
+matching host and compute settings. No overall request speedup is claimed
+across the different host-memory policies.
+
+The interface remains explicit. The >80 target, official/human quality, wider
+workflow and shape/TP matrix are still incomplete. Initial setup, skipped work,
+raw IPC storage and slower end-to-end outcomes are retained in the records.
+
+## Native backend and workload breadth
+
+The same native API path with register-probability FI also passes a complete
+latent/RGB/PCM bitwise control against its frozen FI baseline. Full-request
+warmup plus three unprofiled measurements record denoise
+60.986616 / 60.889535 / 60.969633 seconds, median
+50.898828-50.898847 useful TFLOP/s/card and CV 0.069457%. Complete requests take
+89.859034 / 89.086770 / 89.525699 seconds. The allocation upper bound including
+raw IPC is 20,475,227,136 bytes/card. FA and FI peer runs share the pageable
+host/shared VAE policy. Both fail the >80 gate. Evidence:
+`peer-api-fi-720p-three-runs/performance.json`,
+`peer-api-fi-native-quality.json` and `peer-api-fi-formal-telemetry.json`.
+
+Additional complete native controls preserve video/audio latents, all 124 RGB
+frames and PCM bitwise with original floating Light4 weights and W8A16 Ref4
+mixed image/video/audio conditioning. Original Light4 records 59.323955 seconds
+denoise and 22,022,771,200 bytes/card allocation upper bound. Ref4 records
+181.260984 seconds and 21,572,765,184 bytes/card; its longer reference sequence
+uses an explicit 8 GiB reduction budget and 1,491,864,064 raw IPC bytes/card.
+Both record 400 peer calls with zero native fallbacks. These are captured cold
+quality controls, not formal repeated performance measurements. Evidence:
+`peer-api-breadth-summary.json` and both corresponding `*-quality.json` files.
+Independent official quality, human review and the full task/weight/shape
+matrix remain incomplete.
