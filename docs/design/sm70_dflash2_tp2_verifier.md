@@ -901,6 +901,40 @@ admission remain outstanding. No narrowed LM-head route is enabled.
 See `head-cublaslt-probe.json`, `head-lt-plan-probe.json` and the
 [CUDA 12.8 cuBLASLt reference](https://docs.nvidia.com/cuda/archive/12.8.0/cublas/index.html).
 
+### Combined TP2 GDN projection copies
+
+The native-combination trace still contains three tail gathers per GDN layer.
+QUASAR uses the combined projection branch, which did not call the existing
+one-copy z/b/a helper. A separate, default-off
+`VLLM_SM70_DFLASH2_TP2_COMBINED_GDN_SPLIT` switch now routes the verified TP2
+geometry through that helper. It also requires the existing SM70/DFlash2 split
+gate. Other TP sizes, feature dimensions and dtypes retain the old path.
+QKV remains a view for the convolution's in-place update; the helper reads
+the actual padded row stride and BA view offset. No arithmetic changes.
+
+The isolated copy screen passes all 65,536 FP16 bit encodings, changing graph
+replays, rows 1/7/8/9/32/128/4096, row strides 8240/8256/8320 and storage
+offsets 0/17. Input and padding bits are unchanged. Two consecutive 48-layer
+working sets take 0.722739 ms per round of three gathers versus 0.100045 ms
+for the one-copy helper. This approximately 0.623-ms local saving is not a
+complete model-round result. The actual `forward_cuda` entry and existing
+split tests pass all twenty cases, including QKV convolution ownership and
+tail bits after changing graph replays. Live compiled-model and unprofiled
+performance admission are pending. Evidence: `tp2-combined-gdn-split-screen.json`
+and serial queue job 309; no new serving default is enabled.
+
+Two other bounded screens are closed before model work. The N16 QPN2 tile
+matches all sixteen retained real outputs and FP64-reference errors, including
+changing graph replays and canaries, but worsens the four-adjacent-layer
+working set from 0.708352 to 0.795136 ms. The full FP32 head keeps cuBLASLt
+algorithm 21, split two, reduction 4 and stage 14; tile IDs 5 and 11 match
+all 24 saved real M7/M8 cases across both ranks. Tile 15 is unsupported
+(status 15), rather than a numerical failure. Tile 11 saves only about
+0.006/0.045 ms across two heads on rank 0/1. Neither screen justifies a model
+performance candidate. See `tp2-qpn2-n16-screen.json` and
+`head-lt-tiles-screen.json`; the accepted complete-round baseline remains
+31.884546/29.279787 ms.
+
 ## Reproduction and retained negative results
 
 Generate the isolated TP2 projection candidate without installing it:

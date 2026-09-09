@@ -345,6 +345,15 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         self.use_split_input_projections = _uses_split_gdn_input_projections(
             self.quant_config
         )
+        self.enable_sm70_dflash2_tp2_combined_gdn_split = bool(
+            envs.VLLM_SM70_DFLASH2_TP2_COMBINED_GDN_SPLIT
+            and self.enable_sm70_dflash2_fused_gdn_split
+            and not self.use_split_input_projections
+            and self.tp_size == 2
+            and self.key_dim == 2048
+            and self.value_dim == 6144
+            and self.num_v_heads == 48
+        )
 
     def create_qkvz_proj(
         self,
@@ -477,9 +486,28 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             ba_start = z_start + z_size
             a_start = ba_start + ba_size
             mixed_qkv = mixed_qkvzba[..., :qkv_size]
-            z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
-            b = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, ba_start, ba_size)
-            a = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, a_start, ba_size)
+            if (
+                self.enable_sm70_dflash2_tp2_combined_gdn_split
+                and mixed_qkvzba.is_cuda
+                and mixed_qkvzba.dtype == torch.float16
+                and mixed_qkvzba.ndim == 2
+                and num_tokens > 0
+                and mixed_qkvzba.stride(1) == 1
+            ):
+                # QUASAR's logical width is 8240, while QPN2 pads rows to
+                # 8256. Pass views with their actual stride and BA offset.
+                # The QKV view remains owned by the projection for convolution.
+                z, b, a = _sm70_materialize_qwen35_gdn_splits(
+                    mixed_qkvzba,
+                    mixed_qkvzba[..., ba_start:],
+                    qkv_size,
+                    z_size,
+                    ba_size,
+                )
+            else:
+                z = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, z_start, z_size)
+                b = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, ba_start, ba_size)
+                a = _sm70_compile_graph_slice_dim(mixed_qkvzba, -1, a_start, ba_size)
 
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
