@@ -2,12 +2,7 @@
 
 No configuration has completed the >80 useful TFLOP/s/card, independent official quality and human-review gates.
 
-Development now concentrates on FlashAttention-V100, as requested by the user.
-With matched native peer-reduction and pageable host/shared VAE settings, FA
-records 53.235745 useful TFLOP/s/card versus FI's 50.898828. FI retains its
-validated implementation; additional FI optimization and exhaustive acceptance
-are paused. Workflow coverage and quality gates continue on the FA/shared path.
-Historical FI evidence remains below for reproducibility.
+Development concentrates on FlashAttention-V100. FI retains its validated implementation; further FI optimization and exhaustive acceptance are paused at the user request. Quality and workflow gates remain unchanged.
 
 All rows use TP4. Rows marked formal use a complete request warmup plus three unprofiled requests. Other timings are captured cold diagnostics. Original floating-weight controls with legacy FLOP accounting omit throughput.
 
@@ -27,6 +22,7 @@ All rows use TP4. Rows marked formal use a complete request warmup plus three un
 | FastH3 VSA data-free | original floating | FASTVIDEO_VSA | 37.387 | 45.268 | failed | not measured |
 | FL2V Light4 v1.2_768p, original native peer rows | original floating | FLASH_ATTN_V100 | 59.324 | 52.312 | passed | not measured |
 | Ref2V Light4 v0.1, mixed native peer rows | W8A16 | FLASH_ATTN_V100 | 181.261 | 53.544 | passed | not measured |
+| Base H3, no LoRA, 49 updates, native peer rows | original floating | FLASH_ATTN_V100 | 649.973 | 57.353 | passed | not measured |
 | FL2V Light4 v1.2_768p, original floating | original floating | FLASH_ATTN_V100 | 66.366 | not measured | passed | not measured |
 | FL2V Light4 v1.2_768p, first | W8A16 | FLASH_ATTN_V100 | 66.419 | 50.697 | passed | not measured |
 | FL2V Light4 v1.2_768p, last | W8A16 | FLASH_ATTN_V100 | 64.852 | 51.923 | passed | not measured |

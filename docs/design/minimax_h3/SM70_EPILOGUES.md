@@ -341,3 +341,32 @@ Evidence: `original-variant-pairs.json`, `original-variant-summary.json`,
 contracts reside in the corresponding `*-original-{baseline,candidate}` runs.
 The [campaign table](CAMPAIGN_RESULTS.md) separates these diagnostic timings
 from formal acceptance measurements. Every configuration remains unqualified.
+
+## Original floating weights without an adapter
+
+The complete default-sampling T2VA native control uses original floating
+weights, no LoRA, 50 sigma points and 49 actual updates. Both requests retain
+seed 42, the same prompt and 1280x736/124-frame internal canvas. The frozen
+`4f19ef7` control uses ordinary residuals and row-major floating weights;
+the candidate at runtime source `570be8d407` uses prepared column-major
+projections, FA query128 and explicit native peer rows. Shared host VAE
+masters and pageable staging are recorded separately in the run contracts.
+
+All declared numerical gates pass: video/audio latents, all 124 pre-encoding
+RGB frames and PCM are bitwise equal; SSIM and RMS ratio are 1. Denoise falls
+from 725.819030 to 649.973214 seconds (10.449687%). Complete captured requests
+are 835.355602 and 700.121402 seconds. Candidate actual-work validation passes
+on all ranks and records 57.353041 useful TFLOP/s/card. Tracked allocation upper bounds
+are 21,633,302,016 bytes/card for the baseline and 20,998,705,664 for the
+candidate, including the candidate's raw IPC memory.
+
+These are single captured cold requests, not warmup-plus-three performance
+acceptance. The combined result covers shared operators, residual layout and
+host residency; it does not isolate an Attention-only or host-policy-only
+speedup. Independent official reference, continuous human audiovisual review
+and >80 acceptance remain incomplete. Four sampled baseline frames were
+inspected, which does not replace those quality gates.
+
+Evidence: `original-base-pair.json`, `original-base-summary.json`,
+`original-base-no-lora-original-quality.json` and the corresponding original
+base run directories under the campaign artifact roots.

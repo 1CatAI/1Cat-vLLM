@@ -60,3 +60,21 @@ are retained under `/data/minimax-h3/sm70-general-20260909/` in
 `attention-fa-phase-clock`, `gemm-primary-heuristics`,
 `attention-fa-normal-exp2`, `attention-fa-warp16-native` and
 `attention-fa-warp16-staging`. None is installed as a production replacement.
+
+The vector-staging Q96 follow-up raises the per-thread register budget to 168.
+Its only 4-byte local spill is stored before the key loop and reloaded after
+its final back edge, as verified in SASS. This admits a bounded numerical and
+performance probe without claiming zero spills. Nine boundaries and the
+actual 34,551-token input are bitwise, but median regresses from 148.462585 to
+281.825287 ms. This closes the split-key warp16 staging route.
+
+A separate one-owner FA K128 prototype keeps rounded probability fragments
+in registers, preserves the FA K64-half sum order and retains Q across key
+panels. It uses 199 registers, no spills and 96 KiB shared memory. Nine
+boundaries and the actual input are bitwise, but median is 195.892136 ms
+versus 147.519104 ms. Its V-prefetch follow-up compiles to 240 registers with
+no spills, but is not GPU timed: the parent exceeds the predeclared 10%
+slowdown limit. No full-model run or production promotion follows.
+
+Evidence: `attention-fa-warp16-staging-q96`, `attention-fa-register-k128`,
+`attention-fa-register-k128-vprefetch`, and `fa-vprefetch-after-register.json`.
