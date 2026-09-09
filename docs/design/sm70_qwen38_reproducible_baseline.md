@@ -106,6 +106,11 @@ for every requested fixed-prompt case (missing cases are rejected). The warmup
 and timed repeats must also agree.
 The driver does not change sampling to conceal early EOS or numerical drift.
 
+To test model-aware selection instead of the explicit baseline flag map, add
+`--use-defaults`. See [the default-path audit](sm70_qwen38_default_fastpath.md)
+for its scope and current validation status. The precision, workload,
+reference-token checks and shutdown behavior are unchanged.
+
 ## Accepted historical evidence and fresh-build acceptance
 
 The unprofiled `main` source95205a2d9952 sweep used physical GPUs4-7 with the

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit, opt-in reproduction contract for the quality-repaired M1 baseline."""
+"""Explicit-baseline and model-default contracts for the quality-repaired M1 lane."""
 
 import hashlib
 import json
