@@ -21,14 +21,7 @@ def loaded_kernel_provenance():
     paths = {
         str(Path(filename).resolve())
         for name, module in list(sys.modules.items())
-        if name.startswith(
-            (
-                "vllm._h3_",
-                "onecat_h3_",
-                "onecat_sm70_sparse_attention",
-                "vllm._sm70_sparse_attention_C",
-            )
-        )
+        if name.startswith(("vllm._h3_", "onecat_h3_", "vllm._sm70_", "onecat_sm70_"))
         and (filename := getattr(module, "__file__", None))
     }
     return {

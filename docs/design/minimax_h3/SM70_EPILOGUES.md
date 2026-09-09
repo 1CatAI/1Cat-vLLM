@@ -4,6 +4,11 @@ This development branch is stacked on the common prepared execution (#571)
 and workflow accounting (#578) branches. No configuration has passed the
 campaign's >80 useful TFLOP/s/card and complete official quality gates.
 
+The separate [FI register-probability update](FLASHINFER_REGISTER_PROBABILITY.md)
+now also has full native media preservation and a formal warmup-plus-three
+result of 49.795 useful TFLOP/s/card. It remains below the FA query-128 result
+and the campaign target. Both use the same shared projection interface.
+
 ## Measured problem and implementation
 
 The matching four-step FA denoise profile spends 6.890 seconds in miscellaneous
@@ -238,9 +243,101 @@ These are captured cold quality controls, not warmed three-run performance.
 Together with the existing v1.2 four-step and v1.0_768p eight-step controls,
 all six official FL2V Turbo artifacts now have a complete W8A16 T2VA numerical
 preservation result. Original-weight and keyframe combinations remain separate
-pending coverage; Ref2V four-step is also still awaiting its full control.
+pending coverage. The subsequent Ref2V four-step control is recorded below.
 No independent official quality or human acceptance is inferred.
 
 Evidence: `remaining-turbo-pairs.json`, `remaining-turbo-summary.json`,
 `light4-v{10,11,01}-720p-quality.json`, `light8-v10-non768-720p-quality.json`
 and the corresponding captured runs under the campaign's artifact root.
+
+## Four-step mixed references and complete adapter inventory
+
+Source `c69cfc7024460e314e79a0bba37a3b736340bc6e` completes the official
+Ref2V four-step v0.1 adapter with a W8A16 Ref2VA base, one image, one
+2.5-second video and one standalone audio reference. The video starts at zero;
+seed 42, five sigma points, video/audio shifts 12/3 and alpha 8 are retained.
+The candidate uses the same general FA query-128 path as the other adapters.
+
+`ref4-mixed-quality.json` passes all declared numerical gates against frozen
+native `4f19ef7`: final video/audio latents, all 124 RGB frames and PCM match
+bitwise, PSNR is infinite, SSIM is 1 and RMS ratio is 1. Spectral cosine is
+0.9999999999999695. Both native generations complete. The candidate's strict
+actual-work checks pass; its complete denoise is 184.563686 seconds, request
+269.210367 seconds, and peak allocation 19,613,711,360 bytes/card. Corrected
+useful throughput is 52.585556-52.585562 TFLOP/s/card.
+
+The frozen control takes 214.108869 seconds denoise and 321.250580 seconds
+request with the same peak allocation. These are captured cold requests with
+different host VAE sharing policies; they are not formal speed acceptance.
+The old control script did not embed Git metadata. The separate
+`baseline-source-audit.json` verifies all 2,483 tracked `vllm` files in the
+frozen archive against `4f19ef7`, without changing the historical contract.
+
+All eight official LightX2V artifacts now have complete native numerical
+preservation evidence: six FL2V adapters on T2VA and both Ref2V adapters with
+mixed references. This is not the full task/weight/reference cross-product,
+independent official quality, human review or >80 acceptance. Exact paths,
+source identities and timing scope are retained in `ref4-mixed-pair.json`,
+`ref4-mixed-summary.json` and the campaign result index.
+
+## First, last and both-frame controls
+
+Source `4ed70419e7f42c6e9f4625f7fa92cf8dea2126d8` also completes all three
+FL2VA keyframe modes using the official Light4 v1.2_768p adapter and W8A16,
+with one immutable engine per implementation. The candidate uses the same
+general FA query-128/prepared/exact-residual/epilogue path. First and last
+images are the retained frames 0 and 123 of the campaign sample, selected
+with indices `[0]`, `[-1]` and `[0,-1]` respectively.
+
+| Constraint | Frozen-control denoise seconds | Candidate denoise seconds | Candidate request seconds | Candidate useful TFLOP/s/card, minimum |
+| --- | ---: | ---: | ---: | ---: |
+| First frame | 77.275887 | 66.419303 | 106.123582 | 50.697486 |
+| Last frame | 71.537050 | 64.852263 | 102.142091 | 51.922501 |
+| First and last frames | 77.299085 | 69.615145 | 108.431893 | 52.304580 |
+
+Every pair passes complete numerical preservation: final video/audio latents,
+all 124 decoded frames and PCM match bitwise; SSIM and RMS ratio are 1.
+Peak allocation is unchanged within each pair: 19,512,957,952 bytes/card
+for a single image and 19,522,796,544 bytes/card for both images.
+
+These are captured requests with different first-use state, reference lengths
+and host VAE sharing policies. They establish full execution and native
+preservation, not a formal performance comparison or independent verification
+of reference fidelity. Original-weight/other-adapter keyframes and the full
+legal Ref2VA combination matrix remain pending.
+
+Evidence: `keyframe-pairs.json`, `keyframe-summary.json`, and
+`keyframe-{first,last,first-last}-quality.json`. The candidate contract retains
+shared-operator, model and video-source hashes plus clean Git provenance.
+
+## Original floating FlashGen and FastH3 Dense controls
+
+Both four-interval T2VA variants now have complete native comparisons with
+frozen mainline `4f19ef7a20db60bb0685e599bd3f4dd156202eed`. Each pair uses
+original floating FL2VA weights, its matching official adapter, seed 42,
+TP4, flow shifts 12/3 and the same 1280x736/124-frame internal canvas.
+Candidate source and individual file hashes are retained in each contract;
+the frozen source audit covers all 2,483 tracked package files with no mismatch.
+
+Both final video/audio latents, all 124 pre-encoding RGB frames and PCM match
+bitwise for both variants. SSIM and RMS ratio are 1; spectral cosine exceeds
+0.99999999999996. This establishes native numerical preservation for these
+configurations, not independent official-model or human quality acceptance.
+
+| Variant | Baseline denoise / request seconds | Candidate denoise / request seconds | Candidate useful TFLOP/s/card | Candidate peak bytes/card |
+| --- | ---: | ---: | ---: | ---: |
+| FlashGen four-step | 73.290174 / 162.679376 | 59.488178 / 121.697365 | 51.620900 | 20,781,940,224 |
+| FastH3 Dense data-free | 61.574164 / 121.787763 | 56.223567 / 114.632281 | 54.124949 | 20,023,082,496 |
+
+These are captured cold controls. Both arms use pageable host weights; the
+candidate also shares host VAE weights and enables prepared column weights,
+exact residual sharding, shared epilogues and explicit FA query tile 128.
+The measurements combine these changes and do not isolate a kernel effect.
+Neither variant has completed a full warmup plus three unprofiled requests.
+
+Evidence: `original-variant-pairs.json`, `original-variant-summary.json`,
+`flashgen-original-quality.json`, `fasth3-dense-original-quality.json` and
+`baseline-source-audit.json` in the campaign artifact root. Complete media and
+contracts reside in the corresponding `*-original-{baseline,candidate}` runs.
+The [campaign table](CAMPAIGN_RESULTS.md) separates these diagnostic timings
+from formal acceptance measurements. Every configuration remains unqualified.
