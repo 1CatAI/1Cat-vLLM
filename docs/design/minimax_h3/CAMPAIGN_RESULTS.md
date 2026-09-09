@@ -2,6 +2,13 @@
 
 No configuration has completed the >80 useful TFLOP/s/card, independent official quality and human-review gates.
 
+Development now concentrates on FlashAttention-V100, as requested by the user.
+With matched native peer-reduction and pageable host/shared VAE settings, FA
+records 53.235745 useful TFLOP/s/card versus FI's 50.898828. FI retains its
+validated implementation; additional FI optimization and exhaustive acceptance
+are paused. Workflow coverage and quality gates continue on the FA/shared path.
+Historical FI evidence remains below for reproducibility.
+
 All rows use TP4. Rows marked formal use a complete request warmup plus three unprofiled requests. Other timings are captured cold diagnostics. Original floating-weight controls with legacy FLOP accounting omit throughput.
 
 | Workflow | Weights | Backend | Denoise seconds | Minimum card TFLOP/s | Native numerical control | Formal performance |
