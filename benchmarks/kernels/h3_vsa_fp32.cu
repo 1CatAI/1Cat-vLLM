@@ -15,6 +15,12 @@
 #include <cutlass/gemm/device/gemm_universal_base.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 
+// Scores and probabilities each have this bound. This is an opt-in diagnostic
+// budget, not a runtime default. Directly indexed K/V require no per-query
+// copy.
+constexpr int kMaxQueryBatch = 32;
+constexpr int64_t kScoreBudgetBytes = 2LL * 1024 * 1024 * 1024;
+
 struct Geometry {
   const __half *q, *k, *v;
   __half* out;
@@ -174,9 +180,9 @@ torch::Tensor forward_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                 "matching inference QKV required");
   TORCH_CHECK(!q.requires_grad(), "inference only");
   int64_t blocks = q.size(1) / 64, groups = q.size(0) * q.size(2);
-  TORCH_CHECK(
-      q.size(1) <= INT_MAX && groups * blocks <= INT_MAX && groups * 8 <= 65535,
-      "indexed H3 exceeds index limits");
+  TORCH_CHECK(q.size(1) <= INT_MAX && groups * blocks <= INT_MAX &&
+                  groups * kMaxQueryBatch <= 65535,
+              "indexed H3 exceeds index limits");
   TORCH_CHECK(prefix >= 0 && prefix < blocks && topk > 0,
               "invalid H3 prefix/topk");
   TORCH_CHECK(std::isfinite(scale) && scale > 0,
@@ -242,9 +248,14 @@ torch::Tensor forward_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   for (int section = 0; section < 2; ++section) {
     int begin = section == 0 ? 0 : prefix, end = section == 0 ? prefix : blocks;
     g.keep = section == 0 ? blocks : keep;
+    int64_t score_bytes_per_query = groups * g.keep * 64 * 64 * 4;
+    TORCH_CHECK(begin == end || score_bytes_per_query <= kScoreBudgetBytes,
+                "a single query exceeds the diagnostic score budget");
+    // Populate the GPU with independent PV queries; do not union their maps.
+    // Every query still visits its selected keys in the same ascending order.
     int chunk = std::max<int64_t>(
-        1, std::min<int64_t>(
-               8, 256 * 1024 * 1024 / (groups * g.keep * 64 * 128 * 4)));
+        1, std::min<int64_t>(kMaxQueryBatch,
+                             kScoreBudgetBytes / score_bytes_per_query));
     for (int first = begin; first < end; first += chunk) {
       g.first = first;
       g.count = std::min(chunk, end - first);

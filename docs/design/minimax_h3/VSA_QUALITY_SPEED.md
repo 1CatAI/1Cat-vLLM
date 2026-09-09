@@ -247,7 +247,7 @@ an existing binary does not assert that it was built from the current source.
 The diagnostic binary must never be substituted into a formal runtime timing
 record without recording the actual operator override.
 
-The versioned diagnostic currently passes 20 leased-GPU regression checks,
+The initial versioned diagnostic passes 20 leased-GPU regression checks,
 including six mathematical/boundary cases and fourteen public input rejection
 cases. The complete captured primary operator also matches FP32 bitwise. All
 20 checks pass memcheck and synccheck with zero errors. Its build source hash is
@@ -259,3 +259,38 @@ the separately built versioned extension is
 The source body is unchanged apart from inlining includes, using the base
 CUTLASS header directly, formatting and comments. These binary identities
 must remain distinct in retained measurement records.
+
+## Batch independent FP32 queries
+
+The initial prefix PV launch has only 14 threadblocks on an 80-SM V100. Its
+query-chunk limit was inherited from the gathered-K/V oracle, although the
+CUDA implementation indexes shared converted Q/K/V directly. The diagnostic
+now submits at most 32 independent query blocks together, with a 2 GiB limit
+on each score/probability allocation and a matching CUDA grid-size guard.
+Requests with even one query exceeding that allocation limit are rejected.
+Each query retains its own compact selected indices and ascending key order;
+there is no selection union, changed probability precision or split-K reduction.
+
+Source `cb33adbdd821a77a8f7f5575f0a6acb68fa5bb606d2b41dd02657d458e448e56`
+builds binary
+`8a0192009af23b25d559b91e9155385266f9574c6e92adba3570d67b539f5cd6`.
+The exact versioned binary passes all 20 GPU, memcheck and synccheck checks,
+including a 38-block case crossing the new query-batch boundary, with zero
+sanitizer errors. The complete captured primary operator remains bitwise FP32,
+with median 172.439 ms versus 232.740 ms before batching.
+
+The complete primary sample preserves the bytes of initial inputs, all four
+step outputs and final video/audio latents against the frozen reference. All
+124 RGB frames match; PSNR is infinite, SSIM is 1, audio spectral cosine is
+0.999999999999945 and RMS ratio is 0.999999998643185. Human review is pending.
+Captured denoise is 61.826728 seconds, complete request 164.385431 seconds,
+and peak allocation bound including raw IPC is 24,884,304,896 bytes/card.
+These captured times are diagnostic; the original and batched captures are
+not a formal warm-session comparison.
+
+A separate one-warmup/three-request benchmark is pending. Its provenance must
+explicitly name `CUTLASS_SIMT_FP32_BATCHED_DIAGNOSTIC` and the binary/source
+hashes: the native sampler, work counters and timers are unchanged, but the
+acceptance tool replaces the sparse operator. This remains an opt-in diagnostic
+with no runtime/default/AUTO registration. The joint 31.3-second quality/speed
+stage remains incomplete.
