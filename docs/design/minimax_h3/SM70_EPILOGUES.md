@@ -309,3 +309,35 @@ legal Ref2VA combination matrix remain pending.
 Evidence: `keyframe-pairs.json`, `keyframe-summary.json`, and
 `keyframe-{first,last,first-last}-quality.json`. The candidate contract retains
 shared-operator, model and video-source hashes plus clean Git provenance.
+
+## Original floating FlashGen and FastH3 Dense controls
+
+Both four-interval T2VA variants now have complete native comparisons with
+frozen mainline `4f19ef7a20db60bb0685e599bd3f4dd156202eed`. Each pair uses
+original floating FL2VA weights, its matching official adapter, seed 42,
+TP4, flow shifts 12/3 and the same 1280x736/124-frame internal canvas.
+Candidate source and individual file hashes are retained in each contract;
+the frozen source audit covers all 2,483 tracked package files with no mismatch.
+
+Both final video/audio latents, all 124 pre-encoding RGB frames and PCM match
+bitwise for both variants. SSIM and RMS ratio are 1; spectral cosine exceeds
+0.99999999999996. This establishes native numerical preservation for these
+configurations, not independent official-model or human quality acceptance.
+
+| Variant | Baseline denoise / request seconds | Candidate denoise / request seconds | Candidate useful TFLOP/s/card | Candidate peak bytes/card |
+| --- | ---: | ---: | ---: | ---: |
+| FlashGen four-step | 73.290174 / 162.679376 | 59.488178 / 121.697365 | 51.620900 | 20,781,940,224 |
+| FastH3 Dense data-free | 61.574164 / 121.787763 | 56.223567 / 114.632281 | 54.124949 | 20,023,082,496 |
+
+These are captured cold controls. Both arms use pageable host weights; the
+candidate also shares host VAE weights and enables prepared column weights,
+exact residual sharding, shared epilogues and explicit FA query tile 128.
+The measurements combine these changes and do not isolate a kernel effect.
+Neither variant has completed a full warmup plus three unprofiled requests.
+
+Evidence: `original-variant-pairs.json`, `original-variant-summary.json`,
+`flashgen-original-quality.json`, `fasth3-dense-original-quality.json` and
+`baseline-source-audit.json` in the campaign artifact root. Complete media and
+contracts reside in the corresponding `*-original-{baseline,candidate}` runs.
+The [campaign table](CAMPAIGN_RESULTS.md) separates these diagnostic timings
+from formal acceptance measurements. Every configuration remains unqualified.
