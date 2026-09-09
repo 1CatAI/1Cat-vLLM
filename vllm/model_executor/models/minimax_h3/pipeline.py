@@ -26,7 +26,7 @@ from vllm.distributed import get_tp_group, get_world_group
 from vllm.logger import init_logger
 from vllm.video.metrics import DenoiseWorkCounter
 
-from .attention import attention_backend
+from .attention import Attention, attention_backend
 from .comfy_checkpoint import inspect_comfy_checkpoint, resolve_comfy_checkpoint_path
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
@@ -1521,7 +1521,27 @@ class MiniMaxH3Pipeline(nn.Module):
             video_outputs=int(branch.update_mask.sum()),
             audio_outputs=int(branch.audio_update_mask.sum()),
         )
-        with self._resident_dit_layers_on_device(enabled=True):
+        self.denoise_workload = {
+            "partition": self.partition,
+            "task": task,
+            "adapter": (
+                type(self.turbo_spec).__name__ if self.turbo_spec is not None else None
+            ),
+            "video_sigmas": list(inputs["sigmas_video"]),
+            "audio_sigmas": list(inputs["sigmas_audio"]),
+            "used_length": branch.used_len,
+            "blocks_per_call": counter.blocks_per_call,
+            "attention_algorithm": "dense",
+            "cache_algorithm": None,
+            "actual_backends": sorted(
+                {
+                    module.backend
+                    for module in transformer.modules()
+                    if isinstance(module, Attention)
+                }
+            ),
+        }
+        with counter, self._resident_dit_layers_on_device(enabled=True):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()
@@ -1544,6 +1564,7 @@ class MiniMaxH3Pipeline(nn.Module):
                         MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
                     ),
                     on_step=lambda step, video, audio: progress.update(),
+                    step_profiler=counter.step,
                 )
             torch.accelerator.synchronize()
             dist.barrier()
@@ -1552,7 +1573,8 @@ class MiniMaxH3Pipeline(nn.Module):
             self.useful_denoise_flops = counter.flops
             self.actual_dit_calls = counter.calls
             self.denoise_flops_by_layer = counter.by_layer
-            counter.close()
+            self.denoise_steps = counter.finish_steps()
+            self.denoise_executed_blocks = dict(counter.blocks)
 
         return self._unpack_denoised_rows(
             branch,
