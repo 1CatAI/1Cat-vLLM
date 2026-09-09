@@ -1,5 +1,26 @@
 # Native MiniMax H3 migration control
 
+## Current campaign direction
+
+New Attention development and exhaustive workflow acceptance concentrate on
+FlashAttention-V100 at the user's request. The already validated FlashInfer
+implementation remains available, but new FI optimization and exhaustive FI
+qualification are paused. The historical parallel-backend decisions below
+are retained as evidence, not current work allocation.
+
+The full-request TP4 four-step native peer-row FA measurement records a
+minimum-card median of 53.235745 useful TFLOP/s, 58.293218 seconds denoise,
+and CV 0.076959%. It does not meet the >80 gate. Original floating weights,
+W8A16, legal adapters/reference inputs, explicit VSA/cache algorithms and
+independent official/human quality remain part of the campaign scope.
+Only configurations satisfying the unchanged quality and full performance
+gates may enter automatic selection.
+
+See [FA_DEVELOPMENT.md](FA_DEVELOPMENT.md) for current bottleneck evidence and
+rejected kernel candidates, and [CAMPAIGN_RESULTS.md](CAMPAIGN_RESULTS.md)
+for the per-workflow qualification table. The owned stack remains Draft;
+local operator results are not end-to-end model acceptance.
+
 Latest FlashInfer change:
 [FLASHINFER_LOCAL_ROTATION.md](FLASHINFER_LOCAL_ROTATION.md).
 Rotate FP16 rows on their owner before all-gather, avoiding duplicated QKV/MLP
