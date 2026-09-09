@@ -164,3 +164,22 @@ All declared repeatability gates pass (`cache-scm-repeat-quality.json`).
 checks establish optional-policy execution and request isolation. They do not
 qualify approximate outputs against the independent official model, compare
 algorithm quality with lossless sampling or satisfy primary performance gates.
+
+## Shared operators and layer residency integration
+
+This branch inherits the shared dense attention interface, exact projection
+epilogues and optional layer staging through the VSA/kernel dependency stack.
+Sparse selection and request cache policy remain separate operations. The
+combined CPU integration passes 126 checks (`cache-shared-integration-cpu.log`).
+
+The small real-H3 distributed cache test now accepts `--layer-offload`.
+TP1, TP2 and TP4 each pass all five forced-compute, TeaCache, Cache-DiT and
+dynamic/static TaylorSeer-SCM cases across two consecutive requests. It stages
+actual DiT blocks while keeping the first normalization/AdaLN probe weights
+resident; outputs match the resident control within the existing 1e-5 gate,
+executed-block counts agree across ranks and repeats, and every parameter
+returns to its CPU master after each request. Cache state is removed on exit.
+
+Evidence is `cache-layer-tp{1,2,4}-gpu.log` and `cache-layer-checks.json` in the
+campaign root. These are operator/request-lifecycle integration checks; they
+do not extend the recorded full-model quality or performance acceptance.

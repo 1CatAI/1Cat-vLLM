@@ -2,13 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Run directly with torchrun; full small H3 forward and TP cache agreement."""
 
+import argparse
 import os
+from contextlib import nullcontext
 
 import torch
 from torch import nn
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--layer-offload", action="store_true")
+    args = parser.parse_args()
     from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
@@ -20,6 +25,10 @@ def main():
         CACHE_DIT_DEFAULTS,
         CachePlan,
         request_cache,
+    )
+    from vllm.model_executor.models.minimax_h3.residency import (
+        LayerwiseModuleStager,
+        PinnedModuleStager,
     )
     from vllm.model_executor.models.minimax_h3.transformer import MiniMaxH3DiTModel
     from vllm.video.metrics import DenoiseWorkCounter
@@ -91,6 +100,19 @@ def main():
                     audio_ref_cond_timestep=0.1,
                 )
                 expected = model(**kwargs)
+                residency = None
+                if args.layer_offload:
+                    snapshot = PinnedModuleStager(
+                        model, pipeline.device, pin_memory=False
+                    )
+                    residency = LayerwiseModuleStager(
+                        snapshot,
+                        (*model.token_refiner.blocks, *model.blocks),
+                        resident_modules=(
+                            model.blocks[0].norm1,
+                            model.blocks[0].adaln_proj,
+                        ),
+                    )
                 plans = [
                     CachePlan("tea_cache", {"rel_l1_thresh": 0}, 4),
                     CachePlan("tea_cache", {"rel_l1_thresh": 0.5}, 4),
@@ -125,12 +147,15 @@ def main():
                 for plan in plans:
                     repeated = []
                     for request in range(2):
-                        with DenoiseWorkCounter(
-                            model,
-                            used_length=branch.used_len,
-                            video_outputs=int(branch.update_mask.sum()),
-                            audio_outputs=int(branch.audio_update_mask.sum()),
-                        ) as counter:
+                        with (
+                            residency.on_device() if residency else nullcontext(),
+                            DenoiseWorkCounter(
+                                model,
+                                used_length=branch.used_len,
+                                video_outputs=int(branch.update_mask.sum()),
+                                audio_outputs=int(branch.audio_update_mask.sum()),
+                            ) as counter,
+                        ):
                             with request_cache(model, plan):
                                 for step in range(4):
                                     with counter.step(step):
@@ -143,6 +168,11 @@ def main():
                             steps = counter.finish_steps()
                         assert not getattr(model, "_h3_cache_active", False)
                         assert not hasattr(model, "_h3_tea_cache")
+                        if residency:
+                            assert residency.loaded_bytes > 0
+                            assert all(
+                                p.device.type == "cpu" for p in model.parameters()
+                            )
                         assert counter.calls == 4
                         counts = [s["executed_blocks"] for s in steps]
                         if plan.options.get("rel_l1_thresh") == 0:
@@ -155,7 +185,8 @@ def main():
                         repeated.append(counts)
                     assert repeated[0] == repeated[1]
                     print(
-                        f"rank={rank} tp={world} {plan.backend} "
+                        f"rank={rank} tp={world} layer={args.layer_offload} "
+                        f"{plan.backend} "
                         f"{plan.options} counts={repeated[0]} PASS",
                         flush=True,
                     )

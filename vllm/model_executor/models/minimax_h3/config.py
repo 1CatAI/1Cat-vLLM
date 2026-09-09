@@ -41,6 +41,7 @@ class H3Config:
     vsa_topk: int = 64
     cache_backend: str = "none"
     cache_config: dict[str, Any] = field(default_factory=dict)
+    attention_query_tile: Literal[64, 128] = 64
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
@@ -49,6 +50,7 @@ class H3Config:
     residual_sequence_parallel: bool = False
     host_weight_pin_memory: bool = True
     share_host_vae_weights: bool = False
+    weight_offload: Literal["component", "layer"] = "component"
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
@@ -57,6 +59,17 @@ class H3Config:
         validate_cache_config(self.cache_backend, self.cache_config)
         if self.cache_backend == "tea_cache" and self.partition != "fl2va":
             raise H3InputError("official TeaCache is calibrated for FL2VA only")
+        if self.attention_query_tile not in (64, 128):
+            raise H3InputError("Attention query tile must be 64 or 128")
+        if (
+            self.attention_query_tile != 64
+            and self.attention_backend != "FLASH_ATTN_V100"
+        ):
+            raise H3InputError("Explicit query tiling requires FLASH_ATTN_V100")
+        if self.weight_offload not in ("component", "layer"):
+            raise H3InputError("weight offload must be component or layer")
+        if self.weight_offload == "layer" and self.fp16_cache_layers:
+            raise H3InputError("layer offload cannot retain a fixed GPU weight cache")
         if not isinstance(self.host_weight_pin_memory, bool):
             raise H3InputError("host weight pinning must be a boolean")
         if not isinstance(self.share_host_vae_weights, bool):
