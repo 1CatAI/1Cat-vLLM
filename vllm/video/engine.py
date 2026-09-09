@@ -45,6 +45,7 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
     current = VllmConfig(
         parallel_config=ParallelConfig(tensor_parallel_size=config.tensor_parallel_size)
     )
+    pipeline = None
     try:
         with set_current_vllm_config(current):
             init_distributed_environment(
@@ -77,8 +78,15 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
                     from .metrics import loaded_kernel_provenance
 
                     kernel_provenance = loaded_kernel_provenance()
+                communication = pipeline.residual_reduction_stats()
+                torch_peak = torch.accelerator.max_memory_allocated()
+                raw_peak = communication["raw_ipc_peak_bytes"]
                 result = {
                     "rank": rank,
+                    "residual_communication": communication,
+                    "torch_peak_allocated_bytes": torch_peak,
+                    "raw_ipc_peak_bytes": raw_peak,
+                    "peak_allocation_is_upper_bound": bool(raw_peak),
                     "stage_seconds": pipeline.stage_durations,
                     "dit_calls": pipeline.actual_dit_calls,
                     "useful_denoise_flops": pipeline.useful_denoise_flops,
@@ -92,7 +100,7 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
                         pipeline.denoise_sparse_work_by_layer
                     ),
                     "kernel_provenance": kernel_provenance,
-                    "peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
+                    "peak_allocated_bytes": torch_peak + raw_peak,
                 }
                 if rank == 0:
                     from .media import export_video
@@ -137,8 +145,12 @@ def _worker(rank, config, gpu_ids, endpoint, connection, shared_weights_dir=None
     except BaseException:
         connection.send({"error": traceback.format_exc(), "rank": rank})
     finally:
-        cleanup_dist_env_and_memory()
-        connection.close()
+        try:
+            if pipeline is not None:
+                pipeline.close()
+        finally:
+            cleanup_dist_env_and_memory()
+            connection.close()
 
 
 class H3Engine:

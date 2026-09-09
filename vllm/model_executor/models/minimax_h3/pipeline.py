@@ -88,7 +88,7 @@ from .time_request import (
     minimax_h3_align_frame_count,
     minimax_h3_time_shift_sigmas,
 )
-from .transformer import MiniMaxH3DiTModel
+from .transformer import MiniMaxH3DiTBlock, MiniMaxH3DiTModel
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 from .weight_cache import FP16WeightCache
 from .weights import iter_checkpoint_weights, resolve_model_root
@@ -508,6 +508,17 @@ class MiniMaxH3Pipeline(nn.Module):
         for module in self.transformer.modules():
             if isinstance(module, Attention):
                 module.query_tile = config.attention_query_tile
+        self._residual_reduction = None
+        if config.residual_reduction == "peer":
+            from .collectives import H3ResidualReduction
+
+            self._residual_reduction = H3ResidualReduction(
+                get_tp_group(),
+                memory_budget_bytes=int(config.residual_reduction_memory_gib * 2**30),
+            )
+            for module in self.transformer.modules():
+                if isinstance(module, MiniMaxH3DiTBlock):
+                    module.residual_reducer = self._residual_reduction
         weights = iter_checkpoint_weights(transformer_path)
         if restore_adaln:
             weights = restore_dense_adaln_weights(weights, path / "transformer")
@@ -690,9 +701,23 @@ class MiniMaxH3Pipeline(nn.Module):
     def progress_bar(self, *, total):
         return tqdm(total=total, desc="H3 denoise", disable=self._dit_rank != 0)
 
+    def residual_reduction_stats(self):
+        reducer = getattr(self, "_residual_reduction", None)
+        if reducer is None:
+            return {"configured_backend": "native", "raw_ipc_peak_bytes": 0}
+        return reducer.snapshot()
+
+    def close(self):
+        reducer = getattr(self, "_residual_reduction", None)
+        if reducer is not None:
+            reducer.close()
+
     @torch.inference_mode()
     def forward(self, request: H3Request):
         self.stage_durations = {}
+        reducer = getattr(self, "_residual_reduction", None)
+        if reducer is not None:
+            reducer.begin_request()
         self.actual_dit_calls = 0
         started = time.perf_counter()
         context = self._prepare_request_inputs(
