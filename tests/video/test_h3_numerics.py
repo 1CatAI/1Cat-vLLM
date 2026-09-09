@@ -178,7 +178,7 @@ def test_attention_padding_excludes_poisoned_suffix(used, padded):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [127, 128, 129, 12323])
+@pytest.mark.parametrize("length", [127, 128, 129, 191, 192, 193, 12323])
 def test_flashinfer_online_softmax_across_tiles_and_batches(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
@@ -197,7 +197,9 @@ def test_flashinfer_online_softmax_across_tiles_and_batches(length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [31, 32, 33, 63, 64, 65, 127, 128, 129])
+@pytest.mark.parametrize(
+    "length", [31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 385]
+)
 def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
@@ -218,7 +220,7 @@ def test_flashinfer_prefetch_tail_and_unaligned_storage(length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("length", [129, 257])
+@pytest.mark.parametrize("length", [129, 193, 257, 385])
 def test_flashinfer_query_groups_have_independent_softmax_state(length):
     from vllm.model_executor.models.minimax_h3.cuda_ops import flashinfer_extension
 
