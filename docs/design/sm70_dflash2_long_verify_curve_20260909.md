@@ -478,3 +478,77 @@ include 75828, 51562, 83004 and 24318 tokens with exact output IDs, acceptance
 and finish reason. These are paired non-regression observations, not new
 benchmark scores. Remaining natural code pairs continue at complete-pair
 boundaries alongside the optimization queue.
+
+## Matched PV evidence and scalar q1 whole-round result
+
+The subsequent uninstrumented same-startup A/B uses the original three-group
+route as control and PV reuse as candidate. All 12 pairs at 32K/128K have
+identical output IDs, acceptance and finish reason. Both arms reproduce the
+previously observed historical token differences at positions 59/21,
+respectively. The prompt corpus SHA, prompt IDs and sampling contract match
+the retained runs. Thus the observed cross-startup drift is not specific to
+PV reuse. It remains unresolved and is not converted into an allowed quality
+tolerance. Complete-round medians are 25.584/18.401 ms at 32K and
+53.061/23.817 ms at 128K for this single control/candidate startup.
+
+Moving persistent shadow buffers outside the shared graph pool repairs the
+counter corruption: the actual-input 32K diagnostic observes exactly 1856
+native comparisons (29 q8 replays × 16 layers × four ranks), with zero changed
+output, numerator or max/sum elements. Control replays leave the counters at
+zero. All captured target/proposal logical tensors agree across the 30-step
+control/candidate/control runs, retaining the explained raw storage differences.
+The original selected natural-output campaign is now 19/30 complete; seed-1
+HumanEval-10 adds an exact 16503-token natural-EOS pair.
+
+The scalar six-head candidate passes memcheck, racecheck and synccheck with
+zero errors and six byte/canary checks in each run. Its first uninstrumented
+model A/B keeps the prior selected q8 kernel in both arms and uses the scalar
+candidate only for eligible eager q1 calls. All four ranks observe 384 real
+candidate calls over six boundary requests, using CPU context bounds
+262140–262143; no GPU length is read on the CPU. All 12 request pairs have
+identical output IDs, acceptance and finish reason:
+
+| Input | q1 control complete round | q1 candidate complete round | Pure decode control/candidate |
+| --- | ---: | ---: | ---: |
+| 1K | 15.959 ms | 15.893 ms | 295.901 / 297.120 tokens/s |
+| 261888 | 38.563 ms | 36.428 ms | 132.252 / 140.000 tokens/s |
+
+At the boundary, accepted drafts/round and emitted tokens/round remain
+4.02 and 5.12. This is one paired startup, not the required three. The complete
+round includes the terminal q1 overhead. The scalar optimization reduces it
+by 2.134 ms, or 5.53%; the 22 ms goal is still unmet. The initial service-client
+attempt failed to unpack the collective RPC results envelope before any
+benchmark request; the corrected client validates all four rank identities.
+The explicit worker probe and operator harness are now included for review.
+No default route is enabled.
+
+The revised QK/PV warp pipeline is rejected on performance. At 128K/261888,
+the PV-reuse baseline is 7.812/15.093 ms, versus 8.834/17.123 ms for eight
+producers and 9.933/19.340 ms for six. Both retain the same 80-register limit
+and spills. Four producer warps remove spills at 96 registers, while preserving
+all 65 byte checks, but are slower again at 11.301/22.210 ms. Removing spills
+alone does not provide a useful pipeline; none of these variants enters a
+model trial.
+
+A separate feasibility probe predecodes the exact E4M3 values into FP16,
+without restoring precision lost by E4M3 encoding. It passes 65 byte checks but
+only changes the 261888-token attention workset from 15.090 to 15.034 ms,
+excluding population/invalidation and the additional mirror memory. It is
+rejected: the gain does not justify a mirror cache. The recorded failed build
+attempt caught use of the FP8 paired-loader option with FP16 data; the tested
+probe uses the existing FP16 vector loader. No serving KV representation changes.
+
+Available Triton caches share 189 compilation identities; 91 cubin hashes
+differ. For those 91 entries, PTX agrees after excluding debug location/file
+sections and assert-filename strings. This rules out a PTX arithmetic change
+in those shared artifacts, not a change in actual dispatch, arguments or
+machine-code behavior. All raw hashes and the excluded differences are retained.
+
+Native manifests for this stage:
+
+| Candidate | Source SHA256 | DSO SHA256 |
+| --- | --- | --- |
+| q1 six-head KV reuse | `e624c2f2c2eaa0d770b46aef7d2b4f84a710bc895bf0141b4670fd21ba498f69` | `8d6ede73f56b9edc270eab507d23d56f437567db362263c96d60b2a5ae05f98a` |
+| four-producer QK/PV | `b005452e565468012b25a6f53c297ebc9a3482adde545ac041bfd170b264cde4` | `7dab6ff2d14e60a6f2c9803b9039bceeefc0dd879005f9333beef20d8ede8b99` |
+| six-producer QK/PV | `a79561fc9c1a8a0a06590455e8e3d64807efb70a6aed412a50abdf229a1c12f7` | `1e9da088a750af9892b8c50a12187c652e3061dbd645091152cba7ed01a8b74b` |
+| lossless decoded mirror probe | `eca466df3e1a64c945627e70447470250b83a1683cb6a2b32fd23724d06071e5` | `c31c0a3c136f453ea3f2b27f0fdd1275d3c29963ec3aa0ded889100651b0aeba` |

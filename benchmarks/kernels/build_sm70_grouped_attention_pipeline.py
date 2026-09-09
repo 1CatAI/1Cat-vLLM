@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Private SM70 QK/PV warp pipeline; no serving route is installed.
 
-Eight producer warps and sixteen consumer warps share two score/value panels.
+Four to eight producer warps and sixteen consumers share two score/value panels.
 Named ready/free barriers protect each panel. K16 compensation, N32 updates,
 80 logical partitions and the final merge are copied from the audited source.
 """
@@ -154,8 +154,12 @@ void grouped_pipeline_partial_kernel(
 
 
 def pipeline_source(
-    source: str, serialize: bool = False, debug_first_tile: bool = False
+    source: str,
+    serialize: bool = False,
+    debug_first_tile: bool = False,
+    producer_warps: int = 8,
 ) -> str:
+    assert producer_warps in (4, 6, 8)
     start = source.index("__launch_bounds__(kGroupedVerifyThreads, 1) void ")
     end = source.index(
         "template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY, typename PARTIAL_T",
@@ -203,8 +207,50 @@ def pipeline_source(
         "  __syncthreads();", "  pipeline_sync<kPipelineThreads>(8);", 1
     )
     assert "__syncthreads" not in tail
+    prefix = replace_once(
+        PREFIX,
+        "constexpr int kPipelineProducerThreads = 256;",
+        f"constexpr int kPipelineProducerThreads = {producer_warps * 32};",
+    )
+    prefix = replace_once(
+        prefix,
+        "constexpr int kPipelineThreads = 768;",
+        f"constexpr int kPipelineThreads = {producer_warps * 32 + 512};",
+    )
+    if producer_warps == 4:
+        # Six/eight producers both still spill at the resource limit. Reuse
+        # four producer warps across the six independent QK output tiles;
+        # each tile retains the original K16 products and corrections.
+        qk_start = source.index(
+            "template <bool COMPENSATE = false>\n"
+            "__device__ __forceinline__ void grouped_verify_qk("
+        )
+        qk_end = source.index(
+            "__device__ __forceinline__ void grouped_verify_scale_output_fragment(",
+            qk_start,
+        )
+        qk = source[qk_start:qk_end].rstrip()
+        qk = replace_once(qk, "void grouped_verify_qk(", "void pipeline_qk(")
+        qk = replace_once(qk, "warp_id >= kGroupedVerifyQKWarps", "warp_id >= 4")
+        qk = replace_once(
+            qk,
+            "  if ((active_m_tiles & (1 << m_tile)) == 0) {\n    return;\n  }",
+            "  if ((active_m_tiles & (1 << m_tile)) == 0) {\n    continue;\n  }",
+        )
+        qk = qk.replace("m_tile = warp_id /", "m_tile = qk_tile /")
+        qk = qk.replace("n_tile = warp_id %", "n_tile = qk_tile %")
+        loop = qk.index("  const int m_tile =")
+        assert qk.endswith("}")
+        qk = (
+            qk[:loop]
+            + "  for (int qk_tile = warp_id; qk_tile < kGroupedVerifyQKWarps; "
+            "qk_tile += 4) {\n" + qk[loop:-1] + "  }\n}\n"
+        )
+        prefix = qk + replace_once(
+            prefix, "grouped_verify_qk<true>", "pipeline_qk<true>"
+        )
     kernel = (
-        PREFIX
+        prefix
         + softmax
         + "    pipeline_sync<kPipelineConsumerThreads>(6);\n"
         + pv
@@ -263,6 +309,7 @@ def main() -> None:
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--serialize", action="store_true")
     parser.add_argument("--debug-first-tile", action="store_true")
+    parser.add_argument("--producer-warps", type=int, choices=(4, 6, 8), default=8)
     args = parser.parse_args()
     base = json.loads(args.base_manifest.read_text())
     if not (
@@ -275,7 +322,10 @@ def main() -> None:
     source_file = source_dir / "kernel/grouped-attention.cu"
     assert hashlib.sha256(source_file.read_bytes()).hexdigest() == base["source_sha256"]
     source = pipeline_source(
-        source_file.read_text(), args.serialize, args.debug_first_tile
+        source_file.read_text(),
+        args.serialize,
+        args.debug_first_tile,
+        args.producer_warps,
     )
     directory = args.output_dir.resolve()
     if directory.exists():
@@ -296,6 +346,7 @@ def main() -> None:
         warp_pipeline=True,
         serialized_diagnostic=args.serialize,
         debug_first_tile=args.debug_first_tile,
+        producer_warps=args.producer_warps,
         source_files={
             str(p.relative_to(sources)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(sources.rglob("*"))
