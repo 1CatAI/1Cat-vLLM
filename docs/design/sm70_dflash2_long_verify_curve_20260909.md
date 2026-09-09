@@ -13,12 +13,13 @@ E4M3 target KV, FP32 logits/state and the existing compensated attention.
 Original FlashQLA GDN prefill and the verified FA2 sidecar stay enabled.
 Capacity remains 262144; measured inputs stop at 131072 tokens.
 
-For adjacent lengths 32K/64K/128K, candidate complete-round growth must not
-exceed frozen baseline cold-prefill unit-token cost growth. Every long-context
-absolute round cost must improve, and 1K must not regress. The initial
-diagnostic reference ratios are 1.115, 1.211 and 1.350 for 32→64, 64→128 and
-32→128 respectively. Freeze the final ratios after three independent baseline
-startups; never relax them by slowing prefill or the shorter decode point.
+The user revised the objective on September 10: continuously reduce absolute
+complete-round cost and the incremental cost of longer contexts. Prefill
+growth ratios are reference observations, not admission limits or a stopping
+condition. Every long-context absolute round cost must improve, 1K must not
+regress, and context increments must not increase. Report both additional
+milliseconds and milliseconds per 1024 additional context tokens. Never
+improve a ratio by slowing the shorter point, prefill or acceptance.
 
 ## Implementation order
 
@@ -43,14 +44,18 @@ Three baseline startups completed 72 requests, with identical token IDs and
 acceptance across and within startups at every length. The baseline median
 complete rounds at 1K/32K/64K/128K are 16.350/25.821/35.047/53.267 ms.
 Cold-prefill throughput is 3525/4063/3640/3009 tokens/s. The frozen growth
-limits are 1.1163476857, 1.2095236995 and 1.3502489828 for 32→64, 64→128 and
-32→128. First-use prefill overhead affects the first 1K request; medians use
+reference ratios are 1.1163476857, 1.2095236995 and 1.3502489828 for 32→64,
+64→128 and 32→128. The original frozen report remains immutable even though
+these ratios no longer gate admission. First-use prefill overhead affects the
+first 1K request; medians use
 the three independent cold observations, and 1K is not the curve denominator.
 
 The curve reporter verifies distinct worker startups, the full computed-token
 count for cold requests and five measured requests per length. Its percentiles
 describe request-average round costs, not individual GPU-round latency. It
-refuses to overwrite a frozen curve and checks absolute costs as well as ratios.
+refuses to overwrite a frozen curve and checks absolute costs and context
+increments. A candidate can now pass despite exceeding the prefill ratio;
+slowing an anchor still fails the absolute-cost gate.
 
 The separate 128K trace measures 36.849 ms target grouped attention per
 rank/round, versus about 7.317 ms of QPN2 projections, 0.878 ms of draft
@@ -113,9 +118,9 @@ synccheck with zero errors/warnings. Its first unprofiled startup gives
 16.133/22.068/27.824/38.765 ms complete rounds at 1K/32K/64K/128K, with identical
 token IDs, finish reasons and acceptance to the frozen control. All four
 ranks capture the candidate in 16 actual target attention calls. This is an
-independent screen, not three-startup curve acceptance; the growth gates
-still fail. The combined V-prefetch model screen requires its own native
-sanitizer gates before launch.
+independent screen, not three-startup acceptance. It failed the superseded
+prefill-ratio gate. Subsequent V-prefetch and qk2/page/V-prefetch candidates
+each passed their own memory/race/synchronization checks before model screening.
 
 The actual model capture uses a 3296-token KV page with strides
 `(1687552, 256, 256, 1)`. The initial sixteen-layer performance screen used
@@ -125,7 +130,40 @@ timing the exact captured page geometry. The loader also retains the
 
 Private launch/build manifests and raw results are retained in the task
 artifact archive; generated libraries and private cache paths are excluded
-from Git. No new production route or default has been enabled.
+from Git. The new serving route remains explicitly opt-in and has not been
+enabled by default or merged.
+
+## September 10 implementation and rejected candidates
+
+The qk2/page/V-prefetch operator takes 2.401/4.417/8.444 ms for sixteen
+independent layer allocations at 32K/64K/128K with actual 3296-token pages.
+The corresponding initial model startup gives 16.143/18.521/20.484/24.452 ms
+at 1K/32K/64K/128K. Tokens and acceptance match the frozen baseline. This
+still requires integrated-route quality and repeated-startup admission.
+
+Next-K prefetch preserves byte-exact output and full FP32 workspace, but
+both tested load/softmax warp partitions lose performance. Eight load warps
+cost 8.815 ms at 128K versus the 8.439 ms paired control; four load warps
+cost 9.394 versus 8.444 ms. The extra warp-role work outweighs the overlap.
+Neither is selected for serving. The extended byte gate covers 132096 visible
+tokens, providing bounded generation headroom after a 128K input.
+
+Increasing to 160/320 splits also loses: 128K costs 9.002/9.897 ms versus
+8.469 ms for 80. The independent FP64 screen records final-FP16 max error
+0.001952 for all three at 128K; this does not replace a native pre-cast FP32
+audit or model admission. Arithmetic variants remain rejected and disabled.
+
+`VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST` enables the experimental loader and
+an additional MRV2 B1/q8 graph. The loader verifies the actual DSO SHA and
+module identity, accepts the 80-split six-head workspace, and retains native
+input validation. Eligibility depends on q8/GQA6/D256 E4M3 tensors and
+validated 1648/3296 page layouts, not target weight quantization or model name.
+The descriptor carries a 132096-token upper bound; replay chooses it from
+the existing CPU sequence-length upper bound. Larger bounds and other shapes
+retain the full-context graph. No device-to-host length read is introduced.
+Workspaces are fixed per operator source SHA, capacity, device and CUDA stream.
+CPU tests cover the boundary, fallback, switching back, missing captures and
+refusal to read a device hint. Native graph-switch/model gates remain pending.
 
 Prior rejected experiments remain recorded in the context-cost and long-verify
 worklogs. Historical E5M2 and FP16-partial Pack-GQA timings are design references,

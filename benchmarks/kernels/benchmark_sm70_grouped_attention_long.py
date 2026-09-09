@@ -27,7 +27,7 @@ def load_operator(manifest_path):
     return module.run, manifest
 
 
-def make_case(rows, page, length, num_arms, stride_padding=0):
+def make_case(rows, page, length, num_arms, stride_padding=0, split_counts=None):
     pages = (length + page - 1) // page
     raw = torch.randn((pages, 2, page, 1, 256), device="cuda", dtype=torch.float16)
     raw[:, 1].add_(torch.linspace(-4, 4, 256, device="cuda"))
@@ -43,7 +43,9 @@ def make_case(rows, page, length, num_arms, stride_padding=0):
         length - rows + 1, length + 1, device="cuda", dtype=torch.int32
     )
     arms = []
-    for _ in range(num_arms):
+    split_counts = split_counts or [80] * num_arms
+    assert len(split_counts) == num_arms
+    for splits in split_counts:
         guard = torch.full(
             (rows + 2, 6, 256), -777.0, device="cuda", dtype=torch.float16
         )
@@ -52,10 +54,10 @@ def make_case(rows, page, length, num_arms, stride_padding=0):
                 "guard": guard,
                 "out": guard[1:-1],
                 "partial": torch.full(
-                    (80, 8, 6, 256), -777.0, device="cuda", dtype=torch.float32
+                    (splits, 8, 6, 256), -777.0, device="cuda", dtype=torch.float32
                 ),
                 "lse": torch.full(
-                    (80, 8, 6, 2), -777.0, device="cuda", dtype=torch.float32
+                    (splits, 8, 6, 2), -777.0, device="cuda", dtype=torch.float32
                 ),
             }
         )
@@ -146,9 +148,14 @@ def main():
         (8, 1648, 3297, 8),
     ]
     if not args.short:
-        cases += [(5, 1648, 32768, 0), (8, 1648, 65536, 0), (8, 3296, 131072, 0)]
+        cases += [
+            (5, 1648, 32768, 0),
+            (8, 1648, 65536, 0),
+            (8, 3296, 131072, 0),
+            (8, 3296, 132096, 0),  # 128K prompt plus bounded generation headroom.
+        ]
     if args.sanitizer:
-        cases = [(8, 1648, 1649, 0), (8, 1648, 3297, 8)]
+        cases = [(8, 1648, 1649, 0), (8, 1648, 3297, 8), (8, 3296, 6593, 0)]
     for rows, page, length, padding in cases:
         case = make_case(rows, page, length, len(operators), padding)
         graphs = []

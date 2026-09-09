@@ -90,6 +90,50 @@ def summarize(paths):
     return result
 
 
+def context_increments(rows):
+    result = {}
+    for a, b in INTERVALS:
+        start = rows[str(a)]["complete_round_ms"]
+        end = rows[str(b)]["complete_round_ms"]
+        result[f"{a}:{b}"] = {
+            "additional_round_ms": end - start,
+            "round_ms_per_1024_context_tokens": (end - start) / ((b - a) / 1024),
+            "round_growth_ratio": end / start,
+        }
+    return result
+
+
+def compare_performance(result, baseline):
+    """Require absolute/increment improvement; prefill ratios are context only."""
+    assert result["contract"] == baseline["contract"]
+    checks = {}
+    for length in LENGTHS:
+        current = result["rows"][str(length)]["complete_round_ms"]
+        previous = baseline["rows"][str(length)]["complete_round_ms"]
+        checks[f"absolute_{length}"] = (
+            current <= previous if length == 1024 else current < previous
+        )
+    previous_increments = context_increments(baseline["rows"])
+    current_increments = context_increments(result["rows"])
+    for interval, current in current_increments.items():
+        previous = previous_increments[interval]
+        current["baseline_additional_round_ms"] = previous["additional_round_ms"]
+        current["increment_reduction_ms"] = (
+            previous["additional_round_ms"] - current["additional_round_ms"]
+        )
+        checks[f"increment_{interval}"] = current["increment_reduction_ms"] >= 0
+    result["context_increments"] = current_increments
+    result["curve_checks"] = checks
+    result["performance_curve_passed"] = all(checks.values())
+    result["prefill_growth_reference"] = {
+        f"{a}:{b}": baseline["rows"][str(a)]["cold_prefill_tps"]
+        / baseline["rows"][str(b)]["cold_prefill_tps"]
+        for a, b in INTERVALS
+    }
+    result["prefill_growth_is_admission_gate"] = False
+    result["quality_and_acceptance_admission"] = "Requires separate paired evidence"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reports", nargs=3, type=Path, required=True)
@@ -99,32 +143,17 @@ def main():
     if args.output.exists():
         raise FileExistsError("Refusing to overwrite a frozen curve")
     result = summarize(args.reports)
+    result["objective"] = "Reduce absolute round cost and long-context increments"
+    result["context_increments"] = context_increments(result["rows"])
     if args.baseline is None:
-        result["frozen_prefill_growth_limits"] = {
+        result["prefill_growth_reference"] = {
             f"{a}:{b}": result["rows"][str(a)]["cold_prefill_tps"]
             / result["rows"][str(b)]["cold_prefill_tps"]
             for a, b in INTERVALS
         }
     else:
         baseline = json.loads(args.baseline.read_text())
-        assert result["contract"] == baseline["contract"]
-        checks = {}
-        for length in LENGTHS:
-            current = result["rows"][str(length)]["complete_round_ms"]
-            previous = baseline["rows"][str(length)]["complete_round_ms"]
-            checks[f"absolute_{length}"] = (
-                current <= previous if length == 1024 else current < previous
-            )
-        for a, b in INTERVALS:
-            growth = (
-                result["rows"][str(b)]["complete_round_ms"]
-                / result["rows"][str(a)]["complete_round_ms"]
-            )
-            limit = baseline["frozen_prefill_growth_limits"][f"{a}:{b}"]
-            checks[f"growth_{a}:{b}"] = growth <= limit
-        result["curve_checks"] = checks
-        result["performance_curve_passed"] = all(checks.values())
-        result["quality_and_acceptance_admission"] = "Requires separate paired evidence"
+        compare_performance(result, baseline)
         result["baseline_sha256"] = hashlib.sha256(
             args.baseline.read_bytes()
         ).hexdigest()

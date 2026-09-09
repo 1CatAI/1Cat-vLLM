@@ -90,6 +90,64 @@ def prefetch_values(source: str) -> str:
     return source
 
 
+def prefetch_keys(source: str, key_load_warps: int) -> str:
+    """Overlap the next K panel with softmax using dedicated load warps."""
+    start = source.index("__launch_bounds__(kGroupedVerifyThreads, 1) void ")
+    end = source.index(
+        "void flash_attention_grouped_verify_e5m2_combine_kernel(", start
+    )
+    partial = source[start:end]
+    loop_start = partial.rindex("  for (int tile_start = split_start;")
+    loop = partial[loop_start:]
+    barrier = "    __syncthreads();"
+    load_start = loop.index("    load_xqa_tc_kv_panel<")
+    load_end = loop.index(barrier, load_start) + len(barrier)
+    load = loop[load_start:load_end]
+    # The first panel is loaded by the whole CTA. Subsequent panels are ready
+    # at the previous tile's softmax barrier, before PV consumes disjoint V.
+    loop = (
+        loop[:load_start]
+        + "    if (tile_start == split_start) {\n"
+        + load
+        + "\n    }\n"
+        + loop[load_end:]
+    )
+    load = load[: load.rfind(barrier)]
+    load = load.replace("kGroupedVerifyThreads", "kKeyLoadThreads")
+    load = load.replace("idx = tid +", "idx = key_load_tid +")
+    load = load.replace("valid_k_rows", "next_k_rows")
+    load = load.replace("tile_page_offset", "next_page_offset")
+    load = replace_once(
+        load,
+        "k_block_stride, k_token_stride, k_head_stride, 0);",
+        "k_block_stride, k_token_stride, k_head_stride, 0, key_load_tid);",
+    )
+    softmax_start = loop.index(
+        "#pragma unroll\n      for (int row = warp_id; row < kGroupedVerifyRows;"
+    )
+    softmax_end = loop.index("      __syncthreads();", softmax_start)
+    softmax = loop[softmax_start:softmax_end]
+    softmax = replace_once(
+        softmax, "row += kGroupedVerifyWarps)", "row += kSoftmaxWarps)"
+    )
+    replacement = (
+        f"      constexpr int kSoftmaxWarps = {16 - key_load_warps};\n"
+        "      if (warp_id < kSoftmaxWarps) {\n"
+        + softmax
+        + "      } else if (tile_start + kGroupedVerifyBlockN < split_end) {\n"
+        "        constexpr int kKeyLoadThreads = "
+        "kGroupedVerifyThreads - kSoftmaxWarps * kWarpSize;\n"
+        "        const int key_load_tid = tid - kSoftmaxWarps * kWarpSize;\n"
+        "        const int next_k_rows = min(kGroupedVerifyBlockN, "
+        "split_end - tile_start - kGroupedVerifyBlockN);\n"
+        "        const int next_page_offset = tile_page_offset + "
+        "kGroupedVerifyBlockN;\n" + load + "      }\n"
+    )
+    loop = loop[:softmax_start] + replacement + loop[softmax_end:]
+    partial = partial[:loop_start] + loop
+    return source[:start] + partial + source[end:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -98,11 +156,16 @@ def main() -> None:
     parser.add_argument("--vector-load", action="store_true")
     parser.add_argument("--page-specialize", action="store_true")
     parser.add_argument("--prefetch-v", action="store_true")
+    parser.add_argument("--prefetch-k", action="store_true")
+    parser.add_argument("--prefetch-k-warps", type=int, choices=(4, 8), default=8)
+    parser.add_argument("--splits", type=int, choices=(80, 160, 320), default=80)
     parser.add_argument("--grouped-only", action="store_true")
     parser.add_argument("--build", action="store_true")
     args = parser.parse_args()
     if args.prefetch_v and args.head_groups != 1:
         parser.error("--prefetch-v currently requires --head-groups 1")
+    if args.prefetch_k and not (args.prefetch_v and args.grouped_only):
+        parser.error("--prefetch-k requires --prefetch-v and --grouped-only")
     root = Path(__file__).resolve().parents[2] / "flash-attention-v100"
     original = root / "kernel/flash_decode_paged.cu"
     source = original.read_text()
@@ -187,6 +250,8 @@ def main() -> None:
         source = replace_once(source, marker, "".join(statements) + marker)
     if args.prefetch_v:
         source = prefetch_values(source)
+    if args.prefetch_k:
+        source = prefetch_keys(source, args.prefetch_k_warps)
     barrier = """        __syncwarp();
         if (lane_id == 0) {
           if (tile_sum > 0.0f) {"""
@@ -225,6 +290,23 @@ def main() -> None:
             "MAX_QUERY_TOKENS * kHeadsPerCta == kGroupedVerifyRows,",
             "MAX_QUERY_TOKENS * kHeadsPerCta <= kGroupedVerifyRows,",
         )
+    if args.splits != 80:
+        source = replace_once(
+            source,
+            "constexpr int kGroupedVerifyQ8Splits = 80;",
+            f"constexpr int kGroupedVerifyQ8Splits = {args.splits};",
+        )
+        for old, new in (
+            ("{80, 8, 6, 256}", f"{{{args.splits}, 8, 6, 256}}"),
+            ("{80, 8, 6, 2}", f"{{{args.splits}, 8, 6, 2}}"),
+            ("[80,8,6,256]", f"[{args.splits},8,6,256]"),
+            ("[80,8,6,2]", f"[{args.splits},8,6,2]"),
+            (
+                f"kernel<<<dim3({args.head_groups}, 80),",
+                f"kernel<<<dim3({args.head_groups}, {args.splits}),",
+            ),
+        ):
+            source = replace_once(source, old, new)
     source = replace_once(
         source,
         "flash_attention_grouped_e4m3_fp32_paged(",
@@ -276,6 +358,9 @@ def main() -> None:
         "vector_load": args.vector_load,
         "page_specialize": args.page_specialize,
         "prefetch_v": args.prefetch_v,
+        "prefetch_k": args.prefetch_k,
+        "prefetch_k_warps": args.prefetch_k_warps if args.prefetch_k else None,
+        "splits": args.splits,
         "grouped_only": args.grouped_only,
         "extra_cuda_cflags": flags,
         "scope": "Private operator candidate; full-model admission required",
