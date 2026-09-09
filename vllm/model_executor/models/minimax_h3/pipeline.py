@@ -658,8 +658,11 @@ class MiniMaxH3Pipeline(nn.Module):
 
     @torch.inference_mode()
     def forward(self, request: H3Request):
+        from vllm.media.progress import report
+
         self.stage_durations = {}
         self.actual_dit_calls = 0
+        report("encoding")
         started = time.perf_counter()
         context = self._prepare_request_inputs(
             prompt=request.prompt,
@@ -681,6 +684,7 @@ class MiniMaxH3Pipeline(nn.Module):
             time.perf_counter() - started
         )
         started = time.perf_counter()
+        report("decoding")
         video, audio = self.decode(
             video_latent, audio_latent, height=context["height"], width=context["width"]
         )
@@ -1554,12 +1558,22 @@ class MiniMaxH3Pipeline(nn.Module):
             video_outputs=int(branch.update_mask.sum()),
             audio_outputs=int(branch.audio_update_mask.sum()),
         )
+        from vllm.media.progress import report
+
+        report("loading_weights")
         with self._resident_dit_layers_on_device(enabled=True):
             torch.accelerator.synchronize()
             dist.barrier()
             torch.accelerator.synchronize()
             started = time.perf_counter()
-            with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
+            total = len(inputs["sigmas_video"]) - 1
+            report("denoising", completed=0, total=total)
+            with self.progress_bar(total=total) as progress:
+
+                def on_step(step, video, audio):
+                    progress.update()
+                    report("denoising", completed=step + 1, total=total)
+
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=transformer,
                     positive=branch,
@@ -1576,7 +1590,7 @@ class MiniMaxH3Pipeline(nn.Module):
                     audio_cond_noise_aug_for_inference=(
                         MINIMAX_H3_AUDIO_REF_COND_TIMESTEP
                     ),
-                    on_step=lambda step, video, audio: progress.update(),
+                    on_step=on_step,
                 )
             torch.accelerator.synchronize()
             dist.barrier()

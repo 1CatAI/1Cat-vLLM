@@ -17,7 +17,7 @@ class RecordingEngine:
     def __init__(self, config):
         self.config = config
 
-    def generate(self, request, output):
+    def generate(self, request, output, *, on_progress=None):
         self.requests.append(request)
         Path(output).mkdir(parents=True)
         (Path(output) / "video.mp4").write_bytes(b"test video")
