@@ -69,7 +69,7 @@ def test_flashattn_d128_storage_and_different_q_k_lengths(layout, key_tile, quer
 
 
 def test_flashattn_dispatch_slices_poisoned_padding(monkeypatch):
-    from vllm.model_executor.models.minimax_h3 import cuda_ops
+    from vllm.model_executor.layers import sm70_attention as cuda_ops
 
     native = flashattn_extension()
     calls = []
