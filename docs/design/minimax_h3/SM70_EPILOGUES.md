@@ -136,3 +136,37 @@ was rejected at compilation: CUTLASS Volta MMA requires a multiple of its
 interleaved tile shape. No GPU run or production change followed. Supporting
 that geometry requires new MMA and accumulator iterators, not another
 configuration-only benchmark of the rejected shape.
+
+## Mixed-reference eight-step control
+
+Source `2063b09f2d75c4a63af3f90a3b7803744ffc6e02` completes Ref2VA with the
+official eight-step v1.0_768p adapter, W8A16 Ref2VA base, seed 42 and one image,
+one 2.5-second reference video plus one standalone audio reference. The video
+start time is zero. The output remains 1280x736/124 internal frames for the
+five-second request. This control uses 69,325 valid DiT tokens and a 10,273-token
+Qwen presentation, exercising mixed reference indices and padded residual rows.
+
+`ref8-mixed-quality.json` passes all gates against frozen native mainline:
+video/audio latents, all RGB frames and PCM are bitwise equal; PSNR infinity,
+SSIM 1, RMS ratio 1. Candidate settings include prepared execution, exact
+residual sharding, query tile 128 and explicit shared pageable VAE host weights.
+The frozen control uses its ordinary query-64 path and pinned host masters.
+Host residency changes byte ownership/transfers, not GPU arithmetic.
+
+Single captured cold denoise times are 421.173489 seconds for the frozen
+control and 366.799932 seconds for the candidate; request times are
+586.794155 and 454.461091 seconds. Peak GPU allocation is 19,623,684,096 and
+19,615,279,104 bytes/card respectively. The candidate reports corrected useful
+throughput 52.919225–52.919231 TFLOP/s/card. These runs lack full warmup and
+three measurements and have different host staging policies, so they do not
+qualify either performance or attribution to an individual optimization.
+Independent official quality, audiovisual/reference review and other reference
+combinations remain pending. Raw contracts and media are retained in
+`/home/ymzx/h3-sm70-artifacts-20260909/runs/ref8-mixed-720p-{baseline,candidate}/`.
+
+Two additional CTA-barrier coalescing candidates preserve bitwise edge and
+34,551-token results. The second passes 20 synccheck and racecheck geometries
+with zero errors/hazards. Their paired operator gains are only 0.3–0.6%, so
+neither is retained or promoted to a full-request performance claim. Evidence:
+`attention-barrier-coalesce/`, `attention-barrier-coalesce-v2/` and the
+`barrier-v2-*.log` files under the campaign root.
