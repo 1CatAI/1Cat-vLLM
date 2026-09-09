@@ -285,6 +285,143 @@ def pair_qk_products(source: str) -> str:
     return source[:start] + qk + source[end:]
 
 
+def retain_fp32_output(source: str) -> str:
+    """Expose the final FP32 accumulator for an independent numerical audit."""
+    symbol = source.index("void flash_attention_grouped_verify_e5m2_combine_kernel(")
+    start = source.rfind("template <", 0, symbol)
+    end = source.index("\ntemplate <", symbol)
+    combine = source[start:end]
+    for old, new in (
+        ("__half* __restrict__ out,", "float* __restrict__ out,"),
+        ("__float2half_rn(0.0f)", "0.0f"),
+        ("__float2half_rn(accumulator)", "accumulator"),
+    ):
+        combine = replace_once(combine, old, new)
+    source = source[:start] + combine + source[end:]
+    start = source.index("at::Tensor flash_attention_grouped_e4m3_fp32_paged(")
+    host = source[start:]
+    for old, new in (
+        ("out.scalar_type() == at::kHalf", "out.scalar_type() == at::kFloat"),
+        ("output must be contiguous FP16", "audit output must be contiguous FP32"),
+        (
+            "reinterpret_cast<__half*>(out.data_ptr())",
+            "reinterpret_cast<float*>(out.data_ptr())",
+        ),
+    ):
+        host = replace_once(host, old, new)
+    return source[:start] + host
+
+
+def accumulate_qk_fp64(source: str) -> str:
+    """Arithmetic experiment: sum the unchanged K16 products with FP64 adds.
+
+    This is not an exact scheduling optimization. Even if a sampled output
+    agrees, independent pre-cast reference and model audits remain mandatory.
+    """
+    start = source.index("template <bool COMPENSATE = false>")
+    end = source.index("void grouped_verify_scale_output_fragment(", start)
+    qk = source[start:end]
+    qk = replace_once(qk, "float correction[8] = {};", "double wide_sum[8] = {};")
+    qk = replace_once(
+        qk,
+        """      // E4M3 x FP16 products fit comfortably in FP32, but a D256 Tensor
+      // Core accumulation can still lose low bits. Sum short K16 products
+      // with compensated FP32 additions; explicit RN operations preserve
+      // the correction under the standard fast-math build.""",
+        """      // Arithmetic probe: retain each original FP32 K16 Tensor Core
+      // product, but sum those products in FP64 before the final FP32 cast.
+      // This needs an independent reference audit; it is not bit-exact by
+      // construction and is not admitted by an operator timing result.""",
+    )
+    qk = replace_once(
+        qk,
+        """        const float y = __fsub_rn(tile_fragment.x[i], correction[i]);
+        const float sum = __fadd_rn(score_fragment.x[i], y);
+        correction[i] = __fsub_rn(__fsub_rn(sum, score_fragment.x[i]), y);
+        score_fragment.x[i] = sum;""",
+        """        wide_sum[i] = __dadd_rn(
+            wide_sum[i], static_cast<double>(tile_fragment.x[i]));""",
+    )
+    qk = replace_once(
+        qk,
+        "    score_fragment.x[i] *= qk_scale;",
+        """    if constexpr (COMPENSATE) {
+      score_fragment.x[i] = __double2float_rn(wide_sum[i]) * qk_scale;
+    } else {
+      score_fragment.x[i] *= qk_scale;
+    }""",
+    )
+    return source[:start] + qk + source[end:]
+
+
+def specialize_full_q8(source: str, visible_tiles: bool) -> str:
+    """Remove variable-Q branches only when all eight query rows exist.
+
+    Per-row GPU lengths remain authoritative. The optional all-visible branch
+    requires the complete N32 tile to precede the minimum of all eight lengths;
+    padding, rejected rows and the causal tail use the original visibility code.
+    """
+    old_name = "flash_attention_grouped_verify_e5m2_partial_kernel"
+    new_name = "flash_attention_grouped_verify_e4m3_full_q8_kernel"
+    start = source.index(
+        "template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE"
+    )
+    end = source.index("template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY", start)
+    partial = source[start:end].replace(old_name, new_name)
+    partial = replace_once(
+        partial, "const int query_len,", "const int runtime_query_len,"
+    )
+    partial = replace_once(
+        partial,
+        "  using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;",
+        "  static_assert(MAX_QUERY_TOKENS == 8 && COMPENSATE_P &&\n"
+        '      ROW_SEQLENS && !SPARSE_PAGE4, "Full q8 compensated contract");\n'
+        "  if (runtime_query_len != 8) return;\n"
+        "  constexpr int query_len = 8;\n"
+        "  using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;",
+    )
+    if visible_tiles:
+        loop_start = partial.index("  // Recompute QK for the conservative path")
+        partial = (
+            partial[:loop_start] + "  int minimum_visible_length = row_lengths[0];\n"
+            "#pragma unroll\n"
+            "  for (int i = 1; i < 8; ++i)\n"
+            "    minimum_visible_length =\n"
+            "        min(minimum_visible_length, row_lengths[i]);\n"
+            + partial[loop_start:]
+        )
+        begin = partial.index(
+            "#pragma unroll\n      for (int row = warp_id;", loop_start
+        )
+        finish = partial.index("      __syncthreads();", begin)
+        original = partial[begin:finish]
+        visible = original
+        a = visible.index("        const bool visible =")
+        b = visible.index("        const float score =", a)
+        visible = visible[:a] + "        constexpr bool visible = true;\n" + visible[b:]
+        partial = (
+            partial[:begin] + "      if (tile_start + kGroupedVerifyBlockN <=\n"
+            "          minimum_visible_length) {\n"
+            + visible
+            + "      } else {\n"
+            + original
+            + "      }\n"
+            + partial[finish:]
+        )
+    source = source[:end] + partial + source[end:]
+    host_start = source.index("  auto kernel =", source.index("at::Tensor "))
+    host_end = source.index("  constexpr int kCompensatedSmemBytes", host_start)
+    selection = source[host_start:host_end].replace("auto kernel =", "kernel =", 1)
+    selection = selection.replace(old_name, new_name)
+    return (
+        source[:host_end]
+        + "  if (q.size(0) == 8) {\n"
+        + selection
+        + "  }\n"
+        + source[host_end:]
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -297,6 +434,10 @@ def main() -> None:
     parser.add_argument("--prefetch-k-warps", type=int, choices=(4, 8), default=8)
     parser.add_argument("--reuse-pv-values", action="store_true")
     parser.add_argument("--qk-paired-products", action="store_true")
+    parser.add_argument("--qk-fp64-sum", action="store_true")
+    parser.add_argument("--specialize-full-q8", action="store_true")
+    parser.add_argument("--all-visible-tiles", action="store_true")
+    parser.add_argument("--diagnostic-output-fp32", action="store_true")
     parser.add_argument("--splits", type=int, choices=(80, 160, 320), default=80)
     parser.add_argument("--grouped-only", action="store_true")
     parser.add_argument("--build", action="store_true")
@@ -312,6 +453,18 @@ def main() -> None:
         and not args.prefetch_k
     ):
         parser.error("--reuse-pv-values needs six heads, V prefetch and grouped-only")
+    if args.specialize_full_q8 and not (
+        args.grouped_only and args.head_groups == 1 and args.reuse_pv_values
+    ):
+        parser.error("Full-q8 specialization requires the six-head PV-reuse path")
+    if args.all_visible_tiles and not args.specialize_full_q8:
+        parser.error("Visible-tile specialization requires --specialize-full-q8")
+    if args.qk_fp64_sum and not (
+        args.grouped_only and args.head_groups == 1 and not args.qk_paired_products
+    ):
+        parser.error("FP64 K16 accumulation needs an isolated six-head grouped build")
+    if args.diagnostic_output_fp32 and not args.grouped_only:
+        parser.error("Pre-cast FP32 output is an isolated grouped-operator audit")
     root = Path(__file__).resolve().parents[2] / "flash-attention-v100"
     original = root / "kernel/flash_decode_paged.cu"
     source = original.read_text()
@@ -406,6 +559,8 @@ def main() -> None:
                 "QK paired products require grouped-only, six heads and unroll1"
             )
         source = pair_qk_products(source)
+    if args.qk_fp64_sum:
+        source = accumulate_qk_fp64(source)
     barrier = """        __syncwarp();
         if (lane_id == 0) {
           if (tile_sum > 0.0f) {"""
@@ -461,6 +616,10 @@ def main() -> None:
             ),
         ):
             source = replace_once(source, old, new)
+    if args.specialize_full_q8:
+        source = specialize_full_q8(source, args.all_visible_tiles)
+    if args.diagnostic_output_fp32:
+        source = retain_fp32_output(source)
     source = replace_once(
         source,
         "flash_attention_grouped_e4m3_fp32_paged(",
@@ -514,6 +673,11 @@ def main() -> None:
         "prefetch_v": args.prefetch_v,
         "prefetch_k": args.prefetch_k,
         "prefetch_k_warps": args.prefetch_k_warps if args.prefetch_k else None,
+        "specialize_full_q8": args.specialize_full_q8,
+        "all_visible_tiles": args.all_visible_tiles,
+        "qk_fp64_sum": args.qk_fp64_sum,
+        "arithmetic_change": args.qk_fp64_sum or args.splits != 80,
+        "diagnostic_output_fp32": args.diagnostic_output_fp32,
         "reuse_pv_values": args.reuse_pv_values,
         "qk_paired_products": args.qk_paired_products,
         "splits": args.splits,

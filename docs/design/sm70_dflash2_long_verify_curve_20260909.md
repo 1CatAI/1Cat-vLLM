@@ -657,3 +657,74 @@ The timestamp probe also passes its own memcheck, racecheck and synccheck,
 including full 262144 visibility, page crossing, graph replay and timestamp
 canaries. These checks validate the diagnostic; they do not remove its timing
 overhead or grant model admission to another operator.
+
+## Fixed-q8 tile specialization and a separate arithmetic screen
+
+The fixed-q8 prototype clones the existing partial kernel with a constant
+query-row count, selected only when the actual query shape has eight rows.
+Queries with two through seven rows retain the original kernel. A second
+variant removes visibility checks only when the complete N32 tile precedes
+the minimum of all eight GPU row lengths. Zero-length and rejected rows,
+partial tiles and the causal tail retain the original masking. No CPU copy of
+GPU lengths is introduced. All 80 logical partitions, K16 compensation,
+probability residual products and N32 numerator/max/sum updates are unchanged.
+
+The two variants pass 130 byte-equality checks in total, including full FP32
+workspaces. Sixteen-layer worksets show that fixed-q8 specialization alone
+regresses 128K/261888 from 7.816/15.092 to 7.932/15.325 ms and is rejected.
+Adding the complete-visible-tile specialization reaches 7.703/14.872 ms,
+approximately 1.4% faster than the PV-reuse parent. The smaller gain needs a
+same-startup complete-round A/B against that parent, using separate MRV2
+graphs; operator timing does not establish service benefit. Its native
+sanitizer checks precede that service job.
+
+QK remains a substantial phase. A separate arithmetic prototype sums the
+unchanged FP32 K16 products with explicit FP64 additions, then rounds to FP32
+before the original scale and softmax. It preserves N32 state updates and PV
+compensation, but changes the QK summation arithmetic and has no admission.
+The explicit nearest-even operation follows the
+[CUDA double-precision intrinsic contract](https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH__INTRINSIC__DOUBLE.html).
+This is a feasibility experiment, not a claim that FP64 improves either
+reference error or latency for this workload.
+
+The builder can additionally expose the actual FP32 combine accumulator before
+FP16 conversion. The independent numerical harness first proves that each
+diagnostic build retains the regular build's full partial/max/sum workspaces
+and produces exactly the same final FP16 values after conversion. It then
+compares both ordinary and pre-cast outputs against independent FP64 QK,
+softmax and PV, reporting maximum absolute error, p99 absolute error and
+relative L2 for two seeds at five lengths through 262144. An increase in any
+registered error metric rejects the arithmetic candidate before performance
+testing. Passing this operator screen still does not establish recursive or
+model quality, logits/distribution equality, or acceptance non-inferiority.
+
+The new options are private builder switches: `--specialize-full-q8`,
+`--all-visible-tiles`, `--qk-fp64-sum`, and `--diagnostic-output-fp32`. None
+changes the frozen serving source or enables a production default.
+
+The arithmetic screen completes and rejects the FP64-sum candidate before
+timing or any model trial. All ten pre-cast diagnostics agree with their
+corresponding regular builds' workspaces and converted outputs. All final
+FP16 reference-error metrics are nonexpanding, but four of ten cases expand
+at least one pre-cast FP32 metric. At length 3297, seed 20260910, maximum
+absolute error grows from `2.779396474e-6` to `3.216708786e-6` (about 15.73%);
+p99 grows from `1.495418274e-6` to `1.531674442e-6`. Two cases also change
+final FP16 output values. These are operator differences, not measured model
+token flips. The original K16 compensation remains selected.
+
+The exact visible-tile candidate completes 25 byte/canary checks under each
+of memcheck, racecheck and synccheck, with zero reported errors or races.
+The initial racecheck invocation accidentally included timing worksets and
+was stopped; the corrected invocation uses `--correctness-only` and reruns
+the complete required checks. Timing collected under a sanitizer is excluded
+from all performance claims. The subsequent service A/B compares PV reuse
+against visible-tile specialization at 1K/32K/64K/128K/261888, with scalar q1
+unchanged in both arms.
+
+| Candidate | Source SHA256 | DSO SHA256 |
+| --- | --- | --- |
+| fixed q8, rejected speed | `eff0d41b399cbdb343f3b5543cd4577af2571b033fa9a3904d2fd9ad96cd07d3` | `6bfb9f20bc062f91731519faa05254bb53c4342052c6b0b733431f3a1ac35134` |
+| fixed q8 and complete visible tiles | `3b0c9688ce17e1870408ef81fb5cd9b63a677b7cfd7d4777b8df77dd0fc24132` | `7dc632c2ff110cc751bceeb5fb683ede6066e443dad673d06c9e05429e01d0a2` |
+| FP64 sum of K16 products | `e477e605fb94b9003cf71308da371b9051d7c72eb841e4e6e7fb4dbd6a8484da` | `e86ee04a6c7e949f9d3ded8ca7613b208bd89f4d3b642804d57e3f51f37daa1d` |
+| PV parent, pre-cast diagnostic | `f30d85ef59aa86ca99d48aeba96eaa4a63dca8fbe4aaa1c375295d42f6ed284e` | `fc08222e8d768691d052817d89aadb2c7e5a7aa0207397da04fe4d70739ed0af` |
+| FP64 K16 sum, pre-cast diagnostic | `9ba8011dbdc11103fb4746e07e3b798953bfa17d54557f973cdcb7638084e353` | `23ae5cb0b011b797e9279c6f2377863e2b337d301423b0ca38f4b28f59254699` |
