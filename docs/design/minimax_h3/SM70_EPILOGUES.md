@@ -171,6 +171,21 @@ neither is retained or promoted to a full-request performance claim. Evidence:
 `attention-barrier-coalesce/`, `attention-barrier-coalesce-v2/` and the
 `barrier-v2-*.log` files under the campaign root.
 
+Further isolated operand probes are also rejected:
+
+- `attention-fi-p-reuse/` interchanges PV loops in the retained FlashInfer
+  Q128/K64 kernel to share a loaded P fragment across four output fragments.
+  Nine boundary shapes and the real 34,551-token input remain bitwise equal,
+  but paired latency regresses from 183.285767 to 185.328644 ms.
+- `attention-rescale-identity/` uses a warp-uniform check to skip accumulator
+  multiplication when every applicable online-softmax scale equals one.
+  The same numerical cases remain bitwise equal; 150.328323 to 149.099518 ms
+  is less than 1% and includes clock variation, so it is not retained.
+
+Neither probe changes production kernels or establishes a full-denoise gain.
+Their source, build logs, hashes and actual-input timings remain in the
+campaign artifact root to prevent repeating unchanged experiments.
+
 ## Larger canvas and duration compatibility
 
 Source `9d2489fc4e2f32ea500ec13478bd68ef9000c1cc` completes two additional
