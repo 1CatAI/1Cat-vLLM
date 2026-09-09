@@ -56,13 +56,39 @@ rounds, TTFT and pure decode separately. Aggregate decode is
 `sum(output_tokens - 1) / sum(engine_decode_seconds)`; stream chunk intervals
 are transport observations rather than instrumented GPU-round percentiles.
 
-Seed-zero mathematics is provisionally scored at GSM8K 30/32 and MATH500 31/32
-in both arms, with identical failed questions. HumanEval/10 reaches the 16K cap
-in both arms with no final answer. It is a quality failure at that cap and must
-not receive credit from code present only in reasoning. A bounded whole-stack
-control and a separate paired 32K-cap diagnostic are queued; the latter does
-not replace or erase the original truncated samples. Other seeds, executable
-code scores and the final acceptance verdict remain pending.
+Seed zero completes all 148 pairs with identical token IDs, acceptance counts
+(including per-position counts), finish reasons and semantic tool calls. Its
+unprofiled aggregate decode measurements are:
+
+| Subset | Cases | BV8 / BV2 pure decode (token/s) | Accepted / proposed | Accepted drafts / emitted tokens per round |
+| --- | ---: | ---: | ---: | ---: |
+| GSM8K | 32 | 309.791 / 316.749 | 57.9715% | 4.058008 / 5.058848 |
+| MATH500 | 32 | 243.960 / 246.660 | 48.2514% | 3.377595 / 4.377883 |
+| HumanEval | 32 | 225.650 / 229.195 | 42.8062% | 2.996437 / 3.996309 |
+| MBPP | 32 | 231.882 / 234.678 | 43.3363% | 3.033541 / 4.033895 |
+| LiveCodeBench v6 | 16 | 175.055 / 177.259 | 32.9424% | 2.305965 / 3.305909 |
+| JSON/tool fixtures | 4 | 214.813 / 217.170 | 42.0974% | 2.824121 / 3.824121 |
+
+These measurements isolate the GDN change inside the shared candidate stack.
+They are not complete-stack acceptance evidence. Seed-zero mathematics is
+provisionally scored at GSM8K 30/32 and MATH500 31/32 in both arms. Six cases
+reach the 16K cap without final content: HumanEval/10 and LiveCodeBench subset
+indices 21, 64, 93, 131 and 162. They remain failures at that cap, with no credit
+from reasoning-only code. Disabling all performance candidates reproduces
+identical tokens for the three mathematics errors and HumanEval/10. A separate
+32K-cap diagnostic makes HumanEval/10 end naturally at 21162 tokens in both
+arms, again with identical tokens. It does not replace the original truncated
+sample. The five LiveCodeBench failures have a separate whole-stack check.
+
+The retained LiveCodeBench wrapper incorrectly treated negative error codes as
+truthy passes. The campaign's private corrected wrapper follows official
+`lcb_runner/evaluation/pass_k_utils.py` at commit
+`28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24`: every test result must be greater
+than zero. Eight synthetic sentinel checks pass. The original wrapper, both
+source hashes and the correction are recorded; no affected score is credited.
+Original HumanEval/MBPP assertion scores and EvalPlus scores are separate, with
+EvalPlus's eligible-subset denominator reported explicitly. Other seeds,
+executable scores and the final acceptance verdict remain pending.
 
 A separate same-startup control/candidate/control diagnostic is queued for
 fixed prefixes, all 48 GDN layers and all 64 target layer observations. It
@@ -79,6 +105,21 @@ does not require a target quantization name. Existing guards continue to require
 the audited shapes, activation/state types and applicable graph path.
 Native dependencies are hashed before installation. Unsupported calls retain
 the existing operator.
+
+`sm70_dflash2_qpn2_candidate_route.py` separately packages optional cap64 column
+projections and TP4 row publication. Its representation and dimension guards
+match the audited QPN2 calls. A model with other weight formats can install the
+common routes without importing or loading any QPN2 projection implementation.
+The combined public entry point is queued for an NVFP4 comparison with the
+frozen private installer before admission.
+
+The integration branch includes dependency PR #563 at
+`b4334fc028593942d658854e94461546c40ee21b`. It preserves prefill classification
+for initial one-token requests in speculative GDN, preventing reads from a
+previous request's recycled state. Its 32 focused CPU metadata tests pass;
+GPU singleton/history-reuse diagnostics are queued on the fixed integration
+source. This dependency is not yet merged into main, and the unsafe original
+singleton case is not rerun on the unpatched frozen evaluation checkout.
 
 The FP8 model snapshot has all 66 indexed shards present. Independent control
 and common-route candidate model jobs are queued, including the two speed
