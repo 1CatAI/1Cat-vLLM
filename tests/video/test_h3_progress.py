@@ -105,3 +105,34 @@ def test_api_reports_progress_before_output_exists(tmp_path):
                 break
             time.sleep(0.01)
         assert snapshot["stage"] == "completed"
+
+
+def test_queued_device_work_is_not_reported_as_a_completed_step():
+    from vllm.media.progress import DeviceProgress
+
+    ready = threading.Event()
+    arrived = threading.Event()
+    observed: list[dict] = []
+
+    class Fence:
+        def record(self):
+            pass
+
+        def query(self):
+            return ready.is_set()
+
+        def synchronize(self):
+            pytest.fail("Progress must not synchronize the device")
+
+    def callback(event):
+        observed.append(event)
+        arrived.set()
+
+    with DeviceProgress(callback, event_factory=Fence) as observer:
+        observer({"stage": "denoising", "completed": 1, "total": 4})
+        observer({"stage": "decoding"})
+        assert not arrived.wait(0.03)
+        assert not observed
+        ready.set()
+        assert arrived.wait(1)
+    assert [e["stage"] for e in observed] == ["denoising", "decoding"]

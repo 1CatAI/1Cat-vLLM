@@ -48,3 +48,89 @@ def update_metadata(metadata: dict, event: dict, now: float):
     )
     if stage == "denoising":
         metadata["denoise_progress"] = metadata["stage_progress"]
+
+
+class DeviceProgress:
+    """Publish steps only after their stream events complete, without waiting on GPU.
+
+    A model forward may only enqueue kernels. A small reporting thread polls
+    recorded events, preserving stage order without adding a device/TP barrier.
+    Disabled reporting records no events and starts no thread.
+    """
+
+    def __init__(
+        self, callback: ProgressCallback | None, *, device=0, event_factory=None
+    ):
+        import threading
+        from collections import deque
+
+        self.callback = callback
+        self.device = device
+        self.event_factory = event_factory
+        self.pending: deque[tuple[dict, Any]] = deque()
+        self.condition = threading.Condition()
+        self.closing = False
+        self.stopping = False
+        self.thread: threading.Thread | None = None
+
+    def __enter__(self):
+        import threading
+
+        if self.callback is None:
+            return None
+        self.thread = threading.Thread(
+            target=self._publish, daemon=True, name="media-progress"
+        )
+        self.thread.start()
+        return self.emit
+
+    def emit(self, event):
+        fence = None
+        if event.get("stage") == "denoising" and event.get("completed", 0) > 0:
+            if self.event_factory is not None:
+                fence = self.event_factory()
+            else:
+                import torch
+
+                fence = torch.Event(device=f"cuda:{self.device}", enable_timing=False)
+            fence.record()
+        with self.condition:
+            self.pending.append((dict(event), fence))
+            self.condition.notify()
+
+    def _publish(self):
+        try:
+            while True:
+                with self.condition:
+                    if self.stopping or (self.closing and not self.pending):
+                        return
+                    if not self.pending:
+                        self.condition.wait(0.01)
+                        continue
+                    event, fence = self.pending[0]
+                    if fence is not None and not fence.query():
+                        self.condition.wait(0.01)
+                        continue
+                    self.pending.popleft()
+                if self.callback is not None:
+                    self.callback(event)
+        except Exception:
+            # A broken observer is not a reason to change inference or discard pixels.
+            import logging
+
+            logging.getLogger(__name__).exception("Media progress observer failed")
+
+    def __exit__(self, error_type, *_):
+        if self.thread is None:
+            return
+        with self.condition:
+            self.closing = True
+            if error_type is not None:
+                self.pending.clear()
+            self.condition.notify()
+        # A successful pipeline has already copied the final output to host. Its
+        # step fences are ready. Bound shutdown in case a failed observer blocks.
+        self.thread.join(timeout=5)
+        with self.condition:
+            self.stopping = True
+            self.condition.notify()

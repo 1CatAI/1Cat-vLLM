@@ -16,7 +16,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import cast
 
-from vllm.media.progress import ProgressCallback, reporting
+from vllm.media.progress import DeviceProgress, ProgressCallback, reporting
 from vllm.model_executor.models.minimax_h3.config import H3Config, H3Request
 
 from .gpu import acquire_gpu_group, worker_device_mask
@@ -75,7 +75,10 @@ def _worker(rank, config, gpu_ids, endpoint, connection):
                     if rank == 0 and track_progress
                     else None
                 )
-                with reporting(callback):
+                with (
+                    DeviceProgress(callback, device=rank) as observer,
+                    reporting(observer),
+                ):
                     video, audio = pipeline(request)
                 result = {
                     "rank": rank,

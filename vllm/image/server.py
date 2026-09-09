@@ -119,6 +119,9 @@ def create_app(config: ImageConfig, output_dir: str | Path, *, engine_factory=No
                     },
                 )
                 save(record)
+            jobs[record["id"]] = record
+            done[record["id"]] = asyncio.Event()
+            done[record["id"]].set()
         state["engine"] = await asyncio.to_thread(engine_factory or ImageEngine, config)
         state["ready"] = True
         task = asyncio.create_task(process())

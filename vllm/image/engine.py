@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from vllm.media.progress import ProgressCallback, report, reporting
+from vllm.media.progress import DeviceProgress, ProgressCallback, report, reporting
 
 from .config import RECIPE_VERSION, RECIPES, ImageConfig, ImageRequest
 
@@ -36,7 +36,7 @@ class ImageEngine:
         *,
         on_progress: ProgressCallback | None = None,
     ):
-        with self._lock, reporting(on_progress):
+        with self._lock, DeviceProgress(on_progress) as observer, reporting(observer):
             if self._closed:
                 raise RuntimeError("Native image engine is closed")
             started = time.perf_counter()

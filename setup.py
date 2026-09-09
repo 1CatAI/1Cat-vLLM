@@ -1411,6 +1411,7 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
+        "image": ["diffusers==0.40.0", "accelerate>=1.12", "nvidia-ml-py"],
         "video": [
             "diffusers==0.40.0",
             "av>=14",
