@@ -46,9 +46,14 @@ class H3Config:
     residual_sequence_parallel: bool = False
     host_weight_pin_memory: bool = True
     share_host_vae_weights: bool = False
+    weight_offload: Literal["component", "layer"] = "component"
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
 
     def __post_init__(self) -> None:
+        if self.weight_offload not in ("component", "layer"):
+            raise H3InputError("weight offload must be component or layer")
+        if self.weight_offload == "layer" and self.fp16_cache_layers:
+            raise H3InputError("layer offload cannot retain a fixed GPU weight cache")
         if not isinstance(self.host_weight_pin_memory, bool):
             raise H3InputError("host weight pinning must be a boolean")
         if not isinstance(self.share_host_vae_weights, bool):

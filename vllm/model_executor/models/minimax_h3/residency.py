@@ -8,7 +8,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections.abc import Iterable
+from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -143,6 +146,7 @@ class PinnedModuleStager:
         self._ready_event = torch.cuda.Event()
         self.cache_retention = cache_retention
         self.loaded = False
+        self._layerwise_active = False
         self._groups = self._snapshot_groups(modules, pin_memory=pin_memory)
         self._device_storages: list[torch.Tensor] = []
         self._restore_masters()
@@ -374,6 +378,8 @@ class PinnedModuleStager:
         self._release_cache(force=True)
 
     def load(self) -> None:
+        if getattr(self, "_layerwise_active", False):
+            raise RuntimeError("whole-module load overlaps layerwise weight staging")
         if self.loaded:
             return
         try:
@@ -408,6 +414,117 @@ class PinnedModuleStager:
         self._device_storages.clear()
         self.loaded = False
         self._release_cache()
+
+
+class LayerwiseModuleStager:
+    """Execute disjoint blocks from the same immutable host snapshot.
+
+    Storage shared across blocks, or between a block and the outer module,
+    remains resident throughout the context. Other block storage is loaded
+    immediately before its forward and released afterwards, including errors.
+    Transfers synchronize at block boundaries; this is a capacity policy.
+    """
+
+    def __init__(
+        self,
+        snapshot: PinnedModuleStager,
+        blocks: Iterable[nn.Module],
+        *,
+        resident_modules: Iterable[nn.Module] = (),
+    ):
+        self.snapshot = snapshot
+        self.blocks = tuple(blocks)
+        if len({id(block) for block in self.blocks}) != len(self.blocks):
+            raise ValueError("layerwise staging blocks must be unique")
+        block_ids = {id(block) for block in self.blocks}
+        for block in self.blocks:
+            if any(id(child) in block_ids for child in tuple(block.modules())[1:]):
+                raise ValueError("layerwise staging blocks must not be nested")
+        owners: dict[int, set[int]] = {}
+        for index, block in enumerate(self.blocks):
+            for target in chain(block.parameters(), block.buffers()):
+                owners.setdefault(id(target), set()).add(index)
+        for module in resident_modules:
+            for target in chain(module.parameters(), module.buffers()):
+                owners.setdefault(id(target), set()).add(-1)
+        grouped: list[list[_StorageGroup]] = [[] for _ in self.blocks]
+        resident = []
+        for group in snapshot._groups:
+            group_owners: set[int] = set().union(
+                *(owners.get(id(binding.target), {-1}) for binding in group.bindings)
+            )
+            if len(group_owners) == 1 and -1 not in group_owners:
+                grouped[next(iter(group_owners))].append(group)
+            else:
+                resident.append(group)
+
+        def subset(groups: list[_StorageGroup]) -> PinnedModuleStager:
+            stager = copy(snapshot)
+            stager._groups = groups
+            stager._device_storages = []
+            stager.loaded = False
+            stager.cache_retention = snapshot.cache_retention or BoundedAllocatorCache(
+                snapshot.device
+            )
+            return stager
+
+        self.resident = subset(resident)
+        self.stagers = tuple(subset(groups) for groups in grouped)
+        self.load_seconds = 0.0
+        self.offload_seconds = 0.0
+        self.loaded_bytes = 0
+
+    def _load(self, stager):
+        started = time.perf_counter()
+        stager.load()
+        torch.accelerator.synchronize()
+        self.load_seconds += time.perf_counter() - started
+        self.loaded_bytes += sum(group.master.numel() for group in stager._groups)
+
+    def _offload(self, stager):
+        started = time.perf_counter()
+        stager.offload()
+        self.offload_seconds += time.perf_counter() - started
+
+    @contextmanager
+    def on_device(self):
+        if self.snapshot.loaded or getattr(self.snapshot, "_layerwise_active", False):
+            raise RuntimeError("layerwise staging requires an idle host snapshot")
+        self.snapshot._layerwise_active = True
+        self.load_seconds = self.offload_seconds = 0.0
+        self.loaded_bytes = 0
+        hooks = []
+        try:
+            self._load(self.resident)
+            for block, stager in zip(self.blocks, self.stagers):
+                hooks.append(
+                    block.register_forward_pre_hook(
+                        lambda module, args, stager=stager: self._load(stager)
+                    )
+                )
+                hooks.append(
+                    block.register_forward_hook(
+                        lambda module, args, result, stager=stager: self._offload(
+                            stager
+                        ),
+                        always_call=True,
+                    )
+                )
+            yield
+        finally:
+            for hook in hooks:
+                hook.remove()
+            errors = []
+            try:
+                for stager in (*self.stagers, self.resident):
+                    try:
+                        self._offload(stager)
+                    except Exception as exc:
+                        errors.append(exc)
+            finally:
+                self.snapshot._layerwise_active = False
+            if errors:
+                raise errors[0]
 
 
 __all__ = ["BoundedAllocatorCache", "PinnedModuleStager"]

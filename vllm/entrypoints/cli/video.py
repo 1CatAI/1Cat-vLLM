@@ -41,6 +41,12 @@ class VideoSubcommand(CLISubcommand):
             )
             mode.add_argument("--fp16-weight-cache-gib", type=float, default=0)
             mode.add_argument(
+                "--weight-offload",
+                choices=("component", "layer"),
+                default="component",
+                help="Stage complete components or individual DiT/encoder layers",
+            )
+            mode.add_argument(
                 "--share-host-vae-weights",
                 action="store_true",
                 help="Share immutable pageable VAE masters across TP workers",
@@ -128,6 +134,7 @@ class VideoSubcommand(CLISubcommand):
             video_encoder=args.video_encoder,
             host_weight_pin_memory=args.host_weight_pin_memory,
             share_host_vae_weights=args.share_host_vae_weights,
+            weight_offload=args.weight_offload,
         )
         if args.video_mode == "serve":
             from vllm.video.server import serve
