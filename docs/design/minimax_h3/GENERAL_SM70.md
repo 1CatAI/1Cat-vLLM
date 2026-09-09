@@ -34,6 +34,11 @@ The old 43.914752 TFLOP/s/card sample had 71.315842 s denoise and no warmup;
 its equal-work 80 TFLOP/s budget is 39.147719 s. The old 39-frame/20-step
 FA/FI diagnostics are not matching speed baselines.
 
+After auditing duplicated column-LoRA A work, the current four-step numerator
+is 3,103,284,010,387,456 useful FLOPs on rank 0. Its corrected 80-TFLOP/s budget
+is 38.791050 seconds. Historical numbers above retain their original accounting
+and must not be mixed with the corrected formal results below.
+
 Quality compares each variant against the same weights, initial noise and
 official algorithm, including full sampling. Default numerical gates are
 video/audio final-latent relative L2 <= 0.01, pre-encoding video PSNR >= 40 dB
@@ -47,14 +52,15 @@ Unaccepted drift is not a new oracle; thresholds must not be relaxed to pass.
 | --- | --- | --- |
 | Common FP16 input/GEMM, dense column-major path | Shared operator and explicit dense layout | GPU operator checks pass; original/W8A16 four-step complete controls match bitwise |
 | Prepared LoRA input and collective ordering | Implemented, including explicit original basis | GPU prepared/normal results bitwise equal; TP2/TP4 block comparisons pass |
-| General residual sequence sharding | TP2/TP4, original/INT8, matching adapters; TP1 no-op | Both backends and wide residual/padding block checks pass; full Ref2VA pending |
+| General residual sequence sharding | TP2/TP4, original/INT8, matching adapters; TP1 no-op | TP2 original Light4 small full control and TP4 Ref8 mixed-reference control match bitwise; broader matrix pending |
 | FA and FI kernel optimization | Explicit query-128 and shared epilogues in #581 | Audited FA 47.092, FI 43.990, candidate FA 51.939 TFLOP/s/card; >80 fails |
 | All dense task/weight/adapter combinations | Partial mainline support | Full matrix pending |
 | FastH3 VSA on SM70 | True block-sparse native API in #583 | Full generation completes; final FP32-math diagnostic fails latent/video gates |
 | TeaCache and Cache-DiT | Request-scoped official policies in #584 | TP1/2/4 small forwards and full native cached/lossless/cached lifecycle pass; official quality pending |
 | AUTO and native variant APIs | Variant APIs in #583/#584; AUTO pending | No configuration qualified for automatic selection |
 | Workflow-specific performance accounting | Actual intervals, blocks, sparse pairs and cache hits in #578/#583/#584 | Strict validators pass; skipped/padded/duplicate work excluded |
-| Non-H3 DiT operator reuse | Shared GEMM/input preparation | Two non-H3 GEMM shapes pass; Attention reuse pending |
+| Non-H3 DiT operator reuse | Shared GEMM/input preparation and explicit dense attention | GEMM and non-H3 BSHD attention shapes pass; no second complete model added |
+| TP1/TP2 original-weight capacity | Explicit DiT/encoder layer staging | Full small original Light4 generations pass; pinned/pageable TP1 and ordinary/sharded TP2 final media match bitwise |
 | >80 TFLOP/s/card, full quality, memory | Not achieved | No qualifying results |
 | Draft PRs, matrix report and playable samples | Draft PRs #571/#578/#581/#583/#584 | Original/W8A16 Light4, W8A16 Light8, FlashGen, FastH3 and cache samples retained; full matrix pending |
 

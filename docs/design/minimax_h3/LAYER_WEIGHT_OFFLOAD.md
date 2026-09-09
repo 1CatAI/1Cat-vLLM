@@ -64,6 +64,21 @@ DiT load/offload boundaries take 35.957164/15.261954 seconds; the latter include
 waiting for asynchronous copies and compute, not device-to-host weight traffic.
 Both are captured cold capacity checks, not formal warmed speed measurements.
 
-Larger TP1 and full TP2 generation remain pending. Neither these residency-mode
+The full TP2 original-weight DiT also exceeds 32-GB/card capacity in component
+mode: loading fails before denoise after the allocator's bounded retry. No
+timing or output is claimed for that failed run. The matching layer policy
+completes a full request with exact residual sharding, peaking at
+15,449,646,080 allocated bytes/card. Denoise is 90.431030 seconds and request
+latency 110.419366 seconds. A separate layer-mode control disables residual
+sharding while preserving TP2, original weights, adapter, seed and sampling.
+Final video/audio latents, all 22 RGB frames and decoded PCM match bitwise
+(`layer-tp2-quality.json`). Both controls use shared pageable VAE masters.
+The ordinary-residual cold request takes 166.482792 seconds denoise; variable
+host paging and captures preclude a formal performance comparison.
+
+Artifacts are `layer-offload-tp2-original-component/`,
+`layer-offload-tp2-original-layer/` and
+`layer-offload-tp2-original-layer-ordinary/` under the same `runs/` root.
+Larger TP1/TP2 shapes remain pending. Neither these residency/sharding
 comparisons nor the operator tests establish independent official full-model
 quality or performance acceptance.
