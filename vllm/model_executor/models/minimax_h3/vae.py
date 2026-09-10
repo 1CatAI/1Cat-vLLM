@@ -67,6 +67,8 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
+    *,
+    skip_parameter_init: bool = False,
 ) -> nn.Module:
     auto_map = config.get("auto_map") or {}
     class_reference = auto_map.get("AutoModel")
@@ -83,6 +85,12 @@ def _load_remote_component(
     # anti-aliasing filters call torch.kaiser_window). Callers place the module
     # explicitly right after this returns, so nothing depends on the context.
     with torch.device("cpu"):
+        if skip_parameter_init:
+            from .initialization import load_without_random_parameter_init
+
+            return load_without_random_parameter_init(
+                lambda: component_cls.from_pretrained(component_path)
+            )
         return component_cls.from_pretrained(component_path)
 
 
@@ -138,6 +146,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         load_device: torch.device | None = None,
         pin_memory: bool = True,
         shared_weights_dir: str | None = None,
+        skip_parameter_init: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -145,6 +154,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            skip_parameter_init=skip_parameter_init,
         )
         # Match the reference loader contract before installing inference-only
         # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
