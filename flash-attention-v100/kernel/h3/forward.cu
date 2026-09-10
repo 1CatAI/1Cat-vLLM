@@ -17,29 +17,30 @@
 namespace {
 using Half = cutlass::half_t;
 constexpr int kHeadDim = 128;
-constexpr int kQueries = 64;
-template <int Keys>
-using KernelFor = typename cutlass::gemm::kernel::H3FMHA<
-    Half, cutlass::arch::Sm70, true, kQueries, Keys, kHeadDim>::FMHAKernel;
+template <int Queries, int Keys>
+using KernelFor =
+    typename cutlass::gemm::kernel::H3FMHA<Half, cutlass::arch::Sm70, true,
+                                           Queries, Keys, kHeadDim>::FMHAKernel;
 
-template <int Keys, bool Fixed>
-__global__ __launch_bounds__(128, 1) void h3_flash_v100_d128(
-    typename KernelFor<Keys>::DirectParams params) {
+template <int Queries, int Keys, bool Fixed>
+__global__ __launch_bounds__(Queries * 2, 1) void h3_flash_v100_d128(
+    typename KernelFor<Queries, Keys>::DirectParams params) {
   extern __shared__ __align__(16) unsigned char storage[];
   if constexpr (Fixed) {
     params.heads = 14;
     params.queries = 12323;
     params.keys = 12323;
   }
-  KernelFor<Keys> kernel;
+  KernelFor<Queries, Keys> kernel;
   kernel(params,
-         *reinterpret_cast<typename KernelFor<Keys>::SharedStorage*>(storage));
+         *reinterpret_cast<typename KernelFor<Queries, Keys>::SharedStorage*>(
+             storage));
 }
 
-template <int Keys, bool Fixed = false>
+template <int Queries, int Keys, bool Fixed = false>
 void launch_attention(at::Tensor const& q, at::Tensor const& k,
                       at::Tensor const& v, at::Tensor& output, float scale) {
-  using Kernel = KernelFor<Keys>;
+  using Kernel = KernelFor<Queries, Keys>;
   typename Kernel::DirectParams params{
       reinterpret_cast<Half*>(q.data_ptr()),
       reinterpret_cast<Half*>(k.data_ptr()),
@@ -50,16 +51,36 @@ void launch_attention(at::Tensor const& q, at::Tensor const& k,
       int(q.size(2)),
       scale};
   if constexpr (Keys == 128) {
-    // 34,304 bytes/block: allow two resident blocks without extra global
-    // storage.
+    // The 64-query tile uses 34,304 bytes/block. Prefer full shared-memory
+    // capacity for both query geometries without extra global storage.
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        h3_flash_v100_d128<Keys, Fixed>,
+        h3_flash_v100_d128<Queries, Keys, Fixed>,
         cudaFuncAttributePreferredSharedMemoryCarveout, 100));
   }
-  h3_flash_v100_d128<Keys, Fixed>
-      <<<dim3((q.size(1) + kQueries - 1) / kQueries, q.size(0) * q.size(2)),
+  if constexpr (Queries == 128) {
+    C10_CUDA_CHECK(
+        cudaFuncSetAttribute(h3_flash_v100_d128<Queries, Keys, Fixed>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             sizeof(typename Kernel::SharedStorage)));
+  }
+  h3_flash_v100_d128<Queries, Keys, Fixed>
+      <<<dim3((q.size(1) + Queries - 1) / Queries, q.size(0) * q.size(2)),
          Kernel::kThreadCount, sizeof(typename Kernel::SharedStorage),
          at::cuda::getCurrentCUDAStream()>>>(params);
+}
+
+template <int Queries>
+void dispatch_attention(at::Tensor const& q, at::Tensor const& k,
+                        at::Tensor const& v, at::Tensor& output, float scale,
+                        int selected) {
+  if (selected == 128) {
+    if (q.size(1) == 12323 && k.size(1) == 12323 && q.size(2) == 14)
+      launch_attention<Queries, 128, true>(q, k, v, output, scale);
+    else
+      launch_attention<Queries, 128>(q, k, v, output, scale);
+  } else {
+    launch_attention<Queries, 64>(q, k, v, output, scale);
+  }
 }
 
 at::Tensor aligned_contiguous(const at::Tensor& tensor) {
@@ -72,7 +93,8 @@ at::Tensor aligned_contiguous(const at::Tensor& tensor) {
 }  // namespace
 
 at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
-                                      double scale, int key_tile) {
+                                      double scale, int key_tile,
+                                      int query_tile) {
   TORCH_CHECK(q.is_cuda() && q.dim() == 4 && q.scalar_type() == at::kHalf,
               "H3 FlashAttention-V100 requires CUDA FP16 BSND tensors");
   TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -91,12 +113,14 @@ at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
               "H3 FlashAttention-V100 is an inference-only operator");
   TORCH_CHECK(key_tile == 0 || key_tile == 64 || key_tile == 128,
               "H3 attention key tile must be 0, 64 or 128");
+  TORCH_CHECK(query_tile == 64 || query_tile == 128,
+              "H3 attention query tile must be 64 or 128");
   const c10::cuda::CUDAGuard guard(q.device());
   auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "H3 FlashAttention-V100 requires SM70");
   int64_t groups64 = q.size(0) * q.size(2);
-  int64_t blocks64 = ((q.size(1) + kQueries - 1) / kQueries) * groups64;
+  int64_t blocks64 = ((q.size(1) + query_tile - 1) / query_tile) * groups64;
   TORCH_CHECK(q.size(1) <= INT_MAX && k.size(1) <= INT_MAX &&
                   groups64 <= 65535 && blocks64 <= INT_MAX,
               "H3 attention shape exceeds kernel index limits");
@@ -108,13 +132,10 @@ at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
   // self-attention reuses each Q fragment across twice as many keys.
   int selected =
       key_tile ? key_tile : (q.size(1) >= 1024 && k.size(1) >= 1024 ? 128 : 64);
-  if (selected == 128) {
-    if (q.size(1) == 12323 && k.size(1) == 12323 && q.size(2) == 14)
-      launch_attention<128, true>(q, k, v, output, float(scale));
-    else
-      launch_attention<128>(q, k, v, output, float(scale));
-  } else
-    launch_attention<64>(q, k, v, output, float(scale));
+  if (query_tile == 128)
+    dispatch_attention<128>(q, k, v, output, float(scale), selected);
+  else
+    dispatch_attention<64>(q, k, v, output, float(scale), selected);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
@@ -122,5 +143,5 @@ at::Tensor h3_flash_attention_forward(at::Tensor q, at::Tensor k, at::Tensor v,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &h3_flash_attention_forward, pybind11::arg("q"),
         pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("scale"),
-        pybind11::arg("key_tile") = 0);
+        pybind11::arg("key_tile") = 0, pybind11::arg("query_tile") = 64);
 }

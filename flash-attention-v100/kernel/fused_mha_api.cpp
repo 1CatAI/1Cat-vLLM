@@ -30,6 +30,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_e4m3_fp32_precision_version",
         &flash_attention_grouped_e4m3_fp32_precision_version,
         "E4M3 grouped FP32 numerical implementation revision");
+  m.def("tp2_e4m3_scalar_fast_version",
+        &flash_attention_tp2_e4m3_scalar_fast_version,
+        "Capability for the opt-in TP2 E4M3 scalar decoder");
+  m.def("tp2_e4m3_scalar_fast_launch_count",
+        &flash_attention_tp2_e4m3_scalar_fast_launch_count,
+        "TP2 E4M3 scalar host dispatch count, including graph capture");
   m.attr("grouped_verify_e4m3") = true;
   m.def("grouped_verify_max_query_tokens",
         &flash_attention_grouped_verify_max_query_tokens,

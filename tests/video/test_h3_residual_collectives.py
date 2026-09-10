@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from vllm.model_executor.models.minimax_h3 import collectives
+from vllm.model_executor.models.minimax_h3.config import H3Config, H3InputError
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("partition", ["fl2va", "ref2va"])
+def test_explicit_peer_option_keeps_tp_and_partition_compatibility(tp, partition):
+    config = H3Config(
+        tensor_parallel_size=tp,
+        partition=partition,
+        residual_sequence_parallel=True,
+        residual_reduction="peer",
+    )
+    assert config.residual_reduction == "peer"
+    assert H3Config().residual_reduction == "native"
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, float("nan"), float("inf"), 1e308])
+def test_reject_invalid_communication_budget(budget):
+    with pytest.raises(H3InputError):
+        H3Config(residual_reduction_memory_gib=budget)
+
+
+def test_peer_option_requires_residual_rows():
+    with pytest.raises(H3InputError, match="residual sequence"):
+        H3Config(residual_reduction="peer")
+
+
+def test_reuse_request_accounting_shape_eviction_and_budget_fallback(monkeypatch):
+    plans = []
+
+    class Plan:
+        raw_ipc_bytes = 64
+
+        @staticmethod
+        def required_memory_bytes(shape):
+            return shape[0] * shape[1] * 4
+
+        def __init__(self, group, shape, *, memory_budget_bytes):
+            self.shape = shape
+            self.closed = False
+            plans.append(self)
+
+        def reduce(self, value):
+            return (value * 4).chunk(4)[1]
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(collectives, "SM70ExactRowReductionPlan", Plan)
+    monkeypatch.setattr(
+        collectives.H3ResidualReduction, "_setup_unavailable", lambda *args: None
+    )
+    group = SimpleNamespace(world_size=4, rank_in_group=1, all_reduce=lambda x: x * 4)
+    owner = collectives.H3ResidualReduction(group, memory_budget_bytes=100)
+    value = torch.arange(12, dtype=torch.float32).view(4, 3)
+    expected = (value * 4).chunk(4)[1]
+    assert torch.equal(owner.reduce(value), expected)
+    owner.begin_request()
+    assert owner.snapshot()["peer_calls"] == 0
+    assert owner.snapshot()["raw_ipc_peak_bytes"] == 64
+    assert torch.equal(owner.reduce(value), expected)
+    assert len(plans) == 1
+    assert owner.snapshot()["setup_seconds"] == 0
+    large = torch.ones(16, 3)
+    assert torch.equal(owner.reduce(large), torch.full((4, 3), 4.0))
+    assert plans[0].closed
+    assert owner.snapshot()["native_calls"] == 1
+    assert owner.snapshot()["fallback_reason"]
+    owner.begin_request()
+    assert owner.snapshot()["raw_ipc_peak_bytes"] == 0
+    owner.close()
+
+
+def test_tp2_uses_ordinary_reduction_without_plan(monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("TP2 must not construct a TP4 peer plan")
+
+    monkeypatch.setattr(collectives, "SM70ExactRowReductionPlan", unexpected)
+    group = SimpleNamespace(world_size=2, rank_in_group=1, all_reduce=lambda x: x * 2)
+    owner = collectives.H3ResidualReduction(group, memory_budget_bytes=100)
+    assert torch.equal(owner.reduce(torch.ones(6, 3)), torch.full((3, 3), 2.0))
+    assert owner.snapshot()["native_calls"] == 1
+
+
+def test_resource_fallback_keeps_native_values_and_rechecks_next_request(monkeypatch):
+    checks = []
+
+    def unavailable(*args):
+        checks.append(1)
+        return "peer access unavailable for this GPU group"
+
+    monkeypatch.setattr(
+        collectives.H3ResidualReduction, "_setup_unavailable", unavailable
+    )
+    group = SimpleNamespace(world_size=4, rank_in_group=2, all_reduce=lambda x: x * 4)
+    owner = collectives.H3ResidualReduction(group, memory_budget_bytes=2**30)
+    value = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    expected = (value * 4)[2:3]
+    for _ in range(3):
+        assert torch.equal(owner.reduce(value), expected)
+    assert len(checks) == 1
+    assert owner.snapshot()["native_calls"] == 3
+    assert owner.snapshot()["peer_calls"] == 0
+    assert "peer access" in owner.snapshot()["fallback_reason"]
+    owner.begin_request()
+    assert torch.equal(owner.reduce(value), expected)
+    assert len(checks) == 2
+
+
+def test_peer_memory_precheck_uses_slowest_rank_before_allocation(monkeypatch):
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda *args: (8 * 2**30, 32 * 2**30)
+    )
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda *args: 2**30)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda *args: 2**30)
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda *args: True)
+    reason = "insufficient free memory for residual communication setup"
+
+    def gather(output, local, **kwargs):
+        assert local is None
+        output[:] = [None, reason, None, None]
+
+    monkeypatch.setattr(collectives.dist, "all_gather_object", gather)
+    owner = collectives.H3ResidualReduction(
+        SimpleNamespace(world_size=4, cpu_group=None), memory_budget_bytes=2**30
+    )
+    value = SimpleNamespace(device=torch.device("cuda:0"), shape=(4, 4))
+    assert owner._setup_unavailable(value) == reason

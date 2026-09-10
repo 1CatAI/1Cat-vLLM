@@ -21,6 +21,8 @@
 
 namespace {
 
+std::atomic<int64_t> tp2_e4m3_scalar_fast_calls{0};
+
 int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   if (kv_cache_dtype == "auto" || kv_cache_dtype == "float16" ||
       kv_cache_dtype == "bfloat16") {
@@ -989,7 +991,7 @@ __device__ __forceinline__ float dot_qk_half2(const __half* __restrict__ q_ptr,
   return warp_reduce_sum(acc);
 }
 
-template <int D, int KV_DTYPE>
+template <int D, int KV_DTYPE, bool E4M3_BITS = false>
 __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
                                               const void* __restrict__ k_cache,
                                               const int64_t k_index_base,
@@ -1017,8 +1019,9 @@ __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
 #pragma unroll
     for (int d = lane; d < D; d += kWarpSize) {
       const float qv = __half2float(q_ptr[d]);
-      const float kv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
-          k_cache, k_index_base + d);
+      const float kv =
+          flash_v100::load_kv_cache_float_unscaled<KV_DTYPE, E4M3_BITS>(
+              k_cache, k_index_base + d);
       acc = fmaf(qv, kv, acc);
     }
     return warp_reduce_sum(acc);
@@ -1027,7 +1030,7 @@ __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
 
 template <int D, int PARTITION_SIZE, int KV_DTYPE,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool ANCHORED_SWA = false,
-          typename PARTIAL_T = __half>
+          typename PARTIAL_T = __half, bool TP2_E4M3_FAST = false>
 __global__ void flash_attention_decode_partition_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
     const void* __restrict__ v_cache, PARTIAL_T* __restrict__ tmp_out,
@@ -1155,7 +1158,8 @@ __global__ void flash_attention_decode_partition_kernel(
         static_cast<int64_t>(block_offset) * k_token_stride +
         static_cast<int64_t>(kv_head_idx) * k_head_stride;
 
-    float score = dot_qk_cache<D, KV_DTYPE>(q_shared, k_cache, k_index, lane);
+    float score = dot_qk_cache<D, KV_DTYPE, TP2_E4M3_FAST>(q_shared, k_cache,
+                                                           k_index, lane);
     if (lane == 0) {
       if constexpr (ANCHORED_SWA) {
         const int token_idx = part_start + token_local;
@@ -1197,16 +1201,33 @@ __global__ void flash_attention_decode_partition_kernel(
 
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.f;
-    for (int i = 0; i < part_tokens; ++i) {
-      const int physical_block = block_idx_shared[i];
-      const int block_offset = block_offset_shared[i];
-      const int64_t v_index =
-          static_cast<int64_t>(physical_block) * v_block_stride +
-          static_cast<int64_t>(block_offset) * v_token_stride +
-          static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
-      const float vv =
-          flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(v_cache, v_index);
-      acc = fmaf(scores_shared[i], vv, acc);
+    if constexpr (TP2_E4M3_FAST) {
+      // Expose independent loads while retaining the ascending-token FMA chain.
+#pragma unroll 8
+      for (int i = 0; i < part_tokens; ++i) {
+        const int physical_block = block_idx_shared[i];
+        const int block_offset = block_offset_shared[i];
+        const int64_t v_index =
+            static_cast<int64_t>(physical_block) * v_block_stride +
+            static_cast<int64_t>(block_offset) * v_token_stride +
+            static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
+        const float vv =
+            flash_v100::load_kv_cache_float_unscaled<KV_DTYPE, true>(v_cache,
+                                                                     v_index);
+        acc = fmaf(scores_shared[i], vv, acc);
+      }
+    } else {
+      for (int i = 0; i < part_tokens; ++i) {
+        const int physical_block = block_idx_shared[i];
+        const int block_offset = block_offset_shared[i];
+        const int64_t v_index =
+            static_cast<int64_t>(physical_block) * v_block_stride +
+            static_cast<int64_t>(block_offset) * v_token_stride +
+            static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
+        const float vv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
+            v_cache, v_index);
+        acc = fmaf(scores_shared[i], vv, acc);
+      }
     }
     const float out_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
                                 ? inv_part_sum
@@ -3475,10 +3496,11 @@ void launch_flash_attention_decode_paged(
   // Second kernel version: the anchored decode-window mask is a separate
   // template instantiation, generated only for the fp16-KV configuration;
   // the non-anchored instantiations stay untouched.
-  const auto launch_partition = [&](auto anchored_tag) {
+  const auto launch_partition = [&](auto anchored_tag, auto fast_tag) {
     constexpr bool kAnchored = decltype(anchored_tag)::value;
-    flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE,
-                                            SEQ_LEN_ROUTE, kAnchored, PARTIAL_T>
+    constexpr bool kFast = decltype(fast_tag)::value;
+    flash_attention_decode_partition_kernel<
+        D, PARTITION_SIZE, KV_DTYPE, SEQ_LEN_ROUTE, kAnchored, PARTIAL_T, kFast>
         <<<partition_grid, block, 0, stream>>>(
             reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
             k_cache.data_ptr(), v_cache.data_ptr(),
@@ -3497,14 +3519,29 @@ void launch_flash_attention_decode_paged(
   };
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     if (use_anchored) {
-      launch_partition(std::true_type{});
+      launch_partition(std::true_type{}, std::false_type{});
     } else {
-      launch_partition(std::false_type{});
+      launch_partition(std::false_type{}, std::false_type{});
     }
   } else {
     TORCH_CHECK(!use_anchored,
                 "anchored decode window requires an fp16 KV cache");
-    launch_partition(std::false_type{});
+    if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && D == 256 &&
+                  PARTITION_SIZE == 1024 && std::is_same_v<PARTIAL_T, float>) {
+      const char* enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
+      const bool use_fast = enabled && enabled[0] == '1' &&
+                            enabled[1] == '\0' && batch_size == 8 &&
+                            num_heads_q == 12 && num_heads_kv == 2 &&
+                            window_size_left == -1 && window_size_right == -1;
+      if (use_fast) {
+        tp2_e4m3_scalar_fast_calls.fetch_add(1, std::memory_order_relaxed);
+        launch_partition(std::false_type{}, std::true_type{});
+      } else {
+        launch_partition(std::false_type{}, std::false_type{});
+      }
+    } else {
+      launch_partition(std::false_type{}, std::false_type{});
+    }
   }
 
   if (!launch_reduce) {
@@ -4379,6 +4416,14 @@ int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Older normalized-partial/LSE workspaces are not ABI-compatible.
   // Revision 4 admits DFlash2 1728/3456 pages and FP32 scalar E4M3 partials.
   return 4;
+}
+
+int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 2; }
+
+int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count() {
+  // Includes capture-time launches; CUDA Graph replay does not call this host
+  // dispatcher again. This counter proves route admission, not round count.
+  return tp2_e4m3_scalar_fast_calls.load(std::memory_order_relaxed);
 }
 
 int64_t flash_attention_grouped_verify_max_query_tokens() {

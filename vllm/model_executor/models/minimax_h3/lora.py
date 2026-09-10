@@ -21,6 +21,11 @@ from safetensors import safe_open
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
+from vllm.model_executor.layers.sm70_diffusion import (
+    fp16_linear_add,
+    fp16_linear_prepared,
+    supports_fused_scaled_add,
+)
 
 from .config import H3InputError
 from .fasth3 import FASTH3_FILENAME, FastH3Spec
@@ -150,6 +155,11 @@ def inspect_deployment_adapter(config):
         raise H3InputError(
             "FastH3 Dense fusion requires original weights; omit --transformer-path"
         )
+    sparse = isinstance(spec, FastH3Spec) and spec.requires_vsa
+    if sparse != (config.attention_backend == "FASTVIDEO_VSA"):
+        raise H3InputError(
+            "FastH3 VSA artifacts require the FASTVIDEO_VSA backend together"
+        )
     return spec
 
 
@@ -272,9 +282,56 @@ class TurboLinearMethod(LinearMethodBase):
         self.base = base
         self.parts = parts
         self.alpha_over_rank = alpha_over_rank
+        spans = sorted((offset, offset + width) for _, offset, width in parts)
+        self.disjoint_parts = all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
 
     def create_weights(self, *args, **kwargs):
         raise RuntimeError("Turbo is installed after base checkpoint loading")
+
+    @property
+    def supports_prepared_fp16(self):
+        return bool(getattr(self.base, "supports_prepared_fp16", False))
+
+    @property
+    def supports_rotated_input(self):
+        return bool(getattr(self.base, "supports_rotated_input", False))
+
+    @property
+    def requires_original_input(self):
+        return lora_scale.get() != 0
+
+    def apply_prepared(
+        self, layer, values, input_scale, *, input_is_rotated=False, original_input=None
+    ):
+        if not self.supports_prepared_fp16:
+            raise ValueError("LoRA base does not support prepared FP16 operands")
+        if input_is_rotated and self.requires_original_input and original_input is None:
+            raise ValueError("Active LoRA requires the original unrotated input")
+        output = self.base.apply_prepared(
+            layer, values, input_scale, input_is_rotated=input_is_rotated
+        )
+        scale = lora_scale.get() * self.alpha_over_rank
+        if scale == 0:
+            return output
+        original = original_input if input_is_rotated else values
+        dtype = output.dtype
+        fused = self.disjoint_parts and supports_fused_scaled_add(output)
+        if not fused:
+            output = output.float()
+        for index, offset, width in self.parts:
+            a = getattr(layer, f"h3_lora_a_{index}")
+            b = getattr(layer, f"h3_lora_b_{index}")
+            # Restore the first projection's row scale before preparing B's
+            # input, retaining the established intermediate rounding boundary.
+            intermediate = fp16_linear_prepared(
+                original, a, input_scale, output_fp32=True
+            )
+            if fused:
+                fp16_linear_add(intermediate, b, output, alpha=scale, offset=offset)
+            else:
+                delta = _linear_fp32(intermediate, b)
+                output[..., offset : offset + width].add_(delta, alpha=scale)
+        return output.to(dtype)
 
     def apply(self, layer, x, bias=None):
         output = self.base.apply(layer, x, bias)
@@ -282,12 +339,18 @@ class TurboLinearMethod(LinearMethodBase):
         if scale == 0:
             return output
         dtype = output.dtype
-        output = output.float()
+        fused = self.disjoint_parts and supports_fused_scaled_add(output)
+        if not fused:
+            output = output.float()
         for index, offset, width in self.parts:
             a = getattr(layer, f"h3_lora_a_{index}")
             b = getattr(layer, f"h3_lora_b_{index}")
-            delta = _linear_fp32(_linear_fp32(x, a), b)
-            output[..., offset : offset + width].add_(delta, alpha=scale)
+            intermediate = _linear_fp32(x, a)
+            if fused:
+                fp16_linear_add(intermediate, b, output, alpha=scale, offset=offset)
+            else:
+                delta = _linear_fp32(intermediate, b)
+                output[..., offset : offset + width].add_(delta, alpha=scale)
         return output.to(dtype)
 
 

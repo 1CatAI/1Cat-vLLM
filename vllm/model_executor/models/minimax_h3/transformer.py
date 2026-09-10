@@ -40,18 +40,21 @@ from .modulation import (
 )
 from .ops import RMSNorm, RotaryEmbedding, fused_qk_norm_rope
 from .quantization import (
+    FP16LinearMethod,
     H3MergedColumnParallelLinear,
     H3QKVParallelLinear,
     H3RowParallelLinear,
-    Int8ConvRotLinearMethod,
     preserve_fp32_output,
     rotate_local_fp16,
+    supports_prepared_fp16,
 )
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
     )
+
+    from .collectives import H3ResidualReduction
 
 
 logger = init_logger(__name__)
@@ -403,6 +406,9 @@ class MiniMaxH3Attention(nn.Module):
             prefix=f"{prefix}.out_proj",
         )
         preserve_fp32_output(self.out_proj)
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        self._gate_dimensions = (arch.hidden_size, inner_dim)
+        self._gate_prefix = f"{prefix}.to_gate_compress"
         self.attention = Attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -416,6 +422,18 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
         )
+
+    def enable_vsa_gate(self, topk: int) -> None:
+        if self.to_gate_compress is None:
+            self.to_gate_compress = ColumnParallelLinear(
+                *self._gate_dimensions,
+                bias=False,
+                params_dtype=_COMPUTE_DTYPE,
+                prefix=self._gate_prefix,
+            )
+            self.to_gate_compress.quant_method = FP16LinearMethod()
+            nn.init.zeros_(self.to_gate_compress.weight)
+        self.attention.vsa_topk = topk
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -442,6 +460,8 @@ class MiniMaxH3Attention(nn.Module):
         packed_total: int,
         num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
+        gate_compress: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -527,6 +547,14 @@ class MiniMaxH3Attention(nn.Module):
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
                 "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+                **(
+                    {
+                        "gate_compress": gate_compress.unsqueeze(0),
+                        "vsa_h3_prefix_segments": vsa_prefix_segments,
+                    }
+                    if gate_compress is not None
+                    else {}
+                ),
             },
             video_layout=video_layout,
         )
@@ -549,6 +577,7 @@ class MiniMaxH3Attention(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         input_is_rotated: bool = False,
+        vsa_prefix_segments: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -585,6 +614,13 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
             )
 
+        gate_compress = None
+        if self.to_gate_compress is not None:
+            if input_is_rotated:
+                raise ValueError("VSA gate requires its original unrotated activation")
+            gate_compress, _ = self.to_gate_compress(x)
+            gate_compress = gate_compress.view(total, self.num_heads, self.head_dim)
+
         # Each request contributes a document for its rows plus one for any
         # nonempty alignment padding. Local/Ulysses backends unpad it, while
         # Ring keeps aligned rows for fixed-size P2P buffers.
@@ -600,6 +636,8 @@ class MiniMaxH3Attention(nn.Module):
             packed_total=packed_total if packed_total is not None else q.shape[0],
             num_requests=num_requests,
             video_layout=video_layout,
+            vsa_prefix_segments=vsa_prefix_segments,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -647,7 +685,7 @@ class MiniMaxH3MLP(nn.Module):
             hidden.is_cuda
             and hidden.dtype == torch.float16
             and 0 < hidden.shape[-1] <= 32768
-            and isinstance(self.fc2.quant_method, Int8ConvRotLinearMethod)
+            and supports_prepared_fp16(self.fc2)
         ):
             from .activation import silu_prepare_fp16
 
@@ -824,12 +862,18 @@ class MiniMaxH3DiTBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.residual_group = get_tp_group() if residual_sequence_parallel else None
+        self.residual_reducer: H3ResidualReduction | None = None
+        self.residual_group = (
+            get_tp_group()
+            if residual_sequence_parallel and get_tensor_model_parallel_world_size() > 1
+            else None
+        )
         if self.residual_group is not None:
-            if self.residual_group.world_size != 4:
-                raise ValueError("H3 residual sequence parallelism requires TP4")
-            # These projections return unreduced FP32 partial sums. Reduce-scatter
-            # keeps that precision and assigns each rank its residual rows.
+            if self.residual_group.world_size not in (2, 4):
+                raise ValueError("H3 residual sequence parallelism requires TP2 or TP4")
+            # Keep the replicated path's FP32 sum order before selecting local
+            # residual rows. NCCL reduce-scatter uses a different reduction
+            # order and fails the full four-step latent quality gate.
             self.attn.out_proj.reduce_results = False
             self.mlp.fc2.reduce_results = False
         self.adaln_proj = MiniMaxH3AdalnProj(
@@ -854,6 +898,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         num_requests: int = 1,
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -914,9 +959,15 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             input_is_rotated=input_is_rotated,
+            vsa_prefix_segments=vsa_prefix_segments,
         )
         if group is not None:
-            h = group.reduce_scatter(h, dim=0)
+            if self.residual_reducer is not None:
+                h = self.residual_reducer.reduce(h)
+            else:
+                h = group.all_reduce(h).narrow(
+                    0, group.rank_in_group * residual.shape[0], residual.shape[0]
+                )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
             gate_msa,
@@ -935,7 +986,12 @@ class MiniMaxH3DiTBlock(nn.Module):
             h = group.all_gather(h, dim=0)
         h = self.mlp(h, input_is_rotated=input_is_rotated)
         if group is not None:
-            h = group.reduce_scatter(h, dim=0)
+            if self.residual_reducer is not None:
+                h = self.residual_reducer.reduce(h)
+            else:
+                h = group.all_reduce(h).narrow(
+                    0, group.rank_in_group * residual.shape[0], residual.shape[0]
+                )
         return indexed_gate(residual, gate_mlp, h, combined_indices)
 
 
@@ -1087,15 +1143,9 @@ class MiniMaxH3DiTModel(nn.Module):
         self._qkv_checkpoint_is_runtime_layout = bool(
             getattr(quant_config, "is_checkpoint_int8_convrot_serialized", False)
         )
-        self.residual_sequence_parallel = residual_sequence_parallel
-        if residual_sequence_parallel and (
-            get_tensor_model_parallel_world_size() != 4
-            or not self._qkv_checkpoint_is_runtime_layout
-        ):
-            raise ValueError(
-                "H3 residual sequence parallelism requires TP4 "
-                "and serialized INT8 ConvRot"
-            )
+        self.residual_sequence_parallel = (
+            residual_sequence_parallel and get_tensor_model_parallel_world_size() > 1
+        )
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -1177,6 +1227,16 @@ class MiniMaxH3DiTModel(nn.Module):
         validate_bindings = getattr(quant_config, "validate_model_bindings", None)
         if callable(validate_bindings):
             validate_bindings(self)
+
+    def enable_vsa_gates(self, topk: int) -> None:
+        for block in self.blocks:
+            if block.attn.attention.backend != "FASTVIDEO_VSA":
+                raise ValueError("VSA gates require the explicit sparse backend")
+            block.attn.enable_vsa_gate(topk)
+        # The official adapter has no token-refiner gates or video tile layout.
+        for block in self.token_refiner.blocks:
+            block.attn.attention.backend = "FLASH_ATTN_V100"
+        self._mark_missing_params_required()
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
@@ -1322,6 +1382,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 weight_loader(param, up, 1)
             else:
                 weight_loader(param, loaded_weight)
+            if param.dtype == _COMPUTE_DTYPE and not torch.isfinite(param).all():
+                raise ValueError(
+                    f"H3 weight {name} cannot be represented as finite FP16; "
+                    "checkpoint conversion must not silently overflow"
+                )
             loaded.add(name)
         return loaded
 
@@ -1499,6 +1564,9 @@ class MiniMaxH3DiTModel(nn.Module):
         )
 
         psp = _required_kwarg(kwargs, "packed_seq_params")
+        vsa_prefix_segments = tuple(
+            int(n) for n in self._psp_optional(psp, "vsa_prefix_segments", ())
+        )
         cu_seqlens = self._psp_field(psp, "packed_seq_params", "cu_seqlens_q").to(
             torch.int32
         )
@@ -1609,6 +1677,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 packed_total=seq_len,
                 num_requests=num_requests,
                 video_layout=video_layout,
+                vsa_prefix_segments=vsa_prefix_segments,
             )
         if residual_group is not None:
             # Final heads and the existing padding boundary consume full FP32 rows.

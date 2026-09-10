@@ -38,16 +38,56 @@ class H3Config:
     transformer_path: str | None = None
     tensor_parallel_size: int = 4
     attention_backend: str = "FLASH_ATTN_V100"
+    vsa_topk: int = 64
+    attention_query_tile: Literal[64, 128] = 64
     fp16_weight_cache_gib: float = 0.0
     fp16_cache_layers: tuple[str, ...] = ()
     lora_path: str | None = None
     int8_weight_layout: str = "column"
+    fp16_weight_layout: Literal["row", "column"] = "row"
     residual_sequence_parallel: bool = False
+    residual_reduction: Literal["native", "peer"] = "native"
+    residual_reduction_memory_gib: float = 4.0
+    host_weight_pin_memory: bool = True
+    share_host_vae_weights: bool = False
+    weight_offload: Literal["component", "layer"] = "component"
     video_encoder: Literal["libx264", "h264_nvenc"] = "libx264"
     host_memory_mode: Literal["auto", "pinned", "mmap"] = "auto"
     host_memory_directory: str | None = None
 
     def __post_init__(self) -> None:
+        if self.residual_reduction not in ("native", "peer"):
+            raise H3InputError("residual reduction must be native or peer")
+        if self.residual_reduction == "peer" and not self.residual_sequence_parallel:
+            raise H3InputError("peer reduction requires residual sequence parallelism")
+        if (
+            isinstance(self.residual_reduction_memory_gib, bool)
+            or not math.isfinite(self.residual_reduction_memory_gib)
+            or not math.isfinite(self.residual_reduction_memory_gib * 2**30)
+            or self.residual_reduction_memory_gib <= 0
+        ):
+            raise H3InputError("residual communication budget must be finite and > 0")
+        if self.attention_query_tile not in (64, 128):
+            raise H3InputError("Attention query tile must be 64 or 128")
+        if (
+            self.attention_query_tile != 64
+            and self.attention_backend != "FLASH_ATTN_V100"
+        ):
+            raise H3InputError("Explicit query tiling requires FLASH_ATTN_V100")
+        if self.weight_offload not in ("component", "layer"):
+            raise H3InputError("weight offload must be component or layer")
+        if self.weight_offload == "layer" and self.fp16_cache_layers:
+            raise H3InputError("layer offload cannot retain a fixed GPU weight cache")
+        if not isinstance(self.host_weight_pin_memory, bool):
+            raise H3InputError("host weight pinning must be a boolean")
+        if not isinstance(self.share_host_vae_weights, bool):
+            raise H3InputError("shared host VAE weights must be a boolean")
+        if (
+            self.share_host_vae_weights
+            and self.tensor_parallel_size > 1
+            and self.host_weight_pin_memory
+        ):
+            raise H3InputError("shared host VAE weights require pageable host masters")
         if self.host_memory_mode not in ("auto", "pinned", "mmap"):
             raise H3InputError("host memory mode must be auto, pinned or mmap")
         if self.video_encoder not in ("libx264", "h264_nvenc"):
@@ -56,26 +96,25 @@ class H3Config:
             raise H3InputError("partition must be fl2va or ref2va")
         if self.int8_weight_layout not in ("row", "column"):
             raise H3InputError("H3 INT8 weight layout must be row or column")
+        if self.fp16_weight_layout not in ("row", "column"):
+            raise H3InputError("H3 FP16 weight layout must be row or column")
         if self.tensor_parallel_size not in (1, 2, 4):
             raise H3InputError("native H3 supports TP1, TP2, or TP4")
         if self.attention_backend not in (
             "FLASH_ATTN_V100",
             "FLASHINFER_SM70",
             "TORCH_SDPA",
+            "FASTVIDEO_VSA",
         ):
             raise H3InputError(f"unsupported H3 attention: {self.attention_backend}")
-        if self.residual_sequence_parallel and (
-            self.tensor_parallel_size != 4
-            or self.attention_backend not in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
-            or self.partition != "fl2va"
-            or not self.transformer_path
-            or self.lora_path is not None
+        if (
+            isinstance(self.vsa_topk, bool)
+            or not isinstance(self.vsa_topk, int)
+            or self.vsa_topk <= 0
         ):
-            raise H3InputError(
-                "experimental residual sequence parallelism requires TP4, "
-                "FLASH_ATTN_V100 or FLASHINFER_SM70 and an FL2VA INT8 "
-                "ConvRot checkpoint without an adapter"
-            )
+            raise H3InputError("VSA topk must be a positive integer")
+        if self.attention_backend == "FASTVIDEO_VSA" and not self.lora_path:
+            raise H3InputError("H3 VSA requires an explicit FastH3 VSA artifact")
         if (
             not math.isfinite(self.fp16_weight_cache_gib)
             or self.fp16_weight_cache_gib < 0
