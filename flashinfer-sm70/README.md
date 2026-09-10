@@ -41,3 +41,12 @@ reference, requires zero PTXAS spills and zero SASS `LDL`/`STL`, checks for
 256 emitted `HMMA.884` instructions per kernel, and reports paired timings.
 Timing is observational only and is not an attention promotion or speedup
 gate.
+
+## Sparse QSA decode port (experimental)
+
+The separate [QSA source-port worklog](../docs/design/sm70_flashinfer_qsa_port.md)
+documents an SM70 instantiation of pinned FlashInfer CUDA decode and cascade
+kernels with an ordered sparse-cache adapter. It uses a newer independent
+source pin, not the WMMA probe above. It is benchmark-only, has no serving
+dispatch/default change, and must pass GPU correctness and measured speed
+gates before runtime integration.
