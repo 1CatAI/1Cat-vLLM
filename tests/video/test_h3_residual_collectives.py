@@ -55,6 +55,9 @@ def test_reuse_request_accounting_shape_eviction_and_budget_fallback(monkeypatch
             self.closed = True
 
     monkeypatch.setattr(collectives, "SM70ExactRowReductionPlan", Plan)
+    monkeypatch.setattr(
+        collectives.H3ResidualReduction, "_setup_unavailable", lambda *args: None
+    )
     group = SimpleNamespace(world_size=4, rank_in_group=1, all_reduce=lambda x: x * 4)
     owner = collectives.H3ResidualReduction(group, memory_budget_bytes=100)
     value = torch.arange(12, dtype=torch.float32).view(4, 3)
@@ -85,3 +88,49 @@ def test_tp2_uses_ordinary_reduction_without_plan(monkeypatch):
     owner = collectives.H3ResidualReduction(group, memory_budget_bytes=100)
     assert torch.equal(owner.reduce(torch.ones(6, 3)), torch.full((3, 3), 2.0))
     assert owner.snapshot()["native_calls"] == 1
+
+
+def test_resource_fallback_keeps_native_values_and_rechecks_next_request(monkeypatch):
+    checks = []
+
+    def unavailable(*args):
+        checks.append(1)
+        return "peer access unavailable for this GPU group"
+
+    monkeypatch.setattr(
+        collectives.H3ResidualReduction, "_setup_unavailable", unavailable
+    )
+    group = SimpleNamespace(world_size=4, rank_in_group=2, all_reduce=lambda x: x * 4)
+    owner = collectives.H3ResidualReduction(group, memory_budget_bytes=2**30)
+    value = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    expected = (value * 4)[2:3]
+    for _ in range(3):
+        assert torch.equal(owner.reduce(value), expected)
+    assert len(checks) == 1
+    assert owner.snapshot()["native_calls"] == 3
+    assert owner.snapshot()["peer_calls"] == 0
+    assert "peer access" in owner.snapshot()["fallback_reason"]
+    owner.begin_request()
+    assert torch.equal(owner.reduce(value), expected)
+    assert len(checks) == 2
+
+
+def test_peer_memory_precheck_uses_slowest_rank_before_allocation(monkeypatch):
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda *args: (8 * 2**30, 32 * 2**30)
+    )
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda *args: 2**30)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda *args: 2**30)
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda *args: True)
+    reason = "insufficient free memory for residual communication setup"
+
+    def gather(output, local, **kwargs):
+        assert local is None
+        output[:] = [None, reason, None, None]
+
+    monkeypatch.setattr(collectives.dist, "all_gather_object", gather)
+    owner = collectives.H3ResidualReduction(
+        SimpleNamespace(world_size=4, cpu_group=None), memory_budget_bytes=2**30
+    )
+    value = SimpleNamespace(device=torch.device("cuda:0"), shape=(4, 4))
+    assert owner._setup_unavailable(value) == reason

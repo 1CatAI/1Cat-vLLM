@@ -894,7 +894,7 @@ class precompiled_wheel_utils:
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
                 sm70_sampler_ext_regex = re.compile(
-                    r"vllm/_sm70_sampler_C(?:\.[^/]+)?\.so$"
+                    r"vllm/_sm70_(?:sampler|exact_reduce)_C(?:\.[^/]+)?\.so$"
                 )
                 h3_ext_regex = re.compile(
                     r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
@@ -1247,6 +1247,7 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_contains(7, 0):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
+        ext_modules.append(CMakeExtension(name="vllm._sm70_exact_reduce_C"))
         ext_modules.append(CMakeExtension(name="vllm._h3_w8a16_C"))
         ext_modules.append(CMakeExtension(name="vllm._h3_flashinfer_C"))
         ext_modules.append(CMakeExtension(name="vllm._h3_flashattn_C"))
