@@ -81,12 +81,20 @@ class MTPFp8SM70MoEMethod(Fp8SM70MoEMethod):
         # Channelwise scales avoid crossing gate/up or TP shard boundaries.
         for name in ("w13", "w2"):
             source = getattr(layer, name + "_weight")
-            quantized = torch.empty_like(source, dtype=torch.float8_e4m3fn)
+            padded_shape = pad_expert_matrix(source[0], name == "w13").shape
+            quantized = torch.empty(
+                (source.shape[0], *padded_shape),
+                dtype=torch.float8_e4m3fn,
+                device=source.device,
+            )
             scales = torch.empty(
-                (*source.shape[:2], 1), dtype=torch.float32, device=source.device
+                (source.shape[0], padded_shape[0], 1),
+                dtype=torch.float32,
+                device=source.device,
             )
             for expert in range(source.shape[0]):
-                quantized[expert], scales[expert] = quantize_expert_rows(source[expert])
+                padded = pad_expert_matrix(source[expert], name == "w13")
+                quantized[expert], scales[expert] = quantize_expert_rows(padded)
             setattr(
                 layer, name + "_weight", nn.Parameter(quantized, requires_grad=False)
             )
@@ -96,6 +104,22 @@ class MTPFp8SM70MoEMethod(Fp8SM70MoEMethod):
         # The existing packer accepts channel scales and the existing method
         # discards the unpacked weights after preparing the runtime layout.
         super().process_weights_after_loading(layer)
+
+
+def pad_expert_matrix(weight: torch.Tensor, gate_up: bool) -> torch.Tensor:
+    """Keep gate/up halves aligned with the zero-padded down-projection input."""
+    intermediate = weight.shape[0] // 2 if gate_up else weight.shape[1]
+    padded = (intermediate + 127) // 128 * 128
+    if padded == intermediate:
+        return weight
+    if gate_up:
+        result = weight.new_zeros((2 * padded, weight.shape[1]))
+        result[:intermediate].copy_(weight[:intermediate])
+        result[padded : padded + intermediate].copy_(weight[intermediate:])
+    else:
+        result = weight.new_zeros((weight.shape[0], padded))
+        result[:, :intermediate].copy_(weight)
+    return result
 
 
 class MTPExpertFp8Config(QuantizationConfig):

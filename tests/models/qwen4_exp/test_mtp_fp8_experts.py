@@ -44,6 +44,26 @@ def test_nonfinite_checkpoint_rejected(value):
         impl.quantize_expert_rows(weight)
 
 
+def test_padding_preserves_gated_expert_and_still_reduces_storage():
+    generator = torch.Generator().manual_seed(9)
+    gate_up = torch.randn(320, 64, generator=generator)
+    down = torch.randn(64, 160, generator=generator)
+    x = torch.randn(3, 64, generator=generator)
+    padded_gate_up = impl.pad_expert_matrix(gate_up, True)
+    padded_down = impl.pad_expert_matrix(down, False)
+    assert padded_gate_up.shape == (512, 64)
+    assert padded_down.shape == (64, 256)
+    gate, up = (x @ gate_up.T).chunk(2, dim=-1)
+    padded_gate, padded_up = (x @ padded_gate_up.T).chunk(2, dim=-1)
+    expected = (torch.nn.functional.silu(gate) * up) @ down.T
+    actual = (torch.nn.functional.silu(padded_gate) * padded_up) @ padded_down.T
+    torch.testing.assert_close(actual, expected)
+    # Payload savings survive the required padding: 160/256 * FP16/FP8.
+    assert padded_gate_up.numel() + padded_down.numel() < 2 * (
+        gate_up.numel() + down.numel()
+    )
+
+
 def test_only_unquantized_draft_experts_are_overridden(monkeypatch):
     unquantized = Mock(spec=impl.UnquantizedFusedMoEMethod)
     fallback = SimpleNamespace(
