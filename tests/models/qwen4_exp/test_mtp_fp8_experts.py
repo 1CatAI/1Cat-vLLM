@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config.speculative import SpeculativeConfig
 from vllm.models.qwen4_exp.nvidia import mtp_fp8_experts as impl
 
 
@@ -14,6 +15,33 @@ from vllm.models.qwen4_exp.nvidia import mtp_fp8_experts as impl
 def should_do_global_cleanup_after_test():
     # These tests only create CPU tensors and never initialize a process group.
     return False
+
+
+@pytest.mark.parametrize(
+    "method,architecture,sampler,valid",
+    [
+        ("mtp", "Qwen4ExpMTP", "standard", True),
+        ("mtp", "Qwen4ExpMTP", "synthetic", False),
+        ("mtp", "Qwen3_5MTP", "standard", False),
+        ("eagle3", "Qwen4ExpMTP", "standard", False),
+    ],
+)
+def test_fp8_feature_requires_supported_draft_and_real_verification(
+    method, architecture, sampler, valid
+):
+    config = SimpleNamespace(
+        mtp_expert_quantization="fp8",
+        method=method,
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        ),
+        rejection_sample_method=sampler,
+    )
+    if valid:
+        SpeculativeConfig._verify_mtp_expert_quantization(config)
+    else:
+        with pytest.raises(ValueError):
+            SpeculativeConfig._verify_mtp_expert_quantization(config)
 
 
 @pytest.mark.parametrize("shape", [(320, 2560), (2560, 160), (16, 16)])

@@ -1396,6 +1396,7 @@ class SpeculativeConfig:
                     "dflash_ddtree tree verification is enabled."
                 )
 
+        self._verify_mtp_expert_quantization()
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1420,6 +1421,17 @@ class SpeculativeConfig:
 
         self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def _verify_mtp_expert_quantization(self):
+        if self.mtp_expert_quantization is None:
+            return
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if self.method != "mtp" or getattr(hf_config, "architectures", []) != [
+            "Qwen4ExpMTP"
+        ]:
+            raise ValueError("mtp_expert_quantization currently requires Qwen4Exp MTP")
+        if self.rejection_sample_method != "standard":
+            raise ValueError("FP8 MTP requires standard rejection sampling")
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (

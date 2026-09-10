@@ -57,6 +57,8 @@ class MTPFp8SM70MoEMethod(Fp8SM70MoEMethod):
     ):
         if params_dtype != torch.float16 or not self.moe.is_act_and_mul:
             raise ValueError("SM70 MTP FP8 requires FP16 gated experts")
+        if hidden_size % 128:
+            raise ValueError("SM70 MTP FP8 requires a hidden size divisible by 128")
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
         # The checkpoint is unquantized. The normal loader must slice its
