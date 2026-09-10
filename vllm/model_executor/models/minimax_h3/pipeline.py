@@ -749,6 +749,7 @@ class MiniMaxH3Pipeline(nn.Module):
             load_device=torch.device("cpu"),
             pin_memory=config.host_weight_pin_memory,
             shared_weights_dir=shared_weights_dir,
+            skip_parameter_init=config.prepared_weight_cache,
         )
         self.video_vae.set_parallel_size(config.tensor_parallel_size)
         loading(3, "audio_vae")
